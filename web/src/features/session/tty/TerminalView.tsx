@@ -5,8 +5,6 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import { Button } from "../../../components/Button";
-import { ConnectionIndicator } from "../../../components/ConnectionIndicator";
 import { useWorkbenchViewport } from "../../../lib/viewport";
 import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
@@ -60,7 +58,6 @@ export function TerminalView({
   const [searchQuery, setSearchQuery] = useState("");
   const [preview, setPreview] = useState("");
   const [ready, setReady] = useState(false);
-  const [auxOpen, setAuxOpen] = useState(true);
   const frozen = status === "reconnecting" || status === "failed";
 
   const send = (data: string) => {
@@ -224,8 +221,6 @@ export function TerminalView({
     if (directInput && !frozen) term.focus();
   }, [directInput, frozen]);
 
-  const conn = status === "live" ? "live" : status === "reconnecting" ? "reconnecting" : "offline";
-
   return (
     <section
       className={css.lab}
@@ -237,41 +232,48 @@ export function TerminalView({
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
       <header className={css.toolbar}>
-        <span>
-          {cols}×{rows} {mode}
+        <span className={css.geo}>
+          {cols}×{rows} · {mode} · Unicode11 · WebLinks
         </span>
-        <ConnectionIndicator status={conn} />
-        <Button
-          className={!directInput ? css.toggleOn : undefined}
-          aria-pressed={!directInput}
-          onClick={() => setInputOverride((current) => ({ direct: false, mode: current?.mode ?? mode }))}
-        >
-          本地输入
-        </Button>
-        <Button
-          className={directInput ? css.toggleOn : undefined}
-          aria-pressed={directInput}
-          onClick={() => setInputOverride((current) => ({ direct: true, mode: current?.mode ?? mode }))}
-        >
-          直连
-        </Button>
-        <Button
-          onClick={() =>
-            setInputOverride((current) => {
-              const next = mode === "fit" ? "fixed" : mode === "fixed" ? "responsive" : "fit";
-              return { direct: current?.direct ?? directInput, mode: next };
-            })
-          }
-        >
-          {mode}
-        </Button>
-        <Button aria-pressed={searchOpen} onClick={() => setSearchOpen((open) => !open)}>
-          搜索
-        </Button>
-        <Button aria-pressed={auxOpen} onClick={() => setAuxOpen((open) => !open)}>
-          辅助键
-        </Button>
-        {searchOpen ? (
+        <div className={css.seg}>
+          <button
+            type="button"
+            className={!directInput ? css.segOn : undefined}
+            aria-pressed={!directInput}
+            onClick={() => setInputOverride((current) => ({ direct: false, mode: current?.mode ?? mode }))}
+          >
+            本地输入
+          </button>
+          <button
+            type="button"
+            className={directInput ? css.segOn : undefined}
+            aria-pressed={directInput}
+            onClick={() => setInputOverride((current) => ({ direct: true, mode: current?.mode ?? mode }))}
+          >
+            直连
+          </button>
+        </div>
+        {!mobile ? <AuxKeys disabled={frozen} onKey={send} variant="toolbar" /> : null}
+        {!mobile ? (
+          <button
+            type="button"
+            className={css.geo}
+            onClick={() =>
+              setInputOverride((current) => {
+                const next = mode === "fit" ? "fixed" : mode === "fixed" ? "responsive" : "fit";
+                return { direct: current?.direct ?? directInput, mode: next };
+              })
+            }
+          >
+            {mode}
+          </button>
+        ) : null}
+        {!mobile ? (
+          <button type="button" className={css.geo} aria-pressed={searchOpen} onClick={() => setSearchOpen((open) => !open)}>
+            搜索
+          </button>
+        ) : null}
+        {searchOpen && !mobile ? (
           <form
             className={css.search}
             onSubmit={(event) => {
@@ -279,47 +281,66 @@ export function TerminalView({
               if (searchQuery) searchRef.current?.findNext(searchQuery);
             }}
           >
-            <input
-              aria-label="搜索终端"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-            <Button
+            <input aria-label="搜索终端" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
+            <button
+              type="button"
+              className={css.geo}
               onClick={() => {
                 if (searchQuery) searchRef.current?.findNext(searchQuery);
               }}
             >
               下一个
-            </Button>
+            </button>
           </form>
         ) : null}
       </header>
+      {status !== "live" ? (
+        <div className={css.banner} role="status">
+          <span className={css.dots} aria-hidden>
+            <span className={css.dot} />
+            <span className={css.dot} />
+            <span className={css.dot} />
+          </span>
+          {status === "connecting"
+            ? "正在连接终端…"
+            : status === "reconnecting"
+              ? "reconnecting · 终端保留最后一帧，不清屏"
+              : "终端连接失败"}
+          {status === "reconnecting" || status === "failed" ? (
+            <button
+              type="button"
+              className={css.geo}
+              onClick={() => {
+                resetStreamRef.current = true;
+                sessionRef.current?.reconnectForTest();
+              }}
+            >
+              重连
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <div className={css.viewport} ref={viewportRef} role="region" aria-label="终端画面">
-        {status !== "live" ? (
-          <div className={css.banner} role="status">
-            {status === "connecting" ? "正在连接终端…" : status === "reconnecting" ? "reconnecting" : "终端连接失败"}
-            {status === "reconnecting" || status === "failed" ? (
-              <Button
-                variant="primary"
-                onClick={() => {
-                  resetStreamRef.current = true;
-                  sessionRef.current?.reconnectForTest();
-                }}
-              >
-                重连
-              </Button>
-            ) : null}
-          </div>
-        ) : null}
         <div className={css.host} ref={hostRef} />
         <pre className={css.preview} data-testid="tty-ansi-preview">
           {preview}
         </pre>
       </div>
       <div className={css.dock}>
-        {!directInput ? <LocalInput disabled={frozen} mobile={mobile} onSend={send} /> : null}
-        {auxOpen ? <AuxKeys disabled={frozen} onKey={send} /> : null}
+        {directInput ? (
+          <>
+            <span className={css.dockLabel}>本地输入</span>
+            <div className={css.directGhost}>直连开启中 —— 击键直接进 PTY</div>
+            <div className={css.directGhostSend}>发送</div>
+          </>
+        ) : (
+          <LocalInput disabled={frozen} mobile={mobile} onSend={send} />
+        )}
       </div>
+      {mobile ? <AuxKeys disabled={frozen} onKey={send} /> : null}
+      {!mobile ? (
+        <div className={css.note}>TTY 字节走独立 raw_tty 流，不进 transcript 节点 · 结构化卡片仍在「结构」tab 看同一 journal</div>
+      ) : null}
     </section>
   );
 }

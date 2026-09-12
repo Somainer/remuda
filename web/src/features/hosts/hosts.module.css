@@ -2,12 +2,111 @@
   padding: 16px;
 }
 
-.head {
+.board {
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  min-height: 100%;
+  background: var(--ink);
+}
+
+.head {
+  height: 56px;
+  flex: none;
+  display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
+  gap: 12px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.title {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--paper);
+}
+
+.count {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.add {
+  height: 30px;
+  min-height: 30px;
+  border: 1px solid var(--paper);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--paper);
+  font-size: 13px;
+  padding: 0 13px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 20px;
+  border-bottom: 1px solid var(--line);
+  color: inherit;
+  text-decoration: none;
+  background: transparent;
+  min-height: 0;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+  border-radius: 0;
+  width: 100%;
+  text-align: left;
+}
+
+.identity {
+  width: 150px;
+  flex: none;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--paper);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nameOff {
+  font-weight: 400;
+  color: var(--mute);
+}
+
+.cell {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.cellRtt {
+  width: 96px;
+  flex: none;
+}
+
+.cellCli {
+  width: 150px;
+  flex: none;
+}
+
+.cellTransport {
+  flex: 1;
+  min-width: 0;
+}
+
+.cellSessions {
+  flex: none;
 }
 
 .dot {
@@ -23,7 +122,186 @@
 
 .dotOff {
   background: transparent;
-  box-shadow: inset 0 0 0 1px var(--mute);
+  border: 1px solid var(--mute);
+  box-sizing: border-box;
+}
+
+.dotAuth {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--ok);
+}
+
+.dotUnknown {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  border: 1px dashed var(--mute);
+  box-sizing: border-box;
+  background: transparent;
+}
+
+.detail {
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.detailHead {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.back {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+  flex: none;
+}
+
+.detailTitle {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detailMeta {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+}
+
+.metric {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 11px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.metricLabel {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  letter-spacing: 0.06em;
+}
+
+.metricValue {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--paper);
+}
+
+.sectionLabel {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  letter-spacing: 0.06em;
+  margin-bottom: 9px;
+}
+
+.cliTable {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.cliRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 13px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.cliRow:last-child {
+  border-bottom: 0;
+}
+
+.cliKind {
+  width: 80px;
+  color: var(--paper);
+  flex: none;
+}
+
+.cliVerInline {
+  display: none;
+}
+
+.cliPath {
+  flex: 1;
+  color: var(--mute);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cliVer {
+  width: 90px;
+  color: var(--mute);
+  flex: none;
+}
+
+.cliAuth {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 110px;
+  flex: none;
+  color: var(--mute);
+}
+
+.chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.chipPath {
+  color: var(--mute);
+  margin-left: 7px;
+}
+
+.foot {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
 }
 
 .meta {
@@ -58,4 +336,148 @@
   gap: 6px;
   flex-wrap: wrap;
   margin-top: 8px;
+}
+
+.fields {
+  display: grid;
+  gap: 8px;
+  max-width: 480px;
+}
+
+.newSession {
+  height: 30px;
+  min-height: 30px;
+  border: 1px solid var(--paper);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  padding: 0 13px;
+  font-size: 13px;
+  color: var(--paper);
+  background: transparent;
+  flex: none;
+  white-space: nowrap;
+}
+
+.newSession:disabled {
+  opacity: 0.45;
+}
+
+.mobileMeta,
+.chevron {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .head {
+    height: 52px;
+    padding: 0 16px;
+  }
+
+  .title {
+    font-size: 18px;
+  }
+
+  .add {
+    height: 32px;
+    min-height: 32px;
+    padding: 0 12px;
+  }
+
+  .row {
+    padding: 14px 16px;
+    gap: 12px;
+  }
+
+  .identity {
+    width: auto;
+    flex: 1;
+    gap: 4px;
+  }
+
+  .name,
+  .nameOff {
+    font-size: 15px;
+  }
+
+  .cell {
+    display: none;
+  }
+
+  .mobileMeta {
+    display: block;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--mute);
+  }
+
+  .chevron {
+    display: block;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--mute);
+    flex: none;
+  }
+
+  .metrics {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .detail {
+    padding: 16px;
+  }
+
+  .detailHead {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .detailTitle {
+    font-size: 18px;
+    flex: 1;
+  }
+
+  .detailMeta {
+    flex: 1 1 100%;
+    order: 4;
+  }
+
+  .newSession {
+    height: 32px;
+    min-height: 32px;
+  }
+
+  .cliRow {
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    padding: 11px 12px;
+  }
+
+  .cliKind {
+    width: auto;
+    flex: 1;
+    font-size: 13px;
+    order: 1;
+  }
+
+  .cliVerInline {
+    display: inline;
+    color: var(--mute);
+  }
+
+  .cliVer {
+    display: none;
+  }
+
+  .cliAuth {
+    width: auto;
+    flex: none;
+    order: 2;
+  }
+
+  .cliPath {
+    flex: 1 1 100%;
+    font-size: 11px;
+    order: 3;
+  }
 }

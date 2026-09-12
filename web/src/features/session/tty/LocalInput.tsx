@@ -1,7 +1,6 @@
 import { useState, type KeyboardEvent } from "react";
-import { Button } from "../../../components/Button";
 import { composing } from "../../../lib/viewport";
-import ui from "../../../styles/ui.module.css";
+import css from "./TerminalView.module.css";
 
 export function LocalInput({
   disabled,
@@ -21,7 +20,7 @@ export function LocalInput({
     onSend(value);
   };
 
-  const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+  const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (composing(event)) return;
     if (!mobile && event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -30,27 +29,29 @@ export function LocalInput({
   };
 
   return (
-    <form
-      className={ui.card}
-      onSubmit={(e) => {
-        e.preventDefault();
-        submit();
-      }}
-    >
-      <textarea
-        className={ui.textarea}
-        value={text}
-        disabled={disabled}
-        placeholder="本地输入：直连关闭时击键进 textarea"
-        aria-label="本地输入"
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={onKeyDown}
-      />
-      <div className={ui.row} style={{ marginTop: 8, justifyContent: "flex-end" }}>
-        <Button variant="primary" disabled={disabled || !text} onClick={submit}>
-          发送
-        </Button>
-      </div>
-    </form>
+    <div className={css.localWrap}>
+      <form
+        className={css.localForm}
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <div className={css.localField}>
+          <input
+            value={text}
+            disabled={disabled}
+            placeholder="本地输入"
+            aria-label="本地输入"
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={onKeyDown}
+          />
+        </div>
+        <button type="submit" className={css.localSend} disabled={disabled || !text} aria-label="发送">
+          {mobile ? "↑" : "发送"}
+        </button>
+      </form>
+      {mobile ? <p className={css.localHint}>本地输入（默认）· 中文候选不会串进 PTY</p> : null}
+    </div>
   );
 }

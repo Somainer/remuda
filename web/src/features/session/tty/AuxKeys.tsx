@@ -1,22 +1,49 @@
-import { Button } from "../../../components/Button";
 import css from "./TerminalView.module.css";
 
-const KEYS: Array<[string, string]> = [
-  ["Enter", "\r"],
+const BAR: Array<[string, string]> = [
   ["Esc", "\u001b"],
   ["Tab", "\t"],
+  ["⌃", "\u0003"],
+  ["⌥", "\u001b"],
+  ["↑", "\u001b[A"],
+  ["↓", "\u001b[B"],
+  ["⌘K", "\u001bk"],
+];
+
+const STRIP: Array<[string, string]> = [
+  ["Esc", "\u001b"],
   ["⇧", ""],
   ["⌃", "\u0003"],
   ["⌥", "\u001b"],
   ["⌘", ""],
-  ["Ctrl+C", "\u0003"],
-  ["↑", "\u001b[A"],
-  ["↓", "\u001b[B"],
-  ["←", "\u001b[D"],
-  ["→", "\u001b[C"],
+  ["Tab", "\t"],
 ];
 
-export function AuxKeys({ disabled, onKey }: { disabled: boolean; onKey: (data: string) => void }) {
+export function AuxKeys({
+  disabled,
+  onKey,
+  variant = "bar",
+}: {
+  disabled: boolean;
+  onKey: (data: string) => void;
+  variant?: "bar" | "toolbar";
+}) {
+  if (variant === "toolbar") {
+    return (
+      <div className={css.auxStrip} role="toolbar" aria-label="终端辅助键">
+        {STRIP.map(([label, data]) =>
+          data ? (
+            <button key={label} type="button" disabled={disabled} aria-label={label} onClick={() => onKey(data)}>
+              {label}
+            </button>
+          ) : (
+            <span key={label}>{label}</span>
+          ),
+        )}
+      </div>
+    );
+  }
+
   return (
     <div
       className={css.keys}
@@ -26,10 +53,10 @@ export function AuxKeys({ disabled, onKey }: { disabled: boolean; onKey: (data: 
         if ((event.target as HTMLElement).closest("button")) event.preventDefault();
       }}
     >
-      {KEYS.filter(([, data]) => data).map(([label, data]) => (
-        <Button key={label} disabled={disabled} aria-label={label} onClick={() => onKey(data)}>
+      {BAR.map(([label, data]) => (
+        <button key={label} type="button" disabled={disabled} aria-label={label} onClick={() => onKey(data)}>
           {label}
-        </Button>
+        </button>
       ))}
     </div>
   );

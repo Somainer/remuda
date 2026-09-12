@@ -9,6 +9,7 @@ mod capabilities;
 mod entities;
 mod enums;
 mod error;
+pub mod hubnode;
 mod interaction;
 mod json;
 mod launch;

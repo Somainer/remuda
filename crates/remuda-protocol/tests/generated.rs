@@ -68,7 +68,28 @@ fn generated_files_are_current_without_writing_to_the_workspace() {
 fn public_wire_types_are_registered_for_generation() {
     let document = schema_document();
     let definitions = document["$defs"].as_object().unwrap();
-    let exempt = ["WireValueError", "BinaryFrameError", "SchemaExportError"];
+    let exempt = [
+        "WireValueError",
+        "BinaryFrameError",
+        "SchemaExportError",
+        // M1 Hub↔Node operational frames (`pub mod hubnode`); not protocol.md §12 catalog.
+        "HubNodeRequest",
+        "HubNodeResponse",
+        "JsonRpcErrorObject",
+        "HubNodeMethod",
+        "NodeAuthParams",
+        "NodeHelloParams",
+        "NodeHostInventory",
+        "NodeHeartbeatParams",
+        "InstanceCreateParams",
+        "InstanceSendParams",
+        "InstanceCancelParams",
+        "InstanceRespondParams",
+        "JournalAppendParams",
+        "JournalSeqWatermark",
+        "TtyFrameParams",
+        "TtyBinaryEnvelopeSpec",
+    ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();
         if file.extension().is_none_or(|extension| extension != "rs") {

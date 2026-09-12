@@ -1,0 +1,757 @@
+//! Operational Hub↔Node JSON-RPC 2.0 frames for `GET /v1/node` and stdio.
+//!
+//! Distinct from [`crate::MethodCall`] (`runtime.hello` catalog in `protocol.md`
+//! §7). This module is the M1 wire both Hub and Node speak: `node.hello` with
+//! host inventory, persisted `hostId`, and an enrollment token; heartbeat;
+//! instance methods; batched `journal.append`; and `tty.frame`.
+//!
+//! Authentication:
+//! - WebSocket: HTTP `Authorization: Bearer <token>` on the upgrade.
+//! - Stdio: first JSON-RPC frame is [`METHOD_NODE_AUTH`]; it is not forwarded
+//!   onto the Hub WebSocket.
+
+use crate::{
+    BINARY_HEADER_LEN, BinaryChannel, BinaryFrameError, BinaryHeader, JsonRpcVersion,
+    PROTOCOL_VERSION, ProtocolVersion, U64, decode_binary_frame,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+/// JSON-RPC method for the first stdio frame (Bearer equivalent).
+pub const METHOD_NODE_AUTH: &str = "node.auth";
+/// Node inventory + enrollment hello.
+pub const METHOD_NODE_HELLO: &str = "node.hello";
+/// Node liveness + inventory refresh.
+pub const METHOD_NODE_HEARTBEAT: &str = "node.heartbeat";
+/// Alias accepted by Hub for [`METHOD_NODE_HELLO`].
+pub const METHOD_RUNTIME_HELLO: &str = "runtime.hello";
+/// Alias accepted by Hub for [`METHOD_NODE_HEARTBEAT`].
+pub const METHOD_RUNTIME_HEARTBEAT: &str = "runtime.heartbeat";
+/// Create an Instance on the Node.
+pub const METHOD_INSTANCE_CREATE: &str = "instance.create";
+/// Submit a prompt to an Instance.
+pub const METHOD_INSTANCE_SEND: &str = "instance.send";
+/// Cancel the current run.
+pub const METHOD_INSTANCE_CANCEL: &str = "instance.cancel";
+/// Answer a pending interaction (`instance.respond`).
+pub const METHOD_INSTANCE_RESPOND: &str = "instance.respond";
+/// Alias accepted by Hub for [`METHOD_INSTANCE_RESPOND`].
+pub const METHOD_INTERACTION_RESPOND: &str = "interaction.respond";
+/// Append one or more journal events.
+pub const METHOD_JOURNAL_APPEND: &str = "journal.append";
+/// TTY JSON control frame; binary envelopes use [`TTY_BINARY_HEADER_LEN`].
+pub const METHOD_TTY_FRAME: &str = "tty.frame";
+/// HTTP Authorization scheme for `GET /v1/node`.
+pub const WS_AUTHORIZATION_SCHEME: &str = "Bearer";
+/// `params.scheme` on [`METHOD_NODE_AUTH`].
+pub const AUTH_SCHEME_BEARER: &str = "bearer";
+/// Binary `tty.frame` header length; same as [`BINARY_HEADER_LEN`].
+pub const TTY_BINARY_HEADER_LEN: usize = BINARY_HEADER_LEN;
+
+/// JSON-RPC 2.0 request or notification with an optional protocol `version`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct HubNodeRequest {
+    /// JSON-RPC version; always `"2.0"`.
+    pub jsonrpc: JsonRpcVersion,
+    /// Request id. Absent on notifications.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Value>,
+    /// Hub↔Node protocol version (`protocol.md` §7.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<ProtocolVersion>,
+    /// Method name (`node.hello`, `instance.create`, …).
+    pub method: String,
+    /// Method params object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+/// JSON-RPC 2.0 response with an optional protocol `version`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct HubNodeResponse {
+    /// JSON-RPC version; always `"2.0"`.
+    pub jsonrpc: JsonRpcVersion,
+    /// Echoed request id.
+    pub id: Value,
+    /// Hub↔Node protocol version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<ProtocolVersion>,
+    /// Success payload. Mutually exclusive with `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// Error object. Mutually exclusive with `result`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcErrorObject>,
+}
+
+/// JSON-RPC 2.0 error object (code + message).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct JsonRpcErrorObject {
+    /// Native JSON-RPC code.
+    pub code: i64,
+    /// Human-readable message; not a Remuda discriminant.
+    pub message: String,
+    /// Optional structured data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+/// Known Hub↔Node methods on `/v1/node` and stdio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubNodeMethod {
+    /// [`METHOD_NODE_AUTH`].
+    NodeAuth,
+    /// [`METHOD_NODE_HELLO`].
+    NodeHello,
+    /// [`METHOD_RUNTIME_HELLO`].
+    RuntimeHello,
+    /// [`METHOD_NODE_HEARTBEAT`].
+    NodeHeartbeat,
+    /// [`METHOD_RUNTIME_HEARTBEAT`].
+    RuntimeHeartbeat,
+    /// [`METHOD_INSTANCE_CREATE`].
+    InstanceCreate,
+    /// [`METHOD_INSTANCE_SEND`].
+    InstanceSend,
+    /// [`METHOD_INSTANCE_CANCEL`].
+    InstanceCancel,
+    /// [`METHOD_INSTANCE_RESPOND`].
+    InstanceRespond,
+    /// [`METHOD_INTERACTION_RESPOND`].
+    InteractionRespond,
+    /// [`METHOD_JOURNAL_APPEND`].
+    JournalAppend,
+    /// [`METHOD_TTY_FRAME`].
+    TtyFrame,
+}
+
+/// `node.auth` params (stdio first frame).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeAuthParams {
+    /// Bootstrap or persisted host token.
+    pub token: String,
+    /// Auth scheme; `bearer` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+}
+
+/// `node.hello` params: persisted host id, inventory, enrollment token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeHelloParams {
+    /// Persisted host identity (`hst_…`). Also accepted nested under `host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    /// Registry display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Node binary version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
+    /// Process epoch (`epoch_…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_epoch: Option<String>,
+    /// Enrollment / host token when not using HTTP Bearer (stdio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment_token: Option<String>,
+    /// Carrier (`ssh-stdio`, `outbound-wss`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Protocol version inside params (frame also has `version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<ProtocolVersion>,
+    /// Framing declaration (`ndjson` / `websocket-message`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<Value>,
+    /// Nested host inventory (hostname, labels, cli, herdr, resources).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<NodeHostInventory>,
+    /// Feature flags / capabilities blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+    /// Top-level CLI inventory (Hub also reads nested `host.cli`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<Value>,
+}
+
+/// Host inventory nested under `params.host` (or flattened into params).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeHostInventory {
+    /// Host identity when not at the params root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    /// Best-effort hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Placement labels (map or `["region=sg"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Value>,
+    /// Concurrent instance ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<u32>,
+    /// CLI inventory array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<Value>,
+    /// Herdr presence object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr: Option<Value>,
+    /// Load snapshot `{cpuPct,memPct}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Value>,
+    /// `std::env::consts::OS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Kernel release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    /// libc identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub libc: Option<String>,
+    /// Display label when nested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// `node.heartbeat` params (inventory refresh + optional watermarks).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeHeartbeatParams {
+    /// Connection id from hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    /// Lease id from hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    /// Node binary version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
+    /// Carrier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Nested or flat inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<NodeHostInventory>,
+    /// CLI inventory refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<Value>,
+    /// Capabilities blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+    /// Instance journal watermarks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_watermarks: Vec<JournalSeqWatermark>,
+}
+
+/// `instance.create` params as Hub actually forwards them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceCreateParams {
+    /// Instance identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Command identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Create spec (kind, driver, prompt, hostId, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<Value>,
+    /// Initial prompt payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_input: Option<Value>,
+    /// Flattened kind when Hub omits `spec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Flattened driver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Flattened prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Target host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    /// Target workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+
+/// `instance.send` params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceSendParams {
+    /// Target Instance.
+    pub instance_id: String,
+    /// Command identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Run identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Structured input (`{text}` or prompt wrapper).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+    /// Flattened prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// `instance.cancel` params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceCancelParams {
+    /// Target Instance.
+    pub instance_id: String,
+    /// Command identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Run identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// `instance.respond` / `interaction.respond` params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceRespondParams {
+    /// Target Instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Pending interaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
+    /// Command identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Opaque answer payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
+}
+
+/// Batched `journal.append` with an optional sequence watermark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalAppendParams {
+    /// Instance whose journal is appended.
+    pub instance_id: String,
+    /// Single-event form (pre-batch Hub).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Value>,
+    /// Batched events. Preferred over `event` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<Value>,
+    /// Optional sequence hint (string or number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<Value>,
+    /// Inclusive durable-seq watermark for this batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<JournalSeqWatermark>,
+}
+
+/// Sequence watermark carried on `journal.append` and heartbeat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalSeqWatermark {
+    /// Journal identity when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_id: Option<String>,
+    /// Instance identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Inclusive durable sequence (string or number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_seq: Option<Value>,
+    /// Resume cursor (string or number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_seq: Option<Value>,
+    /// Last acked seq as [`U64`] when the Node can emit a canonical string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<U64>,
+}
+
+/// JSON `tty.frame` control params. Binary frames use [`TtyBinaryEnvelopeSpec`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtyFrameParams {
+    /// Instance that owns the stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Stream identity (`tty_…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// Channel byte (`1` = tty output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<u8>,
+    /// Stream byte offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<Value>,
+    /// Optional base64 payload when not using the binary envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+}
+
+/// Fixed binary envelope for WS/stdio `tty.frame` (not JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtyBinaryEnvelopeSpec {
+    /// Byte 0; always `1` for v1.
+    pub version: u8,
+    /// Header size in bytes ([`TTY_BINARY_HEADER_LEN`]).
+    pub header_len: u32,
+    /// Channel byte for terminal output.
+    pub tty_output_channel: u8,
+    /// Channel byte for object chunks.
+    pub object_chunk_channel: u8,
+    /// Byte layout of the 32-byte header.
+    pub layout: String,
+}
+
+impl Default for TtyBinaryEnvelopeSpec {
+    fn default() -> Self {
+        Self::v1()
+    }
+}
+
+impl TtyBinaryEnvelopeSpec {
+    /// v1 envelope matching [`decode_binary_frame`].
+    #[must_use]
+    pub fn v1() -> Self {
+        Self {
+            version: 1,
+            header_len: TTY_BINARY_HEADER_LEN as u32,
+            tty_output_channel: BinaryChannel::TtyOutput as u8,
+            object_chunk_channel: BinaryChannel::ObjectChunk as u8,
+            layout: "byte0=version(1) byte1=channel bytes2-3=reserved(0) bytes4-19=streamUuidv7 bytes20-27=offsetBE u64 bytes28-31=payloadLenBE u32 payload".into(),
+        }
+    }
+}
+
+impl HubNodeMethod {
+    /// Wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NodeAuth => METHOD_NODE_AUTH,
+            Self::NodeHello => METHOD_NODE_HELLO,
+            Self::RuntimeHello => METHOD_RUNTIME_HELLO,
+            Self::NodeHeartbeat => METHOD_NODE_HEARTBEAT,
+            Self::RuntimeHeartbeat => METHOD_RUNTIME_HEARTBEAT,
+            Self::InstanceCreate => METHOD_INSTANCE_CREATE,
+            Self::InstanceSend => METHOD_INSTANCE_SEND,
+            Self::InstanceCancel => METHOD_INSTANCE_CANCEL,
+            Self::InstanceRespond => METHOD_INSTANCE_RESPOND,
+            Self::InteractionRespond => METHOD_INTERACTION_RESPOND,
+            Self::JournalAppend => METHOD_JOURNAL_APPEND,
+            Self::TtyFrame => METHOD_TTY_FRAME,
+        }
+    }
+
+    /// Parse a method string. Unknown methods return `None`.
+    #[must_use]
+    pub fn parse(method: &str) -> Option<Self> {
+        Some(match method {
+            METHOD_NODE_AUTH => Self::NodeAuth,
+            METHOD_NODE_HELLO => Self::NodeHello,
+            METHOD_RUNTIME_HELLO => Self::RuntimeHello,
+            METHOD_NODE_HEARTBEAT => Self::NodeHeartbeat,
+            METHOD_RUNTIME_HEARTBEAT => Self::RuntimeHeartbeat,
+            METHOD_INSTANCE_CREATE => Self::InstanceCreate,
+            METHOD_INSTANCE_SEND => Self::InstanceSend,
+            METHOD_INSTANCE_CANCEL => Self::InstanceCancel,
+            METHOD_INSTANCE_RESPOND => Self::InstanceRespond,
+            METHOD_INTERACTION_RESPOND => Self::InteractionRespond,
+            METHOD_JOURNAL_APPEND => Self::JournalAppend,
+            METHOD_TTY_FRAME => Self::TtyFrame,
+            _ => return None,
+        })
+    }
+
+    /// Hello (including `runtime.hello` alias).
+    #[must_use]
+    pub fn is_hello(self) -> bool {
+        matches!(self, Self::NodeHello | Self::RuntimeHello)
+    }
+
+    /// Stdio auth frame.
+    #[must_use]
+    pub fn is_auth(self) -> bool {
+        matches!(self, Self::NodeAuth)
+    }
+
+    /// Instance control methods dispatched by the Node runtime.
+    #[must_use]
+    pub fn is_instance(self) -> bool {
+        matches!(
+            self,
+            Self::InstanceCreate
+                | Self::InstanceSend
+                | Self::InstanceCancel
+                | Self::InstanceRespond
+                | Self::InteractionRespond
+        )
+    }
+}
+
+impl HubNodeRequest {
+    /// Build a request with [`PROTOCOL_VERSION`] on the frame.
+    #[must_use]
+    pub fn call(id: impl Into<Value>, method: &str, params: Value) -> Self {
+        Self {
+            jsonrpc: JsonRpcVersion::V2,
+            id: Some(id.into()),
+            version: Some(PROTOCOL_VERSION),
+            method: method.to_owned(),
+            params: Some(params),
+        }
+    }
+
+    /// Build a notification (no id).
+    #[must_use]
+    pub fn notification(method: &str, params: Value) -> Self {
+        Self {
+            jsonrpc: JsonRpcVersion::V2,
+            id: None,
+            version: Some(PROTOCOL_VERSION),
+            method: method.to_owned(),
+            params: Some(params),
+        }
+    }
+
+    /// Decode from a JSON value without requiring unknown fields to fail.
+    pub fn from_value(value: &Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+
+    /// Known method, if this frame uses one of the Hub↔Node names.
+    #[must_use]
+    pub fn method_kind(&self) -> Option<HubNodeMethod> {
+        HubNodeMethod::parse(&self.method)
+    }
+}
+
+impl HubNodeResponse {
+    /// Successful result with [`PROTOCOL_VERSION`].
+    #[must_use]
+    pub fn ok(id: impl Into<Value>, result: Value) -> Self {
+        Self {
+            jsonrpc: JsonRpcVersion::V2,
+            id: id.into(),
+            version: Some(PROTOCOL_VERSION),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// JSON-RPC error response.
+    #[must_use]
+    pub fn err(id: impl Into<Value>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: JsonRpcVersion::V2,
+            id: id.into(),
+            version: Some(PROTOCOL_VERSION),
+            result: None,
+            error: Some(JsonRpcErrorObject {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+}
+
+impl NodeHelloParams {
+    /// Host id from the params root or nested `host.hostId`.
+    #[must_use]
+    pub fn persisted_host_id(&self) -> Option<&str> {
+        self.host_id
+            .as_deref()
+            .or_else(|| self.host.as_ref().and_then(|host| host.host_id.as_deref()))
+    }
+}
+
+impl JournalAppendParams {
+    /// Events to append: `events` when non-empty, else the single `event`.
+    #[must_use]
+    pub fn events_to_append(&self) -> Vec<Value> {
+        if !self.events.is_empty() {
+            return self.events.clone();
+        }
+        self.event.clone().into_iter().collect()
+    }
+
+    /// Sequence hint as i64.
+    #[must_use]
+    pub fn seq_i64(&self) -> Option<i64> {
+        self.seq.as_ref().and_then(value_as_i64)
+    }
+}
+
+impl JournalSeqWatermark {
+    /// Durable sequence as i64.
+    #[must_use]
+    pub fn durable_i64(&self) -> Option<i64> {
+        self.durable_seq
+            .as_ref()
+            .and_then(value_as_i64)
+            .or_else(|| self.seq.map(|seq| seq.0 as i64))
+    }
+}
+
+impl InstanceSendParams {
+    /// Prompt text from `input.text`, `input` string, or `prompt`.
+    #[must_use]
+    pub fn prompt_text(&self) -> Option<&str> {
+        self.input
+            .as_ref()
+            .and_then(|input| {
+                input
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| input.as_str())
+            })
+            .or(self.prompt.as_deref())
+    }
+}
+
+/// Decode a v1 binary tty/object envelope.
+pub fn decode_tty_binary_frame(
+    frame: &[u8],
+    max_payload: u32,
+) -> Result<(BinaryHeader, &[u8]), BinaryFrameError> {
+    decode_binary_frame(frame, max_payload)
+}
+
+/// Extract the token from `Authorization: Bearer …`.
+#[must_use]
+pub fn bearer_from_authorization(header: &str) -> Option<&str> {
+    let rest = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))?;
+    let rest = rest.trim();
+    if rest.is_empty() { None } else { Some(rest) }
+}
+
+/// JSON-RPC request object with protocol `version`.
+#[must_use]
+pub fn rpc_request(id: impl Into<Value>, method: &str, params: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.into(),
+        "method": method,
+        "version": PROTOCOL_VERSION,
+        "params": params,
+    })
+}
+
+/// JSON-RPC success object with protocol `version`.
+#[must_use]
+pub fn rpc_ok(id: impl Into<Value>, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.into(),
+        "version": PROTOCOL_VERSION,
+        "result": result,
+    })
+}
+
+/// JSON-RPC error object with protocol `version`.
+#[must_use]
+pub fn rpc_error(id: impl Into<Value>, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.into(),
+        "version": PROTOCOL_VERSION,
+        "error": { "code": code, "message": message },
+    })
+}
+
+/// Parse a JSON number or decimal string as i64.
+#[must_use]
+pub fn value_as_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_round_trip_lifts_nested_host_id() {
+        let params = NodeHelloParams {
+            host_id: None,
+            label: Some("devbox-sg".into()),
+            node_version: Some("0.1.0".into()),
+            node_epoch: None,
+            enrollment_token: Some("tok".into()),
+            transport: Some("ssh-stdio".into()),
+            version: Some(PROTOCOL_VERSION),
+            protocol: None,
+            host: Some(NodeHostInventory {
+                host_id: Some("hst_01993ab0-0000-7000-8000-000000000004".into()),
+                hostname: Some("devbox".into()),
+                labels: Some(json!({"region":"sg"})),
+                max_instances: Some(8),
+                cli: None,
+                herdr: None,
+                resources: None,
+                os: None,
+                kernel: None,
+                libc: None,
+                label: None,
+            }),
+            capabilities: None,
+            cli: None,
+        };
+        assert_eq!(
+            params.persisted_host_id(),
+            Some("hst_01993ab0-0000-7000-8000-000000000004")
+        );
+        let req = HubNodeRequest::call("hello-1", METHOD_NODE_HELLO, json!(params));
+        let value = serde_json::to_value(&req).expect("ser");
+        assert_eq!(value["version"]["major"], 1);
+        assert_eq!(value["jsonrpc"], "2.0");
+        let decoded = HubNodeRequest::from_value(&value).expect("de");
+        assert_eq!(decoded.method_kind(), Some(HubNodeMethod::NodeHello));
+    }
+
+    #[test]
+    fn journal_prefers_events_batch() {
+        let params = JournalAppendParams {
+            instance_id: "ins_1".into(),
+            event: Some(json!({"kind":"old"})),
+            events: vec![json!({"kind":"a"}), json!({"kind":"b"})],
+            seq: Some(json!("3")),
+            watermark: Some(JournalSeqWatermark {
+                journal_id: None,
+                instance_id: Some("ins_1".into()),
+                durable_seq: Some(json!("3")),
+                after_seq: None,
+                seq: None,
+            }),
+        };
+        assert_eq!(params.events_to_append().len(), 2);
+        assert_eq!(params.seq_i64(), Some(3));
+        assert_eq!(
+            params.watermark.as_ref().and_then(|w| w.durable_i64()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn tty_spec_matches_binary_header() {
+        let spec = TtyBinaryEnvelopeSpec::v1();
+        assert_eq!(spec.header_len as usize, BINARY_HEADER_LEN);
+        assert_eq!(spec.tty_output_channel, BinaryChannel::TtyOutput as u8);
+    }
+
+    #[test]
+    fn bearer_strips_scheme() {
+        assert_eq!(bearer_from_authorization("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_from_authorization("Bearer "), None);
+    }
+}

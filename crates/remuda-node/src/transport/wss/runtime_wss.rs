@@ -1,6 +1,7 @@
 //! Dispatch Hub `instance.*` RPCs into [`crate::DevNode`] and stream journals.
 
 use super::JournalSender;
+use crate::transport::hubnode::SeqWatermark;
 use crate::{CommandAction, CreateInstanceRequest, DevNode, InstanceCommandRequest, NodeError};
 use remuda_protocol::hubnode::{
     HubNodeMethod, InstanceCancelParams, InstanceCreateParams, InstanceRespondParams,
@@ -15,17 +16,6 @@ use tokio::sync::{broadcast, mpsc};
 
 /// Wait for FakeDriver output that is persisted after the create/send RPC acks.
 const DRIVER_CATCHUP: Duration = Duration::from_millis(30);
-
-/// Per-instance Hub-acknowledged durable sequence.
-#[derive(Debug, Clone)]
-pub(crate) struct SeqWatermark {
-    /// Instance identity (`ins_…`).
-    pub instance_id: String,
-    /// Journal identity when known.
-    pub journal_id: Option<String>,
-    /// Last Hub-acked sequence (inclusive).
-    pub seq: i64,
-}
 
 pub(crate) struct RuntimeLink {
     pub node: DevNode,

@@ -1,0 +1,4 @@
+# Built locally; do not commit Hub tarballs or Node binaries.
+*
+!.gitignore
+!SHA256SUMS

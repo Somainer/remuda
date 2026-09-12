@@ -1,5 +1,7 @@
-# New server block for Remuda Hub. Append to the existing Caddyfile on
-# devbox-sg-host (`~/astergate/deploy/Caddyfile`); do not edit the
+# New server block for Remuda Hub. Install as an *include* on
+# devbox-sg-host (`~/astergate/deploy/Caddyfile.d/remuda.caddy`) and
+# add a single `import Caddyfile.d/*.caddy` line to the live Caddyfile if
+# that import is not already present. Do not paste this block into the
 # AsterGate site. `/v1` on that hostname is already the gateway and must
 # stay untouched.
 #

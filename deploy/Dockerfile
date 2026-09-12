@@ -11,9 +11,12 @@ ARG NODE_IMAGE=node:24-bookworm-slim
 ARG RUST_IMAGE=rust:1.94.1-bookworm
 ARG DISTROLESS_IMAGE=gcr.io/distroless/cc-debian12:nonroot
 
+# Native linux/amd64 CI (no qemu). Operator laptops should use
+# deploy/m1/Dockerfile with a cargo-zigbuild musl binary instead.
+
 FROM ${NODE_IMAGE} AS web-build
 WORKDIR /src/web
-COPY web/package.json web/pnpm-lock.yaml ./
+COPY web/package.json web/pnpm-lock.yaml web/.npmrc ./
 RUN corepack enable \
     && corepack prepare pnpm@9.15.9 --activate \
     && pnpm install --frozen-lockfile

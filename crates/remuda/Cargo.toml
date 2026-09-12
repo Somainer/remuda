@@ -28,6 +28,11 @@ toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(target_env = "musl")'.dependencies]
+# Static Node artifacts (just linux-musl / deploy/m1) vendor OpenSSL so
+# openssl-sys does not require a musl sysroot on the operator laptop.
+openssl = { version = "0.10", features = ["vendored"] }
+
 [build-dependencies]
 time.workspace = true
 

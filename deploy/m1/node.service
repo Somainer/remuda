@@ -1,0 +1,25 @@
+[Unit]
+Description=Remuda Node (outbound WSS)
+Documentation=https://github.com/Somainer/remuda
+After=network-online.target
+Wants=network-online.target
+# Optional: require a same-UID Herdr unit when PTY drivers are used.
+# Requires=remuda-herdr.service
+# After=remuda-herdr.service
+
+[Service]
+Type=simple
+User=remuda-agent
+Group=remuda-agent
+ExecStart=/opt/remuda/remuda node --config /etc/remuda/node.toml --hub-url wss://remuda.example.com/v1/node --host-token-file /etc/remuda/secrets/node-token --label region=sg
+Environment=REMUDA_DATA_DIR=/var/lib/remuda
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/remuda /run/remuda /workspaces
+
+[Install]
+WantedBy=multi-user.target

@@ -5,55 +5,26 @@
 #   NAME=deploy_default  DRIVER=bridge  SCOPE=local
 # Compose project `deploy` lives at ~/astergate/deploy on that host.
 #
-# No `ports:` — Hub is reached through Caddy on the same Docker network.
-# Image tags are placeholders; production must pin a digest.
+# Load the M1 tarball first (`docker load -i remuda-hub-<sha>.tar`) so the
+# `remuda-hub:m1` tag exists locally. No `ports:` — Hub is reached through
+# Caddy on the same Docker network.
 
 services:
-  remuda-migrate:
-    image: ghcr.io/somainer/remuda:0.1.0
-    command: ["migrate", "--database", "/data/remuda.db"]
-    user: "65532:65532"
-    read_only: true
-    volumes:
-      - /data00/remuda/hub:/data
-    secrets:
-      - remuda_master_key
-    environment:
-      REMUDA_MASTER_KEY_FILE: /run/secrets/remuda_master_key
-    restart: "no"
-    networks: [deploy_default]
-
   remuda-hub:
-    image: ghcr.io/somainer/remuda:0.1.0
-    command: ["hub", "--config", "/etc/remuda/hub.toml"]
+    image: remuda-hub:m1
+    command: ["hub", "--listen", "0.0.0.0:8080"]
     user: "65532:65532"
     read_only: true
     tmpfs: [/tmp]
     volumes:
       - /data00/remuda/hub:/data
       - ./hub.toml:/etc/remuda/hub.toml:ro
-    secrets:
-      - remuda_master_key
-      - remuda_web_password
-      - lark_app_secret
     environment:
-      REMUDA_MASTER_KEY_FILE: /run/secrets/remuda_master_key
-      REMUDA_WEB_PASSWORD_FILE: /run/secrets/remuda_web_password
-      LARK_APP_SECRET_FILE: /run/secrets/lark_app_secret
-    depends_on:
-      remuda-migrate:
-        condition: service_completed_successfully
+      REMUDA_DATA_DIR: /data
+      REMUDA_CONFIG: /etc/remuda/hub.toml
     restart: unless-stopped
     networks: [deploy_default]
 
 networks:
   deploy_default:
     external: true
-
-secrets:
-  remuda_master_key:
-    file: /data00/remuda/secrets/master-key
-  remuda_web_password:
-    file: /data00/remuda/secrets/web-password
-  lark_app_secret:
-    file: /data00/remuda/secrets/lark-app-secret

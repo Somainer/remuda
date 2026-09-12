@@ -195,6 +195,49 @@ fn card_action_parses_callback_json_string() {
 }
 
 #[test]
+fn card_action_without_chat_id_fails_closed_when_allowlist_set() {
+    let mut dedup = remuda_feishu::Deduper::default();
+    let mut value = load_jsonl("card-action-allow.jsonl")[0].clone();
+    value["chat_id"] = Value::Null;
+    value["event_id"] = Value::String("ev_card_no_chat".into());
+    let event = parse_event_line(&value.to_string()).unwrap();
+    assert!(matches!(
+        admit(event, &policy(), &mut dedup).unwrap(),
+        GateDecision::Drop {
+            reason: DropReason::ChatNotAllowed
+        }
+    ));
+}
+
+#[test]
+fn group_mention_name_must_match_exactly() {
+    let mut dedup = remuda_feishu::Deduper::default();
+    let mut value = load_jsonl("im-message-group-at.jsonl")[0].clone();
+    value["mentions"][0]["name"] = Value::String("Remuda intern".into());
+    value["mentions"][0]["id"] = Value::String("ou_other".into());
+    value["content"] = Value::String("hello team".into());
+    value["message_id"] = Value::String("om_grp_substring".into());
+    let event = parse_event_line(&value.to_string()).unwrap();
+    assert!(matches!(
+        admit(event, &policy(), &mut dedup).unwrap(),
+        GateDecision::Drop {
+            reason: DropReason::GroupRequiresMention
+        }
+    ));
+}
+
+#[test]
+fn card_token_is_redacted_in_debug() {
+    let mut dedup = remuda_feishu::Deduper::default();
+    let GateDecision::Take(inbound) = take_line("card-action-allow.jsonl", 0, &mut dedup) else {
+        panic!("card");
+    };
+    let debug = format!("{inbound:?}");
+    assert!(!debug.contains("tok_test_allow"), "{debug}");
+    assert!(debug.contains("[redacted]"), "{debug}");
+}
+
+#[test]
 fn content_is_not_parsed_as_json() {
     let line = load_jsonl("im-message-p2p.jsonl")[0].clone();
     let event = parse_event_line(&line.to_string()).unwrap();

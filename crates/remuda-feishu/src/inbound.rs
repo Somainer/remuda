@@ -73,7 +73,7 @@ pub struct ImMessage {
 }
 
 /// Flattened `card.action.trigger` line.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CardAction {
     /// Card-update token (30 min / 2 uses). Never logged in full.
     #[serde(default)]
@@ -106,6 +106,31 @@ pub struct CardAction {
     /// Always `card.action.trigger` when the bus sets it.
     #[serde(default, rename = "type")]
     pub event_type: Option<String>,
+}
+
+impl std::fmt::Debug for CardAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CardAction")
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    ""
+                } else {
+                    "[redacted]"
+                },
+            )
+            .field("action_tag", &self.action_tag)
+            .field("action_value", &self.action_value)
+            .field("action_name", &self.action_name)
+            .field("form_value", &self.form_value)
+            .field("form_values", &self.form_values)
+            .field("operator_id", &self.operator_id)
+            .field("message_id", &self.message_id)
+            .field("chat_id", &self.chat_id)
+            .field("event_id", &self.event_id)
+            .field("event_type", &self.event_type)
+            .finish()
+    }
 }
 
 impl CardAction {
@@ -534,14 +559,17 @@ fn admit_card(
             reason: DropReason::OwnerNotAllowed,
         });
     }
-    if let Some(chat_id) = action.chat_id.as_deref()
-        && !chat_id.is_empty()
-        && !policy.chat_allowlist.is_empty()
-        && !policy.chat_allowlist.iter().any(|id| id == chat_id)
-    {
-        return Ok(GateDecision::Drop {
-            reason: DropReason::ChatNotAllowed,
-        });
+    if !policy.chat_allowlist.is_empty() {
+        let Some(chat_id) = action.chat_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Ok(GateDecision::Drop {
+                reason: DropReason::ChatNotAllowed,
+            });
+        };
+        if !policy.chat_allowlist.iter().any(|id| id == chat_id) {
+            return Ok(GateDecision::Drop {
+                reason: DropReason::ChatNotAllowed,
+            });
+        }
     }
     let thread = ThreadRef {
         thread_id: None,
@@ -599,9 +627,7 @@ fn mentions_bot(msg: &ImMessage, policy: &InboundPolicy) -> bool {
         .as_deref()
         .is_some_and(|bot| msg.mentions.iter().any(|m| m.id == bot));
     let by_name = policy.bot_name.as_deref().is_some_and(|name| {
-        msg.mentions
-            .iter()
-            .any(|m| m.name == name || m.name.contains(name))
+        msg.mentions.iter().any(|m| m.name == name)
             || msg
                 .content
                 .split_whitespace()

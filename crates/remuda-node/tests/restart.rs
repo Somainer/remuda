@@ -5,7 +5,8 @@ use remuda_node::{
     CreateInstanceRequest, DevServerConfig, LocalDrivers, NativeDriverConfig, ServeConfig, compose,
 };
 use remuda_protocol::{
-    AgentKind, DriverKind, InstanceLifecycle, JournalEvent, Observation, ObservationPayload,
+    AgentKind, CommandState, DriverKind, InstanceLifecycle, JournalEvent, Observation,
+    ObservationPayload,
 };
 use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
 use std::time::Duration;
@@ -19,6 +20,7 @@ fn loopback_config(root: &std::path::Path) -> DevServerConfig {
 
 fn create_req(prompt: &str) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        command_id: None,
         instance_id: None,
         host_id: None,
         workspace_id: None,
@@ -43,6 +45,19 @@ fn observations(events: &[JournalEvent]) -> Vec<Observation> {
         .collect()
 }
 
+async fn wait_for_settlement(node: &remuda_node::DevNode, command_id: &remuda_protocol::CommandId) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if node.get_command(command_id).expect("command").state == CommandState::Settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("command settlement");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_driver_restart_lists_instances_and_replays_folds() {
     let data = tempfile::tempdir().expect("data dir");
@@ -50,9 +65,12 @@ async fn fake_driver_restart_lists_instances_and_replays_folds() {
     let config = ServeConfig::fake(http, data.path().to_path_buf());
     let created = {
         let node = compose(&config).expect("compose");
-        node.create_instance(create_req("durable hello"))
+        let created = node
+            .create_instance(create_req("durable hello"))
             .await
-            .expect("create")
+            .expect("create");
+        wait_for_settlement(&node, &created.command.command_id).await;
+        created
     };
     let instance_id = created.instance.meta.id.clone();
     let journal_id = created.instance.journal_id.clone();
@@ -114,6 +132,7 @@ async fn fake_claude_kill_mid_session_replays_identical_folds() {
         .await
         .expect("create timed out")
         .expect("create fake-claude instance");
+        wait_for_settlement(&node, &created.command.command_id).await;
         // Drop `node` here: mid-session kill (no close command).
         (created.instance.meta.id, created.instance.journal_id)
     };

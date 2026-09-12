@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TIMEOUT: Duration = Duration::from_secs(8);
+const SLOW_START: Duration = Duration::from_secs(10);
+const SLOW_TIMEOUT: Duration = Duration::from_secs(25);
 
 async fn http(
     addr: std::net::SocketAddr,
@@ -405,6 +407,185 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
     assert_unique_seqs(&seqs);
 
     link.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
+    use remuda_node::{
+        DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, native_driver_registry,
+    };
+    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let mut hub_config = HubConfig::for_test(dir.path().join("hub"));
+    hub_config.command_accept_timeout_ms = 2_000;
+    let hub = remuda_hub::spawn(hub_config).await.expect("hub");
+
+    let socket_dir = dir.path().join("herdr");
+    std::fs::create_dir_all(&socket_dir).expect("herdr dir");
+    let fake_herdr = FakeHerdrServer::spawn(
+        FakeHerdrOptions::new(socket_dir.join("herdr.sock")).with_agent_start_delay(SLOW_START),
+    )
+    .expect("fake herdr");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let mut node_config = DevServerConfig::loopback(0);
+    node_config.workspace_root = workspace;
+    let mut native = NativeDriverConfig::new(dir.path().join("node"))
+        .with_claude_binary(ensure_workspace_bin("fake-claude"));
+    native.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
+    native.herdr_socket_dir = Some(socket_dir);
+    let drivers = native_driver_registry(native).expect("native drivers");
+    let node =
+        DevNode::with_parts(&node_config, Arc::new(MemoryStore::new(256)), drivers).expect("node");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let mut config = WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host_id.clone());
+    config.heartbeat_interval = Duration::from_millis(100);
+    config.backoff = Backoff {
+        initial: Duration::from_millis(5),
+        max: Duration::from_millis(20),
+        jitter_ppt: 0,
+    };
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(config, node))
+        .await
+        .expect("connect timeout")
+        .expect("wss runtime connect");
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+
+    let request = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "generic-pty",
+        "model": "fake",
+        "providerProfileId": "native",
+        "permissionMode": "dontAsk",
+        "prompt": "slow-start"
+    })
+    .to_string();
+    let started = tokio::time::Instant::now();
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(4),
+        http(
+            hub.addr,
+            "POST",
+            "/v1/instances",
+            &[("Cookie", cookie.as_str())],
+            Some(&request),
+        ),
+    )
+    .await
+    .expect("create must return before materialization");
+    assert_eq!(status, 200, "{body}");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let created: Value = serde_json::from_str(body.trim()).expect("create json");
+    assert_eq!(created["command"]["state"], json!("accepted"));
+    assert_eq!(created["command"]["resolution"], json!("clear"));
+    let command_id = created["command"]["commandId"]
+        .as_str()
+        .expect("commandId")
+        .to_owned();
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .expect("instanceId")
+        .to_owned();
+
+    let interaction_id = remuda_protocol::InteractionId::new();
+    for (operation, payload) in [
+        ("instance.send", json!({"prompt": "queued-during-start"})),
+        ("instance.cancel", json!({})),
+        (
+            "instance.respond",
+            json!({
+                "interactionId": interaction_id,
+                "answer": {
+                    "kind": "approval",
+                    "optionId": "allow",
+                    "inputDigest": format!("sha256:{}", "0".repeat(64))
+                }
+            }),
+        ),
+    ] {
+        let command = json!({"operation": operation, "payload": payload}).to_string();
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(4),
+            http(
+                hub.addr,
+                "POST",
+                &format!("/v1/instances/{instance_id}/commands"),
+                &[("Cookie", cookie.as_str())],
+                Some(&command),
+            ),
+        )
+        .await
+        .expect("command accept response");
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(body.trim()).expect("command json");
+        assert_eq!(response["command"]["state"], json!("accepted"));
+        assert_eq!(response["command"]["resolution"], json!("clear"));
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (status, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let during_start: Value = serde_json::from_str(body.trim()).expect("instance json");
+    assert_eq!(during_start["connectivity"], json!("connected"));
+
+    let journal_path = format!("/v1/instances/{instance_id}/journal");
+    tokio::time::timeout(SLOW_TIMEOUT, async {
+        loop {
+            let (status, body) = http(
+                hub.addr,
+                "GET",
+                &journal_path,
+                &[("Cookie", cookie.as_str())],
+                None,
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let journal: Value = serde_json::from_str(body.trim()).expect("journal json");
+            if journal_has_command_state(&journal, &command_id, "settled") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("create settlement after slow start");
+
+    let (status, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let settled: Value = serde_json::from_str(body.trim()).expect("instance json");
+    assert_eq!(settled["connectivity"], json!("connected"));
+    assert_ne!(settled["durableSeq"], json!("0"));
+
+    link.shutdown().await;
+    fake_herdr.shutdown().expect("fake herdr shutdown");
+}
+
+fn journal_has_command_state(journal: &Value, command_id: &str, state: &str) -> bool {
+    journal["events"].as_array().is_some_and(|events| {
+        events.iter().any(|record| {
+            let payload = &record["event"]["payload"];
+            payload["entityType"] == "command"
+                && payload["entityId"] == command_id
+                && payload["state"] == state
+        })
+    })
 }
 
 fn collect_follow_seqs(frame: &Value, seqs: &mut Vec<String>) {

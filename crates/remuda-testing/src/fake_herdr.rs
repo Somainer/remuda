@@ -77,6 +77,8 @@ pub struct FakeHerdrOptions {
     pub script: FakeHerdrScript,
     /// JSONL of `terminal.frame` lines for `terminal observe`.
     pub frames: PathBuf,
+    /// Deterministic delay before replying to `agent.start`.
+    pub agent_start_delay: Duration,
 }
 
 impl FakeHerdrOptions {
@@ -86,7 +88,15 @@ impl FakeHerdrOptions {
             socket: socket.into(),
             script: FakeHerdrScript::Ok,
             frames: herdr_frames_path(),
+            agent_start_delay: Duration::ZERO,
         }
+    }
+
+    /// Delay `agent.start` to model a cold native launch.
+    #[must_use]
+    pub fn with_agent_start_delay(mut self, delay: Duration) -> Self {
+        self.agent_start_delay = delay;
+        self
     }
 }
 
@@ -295,6 +305,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             socket,
             script,
             frames,
+            agent_start_delay: Duration::ZERO,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -349,7 +360,10 @@ async fn serve(
         let _ = std::fs::set_permissions(&options.socket, std::fs::Permissions::from_mode(0o600));
     }
     eprintln!("api socket: {}", options.socket.display());
-    let state = Arc::new(Mutex::new(State::new(options.script)));
+    let state = Arc::new(Mutex::new(State::new(
+        options.script,
+        options.agent_start_delay,
+    )));
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -374,6 +388,7 @@ async fn serve(
 
 struct State {
     script: FakeHerdrScript,
+    agent_start_delay: Duration,
     next_ws: u32,
     next_tab: u32,
     next_pane: u32,
@@ -389,9 +404,10 @@ struct State {
 }
 
 impl State {
-    fn new(script: FakeHerdrScript) -> Self {
+    fn new(script: FakeHerdrScript, agent_start_delay: Duration) -> Self {
         Self {
             script,
+            agent_start_delay,
             next_ws: 1,
             next_tab: 1,
             next_pane: 1,
@@ -459,6 +475,10 @@ async fn handle_conn(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<(),
             writer.write_all(body.as_bytes()).await?;
             writer.flush().await?;
             return Ok(());
+        }
+        if req.method == "agent.start" {
+            let delay = lock_state(&state)?.agent_start_delay;
+            tokio::time::sleep(delay).await;
         }
         let reply = match handle_rpc(&state, &req) {
             Ok(value) => success(&req, value),

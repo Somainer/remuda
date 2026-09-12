@@ -23,7 +23,8 @@
 //! HOST_TOKEN, HOST_TOKEN_FILE (or NODE_TOKEN_FILE), LABELS (JSON object),
 //! MAX_INSTANCES, PROVIDER_PROFILES (JSON object), SHUTDOWN_TIMEOUT_SECS,
 //! BOOTSTRAP_TOKEN, WEB_PASSWORD_FILE, COOKIE_SECURE, WEB_ROOT,
-//! ALLOWED_ORIGINS and WEB_ORIGINS (JSON arrays), all prefixed `REMUDA_`.
+//! ALLOWED_ORIGINS, WEB_ORIGINS (JSON arrays), COMMAND_ACCEPT_TIMEOUT_MS, and
+//! CREATE_SETTLE_TIMEOUT_MS, all prefixed `REMUDA_`.
 //! Direct token environment variables take precedence over token-file variables.
 
 use anyhow::{Context, bail, ensure};
@@ -64,6 +65,10 @@ pub(crate) struct Hub {
     pub allowed_origins: Vec<String>,
     #[serde(alias = "webRoot")]
     pub web_root: Option<PathBuf>,
+    #[serde(alias = "commandAcceptTimeoutMs")]
+    pub command_accept_timeout_ms: u64,
+    #[serde(alias = "createSettleTimeoutMs")]
+    pub create_settle_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -337,6 +342,8 @@ impl Default for Hub {
             cookie_secure: true,
             allowed_origins: Vec::new(),
             web_root: None,
+            command_accept_timeout_ms: remuda_hub::DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
+            create_settle_timeout_ms: remuda_hub::MIN_CREATE_SETTLE_TIMEOUT_MS,
         }
     }
 }
@@ -481,6 +488,14 @@ impl Config {
         if let Some(value) = env_text(env, "REMUDA_ALLOWED_ORIGINS")? {
             self.hub.allowed_origins = parse_json_env(&value, "REMUDA_ALLOWED_ORIGINS")?;
         }
+        if let Some(value) = env_text(env, "REMUDA_COMMAND_ACCEPT_TIMEOUT_MS")? {
+            self.hub.command_accept_timeout_ms =
+                parse_env(&value, "REMUDA_COMMAND_ACCEPT_TIMEOUT_MS")?;
+        }
+        if let Some(value) = env_text(env, "REMUDA_CREATE_SETTLE_TIMEOUT_MS")? {
+            self.hub.create_settle_timeout_ms =
+                parse_env(&value, "REMUDA_CREATE_SETTLE_TIMEOUT_MS")?;
+        }
         if let Some(value) = env_text(env, "REMUDA_WEB_ORIGINS")? {
             self.node.web_origins = parse_json_env(&value, "REMUDA_WEB_ORIGINS")?;
         }
@@ -602,6 +617,14 @@ impl Config {
             "data_dir must not be empty"
         );
         ensure!(self.node.max_instances > 0, "maxInstances must be positive");
+        ensure!(
+            self.hub.command_accept_timeout_ms > 0,
+            "hub.command_accept_timeout_ms must be positive"
+        );
+        ensure!(
+            self.hub.create_settle_timeout_ms >= remuda_hub::MIN_CREATE_SETTLE_TIMEOUT_MS,
+            "hub.create_settle_timeout_ms must be at least 120000"
+        );
         ensure!(
             self.shutdown_timeout_secs > 0,
             "shutdown_timeout_secs must be positive"

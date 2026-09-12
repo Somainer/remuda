@@ -41,6 +41,9 @@ fn default_permission() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateInstanceRequest {
+    /// Optional client-selected Command identity for retry-safe Hub forwarding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<CommandId>,
     /// Optional client-selected Instance identity for retry-safe creation.
     #[serde(default)]
     pub instance_id: Option<InstanceId>,

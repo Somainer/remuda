@@ -23,16 +23,12 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
-use tokio::sync::{RwLock, mpsc, oneshot};
-
-const COMMAND_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+use tokio::sync::{RwLock, mpsc};
 
 struct QueuedCommand {
     command_id: CommandId,
     request: DriverRequest,
-    accepted_tx: oneshot::Sender<Result<Command, NodeError>>,
     close_after: bool,
 }
 
@@ -139,7 +135,7 @@ impl DevNode {
         self.inner.store.get_instance(instance_id)
     }
 
-    /// Create an Instance, its worker, and one create Command.
+    /// Durably accept an Instance create, then materialize it in its worker.
     pub async fn create_instance(
         &self,
         request: CreateInstanceRequest,
@@ -193,36 +189,9 @@ impl DevNode {
             .interactions
             .register_driver(instance_id.clone(), Arc::clone(&driver))
             .await;
-        let observations = match driver.start().await {
-            Ok(observations) => observations,
-            Err(error) => {
-                record_task_exit(self.inner.store.as_ref(), &instance_id, &error.to_string());
-                return Err(NodeError::Driver(error.to_string()));
-            }
-        };
-        if let Some(error) = driver.startup_error() {
-            if let Some(mut pending) = observations {
-                while let Ok(observation) = pending.try_recv() {
-                    let _ = self
-                        .inner
-                        .store
-                        .append_driver_observation(&instance_id, observation);
-                }
-            }
-            record_task_exit(self.inner.store.as_ref(), &instance_id, &error);
-            return Err(NodeError::Driver(error));
-        }
-        if let Some(observations) = observations {
-            self.spawn_observation_pump(instance_id.clone(), observations);
-        }
-        if let Some(recipe) = driver.launch_recipe() {
-            self.inner.store.put_launch_recipe(&instance_id, &recipe)?;
-        }
-        self.spawn_instance_worker(instance_id.clone(), driver)
-            .await;
 
-        let command_id = CommandId::new();
-        let command = new_command(
+        let command_id = request.command_id.clone().unwrap_or_default();
+        let mut command = new_command(
             command_id.clone(),
             CommandOperation::InstanceCreate,
             &instance_id,
@@ -231,30 +200,26 @@ impl DevNode {
             None,
             payload_digest,
         )?;
-        self.inner
+        let inserted = self
+            .inner
             .store
             .insert_command(&instance_id, command.clone())?;
-        append_instance_lifecycle(
+        if !inserted {
+            return Ok(CreateInstanceResponse {
+                command: self.inner.store.get_command(&command_id)?,
+                instance: self.inner.store.get_instance(&instance_id)?,
+            });
+        }
+        accept_command(&mut command)?;
+        self.inner.store.save_command(command.clone())?;
+        append_command_lifecycle(
             self.inner.store.as_ref(),
             &instance_id,
-            None,
-            "ready",
-            "driver-started",
+            &command,
+            "accepted",
         )?;
-
-        let command = if request.prompt.is_empty() {
-            settle_without_driver(self.inner.store.as_ref(), &instance_id, command)?
-        } else {
-            self.enqueue_existing(
-                &instance_id,
-                command_id,
-                DriverRequest::Send {
-                    prompt: request.prompt,
-                },
-                false,
-            )
-            .await?
-        };
+        self.spawn_instance_worker(instance_id.clone(), driver, command.clone(), request.prompt)
+            .await;
         let instance = self.inner.store.get_instance(&instance_id)?;
         Ok(CreateInstanceResponse { command, instance })
     }
@@ -302,6 +267,18 @@ impl DevNode {
                     instance_id,
                     command,
                     "instance-queue-full",
+                )?;
+                Ok(CommandResult {
+                    command,
+                    related_command_ids: Vec::new(),
+                })
+            }
+            Err(NodeError::DriverUnavailable) => {
+                let command = reject_before_dispatch(
+                    self.inner.store.as_ref(),
+                    instance_id,
+                    command,
+                    "instance-driver-unavailable",
                 )?;
                 Ok(CommandResult {
                     command,
@@ -364,39 +341,13 @@ impl DevNode {
         self.inner.interactions.dispatch_rpc(method, params).await
     }
 
-    fn spawn_observation_pump(
+    async fn spawn_instance_worker(
         &self,
         instance_id: InstanceId,
-        mut observations: mpsc::Receiver<remuda_protocol::Observation>,
+        driver: Arc<dyn Driver>,
+        create_command: Command,
+        initial_prompt: String,
     ) {
-        let store = self.inner.store.clone();
-        let interactions = Arc::clone(&self.inner.interactions);
-        tokio::spawn(async move {
-            while let Some(observation) = observations.recv().await {
-                if let Some(reason) = native_failure_reason(&observation) {
-                    record_task_exit(store.as_ref(), &instance_id, &reason);
-                }
-                match store.append_driver_observation(&instance_id, observation) {
-                    Ok(committed) => {
-                        if let Err(error) = interactions.ingest(&committed).await {
-                            tracing::debug!(%error, "interaction ingest failed");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
-                        record_task_exit(
-                            store.as_ref(),
-                            &instance_id,
-                            "native-observation-commit-failed",
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    async fn spawn_instance_worker(&self, instance_id: InstanceId, driver: Arc<dyn Driver>) {
         let (sender, receiver) = mpsc::channel(self.inner.queue_capacity);
         self.inner
             .senders
@@ -407,7 +358,16 @@ impl DevNode {
         let interactions = Arc::clone(&self.inner.interactions);
         let worker_instance = instance_id.clone();
         let worker = tokio::spawn(async move {
-            instance_worker(store, worker_instance, driver, receiver, interactions).await
+            materialize_instance(
+                store,
+                worker_instance,
+                driver,
+                receiver,
+                interactions,
+                create_command,
+                initial_prompt,
+            )
+            .await
         });
         let store = self.inner.store.clone();
         tokio::spawn(async move {
@@ -440,26 +400,167 @@ impl DevNode {
             .get(instance_id)
             .cloned()
             .ok_or(NodeError::DriverUnavailable)?;
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        sender
-            .try_send(QueuedCommand {
-                command_id,
-                request,
-                accepted_tx,
-                close_after,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => NodeError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => NodeError::DriverUnavailable,
-            })?;
+        let permit = sender.try_reserve_owned().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => NodeError::QueueFull,
+            mpsc::error::TrySendError::Closed(_) => NodeError::DriverUnavailable,
+        })?;
+        let mut command = self.inner.store.get_command(&command_id)?;
+        accept_command(&mut command)?;
+        self.inner.store.save_command(command.clone())?;
+        append_command_lifecycle(self.inner.store.as_ref(), instance_id, &command, "accepted")?;
+        permit.send(QueuedCommand {
+            command_id,
+            request,
+            close_after,
+        });
         if close_after {
             self.inner.senders.write().await.remove(instance_id);
         }
-        tokio::time::timeout(COMMAND_ACK_TIMEOUT, accepted_rx)
-            .await
-            .map_err(|_| NodeError::DriverUnavailable)?
-            .map_err(|_| NodeError::DriverUnavailable)?
+        Ok(command)
     }
+}
+
+fn spawn_observation_pump(
+    store: Arc<dyn LocalStore>,
+    interactions: Arc<InteractionRuntime>,
+    instance_id: InstanceId,
+    mut observations: mpsc::Receiver<remuda_protocol::Observation>,
+) {
+    tokio::spawn(async move {
+        while let Some(observation) = observations.recv().await {
+            if let Some(reason) = native_failure_reason(&observation) {
+                record_task_exit(store.as_ref(), &instance_id, &reason);
+            }
+            match store.append_driver_observation(&instance_id, observation) {
+                Ok(committed) => {
+                    if let Err(error) = interactions.ingest(&committed).await {
+                        tracing::debug!(%error, "interaction ingest failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
+                    record_task_exit(
+                        store.as_ref(),
+                        &instance_id,
+                        "native-observation-commit-failed",
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn materialize_instance(
+    store: Arc<dyn LocalStore>,
+    instance_id: InstanceId,
+    driver: Arc<dyn Driver>,
+    mut receiver: mpsc::Receiver<QueuedCommand>,
+    interactions: Arc<InteractionRuntime>,
+    mut create_command: Command,
+    initial_prompt: String,
+) -> Result<(), NodeError> {
+    let observations = match driver.start().await {
+        Ok(observations) => observations,
+        Err(error) => {
+            reject_materialization(
+                store.as_ref(),
+                &instance_id,
+                &mut create_command,
+                &mut receiver,
+                &error.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if let Some(error) = driver.startup_error() {
+        if let Some(mut pending) = observations {
+            while let Ok(observation) = pending.try_recv() {
+                let _ = store.append_driver_observation(&instance_id, observation);
+            }
+        }
+        reject_materialization(
+            store.as_ref(),
+            &instance_id,
+            &mut create_command,
+            &mut receiver,
+            &error,
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Some(observations) = observations {
+        spawn_observation_pump(
+            Arc::clone(&store),
+            Arc::clone(&interactions),
+            instance_id.clone(),
+            observations,
+        );
+    }
+    if let Some(recipe) = driver.launch_recipe() {
+        store.put_launch_recipe(&instance_id, &recipe)?;
+    }
+    append_instance_lifecycle(
+        store.as_ref(),
+        &instance_id,
+        None,
+        "ready",
+        "driver-started",
+    )?;
+
+    if initial_prompt.is_empty() {
+        settle_without_driver(store.as_ref(), &instance_id, &mut create_command)?;
+    } else {
+        execute_queued(
+            Arc::clone(&store),
+            &instance_id,
+            Arc::clone(&driver),
+            QueuedCommand {
+                command_id: create_command.command_id.clone(),
+                request: DriverRequest::Send {
+                    prompt: initial_prompt,
+                },
+                close_after: false,
+            },
+            Arc::clone(&interactions),
+        )
+        .await?;
+    }
+
+    instance_worker(store, instance_id, driver, receiver, interactions).await
+}
+
+async fn reject_materialization(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    create_command: &mut Command,
+    receiver: &mut mpsc::Receiver<QueuedCommand>,
+    reason: &str,
+) -> Result<(), NodeError> {
+    settle_command(
+        create_command,
+        SettlementOutcome::Rejected,
+        Some(reason.to_owned()),
+        remuda_protocol::ExecutionState::NotDispatched,
+    )?;
+    store.save_command(create_command.clone())?;
+    append_command_lifecycle(store, instance_id, create_command, "settled")?;
+
+    receiver.close();
+    while let Some(queued) = receiver.recv().await {
+        let mut command = store.get_command(&queued.command_id)?;
+        settle_command(
+            &mut command,
+            SettlementOutcome::Rejected,
+            Some("instance materialization failed".to_owned()),
+            remuda_protocol::ExecutionState::NotDispatched,
+        )?;
+        store.save_command(command.clone())?;
+        append_command_lifecycle(store, instance_id, &command, "settled")?;
+    }
+    record_task_exit(store, instance_id, reason);
+    Ok(())
 }
 
 async fn instance_worker(
@@ -470,80 +571,88 @@ async fn instance_worker(
     interactions: Arc<InteractionRuntime>,
 ) -> Result<(), NodeError> {
     while let Some(queued) = receiver.recv().await {
-        let mut command = store.get_command(&queued.command_id)?;
-        accept_command(&mut command)?;
-        store.save_command(command.clone())?;
-        append_command_lifecycle(store.as_ref(), &instance_id, &command, "accepted")?;
-        let _ = queued.accepted_tx.send(Ok(command.clone()));
-
-        if let DriverRequest::Send { prompt } = &queued.request {
-            store.set_instance_state(
-                &instance_id,
-                None,
-                Some(Knowledge::Known {
-                    value: Activity::Working,
-                }),
-            )?;
-            store.append_observation(
-                &instance_id,
-                None,
-                Completeness::Structured,
-                crate::driver::message_payload(
-                    MessageRole::User,
-                    MessagePhase::Input,
-                    prompt.clone(),
-                )?,
-            )?;
-        }
-
-        let result = driver.execute(queued.request.clone()).await;
-        match result {
-            Ok(emissions) => {
-                for emission in emissions {
-                    let observation = store.append_observation(
-                        &instance_id,
-                        None,
-                        Completeness::Structured,
-                        emission.into_payload()?,
-                    )?;
-                    interactions.ingest(&observation).await?;
-                }
-                finish_instance_operation(store.as_ref(), &instance_id, &queued.request)?;
-                settle_command(
-                    &mut command,
-                    SettlementOutcome::Completed,
-                    None,
-                    remuda_protocol::ExecutionState::PossiblyDispatched,
-                )?;
-            }
-            Err(error) => {
-                let diagnostic = DriverEmission::NativeLifecycle {
-                    name: "fake-driver-error".to_owned(),
-                    status: error.to_string(),
-                    severity: remuda_protocol::Severity::Error,
-                };
-                store.append_observation(
-                    &instance_id,
-                    None,
-                    Completeness::Structured,
-                    diagnostic.into_payload()?,
-                )?;
-                record_task_exit(store.as_ref(), &instance_id, &error.to_string());
-                settle_command(
-                    &mut command,
-                    SettlementOutcome::Rejected,
-                    Some(error.to_string()),
-                    remuda_protocol::ExecutionState::PossiblyDispatched,
-                )?;
-            }
-        }
-        store.save_command(command.clone())?;
-        append_command_lifecycle(store.as_ref(), &instance_id, &command, "settled")?;
-        if queued.close_after {
+        let close_after = queued.close_after;
+        execute_queued(
+            Arc::clone(&store),
+            &instance_id,
+            Arc::clone(&driver),
+            queued,
+            Arc::clone(&interactions),
+        )
+        .await?;
+        if close_after {
             return Ok(());
         }
     }
     Err(NodeError::DriverUnavailable)
+}
+
+async fn execute_queued(
+    store: Arc<dyn LocalStore>,
+    instance_id: &InstanceId,
+    driver: Arc<dyn Driver>,
+    queued: QueuedCommand,
+    interactions: Arc<InteractionRuntime>,
+) -> Result<(), NodeError> {
+    let mut command = store.get_command(&queued.command_id)?;
+    if let DriverRequest::Send { prompt } = &queued.request {
+        store.set_instance_state(
+            instance_id,
+            None,
+            Some(Knowledge::Known {
+                value: Activity::Working,
+            }),
+        )?;
+        store.append_observation(
+            instance_id,
+            None,
+            Completeness::Structured,
+            crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?,
+        )?;
+    }
+
+    match driver.execute(queued.request.clone()).await {
+        Ok(emissions) => {
+            for emission in emissions {
+                let observation = store.append_observation(
+                    instance_id,
+                    None,
+                    Completeness::Structured,
+                    emission.into_payload()?,
+                )?;
+                interactions.ingest(&observation).await?;
+            }
+            finish_instance_operation(store.as_ref(), instance_id, &queued.request)?;
+            settle_command(
+                &mut command,
+                SettlementOutcome::Completed,
+                None,
+                remuda_protocol::ExecutionState::PossiblyDispatched,
+            )?;
+        }
+        Err(error) => {
+            let diagnostic = DriverEmission::NativeLifecycle {
+                name: "fake-driver-error".to_owned(),
+                status: error.to_string(),
+                severity: remuda_protocol::Severity::Error,
+            };
+            store.append_observation(
+                instance_id,
+                None,
+                Completeness::Structured,
+                diagnostic.into_payload()?,
+            )?;
+            record_task_exit(store.as_ref(), instance_id, &error.to_string());
+            settle_command(
+                &mut command,
+                SettlementOutcome::Rejected,
+                Some(error.to_string()),
+                remuda_protocol::ExecutionState::PossiblyDispatched,
+            )?;
+        }
+    }
+    store.save_command(command.clone())?;
+    append_command_lifecycle(store.as_ref(), instance_id, &command, "settled")
 }
 
 fn finish_instance_operation(
@@ -781,7 +890,7 @@ fn new_command(
 fn accept_command(command: &mut Command) -> Result<(), NodeError> {
     let now = timestamp_now()?;
     command.state = CommandState::Accepted;
-    command.dispatch = DispatchState::NativeAcknowledged;
+    command.dispatch = DispatchState::IntentDurable;
     command.acceptance = Knowledge::Known {
         value: Acceptance {
             scope: acceptance_scope(command.operation),
@@ -813,6 +922,7 @@ fn settle_command(
 ) -> Result<(), NodeError> {
     let now = timestamp_now()?;
     command.state = CommandState::Settled;
+    command.resolution = ResolutionState::Clear;
     command.settlement = Knowledge::Known {
         value: Settlement {
             outcome,
@@ -852,20 +962,16 @@ fn runtime_error(
 fn settle_without_driver(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
-    mut command: Command,
-) -> Result<Command, NodeError> {
-    accept_command(&mut command)?;
-    store.save_command(command.clone())?;
-    append_command_lifecycle(store, instance_id, &command, "accepted")?;
+    command: &mut Command,
+) -> Result<(), NodeError> {
     settle_command(
-        &mut command,
+        command,
         SettlementOutcome::Completed,
         None,
         remuda_protocol::ExecutionState::NotDispatched,
     )?;
     store.save_command(command.clone())?;
-    append_command_lifecycle(store, instance_id, &command, "settled")?;
-    Ok(command)
+    append_command_lifecycle(store, instance_id, command, "settled")
 }
 
 fn reject_before_dispatch(
@@ -1134,6 +1240,7 @@ fn fixture_capabilities(
 mod tests {
     use super::*;
     use crate::{FakeDriver, MemoryStore};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn driver_panic_is_contained_and_marks_dispatch_unknown() {

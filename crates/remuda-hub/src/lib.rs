@@ -39,7 +39,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-pub use config::HubConfig;
+pub use config::{DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS};
 pub use error::HubError;
 pub use transport::{ConnectedNodes, NodeTransport, StdioTransport, TransportKind, WssTransport};
 

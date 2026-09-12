@@ -888,6 +888,9 @@ token = 'file:./secrets/token'
                 .load(&[])
                 .is_err()
         );
+    }
+
+    #[test]
     fn node_hub_url_allows_plain_websocket_only_on_loopback() {
         assert!(validate_url("ws://127.0.0.1:8080/v1/node", true).is_ok());
         assert!(validate_url("ws://localhost:8080/v1/node", true).is_ok());

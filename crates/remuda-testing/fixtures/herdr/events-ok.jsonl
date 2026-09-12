@@ -1,0 +1,3 @@
+{"id":"sub1","result":{"type":"subscription_started"}}
+{"event":"pane.agent_status_changed","data":{"type":"pane_agent_status_changed","agent":"claude","agent_status":"working","pane_id":"w1:p2","workspace_id":"w1"}}
+{"event":"pane.agent_status_changed","data":{"type":"pane_agent_status_changed","agent":"claude","agent_status":"idle","pane_id":"w1:p2","workspace_id":"w1"}}

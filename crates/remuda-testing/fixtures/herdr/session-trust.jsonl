@@ -1,0 +1,4 @@
+{"dir":"c2a","rpc":{"id":"rec-agent.start","method":"agent.start","params":{"name":"probe","kind":"claude","pane_id":"w1:p2","args":["--dangerously-skip-permissions"],"timeout_ms":90000}}}
+{"dir":"a2c","rpc":{"id":"rec-agent.start","error":{"code":"agent_not_ready","message":"agent probe is blocked during startup and is not ready for prompts"}}}
+{"dir":"c2a","rpc":{"id":"rec-agent.send_keys","method":"agent.send_keys","params":{"target":"probe","keys":["down","enter"]}}}
+{"dir":"a2c","rpc":{"id":"rec-agent.send_keys","result":{"type":"ok"}}}

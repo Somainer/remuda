@@ -5,18 +5,28 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "fake-claude stream-json test double and captured CLI fixtures."
+description = "fake-claude stream-json test double, fake-herdr socket, and captured CLI fixtures."
 
 [[bin]]
 name = "fake-claude"
 path = "src/bin/fake-claude.rs"
+
+[[bin]]
+name = "fake-herdr"
+path = "src/bin/fake-herdr.rs"
 
 [lints]
 workspace = true
 
 [dependencies]
 anyhow.workspace = true
+remuda-herdr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

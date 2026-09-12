@@ -1,11 +1,15 @@
-//! Test double for `claude -p` stream-json and captured CLI fixtures.
+//! Test doubles for `claude -p` stream-json and the Herdr socket API.
 //!
 //! The `fake-claude` binary speaks the NDJSON control protocol in
 //! `docs/research/claude-stream-json-protocol.md`. Other crates spawn it through
 //! [`FakeClaudeProcess`] and read fixture bytes from [`fixtures_dir`].
+//!
+//! `fake-herdr` impersonates herdr 0.9.0 JSON-RPC over a Unix socket so
+//! `remuda-herdr` tests can run offline.
 
 mod client;
 mod fake;
+mod fake_herdr;
 mod flags;
 mod paths;
 mod script;
@@ -15,6 +19,10 @@ pub use client::{
     is_type, spawn_fake_claude, transcript_path,
 };
 pub use fake::{FakeClaudeError, run_fake_claude};
+pub use fake_herdr::{
+    FakeHerdrError, FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, fake_herdr_bin,
+    herdr_frames_path, herdr_session_ok_path, run_fake_herdr, write_observe_frames,
+};
 pub use flags::ClaudeFlags;
 pub use paths::{FIXED_SESSION_ID, ScriptKind, fixtures_dir, script_kind_from_name, script_path};
 pub use script::{load_script, load_script_from_env};

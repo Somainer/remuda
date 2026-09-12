@@ -17,5 +17,6 @@ Copied from `docs/research/cli-help/` (research traces, 2026-09-12). Originals s
 | `grok/grok-headless-streaming-json.jsonl` | `grok -p --output-format streaming-json` |
 | `agy/agy-stream-json-sample.jsonl` | `agy -p=… --output-format stream-json` |
 | `scripts/*.jsonl` | authored for `fake-claude`; shapes follow `claude-stream-json-protocol.md` §§3–5 |
+| `herdr/*.jsonl` | see `herdr/SOURCES.md` — live herdr 0.9.0 capture plus authored trust/observe frames |
 
 The Codex OpenAPI schema tree (`codex-app-server-schema/`, 400+ files) is not copied; session NDJSON is enough for driver tests.

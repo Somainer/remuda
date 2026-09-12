@@ -278,3 +278,17 @@ error: could not compile `remuda-node` (lib) due to 2 previous errors
 
 `mod interactions` is declared but `src/interactions.rs` was not in the pushed tree. Do not treat this as a lockfile/CI issue.
 
+### GitHub Actions `34685778926` (`f3ac6aa`, 2026-09-12)
+
+**remuda-driver** — `cargo test --workspace --locked` failed:
+
+```
+test tty_bypass_strips_print_flag ... FAILED
+thread 'tty_bypass_strips_print_flag' panicked at crates/remuda-driver/tests/claude_pty_review.rs:408:74:
+called `Result::unwrap()` on an `Err` value: Io(Os { code: 26, kind: ExecutableFileBusy, message: "Text file busy" })
+error: test failed, to rerun pass `-p remuda-driver --test claude_pty_review`
+test result: FAILED. 12 passed; 1 failed; 0 ignored
+```
+
+Likely ETXTBSY while replacing a still-running stub binary. Crate test isolation, not a workflow/lockfile issue.
+

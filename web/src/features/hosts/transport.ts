@@ -1,1 +1,3 @@
-export const HOST_TRANSPORTS = ["outbound-wss", "ssh-dev"] as const;
+export const HOST_TRANSPORTS = ["ssh-stdio", "outbound-wss", "local"] as const;
+
+export type HostTransportName = (typeof HOST_TRANSPORTS)[number];

@@ -1,0 +1,14 @@
+.members {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.member {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  min-height: 44px;
+}

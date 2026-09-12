@@ -7,6 +7,7 @@ import { NewSessionPage } from "../pages/NewSessionPage";
 import { SessionPage } from "../pages/SessionPage";
 import { ApprovalsPage } from "../pages/ApprovalsPage";
 import { HostsPage, HostDetailPage } from "../pages/HostsPage";
+import { FleetPage } from "../pages/FleetPage";
 import { ProjectsPage, ProjectDetailPage } from "../pages/ProjectsPage";
 import { ProvidersPage, ProviderDetailPage } from "../pages/ProvidersPage";
 import { BotsPage, BotDetailPage } from "../pages/BotsPage";
@@ -28,6 +29,7 @@ export function AppRouter() {
           <Route path="/approvals" element={<ApprovalsPage />} />
           <Route path="/hosts" element={<HostsPage />} />
           <Route path="/hosts/:hostId" element={<HostDetailPage />} />
+          <Route path="/fleet" element={<FleetPage />} />
           <Route path="/projects" element={<ProjectsPage />} />
           <Route path="/projects/:workspaceId" element={<ProjectDetailPage />} />
           <Route path="/providers" element={<ProvidersPage />} />

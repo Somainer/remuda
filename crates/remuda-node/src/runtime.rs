@@ -609,6 +609,28 @@ async fn execute_queued(
             Completeness::Structured,
             crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?,
         )?;
+        if let Err(error) = driver.wait_control().await {
+            let diagnostic = DriverEmission::NativeLifecycle {
+                name: "control-wait".to_owned(),
+                status: error.to_string(),
+                severity: remuda_protocol::Severity::Error,
+            };
+            store.append_observation(
+                instance_id,
+                None,
+                Completeness::Structured,
+                diagnostic.into_payload()?,
+            )?;
+            settle_command(
+                &mut command,
+                SettlementOutcome::Rejected,
+                Some(error.to_string()),
+                remuda_protocol::ExecutionState::PossiblyDispatched,
+            )?;
+            store.save_command(command.clone())?;
+            append_command_lifecycle(store.as_ref(), instance_id, &command, "settled")?;
+            return Ok(());
+        }
     }
 
     match driver.execute(queued.request.clone()).await {

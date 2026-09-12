@@ -883,7 +883,26 @@ fn event_type(event: &Value) -> String {
 
 fn is_screen_event(event: &Value) -> bool {
     let ty = event_type(event);
-    ty.contains("tty") || ty.contains("screen") || ty.contains("terminal.frame")
+    if ty.contains("tty") || ty.contains("screen") || ty.contains("terminal.frame") {
+        return true;
+    }
+    if native_name(event).as_deref() == Some("screen") {
+        return true;
+    }
+    completeness_of(event).is_some_and(|value| value.contains("screen"))
+}
+
+fn completeness_of(event: &Value) -> Option<String> {
+    event
+        .get("completeness")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .get("event")
+                .and_then(|inner| inner.get("completeness"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_ascii_lowercase)
 }
 
 fn is_prompt_echo(event: &Value) -> bool {
@@ -915,7 +934,9 @@ fn line_wait_event(event: &Value) -> bool {
     if is_screen_event(event) {
         return true;
     }
-    if native_name(event).as_deref() == Some("line-matcher") {
+    if native_name(event).as_deref() == Some("line-matcher")
+        || native_name(event).as_deref() == Some("screen")
+    {
         return true;
     }
     let ty = event_type(event);
@@ -992,6 +1013,17 @@ mod tests {
         let events = [json!({ "event": { "type": "message", "text": "DONE abcdef" } })];
         assert!(until_met("line:DONE ", &events, None, None).unwrap());
         assert!(!until_met("line:MISSING", &events, None, None).unwrap());
+    }
+
+    #[test]
+    fn until_line_matches_screen_snapshot() {
+        let events = [json!({
+            "nativeName": "screen",
+            "completeness": "screen-derived",
+            "status": "worker output\nDONE\n"
+        })];
+        assert!(until_met("line:(?m)^DONE", &events, None, None).unwrap());
+        assert!(is_screen_event(&events[0]));
     }
 
     #[test]

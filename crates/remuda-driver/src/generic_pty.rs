@@ -33,9 +33,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
+
+/// Last N screen lines stored on each journal snapshot.
+const SCREEN_SNAPSHOT_LINES: usize = 80;
+/// How long [`Driver::wait_control`] waits for a live pane.
+const CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Per-kind PTY launch conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,22 +222,40 @@ pub struct GenericPtyDriver {
     inner: Mutex<Option<PtyLive>>,
     seq: Arc<AtomicU64>,
     closed: AtomicBool,
+    ready: watch::Sender<bool>,
+    /// Kept so [`Self::ready`] stays open when no waiter has subscribed yet.
+    _ready_rx: watch::Receiver<bool>,
 }
 
 impl GenericPtyDriver {
     /// Build a driver from explicit options.
     pub fn new(options: GenericPtyOptions) -> Self {
+        let (ready, ready_rx) = watch::channel(false);
         Self {
             options,
             inner: Mutex::new(None),
             seq: Arc::new(AtomicU64::new(0)),
             closed: AtomicBool::new(false),
+            ready,
+            _ready_rx: ready_rx,
         }
+    }
+
+    fn mark_ready(&self) {
+        let _ = self.ready.send(true);
+    }
+
+    fn fail_control(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let _ = self.ready.send(true);
     }
 
     async fn live_client(&self) -> DriverResult<(Client, String)> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        if live.failed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
         Ok((live.client.clone(), live.agent_name.clone()))
     }
 
@@ -433,6 +456,7 @@ impl GenericPtyDriver {
                     .insert("herdrKind".into(), preset.herdr_kind.into());
                 ack.native_ids.insert("lastError".into(), reason);
                 info!(kind = preset.id, "generic-pty agent.start failed liveness");
+                self.fail_control();
                 return Ok(RunHandle::new(recipe, ack, rx));
             }
         };
@@ -471,16 +495,14 @@ impl GenericPtyDriver {
             pane_id.clone(),
             Arc::clone(&failed),
         );
-        let matcher_task = self.options.line_matcher.as_ref().map(|pattern| {
-            spawn_line_matcher(
-                client.clone(),
-                agent_name.clone(),
-                pattern.clone(),
-                tx.clone(),
-                ctx.clone(),
-                Arc::clone(&self.seq),
-            )
-        });
+        let matcher_task = Some(spawn_screen_pump(
+            client.clone(),
+            agent_name.clone(),
+            self.options.line_matcher.clone(),
+            tx.clone(),
+            ctx.clone(),
+            Arc::clone(&self.seq),
+        ));
         let mut ack = DriverAck::transport_written();
         ack.native_ids.insert("paneId".into(), pane_id.clone());
         ack.native_ids
@@ -498,6 +520,7 @@ impl GenericPtyDriver {
             closed: false,
             failed,
         });
+        self.mark_ready();
         info!(kind = preset.id, "generic-pty agent.start dispatched");
         Ok(RunHandle::new(recipe, ack, rx))
     }
@@ -516,7 +539,30 @@ impl Driver for GenericPtyDriver {
     }
 
     async fn start(&self, spec: InstanceSpec) -> DriverResult<RunHandle> {
-        self.launch(spec).await
+        match self.launch(spec).await {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                self.fail_control();
+                Err(error)
+            }
+        }
+    }
+
+    async fn wait_control(&self) -> DriverResult<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        if !*self.ready.borrow() {
+            let mut rx = self.ready.subscribe();
+            tokio::time::timeout(CONTROL_READY_TIMEOUT, rx.wait_for(|ready| *ready))
+                .await
+                .map_err(|_| DriverError::ControlUnavailable)?
+                .map_err(|_| DriverError::ControlUnavailable)?;
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        Ok(())
     }
 
     async fn attach(&self, _native_ref: NativeRef) -> DriverResult<DriverAck> {
@@ -531,20 +577,12 @@ impl Driver for GenericPtyDriver {
     }
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
+        self.wait_control().await?;
         let text = prompt_text(&input)?;
+        let (client, agent_name) = self.live_client().await?;
+        prompt_when_ready(&client, &agent_name, &text).await?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        if live.failed.load(Ordering::SeqCst) {
-            return Err(DriverError::ControlUnavailable);
-        }
-        live.client
-            .agent_prompt(AgentPromptParams {
-                target: live.agent_name.clone(),
-                text: text.clone(),
-                wait: None,
-            })
-            .await
-            .map_err(map_prompt_herdr)?;
         let ctx = obs_ctx(
             DriverKind::GenericPty,
             InstanceId::new(),
@@ -604,7 +642,7 @@ impl Driver for GenericPtyDriver {
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
-        self.closed.store(true, Ordering::SeqCst);
+        self.fail_control();
         let mut inner = self.inner.lock().await;
         let Some(live) = inner.as_mut() else {
             return Ok(DriverAck::not_dispatched());
@@ -715,23 +753,24 @@ fn spawn_status_pump(
     })
 }
 
-fn spawn_line_matcher(
+fn spawn_screen_pump(
     client: Client,
     agent_name: String,
-    pattern: String,
+    pattern: Option<String>,
     tx: mpsc::Sender<Observation>,
     ctx: crate::claude_pty::ObsCtx,
     seq: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut seen = false;
+        let mut seen_match = false;
+        let mut last_snapshot: Option<String> = None;
         loop {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             let Ok(read) = client
                 .agent_read(AgentReadParams {
                     target: agent_name.clone(),
                     source: ReadSource::RecentUnwrapped,
-                    lines: Some(80),
+                    lines: Some(SCREEN_SNAPSHOT_LINES as u32),
                     format: ReadFormat::Text,
                     strip_ansi: true,
                 })
@@ -739,9 +778,47 @@ fn spawn_line_matcher(
             else {
                 continue;
             };
-            let text = read.text();
-            if !seen && line_matches(text, &pattern) {
-                seen = true;
+            let text = last_n_lines(read.text(), SCREEN_SNAPSHOT_LINES);
+            if last_snapshot.as_deref() != Some(text.as_str()) {
+                last_snapshot = Some(text.clone());
+                let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(
+                    Box::new(NativeLifecycle {
+                        topic: LifecycleTopic::Turn,
+                        native_name: "screen".into(),
+                        native_id: Knowledge::Known {
+                            value: agent_name.clone(),
+                        },
+                        status: Knowledge::Known {
+                            value: text.clone(),
+                        },
+                        related_ids: BTreeMap::from([(
+                            "lines".into(),
+                            SCREEN_SNAPSHOT_LINES.to_string(),
+                        )]),
+                        data_ref: None,
+                        severity: Severity::Info,
+                        affects_completion: false,
+                    }),
+                )));
+                if emit_on(
+                    &tx,
+                    &seq,
+                    &ctx,
+                    SourceChannel::Pty,
+                    Completeness::ScreenDerived,
+                    payload,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            if let Some(pattern) = &pattern
+                && !seen_match
+                && line_matches(&text, pattern)
+            {
+                seen_match = true;
                 let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(
                     Box::new(NativeLifecycle {
                         topic: LifecycleTopic::Turn,
@@ -774,6 +851,36 @@ fn spawn_line_matcher(
             }
         }
     })
+}
+
+fn last_n_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+async fn prompt_when_ready(client: &Client, agent_name: &str, text: &str) -> DriverResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match client
+            .agent_prompt(AgentPromptParams {
+                target: agent_name.to_owned(),
+                text: text.to_owned(),
+                wait: None,
+            })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                let mapped = map_prompt_herdr(err);
+                if !matches!(mapped, DriverError::ControlUnavailable) || Instant::now() >= deadline
+                {
+                    return Err(mapped);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// Prefix / substring matcher used for `^DONE ` without a regex crate.

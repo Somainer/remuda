@@ -15,6 +15,7 @@ use remuda_testing::{
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn stub_bin(dir: &Path, name: &str) -> PathBuf {
@@ -315,6 +316,113 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
         "expected session ready lifecycle after slow start"
     );
     let _ = driver.close().await;
+}
+
+#[tokio::test]
+async fn fake_herdr_send_before_start_waits_for_control() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let driver = Arc::new(GenericPtyDriver::new(GenericPtyOptions {
+        profile: profile(),
+        launch_dir: tmp.path().join("launch"),
+        native_home: tmp.path().join("home"),
+        binary: BinarySource::Pinned(pin_binary(stub_bin(tmp.path(), "codex")).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
+        extra_env: Default::default(),
+        agent_start_timeout_ms: 5_000,
+        liveness_timeout_ms: 5_000,
+        line_matcher: Some("^DONE".into()),
+    }));
+    fs::create_dir_all(tmp.path().join("home")).unwrap();
+
+    let pending = {
+        let driver = Arc::clone(&driver);
+        tokio::spawn(async move { driver.send(prompt("print DONE")).await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    driver
+        .start(spec(&cwd, AgentKind::Codex))
+        .await
+        .expect("start");
+    pending
+        .await
+        .expect("join")
+        .expect("queued send delivered after control ready");
+    driver.close().await.expect("stop");
+}
+
+#[tokio::test]
+async fn fake_herdr_journals_bounded_screen_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(tmp.path().join("home")).unwrap();
+    let driver = GenericPtyDriver::new(GenericPtyOptions {
+        profile: profile(),
+        launch_dir: tmp.path().join("launch"),
+        native_home: tmp.path().join("home"),
+        binary: BinarySource::Pinned(pin_binary(stub_bin(tmp.path(), "codex")).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
+        extra_env: Default::default(),
+        agent_start_timeout_ms: 5_000,
+        liveness_timeout_ms: 5_000,
+        line_matcher: Some("^DONE".into()),
+    });
+
+    let mut handle = driver
+        .start(spec(&cwd, AgentKind::Codex))
+        .await
+        .expect("start");
+    driver.send(prompt("print DONE")).await.expect("send");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_screen = false;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(400), handle.recv()).await
+        else {
+            continue;
+        };
+        if obs.completeness != remuda_protocol::Completeness::ScreenDerived {
+            continue;
+        }
+        if let ObservationPayload::Lifecycle(payload) = &obs.body
+            && let LifecyclePayload::Native(native) = payload.as_ref()
+            && native.native_name == "screen"
+        {
+            let text = match &native.status {
+                remuda_protocol::Knowledge::Known { value } => value.as_str(),
+                _ => "",
+            };
+            assert!(
+                text.lines().count() <= 80,
+                "screen snapshot must be bounded"
+            );
+            saw_screen = true;
+            if text.contains("OK") || text.contains("DONE") || !text.is_empty() {
+                break;
+            }
+        }
+    }
+    assert!(saw_screen, "expected screen-derived journal snapshot");
+    driver.close().await.expect("stop");
 }
 
 fn live_kind(_kind: AgentKind, binary: &str) {

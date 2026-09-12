@@ -286,6 +286,15 @@ impl Driver for NativeAdapter {
         self.startup_error.lock().ok().and_then(|slot| slot.clone())
     }
 
+    fn wait_control(&self) -> DriverFuture<'_> {
+        Box::pin(async move {
+            NativeDriver::wait_control(&*self.native)
+                .await
+                .map_err(map_driver_error)?;
+            Ok(Vec::new())
+        })
+    }
+
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
         Box::pin(async move {
             match request {

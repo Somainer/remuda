@@ -16,6 +16,7 @@ use std::str::FromStr;
 
 /// Per-instance Hub-acknowledged durable sequence.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SeqWatermark {
     /// Instance identity (`ins_…`).
     pub instance_id: String,
@@ -26,6 +27,7 @@ pub struct SeqWatermark {
 }
 
 /// `node.hello` params: protocol HelloParams plus Hub inventory.
+#[allow(dead_code)]
 pub fn encode_hello(
     host_id: &str,
     node_version: &str,
@@ -48,7 +50,7 @@ pub fn encode_hello(
 }
 
 /// Hello params with an explicit carrier and optional nested host inventory.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn encode_hello_transport(
     host_id: &str,
     node_version: &str,
@@ -87,6 +89,7 @@ pub fn encode_hello_transport(
 }
 
 /// Heartbeat params: protocol HeartbeatParams plus Hub inventory refresh.
+#[allow(dead_code)]
 pub fn encode_heartbeat(
     node_version: &str,
     cli: &Value,
@@ -113,6 +116,7 @@ pub fn encode_heartbeat(
 }
 
 /// `journal.append` params with an optional sequence watermark and a batch array.
+#[allow(dead_code)]
 pub fn encode_append(instance_id: &str, seq: Option<i64>, event: Value) -> Value {
     let mut params = Map::new();
     params.insert("instanceId".into(), json!(instance_id));
@@ -362,6 +366,7 @@ async fn submit(
     serde_json::to_value(result).map_err(NodeError::from)
 }
 
+#[allow(dead_code)]
 fn typed_hello(
     host_id: &str,
     node_version: &str,
@@ -385,6 +390,7 @@ fn typed_hello(
     serde_json::to_value(params).map_err(|err| remuda_protocol::WireValueError(err.to_string()))
 }
 
+#[allow(dead_code)]
 fn typed_heartbeat(
     connection_id: &str,
     lease_id: &str,
@@ -409,6 +415,7 @@ fn typed_heartbeat(
     serde_json::to_value(params).map_err(|err| remuda_protocol::WireValueError(err.to_string()))
 }
 
+#[allow(dead_code)]
 fn typed_resume(watermarks: &HashMap<String, SeqWatermark>) -> Vec<ResumeCursor> {
     watermarks
         .values()
@@ -426,6 +433,7 @@ fn typed_resume(watermarks: &HashMap<String, SeqWatermark>) -> Vec<ResumeCursor>
         .collect()
 }
 
+#[allow(dead_code)]
 fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
     watermarks
         .values()

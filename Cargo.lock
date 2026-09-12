@@ -3050,6 +3050,7 @@ dependencies = [
  "futures",
  "remuda-driver",
  "remuda-hub",
+ "remuda-journal",
  "remuda-protocol",
  "serde",
  "serde_json",

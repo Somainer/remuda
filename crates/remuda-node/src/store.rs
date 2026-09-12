@@ -1,13 +1,19 @@
 //! Store seam and the M0 in-memory implementation.
 
 use crate::{NodeError, driver::runtime_source};
+use remuda_journal::{Envelope, Journal};
 use remuda_protocol::{
     Activity, Command, CommandId, CommandState, Completeness, ConversationNode, EventId,
     EventsReadResult, HistoryCoverage, Instance, InstanceId, InstanceLifecycle, InstanceSnapshot,
     JournalEvent, Knowledge, Observation, ObservationPayload, ResolutionState, RunId,
     SchemaVersion, U64,
 };
-use std::{collections::BTreeMap, sync::RwLock};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{RwLock, mpsc as std_mpsc},
+    thread,
+};
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 
@@ -92,6 +98,78 @@ pub trait LocalStore: Send + Sync {
 pub struct MemoryStore {
     state: RwLock<MemoryState>,
     follow_buffer_capacity: usize,
+    durable: Option<DurableJournal>,
+}
+
+#[derive(Clone)]
+struct DurableJournal {
+    journal: Journal,
+    writes: std_mpsc::SyncSender<JournalWrite>,
+}
+
+struct JournalWrite {
+    instance_id: InstanceId,
+    envelope: Envelope,
+    reply: std_mpsc::SyncSender<Result<Observation, String>>,
+}
+
+impl DurableJournal {
+    fn open(data_dir: &Path, queue_capacity: usize) -> Result<Self, NodeError> {
+        let journal = Journal::open(data_dir)
+            .map_err(|error| NodeError::Driver(format!("journal open failed: {error}")))?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| NodeError::Driver(format!("journal runtime failed: {error}")))?;
+        let (writes, receiver) = std_mpsc::sync_channel::<JournalWrite>(queue_capacity.max(1));
+        let writer = journal.clone();
+        thread::Builder::new()
+            .name("remuda-node-journal".to_owned())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let result = runtime.block_on(async {
+                        let seq = writer
+                            .append(&job.instance_id, job.envelope)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let mut observations = writer
+                            .read_range(&job.instance_id, seq, Some(seq))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if observations.len() != 1 {
+                            return Err(format!(
+                                "journal returned {} observations for committed seq {}",
+                                observations.len(),
+                                seq.0
+                            ));
+                        }
+                        Ok(observations.remove(0))
+                    });
+                    let _ = job.reply.send(result);
+                }
+            })
+            .map_err(|error| NodeError::Driver(format!("journal writer failed: {error}")))?;
+        Ok(Self { journal, writes })
+    }
+
+    fn append(
+        &self,
+        instance_id: &InstanceId,
+        envelope: Envelope,
+    ) -> Result<Observation, NodeError> {
+        let (reply, result) = std_mpsc::sync_channel(1);
+        self.writes
+            .send(JournalWrite {
+                instance_id: instance_id.clone(),
+                envelope,
+                reply,
+            })
+            .map_err(|_| NodeError::Driver("journal writer stopped".to_owned()))?;
+        result
+            .recv()
+            .map_err(|_| NodeError::Driver("journal writer dropped its result".to_owned()))?
+            .map_err(|error| NodeError::Driver(format!("journal append failed: {error}")))
+    }
 }
 
 impl MemoryStore {
@@ -100,7 +178,28 @@ impl MemoryStore {
         Self {
             state: RwLock::new(MemoryState::default()),
             follow_buffer_capacity: follow_buffer_capacity.max(1),
+            durable: None,
         }
+    }
+
+    /// Create an empty entity store whose observations commit to the durable journal first.
+    pub fn open_journaled(
+        data_dir: impl AsRef<Path>,
+        follow_buffer_capacity: usize,
+    ) -> Result<Self, NodeError> {
+        Ok(Self {
+            state: RwLock::new(MemoryState::default()),
+            follow_buffer_capacity: follow_buffer_capacity.max(1),
+            durable: Some(DurableJournal::open(
+                data_dir.as_ref(),
+                follow_buffer_capacity,
+            )?),
+        })
+    }
+
+    /// Return the durable journal handle when this store was opened with persistence.
+    pub fn journal(&self) -> Option<Journal> {
+        self.durable.as_ref().map(|durable| durable.journal.clone())
     }
 }
 
@@ -263,6 +362,7 @@ impl LocalStore for MemoryStore {
         body: ObservationPayload,
     ) -> Result<Observation, NodeError> {
         let now = timestamp_now()?;
+        let durable = self.durable.clone();
         let (event, sender) = {
             let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
             let record = state
@@ -270,25 +370,26 @@ impl LocalStore for MemoryStore {
                 .get_mut(instance_id)
                 .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
             let seq = U64(record.instance.durable_seq.0.saturating_add(1));
-            let event = Observation {
-                schema_version: SchemaVersion,
-                event_id: EventId::new(),
+            let envelope = Envelope {
                 journal_id: record.instance.journal_id.clone(),
                 instance_id: instance_id.clone(),
                 run_id: run_id.clone(),
                 host_id: record.instance.host_id.clone(),
                 process_generation: record.instance.process_ref.process_generation,
                 run_generation: run_id.map(|_| U64(1)),
-                seq,
                 observed_at: now.clone(),
                 native_at: unknown("not-emitted"),
                 source: runtime_source(&record.instance, seq),
                 completeness,
-                raw_ref: None,
                 evidence_event_ids: Vec::new(),
                 body,
+                raw: None,
             };
-            record.instance.durable_seq = seq;
+            let event = match durable.as_ref() {
+                Some(durable) => durable.append(instance_id, envelope)?,
+                None => in_memory_observation(envelope, seq),
+            };
+            record.instance.durable_seq = event.seq;
             record.instance.meta.updated_at = now;
             let journal_event = JournalEvent::Instance(Box::new(event.clone()));
             record.events.push(journal_event.clone());
@@ -303,6 +404,7 @@ impl LocalStore for MemoryStore {
         instance_id: &InstanceId,
         mut observation: Observation,
     ) -> Result<Observation, NodeError> {
+        let durable = self.durable.clone();
         let (event, sender) = {
             let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
             let record = state
@@ -310,17 +412,39 @@ impl LocalStore for MemoryStore {
                 .get_mut(instance_id)
                 .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
             let seq = U64(record.instance.durable_seq.0.saturating_add(1));
-            observation.event_id = EventId::new();
-            observation.journal_id = record.instance.journal_id.clone();
-            observation.instance_id = instance_id.clone();
-            observation.host_id = record.instance.host_id.clone();
-            observation.process_generation = record.instance.process_ref.process_generation;
-            observation.seq = seq;
-            record.instance.durable_seq = seq;
-            record.instance.meta.updated_at = observation.observed_at.clone();
-            let journal_event = JournalEvent::Instance(Box::new(observation.clone()));
+            let event = if let Some(durable) = durable.as_ref() {
+                durable.append(
+                    instance_id,
+                    Envelope {
+                        journal_id: record.instance.journal_id.clone(),
+                        instance_id: instance_id.clone(),
+                        run_id: observation.run_id,
+                        host_id: record.instance.host_id.clone(),
+                        process_generation: record.instance.process_ref.process_generation,
+                        run_generation: observation.run_generation,
+                        observed_at: observation.observed_at,
+                        native_at: observation.native_at,
+                        source: observation.source,
+                        completeness: observation.completeness,
+                        evidence_event_ids: observation.evidence_event_ids,
+                        body: observation.body,
+                        raw: None,
+                    },
+                )?
+            } else {
+                observation.event_id = EventId::new();
+                observation.journal_id = record.instance.journal_id.clone();
+                observation.instance_id = instance_id.clone();
+                observation.host_id = record.instance.host_id.clone();
+                observation.process_generation = record.instance.process_ref.process_generation;
+                observation.seq = seq;
+                observation
+            };
+            record.instance.durable_seq = event.seq;
+            record.instance.meta.updated_at = event.observed_at.clone();
+            let journal_event = JournalEvent::Instance(Box::new(event.clone()));
             record.events.push(journal_event.clone());
-            (observation, (record.events_tx.clone(), journal_event))
+            (event, (record.events_tx.clone(), journal_event))
         };
         let _ = sender.0.send(sender.1);
         Ok(event)
@@ -414,6 +538,27 @@ impl LocalStore for MemoryStore {
     }
 }
 
+fn in_memory_observation(envelope: Envelope, seq: U64) -> Observation {
+    Observation {
+        schema_version: SchemaVersion,
+        event_id: EventId::new(),
+        journal_id: envelope.journal_id,
+        instance_id: envelope.instance_id,
+        run_id: envelope.run_id,
+        host_id: envelope.host_id,
+        process_generation: envelope.process_generation,
+        run_generation: envelope.run_generation,
+        seq,
+        observed_at: envelope.observed_at,
+        native_at: envelope.native_at,
+        source: envelope.source,
+        completeness: envelope.completeness,
+        raw_ref: None,
+        evidence_event_ids: envelope.evidence_event_ids,
+        body: envelope.body,
+    }
+}
+
 fn conversation_node(event: &JournalEvent) -> Option<ConversationNode> {
     let JournalEvent::Instance(event) = event else {
         return None;
@@ -496,5 +641,52 @@ mod tests {
             .expect("read page");
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].position().1, U64(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn journaled_store_commits_before_publishing() {
+        let data_dir = tempfile::tempdir().expect("journal data dir");
+        let store = MemoryStore::open_journaled(data_dir.path(), 4).expect("journaled store");
+        let instance = fixture_instance(
+            InstanceId::new(),
+            remuda_protocol::HostId::new(),
+            remuda_protocol::WorkspaceId::new(),
+            remuda_protocol::DriverKind::ClaudePrint,
+        )
+        .expect("fixture instance");
+        let instance_id = instance.meta.id.clone();
+        store.insert_instance(instance).expect("insert instance");
+        let mut changes = store.subscribe(&instance_id).expect("subscribe");
+        let body = crate::driver::message_payload(
+            remuda_protocol::MessageRole::Assistant,
+            remuda_protocol::MessagePhase::Final,
+            "durable".to_owned(),
+        )
+        .expect("message");
+
+        let committed = store
+            .append_observation(&instance_id, None, Completeness::Structured, body)
+            .expect("append durable observation");
+        let published = changes.recv().await.expect("published observation");
+        let JournalEvent::Instance(published) = published else {
+            panic!("instance observation")
+        };
+        assert_eq!(published.event_id, committed.event_id);
+        assert_eq!(published.seq, U64(1));
+
+        let journal = store.journal().expect("journal handle");
+        assert_eq!(
+            journal
+                .durable_seq(&instance_id)
+                .await
+                .expect("durable seq"),
+            U64(1)
+        );
+        let persisted = journal
+            .read_range(&instance_id, U64(1), Some(U64(1)))
+            .await
+            .expect("persisted observation");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].event_id, committed.event_id);
     }
 }

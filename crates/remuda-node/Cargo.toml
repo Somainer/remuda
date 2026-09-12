@@ -27,6 +27,7 @@ axum.workspace = true
 clap.workspace = true
 futures.workspace = true
 remuda-driver.workspace = true
+remuda-journal.workspace = true
 remuda-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

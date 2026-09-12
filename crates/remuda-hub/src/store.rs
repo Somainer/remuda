@@ -192,6 +192,17 @@ pub struct JournalRecord {
     pub observed_at: String,
 }
 
+/// Result of [`Store::append_journal`].
+#[derive(Clone, Debug)]
+pub struct JournalAppend {
+    /// Mirrored row (existing row when `replayed`).
+    pub record: JournalRecord,
+    /// True when this seq was already durable; callers must not fan out again.
+    pub replayed: bool,
+    /// Inclusive instance watermark after this call (may exceed `record.seq` on replay).
+    pub durable_seq: i64,
+}
+
 /// Hub-side journal resume cursor for one instance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -765,7 +776,7 @@ impl Store {
         instance_id: String,
         seq: Option<i64>,
         mut event: Value,
-    ) -> Result<(JournalRecord, bool), StoreError> {
+    ) -> Result<JournalAppend, StoreError> {
         self.run(move |conn| {
             let inst = load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
@@ -778,9 +789,14 @@ impl Store {
                 .unwrap_or(0)
                 + 1;
             let seq = seq.unwrap_or(next);
+            let durable = inst.durable_seq.parse::<i64>().unwrap_or(0);
             if let Some(existing) = load_journal_row(conn, &instance_id, seq)? {
                 apply_interaction_event(conn, &host_id, &instance_id, &existing.event)?;
-                return Ok((existing, false));
+                return Ok(JournalAppend {
+                    record: existing,
+                    replayed: true,
+                    durable_seq: durable,
+                });
             }
             if seq != next {
                 return Err(StoreError::Id(format!(
@@ -813,16 +829,17 @@ impl Store {
                 params![seq, now, instance_id],
             )?;
             apply_interaction_event(conn, &host_id, &instance_id, &event)?;
-            Ok((
-                JournalRecord {
+            Ok(JournalAppend {
+                record: JournalRecord {
                     instance_id,
                     seq,
                     event_id,
                     event,
                     observed_at: now,
                 },
-                true,
-            ))
+                replayed: false,
+                durable_seq: seq,
+            })
         })
         .await
     }

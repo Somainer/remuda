@@ -271,7 +271,12 @@ async fn hub_restart_keeps_host_journal_interactions_and_device() -> Result<()> 
     .await?;
     let replayed = recv_json(&mut node).await?;
     assert_eq!(replayed["result"]["seq"], json!("1"));
-    assert_eq!(replayed["result"]["durableSeq"], json!("1"));
+    assert_eq!(replayed["result"]["replayed"], json!(true));
+    assert_eq!(
+        replayed["result"]["durableSeq"],
+        json!("2"),
+        "replay ACK must keep the instance watermark"
+    );
 
     let journal_path = format!("/v1/instances/{}/journal", instance_id.as_id().as_str());
     let (status, _, journal) = http(

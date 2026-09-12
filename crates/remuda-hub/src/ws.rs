@@ -396,26 +396,27 @@ async fn handle_node_method(
             let mut last = None;
             let mut seq = seq;
             for event in events {
-                let (record, inserted) = state
+                let appended = state
                     .store
                     .append_journal(host_id.clone(), instance_id.clone(), seq, event)
                     .await
                     .map_err(map_host_store)?;
-                if inserted {
-                    publish_journal(&state.bus, &record);
-                    crate::alerts::observe(state, &record);
+                if !appended.replayed {
+                    publish_journal(&state.bus, &appended.record);
+                    crate::alerts::observe(state, &appended.record);
                 }
-                seq = Some(record.seq.saturating_add(1));
-                last = Some(record);
+                seq = Some(appended.record.seq.saturating_add(1));
+                last = Some(appended);
             }
-            let record = last.ok_or_else(|| {
+            let appended = last.ok_or_else(|| {
                 HubError::BadRequest("journal.append requires event or events".into())
             })?;
             Ok(Some(json!({
-                "seq": record.seq.to_string(),
-                "eventId": record.event_id,
-                "durableSeq": record.seq.to_string(),
-                "watermark": { "durableSeq": record.seq.to_string() },
+                "seq": appended.record.seq.to_string(),
+                "eventId": appended.record.event_id,
+                "durableSeq": appended.durable_seq.to_string(),
+                "replayed": appended.replayed,
+                "watermark": { "durableSeq": appended.durable_seq.to_string() },
             })))
         }
         "tty.frame" => {

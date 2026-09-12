@@ -7,5 +7,5 @@ export function usageLine(payload: UsagePayload): string | null {
   const output = formatTokens(payload.outputTokens);
   if (!input || !output) return null;
   const cost = payload.cost.state === "known" ? ` · $${payload.cost.value.amount}` : "";
-  return `usage in ${input} / out ${output}${cost}`;
+  return `usage · in ${input} / out ${output}${cost}`;
 }

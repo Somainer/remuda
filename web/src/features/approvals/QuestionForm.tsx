@@ -1,8 +1,7 @@
 import { useState, type KeyboardEvent } from "react";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
-import { Button } from "../../components/Button";
 import { composing } from "../../lib/viewport";
-import ui from "../../styles/ui.module.css";
+import css from "../session/session.module.css";
 
 export function QuestionForm({
   interaction,
@@ -28,77 +27,82 @@ export function QuestionForm({
   };
 
   return (
-    <section className={ui.approval} data-testid="question-form">
-      <div className={ui.cardHead}>
-        <strong>{req.title}</strong>
-        <span>
-          {index + 1}/{req.fields.length}
+    <section className={css.question} data-testid="question-form">
+      <div className={css.approvalHead} style={{ padding: 0, borderBottom: 0 }}>
+        <span className={css.dustDot} />
+        <span className={css.approvalTitle}>{req.title}</span>
+        <span className={css.spacer} />
+        <span className={css.approvalHint}>
+          {index + 1} / {req.fields.length} · 接管 composer
         </span>
       </div>
-      <p>{field.title}</p>
-      {field.options.map((opt) => (
-        <label key={opt.id} className={ui.row} style={{ marginBottom: 6 }}>
-          <input
-            type={field.input === "multi-select" ? "checkbox" : "radio"}
-            name={field.id}
-            checked={current.optionIds.includes(opt.id)}
-            disabled={disabled}
-            onChange={() => {
-              const optionIds = field.input === "multi-select"
-                ? current.optionIds.includes(opt.id)
-                  ? current.optionIds.filter((id) => id !== opt.id)
-                  : current.optionIds.concat(opt.id)
-                : [opt.id];
-              setAnswers({ ...answers, [field.id]: { optionIds, text: current.text } });
-              if (field.input === "single-select" && index < req.fields.length - 1) setIndex(index + 1);
-            }}
-          />
-          {opt.label}
-        </label>
-      ))}
+      <p className={css.qTitle}>{field.title}</p>
+      <div className={css.qOpts}>
+        {field.options.map((opt) => {
+          const on = current.optionIds.includes(opt.id);
+          return (
+            <button
+              key={opt.id}
+              type="button"
+              className={`${css.qOpt} ${on ? css.qOptOn : ""}`}
+              disabled={disabled}
+              onClick={() => {
+                const optionIds =
+                  field.input === "multi-select"
+                    ? current.optionIds.includes(opt.id)
+                      ? current.optionIds.filter((id) => id !== opt.id)
+                      : current.optionIds.concat(opt.id)
+                    : [opt.id];
+                setAnswers({ ...answers, [field.id]: { optionIds, text: current.text } });
+                if (field.input === "single-select" && index < req.fields.length - 1) setIndex(index + 1);
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
       {field.allowFreeText ? (
         <input
-          className={ui.input}
+          className={css.input}
           value={current.text ?? ""}
           disabled={disabled}
+          placeholder="自定义…（IME 组字不提交）"
           onKeyDown={onKeyDown}
           onChange={(e) => setAnswers({ ...answers, [field.id]: { ...current, text: e.target.value } })}
         />
       ) : null}
-      <div className={ui.row} style={{ marginTop: 8 }}>
-        <Button
-          disabled={disabled || index === 0}
-          onClick={() => setIndex(Math.max(0, index - 1))}
-        >
-          上一题
-        </Button>
-        <Button
+      <div className={css.qRow}>
+        <button
+          type="button"
+          className={css.quietBtn}
           disabled={disabled}
           onClick={() => {
             if (index < req.fields.length - 1) setIndex(index + 1);
           }}
         >
-          Skip
-        </Button>
+          跳过本题
+        </button>
+        <span className={css.spacer} />
         {index < req.fields.length - 1 ? (
-          <Button onClick={() => setIndex(index + 1)}>下一题</Button>
+          <button type="button" className={css.allowBtn} onClick={() => setIndex(index + 1)}>
+            下一题
+          </button>
         ) : (
-          <Button
-            variant="primary"
-            disabled={disabled}
-            onClick={() => onRespond({ kind: "question", answers })}
-          >
+          <button type="button" className={css.allowBtn} disabled={disabled} onClick={() => onRespond({ kind: "question", answers })}>
             提交
-          </Button>
+          </button>
         )}
-        <Button
-          variant="danger"
-          disabled={disabled}
-          onClick={() => onRespond({ kind: "question", answers: {} })}
-        >
-          关闭
-        </Button>
       </div>
+      <div className={css.approvalHint}>关闭 = cancel 整批 · 提交一次 InteractionAnswer · 多设备以第一次为准</div>
+      <button
+        type="button"
+        className={css.quietBtn}
+        disabled={disabled}
+        onClick={() => onRespond({ kind: "question", answers: {} })}
+      >
+        关闭
+      </button>
     </section>
   );
 }

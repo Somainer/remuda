@@ -1,6 +1,5 @@
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
-import { Button } from "../../components/Button";
-import ui from "../../styles/ui.module.css";
+import css from "../session/session.module.css";
 
 export function ApprovalCard({
   interaction,
@@ -15,24 +14,30 @@ export function ApprovalCard({
   if (req.kind !== "approval") return null;
   const disabled = busy || !interaction.answerable || interaction.state !== "pending";
   return (
-    <section className={ui.approval} data-testid="approval-card">
-      <div className={ui.cardHead}>
-        <strong>审批 · {req.title}</strong>
-        <span>{interaction.state}</span>
+    <section className={css.approval} data-testid="approval-card">
+      <div className={css.approvalHead}>
+        <span className={css.dustDot} />
+        <span className={css.approvalTitle}>审批 · {req.title}</span>
+        <span className={css.approvalHint}>{interaction.id.slice(0, 12)}</span>
+        <span className={css.spacer} />
+        <span className={css.approvalHint}>多台设备同时点，只记第一次</span>
       </div>
-      <p style={{ margin: "0 0 8px" }}>{req.description}</p>
-      <p className={ui.listMeta}>多台设备同时点，只记第一次。</p>
-      <div className={ui.row}>
-        {req.options.map((opt) => (
-          <Button
-            key={opt.id}
-            variant={opt.effect === "deny" ? "danger" : "primary"}
-            disabled={disabled}
-            onClick={() => onRespond({ kind: "approval", optionId: opt.id, inputDigest: req.inputDigest })}
-          >
-            {opt.label}
-          </Button>
-        ))}
+      <div className={css.approvalBody}>
+        <p className={css.preview}>{req.description}</p>
+        {req.options.map((opt) => {
+          const kind = opt.effect === "deny" ? css.denyBtn : opt.effect === "allow-once" ? css.allowBtn : css.quietBtn;
+          return (
+            <button
+              key={opt.id}
+              type="button"
+              className={kind}
+              disabled={disabled}
+              onClick={() => onRespond({ kind: "approval", optionId: opt.id, inputDigest: req.inputDigest })}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
       </div>
     </section>
   );

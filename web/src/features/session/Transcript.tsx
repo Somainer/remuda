@@ -11,6 +11,7 @@ import { WorkflowTree } from "./WorkflowTree";
 import { UsageFooter } from "./UsageFooter";
 import { OpaqueRow } from "./OpaqueRow";
 import css from "./Transcript.module.css";
+import session from "./session.module.css";
 import { DEFAULT_ROW, OVERSCAN, visibleRange } from "./virtualWindow";
 
 export function Transcript({
@@ -236,13 +237,17 @@ function renderNode(
   opts: { defaultFolded: boolean; collapseTick: number; settle: boolean },
 ): ReactNode {
   if (node.type === "message") {
+    const user = node.role === "user";
     return (
-      <section data-testid={node.local ? "optimistic-bubble" : "message"}>
-        <div className={ui.you}>
-          {node.role === "user" ? "You" : node.role}
+      <section
+        className={user ? session.user : session.assistant}
+        data-testid={node.local ? "optimistic-bubble" : "message"}
+      >
+        <div className={session.you}>
+          {user ? "You" : node.role}
           {node.local ? ` · ${node.local.state}` : ""}
         </div>
-        {node.role === "assistant" ? <MarkdownText text={node.text} /> : <p style={{ margin: 0 }}>{node.text}</p>}
+        {node.role === "assistant" ? <MarkdownText text={node.text} /> : <p className={session.bubble}>{node.text}</p>}
         {node.local?.state === "queued" ? (
           <button className={ui.chip} onClick={() => hubStore.retract(node.local!.id)}>
             撤回
@@ -258,8 +263,8 @@ function renderNode(
   }
   if (node.type === "thought") {
     return (
-      <details className={ui.thought}>
-        <summary>thinking{node.completeness === "screen-derived" ? " · 从屏幕猜测" : ""}</summary>
+      <details className={session.thought}>
+        <summary>▸ thinking{node.completeness === "screen-derived" ? " · 从屏幕猜测" : ""}</summary>
         <p>{node.text}</p>
       </details>
     );
@@ -300,7 +305,7 @@ function renderNode(
               settle={opts.settle}
             />
           ) : child.type === "thought" ? (
-            <details key={child.id} className={ui.thought}>
+            <details key={child.id} className={session.thought}>
               <summary>thinking</summary>
               <p>{child.text}</p>
             </details>
@@ -337,8 +342,9 @@ function CompactFold({
   const [open, setOpen] = useState(false);
   return (
     <div>
-      <button className={ui.chip} data-testid="compact-fold" onClick={() => setOpen(!open)}>
-        {open ? "收起过程" : `${toolCount} 次工具 · ${thoughtCount} 段思考`}
+      <button className={session.fold} data-testid="compact-fold" onClick={() => setOpen(!open)}>
+        <span>▸</span>
+        <span>{open ? "收起过程" : `${toolCount} 次工具 · ${thoughtCount} 段思考`}</span>
       </button>
       {open ? <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>{children}</div> : null}
     </div>

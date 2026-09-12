@@ -11,10 +11,11 @@ import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { canShowTtyLab, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
-import { nativeShort, projectStatus } from "../lib/status";
+import { nativeShort, projectStatus, uiMode } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import ui from "../styles/ui.module.css";
+import session from "../features/session/session.module.css";
 
 export function SessionPage({ view = "structured" }: { view?: "structured" | "tty" | "files" | "events" }) {
   const { instanceId = "" } = useParams();
@@ -53,81 +54,119 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   const cost = usage && usage.cost.state === "known" ? `$${usage.cost.value.amount}` : "—";
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
+  const workspace = hubStore.workspaceOf(instance.workspaceId)?.label;
+  const title = hubStore.titleOf(instance.id);
+  const structuredOnly = uiMode(instance) === "structured-only";
 
   return (
     <div
+      className={session.page}
       data-testid="session-page"
       data-status={status}
       data-journal={journalStatus}
-      style={{ display: "flex", flexDirection: "column", minHeight: "100%", paddingBottom: offsetTop ? 0 : undefined }}
+      style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
-      <header style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--line)", flexWrap: "wrap" }}>
-        {mobile ? (
-          <Link to="/sessions" aria-label="返回">
-            ←
-          </Link>
-        ) : null}
-        <StateDot status={status} />
-        <strong style={{ flex: 1 }}>{hubStore.titleOf(instance.id)}</strong>
-        <span className={ui.pill}>{hubStore.workspaceOf(instance.workspaceId)?.label}</span>
-        <span className={ui.pill}>{hubStore.hostName(instance.hostId)}</span>
-        <span className={ui.pill}>{instance.driver}</span>
-        <ConnectionIndicator status={connLabel} />
-        {showTtyLab ? (
-          <span className={ui.row}>
-            <Link to={`/s/${instance.id}`}>结构</Link>
-            <Link to={`/s/${instance.id}/tty`} aria-current={view === "tty" ? "page" : undefined}>
-              终端
+      <header className={session.header}>
+        <div className={session.headRow}>
+          {mobile ? (
+            <Link className={session.back} to="/sessions" aria-label="返回">
+              ←
             </Link>
+          ) : null}
+          <h1 className={session.title}>{workspace ? `${workspace} / ${title}` : title}</h1>
+          <span className={session.status}>
+            <StateDot status={status} />
+            {status}
           </span>
-        ) : null}
-        <Button
-          variant="ghost"
-          data-testid="density-toggle"
-          data-mode={hub.compact ? "compact" : "full"}
-          onClick={() => hubStore.setCompact(!hub.compact)}
-        >
-          {hub.compact ? "Compact" : "Full"}
-        </Button>
-        {status === "exited" ? (
-          canResume ? (
-            <Button
-              variant="primary"
+          <span className={session.spacer} />
+          {showTtyLab ? (
+            <span className={ui.row}>
+              <Link to={`/s/${instance.id}`}>结构</Link>
+              <Link to={`/s/${instance.id}/tty`} aria-current={view === "tty" ? "page" : undefined}>
+                终端
+              </Link>
+            </span>
+          ) : null}
+          <button
+            type="button"
+            className={`${session.headBtn} ${hub.compact ? session.headBtnOn : ""}`}
+            data-testid="density-toggle"
+            data-mode={hub.compact ? "compact" : "full"}
+            onClick={() => hubStore.setCompact(!hub.compact)}
+          >
+            {hub.compact ? "Compact" : "Full"}
+          </button>
+          {view === "structured" ? (
+            <>
+              <button type="button" className={`${session.headBtn} ${session.deskOnly}`} onClick={() => navigate(`/s/${instance.id}/files`)}>
+                文件
+              </button>
+              <button type="button" className={session.headBtn} onClick={() => navigate(`/s/${instance.id}/events`)}>
+                原始事件
+              </button>
+            </>
+          ) : null}
+          {status === "exited" ? (
+            canResume ? (
+              <Button
+                variant="primary"
+                onClick={() => {
+                  void hubStore.resume(instance.id);
+                }}
+              >
+                Resume
+              </Button>
+            ) : (
+              <Link to={`/sessions/new?host=${instance.hostId}&workspace=${instance.workspaceId}`}>开新会话继承 cwd</Link>
+            )
+          ) : (
+            <button
+              type="button"
+              className={session.stopBtn}
+              aria-label="Stop"
               onClick={() => {
-                void hubStore.resume(instance.id);
+                void hubStore.close(instance.id);
               }}
             >
-              Resume
-            </Button>
-          ) : (
-            <Link to={`/sessions/new?host=${instance.hostId}&workspace=${instance.workspaceId}`}>开新会话继承 cwd</Link>
-          )
-        ) : (
-          <Button
-            variant="danger"
-            onClick={() => {
-              void hubStore.close(instance.id);
-            }}
-          >
-            Stop
-          </Button>
-        )}
+              {mobile ? "■" : "■ 停止"}
+            </button>
+          )}
+        </div>
+        <div className={session.meta} data-testid="session-meta">
+          <span className={session.metaHost}>{hubStore.hostName(instance.hostId)}</span>
+          <span className={session.dotSep}>·</span>
+          <span>{instance.driver}</span>
+          <span className={session.dotSep}>·</span>
+          <span>seq {events.at(-1)?.seq ?? instance.durableSeq}</span>
+          <span className={session.dotSep}>·</span>
+          <span>{instance.connectivity}</span>
+          <span className={session.dotSep}>·</span>
+          <span>{cost}</span>
+          {structuredOnly && !mobile ? (
+            <>
+              <span className={session.dotSep}>·</span>
+              <span>structured-only — 无终端 tab</span>
+            </>
+          ) : null}
+          <ConnectionIndicator status={connLabel} />
+          {nativeShort(instance) !== "—" ? (
+            <>
+              <span className={session.dotSep}>·</span>
+              <span>native {nativeShort(instance)}</span>
+            </>
+          ) : null}
+          {journalStatus === "gap-backfill" ? " · 正在补事件" : ""}
+          {journalStatus === "readonly-stale" ? " · 只读" : ""}
+          {status === "idle" ? " · 回合结束、进程仍在" : ""}
+        </div>
       </header>
-      <div className={ui.listMeta} style={{ padding: "4px 12px" }} data-testid="session-meta">
-        seq {events.at(-1)?.seq ?? instance.durableSeq} · connectivity={instance.connectivity} · {cost}
-        · native {nativeShort(instance)}
-        {journalStatus === "gap-backfill" ? " · 正在补事件" : ""}
-        {journalStatus === "readonly-stale" ? " · 只读" : ""}
-        {status === "idle" ? " · 回合结束、进程仍在" : ""}
-      </div>
       <div
-        style={{
-          flex: 1,
-          overflow: view === "tty" || view === "structured" ? "hidden" : "auto",
-          minHeight: 0,
-          display: view === "tty" || view === "structured" ? "flex" : undefined,
-          flexDirection: view === "tty" || view === "structured" ? "column" : undefined,
-        }}
+        className={view === "tty" || view === "structured" ? session.pane : undefined}
+        style={
+          view === "tty" || view === "structured"
+            ? undefined
+            : { flex: 1, overflow: "auto", minHeight: 0 }
+        }
       >
         {view === "events" ? (
           <RawEvents events={events} />
@@ -157,7 +196,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           />
         )}
       </div>
-      {view === "tty" || view === "events" ? null : <div style={{ padding: 12, borderTop: "1px solid var(--line)" }}>
+      {view === "tty" || view === "events" ? null : <div className={session.dock}>
         <TaskTrack tasks={tasks} />
         {pending.map((item) =>
           item.kind === "question" ? (
@@ -204,16 +243,6 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           />
         )}
       </div>}
-      {view === "structured" ? (
-        <div style={{ padding: "0 12px 12px" }} className={ui.row}>
-          <Button variant="ghost" onClick={() => navigate(`/s/${instance.id}/files`)}>
-            文件
-          </Button>
-          <Button variant="ghost" onClick={() => navigate(`/s/${instance.id}/events`)}>
-            原始事件
-          </Button>
-        </div>
-      ) : null}
     </div>
   );
 }

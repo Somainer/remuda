@@ -3,9 +3,9 @@ import type { ToolCallPayload, ToolResultPayload } from "../../types/observation
 import { knowledgeValue } from "../../types/command";
 import { asRecord, asString, jsonPreview } from "../../lib/format";
 import { DiffBlock } from "../../components/DiffBlock";
-import ui from "../../styles/ui.module.css";
 import { familyFor, splitMcpName } from "./toolRegistry";
 import type { DiffState } from "./assemble";
+import css from "./session.module.css";
 
 function asTextBlocks(result: ToolResultPayload | null): string {
   if (!result) return "";
@@ -15,26 +15,53 @@ function asTextBlocks(result: ToolResultPayload | null): string {
     .join("\n");
 }
 
+function diffStat(diff: string): string | null {
+  let add = 0;
+  let del = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) add += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) del += 1;
+  }
+  if (!add && !del) return null;
+  return `+${add} −${del}`;
+}
+
+function cwdOf(call: ToolCallPayload): string | null {
+  const rec = asRecord(knowledgeValue(call.executor));
+  return asString(rec?.workspaceId) ?? asString(rec?.cwd);
+}
+
 function BashCard({ call, result, completeness }: { call: ToolCallPayload; result: ToolResultPayload | null; completeness: string }) {
   const input = knowledgeValue(call.input);
   const rec = asRecord(input);
   const command = asString(rec?.command) ?? jsonPreview(input);
   const exit = result ? knowledgeValue(result.exitCode) : undefined;
   const running = !result || result.stage !== "final";
+  const stdout = asTextBlocks(result);
+  const lines = stdout ? stdout.split("\n").length : 0;
   return (
-    <article className={`${ui.card} ${completeness === "partial" ? ui.cardPartial : ""}`}>
-      <div className={ui.cardHead}>
-        <strong>Bash</strong>
-        <span className={ui.pill}>{running ? "running" : exit === undefined ? "无 exit" : `exit ${exit}`}</span>
-        {completeness !== "structured" ? <span>不完整</span> : null}
+    <article className={`${css.tool} ${completeness === "partial" ? css.toolPartial : ""}`}>
+      <div className={css.toolHead}>
+        <span className={css.toolTitle}>Bash</span>
+        <span className={css.toolStatus}>
+          {running ? <span className={css.runDot} /> : null}
+          {running ? "running · 无 exit，不画成功" : exit === undefined ? "无 exit" : `exit ${exit}`}
+        </span>
+        {completeness !== "structured" ? <span className={css.stat}>不完整</span> : null}
+        <span className={css.spacer} />
+        <span className={css.stat}>{cwdOf(call) ?? call.toolCallId}</span>
       </div>
-      <pre className={ui.pre}>{`$ ${command}`}</pre>
+      <pre className={css.cmd}>{`$ ${command}`}</pre>
       {result ? (
         <details>
-          <summary>stdout</summary>
-          <pre className={ui.pre}>{asTextBlocks(result) || "ninja: no work to do."}</pre>
+          <summary className={css.stdoutHead}>
+            ▾ stdout{lines ? ` · ${lines} 行` : ""}
+          </summary>
+          <pre className={css.stdout}>{stdout || "ninja: no work to do."}</pre>
         </details>
-      ) : null}
+      ) : (
+        <div className={css.stdoutHead}>▸ stdout</div>
+      )}
     </article>
   );
 }
@@ -55,11 +82,17 @@ function EditWriteCard({
   const diff =
     result?.changes[0]?.diff ??
     (family === "Edit" && rec ? `@@\n-${asString(rec.old_string) ?? ""}\n+${asString(rec.new_string) ?? ""}\n` : asString(rec?.content) ?? "");
+  const stat = diffStat(diff);
+  const badge = diffState === "applied" ? css.applied : diffState === "unknown" ? css.unknown : css.proposed;
+  const label = diffState === "applied" ? "已写入" : diffState === "unknown" ? "结果未知" : "拟修改";
   return (
-    <article className={ui.card}>
-      <div className={ui.cardHead}>
-        <strong>{family}</strong>
-        <span className={ui.path}>{path}</span>
+    <article className={css.tool}>
+      <div className={css.toolHead}>
+        <span className={css.toolTitle}>{family}</span>
+        <span className={css.path}>{path}</span>
+        {stat ? <span className={css.stat}>{stat}</span> : null}
+        <span className={css.spacer} />
+        <span className={badge}>{label}</span>
       </div>
       <DiffBlock path={path} diff={diff} state={diffState} />
     </article>
@@ -78,15 +111,15 @@ function ReadCard({ call, result }: { call: ToolCallPayload; result: ToolResultP
         .join("\n")
     : "";
   return (
-    <article className={ui.card}>
-      <div className={ui.cardHead}>
-        <strong>Read</strong>
-        <span className={ui.path}>
+    <article className={css.tool}>
+      <div className={css.toolHead}>
+        <span className={css.toolTitle}>Read</span>
+        <span className={css.path}>
           {asString(rec?.file_path) ?? "file"}
           {range}
         </span>
       </div>
-      {snippet ? <pre className={ui.pre}>{snippet}</pre> : null}
+      {snippet ? <pre className={css.stdout}>{snippet}</pre> : null}
     </article>
   );
 }
@@ -99,15 +132,16 @@ function WorkflowCard({
   members?: { label: string; state: string }[];
 }) {
   return (
-    <article className={ui.card}>
-      <div className={ui.cardHead}>
-        <strong>Workflow</strong>
-        <span>{runTitle ?? "running"}</span>
+    <article className={css.tool}>
+      <div className={css.toolHead}>
+        <span className={css.toolTitle}>Workflow</span>
+        <span className={css.path}>{runTitle ?? "running"}</span>
       </div>
-      <ul>
+      <ul className={css.wfMembers}>
         {(members ?? []).map((m) => (
-          <li key={m.label}>
-            {m.label} · {m.state}
+          <li key={m.label} className={css.member}>
+            <span className={css.memberName}>{m.label}</span>
+            <span className={css.memberMeta}>{m.state}</span>
           </li>
         ))}
       </ul>
@@ -118,11 +152,11 @@ function WorkflowCard({
 function TaskCard({ call }: { call: ToolCallPayload }) {
   const rec = asRecord(knowledgeValue(call.input));
   return (
-    <article className={ui.card}>
-      <div className={ui.cardHead}>
-        <strong>Task</strong>
+    <article className={css.tool}>
+      <div className={css.toolHead}>
+        <span className={css.toolTitle}>Task</span>
       </div>
-      <pre className={ui.pre}>{asString(rec?.prompt) ?? jsonPreview(rec)}</pre>
+      <pre className={css.cmd}>{asString(rec?.prompt) ?? jsonPreview(rec)}</pre>
     </article>
   );
 }
@@ -131,21 +165,21 @@ function McpCard({ call, result }: { call: ToolCallPayload; result: ToolResultPa
   const name = knowledgeValue(call.toolName) ?? "mcp";
   const { server, tool } = splitMcpName(name);
   return (
-    <article className={ui.card}>
-      <div className={ui.cardHead}>
-        <strong>MCP</strong>
-        <span>
+    <article className={css.tool}>
+      <div className={css.toolHead}>
+        <span className={css.toolTitle}>MCP</span>
+        <span className={css.path}>
           {server}/{tool}
         </span>
       </div>
       <details>
-        <summary>参数</summary>
-        <pre className={ui.pre}>{jsonPreview(knowledgeValue(call.input))}</pre>
+        <summary className={css.stdoutHead}>参数</summary>
+        <pre className={css.stdout}>{jsonPreview(knowledgeValue(call.input))}</pre>
       </details>
       {result ? (
         <details>
-          <summary>结果</summary>
-          <pre className={ui.pre}>{asTextBlocks(result) || jsonPreview(knowledgeValue(result.structuredResult))}</pre>
+          <summary className={css.stdoutHead}>结果</summary>
+          <pre className={css.stdout}>{asTextBlocks(result) || jsonPreview(knowledgeValue(result.structuredResult))}</pre>
         </details>
       ) : null}
     </article>
@@ -155,19 +189,19 @@ function McpCard({ call, result }: { call: ToolCallPayload; result: ToolResultPa
 function GenericCard({ call, result }: { call: ToolCallPayload; result: ToolResultPayload | null }) {
   const name = knowledgeValue(call.displayTitle) ?? knowledgeValue(call.toolName) ?? "tool";
   return (
-    <article className={ui.card}>
-      <div className={ui.cardHead}>
-        <strong>{name}</strong>
-        <span>Generic</span>
+    <article className={css.tool}>
+      <div className={css.toolHead}>
+        <span className={css.toolTitle}>{name}</span>
+        <span className={css.stat}>Generic</span>
       </div>
       <details open>
-        <summary>入参</summary>
-        <pre className={ui.pre}>{jsonPreview(knowledgeValue(call.input))}</pre>
+        <summary className={css.stdoutHead}>入参</summary>
+        <pre className={css.stdout}>{jsonPreview(knowledgeValue(call.input))}</pre>
       </details>
       {result ? (
         <details>
-          <summary>出参</summary>
-          <pre className={ui.pre}>{jsonPreview(result)}</pre>
+          <summary className={css.stdoutHead}>出参</summary>
+          <pre className={css.stdout}>{jsonPreview(result)}</pre>
         </details>
       ) : null}
     </article>
@@ -201,11 +235,12 @@ export function ToolCard({
   const family = familyFor(driverKind, knowledgeValue(call.toolName));
   if (folded) {
     return (
-      <article className={ui.card} data-testid="tool-card" data-folded="1">
-        <div className={ui.cardHead}>
-          <strong>{name}</strong>
-          <span>{family}</span>
-          <button type="button" className={ui.chip} onClick={() => setFolded(false)}>
+      <article className={css.tool} data-testid="tool-card" data-folded="1">
+        <div className={css.toolHead}>
+          <span className={css.toolTitle}>{name}</span>
+          <span className={css.stat}>{family}</span>
+          <span className={css.spacer} />
+          <button type="button" className={css.openBtn} onClick={() => setFolded(false)}>
             展开
           </button>
         </div>

@@ -1,9 +1,8 @@
 import { useState, type KeyboardEvent } from "react";
-import { Button } from "../../components/Button";
 import { readDraft, writeDraft } from "../../lib/drafts";
 import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
-import ui from "../../styles/ui.module.css";
+import css from "./session.module.css";
 
 const MODES = PERMISSION_OPTIONS;
 
@@ -48,49 +47,69 @@ export function Composer({
 
   return (
     <form
-      className={ui.card}
       data-testid="composer"
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
       }}
     >
-      <textarea
-        className={ui.textarea}
-        value={text}
-        disabled={disabled}
-        placeholder={mobile ? "输入提示词…" : "输入提示词… ⌘/Ctrl+Enter 发送"}
-        onChange={(e) => {
-          setText(e.target.value);
-          writeDraft(instanceId, e.target.value);
-        }}
-        onKeyDown={onKeyDown}
-      />
-      <div className={ui.row} style={{ marginTop: 8, justifyContent: "space-between" }}>
-        <div>
-          <button type="button" className={ui.chip} data-testid="permission-chip" onClick={() => setPermOpen(!permOpen)}>
-            权限:{permLabel}
+      <div className={css.composer}>
+        <textarea
+          className={css.input}
+          value={text}
+          disabled={disabled}
+          placeholder={mobile ? "输入提示词…" : "输入提示词…  Enter 送出 · Shift+Enter 换行 · IME 组字期间不送"}
+          onChange={(e) => {
+            setText(e.target.value);
+            writeDraft(instanceId, e.target.value);
+          }}
+          onKeyDown={onKeyDown}
+        />
+        {mobile ? (
+          <button
+            type="button"
+            className={css.sendIcon}
+            aria-label="送出"
+            disabled={disabled || sending || !text.trim()}
+            onClick={() => void submit()}
+          >
+            ↑
           </button>
-          {permOpen
-            ? MODES.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  className={`${ui.chip} ${permissionMode === m.id ? ui.chipOn : ""}`}
-                  onClick={() => {
-                    onPermission?.(m.id);
-                    setPermOpen(false);
-                  }}
-                >
-                  {m.label}
-                </button>
-              ))
-            : null}
-        </div>
-        <Button variant="primary" disabled={disabled || sending || !text.trim()} onClick={() => void submit()}>
-          {sending ? "发送中" : "送出"}
-        </Button>
+        ) : (
+          <button type="button" className={css.perm} data-testid="permission-chip" onClick={() => setPermOpen(!permOpen)}>
+            权限 {permLabel} ▾
+          </button>
+        )}
+        {mobile ? null : (
+          <button type="button" className={css.send} disabled={disabled || sending || !text.trim()} onClick={() => void submit()}>
+            {sending ? "发送中" : "送出"}
+          </button>
+        )}
       </div>
+      {mobile ? (
+        <div className={css.permMenu} style={{ marginTop: 10 }}>
+          <button type="button" className={css.perm} data-testid="permission-chip" onClick={() => setPermOpen(!permOpen)}>
+            权限 {permLabel} ▾
+          </button>
+        </div>
+      ) : null}
+      {permOpen ? (
+        <div className={css.permMenu} style={{ marginTop: 8 }}>
+          {MODES.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              className={`${css.qOpt} ${permissionMode === m.id ? css.qOptOn : ""}`}
+              onClick={() => {
+                onPermission?.(m.id);
+                setPermOpen(false);
+              }}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </form>
   );
 }

@@ -46,7 +46,9 @@ impl NativeDriverConfig {
         }
         Self {
             data_dir,
-            claude_binary: None,
+            claude_binary: std::env::var_os("REMUDA_CLAUDE_BIN")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
             herdr_socket_dir: None,
             herdr_binary: None,
             herdr_session: "remuda-node".to_owned(),

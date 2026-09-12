@@ -2,7 +2,7 @@
 
 use crate::{
     DevNode, DevServerConfig, DriverRegistry, MemoryStore, NativeDriverConfig, NodeError,
-    dev_router, load_or_create_host_id, native_driver_registry,
+    dev_router, native_driver_registry,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -113,7 +113,7 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
         LocalDrivers::Fake => DriverRegistry::with_fake()?,
         LocalDrivers::Native(native) => native_driver_registry(native.clone())?,
     };
-    let host_id = load_or_create_host_id(&config.data_dir.join("node"))?;
+    let host_id = crate::enroll::load_or_create(&config.data_dir)?.host_id;
     DevNode::with_parts_on_host(&config.http, store, drivers, host_id)
 }
 
@@ -175,5 +175,7 @@ mod tests {
         let first = compose(&config).expect("first Node").host().meta.id;
         let second = compose(&config).expect("second Node").host().meta.id;
         assert_eq!(first, second);
+        let enrollment = crate::enroll::load_or_create(data_dir.path()).expect("enrollment");
+        assert_eq!(first, enrollment.host_id);
     }
 }

@@ -11,6 +11,7 @@ JSONL lines may be prefixed with `#` comments (skipped by tests).
 | File | Notes |
 | --- | --- |
 | `im-message-*.jsonl` | Flattened IM events. `.content` is pre-rendered text (do not `fromjson`). |
+| `im-message-second-prompt.jsonl` | Same p2p `session_key` as `im-message-p2p.jsonl`, new `message_id` (resume/send). |
 | `card-action-*.jsonl` | `action_value` / `form_value` are JSON strings as in the resolved schema. |
 | `interaction-*.json` | Adapted from `crates/remuda-protocol/tests/fixtures/interaction.json` (`protocol.md` §2.6 / §5.4). |
 | `fake-lark-cli.sh` | Local test double. Does not contact Feishu or change `lark-cli` config. |

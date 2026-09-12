@@ -7,11 +7,14 @@
 //! - wraps `lark-cli im +messages-send/+messages-reply` (DryRun by default)
 //! - renders Card JSON 2.0 templates and maps them onto `protocol.md` Interactions
 //! - supervises consume children (stdin kept open, SIGTERM on stop, backoff restart)
+//! - maps `session_key` → instanceId and routes `/new` `/host` `/agent` `/model`
+//!   `/status` `/stop` `/yes` `/no` through [`InstanceApi`]
 //!
 //! It does not create Feishu apps, send live messages, or change `lark-cli` config.
 
 mod cards;
 mod consume;
+mod dispatcher;
 mod error;
 mod inbound;
 mod outbound;
@@ -23,6 +26,11 @@ pub use cards::{
     render_question_card, render_recorded_card, validate_card,
 };
 pub use consume::{Backoff, ConsumeEvent, ConsumeSettings, ConsumeSupervisor};
+pub use dispatcher::{
+    ApiCall, CreateRequest, CreatedInstance, DispatchAction, DispatchReport, Dispatcher,
+    FakeInstanceApi, FollowEvent, FollowPage, InstanceApi, RespondRequest, RouteDefaults,
+    SendRequest, SessionBinding, SessionStatus, SessionStore,
+};
 pub use error::Error;
 pub use inbound::{
     CallbackValue, CardAction, ChatType, Deduper, DropReason, ExplicitCommand, GateDecision,

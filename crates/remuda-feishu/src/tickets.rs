@@ -212,6 +212,19 @@ impl TicketStore {
         self.tickets.get(ticket_id)
     }
 
+    /// Newest still-open ticket for `session_key`, if the deadline has not passed.
+    #[must_use]
+    pub fn latest_open(&self, session_key: &str, now: SystemTime) -> Option<&CardTicket> {
+        self.tickets
+            .values()
+            .filter(|ticket| {
+                ticket.session_key == session_key
+                    && ticket.state == TicketState::Open
+                    && now < ticket.expires_at
+            })
+            .max_by_key(|ticket| ticket.created_at)
+    }
+
     /// Decode a card action, parsing string `form_value` when needed.
     pub fn answer_card_parsed(
         &mut self,

@@ -66,4 +66,13 @@ pub enum Error {
     /// A consume stdout line exceeded the configured byte cap.
     #[error("event line exceeds {0} bytes")]
     LineTooLong(usize),
+    /// SQLite session_key → instance map failed.
+    #[error("session store: {0}")]
+    SessionStore(String),
+    /// Hub/runtime InstanceApi call failed.
+    #[error("instance api: {0}")]
+    InstanceApi(String),
+    /// Prompt/command needs a live instance and none is mapped.
+    #[error("no live instance for session {0}")]
+    NoLiveInstance(String),
 }

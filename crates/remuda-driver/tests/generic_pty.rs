@@ -9,32 +9,27 @@ use remuda_protocol::{
     AgentKind, ContentBlock, DriverInput, InputOrigin, InstanceSpec, LifecyclePayload,
     ObservationPayload, PromptInput, PromptMode, TextBlock,
 };
-use remuda_testing::{FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin};
+use remuda_testing::{
+    FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin, install_executable,
+};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 fn stub_bin(dir: &Path, name: &str) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(&path, "#!/bin/sh\necho 'stub 0.0.0'\n").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    install_executable(dir, name, "#!/bin/sh\necho 'stub 0.0.0'\n")
 }
 
 fn stub_crash_bin(dir: &Path, name: &str) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(
-        &path,
+    install_executable(
+        dir,
+        name,
         "#!/bin/sh\n\
          echo \"error: unexpected argument '--name' found\" >&2\n\
          echo 'Usage: grok [OPTIONS] [PROMPT]' >&2\n\
          exit 2\n",
     )
-    .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
 }
 
 fn profile() -> ProviderProfile {

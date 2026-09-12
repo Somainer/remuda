@@ -10,6 +10,7 @@ use remuda_protocol::{
     ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, CommandOrigin, DriverKind,
     EnvBinding, EnvVisibility, Id, InstanceSpec, LiteralEnv, PermissionMode,
 };
+use remuda_testing::install_executable;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -43,10 +44,7 @@ fn native_profile() -> ProviderProfile {
 }
 
 fn stub_binary(dir: &Path, version: &str) -> PathBuf {
-    let path = dir.join("claude");
-    fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    install_executable(dir, "claude", format!("#!/bin/sh\necho '{version}'\n"))
 }
 
 fn request<'a>(

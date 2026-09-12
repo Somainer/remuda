@@ -66,7 +66,7 @@ fn profile() -> ProviderProfile {
 fn driver_for(
     kind: ScriptKind,
     spec_mode: Option<ClaudePermissionMode>,
-) -> (ClaudePrintDriver, InstanceSpec) {
+) -> (tempfile::TempDir, ClaudePrintDriver, InstanceSpec) {
     let tmp = tempfile::tempdir().unwrap();
     let launch = tmp.path().join("launch");
     let home = tmp.path().join("home");
@@ -94,9 +94,7 @@ fn driver_for(
             interaction: ClaudeInteractionMode::Host,
         }));
     }
-    // Keep tempdir alive by leaking; tests are short-lived.
-    std::mem::forget(tmp);
-    (ClaudePrintDriver::new(options), spec)
+    (tmp, ClaudePrintDriver::new(options), spec)
 }
 
 fn prompt(text: &str) -> DriverInput {
@@ -198,7 +196,7 @@ fn turn_done_count(obs: &[Observation]) -> usize {
 
 #[tokio::test]
 async fn ok_script_emits_init_message_and_turn_done() {
-    let (driver, spec) = driver_for(ScriptKind::Ok, None);
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok, None);
     let mut handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
     let ack = driver.send(prompt("hi")).await.expect("send");
@@ -231,7 +229,7 @@ async fn ok_script_emits_init_message_and_turn_done() {
 
 #[tokio::test]
 async fn approval_allow_and_deny() {
-    let (driver, spec) = driver_for(ScriptKind::Approval, None);
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Approval, None);
     let mut handle = driver.start(spec).await.expect("start");
     driver.send(prompt("touch")).await.expect("send");
     let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
@@ -271,7 +269,7 @@ async fn approval_allow_and_deny() {
     );
     driver.close().await.expect("close");
 
-    let (driver, spec) = driver_for(ScriptKind::Approval, None);
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Approval, None);
     let mut handle = driver.start(spec).await.expect("start deny");
     driver.send(prompt("touch")).await.expect("send");
     let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
@@ -310,7 +308,7 @@ async fn approval_allow_and_deny() {
 
 #[tokio::test]
 async fn askuser_answers_question() {
-    let (driver, spec) = driver_for(ScriptKind::AskUser, None);
+    let (_tmp, driver, spec) = driver_for(ScriptKind::AskUser, None);
     let mut handle = driver.start(spec).await.expect("start");
     driver.send(prompt("ask")).await.expect("send");
     let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
@@ -351,7 +349,7 @@ async fn askuser_answers_question() {
 
 #[tokio::test]
 async fn workflow_emits_two_results() {
-    let (driver, spec) = driver_for(ScriptKind::Workflow, None);
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Workflow, None);
     let mut handle = driver.start(spec).await.expect("start");
     driver.send(prompt("wf")).await.expect("send");
     let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
@@ -386,7 +384,7 @@ async fn workflow_emits_two_results() {
 
 #[tokio::test]
 async fn kill_emits_session_exit_lifecycle() {
-    let (driver, spec) = driver_for(ScriptKind::Ok, None);
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok, None);
     let mut handle = driver.start(spec).await.expect("start");
     driver.kill().await.expect("kill");
     let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
@@ -398,6 +396,7 @@ async fn kill_emits_session_exit_lifecycle() {
         "expected exited lifecycle, got {:?}",
         kinds(&events)
     );
+    driver.close().await.expect("close");
 }
 
 #[tokio::test]

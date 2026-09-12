@@ -10,9 +10,8 @@ use remuda_protocol::{
     Completeness, ContentBlock, DriverInput, InputOrigin, InstanceSpec, Knowledge,
     LifecyclePayload, ObservationPayload, PromptInput, PromptMode, TextBlock,
 };
-use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin};
+use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin, install_executable};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -22,10 +21,7 @@ fn ensure_fake_herdr_bin() -> PathBuf {
 }
 
 fn stub_claude(dir: &Path) -> PathBuf {
-    let path = dir.join("claude");
-    fs::write(&path, "#!/bin/sh\necho '2.1.268 (Claude Code)'\n").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    install_executable(dir, "claude", "#!/bin/sh\necho '2.1.268 (Claude Code)'\n")
 }
 
 fn profile() -> ProviderProfile {

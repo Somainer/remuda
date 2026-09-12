@@ -4,10 +4,14 @@ use crate::error::{DriverError, DriverResult};
 use remuda_protocol::Digest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static PIN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Pinned native executable recorded in a [`crate::LaunchRecipe`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,18 +26,54 @@ pub struct BinaryPin {
 }
 
 /// Resolve `command` on `PATH` or accept an absolute path, then pin it.
+///
+/// If `--version` fails with `ETXTBSY` (the file is still mapped or open for
+/// write), the bytes are copied to a unique sibling path and that copy is
+/// pinned instead of overwriting the busy inode.
 pub fn pin_binary(command: impl AsRef<Path>) -> DriverResult<BinaryPin> {
-    let abs = resolve_binary(command)?;
-    let version = read_version(&abs)?;
-    let sha256 = hash_file(&abs)?;
+    let original = resolve_binary(command)?;
+    let mut path = original.clone();
+    let mut last_busy = None;
+    let mut version = None;
+    for _ in 0..8 {
+        match read_version(&path) {
+            Ok(line) => {
+                version = Some(line);
+                break;
+            }
+            Err(DriverError::Io(err)) if is_etxtbsy(&err) => {
+                last_busy = Some(err);
+                path = copy_to_fresh_path(&original)?;
+                tracing::warn!(
+                    src = %original.display(),
+                    dest = %path.display(),
+                    "pin_binary copied binary to a fresh path after ETXTBSY"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let version = version.ok_or_else(|| {
+        DriverError::Io(last_busy.unwrap_or_else(|| {
+            io::Error::new(
+                ErrorKind::ExecutableFileBusy,
+                format!(
+                    "pin_binary: {} still busy after copying to a fresh path",
+                    original.display()
+                ),
+            )
+        }))
+    })?;
+    let path = path.canonicalize().unwrap_or(path);
+    let sha256 = hash_file(&path)?;
     tracing::info!(
-        path = %abs.display(),
+        path = %path.display(),
         version = %version,
         digest = %String::from(sha256.clone()),
         "pinned native binary"
     );
     Ok(BinaryPin {
-        abs_path: abs.to_string_lossy().into_owned(),
+        abs_path: path.to_string_lossy().into_owned(),
         version,
         sha256,
     })
@@ -102,6 +142,86 @@ fn read_version(path: &Path) -> DriverResult<String> {
     Ok(line.to_string())
 }
 
+fn is_etxtbsy(err: &io::Error) -> bool {
+    err.kind() == ErrorKind::ExecutableFileBusy || err.raw_os_error() == Some(26)
+}
+
+fn unique_token() -> String {
+    let seq = PIN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}-{seq}", std::process::id())
+}
+
+/// Copy `src` to a unique path so `exec` is not racing a mapped inode.
+fn copy_to_fresh_path(src: &Path) -> DriverResult<PathBuf> {
+    let bytes = fs::read(src)?;
+    let stem = src
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pinned-bin");
+    let mut dirs = Vec::new();
+    if let Some(parent) = src.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.push(std::env::temp_dir());
+    let mut last_err = None;
+    for dir in dirs {
+        match install_unique(&dir, stem, &bytes) {
+            Ok(path) => return Ok(path),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(DriverError::Io(last_err.unwrap_or_else(|| {
+        io::Error::other(format!(
+            "pin_binary: could not copy {} to a fresh path",
+            src.display()
+        ))
+    })))
+}
+
+fn install_unique(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let mut last = None;
+    for _ in 0..16 {
+        match try_install(dir, name, bytes) {
+            Ok(path) => return Ok(path),
+            Err(err) if is_etxtbsy(&err) || err.kind() == ErrorKind::AlreadyExists => {
+                last = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::from(ErrorKind::ExecutableFileBusy)))
+}
+
+fn try_install(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let token = unique_token();
+    let dest = dir.join(format!("{name}-{token}"));
+    let part = dir.join(format!(".{name}-{token}.part"));
+    if dest.exists() {
+        return Err(io::Error::from(ErrorKind::AlreadyExists));
+    }
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&part)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        let _ = file.sync_all();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&part, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::rename(&part, &dest)?;
+    Ok(dest)
+}
+
 fn find_on_path(name: &Path) -> Option<PathBuf> {
     let file_name = name.file_name()?;
     let path_var = std::env::var_os("PATH")?;
@@ -147,7 +267,6 @@ pub fn default_command(kind: remuda_protocol::DriverKind) -> Option<&'static str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn pin_is_idempotent_for_a_stub_binary() {
@@ -162,9 +281,28 @@ mod tests {
     }
 
     fn write_stub(dir: &Path, version: &str) -> PathBuf {
-        let path = dir.join("agent");
-        std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        install_unique(
+            dir,
+            "agent",
+            format!("#!/bin/sh\necho '{version}'\n").as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_binary_copies_to_a_fresh_path_when_source_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_stub(dir.path(), "stub-busy (test)");
+        let _writer = OpenOptions::new().write(true).open(&path).unwrap();
+        let pin = pin_binary(&path).unwrap();
+        let pinned = PathBuf::from(&pin.abs_path);
+        assert_ne!(
+            pinned,
+            path.canonicalize().unwrap(),
+            "busy source must not be overwritten"
+        );
+        assert_eq!(pin.version, "stub-busy (test)");
+        assert!(pinned.is_file());
     }
 }

@@ -271,6 +271,7 @@ async fn instance_configure_is_journaled_and_persisted() -> Result<()> {
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "model": "haiku",
         "prompt": "configure-me",
         "effort": { "index": 1, "name": "think", "kind": "claude" }
@@ -626,6 +627,7 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "prompt": "hi"
     })
     .to_string();
@@ -931,6 +933,7 @@ async fn follow_uses_cookie_or_header_and_never_query_token() -> Result<()> {
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "prompt": "token-follow"
     })
     .to_string();
@@ -1074,8 +1077,7 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
         "kind": "claude",
         "driver": "claude-print",
         "providerProfileId": "gateway",
-        "delegation": "gateway",
-        "settingsOverlayPath": "~/.claude/settings.relay.json",
+        "delegation": "none",
         "maxBudgetUsd": "0.3",
         "permissionMode": "bypassPermissions",
         "prompt": "persist-delegation"
@@ -1091,8 +1093,9 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
     .await?;
     assert_eq!(status, 200, "{body}");
     let body: Value = serde_json::from_str(body.trim())?;
-    assert_eq!(body["instance"]["delegation"], json!("gateway"));
-    assert_eq!(body["instance"]["providerProfileId"], json!("gateway"));
+    assert_eq!(body["instance"]["delegation"], json!("none"));
+    assert_eq!(body["instance"]["providerProfileId"], json!("none"));
+    assert_eq!(body["instance"]["providerSource"], json!("request"));
     let instance_id = body["instance"]["instanceId"]
         .as_str()
         .context("instanceId")?
@@ -1108,8 +1111,8 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
     .await?;
     assert_eq!(status, 200, "{got}");
     let got: Value = serde_json::from_str(got.trim())?;
-    assert_eq!(got["delegation"], json!("gateway"));
-    assert_eq!(got["providerProfileId"], json!("gateway"));
+    assert_eq!(got["delegation"], json!("none"));
+    assert_eq!(got["providerProfileId"], json!("none"));
 
     let (status, _, listed) = http(
         hub.addr,
@@ -1126,8 +1129,8 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
         .and_then(|items| items.first())
         .cloned()
         .context("listed instance")?;
-    assert_eq!(item["delegation"], json!("gateway"));
-    assert_eq!(item["providerProfileId"], json!("gateway"));
+    assert_eq!(item["delegation"], json!("none"));
+    assert_eq!(item["providerProfileId"], json!("none"));
     Ok(())
 }
 

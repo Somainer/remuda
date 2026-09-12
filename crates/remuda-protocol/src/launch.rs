@@ -54,6 +54,12 @@ pub struct ProviderProfile {
     pub headers: BTreeMap<String, String>,
     /// When true, New Session `delegation=gateway` selects this profile.
     pub default_gateway: bool,
+    /// `universal` or `host:<hostId>` (D-021). Omitted on the wire means universal.
+    #[serde(
+        default = "universal_scope",
+        skip_serializing_if = "is_universal_scope"
+    )]
+    pub scope: String,
     /// Fingerprint/last4 only.
     pub secret: ProviderSecretView,
     /// Create-time.
@@ -77,6 +83,20 @@ pub struct ProviderOverlaySpec {
     /// Extra HTTP headers for the gateway. Empty for direct.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// `universal` or `host:<hostId>` (D-021). Omitted on the wire means universal.
+    #[serde(
+        default = "universal_scope",
+        skip_serializing_if = "is_universal_scope"
+    )]
+    pub scope: String,
+}
+
+fn universal_scope() -> String {
+    "universal".into()
+}
+
+fn is_universal_scope(value: &str) -> bool {
+    value.is_empty() || value == "universal"
 }
 
 /// SettingsOverlay; `protocol.md` §4.1.

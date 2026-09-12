@@ -4,10 +4,11 @@ use crate::AppState;
 use crate::auth::{require_device, require_origin};
 use crate::error::HubError;
 use crate::http::map_store;
-use crate::store::ProviderRecord;
+use crate::provider_resolve::{self, ResolveInput};
+use crate::store::{HostRecord, ProviderRecord};
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use remuda_driver::{FileSecretStore, Secret, fingerprint_secret};
@@ -49,6 +50,8 @@ struct CreateBody {
     auth_token: Option<String>,
     #[serde(default)]
     default_gateway: bool,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -74,17 +77,30 @@ struct PatchBody {
     auth_token: Option<String>,
     #[serde(default)]
     default_gateway: Option<bool>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ListQuery {
+    #[serde(default, rename = "hostId")]
+    host_id: Option<String>,
 }
 
 /// `GET /v1/providers`
 async fn list_providers(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, HubError> {
     require_device(&state.store, &headers).await?;
+    let host_id = query
+        .host_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let items: Vec<Value> = state
         .store
-        .list_providers()
+        .list_providers(host_id)
         .await?
         .iter()
         .map(ProviderRecord::to_json)
@@ -126,6 +142,7 @@ async fn create_provider(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| HubError::BadRequest("authToken is required on create".into()))?;
     let default_gateway = body.default_gateway && kind == "gateway";
+    let scope = validate_scope(&state, body.scope.as_deref()).await?;
     let models = sanitize_models(body.models);
     let default_model = body
         .default_model
@@ -152,6 +169,7 @@ async fn create_provider(
             default_model,
             headers_map,
             default_gateway,
+            scope,
             Some(secret_name.clone()),
             Some(last4),
             Some(fingerprint),
@@ -193,6 +211,10 @@ async fn patch_provider(
     let headers_map = body.headers.map(sanitize_headers).transpose()?;
     let models = body.models.map(sanitize_models);
     let default_gateway = body.default_gateway.map(|flag| flag && kind == "gateway");
+    let scope = match body.scope.as_deref() {
+        Some(raw) => Some(validate_scope(&state, Some(raw)).await?),
+        None => None,
+    };
     let mut secret_last4 = None;
     let mut secret_fingerprint = None;
     let mut secret_name = None;
@@ -226,6 +248,7 @@ async fn patch_provider(
             body.default_model,
             headers_map,
             default_gateway,
+            scope,
             secret_name,
             secret_last4,
             secret_fingerprint,
@@ -280,6 +303,34 @@ async fn test_provider(
     Ok(Json(result))
 }
 
+/// D-021 Claude waterfall for a chosen host, then attach overlay metadata (never the token).
+pub async fn resolve_and_attach(
+    state: &AppState,
+    host: &HostRecord,
+    spec: &mut Value,
+) -> Result<(), HubError> {
+    strip_provider_secrets(spec);
+    let kind = spec.get("kind").and_then(Value::as_str).unwrap_or("claude");
+    if kind != "claude" {
+        return attach_provider_to_spec(state, spec).await;
+    }
+    let profiles = state.store.list_providers(None).await?;
+    let delegation = spec.get("delegation").and_then(Value::as_str);
+    let provider_profile_id = spec.get("providerProfileId").and_then(Value::as_str);
+    match provider_resolve::resolve(ResolveInput {
+        host,
+        profiles: &profiles,
+        delegation,
+        provider_profile_id,
+    }) {
+        Ok(resolved) => {
+            provider_resolve::apply_to_spec(spec, &resolved);
+            Ok(())
+        }
+        Err(reasons) => Err(provider_resolve::unsatisfiable(reasons)),
+    }
+}
+
 /// Attach a public overlay snapshot to an instance spec (never the token).
 pub async fn attach_provider_to_spec(state: &AppState, spec: &mut Value) -> Result<(), HubError> {
     strip_provider_secrets(spec);
@@ -311,8 +362,16 @@ pub async fn attach_provider_to_spec(state: &AppState, spec: &mut Value) -> Resu
 }
 
 /// Inject `providerAuthToken` into Node RPC params. Do not persist or log the return.
-pub async fn with_launch_secret(state: &AppState, mut params: Value) -> Result<Value, HubError> {
+pub async fn with_launch_secret(
+    state: &AppState,
+    host_id: &str,
+    mut params: Value,
+) -> Result<Value, HubError> {
     let spec = params.get("spec").unwrap_or(&params);
+    let delegation = spec.get("delegation").and_then(Value::as_str).unwrap_or("");
+    if delegation == "none" {
+        return Ok(params);
+    }
     let profile_id = spec
         .get("providerProfileId")
         .and_then(Value::as_str)
@@ -330,6 +389,9 @@ pub async fn with_launch_secret(state: &AppState, mut params: Value) -> Result<V
     let Some(profile) = state.store.get_provider(profile_id).await? else {
         return Ok(params);
     };
+    if !provider_resolve::secret_release_allowed(&profile, host_id) {
+        return Err(HubError::Forbidden);
+    }
     let secret = load_secret(&state.secrets, &profile)?;
     let token = secret
         .expose_str()
@@ -351,8 +413,7 @@ async fn resolve_profile_for_launch(
     delegation: &str,
     requested: Option<&str>,
 ) -> Result<Option<ProviderRecord>, HubError> {
-    let alias = requested
-        .filter(|id| *id != "none" && *id != "native" && *id != "gateway" && *id != "direct");
+    let alias = requested.filter(|id| provider_resolve::is_real_profile_id(id));
     if let Some(id) = alias {
         return Ok(Some(
             state
@@ -363,13 +424,24 @@ async fn resolve_profile_for_launch(
         ));
     }
     if delegation == "gateway" {
-        return Ok(state.store.default_gateway().await?);
+        return Ok(state.store.default_gateway("universal".into()).await?);
     }
     if delegation == "direct" {
-        let items = state.store.list_providers().await?;
+        let items = state.store.list_providers(None).await?;
         return Ok(items.into_iter().find(|p| p.kind == "direct"));
     }
     Ok(None)
+}
+
+async fn validate_scope(state: &AppState, raw: Option<&str>) -> Result<String, HubError> {
+    let scope = provider_resolve::normalize_scope(raw.unwrap_or("universal"))
+        .map_err(HubError::BadRequest)?;
+    if let Some(host_id) = scope.strip_prefix("host:")
+        && state.store.get_host(host_id.to_string()).await?.is_none()
+    {
+        return Err(HubError::BadRequest(format!("unknown host {host_id}")));
+    }
+    Ok(scope)
 }
 
 fn load_secret(store: &FileSecretStore, profile: &ProviderRecord) -> Result<Secret, HubError> {

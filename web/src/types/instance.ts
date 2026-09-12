@@ -46,6 +46,8 @@ export type Instance = EntityMeta & {
   name?: string | null;
   delegation?: string | null;
   providerProfileId?: string | null;
+  providerSource?: string | null;
+  providerSourceHint?: string | null;
   model?: string | null;
   effortName?: string | null;
   effortIndex?: number | null;
@@ -81,6 +83,8 @@ export type Host = EntityMeta & {
   herdr?: { version?: string; socket?: string; path?: string };
   nodeVersion?: string;
   instanceCount?: number;
+  /** `auto` | `native` | `profile:<id>` */
+  providerBinding?: string;
   online?: boolean;
 };
 

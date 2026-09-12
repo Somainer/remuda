@@ -28,7 +28,7 @@
 3. Claude Code 的结构化事件来源：hooks（stdin JSON）+ `~/.claude/projects/<cwd>/<sid>.jsonl`（append-only，可 tail）+ `subagents/workflows/wf_*/journal.jsonl`；本机 Flux Island / Orca / herdr 已经同时挂在 hooks 上，证明「PTY 保真 + hooks/jsonl 取结构」成立。
 4. Claude Code 自带 `--bg` 后台会话、`claude agents/attach/logs`、每进程 messaging socket（`/tmp/cc-socks/<pid>.sock`）——正在实测（claude-control-plane.md）。
 5. 官方 Remote Control 绑定 Anthropic 账号 + claude.ai UI，不能当我们的协议；只能作备选通道。
-6. 网关模式：`claude --settings settings.relay.json`（`ANTHROPIC_BASE_URL` + `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` + `model: passthrough/…`）已在本机跑通；本机 astergate 常驻 `127.0.0.1:18481`。
+6. 网关模式：`claude --settings <overlay>`（`ANTHROPIC_BASE_URL` + `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` + `model: passthrough/…`）已在本机跑通；本机 astergate 常驻 `127.0.0.1:18481`。
 7. Codex：`codex app-server`（JSON-RPC，stdio / unix / ws）是 VS Code 扩展同款控制面，含 thread/turn/approval/steer/interrupt；`codex exec --json` 一次性。grok：**原生 ACP**（`grok agent stdio|serve`）。agy：`-p --output-format stream-json`，无 ACP。
 8. herdr socket API：102 方法 + 29 事件（`agent.start/prompt/wait`、`pane.read/send_keys/wait_for_output`、`events.subscribe`、`worktree.*`、`layout.apply`），protocol 22，socket `~/.config/herdr/herdr.sock`。herdrx 已证明「Go server + React PWA 远程驱动 herdr」形态可行。
 9. hooks：`--settings` 是叠加合并（flagSettings 覆盖在 userSettings 之上），relay 模式完整继承 settings.json 的 hooks；`PermissionRequest` hook 可以**阻塞等待外部决策**（VibeBuddy 用 `nc -w 595 -U sock` 已验证）→ 手机/飞书远程审批可以走 hook 通道；Codex hooks 需要 `config.toml` 里 `trusted_hash` 同步；grok 是 drop-in `~/.grok/hooks/*.json`。（hooks-integrations.md）

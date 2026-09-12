@@ -64,6 +64,7 @@ export async function runBootstrap(
     labels: [],
     maxInstances: 4,
     instanceCount: 0,
+    providerBinding: "auto",
   };
 }
 

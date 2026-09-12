@@ -161,6 +161,12 @@ export function SessionPage({
           <span data-testid="session-delegation">{instance.delegation ?? "none"}</span>
           <span className={session.dotSep}>·</span>
           <span data-testid="session-provider">{instance.providerProfileId ?? "none"}</span>
+          {instance.providerSourceHint ? (
+            <>
+              <span className={session.dotSep}>·</span>
+              <span data-testid="session-provider-source">{instance.providerSourceHint}</span>
+            </>
+          ) : null}
           <span className={session.dotSep}>·</span>
           <span data-testid="session-lifecycle">{instance.lifecycle}</span>
           <span className={session.dotSep}>·</span>

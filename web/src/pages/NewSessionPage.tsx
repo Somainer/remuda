@@ -9,9 +9,9 @@ import {
   PTY_YOLO_FLAGS,
   YOLO_ACK,
   YOLO_HINT,
-  claudeProviderHint,
   normalizeDelegation,
   normalizePermissionMode,
+  providerLaunchHint,
   providerProfileForDelegation,
   ptyYoloHint,
   type DelegationId,
@@ -83,10 +83,10 @@ export function NewSessionPage() {
 
   useEffect(() => {
     void api
-      .providerList()
+      .providerList(hostId ? { hostId } : undefined)
       .then((page) => setGatewayProfiles(page.items.map(fromHub).filter((p) => p.delegation === "gateway")))
       .catch(() => setGatewayProfiles([]));
-  }, []);
+  }, [hostId]);
 
   const defaultGateway = defaultGatewayProfile(gatewayProfiles);
 
@@ -130,7 +130,14 @@ export function NewSessionPage() {
   const activeKind: CreateKind = kindEnabled(kind)
     ? kind
     : (KINDS.find((item) => kindEnabled(item.id))?.id ?? "claude");
-  const claudeHint = claudeProviderHint(activeKind, hostView?.cli ?? host?.cli);
+  const claudeHint = providerLaunchHint({
+    kind: activeKind,
+    binding: hostView?.providerBinding ?? host?.providerBinding,
+    cli: hostView?.cli ?? host?.cli,
+    profiles: gatewayProfiles,
+    delegation,
+    explicitProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
+  });
   const plainTerminal = activeKind === "terminal";
   const driver: DriverKind = plainTerminal
     ? "shell-pty"
@@ -173,7 +180,7 @@ export function NewSessionPage() {
               model,
               providerProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
               permissionMode: activeKind === "claude" ? permissionMode : "bypassPermissions",
-              delegation,
+              delegation: delegation === "host" ? undefined : delegation,
               prompt,
               cwd,
               worktree,
@@ -541,7 +548,7 @@ export function NewSessionPage() {
           {offline ? <p className={css.hint}>主机离线，不能开始。</p> : null}
         </div>
         <footer className={css.foot}>
-          <div className={css.footNote}>Provider {delegation === "gateway" ? "gateway" : "none"} · 默认全填上次成功值</div>
+          <div className={css.footNote}>Provider {delegation === "host" ? "跟随主机" : delegation} · 默认全填上次成功值</div>
           <button type="button" className={css.cancel} onClick={close}>
             取消
           </button>

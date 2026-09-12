@@ -2635,6 +2635,7 @@ export type ProviderOverlaySpec = ({
   "kind": ProviderProfileKind;
   "model": (string);
   "profileId": Id;
+  "scope"?: (string);
   [key: string]: unknown;
 });
 
@@ -2652,6 +2653,7 @@ export type ProviderProfile = ({
   "models": (((string))[]);
   "name": (string);
   "revision": U64;
+  "scope"?: (string);
   "secret": ProviderSecretView;
   "updatedAt": Timestamp;
   [key: string]: unknown;

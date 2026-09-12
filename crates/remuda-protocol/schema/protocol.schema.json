@@ -11637,6 +11637,10 @@
         "profileId": {
           "$ref": "#/$defs/Id",
           "description": "Profile identity (`pvp_` prefix)."
+        },
+        "scope": {
+          "description": "`universal` or `host:<hostId>` (D-021). Omitted on the wire means universal.",
+          "type": "string"
         }
       },
       "required": [
@@ -11700,6 +11704,10 @@
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "Monotonic revision; increments on PATCH (including token rotate)."
+        },
+        "scope": {
+          "description": "`universal` or `host:<hostId>` (D-021). Omitted on the wire means universal.",
+          "type": "string"
         },
         "secret": {
           "$ref": "#/$defs/ProviderSecretView",

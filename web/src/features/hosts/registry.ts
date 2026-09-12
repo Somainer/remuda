@@ -68,6 +68,7 @@ class HostRegistry {
             labels: host.labels?.length ? host.labels : extra.labels,
             maxInstances: host.maxInstances ?? extra.maxInstances,
             hostname: host.hostname ?? extra.hostname,
+            providerBinding: host.providerBinding ?? extra.providerBinding ?? "auto",
           }
         : {
             id: host.id,
@@ -85,6 +86,7 @@ class HostRegistry {
             maxInstances: host.maxInstances ?? 8,
             instanceCount: 0,
             herdr: host.herdr,
+            providerBinding: host.providerBinding ?? "auto",
           };
       const count = instances.filter((i) => i.hostId === host.id).length;
       out.push({

@@ -46,6 +46,8 @@ export type HostView = {
   maxInstances: number;
   instanceCount: number;
   herdr?: { version?: string; socket?: string; path?: string };
+  /** `auto` | `native` | `profile:<id>` */
+  providerBinding: string;
 };
 
 export type Placement =

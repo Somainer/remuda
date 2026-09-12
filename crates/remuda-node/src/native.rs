@@ -14,9 +14,9 @@ use remuda_driver::{
 use remuda_protocol::{
     ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode, ClaudePermission,
     ClaudePermissionMode, CompletionScope, ContentBlock, DriverInput, DriverKind,
-    HerdrRepresentation, HerdrServer, Id, InputOrigin, InstanceSpec, InteractionAnswer, NativeHome,
-    NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend, PtyCarrier,
-    SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
+    HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceSpec, InteractionAnswer,
+    NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend,
+    PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -482,6 +482,9 @@ fn resolve_claude_overlay(
     if matches!(kind, DriverKind::GenericPty | DriverKind::ShellPty) {
         return Ok(None);
     }
+    if let Some(overlay) = request.provider_overlay.as_ref() {
+        refuse_host_scoped_overlay(overlay, request.host_id.as_ref())?;
+    }
     let user = request
         .settings_overlay_path
         .as_deref()
@@ -492,6 +495,9 @@ fn resolve_claude_overlay(
     if delegation != Delegation::Gateway {
         return Ok(user);
     }
+    if let Some(path) = try_write_delivered_overlay(request, launch_dir)? {
+        return Ok(Some(path));
+    }
     match try_write_generated_gateway_overlay(profile, launch_dir, &request.model) {
         Ok(path) => Ok(Some(path)),
         Err(_) => user
@@ -500,6 +506,82 @@ fn resolve_claude_overlay(
             })
             .map(Some),
     }
+}
+
+fn refuse_host_scoped_overlay(
+    overlay: &serde_json::Value,
+    host_id: Option<&HostId>,
+) -> Result<(), DriverError> {
+    let Some(scope) = overlay.get("scope").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let Some(wanted) = scope.strip_prefix("host:") else {
+        return Ok(());
+    };
+    let got = host_id.map(|id| id.as_id().as_str()).unwrap_or("");
+    if got != wanted {
+        return Err(DriverError::Failed(format!(
+            "host-scoped provider {scope} cannot be used on host {got}"
+        )));
+    }
+    Ok(())
+}
+
+fn try_write_delivered_overlay(
+    request: &crate::CreateInstanceRequest,
+    launch_dir: &Path,
+) -> Result<Option<PathBuf>, DriverError> {
+    let Some(overlay) = request.provider_overlay.as_ref() else {
+        return Ok(None);
+    };
+    let Some(token) = request
+        .provider_auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let base_url = overlay
+        .get("baseUrl")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let model = overlay
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(request.model.as_str());
+    let extra = overlay
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_str().map(|value| (k.clone(), value.to_string())))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let secret = Secret::new(token.as_bytes().to_vec());
+    let kind = overlay
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("gateway");
+    let delegation = if kind == "direct" {
+        Delegation::Direct
+    } else {
+        Delegation::Gateway
+    };
+    write_claude_provider_overlay(
+        launch_dir,
+        &ClaudeProviderOverlay {
+            delegation,
+            base_url,
+            model,
+            secret: &secret,
+            extra_env: &extra,
+        },
+    )
+    .map(Some)
+    .map_err(map_driver_error)
 }
 
 fn try_write_generated_gateway_overlay(
@@ -735,6 +817,8 @@ mod tests {
                 settings_overlay_path: None,
                 claude_config_dir: None,
                 max_budget_usd: None,
+                provider_overlay: None,
+                provider_auth_token: None,
             };
             let driver = registry
                 .build(
@@ -792,6 +876,8 @@ mod tests {
             settings_overlay_path: None,
             claude_config_dir: None,
             max_budget_usd: None,
+            provider_overlay: None,
+            provider_auth_token: None,
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -804,7 +890,7 @@ mod tests {
     #[test]
     fn gateway_falls_back_to_user_overlay_when_generated_overlay_is_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let overlay = dir.path().join("settings.relay.json");
+        let overlay = dir.path().join("settings.overlay.json");
         std::fs::write(&overlay, r#"{"model":"example"}"#).expect("overlay");
         let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
             .expect("registry");
@@ -832,6 +918,8 @@ mod tests {
             settings_overlay_path: Some(overlay.to_string_lossy().into_owned()),
             claude_config_dir: None,
             max_budget_usd: None,
+            provider_overlay: None,
+            provider_auth_token: None,
         };
         registry
             .build(
@@ -874,6 +962,8 @@ mod tests {
             settings_overlay_path: None,
             claude_config_dir: None,
             max_budget_usd: None,
+            provider_overlay: None,
+            provider_auth_token: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -890,15 +980,70 @@ mod tests {
     }
 
     #[test]
+    fn host_scoped_overlay_is_refused_on_the_wrong_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
+            .expect("registry");
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePrint,
+        )
+        .expect("instance");
+        let request = crate::CreateInstanceRequest {
+            command_id: None,
+            instance_id: Some(instance.meta.id.clone()),
+            host_id: Some(instance.host_id.clone()),
+            workspace_id: Some(instance.workspace_id.clone()),
+            kind: AgentKind::Claude,
+            driver: DriverKind::ClaudePrint,
+            model: "haiku".into(),
+            args: Vec::new(),
+            provider_profile_id: "pvp_other".into(),
+            permission_mode: "dontAsk".into(),
+            prompt: String::new(),
+            cwd: None,
+            delegation: Some("gateway".into()),
+            settings_overlay_path: None,
+            claude_config_dir: None,
+            max_budget_usd: None,
+            provider_overlay: Some(serde_json::json!({
+                "profileId": "pvp_other",
+                "kind": "gateway",
+                "baseUrl": "http://127.0.0.1:1",
+                "model": "haiku",
+                "scope": "host:hst_other"
+            })),
+            provider_auth_token: Some("sk-fake-host-scoped".into()),
+        };
+        let error = match registry.build(
+            DriverKind::ClaudePrint,
+            DriverLaunch {
+                instance,
+                request,
+                workspace_root: dir.path().to_path_buf(),
+            },
+        ) {
+            Ok(_) => panic!("wrong-host scoped overlay must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("host-scoped provider"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn overlay_tilde_expands_and_missing_file_fails_closed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let overlay = dir.path().join("settings.relay.json");
+        let overlay = dir.path().join("settings.overlay.json");
         std::fs::write(&overlay, r#"{"model":"example"}"#).expect("overlay");
         let resolved = resolve_overlay_path(overlay.to_str().expect("utf8")).expect("exists");
         assert_eq!(resolved, overlay);
-        let expanded = expand_host_path("~/settings.relay.json");
+        let expanded = expand_host_path("~/settings.overlay.json");
         assert!(expanded.is_absolute());
-        assert!(expanded.ends_with("settings.relay.json"));
+        assert!(expanded.ends_with("settings.overlay.json"));
         let missing = dir.path().join("missing-overlay.json");
         let error = resolve_overlay_path(missing.to_str().expect("utf8")).expect_err("missing");
         assert!(error.to_string().contains("does not exist"), "{error}");

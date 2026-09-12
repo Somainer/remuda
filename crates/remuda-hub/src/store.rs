@@ -147,6 +147,17 @@ pub struct HostRecord {
     /// Latest SSH preflight/connection error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Provider binding: `auto` | `native` | `profile:<id>` (D-021).
+    #[serde(default = "default_provider_binding")]
+    pub provider_binding: String,
+}
+
+fn default_provider_binding() -> String {
+    "auto".into()
+}
+
+fn default_provider_scope() -> String {
+    "universal".into()
 }
 
 /// Instance index row.
@@ -183,6 +194,12 @@ pub struct InstanceRecord {
     /// Provider profile id persisted from the create spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_profile_id: Option<String>,
+    /// How the create path chose native vs a Hub profile (D-021).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_source: Option<String>,
+    /// Operator-facing source line (`将使用 …` / `使用主机原生登录`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_source_hint: Option<String>,
     /// Current model id from create / `instance.configure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -325,6 +342,9 @@ pub struct ProviderRecord {
     pub headers: BTreeMap<String, String>,
     /// New Session `delegation=gateway` selects this profile.
     pub default_gateway: bool,
+    /// `universal` or `host:<hostId>` (D-021).
+    #[serde(default = "default_provider_scope")]
+    pub scope: String,
     /// Monotonic revision.
     pub revision: i64,
     /// Vault key (`provider-<id>`); omitted from GET JSON.
@@ -365,6 +385,11 @@ impl ProviderRecord {
             "defaultModel": self.default_model,
             "headers": self.headers,
             "defaultGateway": self.default_gateway,
+            "scope": if self.scope.is_empty() {
+                "universal".to_string()
+            } else {
+                self.scope.clone()
+            },
             "revision": self.revision.to_string(),
             "secret": {
                 "present": self.secret_present,
@@ -395,6 +420,11 @@ impl ProviderRecord {
             "baseUrl": self.base_url,
             "model": model,
             "headers": self.headers,
+            "scope": if self.scope.is_empty() {
+                "universal".to_string()
+            } else {
+                self.scope.clone()
+            },
         })
     }
 }
@@ -1364,13 +1394,14 @@ impl Store {
         .await
     }
 
-    /// Operator PATCH of labels / maxInstances / display name (does not mark online).
+    /// Operator PATCH of labels / maxInstances / display name / provider binding (does not mark online).
     pub async fn patch_host(
         &self,
         host_id: String,
         name: Option<String>,
         labels: Option<Value>,
         max_instances: Option<i64>,
+        provider_binding: Option<String>,
     ) -> Result<HostRecord, StoreError> {
         self.run(move |conn| {
             if load_host(conn, &host_id)?.is_none() {
@@ -1392,6 +1423,12 @@ impl Store {
                 conn.execute(
                     "UPDATE hosts SET max_instances = ?1 WHERE id = ?2",
                     params![max_instances, host_id],
+                )?;
+            }
+            if let Some(provider_binding) = provider_binding {
+                conn.execute(
+                    "UPDATE hosts SET provider_binding = ?1 WHERE id = ?2",
+                    params![provider_binding, host_id],
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
@@ -1543,19 +1580,37 @@ impl Store {
         .await
     }
 
-    /// List provider profiles (metadata only).
-    pub async fn list_providers(&self) -> Result<Vec<ProviderRecord>, StoreError> {
+    /// List provider profiles (metadata only). `host_id` returns universal + that host's scoped rows.
+    pub async fn list_providers(
+        &self,
+        host_id: Option<String>,
+    ) -> Result<Vec<ProviderRecord>, StoreError> {
         self.run(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
-                        is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                        last_test_ok, last_test_at, last_test_message, created_at, updated_at
-                 FROM provider_profiles
-                 ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
-            )?;
-            let rows = stmt.query_map([], load_provider_row)?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(StoreError::from)
+            if let Some(host_id) = host_id {
+                let host_scope = format!("host:{host_id}");
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
+                            is_default, revision, secret_name, secret_last4, secret_fingerprint,
+                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                     FROM provider_profiles
+                     WHERE scope = 'universal' OR scope = '' OR scope = ?1
+                     ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
+                )?;
+                let rows = stmt.query_map(params![host_scope], load_provider_row)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
+                            is_default, revision, secret_name, secret_last4, secret_fingerprint,
+                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                     FROM provider_profiles
+                     ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([], load_provider_row)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StoreError::from)
+            }
         })
         .await
     }
@@ -1565,13 +1620,18 @@ impl Store {
         self.run(move |conn| load_provider(conn, &id)).await
     }
 
-    /// The profile marked default gateway, if any.
-    pub async fn default_gateway(&self) -> Result<Option<ProviderRecord>, StoreError> {
+    /// The profile marked default gateway in `scope` (`universal` or `host:<id>`).
+    pub async fn default_gateway(
+        &self,
+        scope: String,
+    ) -> Result<Option<ProviderRecord>, StoreError> {
         self.run(move |conn| {
             let id: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM provider_profiles WHERE is_default = 1 AND kind = 'gateway' LIMIT 1",
-                    [],
+                    "SELECT id FROM provider_profiles
+                     WHERE is_default = 1 AND kind = 'gateway' AND (scope = ?1 OR (?1 = 'universal' AND (scope = '' OR scope IS NULL)))
+                     LIMIT 1",
+                    params![scope],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -1595,6 +1655,7 @@ impl Store {
         default_model: Option<String>,
         headers: BTreeMap<String, String>,
         default_gateway: bool,
+        scope: String,
         secret_name: Option<String>,
         secret_last4: Option<String>,
         secret_fingerprint: Option<String>,
@@ -1603,16 +1664,16 @@ impl Store {
             let now = now_rfc3339();
             if default_gateway {
                 conn.execute(
-                    "UPDATE provider_profiles SET is_default = 0 WHERE is_default = 1",
-                    [],
+                    "UPDATE provider_profiles SET is_default = 0 WHERE is_default = 1 AND scope = ?1",
+                    params![scope],
                 )?;
             }
             conn.execute(
                 "INSERT INTO provider_profiles
                  (id, name, kind, base_url, models_json, default_model, headers_json,
                   is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                  created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12)",
+                  created_at, updated_at, scope)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13)",
                 params![
                     id,
                     name,
@@ -1626,6 +1687,7 @@ impl Store {
                     secret_last4,
                     secret_fingerprint,
                     now,
+                    scope,
                 ],
             )?;
             load_provider(conn, &id)?
@@ -1646,18 +1708,20 @@ impl Store {
         default_model: Option<Option<String>>,
         headers: Option<BTreeMap<String, String>>,
         default_gateway: Option<bool>,
+        scope: Option<String>,
         secret_name: Option<Option<String>>,
         secret_last4: Option<Option<String>>,
         secret_fingerprint: Option<Option<String>>,
     ) -> Result<ProviderRecord, StoreError> {
         self.run(move |conn| {
-            if load_provider(conn, &id)?.is_none() {
-                return Err(StoreError::Id("unknown provider".into()));
-            }
-            if default_gateway == Some(true) {
+            let existing = load_provider(conn, &id)?
+                .ok_or_else(|| StoreError::Id("unknown provider".into()))?;
+            let next_scope = scope.clone().unwrap_or_else(|| existing.scope.clone());
+            let next_default = default_gateway.unwrap_or(existing.default_gateway);
+            if next_default {
                 conn.execute(
-                    "UPDATE provider_profiles SET is_default = 0 WHERE is_default = 1 AND id != ?1",
-                    params![id],
+                    "UPDATE provider_profiles SET is_default = 0 WHERE is_default = 1 AND scope = ?1 AND id != ?2",
+                    params![next_scope, id],
                 )?;
             }
             if let Some(name) = name {
@@ -1700,6 +1764,12 @@ impl Store {
                 conn.execute(
                     "UPDATE provider_profiles SET is_default = ?1 WHERE id = ?2",
                     params![i64::from(default_gateway), id],
+                )?;
+            }
+            if let Some(scope) = scope {
+                conn.execute(
+                    "UPDATE provider_profiles SET scope = ?1 WHERE id = ?2",
+                    params![scope, id],
                 )?;
             }
             if let Some(secret_name) = secret_name {
@@ -1770,7 +1840,7 @@ fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderRecord>, 
     conn.query_row(
         "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                 is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                last_test_ok, last_test_at, last_test_message, created_at, updated_at
+                last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
          FROM provider_profiles WHERE id = ?1",
         params![id],
         load_provider_row,
@@ -1786,6 +1856,10 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
     let headers: BTreeMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
     let secret_name: Option<String> = row.get(9)?;
     let last_test_ok: Option<i64> = row.get(12)?;
+    let scope: String = row
+        .get::<_, Option<String>>(17)?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "universal".into());
     Ok(ProviderRecord {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -1805,6 +1879,7 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         last_test_message: row.get(14)?,
         created_at: row.get(15)?,
         updated_at: row.get(16)?,
+        scope,
     })
 }
 
@@ -1974,6 +2049,18 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "INTEGER NOT NULL DEFAULT 8",
     )?;
     ensure_column(&conn, "hosts", "hostname", "TEXT")?;
+    ensure_column(
+        &conn,
+        "hosts",
+        "provider_binding",
+        "TEXT NOT NULL DEFAULT 'auto'",
+    )?;
+    ensure_column(
+        &conn,
+        "provider_profiles",
+        "scope",
+        "TEXT NOT NULL DEFAULT 'universal'",
+    )?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
@@ -2804,7 +2891,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
     let row = conn
         .query_row(
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
-                    labels_json, herdr_json, resources_json, max_instances, hostname
+                    labels_json, herdr_json, resources_json, max_instances, hostname, provider_binding
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -2822,6 +2909,9 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, i64>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "auto".into()),
                 ))
             },
         )
@@ -2840,6 +2930,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         resources_json,
         max_instances,
         hostname,
+        provider_binding,
     )) = row
     else {
         return Ok(None);
@@ -2890,6 +2981,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         resources: resources_json.and_then(|raw| serde_json::from_str(&raw).ok()),
         max_instances,
         hostname,
+        provider_binding,
     }))
 }
 
@@ -2921,6 +3013,14 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .map(str::to_string);
             let provider_profile_id = spec
                 .get("providerProfileId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let provider_source = spec
+                .get("providerSource")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let provider_source_hint = spec
+                .get("providerSourceHint")
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let model = spec
@@ -2960,6 +3060,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 cwd,
                 delegation,
                 provider_profile_id,
+                provider_source,
+                provider_source_hint,
                 model,
                 effort_name,
                 effort_index,

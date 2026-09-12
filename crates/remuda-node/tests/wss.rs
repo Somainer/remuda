@@ -172,6 +172,7 @@ async fn wss_hello_heartbeat_append_reconnect_against_hub() {
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "prompt": "do not replay"
     })
     .to_string();
@@ -730,8 +731,6 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
     use std::time::Duration;
 
     let dir = tempfile::tempdir().expect("tmp");
-    let overlay = dir.path().join("settings.relay.json");
-    std::fs::write(&overlay, r#"{"model":"passthrough/example-model"}"#).expect("overlay");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
 
@@ -765,16 +764,35 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
         .expect("connect timeout")
         .expect("wss runtime connect");
     let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+    let provider = json!({
+        "name": "dummy-gateway",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "authToken": "sk-fake-test-gateway-token",
+        "defaultGateway": true
+    })
+    .to_string();
+    let (status, created_provider) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &[("Cookie", cookie.as_str())],
+        Some(&provider),
+    )
+    .await;
+    assert_eq!(status, 200, "{created_provider}");
+    let created_provider: Value =
+        serde_json::from_str(created_provider.trim()).expect("provider json");
+    let profile_id = created_provider["id"].as_str().expect("provider id");
 
     let request = json!({
         "hostId": host_id,
         "kind": "claude",
         "driver": "claude-print",
         "model": "fake",
-        "providerProfileId": "gateway",
+        "providerProfileId": profile_id,
         "permissionMode": "bypassPermissions",
         "delegation": "gateway",
-        "settingsOverlayPath": overlay.to_string_lossy(),
         "maxBudgetUsd": "0.3",
         "prompt": "hello"
     })
@@ -797,7 +815,7 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
         .as_str()
         .expect("instanceId");
     assert_eq!(created["instance"]["delegation"], json!("gateway"));
-    assert_eq!(created["instance"]["providerProfileId"], json!("gateway"));
+    assert_eq!(created["instance"]["providerProfileId"], json!(profile_id));
 
     let instance_id = InstanceId::try_from(instance_id.to_owned()).expect("instance id");
     let recipe = tokio::time::timeout(Duration::from_secs(20), async {
@@ -837,11 +855,8 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
         remuda_driver::Delegation::Gateway
     );
     assert!(
-        recipe
-            .argv
-            .windows(2)
-            .any(|pair| pair[0] == "--settings" && pair[1] == overlay.to_string_lossy()),
-        "WSS launch must keep the overlay: {:?}",
+        recipe.argv.windows(2).any(|pair| pair[0] == "--settings"),
+        "WSS launch must write a gateway overlay: {:?}",
         recipe.argv
     );
     assert!(

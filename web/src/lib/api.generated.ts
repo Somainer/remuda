@@ -645,6 +645,8 @@ export interface components {
             labels?: string[];
             maxInstances?: number;
             name?: string;
+            /** @description auto | native | profile:<id> */
+            providerBinding?: string;
         };
         HostView: {
             capabilities?: {
@@ -667,6 +669,8 @@ export interface components {
             name?: string;
             nodeVersion?: string | null;
             online: boolean;
+            /** @description auto | native | profile:<id> */
+            providerBinding?: string;
             resources?: {
                 [key: string]: unknown;
             } | null;
@@ -742,6 +746,8 @@ export interface components {
             model?: string | null;
             name?: string | null;
             providerProfileId?: string | null;
+            providerSource?: string | null;
+            providerSourceHint?: string | null;
             title?: string | null;
             updatedAt?: string;
             workspaceId?: string | null;
@@ -801,6 +807,8 @@ export interface components {
             kind?: "gateway" | "direct";
             models?: string[];
             name: string;
+            /** @description universal or host:<hostId> */
+            scope?: string;
         };
         ProviderHealth: {
             checkedAt?: string | null;
@@ -826,6 +834,8 @@ export interface components {
             kind?: "gateway" | "direct";
             models?: string[];
             name?: string;
+            /** @description universal or host:<hostId> */
+            scope?: string;
         };
         ProviderProfile: {
             baseUrl: string;
@@ -842,6 +852,8 @@ export interface components {
             models: string[];
             name: string;
             revision: string;
+            /** @description universal or host:<hostId> */
+            scope?: string;
             secret: components["schemas"]["ProviderSecretView"];
             updatedAt?: string;
         };
@@ -1682,7 +1694,10 @@ export interface operations {
     };
     providerList: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description When set, returns universal profiles plus host-scoped profiles for this host. */
+                hostId?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;

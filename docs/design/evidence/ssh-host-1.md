@@ -54,8 +54,8 @@ remote had no Codex credential file and no Grok executable. As requested, this
 authentication block was recorded and local Codex credentials were not migrated.
 The instance was stopped and the host was removed through the browser.
 
-The user then authorized the gateway URL and key in the local
-`$HOME/.claude/settings.relay.json`, and requested model discovery instead of
+The user then authorized the gateway URL and key in a local Claude
+settings overlay, and requested model discovery instead of
 Haiku. The remote had no file at the same relative path. The cited local file's
 URL and key were sent over SSH stdin to the remote probe; neither was printed.
 Both `/models` and `/v1/models` returned HTTP 200 with these model IDs:

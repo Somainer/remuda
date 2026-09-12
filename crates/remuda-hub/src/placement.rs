@@ -222,12 +222,6 @@ fn consider(
             host.host_id
         ));
     }
-    if spec.delegation.as_deref() == Some("gateway") && !has_gateway_egress(host) {
-        return Err(format!(
-            "{}: gateway profile requires label egress:gateway",
-            host.host_id
-        ));
-    }
     Ok(())
 }
 
@@ -259,10 +253,6 @@ fn has_herdr(host: &HostRecord) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty())
     })
-}
-
-fn has_gateway_egress(host: &HostRecord) -> bool {
-    host_has_label(host, "egress=gateway") || host_has_label(host, "egress:gateway")
 }
 
 /// Fields for [`spawn_on_host`].
@@ -432,6 +422,7 @@ mod tests {
             resources: None,
             max_instances: max,
             hostname: None,
+            provider_binding: "auto".into(),
         }
     }
 

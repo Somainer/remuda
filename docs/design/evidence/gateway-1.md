@@ -1,10 +1,10 @@
 # Gateway 1
 
-Date: 2026-09-13. Isolated `remuda dev` on hub `127.0.0.1:58080` and node `127.0.0.1:58787` (not the live demo ports). Cookie Secure off. Access code was a local test file (value not recorded). Data dir was a throwaway folder (not committed). Overlay path was `~/.claude/settings.relay.json` (contents not logged).
+Date: 2026-09-13. Isolated `remuda dev` on hub `127.0.0.1:58080` and node `127.0.0.1:58787` (not the live demo ports). Cookie Secure off. Access code was a local test file (value not recorded). Data dir was a throwaway folder (not committed). Overlay path was a local settings file (contents not logged).
 
 Screenshots:
 
-- [gateway-1-gateway.png](./gateway-1-gateway.png) — New Session `kind=claude`, `driver=claude-print`, Provider=gateway, permission=bypassPermissions, overlay `~/.claude/settings.relay.json`
+- [gateway-1-gateway.png](./gateway-1-gateway.png) — New Session `kind=claude`, `driver=claude-print`, Provider=gateway, permission=bypassPermissions
 - [gateway-1-none.png](./gateway-1-none.png) — same form with Provider=none and inherited host login (`haiku`, `--max-budget-usd 0.3`)
 
 ## Placement

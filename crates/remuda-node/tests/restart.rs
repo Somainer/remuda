@@ -36,6 +36,8 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         settings_overlay_path: None,
         claude_config_dir: None,
         max_budget_usd: None,
+        provider_overlay: None,
+        provider_auth_token: None,
     }
 }
 

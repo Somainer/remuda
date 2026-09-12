@@ -85,6 +85,8 @@ pub(crate) enum InstanceCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
+    /// List pending prompts, or reply with --option, --text, or --answer JSON.
+    Respond(super::instance_interaction::RespondOpts),
     /// Poll until idle, done, blocked, or a journal line matches.
     Wait {
         /// Instance id (`ins_…`) or name.
@@ -231,6 +233,10 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                     "cli",
                 )
                 .await?;
+                print_json(&value)
+            }
+            InstanceCommand::Respond(opts) => {
+                let value = super::instance_interaction::respond(&client, opts).await?;
                 print_json(&value)
             }
             InstanceCommand::Wait {
@@ -754,9 +760,13 @@ pub(crate) fn until_met(
                 || lifecycle.is_some_and(|life| matches!(life, "closed" | "failed" | "terminated"))
         }
         "blocked" => {
-            activity.is_some_and(|a| a.eq_ignore_ascii_case("blocked"))
-                || lifecycle.is_some_and(|life| life.eq_ignore_ascii_case("blocked"))
-                || events.iter().any(event_is_interaction)
+            // A historical requested/answered event cannot satisfy a current
+            // blocked wait once the authoritative snapshot says idle.
+            activity
+                .map(|a| matches!(a, "blocked" | "waiting-interaction"))
+                .unwrap_or_else(|| {
+                    lifecycle.is_some_and(|life| life.eq_ignore_ascii_case("blocked"))
+                })
         }
         "observed-update" => !events.is_empty(),
         "interaction" => events.iter().any(event_is_interaction),

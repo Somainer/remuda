@@ -377,7 +377,7 @@ impl ProviderRecord {
 impl InteractionRecord {
     /// REST list item.
     pub fn to_list_item(&self) -> Value {
-        json!({
+        let mut item = json!({
             "id": self.interaction_id,
             "interactionId": self.interaction_id,
             "instanceId": self.instance_id,
@@ -386,7 +386,20 @@ impl InteractionRecord {
             "state": self.state,
             "blocking": self.blocking,
             "event": self.payload,
-        })
+        });
+        if let Some(entity) = self
+            .payload
+            .pointer("/payload/interaction")
+            .or_else(|| self.payload.pointer("/payload/entity"))
+            && let Some(object) = item.as_object_mut()
+        {
+            if let Some(fields) = entity.as_object() {
+                object.extend(fields.clone());
+            }
+            object.insert("state".into(), json!(self.state));
+            object.insert("interaction".into(), entity.clone());
+        }
+        item
     }
 }
 
@@ -1142,31 +1155,15 @@ impl Store {
             .await
     }
 
-    /// First-answer-wins: pending → answered. Returns the winner command id when already settled.
-    pub async fn answer_interaction(
+    /// Mirror a successful Node answer ACK; never decide a winner in the Hub.
+    pub async fn record_interaction_answer(
         &self,
         interaction_id: String,
-        command_id: String,
-    ) -> Result<InteractionRecord, StoreError> {
+    ) -> Result<(), StoreError> {
         self.run(move |conn| {
-            let mut rec = load_interaction(conn, &interaction_id)?
-                .ok_or_else(|| StoreError::Id("unknown interaction".into()))?;
-            if rec.state != "pending" {
-                return Ok(rec);
-            }
-            let now = now_rfc3339();
-            if let Some(obj) = rec.payload.as_object_mut() {
-                obj.insert("answerCommandId".into(), json!(command_id));
-            }
-            conn.execute(
-                "UPDATE interactions SET state = 'answered', payload_json = ?1, updated_at = ?2 WHERE id = ?3",
-                params![rec.payload.to_string(), now, interaction_id],
-            )?;
-            rec.state = "answered".into();
-            rec.updated_at = now;
-            Ok(rec)
-        })
-        .await
+            conn.execute("UPDATE interactions SET state = 'answer-committed', updated_at = ?1 WHERE id = ?2 AND state = 'pending'", params![now_rfc3339(), interaction_id])?;
+            Ok(())
+        }).await
     }
 
     /// Journal page from `after_seq` exclusive.
@@ -2606,12 +2603,29 @@ fn apply_interaction_event(
         .and_then(Value::as_str)
         .or_else(|| event.get("subtype").and_then(Value::as_str))
         .unwrap_or("");
+    if event.pointer("/payload/entityType").and_then(Value::as_str) == Some("interaction") {
+        if let Some(entity) = event.pointer("/payload/entity")
+            && let (Some(id), Some(state)) = (
+                entity.get("id").and_then(Value::as_str),
+                entity.get("state").and_then(Value::as_str),
+            )
+        {
+            conn.execute("UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3 WHERE id = ?4",
+                params![state, event.to_string(), now_rfc3339(), id])?;
+        }
+        return Ok(());
+    }
     let id = event
         .get("interactionId")
         .and_then(Value::as_str)
         .or_else(|| {
             event
                 .pointer("/payload/interactionId")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            event
+                .pointer("/payload/interaction/id")
                 .and_then(Value::as_str)
         });
     let Some(id) = id.filter(|id| !id.is_empty()) else {
@@ -2623,6 +2637,11 @@ fn apply_interaction_event(
             .get("interactionKind")
             .and_then(Value::as_str)
             .or_else(|| event.pointer("/payload/kind").and_then(Value::as_str))
+            .or_else(|| {
+                event
+                    .pointer("/payload/interaction/kind")
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("permission");
         conn.execute(
             "INSERT INTO interactions
@@ -2646,10 +2665,10 @@ fn apply_interaction_event(
         let state = if kind.contains("expired") {
             "expired"
         } else {
-            "answered"
+            "answer-committed"
         };
         conn.execute(
-            "UPDATE interactions SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE interactions SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = 'pending'",
             params![state, now, id],
         )?;
     }

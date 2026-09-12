@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { StateDot } from "../components/StateDot";
+import { PtyQuestionAnswers } from "../components/PtyQuestionAnswers";
 import { formatClock } from "../lib/format";
 import { hubStore, useHub } from "../lib/store";
 import { projectStatus } from "../lib/status";
@@ -17,14 +18,16 @@ const KIND_FILTERS = ["all", "approval", "question", "plan-review"] as const;
 
 function preview(item: Interaction): string {
   if (item.request.kind === "approval") return item.request.description;
-  if (item.request.kind === "question") return `问你 ${item.request.fields.length} 题 · AskUserQuestion`;
+  if (item.request.kind === "question") return item.carrier === "native-tty"
+    ? item.request.fields.map((field) => field.description ?? field.title).join("\n")
+    : `问你 ${item.request.fields.length} 题 · AskUserQuestion`;
   if (item.request.kind === "plan-review") return item.request.title;
   return item.request.title;
 }
 
 function kindLabel(item: Interaction): string {
   if (item.request.kind === "approval") return item.request.title;
-  if (item.request.kind === "question") return "AskUserQuestion";
+  if (item.request.kind === "question") return item.carrier === "native-tty" ? "终端提问" : "AskUserQuestion";
   if (item.request.kind === "plan-review") return "计划";
   return item.request.title;
 }
@@ -151,8 +154,11 @@ export function ApprovalsPage() {
                 </div>
                 <div className={css.headline}>
                   <div className={`${css.kind} ${paused ? css.kindMute : ""}`}>{kindLabel(item)}</div>
-                  <p className={`${css.preview} ${paused ? css.previewMute : ""}`}>{preview(item)}</p>
+                  {item.carrier === "native-tty" ? <pre className={css.excerpt}>{preview(item)}</pre>
+                    : <p className={`${css.preview} ${paused ? css.previewMute : ""}`}>{preview(item)}</p>}
                 </div>
+                {item.carrier === "native-tty" ? <p className={css.terminalNote}>来自终端屏幕 · 回答会发送按键</p> : null}
+                {!item.answerable ? <p className={css.terminalNote}>请打开会话查看完整终端提示</p> : null}
                 {paused ? <p className={css.note}>主机离线，交互暂停</p> : null}
               </div>
               <div className={css.actions}>
@@ -168,7 +174,7 @@ export function ApprovalsPage() {
                         key={opt.id}
                         type="button"
                         className={`${css.btn} ${opt.effect === "deny" ? "" : css.btnDust} ${paused ? css.btnDash : ""}`}
-                        disabled={paused}
+                        disabled={paused || !item.answerable}
                         onClick={() =>
                           respond(item, {
                             kind: "approval",
@@ -181,7 +187,10 @@ export function ApprovalsPage() {
                       </button>
                     ))
                   : null}
-                {!answering && item.kind === "question" ? (
+                {!answering && item.kind === "question" && item.carrier === "native-tty" ?
+                  <PtyQuestionAnswers item={item} disabled={paused || !item.answerable}
+                    onAnswer={(answer) => respond(item, answer)} /> : null}
+                {!answering && item.kind === "question" && item.carrier !== "native-tty" ? (
                   <Link to={`/s/${item.instanceId}`} className={`${css.btn} ${css.btnDust}`}>
                     去回答
                   </Link>

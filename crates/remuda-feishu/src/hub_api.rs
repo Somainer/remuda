@@ -119,7 +119,10 @@ impl InstanceApi for HubInstanceApi {
                 "answer": req.answer,
             });
             client
-                .post_command(id, "interaction.respond", payload, None)
+                .post(
+                    &format!("/v1/interactions/{}/answer", req.interaction_id.as_id()),
+                    &payload,
+                )
                 .await
                 .map_err(hub_err)?;
             Ok(())
@@ -198,7 +201,7 @@ fn map_journal_event(record: &Value) -> Option<FollowEvent> {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
         }),
-        "interaction" => {
+        "interaction" | "interaction.requested" => {
             let value = payload.get("interaction").cloned().unwrap_or(payload);
             serde_json::from_value::<Interaction>(value)
                 .ok()

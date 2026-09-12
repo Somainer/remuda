@@ -13,6 +13,7 @@ use crate::materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, materialize,
 };
 use crate::profile::{EnvFileSecretBroker, ProviderProfile, SecretBroker};
+use crate::pty_interaction::PtyInteractions;
 use crate::recipe::{FileLifetime, FileRole, LaunchRecipe, MaterializedFile};
 use async_trait::async_trait;
 use remuda_herdr::{
@@ -20,15 +21,13 @@ use remuda_herdr::{
     PaneSplitParams, SplitDirection, Subscription, TerminalObserver, WorkspaceCreateParams,
 };
 use remuda_protocol::{
-    AgentKind, ClaudeRef, Completeness, ContentBlock, DeadlineSource, DeliveryState, Digest,
-    DriverInput, DriverKind, EntityMeta, EventId, HerdrRef, HerdrRepresentation,
-    HerdrServer as HerdrPin, HostId, Id, InstanceId, InstanceSpec, Interaction, InteractionAnswer,
-    InteractionCarrier, InteractionId, InteractionKind, InteractionRequest, InteractionRequestKey,
-    InteractionState, Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle, NativeRef,
-    NativeRequestKey, NativeTerminalFrame, Observation, ObservationPayload, ObservationSource,
-    PtyBackend, PtyCarrier, QuestionField, QuestionInput, QuestionRequest, RawRef, Redaction,
-    RunId, SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, Timestamp,
-    TranscriptRef, TtyOutput, TtyRepresentation, U64,
+    AgentKind, ClaudeRef, Completeness, ContentBlock, Digest, DriverInput, DriverKind, EventId,
+    HerdrRef, HerdrRepresentation, HerdrServer as HerdrPin, HostId, Id, InstanceId, InstanceSpec,
+    InteractionAnswer, InteractionId, Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle,
+    NativeRef, NativeRequestKey, NativeTerminalFrame, Observation, ObservationPayload,
+    ObservationSource, PtyBackend, PtyCarrier, RawRef, Redaction, RunId, SchemaVersion, Severity,
+    SourceChannel, SourceCursor, SourceDelivery, Timestamp, TranscriptRef, TtyOutput,
+    TtyRepresentation, U64,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -38,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::info;
 
 const HOOK_SCRIPT: &str = r#"#!/bin/sh
 set -eu
@@ -143,6 +142,8 @@ struct PtyLive {
     transcript_path: Arc<std::sync::Mutex<Option<String>>>,
     events: mpsc::Sender<Observation>,
     status_task: Option<JoinHandle<()>>,
+    interactions: Arc<PtyInteractions>,
+    interaction_task: JoinHandle<()>,
     hook_task: Option<JoinHandle<()>>,
     tty_task: Option<JoinHandle<()>>,
     closed: bool,
@@ -285,18 +286,19 @@ impl ClaudePtyDriver {
         self.resources
             .record(&client, &session_name, &created, &pane_id)
             .await?;
-        let agent_name = agent_name_for(&spec);
+        let agent_name = agent_name_for();
 
-        let started = client
-            .agent_start(AgentStartParams {
+        let started = crate::pty_interaction::start_agent(
+            &client,
+            AgentStartParams {
                 name: agent_name.clone(),
                 kind: "claude".into(),
                 pane_id: pane_id.clone(),
                 args: recipe.argv.clone(),
                 timeout_ms: Some(self.options.agent_start_timeout_ms),
-            })
-            .await
-            .map_err(map_herdr)?;
+            },
+        )
+        .await?;
         refuse_bare(&started.argv)?;
 
         let native_session = started
@@ -365,7 +367,15 @@ impl ClaudePtyDriver {
         )
         .await?;
 
-        let status_task = spawn_status_pump(stream, tx.clone(), ctx.clone(), Arc::clone(&self.seq));
+        let interactions = PtyInteractions::new(
+            client.clone(),
+            pane_id.clone(),
+            ctx.clone(),
+            tx.clone(),
+            Arc::clone(&self.seq),
+        );
+        let interaction_task = interactions.spawn();
+        let status_task = spawn_status_pump(stream, pane_id.clone(), Arc::clone(&interactions));
         let hook_path = self.options.launch_dir.join("session-meta.json");
         let transcript_path = Arc::new(std::sync::Mutex::new(None));
         let hook_task = spawn_hook_watch(
@@ -393,6 +403,8 @@ impl ClaudePtyDriver {
             transcript_path,
             events: tx,
             status_task: Some(status_task),
+            interactions,
+            interaction_task,
             hook_task: Some(hook_task),
             tty_task: None,
             closed: false,
@@ -515,16 +527,15 @@ impl Driver for ClaudePtyDriver {
     }
 
     async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
-        let inner = self.inner.lock().await;
-        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        if live.closed {
-            return Err(DriverError::ControlUnavailable);
-        }
-        live.client
-            .agent_send_keys(live.agent_name.clone(), keys)
+        let interactions = self
+            .inner
+            .lock()
             .await
-            .map_err(map_herdr)?;
-        Ok(DriverAck::transport_written())
+            .as_ref()
+            .filter(|live| !live.closed)
+            .map(|live| Arc::clone(&live.interactions))
+            .ok_or(DriverError::ControlUnavailable)?;
+        interactions.send_keys(keys).await
     }
 
     async fn tty_bridge(&self) -> Option<crate::tty::TtyBridge> {
@@ -545,12 +556,18 @@ impl Driver for ClaudePtyDriver {
 
     async fn respond_interaction(
         &self,
-        _id: InteractionId,
-        _answer: InteractionAnswer,
+        id: InteractionId,
+        answer: InteractionAnswer,
     ) -> DriverResult<DriverAck> {
-        Err(DriverError::CapabilityUnsupported(
-            "claude-pty screen-derived interactions are not answerable; use the native TTY".into(),
-        ))
+        let interactions = self
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .filter(|live| !live.closed)
+            .map(|live| Arc::clone(&live.interactions))
+            .ok_or(DriverError::ControlUnavailable)?;
+        interactions.respond(id, answer).await
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
@@ -567,6 +584,7 @@ impl Driver for ClaudePtyDriver {
             return Ok(DriverAck::not_dispatched());
         }
         live.closed = true;
+        live.interaction_task.abort();
         if let Some(task) = live.status_task.take() {
             task.abort();
         }
@@ -576,6 +594,7 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.tty_task.take() {
             task.abort();
         }
+        live.interactions.close().await?;
         let events = live.events.clone();
         let ctx = live.ctx.clone();
         drop(inner);
@@ -629,33 +648,15 @@ pub(crate) struct ObsCtx {
 
 fn spawn_status_pump(
     mut stream: EventStream,
-    tx: mpsc::Sender<Observation>,
-    ctx: ObsCtx,
-    seq: Arc<AtomicU64>,
+    pane_id: String,
+    interactions: Arc<PtyInteractions>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(item) = stream.next_event().await {
-            let event = match item {
-                Ok(event) => event,
-                Err(err) => {
-                    debug!(error = %err, "herdr subscribe ended");
-                    break;
-                }
-            };
-            if event.kind != EventKind::PaneAgentStatusChanged {
-                continue;
-            }
-            let Some(status) = event.agent_status() else {
-                continue;
-            };
-            let payloads = status_payloads(&ctx, status);
-            for (channel, completeness, payload) in payloads {
-                if emit_obs(&tx, &seq, &ctx, channel, completeness, payload)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+        while let Some(Ok(event)) = stream.next_event().await {
+            if event.kind == EventKind::PaneAgentStatusChanged
+                && event.pane_id() == Some(pane_id.as_str())
+            {
+                let _ = interactions.observe().await;
             }
         }
     })
@@ -821,7 +822,7 @@ fn status_payloads(
     } else {
         Completeness::Partial
     };
-    let mut out = vec![(
+    vec![(
         SourceChannel::Herdr,
         status_completeness,
         ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
@@ -840,72 +841,7 @@ fn status_payloads(
                 affects_completion: false,
             },
         )))),
-    )];
-    if status == AgentStatus::Blocked
-        && let Ok(interaction) = screen_block_interaction(ctx)
-    {
-        out.push((
-            SourceChannel::Herdr,
-            Completeness::ScreenDerived,
-            ObservationPayload::InteractionRequested(Box::new(
-                remuda_protocol::InteractionRequestedPayload { interaction },
-            )),
-        ));
-    }
-    out
-}
-
-fn screen_block_interaction(ctx: &ObsCtx) -> DriverResult<Interaction> {
-    let ts = now_ts()?;
-    Ok(Interaction {
-        meta: EntityMeta {
-            id: InteractionId::new(),
-            revision: U64(1),
-            created_at: ts.clone(),
-            updated_at: ts,
-        },
-        instance_id: ctx.instance_id.clone(),
-        run_id: Some(ctx.run_id.clone()),
-        host_id: ctx.host_id.clone(),
-        kind: InteractionKind::Question,
-        request_key: InteractionRequestKey {
-            native: NativeRequestKey::None,
-            process_generation: U64(1),
-            run_generation: Some(U64(1)),
-            connection_epoch: Id::new("epoch")?,
-        },
-        request_version: U64(1),
-        state: InteractionState::Pending,
-        blocking: true,
-        answerable: false,
-        carrier: InteractionCarrier::NativeTty,
-        request: InteractionRequest::Question(Box::new(QuestionRequest {
-            title: "Native TTY is blocked".into(),
-            fields: vec![QuestionField {
-                id: "screen".into(),
-                title: "Herdr agent_status=blocked".into(),
-                description: Some(
-                    "Screen-derived; answerable=false. Do not send keys by coordinate.".into(),
-                ),
-                input: QuestionInput::Text,
-                required: false,
-                options: vec![],
-                allow_free_text: false,
-                sensitive: false,
-            }],
-        })),
-        deadline: Knowledge::Unknown {
-            reason: "screen-derived".into(),
-            evidence_event_ids: vec![],
-        },
-        deadline_source: DeadlineSource::Native,
-        answer: Knowledge::NotApplicable,
-        delivery: DeliveryState::NotSent,
-        resolution: Knowledge::Unknown {
-            reason: "pending".into(),
-            evidence_event_ids: vec![],
-        },
-    })
+    )]
 }
 
 async fn emit_obs(
@@ -1337,15 +1273,10 @@ fn herdr_session_name(spec: &InstanceSpec, fallback: &str) -> String {
     fallback.to_string()
 }
 
-fn agent_name_for(spec: &InstanceSpec) -> String {
-    let raw = spec.host.as_id().as_str().to_string();
-    let suffix = raw
-        .rsplit('_')
-        .next()
-        .unwrap_or("pty")
-        .chars()
-        .take(8)
-        .collect::<String>();
+fn agent_name_for() -> String {
+    // A host ID is shared by every Claude pane; use fresh random UUID bytes.
+    let uuid = uuid::Uuid::now_v7().simple().to_string();
+    let suffix = &uuid[20..];
     format!("remuda-{suffix}")
 }
 
@@ -1572,7 +1503,17 @@ pub mod review {
             "review-session".into(),
             "review".into(),
         );
-        Ok(status_payloads(&ctx, AgentStatus::Blocked)
+        let mut payloads = status_payloads(&ctx, AgentStatus::Blocked);
+        payloads.push((
+            SourceChannel::Herdr,
+            Completeness::ScreenDerived,
+            ObservationPayload::InteractionRequested(Box::new(
+                remuda_protocol::InteractionRequestedPayload {
+                    interaction: crate::pty_interaction::screen_request(&ctx, "")?.0,
+                },
+            )),
+        ));
+        Ok(payloads
             .into_iter()
             .map(|(_, completeness, payload)| (completeness, payload))
             .collect())

@@ -1,0 +1,108 @@
+{
+  "binarySha256": "c4e54c60d60cc01ac69731ca04cee5dd7ce776883670bae96eda1bec98f7ca63",
+  "hub": "127.0.0.1:58580",
+  "node": "127.0.0.1:58587",
+  "runs": [
+    {
+      "kind": "codex",
+      "driver": "generic-pty",
+      "channel": "cli",
+      "instanceId": "ins_01a096e3-1020-77e6-8416-88e79b7d9c0d",
+      "interactionId": "int_01a096e3-12f7-7447-b05a-bd6597a9d91a",
+      "excerpt": "Permission requested: run the test command? [y/N]",
+      "blocked": "condition-met",
+      "answer": "accepted",
+      "idle": "condition-met",
+      "historicalBlocked": "timeout",
+      "interactionStates": [
+        "answer-committed",
+        "resolved"
+      ]
+    },
+    {
+      "kind": "grok",
+      "driver": "generic-pty",
+      "channel": "mcp",
+      "instanceId": "ins_01a096e3-18be-7326-a9eb-54e8d9406d81",
+      "interactionId": "int_01a096e3-18e4-71b7-90e7-7e2ffba993d3",
+      "excerpt": "Permission requested: run the test command? [y/N]",
+      "blocked": "condition-met",
+      "answer": "accepted",
+      "idle": "condition-met",
+      "historicalBlocked": "timeout",
+      "interactionStates": [
+        "answer-committed",
+        "resolved"
+      ]
+    },
+    {
+      "kind": "agy",
+      "driver": "generic-pty",
+      "channel": "http",
+      "instanceId": "ins_01a096e3-1e94-7774-b0c5-a56cb008f707",
+      "interactionId": "int_01a096e3-1eae-77ad-a0c8-692518320e22",
+      "excerpt": "Permission requested: run the test command? [y/N]",
+      "blocked": "condition-met",
+      "answer": "accepted",
+      "idle": "condition-met",
+      "historicalBlocked": "timeout",
+      "interactionStates": [
+        "answer-committed",
+        "resolved"
+      ]
+    },
+    {
+      "kind": "claude",
+      "driver": "claude-pty",
+      "channel": "http",
+      "instanceId": "ins_01a096e3-2230-7333-ab12-eaac0ceba540",
+      "interactionId": "int_01a096e3-238c-74b9-bf3a-15c69af7d01a",
+      "excerpt": "Permission requested: run the test command? [y/N]",
+      "blocked": "condition-met",
+      "answer": "accepted",
+      "idle": "condition-met",
+      "historicalBlocked": "timeout",
+      "interactionStates": [
+        "answer-committed",
+        "resolved"
+      ]
+    }
+  ],
+  "browserApproval": {
+    "status": 200,
+    "outcome": "accepted",
+    "pendingAfter": 0,
+    "sameKindIsolation": "one pending card while original codex stays idle"
+  },
+  "question": {
+    "instanceId": "ins_01a096e4-9803-76b4-8802-860de1bdeaec",
+    "interactionId": "int_01a096e4-981d-7678-9486-cb4291dc1db8",
+    "excerpt": "Which test environment should be used?\n\u276f 1. Development\n  2. Staging\n  3. Cancel\nEnter to confirm",
+    "options": [
+      {
+        "id": "1",
+        "label": "Development"
+      },
+      {
+        "id": "2",
+        "label": "Staging"
+      },
+      {
+        "id": "3",
+        "label": "Cancel"
+      }
+    ],
+    "browser": {
+      "status": 200,
+      "outcome": "accepted",
+      "pendingAfter": 0
+    },
+    "idle": "condition-met",
+    "nativeStatus": "idle",
+    "nativeReceipt": "KEYS down enter",
+    "interactionStates": [
+      "answer-committed",
+      "resolved"
+    ]
+  }
+}

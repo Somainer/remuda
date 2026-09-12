@@ -108,7 +108,7 @@ pub async fn list_interactions(
                                     .and_then(Value::as_str)
                                     .unwrap_or("");
                                 if id.is_empty() || seen.insert(id.to_string()) {
-                                    items.push(item.clone());
+                                    items.push(flatten_interaction(item.clone()));
                                 }
                             }
                         }
@@ -146,34 +146,19 @@ pub async fn answer_interaction(
         .store
         .get_interaction(interaction_id.as_id().as_str().to_string())
         .await?;
-    if let Some(row) = &stored {
-        if row.state != "pending" {
-            return Err(HubError::Superseded {
-                winner: row
-                    .payload
-                    .get("answerCommandId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            });
-        }
-        let _ = state
-            .store
-            .answer_interaction(
-                interaction_id.as_id().as_str().to_string(),
-                command_id.as_id().as_str().to_string(),
-            )
-            .await?;
-    }
-    let had_stored = stored.is_some();
+    // Node owns first-answer-wins. Never commit an answer in the Hub before
+    // the owner is reached, and let the Node reconcile same-command retries.
     let params = json!({
         "interactionId": interaction_id.as_id().as_str(),
         "commandId": command_id.as_id().as_str(),
         "byDevice": by_device.as_str(),
         "answer": body.answer,
     });
-    let mut last_not_found = !had_stored;
-    for host_id in state.nodes.host_ids().await {
+    let hosts = match stored {
+        Some(row) => vec![row.host_id],
+        None => state.nodes.host_ids().await,
+    };
+    for host_id in hosts {
         match state
             .nodes
             .call(
@@ -185,25 +170,23 @@ pub async fn answer_interaction(
             .await
         {
             Ok(Some(frame)) => match rpc_result(frame) {
-                Ok(result) => return Ok(Json(result)),
+                Ok(result) => {
+                    // Mirror the owner's successful CAS immediately; a delayed
+                    // journal flush must not resurrect a just-answered card.
+                    state
+                        .store
+                        .record_interaction_answer(interaction_id.as_id().to_string())
+                        .await?;
+                    return Ok(Json(result));
+                }
                 Err(HubError::NotFound) => {}
                 Err(err) => return Err(err),
             },
-            Ok(None) => last_not_found = true,
+            Ok(None) => {}
             Err(err) => return Err(err),
         }
     }
-    if had_stored {
-        let rec = state
-            .store
-            .get_interaction(interaction_id.as_id().as_str().to_string())
-            .await?
-            .ok_or(HubError::NotFound)?;
-        return Ok(Json(rec.to_list_item()));
-    }
-    if last_not_found {
-        return Err(HubError::NotFound);
-    }
+
     Err(HubError::NotFound)
 }
 
@@ -223,7 +206,8 @@ fn rpc_result(frame: Value) -> Result<Value, HubError> {
                     .unwrap_or("")
                     .to_string(),
             },
-            -32602 => HubError::NotFound,
+            -32602 if message.contains("not found") => HubError::NotFound,
+            -32602 => HubError::BadRequest(message.to_string()),
             _ if message.contains("expired") => HubError::Expired,
             _ if message.contains("already answered") => HubError::Superseded {
                 winner: String::new(),
@@ -233,4 +217,15 @@ fn rpc_result(frame: Value) -> Result<Value, HubError> {
         });
     }
     Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+}
+
+// Retain the Node list wrapper for existing clients while exposing the complete
+// Interaction entity at the top level consumed by the web API.
+fn flatten_interaction(mut item: Value) -> Value {
+    if let Some(entity) = item.get("interaction").and_then(Value::as_object).cloned()
+        && let Some(object) = item.as_object_mut()
+    {
+        object.extend(entity);
+    }
+    item
 }

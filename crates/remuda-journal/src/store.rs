@@ -510,6 +510,15 @@ impl Store {
                     ],
                 )?;
             }
+            ObservationPayload::Lifecycle(payload) => {
+                if let remuda_protocol::LifecyclePayload::Entity(entity) = payload.as_ref()
+                    && let remuda_protocol::LifecycleEntity::Interaction(interaction) =
+                        &entity.entity_value
+                {
+                    tx.execute("UPDATE interactions SET state = ?1 WHERE instance_id = ?2 AND interaction_id = ?3",
+                        params![entity.state, instance_s, interaction.meta.id.as_id().as_str()])?;
+                }
+            }
             _ => {}
         }
         tx.commit()?;

@@ -1,0 +1,5 @@
+Which test environment should be used?
+❯ 1. Development
+  2. Staging
+  3. Cancel
+Enter to confirm

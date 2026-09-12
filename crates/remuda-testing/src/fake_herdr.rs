@@ -47,6 +47,14 @@ pub enum FakeHerdrError {
 pub enum FakeHerdrScript {
     /// `agent.start` goes idle; `agent.prompt` emits working → idle and `agent.read` contains `OK`.
     Ok,
+    /// Starts blocked with a y/n approval; keys produce idle.
+    Approval,
+    /// Starts blocked with a numbered question; keys produce idle.
+    Question,
+    /// Starts blocked with an Enter-to-continue prompt.
+    Continue,
+    /// Starts blocked with a free text question.
+    TextQuestion,
     /// `agent.start` is blocked on a trust dialog until `agent.send_keys`.
     Trust,
     /// `agent.start` RPC succeeds, then the process is gone / pane is a shell (startup crash).
@@ -60,6 +68,10 @@ impl FakeHerdrScript {
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim() {
             "ok" | "OK" => Some(Self::Ok),
+            "approval" => Some(Self::Approval),
+            "question" => Some(Self::Question),
+            "continue" => Some(Self::Continue),
+            "text-question" => Some(Self::TextQuestion),
             "trust" | "trust-dialog" | "blocked" => Some(Self::Trust),
             "start-fail" | "start_fail" | "crash" | "die" => Some(Self::StartFail),
             "slow-start" | "slow_start" | "slow" => Some(Self::SlowStart),
@@ -900,7 +912,14 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
     if !st.panes.contains_key(&start.pane_id) {
         return Err(("invalid_request", format!("unknown pane {}", start.pane_id)));
     }
-    let blocked = st.script == FakeHerdrScript::Trust;
+    let blocked = matches!(
+        st.script,
+        FakeHerdrScript::Trust
+            | FakeHerdrScript::Approval
+            | FakeHerdrScript::Question
+            | FakeHerdrScript::Continue
+            | FakeHerdrScript::TextQuestion
+    );
     let slow = st.script == FakeHerdrScript::SlowStart;
     let status = if blocked {
         AgentStatus::Blocked
@@ -910,7 +929,14 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
         AgentStatus::Idle
     };
     let screen = if blocked {
-        TRUST_DIALOG.to_string()
+        match st.script {
+            FakeHerdrScript::Approval => include_str!("../tests/fixtures/pty-approval.txt"),
+            FakeHerdrScript::Question => include_str!("../tests/fixtures/pty-question.txt"),
+            FakeHerdrScript::Continue => "Press Enter to continue",
+            FakeHerdrScript::TextQuestion => "What name should this test project use?",
+            _ => TRUST_DIALOG,
+        }
+        .to_string()
     } else {
         idle_screen("")
     };
@@ -1178,6 +1204,12 @@ fn agent_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static st
             .or_insert(line);
     }
     unblock_if_needed(st, &name);
+    // Keep an observable receipt after the prompt clears.
+    if let Some(agent) = st.agents.get(&name)
+        && let Some(screen) = st.screens.get_mut(&agent.pane_id)
+    {
+        screen.push_str(&format!("\nKEYS {}", keys.join(" ")));
+    }
     ok()
 }
 

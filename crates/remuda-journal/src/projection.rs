@@ -351,6 +351,16 @@ impl InteractionProjection {
                 record.expired_seq = Some(obs.seq);
                 record.state = InteractionState::Expired;
             }
+            ObservationPayload::Lifecycle(payload) => {
+                if let remuda_protocol::LifecyclePayload::Entity(entity) = payload.as_ref()
+                    && let remuda_protocol::LifecycleEntity::Interaction(interaction) =
+                        &entity.entity_value
+                    && let Some(key) = self.by_id.get(interaction.meta.id.as_id().as_str())
+                    && let Some(record) = self.by_key.get_mut(key)
+                {
+                    record.state = interaction.state;
+                }
+            }
             _ => {}
         }
     }

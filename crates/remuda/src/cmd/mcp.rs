@@ -156,6 +156,15 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
             }),
         ),
         tool(
+            "remuda_instance_respond",
+            "List pending interactions, or answer a displayed option/text through the first-answer-wins broker.",
+            json!({"type":"object", "required":["instanceId"], "properties":{
+                "instanceId":{"type":"string"}, "interactionId":{"type":"string"},
+                "option":{"type":"string"}, "text":{"type":"string"},
+                "answer":{"type":"object"}, "commandId":{"type":"string"}
+            }}),
+        ),
+        tool(
             "remuda_instance_wait",
             "Wait until idle, done, blocked, or line:<regex> (default done, timeout 30000 ms).",
             json!({
@@ -310,6 +319,20 @@ async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value>
                 opt_str(&args, "commandId"),
                 opt_str(&args, "completionScope").unwrap_or("native-turn"),
                 "mcp",
+            )
+            .await
+        }
+        "remuda_instance_respond" => {
+            super::instance_interaction::respond(
+                client,
+                super::instance_interaction::RespondOpts {
+                    instance_id: required_str(&args, "instanceId")?.to_owned(),
+                    interaction_id: opt_str(&args, "interactionId").map(str::to_owned),
+                    option: opt_str(&args, "option").map(str::to_owned),
+                    text: opt_str(&args, "text").map(str::to_owned),
+                    answer: args.get("answer").map(Value::to_string),
+                    command_id: opt_str(&args, "commandId").map(str::to_owned),
+                },
             )
             .await
         }
@@ -652,6 +675,7 @@ mod tests {
             "remuda_instance_wait",
             "remuda_instance_read",
             "remuda_instance_keys",
+            "remuda_instance_respond",
             "remuda_instance_stop",
             "remuda_instance_rm",
             "remuda_worktree_create",

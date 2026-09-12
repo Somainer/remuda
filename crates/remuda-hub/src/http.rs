@@ -156,7 +156,10 @@ pub async fn login(
     }
     let token = crate::config::random_token();
     let hash = hash_secret(&token)?;
-    let device = state.store.insert_device(body.device_name, hash).await?;
+    let device = state
+        .store
+        .insert_device(body.device_name, hash, token[..16].to_owned())
+        .await?;
     let cookie = device_cookie(&token, state.config.cookie_secure);
     let body = json!({
         "deviceId": device.id,

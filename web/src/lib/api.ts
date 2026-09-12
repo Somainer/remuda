@@ -389,8 +389,11 @@ function followUrl(instanceId: Id): string {
 }
 
 async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
+  const session = readSession();
   const headers = {
     "content-type": "application/json",
+    // Allows a single-row migration of cookies issued before token indexing.
+    ...(session ? { "X-Remuda-Device-Id": session.deviceId } : {}),
     ...(req.headers as Record<string, string> | undefined),
   };
   const res = await fetch(`${hubBase()}${path}`, {

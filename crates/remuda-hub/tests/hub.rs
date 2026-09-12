@@ -214,6 +214,58 @@ async fn auth_reject_http_and_origin() -> Result<()> {
 }
 
 #[tokio::test]
+async fn login_and_pair_attempts_are_limited_by_peer_not_forwarded_headers() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    for (path, body) in [
+        ("/v1/login", json!({"bootstrapToken":"wrong"})),
+        ("/v1/devices/pair", json!({"code":"ZZZZZZZZ"})),
+    ] {
+        for i in 0..10 {
+            let forwarded = format!("192.0.2.{i}");
+            let (status, _, _) = http(
+                hub.addr,
+                "POST",
+                path,
+                &[("X-Forwarded-For", &forwarded)],
+                Some(&body.to_string()),
+            )
+            .await?;
+            assert_eq!(status, 401, "{path} attempt {i}");
+        }
+        let (status, headers, body) = http(
+            hub.addr,
+            "POST",
+            path,
+            &[("Forwarded", "for=198.51.100.1")],
+            Some(&body.to_string()),
+        )
+        .await?;
+        assert_eq!(status, 429, "{path}: {body}");
+        assert!(headers.to_ascii_lowercase().contains("retry-after: 10"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-frame-options: deny")
+        );
+    }
+    let (status, _, _) = http(
+        hub.addr,
+        "POST",
+        "/v1/login",
+        &[],
+        Some(&json!({"bootstrapToken":bootstrap}).to_string()),
+    )
+    .await?;
+    assert_eq!(
+        status, 429,
+        "rate limit must precede credential verification"
+    );
+    let (status, _, _) = http(hub.addr, "GET", "/healthz", &[], None).await?;
+    assert_eq!(status, 200);
+    Ok(())
+}
+
+#[tokio::test]
 async fn node_ws_rejects_missing_token() -> Result<()> {
     let (hub, _, _dir) = boot().await?;
     let url = format!("ws://{}/v1/node", hub.addr);

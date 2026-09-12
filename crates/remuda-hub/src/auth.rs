@@ -11,6 +11,18 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+pub(crate) const PAIR_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+pub(crate) const MAX_PAIR_FAILURES: i64 = 10;
+
+/// Non-secret lookup selector; the full random token still needs Argon2 verification.
+pub(crate) fn token_prefix(token: &str) -> Option<&str> {
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then(|| &token[..16])
+}
+
+pub(crate) fn pair_prefix(code: &str) -> Option<&str> {
+    (code.len() == 8 && code.bytes().all(|b| PAIR_CODE_ALPHABET.contains(&b))).then(|| &code[..4])
+}
+
 /// Fast-enough Argon2id for Hub token hashes (8 MiB, 1 pass).
 fn hasher() -> Result<Argon2<'static>, HubError> {
     let params = Params::new(8 * 1024, 1, 1, None)
@@ -190,8 +202,12 @@ fn origin_host(origin: &str) -> Option<&str> {
 /// Require a logged-in device.
 pub async fn require_device(store: &Store, headers: &HeaderMap) -> Result<Device, HubError> {
     let token = presented_token(headers).ok_or(HubError::Unauthenticated)?;
+    let legacy_device_id = headers
+        .get("x-remuda-device-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     store
-        .find_device_by_token(token, verify_secret)
+        .find_device_by_token(token, legacy_device_id, verify_secret)
         .await?
         .ok_or(HubError::Unauthenticated)
 }

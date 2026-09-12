@@ -26,6 +26,8 @@ pub struct NativeDriverConfig {
     pub data_dir: PathBuf,
     /// Explicit Claude executable; `None` resolves `claude` through `PATH` at launch.
     pub claude_binary: Option<PathBuf>,
+    /// Explicit registered Claude config directory; otherwise each Instance gets an empty one.
+    pub claude_native_home: Option<PathBuf>,
     /// Explicit Herdr socket directory for PTY/background attach support.
     pub herdr_socket_dir: Option<PathBuf>,
     /// Explicit Herdr executable for PTY operations.
@@ -50,6 +52,9 @@ impl NativeDriverConfig {
             claude_binary: std::env::var_os("REMUDA_CLAUDE_BIN")
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
+            claude_native_home: std::env::var_os("REMUDA_CLAUDE_CONFIG_DIR")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
             herdr_socket_dir: None,
             herdr_binary: None,
             herdr_session: "remuda-node".to_owned(),
@@ -64,10 +69,26 @@ impl NativeDriverConfig {
         self.claude_binary = Some(binary);
         self
     }
+
+    /// Use an explicitly registered persistent Claude config directory.
+    #[must_use]
+    pub fn with_claude_native_home(mut self, native_home: PathBuf) -> Self {
+        self.claude_native_home = Some(native_home);
+        self
+    }
 }
 
 /// Register `claude-print`, `claude-pty`, and `claude-bg` as per-instance factories.
 pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegistry, NodeError> {
+    if config
+        .claude_native_home
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(NodeError::InvalidConfig(
+            "REMUDA_CLAUDE_CONFIG_DIR must be an absolute path".into(),
+        ));
+    }
     let registry = DriverRegistry::default();
     for kind in [
         DriverKind::ClaudePrint,
@@ -100,7 +121,11 @@ impl DriverFactory for NativeClaudeFactory {
             .join("instances")
             .join(launch.instance.meta.id.as_id().as_str());
         let launch_dir = instance_dir.join("launch");
-        let native_home = instance_dir.join("native-home");
+        let native_home = self
+            .config
+            .claude_native_home
+            .clone()
+            .unwrap_or_else(|| instance_dir.join("native-home"));
         std::fs::create_dir_all(&launch_dir)
             .and_then(|()| std::fs::create_dir_all(&native_home))
             .map_err(|error| DriverError::Failed(error.to_string()))?;
@@ -401,5 +426,16 @@ mod tests {
                 .expect("build driver");
             assert_eq!(driver.kind(), kind);
         }
+    }
+
+    #[test]
+    fn registered_claude_home_must_be_absolute() {
+        let config = NativeDriverConfig::new(PathBuf::from("/tmp/remuda-node-test"))
+            .with_claude_native_home(PathBuf::from("relative-home"));
+        let error = match native_driver_registry(config) {
+            Ok(_) => panic!("relative native home must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be an absolute path"));
     }
 }

@@ -27,10 +27,17 @@ pub struct HubConfig {
     /// How long `waiting-interaction` must last before a blocked push (ms).
     #[serde(default = "default_push_block_ms")]
     pub push_block_ms: u64,
+    /// Per-follow-socket outbound queue. Overflow emits `{type:gap}` and a resync snapshot.
+    #[serde(default = "default_follow_buffer_events")]
+    pub follow_buffer_events: usize,
 }
 
 fn default_push_block_ms() -> u64 {
     30_000
+}
+
+fn default_follow_buffer_events() -> usize {
+    256
 }
 
 impl Default for HubConfig {
@@ -43,6 +50,7 @@ impl Default for HubConfig {
             allowed_origins: Vec::new(),
             web_root: None,
             push_block_ms: default_push_block_ms(),
+            follow_buffer_events: default_follow_buffer_events(),
         }
     }
 }
@@ -58,6 +66,7 @@ impl HubConfig {
             allowed_origins: Vec::new(),
             web_root: None,
             push_block_ms: 80,
+            follow_buffer_events: default_follow_buffer_events(),
         }
     }
 }

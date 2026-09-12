@@ -192,6 +192,58 @@ pub struct JournalRecord {
     pub observed_at: String,
 }
 
+/// Hub-side journal resume cursor for one instance.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceWatermark {
+    /// Instance journal owner.
+    pub instance_id: String,
+    /// Journal id (`obj_…`).
+    pub journal_id: String,
+    /// Inclusive durable seq as a decimal string.
+    pub durable_seq: String,
+}
+
+/// Pending (or resolved) Interaction mirrored for Hub restart.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractionRecord {
+    /// `int_…`.
+    pub interaction_id: String,
+    /// Owning instance.
+    pub instance_id: String,
+    /// Owning host.
+    pub host_id: String,
+    /// Interaction kind (`permission`, `question`, …).
+    pub kind: String,
+    /// `pending` / `answered` / `expired`.
+    pub state: String,
+    /// Blocks the instance while pending.
+    pub blocking: bool,
+    /// Source event JSON.
+    pub payload: Value,
+    /// Create-time.
+    pub created_at: String,
+    /// Update-time.
+    pub updated_at: String,
+}
+
+impl InteractionRecord {
+    /// REST list item.
+    pub fn to_list_item(&self) -> Value {
+        json!({
+            "id": self.interaction_id,
+            "interactionId": self.interaction_id,
+            "instanceId": self.instance_id,
+            "hostId": self.host_id,
+            "kind": self.kind,
+            "state": self.state,
+            "blocking": self.blocking,
+            "event": self.payload,
+        })
+    }
+}
+
 impl Store {
     /// Open (or create) `hub.sqlite` on a dedicated writer thread.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
@@ -726,10 +778,8 @@ impl Store {
                 .unwrap_or(0)
                 + 1;
             let seq = seq.unwrap_or(next);
-            if seq < next {
-                let existing = load_journal_row(conn, &instance_id, seq)?.ok_or_else(|| {
-                    StoreError::Id(format!("journal gap: expected {next}, got {seq}"))
-                })?;
+            if let Some(existing) = load_journal_row(conn, &instance_id, seq)? {
+                apply_interaction_event(conn, &host_id, &instance_id, &existing.event)?;
                 return Ok((existing, false));
             }
             if seq != next {
@@ -762,6 +812,7 @@ impl Store {
                 "UPDATE instances SET durable_seq = ?1, connectivity = 'connected', updated_at = ?2 WHERE id = ?3",
                 params![seq, now, instance_id],
             )?;
+            apply_interaction_event(conn, &host_id, &instance_id, &event)?;
             Ok((
                 JournalRecord {
                     instance_id,
@@ -772,6 +823,107 @@ impl Store {
                 },
                 true,
             ))
+        })
+        .await
+    }
+
+    /// Inclusive durable-seq watermarks for every instance on `host_id`.
+    pub async fn list_instance_watermarks(
+        &self,
+        host_id: String,
+    ) -> Result<Vec<InstanceWatermark>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, journal_id, durable_seq FROM instances WHERE host_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![host_id], |row| {
+                let durable: i64 = row.get(2)?;
+                Ok(InstanceWatermark {
+                    instance_id: row.get(0)?,
+                    journal_id: row.get(1)?,
+                    durable_seq: durable.to_string(),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Pending interactions, optionally filtered.
+    pub async fn list_interactions(
+        &self,
+        host_id: Option<String>,
+        instance_id: Option<String>,
+        kind: Option<String>,
+        pending_only: bool,
+    ) -> Result<Vec<InteractionRecord>, StoreError> {
+        self.run(move |conn| {
+            let mut sql = String::from(
+                "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at
+                 FROM interactions WHERE 1=1",
+            );
+            let mut args: Vec<String> = Vec::new();
+            if let Some(host_id) = &host_id {
+                sql.push_str(" AND host_id = ?");
+                args.push(host_id.clone());
+            }
+            if let Some(instance_id) = &instance_id {
+                sql.push_str(" AND instance_id = ?");
+                args.push(instance_id.clone());
+            }
+            if let Some(kind) = &kind {
+                sql.push_str(" AND kind = ?");
+                args.push(kind.clone());
+            }
+            if pending_only {
+                sql.push_str(" AND state = 'pending'");
+            }
+            sql.push_str(" ORDER BY created_at");
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> = args
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(params_refs.as_slice(), interaction_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// One interaction by id.
+    pub async fn get_interaction(
+        &self,
+        interaction_id: String,
+    ) -> Result<Option<InteractionRecord>, StoreError> {
+        self.run(move |conn| load_interaction(conn, &interaction_id))
+            .await
+    }
+
+    /// First-answer-wins: pending → answered. Returns the winner command id when already settled.
+    pub async fn answer_interaction(
+        &self,
+        interaction_id: String,
+        command_id: String,
+    ) -> Result<InteractionRecord, StoreError> {
+        self.run(move |conn| {
+            let mut rec = load_interaction(conn, &interaction_id)?
+                .ok_or_else(|| StoreError::Id("unknown interaction".into()))?;
+            if rec.state != "pending" {
+                return Ok(rec);
+            }
+            let now = now_rfc3339();
+            if let Some(obj) = rec.payload.as_object_mut() {
+                obj.insert("answerCommandId".into(), json!(command_id));
+            }
+            conn.execute(
+                "UPDATE interactions SET state = 'answered', payload_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![rec.payload.to_string(), now, interaction_id],
+            )?;
+            rec.state = "answered".into();
+            rec.updated_at = now;
+            Ok(rec)
         })
         .await
     }
@@ -1082,6 +1234,19 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS interactions (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            blocking INTEGER NOT NULL DEFAULT 1,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS interactions_instance ON interactions(instance_id);
+        CREATE INDEX IF NOT EXISTS interactions_host_state ON interactions(host_id, state);
         ",
     )?;
     ensure_column(&conn, "hosts", "labels_json", "TEXT NOT NULL DEFAULT '[]'")?;
@@ -1275,6 +1440,118 @@ fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRec
     )
     .optional()
     .map_err(StoreError::from)
+}
+
+fn load_journal_row(
+    conn: &Connection,
+    instance_id: &str,
+    seq: i64,
+) -> Result<Option<JournalRecord>, StoreError> {
+    conn.query_row(
+        "SELECT seq, event_id, payload_json, observed_at FROM journal
+         WHERE instance_id = ?1 AND seq = ?2",
+        params![instance_id, seq],
+        |row| {
+            let payload: String = row.get(2)?;
+            Ok(JournalRecord {
+                instance_id: instance_id.to_string(),
+                seq: row.get(0)?,
+                event_id: row.get(1)?,
+                event: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                observed_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn interaction_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InteractionRecord> {
+    let payload: String = row.get(6)?;
+    let blocking: i64 = row.get(5)?;
+    Ok(InteractionRecord {
+        interaction_id: row.get(0)?,
+        instance_id: row.get(1)?,
+        host_id: row.get(2)?,
+        kind: row.get(3)?,
+        state: row.get(4)?,
+        blocking: blocking != 0,
+        payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn load_interaction(conn: &Connection, id: &str) -> Result<Option<InteractionRecord>, StoreError> {
+    conn.query_row(
+        "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at
+         FROM interactions WHERE id = ?1",
+        params![id],
+        interaction_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn apply_interaction_event(
+    conn: &Connection,
+    host_id: &str,
+    instance_id: &str,
+    event: &Value,
+) -> Result<(), StoreError> {
+    let kind = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("subtype").and_then(Value::as_str))
+        .unwrap_or("");
+    let id = event
+        .get("interactionId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .pointer("/payload/interactionId")
+                .and_then(Value::as_str)
+        });
+    let Some(id) = id.filter(|id| !id.is_empty()) else {
+        return Ok(());
+    };
+    let now = now_rfc3339();
+    if kind == "interaction.requested" || kind == "interactionRequested" {
+        let ikind = event
+            .get("interactionKind")
+            .and_then(Value::as_str)
+            .or_else(|| event.pointer("/payload/kind").and_then(Value::as_str))
+            .unwrap_or("permission");
+        conn.execute(
+            "INSERT INTO interactions
+                (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 1, ?5, ?6, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at,
+                state = CASE WHEN interactions.state = 'pending' THEN 'pending' ELSE interactions.state END",
+            params![id, instance_id, host_id, ikind, event.to_string(), now],
+        )?;
+        conn.execute(
+            "UPDATE instances SET activity = 'waiting-interaction', updated_at = ?1 WHERE id = ?2",
+            params![now, instance_id],
+        )?;
+    } else if kind == "interaction.answered"
+        || kind == "interactionAnswered"
+        || kind == "interaction.expired"
+        || kind == "interactionExpired"
+    {
+        let state = if kind.contains("expired") {
+            "expired"
+        } else {
+            "answered"
+        };
+        conn.execute(
+            "UPDATE interactions SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![state, now, id],
+        )?;
+    }
+    Ok(())
 }
 
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {

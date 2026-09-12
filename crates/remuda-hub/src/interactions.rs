@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use remuda_protocol::{CommandId, Id, InteractionAnswer, InteractionId};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::time::Duration;
 
 const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,13 +42,33 @@ pub struct AnswerBody {
     answer: InteractionAnswer,
 }
 
-/// `GET /v1/interactions` — pending cards across connected hosts.
+/// `GET /v1/interactions` — durable Hub index, merged with live Node RPC.
 pub async fn list_interactions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, HubError> {
     require_device(&state.store, &headers).await?;
+    let mut items: Vec<Value> = state
+        .store
+        .list_interactions(
+            query.host_id.clone(),
+            query.instance_id.clone(),
+            query.kind.clone(),
+            true,
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.to_list_item())
+        .collect();
+    let mut seen: HashSet<String> = items
+        .iter()
+        .filter_map(|item| {
+            item.get("interactionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
     let mut params = json!({});
     if let Some(instance_id) = &query.instance_id
         && let Some(obj) = params.as_object_mut()
@@ -63,7 +84,6 @@ pub async fn list_interactions(
         Some(host_id) => vec![host_id.clone()],
         None => state.nodes.host_ids().await,
     };
-    let mut items = Vec::new();
     for host_id in hosts {
         match state
             .nodes
@@ -82,7 +102,14 @@ pub async fn list_interactions(
                             if query.kind.as_ref().is_none_or(|want| {
                                 item.get("kind").and_then(Value::as_str) == Some(want.as_str())
                             }) {
-                                items.push(item.clone());
+                                let id = item
+                                    .get("interactionId")
+                                    .or_else(|| item.get("id"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                if id.is_empty() || seen.insert(id.to_string()) {
+                                    items.push(item.clone());
+                                }
                             }
                         }
                     }
@@ -115,13 +142,37 @@ pub async fn answer_interaction(
         None => CommandId::new(),
     };
     let by_device = Id::try_from(device.id).map_err(|err| HubError::Internal(err.to_string()))?;
+    let stored = state
+        .store
+        .get_interaction(interaction_id.as_id().as_str().to_string())
+        .await?;
+    if let Some(row) = &stored {
+        if row.state != "pending" {
+            return Err(HubError::Superseded {
+                winner: row
+                    .payload
+                    .get("answerCommandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+        let _ = state
+            .store
+            .answer_interaction(
+                interaction_id.as_id().as_str().to_string(),
+                command_id.as_id().as_str().to_string(),
+            )
+            .await?;
+    }
+    let had_stored = stored.is_some();
     let params = json!({
         "interactionId": interaction_id.as_id().as_str(),
         "commandId": command_id.as_id().as_str(),
         "byDevice": by_device.as_str(),
         "answer": body.answer,
     });
-    let mut last_not_found = true;
+    let mut last_not_found = !had_stored;
     for host_id in state.nodes.host_ids().await {
         match state
             .nodes
@@ -141,6 +192,14 @@ pub async fn answer_interaction(
             Ok(None) => last_not_found = true,
             Err(err) => return Err(err),
         }
+    }
+    if had_stored {
+        let rec = state
+            .store
+            .get_interaction(interaction_id.as_id().as_str().to_string())
+            .await?
+            .ok_or(HubError::NotFound)?;
+        return Ok(Json(rec.to_list_item()));
     }
     if last_not_found {
         return Err(HubError::NotFound);

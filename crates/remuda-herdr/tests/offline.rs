@@ -29,9 +29,49 @@ fn workspace_root() -> PathBuf {
         .unwrap()
 }
 
+fn cargo_target_dir() -> PathBuf {
+    for key in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+        if let Ok(dir) = std::env::var(key) {
+            let path = PathBuf::from(dir);
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            if path.is_absolute() {
+                return path;
+            }
+            return workspace_root().join(path);
+        }
+    }
+    workspace_root().join("target")
+}
+
+fn locate_fake_herdr(target_dir: &std::path::Path) -> Option<PathBuf> {
+    let mut dirs = vec![target_dir.to_path_buf()];
+    for key in ["CARGO_BUILD_TARGET", "TARGET"] {
+        if let Ok(triple) = std::env::var(key)
+            && !triple.is_empty()
+        {
+            dirs.push(target_dir.join(triple));
+        }
+    }
+    let names = ["fake-herdr", "fake-herdr.exe"];
+    for dir in dirs {
+        for profile in ["debug", "release"] {
+            for name in names {
+                let candidate = dir.join(profile).join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn fake_herdr_bin() -> PathBuf {
-    let cargo = env!("CARGO");
-    let status = Command::new(cargo)
+    let target_dir = cargo_target_dir();
+    let status = Command::new(env!("CARGO"))
+        .current_dir(workspace_root())
         .args([
             "build",
             "-p",
@@ -39,18 +79,23 @@ fn fake_herdr_bin() -> PathBuf {
             "--bin",
             "fake-herdr",
             "--quiet",
+            "--target-dir",
         ])
+        .arg(&target_dir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("CARGO_BUILD_TARGET_DIR", &target_dir)
         .status()
-        .expect("cargo build fake-herdr");
-    assert!(status.success(), "failed to build fake-herdr");
-    let root = workspace_root();
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("fake-herdr");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    panic!("fake-herdr binary not found under target/{{debug,release}}");
+        .expect("cargo build -p remuda-testing --bin fake-herdr");
+    assert!(
+        status.success(),
+        "cargo build -p remuda-testing --bin fake-herdr failed with {status}"
+    );
+    locate_fake_herdr(&target_dir).unwrap_or_else(|| {
+        panic!(
+            "fake-herdr binary not found under {}/{{debug,release}}",
+            target_dir.display()
+        )
+    })
 }
 
 fn spawn_fake(socket: &std::path::Path, script: &str) -> ChildGuard {

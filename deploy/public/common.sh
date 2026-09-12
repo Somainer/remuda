@@ -90,7 +90,7 @@ create_backup() (
   install -d -m 0700 "$BACKUP_DIR"
   stage=$(mktemp -d "$BACKUP_DIR/.work.XXXXXXXX")
   partial="$stage/archive.tar.gz.age"
-  # shellcheck disable=SC2329 # Invoked by the EXIT trap in this subshell.
+  # shellcheck disable=SC2317,SC2329 # Invoked by the EXIT trap in this subshell.
   cleanup_backup() {
     local status=$?
     trap - EXIT

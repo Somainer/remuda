@@ -231,9 +231,10 @@ Validation used an isolated archive of `63d6cf4801c46f3c8b46d2661eeefc8b740189e3
 
 The Clippy workaround is `cargo clippy --offline -p remuda --no-deps -- -D warnings -A unused-imports`. The unowned `cmd/ssh.rs` re-exports an unused `run_cli as run`; the earlier full dependency lint also found `remuda-node::transport::session_task` exceeding Clippy's argument count (subsequently addressed by its owner). This exception changes the validation command, not lint policy in source. Other command modules are unchanged by this task.
 
+The composition source landed in `3f5a8952396d32a5d2bcdfeba4b4f9fd8a48eaad`. The coordinator synchronized its `Cargo.lock` dependencies in `dc9c5f2`; the committed Remuda lock entry matches the dependencies used by the isolated validation.
+
 Remaining steps:
 
-- Synchronize the Remuda entry in `Cargo.lock` in a separate scoped commit, preserving the unrelated Node/Feishu dependency edits in the shared working tree.
 - Adopt the Node owner's evolving runtime WSS dispatcher after it supports configured labels/maxInstances and bounded cancellation during reconnect. The current root uses `WssCarrier` for enrollment, private host-token persistence and heartbeat; unsupported Hub commands receive JSON-RPC `-32601` rather than a success ACK. A disconnect exits without replay.
 - `StdioCarrier` exposes inventory/hello/ping only. Provider profiles and their secret references are loaded and validated, but the current local Node composition does not register those profiles or enforce configured placement/capacity. Native driver/provider integration belongs in the next composition increment after the Node API lands.
 - `RunningHub` exposes shutdown on Drop but no awaited server-drain handle. Local Node driver close commands are awaited with a deadline; the Node API still needs cancellation of upgraded WebSockets and a shutdown gate for existing command streams.

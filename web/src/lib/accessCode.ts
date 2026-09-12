@@ -3,8 +3,6 @@ import { readSession } from "./session";
 const KEY = "runtime.access-code";
 
 export function readAccessCode(): string {
-  const fromEnv = import.meta.env.VITE_ACCESS_CODE ?? "";
-  if (fromEnv) return fromEnv;
   try {
     return localStorage.getItem(KEY) ?? "";
   } catch {

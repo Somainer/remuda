@@ -14,7 +14,7 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
   const from = (location.state as { from?: string } | null)?.from;
   const pref = mode ?? (params.get("code") || params.get("pair") != null || mobile ? "pair" : "bootstrap");
   const [tab, setTab] = useState<"bootstrap" | "pair">(pref);
-  const [token, setToken] = useState("");
+  const [token, setToken] = useState(() => import.meta.env.VITE_ACCESS_CODE ?? "");
   const [code, setCode] = useState((params.get("code") ?? "").toUpperCase());
   const [deviceName, setDeviceName] = useState(readDeviceSettings().deviceName);
   const [busy, setBusy] = useState(false);

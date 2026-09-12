@@ -156,6 +156,23 @@
         }
       }
     },
+    "/v1/instances/{id}": {
+      "get": {
+        "tags": ["instances"],
+        "operationId": "instanceGet",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Instance",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/InstanceRecord" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/instances/{id}/commands": {
       "post": {
         "tags": ["instances"],
@@ -415,6 +432,50 @@
         }
       }
     },
+    "/v1/interactions": {
+      "get": {
+        "tags": ["instances"],
+        "operationId": "interactionList",
+        "summary": "Pending interactions across connected hosts",
+        "parameters": [
+          { "name": "hostId", "in": "query", "schema": { "type": "string" } },
+          { "name": "instanceId", "in": "query", "schema": { "type": "string" } },
+          { "name": "kind", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Interaction page",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/InteractionPage" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/interactions/{id}/answer": {
+      "post": {
+        "tags": ["instances"],
+        "operationId": "interactionAnswer",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/InteractionAnswerRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "First-answer-wins result",
+            "content": {
+              "application/json": { "schema": { "type": "object", "additionalProperties": true } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/follow": {
       "get": {
         "tags": ["realtime"],
@@ -425,6 +486,12 @@
             "name": "instanceId",
             "in": "query",
             "schema": { "type": "string" }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Device token when the browser cannot set WS headers"
           }
         ],
         "responses": { "101": { "description": "Switching Protocols" } }
@@ -656,6 +723,22 @@
         "properties": {
           "command": { "$ref": "#/components/schemas/CommandRecord" },
           "replayed": { "type": "boolean" }
+        }
+      },
+      "InteractionPage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "nextCursor": { "type": ["string", "null"] }
+        }
+      },
+      "InteractionAnswerRequest": {
+        "type": "object",
+        "required": ["answer"],
+        "properties": {
+          "commandId": { "type": "string" },
+          "answer": { "type": "object", "additionalProperties": true }
         }
       },
       "JournalPage": {

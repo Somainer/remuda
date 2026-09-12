@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:e2e:hub": "playwright test -c playwright.hub.config.ts",
     "lint": "oxlint src --ignore-pattern src/lib/api.generated.ts",
     "preview": "vite preview",
     "gen:api": "node ./scripts/gen-api.mjs"

@@ -69,6 +69,7 @@ pub(crate) fn instance_env(
             .unwrap_or_default(),
     );
     env.insert("REMUDA_BOOTSTRAP_TOKEN".into(), String::new());
+    env.insert("REMUDA_ENROLL_TOKEN".into(), String::new());
     if let Some(hub) = launch
         .request
         .agent_credential
@@ -100,6 +101,49 @@ impl std::fmt::Debug for AgentCredential {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn child_environment_replaces_operator_credentials_and_caller_identity() {
+        use remuda_protocol::{DriverKind, HostId, InstanceId, WorkspaceId};
+
+        let inherited = BTreeMap::from([
+            ("REMUDA_TOKEN".into(), "human-token".into()),
+            ("REMUDA_BOOTSTRAP_TOKEN".into(), "pairing-code".into()),
+            ("REMUDA_ENROLL_TOKEN".into(), "enrollment-token".into()),
+            ("REMUDA_INSTANCE_ID".into(), "other-instance".into()),
+            ("REMUDA_HOST_ID".into(), "other-host".into()),
+            ("FAKE_CLAUDE_SCRIPT".into(), "ok".into()),
+        ]);
+        for credential in [None, Some(json!({"token":"scoped-agent-token"}))] {
+            let launch = crate::DriverLaunch {
+                instance: crate::runtime::fixture_instance(
+                    InstanceId::new(),
+                    HostId::new(),
+                    WorkspaceId::new(),
+                    DriverKind::ClaudePrint,
+                )
+                .unwrap(),
+                request: serde_json::from_value(json!({"agentCredential":credential})).unwrap(),
+                workspace_root: ".".into(),
+            };
+            let env = instance_env(&launch, &inherited);
+            assert_eq!(env["REMUDA_BOOTSTRAP_TOKEN"], "");
+            assert_eq!(env["REMUDA_ENROLL_TOKEN"], "");
+            assert_eq!(
+                env["REMUDA_TOKEN"],
+                credential.as_ref().map_or("", |_| "scoped-agent-token")
+            );
+            assert_eq!(
+                env["REMUDA_INSTANCE_ID"],
+                launch.instance.meta.id.as_id().as_str()
+            );
+            assert_eq!(
+                env["REMUDA_HOST_ID"],
+                launch.instance.host_id.as_id().as_str()
+            );
+            assert_eq!(env["FAKE_CLAUDE_SCRIPT"], "ok");
+        }
+    }
 
     #[test]
     fn only_hub_envelope_sets_origin() {

@@ -234,7 +234,9 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
     .to_string();
     let (status, _, err) =
         http(hub.addr, "POST", "/v1/fleet/instances", &auth, Some(&body)).await?;
-    assert_eq!(status, 422, "{err}");
+    assert_eq!(status, 409, "{err}");
+    let err: Value = serde_json::from_str(err.trim())?;
+    assert_eq!(err["code"], json!("HOST_OFFLINE"));
 
     let (_cn_ws, _) = connect_node(
         hub.addr,

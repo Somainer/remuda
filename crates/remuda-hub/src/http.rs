@@ -164,9 +164,7 @@ pub async fn list_hosts(
     headers: HeaderMap,
 ) -> Result<Json<Value>, HubError> {
     require_device(&state.store, &headers).await?;
-    let items: Vec<Value> = state
-        .store
-        .list_hosts()
+    let items: Vec<Value> = crate::placement::hosts_with_live_links(&state)
         .await?
         .iter()
         .map(crate::registry::host_view)
@@ -300,13 +298,8 @@ pub async fn post_command(
     if !created {
         return Ok(Json(json!({ "command": command, "replayed": true })));
     }
-    let online = state
-        .store
-        .get_host(instance.host_id)
-        .await?
-        .map(|h| h.online)
-        .unwrap_or(false);
-    let command = forward_if_online(&state, command, online).await?;
+    let live = state.nodes.kind_of(&instance.host_id).await.is_some();
+    let command = forward_if_online(&state, command, live).await?;
     Ok(Json(json!({ "command": command, "replayed": false })))
 }
 

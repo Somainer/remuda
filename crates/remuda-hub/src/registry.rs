@@ -57,8 +57,15 @@ async fn get_host(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
     require_device(&state.store, &headers).await?;
-    let host = state.store.get_host(id).await?.ok_or(HubError::NotFound)?;
-    Ok(Json(host_view(&host)))
+    let host = state
+        .store
+        .get_host(id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let live = state.nodes.kind_of(&host.host_id).await.is_some();
+    Ok(Json(host_view(&crate::store::Store::with_live_link(
+        host, live,
+    ))))
 }
 
 async fn patch_host(
@@ -81,5 +88,8 @@ async fn patch_host(
         .patch_host(id, body.name, labels, body.max_instances)
         .await
         .map_err(crate::http::map_store)?;
-    Ok(Json(host_view(&host)))
+    let live = state.nodes.kind_of(&host.host_id).await.is_some();
+    Ok(Json(host_view(&crate::store::Store::with_live_link(
+        host, live,
+    ))))
 }

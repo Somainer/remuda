@@ -131,6 +131,10 @@ async fn spawn_inner(
     resolve_bootstrap(&mut config)?;
     let bootstrap_token = config.bootstrap_token.clone();
     let store = Store::open(&config.data_dir)?;
+    store
+        .mark_all_hosts_offline()
+        .await
+        .map_err(|err| anyhow::anyhow!("mark hosts offline: {err}"))?;
     let push = match transport {
         Some(t) => Some(PushService::open_with(
             &config.data_dir,

@@ -7,6 +7,7 @@
 //! `fake-herdr` impersonates herdr 0.9.0 JSON-RPC over a Unix socket so
 //! `remuda-herdr` tests can run offline.
 
+mod bin_locator;
 mod client;
 mod fake;
 mod fake_herdr;
@@ -14,6 +15,10 @@ mod flags;
 mod paths;
 mod script;
 
+pub use bin_locator::{
+    cargo_bin_exe, cargo_target_dir, ensure_workspace_bin, fallback_bin_path, locate_bin_in,
+    locate_workspace_bin, workspace_root,
+};
 pub use client::{
     FakeClaudeProcess, SpawnOptions, fake_claude_bin, is_control_subtype, is_system_subtype,
     is_type, spawn_fake_claude, transcript_path,

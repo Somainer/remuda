@@ -96,17 +96,8 @@ pub fn herdr_session_ok_path() -> PathBuf {
 
 /// Path to the `fake-herdr` binary built for this package.
 pub fn fake_herdr_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_fake-herdr") {
-        return PathBuf::from(path);
-    }
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("target");
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    path.push(profile);
-    path.push("fake-herdr");
-    path
+    crate::locate_workspace_bin("fake-herdr")
+        .unwrap_or_else(|| crate::fallback_bin_path("fake-herdr"))
 }
 
 /// Background fake server. Dropping it unlinks the socket and joins the thread.

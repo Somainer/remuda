@@ -159,17 +159,8 @@ impl Drop for FakeClaudeProcess {
 
 /// Path to the `fake-claude` binary built for this package.
 pub fn fake_claude_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_fake-claude") {
-        return PathBuf::from(path);
-    }
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("target");
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    path.push(profile);
-    path.push("fake-claude");
-    path
+    crate::locate_workspace_bin("fake-claude")
+        .unwrap_or_else(|| crate::fallback_bin_path("fake-claude"))
 }
 
 /// Spawn `fake-claude` with stream-json flags a real host would pass.

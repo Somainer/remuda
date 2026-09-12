@@ -11,22 +11,16 @@ use remuda_protocol::{
     InteractionKind, Knowledge, LifecyclePayload, Observation, ObservationPayload, PermissionMode,
     PromptInput, PromptMode, QuestionAnswer, QuestionFieldAnswer, TextBlock, WorkflowState,
 };
-use remuda_testing::{ScriptKind, fake_claude_bin, script_path};
+use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 fn ensure_fake_claude() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "remuda-testing", "--bin", "fake-claude"])
-            .status()
-            .expect("build fake-claude");
-        assert!(status.success(), "fake-claude build failed");
-        let path = fake_claude_bin();
+        let path = ensure_workspace_bin("fake-claude");
         assert!(path.is_file(), "missing {}", path.display());
         path
     })

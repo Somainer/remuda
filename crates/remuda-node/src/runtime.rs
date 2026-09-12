@@ -950,12 +950,16 @@ fn command_parts(
         }
         CommandAction::Close => Ok((CommandOperation::InstanceClose, DriverRequest::Close, true)),
         CommandAction::WriteTty => {
-            let keys = request.keys.clone().unwrap_or_default();
+            let keys = request.keys.as_deref().unwrap_or_default();
             if keys.is_empty() {
                 return Err(NodeError::InvalidRequest(
                     "tty.write requires keys".to_owned(),
                 ));
             }
+            let keys = keys
+                .iter()
+                .map(|key| validate_tty_key(key))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok((
                 CommandOperation::TtyWrite,
                 DriverRequest::SendKeys { keys },
@@ -963,6 +967,48 @@ fn command_parts(
             ))
         }
     }
+}
+
+// Keep the logical-key vocabulary aligned with the CLI encoder. The Node is
+// the trust boundary: raw RPC callers do not pass through that encoder.
+fn validate_tty_key(key: &str) -> Result<String, NodeError> {
+    let mut chars = key.chars();
+    if let Some(ch) = chars.next()
+        && chars.next().is_none()
+        && !ch.is_control()
+        && !ch.is_whitespace()
+    {
+        return Ok(key.to_owned());
+    }
+    let name = key.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "enter"
+            | "return"
+            | "tab"
+            | "esc"
+            | "escape"
+            | "space"
+            | "backspace"
+            | "bs"
+            | "delete"
+            | "del"
+            | "up"
+            | "down"
+            | "left"
+            | "right"
+            | "home"
+            | "end"
+            | "c-c"
+    ) || (name.starts_with("ctrl+")
+        && name.len() == 6
+        && name.as_bytes()[5].is_ascii_lowercase())
+    {
+        return Ok(name);
+    }
+    Err(NodeError::InvalidRequest(
+        "unsupported tty.write key".into(),
+    ))
 }
 
 fn validate_kind_driver(
@@ -1555,5 +1601,94 @@ mod tests {
         })
         .await
         .expect("fake-driver-keys lifecycle");
+    }
+
+    #[test]
+    fn tty_key_allowlist_accepts_cli_keys_and_rejects_parser_sequences() {
+        for key in [
+            "enter",
+            "RETURN",
+            "tab",
+            "esc",
+            "escape",
+            "space",
+            "backspace",
+            "bs",
+            "delete",
+            "del",
+            "up",
+            "down",
+            "left",
+            "right",
+            "home",
+            "end",
+            "c-c",
+            "ctrl+a",
+            "CTRL+Z",
+            "a",
+            "A",
+            "中",
+            ";",
+        ] {
+            assert!(validate_tty_key(key).is_ok(), "{key:?}");
+        }
+        for key in [
+            "",
+            " ",
+            "\n",
+            "\0",
+            "\x1b",
+            "\u{7f}",
+            "\x1b[31m",
+            "enter; whoami",
+            "text:payload",
+            " ctrl+c",
+            "enter\n",
+            "ctrl+1",
+            "ctrl+aa",
+            "ctrl+é",
+            "alt+enter",
+            "unknown-key",
+        ] {
+            assert!(validate_tty_key(key).is_err(), "{key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tty_write_rpc_rejects_entire_invalid_batch_before_dispatch() {
+        let node = DevNode::new(&crate::DevServerConfig::loopback(0)).expect("node");
+        let created = node
+            .create_instance(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude", "driver": "claude-print", "prompt": ""
+                }))
+                .expect("request"),
+            )
+            .await
+            .expect("create");
+        for keys in [
+            serde_json::json!([]),
+            serde_json::json!(["enter", "text:payload"]),
+            serde_json::json!(["\u{001b}[31m"]),
+        ] {
+            let rejected = crate::transport::hubnode::dispatch_method(
+                &node,
+                remuda_protocol::hubnode::METHOD_TTY_WRITE,
+                serde_json::json!({"instanceId": created.instance.meta.id, "keys": keys}),
+            )
+            .await;
+            assert!(
+                rejected.is_err(),
+                "invalid logical keys must not reach the driver"
+            );
+        }
+        let events = node
+            .read_journal(&created.instance.journal_id, None, 128)
+            .expect("journal");
+        assert!(
+            !serde_json::to_string(&events)
+                .expect("events")
+                .contains("fake-driver-keys")
+        );
     }
 }

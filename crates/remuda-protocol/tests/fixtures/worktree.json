@@ -1,0 +1,29 @@
+{
+  "id": "wkt_01993ab0-0000-7000-8000-000000000001",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+  "repositoryId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "parentWorkspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+  "path": "/work/project-tree",
+  "branch": {
+    "state": "known",
+    "value": "fixture"
+  },
+  "baseOid": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "headOid": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "managedBy": "runtime",
+  "state": "creating",
+  "dirty": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "createdByCommandId": "cmd_01993ab0-0000-7000-8000-000000000001"
+}

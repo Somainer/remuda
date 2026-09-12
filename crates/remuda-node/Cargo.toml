@@ -1,0 +1,13 @@
+[package]
+name = "remuda-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Node instance management and outbound Hub connection."
+
+[lints]
+workspace = true
+
+[dependencies]

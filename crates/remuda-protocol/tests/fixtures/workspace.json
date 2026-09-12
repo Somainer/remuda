@@ -1,0 +1,23 @@
+{
+  "id": "wsp_01993ab0-0000-7000-8000-000000000001",
+  "revision": "1",
+  "createdAt": "2026-09-12T10:00:00.000Z",
+  "updatedAt": "2026-09-12T10:00:00.000Z",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+  "label": "fixture workspace",
+  "rootPath": "/work/project",
+  "canonicalRoot": {
+    "state": "known",
+    "value": "/work/project"
+  },
+  "state": "ready",
+  "repository": {
+    "state": "not-applicable"
+  },
+  "worktree": null,
+  "writePolicy": "exclusive",
+  "writerLeases": [],
+  "accessPolicyRevision": "1",
+  "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+  "durableSeq": "1"
+}

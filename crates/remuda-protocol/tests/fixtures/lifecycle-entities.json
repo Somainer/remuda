@@ -1,0 +1,516 @@
+[
+  {
+    "type": "entity",
+    "entityType": "host",
+    "entityId": "hst_01993ab0-0000-7000-8000-000000000001",
+    "revision": "1",
+    "previousState": null,
+    "state": "offline",
+    "reasonCode": "fixture",
+    "evidenceEventIds": [],
+    "entity": {
+      "id": "hst_01993ab0-0000-7000-8000-000000000001",
+      "revision": "1",
+      "createdAt": "2026-09-12T10:00:00.000Z",
+      "updatedAt": "2026-09-12T10:00:00.000Z",
+      "label": "fixture host",
+      "ownerPrincipalId": "prn_01993ab0-0000-7000-8000-000000000001",
+      "state": "offline",
+      "nodeVersion": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "platform": {
+        "state": "known",
+        "value": {
+          "os": "linux",
+          "arch": "x86_64",
+          "pathStyle": "posix"
+        }
+      },
+      "identityKeyId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "nodeEpoch": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "transport": {
+        "mode": "outbound-wss",
+        "endpointRef": "obj_01993ab0-0000-7000-8000-000000000002"
+      },
+      "lastSeenAt": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "leaseExpiresAt": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "driverInventory": [],
+      "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+      "durableSeq": "0"
+    }
+  },
+  {
+    "type": "entity",
+    "entityType": "workspace",
+    "entityId": "wsp_01993ab0-0000-7000-8000-000000000001",
+    "revision": "1",
+    "previousState": null,
+    "state": "ready",
+    "reasonCode": "fixture",
+    "evidenceEventIds": [],
+    "entity": {
+      "id": "wsp_01993ab0-0000-7000-8000-000000000001",
+      "revision": "1",
+      "createdAt": "2026-09-12T10:00:00.000Z",
+      "updatedAt": "2026-09-12T10:00:00.000Z",
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "label": "fixture workspace",
+      "rootPath": "/work/project",
+      "canonicalRoot": {
+        "state": "known",
+        "value": "/work/project"
+      },
+      "state": "ready",
+      "repository": {
+        "state": "not-applicable"
+      },
+      "worktree": null,
+      "writePolicy": "exclusive",
+      "writerLeases": [],
+      "accessPolicyRevision": "1",
+      "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+      "durableSeq": "1"
+    }
+  },
+  {
+    "type": "entity",
+    "entityType": "instance",
+    "entityId": "ins_01993ab0-0000-7000-8000-000000000001",
+    "revision": "1",
+    "previousState": null,
+    "state": "unknown",
+    "reasonCode": "fixture",
+    "evidenceEventIds": [],
+    "entity": {
+      "id": "ins_01993ab0-0000-7000-8000-000000000001",
+      "revision": "1",
+      "createdAt": "2026-09-12T10:00:00.000Z",
+      "updatedAt": "2026-09-12T10:00:00.000Z",
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+      "kind": "claude",
+      "driver": "claude-print",
+      "lifecycle": "unknown",
+      "activity": {
+        "state": "unknown",
+        "reason": "control-channel-lost",
+        "evidenceEventIds": []
+      },
+      "activityEvidenceEventIds": [],
+      "connectivity": "disconnected",
+      "ownership": "managed",
+      "nativeRef": {
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "nativeStoreId": "obj_01993ab0-0000-7000-8000-000000000002",
+        "kind": "claude",
+        "sessionId": {
+          "state": "known",
+          "value": "01993ab0-0000-7000-8000-000000000003"
+        },
+        "transcript": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "claude": {
+          "sessionId": "01993ab0-0000-7000-8000-000000000003"
+        }
+      },
+      "processRef": {
+        "processGeneration": "1",
+        "processIdentity": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "connectionEpoch": "epoch_01993ab0-0000-7000-8000-000000000001"
+      },
+      "specRevision": "1",
+      "launchId": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "capabilities": {
+        "id": "obj_01993ab0-0000-7000-8000-000000000002",
+        "driverKind": "claude-print",
+        "adapterVersion": "0.1.0",
+        "binaryVersion": "fixture",
+        "binaryDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "nativeProtocolVersion": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "settingsRevision": "1",
+        "providerProfileRevision": "1",
+        "capabilities": {
+          "resume": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "steer": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "model-switch": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "fork": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "structured-workflow": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "artifact": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "tty-attach": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "hooks": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "interactive-approval": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "question": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "plan-review": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "elicitation": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "live-attach": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "completion-native-turn": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          },
+          "completion-task": {
+            "state": "unknown",
+            "scope": [],
+            "reasonCode": "not-verified",
+            "prerequisites": [],
+            "evidence": []
+          }
+        }
+      },
+      "ownerFence": "1",
+      "activeRunIds": [
+        "run_01993ab0-0000-7000-8000-000000000001"
+      ],
+      "parent": null,
+      "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+      "durableSeq": "0",
+      "exit": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      }
+    }
+  },
+  {
+    "type": "entity",
+    "entityType": "run",
+    "entityId": "run_01993ab0-0000-7000-8000-000000000001",
+    "revision": "1",
+    "previousState": null,
+    "state": "unknown",
+    "reasonCode": "fixture",
+    "evidenceEventIds": [],
+    "entity": {
+      "id": "run_01993ab0-0000-7000-8000-000000000001",
+      "revision": "1",
+      "createdAt": "2026-09-12T10:00:00.000Z",
+      "updatedAt": "2026-09-12T10:00:00.000Z",
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "cause": {
+        "type": "command",
+        "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+        "sourceEventId": null
+      },
+      "parentRunId": null,
+      "rootRunId": "run_01993ab0-0000-7000-8000-000000000001",
+      "parentage": "known-root",
+      "completionScope": "native-turn",
+      "state": "unknown",
+      "processGeneration": "1",
+      "runGeneration": "1",
+      "nativeTurns": [],
+      "inputRef": "obj_01993ab0-0000-7000-8000-000000000002",
+      "inputDigest": {
+        "state": "known",
+        "value": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "providerSelection": {
+        "profileId": "pvp_01993ab0-0000-7000-8000-000000000001",
+        "profileRevision": "1",
+        "endpointId": "obj_01993ab0-0000-7000-8000-000000000002",
+        "ingress": "native-login",
+        "credentialRef": null,
+        "credentialVersion": null,
+        "modelRequested": "fixture-model",
+        "modelResolved": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "selectionReason": "pinned"
+      },
+      "capabilitySnapshotId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "startedAt": {
+        "state": "known",
+        "value": "2026-09-12T10:00:00.000Z"
+      },
+      "endedAt": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "terminalEvidence": {
+        "state": "unknown",
+        "reason": "native-ack-missing",
+        "evidenceEventIds": []
+      },
+      "stateConfidence": "unknown",
+      "result": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "outstandingWork": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      }
+    }
+  },
+  {
+    "type": "entity",
+    "entityType": "command",
+    "entityId": "cmd_01993ab0-0000-7000-8000-000000000001",
+    "revision": "1",
+    "previousState": null,
+    "state": "queued",
+    "reasonCode": "fixture",
+    "evidenceEventIds": [],
+    "entity": {
+      "id": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "revision": "1",
+      "createdAt": "2026-09-12T10:00:00.000Z",
+      "updatedAt": "2026-09-12T10:00:00.000Z",
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "actor": {
+        "principalId": "prn_01993ab0-0000-7000-8000-000000000001",
+        "type": "human",
+        "deviceId": "dev_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": null
+      },
+      "origin": "ui",
+      "operation": "instance.send",
+      "target": {
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001"
+      },
+      "payloadRef": "obj_01993ab0-0000-7000-8000-000000000002",
+      "payloadDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "expected": {
+        "processGeneration": "1",
+        "runGeneration": "1"
+      },
+      "state": "queued",
+      "authority": "node-ledger",
+      "forwardIntent": {
+        "state": "known",
+        "value": {
+          "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+          "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+          "hubRevision": "1",
+          "createdAt": "2026-09-12T10:00:00.000Z"
+        }
+      },
+      "dispatch": "transport-written",
+      "resolution": "unknown",
+      "acceptance": {
+        "state": "unknown",
+        "reason": "native-ack-missing",
+        "evidenceEventIds": []
+      },
+      "settlement": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "queuedAt": "2026-09-12T10:00:00.000Z",
+      "acceptedAt": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "settledAt": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "expiresAt": null,
+      "nodeReceipt": {
+        "state": "known",
+        "value": {
+          "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+          "ledgerRevision": "2"
+        }
+      }
+    }
+  },
+  {
+    "type": "entity",
+    "entityType": "interaction",
+    "entityId": "int_01993ab0-0000-7000-8000-000000000001",
+    "revision": "1",
+    "previousState": null,
+    "state": "pending",
+    "reasonCode": "fixture",
+    "evidenceEventIds": [],
+    "entity": {
+      "id": "int_01993ab0-0000-7000-8000-000000000001",
+      "revision": "1",
+      "createdAt": "2026-09-12T10:00:00.000Z",
+      "updatedAt": "2026-09-12T10:00:00.000Z",
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "runId": "run_01993ab0-0000-7000-8000-000000000001",
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "kind": "question",
+      "requestKey": {
+        "native": {
+          "type": "rpc",
+          "valueType": "string",
+          "value": "native-perm-1"
+        },
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "connectionEpoch": "epoch_01993ab0-0000-7000-8000-000000000001"
+      },
+      "requestVersion": "1",
+      "state": "pending",
+      "blocking": true,
+      "answerable": true,
+      "carrier": "claude-control",
+      "request": {
+        "kind": "question",
+        "title": "Beverage",
+        "fields": [
+          {
+            "id": "beverage",
+            "title": "Tea or coffee?",
+            "description": null,
+            "input": "single-select",
+            "required": true,
+            "options": [
+              {
+                "id": "tea",
+                "label": "Tea"
+              },
+              {
+                "id": "coffee",
+                "label": "Coffee"
+              }
+            ],
+            "allowFreeText": false,
+            "sensitive": false
+          }
+        ]
+      },
+      "deadline": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "deadlineSource": "none",
+      "answer": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "delivery": "not-sent",
+      "resolution": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      }
+    }
+  }
+]

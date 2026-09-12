@@ -1,0 +1,14 @@
+[package]
+name = "remuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Remuda Hub, Node, and local development command entry points."
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true

@@ -1,0 +1,1258 @@
+{
+  "jsonrpc": "2.0",
+  "method": "events.batch",
+  "params": {
+    "subscriptionId": "sub_01993ab0-0000-7000-8000-000000000001",
+    "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+    "fromSeq": "1",
+    "toSeq": "15",
+    "events": [
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000001",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "1",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "message",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "nodeId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "revision": "1",
+          "operation": "open",
+          "baseRevision": null,
+          "messageId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "role": "assistant",
+          "phase": "commentary",
+          "blocks": [
+            {
+              "type": "text",
+              "text": "OK"
+            }
+          ],
+          "targetBlock": null,
+          "parentToolCallId": null,
+          "nativeOrigin": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "status": "complete"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000002",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "2",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "thought",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "nodeId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "revision": "1",
+          "operation": "open",
+          "baseRevision": null,
+          "thoughtId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "representation": "redacted",
+          "text": null,
+          "partIndex": 0,
+          "status": "complete"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000003",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "3",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "tool_call",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "nodeId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "revision": "1",
+          "operation": "open",
+          "baseRevision": null,
+          "toolCallId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "parentToolCallId": null,
+          "toolName": {
+            "state": "known",
+            "value": "Read"
+          },
+          "displayTitle": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "category": "file-read",
+          "input": {
+            "state": "known",
+            "value": {
+              "path": "README.md"
+            }
+          },
+          "inputTextDelta": null,
+          "state": "proposed",
+          "executor": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          }
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000004",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "4",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "tool_result",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "nodeId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "revision": "1",
+          "operation": "open",
+          "baseRevision": null,
+          "toolCallId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "stage": "final",
+          "outcome": "denied",
+          "blocks": [],
+          "structuredResult": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "exitCode": {
+            "state": "not-applicable"
+          },
+          "changes": []
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000005",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "5",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "interaction.requested",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "interaction": {
+            "id": "int_01993ab0-0000-7000-8000-000000000001",
+            "revision": "1",
+            "createdAt": "2026-09-12T10:00:00.000Z",
+            "updatedAt": "2026-09-12T10:00:00.000Z",
+            "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+            "runId": "run_01993ab0-0000-7000-8000-000000000001",
+            "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+            "kind": "question",
+            "requestKey": {
+              "native": {
+                "type": "rpc",
+                "valueType": "string",
+                "value": "native-perm-1"
+              },
+              "processGeneration": "1",
+              "runGeneration": "1",
+              "connectionEpoch": "epoch_01993ab0-0000-7000-8000-000000000001"
+            },
+            "requestVersion": "1",
+            "state": "pending",
+            "blocking": true,
+            "answerable": true,
+            "carrier": "claude-control",
+            "request": {
+              "kind": "question",
+              "title": "Beverage",
+              "fields": [
+                {
+                  "id": "beverage",
+                  "title": "Tea or coffee?",
+                  "description": null,
+                  "input": "single-select",
+                  "required": true,
+                  "options": [
+                    {
+                      "id": "tea",
+                      "label": "Tea"
+                    },
+                    {
+                      "id": "coffee",
+                      "label": "Coffee"
+                    }
+                  ],
+                  "allowFreeText": false,
+                  "sensitive": false
+                }
+              ]
+            },
+            "deadline": {
+              "state": "unknown",
+              "reason": "not-emitted",
+              "evidenceEventIds": []
+            },
+            "deadlineSource": "none",
+            "answer": {
+              "state": "unknown",
+              "reason": "not-emitted",
+              "evidenceEventIds": []
+            },
+            "delivery": "not-sent",
+            "resolution": {
+              "state": "unknown",
+              "reason": "not-emitted",
+              "evidenceEventIds": []
+            }
+          }
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000006",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "6",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "interaction.answered",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "interactionId": "int_01993ab0-0000-7000-8000-000000000001",
+          "requestVersion": "1",
+          "answerCommandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+          "actor": {
+            "principalId": "prn_01993ab0-0000-7000-8000-000000000001",
+            "type": "human",
+            "deviceId": "dev_01993ab0-0000-7000-8000-000000000001",
+            "instanceId": null
+          },
+          "answerRef": "obj_01993ab0-0000-7000-8000-000000000002",
+          "delivery": "written"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000007",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "7",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "interaction.expired",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "interactionId": "int_01993ab0-0000-7000-8000-000000000001",
+          "requestVersion": "1",
+          "reason": "generation-ended",
+          "evidenceEventIds": []
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000008",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "8",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "workflow.run",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "workflowId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "engine": "claude-workflow",
+          "nativeRunId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeTaskId": {
+            "state": "known",
+            "value": "wf-fixture"
+          },
+          "toolCallId": null,
+          "state": "unknown",
+          "revision": "1",
+          "title": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "resultRef": null
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000009",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "9",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "workflow.phase",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "workflowId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "phaseId": "obj_01993ab0-0000-7000-8000-000000000003",
+          "nativePhaseId": {
+            "state": "known",
+            "value": "fixture-phase"
+          },
+          "label": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "state": "unknown",
+          "revision": "1",
+          "parentPhaseId": null
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000010",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "10",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "workflow.member",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "workflowId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "memberId": "obj_01993ab0-0000-7000-8000-000000000004",
+          "nativeAgentId": {
+            "state": "known",
+            "value": "native-agent"
+          },
+          "nativeKey": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "attempt": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "phaseId": null,
+          "label": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "state": "running",
+          "modelRequested": {
+            "state": "known",
+            "value": "gpt-example"
+          },
+          "modelResolved": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "resultRef": null,
+          "revision": "1"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000011",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "11",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "lifecycle",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "type": "native",
+          "topic": "diagnostic",
+          "nativeName": "fixture",
+          "nativeId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "status": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "relatedIds": {},
+          "dataRef": null,
+          "severity": "info",
+          "affectsCompletion": false
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000012",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "12",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "usage",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "usageId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "scope": "turn",
+          "scopeId": "01993ab0-0000-7000-8000-000000000003",
+          "mode": "snapshot",
+          "metricRevision": "1",
+          "inputAccounting": "unknown",
+          "accounting": "reported",
+          "nativeFieldsRef": null,
+          "inputTokens": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "outputTokens": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "reasoningTokens": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "cacheReadTokens": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "cacheWriteTokens": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "totalTokens": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "cost": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          }
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000013",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "13",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "artifact",
+        "completeness": "structured",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "artifactId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "revision": "1",
+          "action": "declared",
+          "type": "file",
+          "title": {
+            "state": "known",
+            "value": "README.md"
+          },
+          "mediaType": {
+            "state": "known",
+            "value": "text/markdown"
+          },
+          "sizeBytes": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "locator": {
+            "type": "workspace-file",
+            "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+            "relativePath": "README.md",
+            "revision": "1",
+            "digest": {
+              "state": "unknown",
+              "reason": "not-emitted",
+              "evidenceEventIds": []
+            }
+          },
+          "producerToolCallId": null,
+          "verification": "declared"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000014",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "14",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-pty",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "herdr",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "raw_tty",
+        "completeness": "screen-derived",
+        "rawRef": null,
+        "evidenceEventIds": [],
+        "payload": {
+          "streamId": "tty_01993ab0-0000-7000-8000-000000000001",
+          "streamEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+          "direction": "output",
+          "representation": "rendered-ansi",
+          "offset": "0",
+          "byteLength": "2",
+          "dataRef": {
+            "objectId": "obj_01993ab0-0000-7000-8000-000000000002",
+            "offset": "0",
+            "length": "2",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "mediaType": "application/json",
+            "redaction": "none"
+          },
+          "nativeFrame": {
+            "state": "known",
+            "value": {
+              "seq": "1",
+              "width": 120,
+              "height": 40,
+              "full": true
+            }
+          }
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "eventId": "evt_01993ab0-0000-7000-8000-000000000015",
+        "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "seq": "15",
+        "observedAt": "2026-09-12T10:00:00.000Z",
+        "nativeAt": {
+          "state": "unknown",
+          "reason": "not-emitted",
+          "evidenceEventIds": []
+        },
+        "source": {
+          "driverKind": "claude-print",
+          "driverVersion": "fixture",
+          "adapterVersion": "0.1.0",
+          "channel": "runtime",
+          "delivery": "live",
+          "nativeSessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "nativeTurnId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeAgentId": {
+            "state": "not-applicable"
+          },
+          "nativeItemId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeEventId": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "nativeRequestId": {
+            "type": "none"
+          },
+          "sourceCursor": {
+            "type": "runtime",
+            "ledgerRevision": "1"
+          }
+        },
+        "kind": "opaque",
+        "completeness": "opaque",
+        "rawRef": {
+          "objectId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "offset": "0",
+          "length": "2",
+          "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "mediaType": "application/json",
+          "redaction": "none"
+        },
+        "evidenceEventIds": [],
+        "payload": {
+          "nativeType": "future-event",
+          "reason": "unknown-type",
+          "rawRef": {
+            "objectId": "obj_01993ab0-0000-7000-8000-000000000002",
+            "offset": "0",
+            "length": "2",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "mediaType": "application/json",
+            "redaction": "none"
+          },
+          "affects": [
+            "presentation"
+          ],
+          "summary": null
+        }
+      }
+    ],
+    "durableSeq": "15"
+  }
+}

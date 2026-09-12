@@ -1,0 +1,184 @@
+{
+  "id": "ins_01993ab0-0000-7000-8000-000000000001",
+  "revision": "1",
+  "createdAt": "2026-09-12T10:00:00.000Z",
+  "updatedAt": "2026-09-12T10:00:00.000Z",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+  "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+  "kind": "claude",
+  "driver": "claude-print",
+  "lifecycle": "unknown",
+  "activity": {
+    "state": "unknown",
+    "reason": "control-channel-lost",
+    "evidenceEventIds": []
+  },
+  "activityEvidenceEventIds": [],
+  "connectivity": "disconnected",
+  "ownership": "managed",
+  "nativeRef": {
+    "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+    "nativeStoreId": "obj_01993ab0-0000-7000-8000-000000000002",
+    "kind": "claude",
+    "sessionId": {
+      "state": "known",
+      "value": "01993ab0-0000-7000-8000-000000000003"
+    },
+    "transcript": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "claude": {
+      "sessionId": "01993ab0-0000-7000-8000-000000000003"
+    }
+  },
+  "processRef": {
+    "processGeneration": "1",
+    "processIdentity": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "connectionEpoch": "epoch_01993ab0-0000-7000-8000-000000000001"
+  },
+  "specRevision": "1",
+  "launchId": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "capabilities": {
+    "id": "obj_01993ab0-0000-7000-8000-000000000002",
+    "driverKind": "claude-print",
+    "adapterVersion": "0.1.0",
+    "binaryVersion": "fixture",
+    "binaryDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "nativeProtocolVersion": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "settingsRevision": "1",
+    "providerProfileRevision": "1",
+    "capabilities": {
+      "resume": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "steer": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "model-switch": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "fork": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "structured-workflow": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "artifact": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "tty-attach": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "hooks": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "interactive-approval": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "question": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "plan-review": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "elicitation": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "live-attach": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "completion-native-turn": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "completion-task": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "not-verified",
+        "prerequisites": [],
+        "evidence": []
+      }
+    }
+  },
+  "ownerFence": "1",
+  "activeRunIds": [
+    "run_01993ab0-0000-7000-8000-000000000001"
+  ],
+  "parent": null,
+  "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+  "durableSeq": "0",
+  "exit": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  }
+}

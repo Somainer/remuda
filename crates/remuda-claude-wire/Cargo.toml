@@ -1,0 +1,13 @@
+[package]
+name = "remuda-claude-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Claude stream-json framing and native control protocol adapters."
+
+[lints]
+workspace = true
+
+[dependencies]

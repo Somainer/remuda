@@ -1534,3 +1534,5 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
   }
 }
 ~~~
+
+本次本机验证（macOS，Rust 1.94.1）：`cargo build --workspace`、`cargo test --workspace`（12 个 wire 测试）、`cargo clippy --workspace -- -D warnings`、`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 均通过；CLI 的 `--help` 和 `hub`、`node`、`dev` 占位命令均成功退出。Linux 的 test/clippy/fmt 已写入 CI 配置，尚未执行托管 CI。

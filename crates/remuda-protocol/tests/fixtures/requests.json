@@ -1,0 +1,717 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "id": "request-1",
+    "method": "runtime.hello",
+    "params": {
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000004",
+      "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000005",
+      "nodeVersion": "0.1.0",
+      "protocol": {
+        "major": 1,
+        "minMinor": 0,
+        "maxMinor": 0
+      },
+      "observationSchemaMajors": [
+        1
+      ],
+      "features": [
+        "snapshot-follow-v1",
+        "tty-binary-v1"
+      ],
+      "resumeCursors": []
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-2",
+    "method": "runtime.heartbeat",
+    "params": {
+      "connectionId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "registryWatermarks": [],
+      "instanceWatermarks": [],
+      "leaseId": "obj_01993ab0-0000-7000-8000-000000000002"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-3",
+    "method": "host.report",
+    "params": {
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+      "platform": {
+        "os": "linux",
+        "arch": "x86_64",
+        "pathStyle": "posix"
+      },
+      "driverInventory": [],
+      "workspaceIds": [
+        "wsp_01993ab0-0000-7000-8000-000000000001"
+      ],
+      "instanceIds": [
+        "ins_01993ab0-0000-7000-8000-000000000001"
+      ]
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-4",
+    "method": "host.get",
+    "params": {
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-5",
+    "method": "host.list",
+    "params": {
+      "limit": 10
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-6",
+    "method": "driver.list",
+    "params": {
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-7",
+    "method": "driver.capabilities",
+    "params": {
+      "driverKind": "claude-print",
+      "binaryRef": "obj_01993ab0-0000-7000-8000-000000000002",
+      "profileRef": {
+        "id": "pvp_01993ab0-0000-7000-8000-000000000001",
+        "revision": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-8",
+    "method": "workspace.register",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+        "rootPath": "/work/project",
+        "label": "fixture",
+        "writePolicy": "exclusive"
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-9",
+    "method": "workspace.get",
+    "params": {
+      "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-10",
+    "method": "workspace.list",
+    "params": {
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "limit": 10
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-11",
+    "method": "worktree.create",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "worktreeId": "wkt_01993ab0-0000-7000-8000-000000000001",
+        "parentWorkspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+        "baseOid": "fixture-base",
+        "branch": "fixture"
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-12",
+    "method": "worktree.remove",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "worktreeId": "wkt_01993ab0-0000-7000-8000-000000000001",
+        "expectedHeadOid": "fixture-head",
+        "expectedDirty": false
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-13",
+    "method": "instance.create",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "spec": {
+          "schemaVersion": 1,
+          "host": "hst_01993ab0-0000-7000-8000-000000000001",
+          "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+          "kind": "claude",
+          "driver": "claude-print",
+          "binaryRef": "obj_01993ab0-0000-7000-8000-000000000002",
+          "cwd": "/work/project",
+          "providerProfile": {
+            "id": "pvp_01993ab0-0000-7000-8000-000000000001",
+            "revision": "1"
+          },
+          "modelId": null,
+          "permissionMode": {
+            "kind": "claude",
+            "mode": "manual",
+            "interaction": "host"
+          },
+          "env": {},
+          "args": [],
+          "settingsOverlay": {
+            "format": "none",
+            "objectRef": null,
+            "revision": "1"
+          },
+          "nativeHome": {
+            "mode": "registered",
+            "storeId": "obj_01993ab0-0000-7000-8000-000000000002"
+          },
+          "carrier": {
+            "type": "stdio"
+          },
+          "requiredCapabilities": [],
+          "completionScope": "native-turn",
+          "parent": null
+        },
+        "initialInput": {
+          "type": "prompt",
+          "mode": "new-turn",
+          "blocks": [
+            {
+              "type": "text",
+              "text": "Read the project README."
+            }
+          ],
+          "origin": "human",
+          "nativeClientMessageId": "user-fixture-1"
+        }
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-14",
+    "method": "instance.attach",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "ref": {
+          "nativeRef": {
+            "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+            "nativeStoreId": "obj_01993ab0-0000-7000-8000-000000000002",
+            "kind": "claude",
+            "sessionId": {
+              "state": "known",
+              "value": "01993ab0-0000-7000-8000-000000000003"
+            },
+            "transcript": {
+              "state": "unknown",
+              "reason": "not-emitted",
+              "evidenceEventIds": []
+            },
+            "claude": {
+              "sessionId": "01993ab0-0000-7000-8000-000000000003"
+            }
+          },
+          "processRef": {
+            "processGeneration": "1",
+            "processIdentity": {
+              "state": "unknown",
+              "reason": "not-emitted",
+              "evidenceEventIds": []
+            },
+            "connectionEpoch": "epoch_01993ab0-0000-7000-8000-000000000001"
+          },
+          "mode": "observe",
+          "allowWake": false
+        }
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-15",
+    "method": "instance.resume",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "nativeRef": {
+          "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+          "nativeStoreId": "obj_01993ab0-0000-7000-8000-000000000002",
+          "kind": "claude",
+          "sessionId": {
+            "state": "known",
+            "value": "01993ab0-0000-7000-8000-000000000003"
+          },
+          "transcript": {
+            "state": "unknown",
+            "reason": "not-emitted",
+            "evidenceEventIds": []
+          },
+          "claude": {
+            "sessionId": "01993ab0-0000-7000-8000-000000000003"
+          }
+        },
+        "providerProfileRevision": "1",
+        "expectedPreviousGeneration": "1"
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-16",
+    "method": "instance.send",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001",
+        "input": {
+          "type": "prompt",
+          "mode": "new-turn",
+          "blocks": [
+            {
+              "type": "text",
+              "text": "Read the project README."
+            }
+          ],
+          "origin": "human",
+          "nativeClientMessageId": "user-fixture-1"
+        },
+        "completionScope": "native-turn"
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-17",
+    "method": "instance.configure",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "modelId": "gpt-example",
+        "effective": "next-turn"
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-18",
+    "method": "instance.fork",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "sourceInstanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "newInstanceId": "ins_01993ab0-0000-7000-8000-000000000002",
+        "nativeBoundary": {
+          "type": "latest-terminal"
+        },
+        "newSpec": {
+          "schemaVersion": 1,
+          "host": "hst_01993ab0-0000-7000-8000-000000000001",
+          "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+          "kind": "claude",
+          "driver": "claude-print",
+          "binaryRef": "obj_01993ab0-0000-7000-8000-000000000002",
+          "cwd": "/work/project",
+          "providerProfile": {
+            "id": "pvp_01993ab0-0000-7000-8000-000000000001",
+            "revision": "1"
+          },
+          "modelId": null,
+          "permissionMode": {
+            "kind": "claude",
+            "mode": "manual",
+            "interaction": "host"
+          },
+          "env": {},
+          "args": [],
+          "settingsOverlay": {
+            "format": "none",
+            "objectRef": null,
+            "revision": "1"
+          },
+          "nativeHome": {
+            "mode": "registered",
+            "storeId": "obj_01993ab0-0000-7000-8000-000000000002"
+          },
+          "carrier": {
+            "type": "stdio"
+          },
+          "requiredCapabilities": [],
+          "completionScope": "native-turn",
+          "parent": null
+        }
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-19",
+    "method": "instance.cancel",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "runId": "run_01993ab0-0000-7000-8000-000000000001"
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-20",
+    "method": "instance.close",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "mode": "terminate",
+        "retainNativeSession": true
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-21",
+    "method": "instance.get",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-22",
+    "method": "instance.list",
+    "params": {
+      "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+      "limit": 10
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-23",
+    "method": "command.get",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-24",
+    "method": "command.list",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "limit": 10
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-25",
+    "method": "run.get",
+    "params": {
+      "runId": "run_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-26",
+    "method": "run.list",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "limit": 10
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-27",
+    "method": "run.wait",
+    "params": {
+      "runId": "run_01993ab0-0000-7000-8000-000000000001",
+      "condition": "terminal",
+      "timeoutMs": 100
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-28",
+    "method": "workflow.wait",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "workflowId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "timeoutMs": 100
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-29",
+    "method": "interaction.list",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-30",
+    "method": "interaction.get",
+    "params": {
+      "interactionId": "int_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-31",
+    "method": "interaction.respond",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "interactionId": "int_01993ab0-0000-7000-8000-000000000001",
+        "requestVersion": "1",
+        "processGeneration": "1",
+        "runGeneration": "1",
+        "connectionEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+        "answer": {
+          "kind": "question",
+          "answers": {
+            "beverage": {
+              "optionIds": [
+                "tea"
+              ],
+              "text": null
+            }
+          }
+        }
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-32",
+    "method": "events.subscribe",
+    "params": {
+      "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+      "afterSeq": null,
+      "snapshot": "required",
+      "projectionVersion": "1",
+      "batchLimit": 128
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-33",
+    "method": "events.read",
+    "params": {
+      "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+      "afterSeq": "0",
+      "limit": 128
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-34",
+    "method": "events.ack",
+    "params": {
+      "subscriptionId": "sub_01993ab0-0000-7000-8000-000000000001",
+      "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+      "throughSeq": "15"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-35",
+    "method": "events.unsubscribe",
+    "params": {
+      "subscriptionId": "sub_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-36",
+    "method": "reconcile.instance",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "expectedGeneration": "1",
+      "commandIds": [
+        "cmd_01993ab0-0000-7000-8000-000000000001"
+      ]
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-37",
+    "method": "tty.attach",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "processGeneration": "1",
+      "mode": "read",
+      "previousStreamId": null,
+      "afterOffset": null
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-38",
+    "method": "tty.detach",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "streamId": "tty_01993ab0-0000-7000-8000-000000000001"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-39",
+    "method": "tty.write",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "processGeneration": "1",
+        "streamId": "tty_01993ab0-0000-7000-8000-000000000001",
+        "streamEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+        "writerLeaseId": "obj_01993ab0-0000-7000-8000-000000000002",
+        "inputSeq": "1",
+        "dataBase64": "eQ=="
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-40",
+    "method": "tty.resize",
+    "params": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "streamId": "tty_01993ab0-0000-7000-8000-000000000001",
+      "writerLeaseId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "resizeRevision": "1",
+      "cols": 120,
+      "rows": 40
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-41",
+    "method": "object.stat",
+    "params": {
+      "objectId": "obj_01993ab0-0000-7000-8000-000000000002"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-42",
+    "method": "object.read",
+    "params": {
+      "objectId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "offset": "0",
+      "length": "2",
+      "expectedDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-43",
+    "method": "object.prepare",
+    "params": {
+      "objectId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+      "mediaType": "text/plain",
+      "sizeBytes": "2",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "purpose": "input"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-44",
+    "method": "object.write",
+    "params": {
+      "uploadId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "offset": "0",
+      "dataBase64": "T0s=",
+      "chunkDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-45",
+    "method": "object.commit",
+    "params": {
+      "uploadId": "obj_01993ab0-0000-7000-8000-000000000002",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+]

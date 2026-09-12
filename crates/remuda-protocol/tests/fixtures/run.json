@@ -1,0 +1,67 @@
+{
+  "id": "run_01993ab0-0000-7000-8000-000000000001",
+  "revision": "1",
+  "createdAt": "2026-09-12T10:00:00.000Z",
+  "updatedAt": "2026-09-12T10:00:00.000Z",
+  "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+  "cause": {
+    "type": "command",
+    "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+    "sourceEventId": null
+  },
+  "parentRunId": null,
+  "rootRunId": "run_01993ab0-0000-7000-8000-000000000001",
+  "parentage": "known-root",
+  "completionScope": "native-turn",
+  "state": "unknown",
+  "processGeneration": "1",
+  "runGeneration": "1",
+  "nativeTurns": [],
+  "inputRef": "obj_01993ab0-0000-7000-8000-000000000002",
+  "inputDigest": {
+    "state": "known",
+    "value": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "providerSelection": {
+    "profileId": "pvp_01993ab0-0000-7000-8000-000000000001",
+    "profileRevision": "1",
+    "endpointId": "obj_01993ab0-0000-7000-8000-000000000002",
+    "ingress": "native-login",
+    "credentialRef": null,
+    "credentialVersion": null,
+    "modelRequested": "fixture-model",
+    "modelResolved": {
+      "state": "unknown",
+      "reason": "not-emitted",
+      "evidenceEventIds": []
+    },
+    "selectionReason": "pinned"
+  },
+  "capabilitySnapshotId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "startedAt": {
+    "state": "known",
+    "value": "2026-09-12T10:00:00.000Z"
+  },
+  "endedAt": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "terminalEvidence": {
+    "state": "unknown",
+    "reason": "native-ack-missing",
+    "evidenceEventIds": []
+  },
+  "stateConfidence": "unknown",
+  "result": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "outstandingWork": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  }
+}

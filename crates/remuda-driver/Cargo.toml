@@ -1,0 +1,13 @@
+[package]
+name = "remuda-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Native Claude print, PTY, and background driver implementations."
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,68 @@
+{
+  "id": "cmd_01993ab0-0000-7000-8000-000000000001",
+  "revision": "1",
+  "createdAt": "2026-09-12T10:00:00.000Z",
+  "updatedAt": "2026-09-12T10:00:00.000Z",
+  "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+  "actor": {
+    "principalId": "prn_01993ab0-0000-7000-8000-000000000001",
+    "type": "human",
+    "deviceId": "dev_01993ab0-0000-7000-8000-000000000001",
+    "instanceId": null
+  },
+  "origin": "ui",
+  "operation": "instance.send",
+  "target": {
+    "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+    "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+    "runId": "run_01993ab0-0000-7000-8000-000000000001"
+  },
+  "payloadRef": "obj_01993ab0-0000-7000-8000-000000000002",
+  "payloadDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "expected": {
+    "processGeneration": "1",
+    "runGeneration": "1"
+  },
+  "state": "queued",
+  "authority": "node-ledger",
+  "forwardIntent": {
+    "state": "known",
+    "value": {
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+      "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+      "hubRevision": "1",
+      "createdAt": "2026-09-12T10:00:00.000Z"
+    }
+  },
+  "dispatch": "transport-written",
+  "resolution": "unknown",
+  "acceptance": {
+    "state": "unknown",
+    "reason": "native-ack-missing",
+    "evidenceEventIds": []
+  },
+  "settlement": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "queuedAt": "2026-09-12T10:00:00.000Z",
+  "acceptedAt": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "settledAt": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "expiresAt": null,
+  "nodeReceipt": {
+    "state": "known",
+    "value": {
+      "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000001",
+      "ledgerRevision": "2"
+    }
+  }
+}

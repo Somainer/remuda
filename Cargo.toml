@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/remuda-protocol",
+    "crates/remuda-claude-wire",
+    "crates/remuda-herdr",
+    "crates/remuda-driver",
+    "crates/remuda-journal",
+    "crates/remuda-node",
+    "crates/remuda-hub",
+    "crates/remuda",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.94.1"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+bytes = { version = "1", features = ["serde"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rust-embed = "8"
+portable-pty = "0.9"
+remuda-protocol = { path = "crates/remuda-protocol" }
+remuda-claude-wire = { path = "crates/remuda-claude-wire" }
+remuda-herdr = { path = "crates/remuda-herdr" }
+remuda-driver = { path = "crates/remuda-driver" }
+remuda-journal = { path = "crates/remuda-journal" }
+remuda-node = { path = "crates/remuda-node" }
+remuda-hub = { path = "crates/remuda-hub" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"

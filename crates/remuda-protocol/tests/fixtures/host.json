@@ -1,0 +1,45 @@
+{
+  "id": "hst_01993ab0-0000-7000-8000-000000000001",
+  "revision": "1",
+  "createdAt": "2026-09-12T10:00:00.000Z",
+  "updatedAt": "2026-09-12T10:00:00.000Z",
+  "label": "fixture host",
+  "ownerPrincipalId": "prn_01993ab0-0000-7000-8000-000000000001",
+  "state": "offline",
+  "nodeVersion": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "platform": {
+    "state": "known",
+    "value": {
+      "os": "linux",
+      "arch": "x86_64",
+      "pathStyle": "posix"
+    }
+  },
+  "identityKeyId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "nodeEpoch": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "transport": {
+    "mode": "outbound-wss",
+    "endpointRef": "obj_01993ab0-0000-7000-8000-000000000002"
+  },
+  "lastSeenAt": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "leaseExpiresAt": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "driverInventory": [],
+  "journalId": "obj_01993ab0-0000-7000-8000-000000000001",
+  "durableSeq": "0"
+}

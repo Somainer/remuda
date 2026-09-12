@@ -1,0 +1,13 @@
+[package]
+name = "remuda-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Hub authentication, host registry, routing, and embedded Web assets."
+
+[lints]
+workspace = true
+
+[dependencies]

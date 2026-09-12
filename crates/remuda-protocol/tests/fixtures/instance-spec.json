@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "host": "hst_01993ab0-0000-7000-8000-000000000001",
+  "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000001",
+  "kind": "claude",
+  "driver": "claude-print",
+  "binaryRef": "obj_01993ab0-0000-7000-8000-000000000002",
+  "cwd": "/work/project",
+  "providerProfile": {
+    "id": "pvp_01993ab0-0000-7000-8000-000000000001",
+    "revision": "1"
+  },
+  "modelId": null,
+  "permissionMode": {
+    "kind": "claude",
+    "mode": "manual",
+    "interaction": "host"
+  },
+  "env": {},
+  "args": [],
+  "settingsOverlay": {
+    "format": "none",
+    "objectRef": null,
+    "revision": "1"
+  },
+  "nativeHome": {
+    "mode": "registered",
+    "storeId": "obj_01993ab0-0000-7000-8000-000000000002"
+  },
+  "carrier": {
+    "type": "stdio"
+  },
+  "requiredCapabilities": [],
+  "completionScope": "native-turn",
+  "parent": null
+}

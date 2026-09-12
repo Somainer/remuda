@@ -403,6 +403,49 @@ fn web_changes_automatically_enable_web_checks() {
     assert_exit(&output, &report, 0);
     assert_eq!(report["web"], true);
     assert_eq!(step(&report, "web-test")["status"], "ok");
+    assert_eq!(step(&report, "web-hub-e2e")["status"], "skipped");
+    repo.assert_cleaned();
+}
+
+#[test]
+fn auth_changes_select_live_web_e2e_in_both_dry_run_and_execution() {
+    for path in [
+        "web/src/lib/api.ts",
+        "web/src/lib/session.ts",
+        "crates/remuda-hub/src/auth.rs",
+    ] {
+        let repo = Repo::new();
+        commit_file(&repo.source, path, "auth fixture change\n");
+        let (output, report) = repo.merge(&["--dry-run", "--web"], &[]);
+        assert_exit(&output, &report, 0);
+        assert_eq!(report["webE2e"], true);
+        assert_eq!(step(&report, "web-hub-e2e")["status"], "planned");
+        let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
+        assert_exit(&output, &report, 0);
+        assert_eq!(report["web"], true);
+        assert_eq!(step(&report, "web-hub-e2e")["status"], "ok");
+        assert_eq!(repo.trace().last().unwrap()["step"], "web-hub-e2e");
+        repo.assert_cleaned();
+    }
+}
+
+#[test]
+fn live_web_e2e_failure_blocks_main_without_retrying() {
+    let repo = Repo::new();
+    commit_file(
+        &repo.source,
+        "crates/remuda-hub/src/ws.rs",
+        "auth fixture change\n",
+    );
+    let (output, report) = repo.merge(
+        &["--gate", "--web"],
+        &[("REMUDA_TEST_GATE_FAIL", "web-hub-e2e")],
+    );
+    assert_exit(&output, &report, 1);
+    assert_eq!(step(&report, "web-hub-e2e")["status"], "failed");
+    assert_eq!(step(&report, "web-hub-e2e")["attempts"], 1);
+    assert_eq!(repo.main(), repo.base);
+    assert_eq!(repo.remote_main(), repo.base);
     repo.assert_cleaned();
 }
 

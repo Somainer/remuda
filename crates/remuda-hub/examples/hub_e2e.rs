@@ -43,12 +43,20 @@ async fn main() -> Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let hub = spawn(config).await?;
+    // Local acceptance can attach the same fake engine to an isolated remuda
+    // dev Hub/Node pair. CI still starts its own disposable real Hub here.
+    let addr = config.listen;
+    let hub = if std::env::var("HUB_E2E_EXTERNAL").as_deref() == Ok("1") {
+        None
+    } else {
+        Some(spawn(config).await?)
+    };
+    let addr = hub.as_ref().map_or(addr, |hub| hub.addr);
     let host_id = HostId::new();
     let pending: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
     let node = tokio::spawn(fake_node(
-        hub.addr,
+        addr,
         BOOTSTRAP.to_string(),
         host_id.clone(),
         pending,
@@ -56,7 +64,7 @@ async fn main() -> Result<()> {
     ));
     ready_rx.await.context("fake node hello")?;
     let line = json!({
-        "hub": format!("http://{}", hub.addr),
+        "hub": format!("http://{addr}"),
         "token": BOOTSTRAP,
         "hostId": host_id.as_id().as_str(),
     });

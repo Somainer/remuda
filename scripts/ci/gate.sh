@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser(description="Run the ordered Remuda merge gate"
 selection = parser.add_mutually_exclusive_group()
 selection.add_argument("--web", action="store_true", help="include web checks")
 selection.add_argument("--web-only", action="store_true", help="CI web job only")
+parser.add_argument("--web-e2e", action="store_true", help="include live Hub browser authentication checks")
 parser.add_argument("--list", action="store_true", help="print the plan without running it")
 parser.add_argument("--report", type=Path, help="write one JSON step result per line")
 tests = parser.add_mutually_exclusive_group()
@@ -50,15 +51,18 @@ definitions = [
     ("web-install", ["pnpm", "install", "--frozen-lockfile"], "web", 1),
     ("web-build", ["pnpm", "build"], "web", 1),
     ("web-test", ["pnpm", "test"], "web", 1),
+    ("web-hub-e2e", ["pnpm", "run", "test:e2e:hub"], "web", 1),
 ]
 # Test seam: an executable path, not a shell expression. It receives the step
 # name and still exercises ordering, retries, reports, cwd, and environment.
 override = os.environ.get("REMUDA_MERGE_GATE_COMMAND")
 plan = []
 for name, command, cwd, attempts in definitions:
-    selected = (args.web or args.web_only) if cwd == "web" else not args.web_only
+    selected = (args.web or args.web_only or args.web_e2e) if cwd == "web" else not args.web_only
     if name == "cargo-test" and args.affected and not crates:
         selected = False
+    if name == "web-hub-e2e":
+        selected = args.web_e2e
     plan.append(dict(name=name, command=[override, name] if override else command,
                      cwd=cwd, maxAttempts=attempts,
                      status="planned" if selected else "skipped",

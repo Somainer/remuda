@@ -6,8 +6,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::error::Error;
-
 /// Default grok model for this crate's spawn helper.
 pub const DEFAULT_MODEL: &str = "grok-4.6";
 
@@ -265,26 +263,6 @@ impl SpawnSpec {
     }
 }
 
-/// Connect to `grok agent serve` at `/ws`.
-#[derive(Debug, Clone)]
-pub struct ServeSpec {
-    /// `ws://127.0.0.1:PORT/ws` — `server-key` query is stripped if present.
-    pub url: String,
-    /// Bearer secret. Never placed in the URL.
-    pub secret: String,
-}
-
-impl ServeSpec {
-    /// Loopback serve URL plus secret.
-    #[must_use]
-    pub fn new(url: impl Into<String>, secret: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            secret: secret.into(),
-        }
-    }
-}
-
 /// Parameters for `session/new`.
 #[derive(Debug, Clone)]
 pub struct SessionSpec {
@@ -389,17 +367,6 @@ pub fn grok_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("grok"))
 }
 
-/// Rewrite `x.ai/…` to `_x.ai/…`. Other methods must already start with `_`.
-pub fn ensure_ext_method(method: &str) -> Result<String, Error> {
-    if method.starts_with('_') {
-        Ok(method.to_string())
-    } else if method.starts_with("x.ai/") {
-        Ok(format!("_{method}"))
-    } else {
-        Err(Error::ExtMethod(method.to_string()))
-    }
-}
-
 /// `initialize` params with **empty** `clientCapabilities` (no fs/terminal).
 #[must_use]
 pub fn initialize_params(name: &str, version: &str) -> Value {
@@ -417,16 +384,6 @@ pub fn initialize_params(name: &str, version: &str) -> Value {
 #[must_use]
 pub fn adapter_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
-}
-
-/// Typed SDK initialize request: capabilities stay at defaults (fs/terminal off).
-#[must_use]
-pub fn initialize_request() -> agent_client_protocol::schema::v1::InitializeRequest {
-    use agent_client_protocol::schema::ProtocolVersion;
-    use agent_client_protocol::schema::v1::{Implementation, InitializeRequest};
-
-    InitializeRequest::new(ProtocolVersion::V1)
-        .client_info(Implementation::new(CLIENT_NAME, adapter_version()))
 }
 
 /// True when initialize JSON advertises fs or terminal support.

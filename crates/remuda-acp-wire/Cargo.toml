@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "ACP client for grok agent stdio and serve WebSocket."
+description = "Minimal ACP v1 client for grok agent stdio (D-013 freeze)."
 
 [lints]
 workspace = true
@@ -17,11 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
-tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

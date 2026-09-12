@@ -1,11 +1,11 @@
-//! Errors from ACP framing, spawn, WebSocket, and JSON-RPC.
+//! Errors from ACP framing, spawn, and JSON-RPC.
 
 use std::io;
 use std::path::PathBuf;
 
 use serde_json::Value;
 
-/// Failure talking to an ACP agent over stdio or WebSocket.
+/// Failure talking to an ACP agent over stdio.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Underlying I/O (pipes, sockets, process stdio).
@@ -31,9 +31,6 @@ pub enum Error {
     /// Child process failed to start or expose stdio.
     #[error("acp spawn: {0}")]
     Spawn(String),
-    /// WebSocket handshake or frame error.
-    #[error("acp websocket: {0}")]
-    WebSocket(String),
     /// JSON-RPC error object from the agent or the SDK.
     #[error("acp rpc {code}: {message}")]
     Rpc {
@@ -44,9 +41,6 @@ pub enum Error {
         /// Optional structured data.
         data: Option<Value>,
     },
-    /// Extension method did not start with `_` (after optional `x.ai/` rewrite).
-    #[error("acp extension method must start with '_': {0}")]
-    ExtMethod(String),
     /// Transport closed before the client finished.
     #[error("acp transport closed")]
     TransportClosed,

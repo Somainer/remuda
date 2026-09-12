@@ -6,9 +6,7 @@
 use serde_json::{Map, Value};
 
 use crate::error::Error;
-use crate::types::{
-    CaptureMeta, Direction, SessionUpdateKind, TransportKind, WireEvent, ensure_ext_method,
-};
+use crate::types::{CaptureMeta, Direction, SessionUpdateKind, TransportKind, WireEvent};
 
 /// Soft cap for a single NDJSON line (~2 MiB). Fixture max is ~69 KiB.
 pub const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -128,9 +126,10 @@ pub fn classify_rpc(rpc: &Value) -> Result<WireEvent, Error> {
         return Ok(classify_session_update(params));
     }
     if is_ext_method(method) {
-        let method = match ensure_ext_method(method) {
-            Ok(m) => m,
-            Err(_) => method.to_string(),
+        let method = if method.starts_with("x.ai/") {
+            format!("_{method}")
+        } else {
+            method.to_string()
         };
         return Ok(WireEvent::Ext { method, params, id });
     }

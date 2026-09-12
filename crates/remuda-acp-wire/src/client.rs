@@ -1,17 +1,13 @@
-//! High-level ACP client over stdio, WebSocket, or any [`ConnectTo`] transport.
-
-use std::path::Path;
+//! High-level ACP client over stdio (or any [`ConnectTo`] transport).
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, InitializeResponse, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionId,
+    CancelNotification, InitializeResponse, NewSessionRequest, NewSessionResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
 };
 use agent_client_protocol::{
     ActiveSession, Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Handled, SessionMessage,
     UntypedMessage, on_receive_notification, on_receive_request,
 };
-use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, warn};
@@ -20,8 +16,8 @@ use crate::codec::classify_session_update;
 use crate::error::Error;
 use crate::spawn::{GrokChild, drain_stderr};
 use crate::types::{
-    CLIENT_NAME, InboundEvent, PromptTurn, ServeSpec, SessionSpec, SpawnSpec, adapter_version,
-    ensure_ext_method, initialize_params,
+    CLIENT_NAME, InboundEvent, PromptTurn, SessionSpec, SpawnSpec, adapter_version,
+    initialize_params,
 };
 
 /// Live connection to an ACP agent plus a side channel for `_x.ai/*` / unknown notifications.
@@ -64,45 +60,10 @@ impl AcpConn {
         Ok(AcpSession { inner: session })
     }
 
-    /// `session/load` (requires `agentCapabilities.loadSession`).
-    pub async fn load_session(
-        &self,
-        session_id: impl Into<SessionId>,
-        cwd: impl AsRef<Path>,
-    ) -> Result<(AcpSession, LoadSessionResponse), Error> {
-        let restored = self
-            .inner
-            .load_session(session_id, cwd)
-            .block_task()
-            .start_session()
-            .await?;
-        let (session, response) = restored.into_parts();
-        Ok((AcpSession { inner: session }, response))
-    }
-
     /// `session/cancel` notification. The original `session/prompt` result carries `cancelled`.
     pub fn cancel(&self, session_id: impl Into<SessionId>) -> Result<(), Error> {
         self.inner
             .send_notification(CancelNotification::new(session_id))
-            .map_err(Error::from)
-    }
-
-    /// Raw `_x.ai/*` request. Methods without a leading `_` are rewritten when they start with `x.ai/`.
-    pub async fn ext_request(&self, method: &str, params: Value) -> Result<Value, Error> {
-        let method = ensure_ext_method(method)?;
-        let message = UntypedMessage::new(&method, params)?;
-        self.inner
-            .send_request(message)
-            .block_task()
-            .await
-            .map_err(Error::from)
-    }
-
-    /// Raw `_x.ai/*` notification.
-    pub fn ext_notify(&self, method: &str, params: Value) -> Result<(), Error> {
-        let method = ensure_ext_method(method)?;
-        self.inner
-            .send_notification(UntypedMessage::new(&method, params)?)
             .map_err(Error::from)
     }
 
@@ -112,7 +73,7 @@ impl AcpConn {
     }
 }
 
-/// Active ACP session (`session/new` or `session/load`).
+/// Active ACP session from `session/new`.
 pub struct AcpSession {
     inner: ActiveSession<'static, Agent>,
 }
@@ -260,15 +221,6 @@ pub async fn connect_stdio<T>(
     let result = connect_transport(transport, op).await;
     child.kill().await;
     result
-}
-
-/// Connect to `grok agent serve` WebSocket and run `op`.
-pub async fn connect_ws<T>(
-    spec: ServeSpec,
-    op: impl AsyncFnOnce(AcpConn) -> Result<T, Error>,
-) -> Result<T, Error> {
-    let transport = crate::ws::connect_ws_transport(&spec).await?;
-    connect_transport(transport, op).await
 }
 
 /// Connect over an already-split byte transport (tests / custom pipes).

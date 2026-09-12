@@ -8,8 +8,7 @@ use anyhow::{Context, bail, ensure};
 use clap::Args as ClapArgs;
 use remuda_node::{
     Backoff, CarrierKind, DevNode, DevServerConfig, HostInventoryConfig, HubCarrier, NodeHello,
-    NodeTransport, ServeConfig, StdioCarrier, WssCarrier, WssConfig, WssLink, compose,
-    load_or_create_host_id,
+    ServeConfig, StdioCarrier, WssConfig, WssLink, compose, load_or_create_host_id,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -137,6 +136,7 @@ pub(crate) async fn run(
 
 /// Enroll with configured inventory and cancellable I/O. Unsupported instance
 /// dispatch receives an explicit JSON-RPC error.
+#[cfg(test)]
 pub(crate) async fn outbound_session(
     url: &str,
     token: String,
@@ -145,6 +145,7 @@ pub(crate) async fn outbound_session(
     shutdown_timeout: Duration,
     stop: impl std::future::Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
+    use remuda_node::{NodeTransport, WssCarrier};
     use serde_json::json;
     tokio::pin!(stop);
     let mut carrier = tokio::select! {

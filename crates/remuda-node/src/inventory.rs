@@ -677,7 +677,7 @@ mod tests {
         write_stub(bin.path(), "codex", "codex 1");
         write_stub(bin.path(), "grok", "grok 1");
         write_stub(bin.path(), "agy", "agy 1");
-        let secret = "sk-live-DO-NOT-LEAK-123456";
+        let secret = "sk-fake-DO-NOT-LEAK-123456";
         std::fs::write(
             home.path().join(".claude.json"),
             json!({ "oauthAccount": { "token": secret }, "theme": "dark" }).to_string(),

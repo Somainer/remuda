@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -450,7 +450,7 @@ fn is_executable(path: &Path) -> bool {
 }
 
 fn binary_version(path: &Path) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
+    let output = spawn_version(path)?;
     if !output.status.success() {
         return None;
     }
@@ -463,6 +463,33 @@ fn binary_version(path: &Path) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(|line| line.chars().take(256).collect())
+}
+
+fn spawn_version(path: &Path) -> Option<std::process::Output> {
+    let mut delay = Duration::from_millis(5);
+    for _ in 0..5 {
+        match Command::new(path).arg("--version").output() {
+            Ok(output) => return Some(output),
+            Err(err) if is_retryable_spawn(&err) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "retry --version after ETXTBSY/spawn failure"
+                );
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn is_retryable_spawn(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ExecutableFileBusy | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) || err.raw_os_error() == Some(26)
 }
 
 fn hash_file(path: &Path) -> Option<String> {
@@ -586,31 +613,45 @@ fn system_binary(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     fn write_stub(dir: &Path, name: &str, version: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        place_on_path(
+            dir,
+            name,
+            remuda_testing::install_executable(dir, name, format!("#!/bin/sh\necho '{version}'\n")),
+        )
     }
 
     fn write_counter_stub(dir: &Path, name: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(
-            &path,
-            "#!/bin/sh\n\
-             hits=\"$0.hits\"\n\
-             n=0\n\
-             if [ -f \"$hits\" ]; then n=$(cat \"$hits\"); fi\n\
-             n=$((n+1))\n\
-             echo \"$n\" > \"$hits\"\n\
-             echo \"claude 0.0.$n\"\n",
+        place_on_path(
+            dir,
+            name,
+            remuda_testing::install_executable(
+                dir,
+                name,
+                "#!/bin/sh\n\
+                 hits=\"$0.hits\"\n\
+                 n=0\n\
+                 if [ -f \"$hits\" ]; then n=$(cat \"$hits\"); fi\n\
+                 n=$((n+1))\n\
+                 echo \"$n\" > \"$hits\"\n\
+                 echo \"claude 0.0.$n\"\n",
+            ),
         )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    }
+
+    /// `install_executable` uses a unique inode; PATH lookup needs `dir/name`.
+    fn place_on_path(dir: &Path, name: &str, unique: PathBuf) -> PathBuf {
+        let dest = dir.join(name);
+        std::fs::rename(&unique, &dest).unwrap_or_else(|err| {
+            panic!(
+                "place stub {} on PATH as {}: {err}",
+                unique.display(),
+                dest.display()
+            )
+        });
+        dest
     }
 
     fn env_for(dir: &Path, home: &Path) -> ProbeEnv {

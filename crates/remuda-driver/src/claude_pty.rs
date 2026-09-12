@@ -170,7 +170,7 @@ impl ClaudePtyDriver {
     }
 
     /// Transcript path recorded by the SessionStart hook, if it has fired.
-    pub async fn session_transcript(&self) -> Option<PathBuf> {
+    pub async fn session_transcript(&self) -> Option<std::path::PathBuf> {
         if let Some(inner) = self.inner.lock().await.as_ref()
             && let Ok(guard) = inner.transcript_path.lock()
             && let Some(path) = guard.as_ref()

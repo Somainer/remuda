@@ -3,7 +3,7 @@
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(RustEmbed)]
 #[folder = "$OUT_DIR/web-dist"]
@@ -11,21 +11,29 @@ struct WebAssets;
 
 /// Serve an embedded or on-disk asset; unknown paths fall back to `index.html`.
 pub async fn static_handler(uri: Uri, web_root: Option<PathBuf>) -> Response {
-    let raw = uri.path().trim_start_matches('/');
+    let raw = uri.path().strip_prefix('/').unwrap_or(uri.path());
+    if !safe_relative_path(raw) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let path = if raw.is_empty() { "index.html" } else { raw };
 
     if let Some(root) = web_root {
-        let candidate = root.join(path);
-        if candidate.is_file()
-            && let Ok(bytes) = std::fs::read(&candidate)
-        {
-            return file_response(path, bytes);
-        }
-        let index = root.join("index.html");
-        if index.is_file()
-            && let Ok(bytes) = std::fs::read(index)
-        {
-            return file_response("index.html", bytes);
+        let Ok(root) = root.canonicalize() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        for asset in [path, "index.html"] {
+            if let Ok(candidate) = root.join(asset).canonicalize() {
+                // Check the resolved path, including the SPA fallback, so an
+                // in-root symlink cannot expose a file outside the web root.
+                if !candidate.starts_with(&root) {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                if candidate.is_file()
+                    && let Ok(bytes) = std::fs::read(candidate)
+                {
+                    return file_response(asset, bytes);
+                }
+            }
         }
     }
 
@@ -40,6 +48,13 @@ pub async fn static_handler(uri: Uri, web_root: Option<PathBuf>) -> Response {
         "web ui is not embedded; build with --features embed-web after just web-build",
     )
         .into_response()
+}
+
+fn safe_relative_path(path: &str) -> bool {
+    !path.contains(['\0', '\\'])
+        && !path.starts_with('/')
+        && !Path::new(path).is_absolute()
+        && !path.split('/').any(|segment| segment == "..")
 }
 
 fn file_response(path: &str, body: Vec<u8>) -> Response {
@@ -62,5 +77,28 @@ fn mime_of(path: &str) -> &'static str {
         "json" => "application/json",
         "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_relative_path;
+
+    #[test]
+    fn rejects_unsafe_relative_paths() {
+        for path in [
+            "../secret",
+            "assets/../secret",
+            "a/..",
+            "/etc/passwd",
+            "a\0b",
+            "a\\b",
+            "C:\\secret",
+        ] {
+            assert!(!safe_relative_path(path), "{path:?}");
+        }
+        for path in ["", "index.html", "assets/main.js", "a..b"] {
+            assert!(safe_relative_path(path), "{path:?}");
+        }
     }
 }

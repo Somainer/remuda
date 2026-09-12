@@ -21,7 +21,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/login": {
+    "/node/v1/connect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Alias of /v1/node */
+        get: operations["nodeConnectAlias"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/push/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["pushConfig"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/push/subscriptions": {
         parameters: {
             query?: never;
             header?: never;
@@ -30,8 +63,136 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Bootstrap token → device cookie */
-        post: operations["login"];
+        post: operations["pushSubscribe"];
+        delete: operations["pushUnsubscribe"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/devices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["deviceList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/devices/pair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["devicePairRedeem"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/devices/pair-code": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["devicePairCode"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/devices/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["deviceRevoke"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/fleet/instances": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["fleetCreate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/fleet/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["fleetGet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/fleet/{id}/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["fleetCommands"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/follow": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** WebSocket snapshot + live journal */
+        get: operations["follow"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -120,7 +281,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/placement/resolve": {
+    "/v1/login": {
         parameters: {
             query?: never;
             header?: never;
@@ -129,168 +290,8 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post: operations["placementResolve"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/fleet/instances": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["fleetCreate"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/fleet/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["fleetGet"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/fleet/{id}/commands": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["fleetCommands"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/devices": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["deviceList"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/devices/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete: operations["deviceRevoke"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/devices/pair-code": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["devicePairCode"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/devices/pair": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["devicePairRedeem"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/push/config": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["pushConfig"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/push/subscriptions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["pushSubscribe"];
-        delete: operations["pushUnsubscribe"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/follow": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** WebSocket snapshot + live journal */
-        get: operations["follow"];
-        put?: never;
-        post?: never;
+        /** Bootstrap token → device cookie */
+        post: operations["login"];
         delete?: never;
         options?: never;
         head?: never;
@@ -314,17 +315,16 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/node/v1/connect": {
+    "/v1/placement/resolve": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Alias of /v1/node */
-        get: operations["nodeConnectAlias"];
+        get?: never;
         put?: never;
-        post?: never;
+        post: operations["placementResolve"];
         delete?: never;
         options?: never;
         head?: never;
@@ -335,19 +335,31 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        ErrorBody: {
-            error: string;
-            code: string;
-            reasons?: string[];
+        CommandRecord: {
+            commandId: string;
+            createdAt?: string;
+            forwarded?: boolean;
+            hostId: string;
+            instanceId?: string | null;
+            operation: string;
+            resolution?: string;
+            state: string;
+            updatedAt?: string;
+        } & {
+            [key: string]: unknown;
         };
-        LoginRequest: {
-            bootstrapToken: string;
-            deviceName?: string;
+        CommandRequest: {
+            commandId?: string;
+            idempotencyKey?: string;
+            operation?: string;
+            payload?: {
+                [key: string]: unknown;
+            };
+            prompt?: string;
         };
-        DeviceSession: {
-            deviceId: string;
-            token: string;
-            name: string;
+        CommandResult: {
+            command: components["schemas"]["CommandRecord"];
+            replayed?: boolean;
         };
         Device: {
             id: string;
@@ -355,6 +367,118 @@ export interface components {
         };
         DevicePage: {
             items: components["schemas"]["Device"][];
+        };
+        DeviceSession: {
+            deviceId: string;
+            name: string;
+            token: string;
+        };
+        ErrorBody: {
+            code: string;
+            error: string;
+            reasons?: string[];
+        };
+        FleetCreate: {
+            driver?: string;
+            hosts?: string[];
+            kind?: string;
+            labels?: string[];
+            max?: number;
+            prompt?: string;
+            spec?: {
+                [key: string]: unknown;
+            };
+        };
+        FleetCreateResult: {
+            fleetId?: string;
+            instanceIds?: string[];
+        };
+        HostPage: {
+            items: components["schemas"]["HostView"][];
+            nextCursor?: string | null;
+        };
+        HostPatch: {
+            labels?: string[];
+            maxInstances?: number;
+            name?: string;
+        };
+        HostView: {
+            cli?: {
+                [key: string]: unknown;
+            }[];
+            herdr?: {
+                [key: string]: unknown;
+            } | null;
+            hostId: string;
+            hostname?: string | null;
+            id?: string;
+            instanceCount?: number;
+            label: string;
+            labels?: string[];
+            lastSeenAt?: string | null;
+            maxInstances?: number;
+            name?: string;
+            online: boolean;
+            resources?: {
+                [key: string]: unknown;
+            } | null;
+            state: string;
+            transport?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        InstanceCreate: {
+            delegation?: string;
+            driver?: string;
+            hostId?: string;
+            kind?: string;
+            model?: string;
+            name?: string;
+            permissionMode?: string;
+            placement?: {
+                [key: string]: unknown;
+            };
+            prompt?: string;
+            providerProfileId?: string;
+            title?: string;
+            workspaceId?: string;
+        };
+        InstanceCreateResult: {
+            command: components["schemas"]["CommandRecord"];
+            hostId?: string;
+            instance: components["schemas"]["InstanceRecord"];
+        };
+        InstancePage: {
+            items: components["schemas"]["InstanceRecord"][];
+            nextCursor?: string | null;
+        };
+        InstanceRecord: {
+            activity: string;
+            connectivity: string;
+            createdAt?: string;
+            driver: string;
+            durableSeq: string;
+            hostId: string;
+            instanceId: string;
+            journalId: string;
+            kind: string;
+            lifecycle: string;
+            title?: string | null;
+            updatedAt?: string;
+            workspaceId?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        JournalPage: {
+            durableSeq: string;
+            events: {
+                [key: string]: unknown;
+            }[];
+            instanceId: string;
+        };
+        LoginRequest: {
+            bootstrapToken: string;
+            deviceName?: string;
         };
         PairCode: {
             code: string;
@@ -364,147 +488,23 @@ export interface components {
             code: string;
             deviceName?: string;
         };
-        HostView: {
-            hostId: string;
-            id?: string;
-            name?: string;
-            label: string;
-            state: string;
-            online: boolean;
-            lastSeenAt?: string | null;
-            cli?: {
-                [key: string]: unknown;
-            }[];
-            labels?: string[];
-            herdr?: {
-                [key: string]: unknown;
-            } | null;
-            resources?: {
-                [key: string]: unknown;
-            } | null;
-            maxInstances?: number;
-            instanceCount?: number;
-            transport?: string;
-            hostname?: string | null;
-        } & {
-            [key: string]: unknown;
-        };
-        HostPage: {
-            items: components["schemas"]["HostView"][];
-            nextCursor?: string | null;
-        };
-        HostPatch: {
-            name?: string;
-            labels?: string[];
-            maxInstances?: number;
-        };
-        InstanceRecord: {
-            instanceId: string;
-            hostId: string;
-            workspaceId?: string | null;
-            kind: string;
-            driver: string;
-            lifecycle: string;
-            activity: string;
-            connectivity: string;
-            title?: string | null;
-            journalId: string;
-            durableSeq: string;
-            createdAt?: string;
-            updatedAt?: string;
-        } & {
-            [key: string]: unknown;
-        };
-        InstancePage: {
-            items: components["schemas"]["InstanceRecord"][];
-            nextCursor?: string | null;
-        };
-        InstanceCreate: {
-            hostId?: string;
-            workspaceId?: string;
-            kind?: string;
-            driver?: string;
-            title?: string;
-            prompt?: string;
-            placement?: {
-                [key: string]: unknown;
-            };
-            delegation?: string;
-            model?: string;
-            providerProfileId?: string;
-            permissionMode?: string;
-            name?: string;
-        };
-        CommandRecord: {
-            commandId: string;
-            instanceId?: string | null;
-            hostId: string;
-            operation: string;
-            state: string;
-            resolution?: string;
-            forwarded?: boolean;
-            createdAt?: string;
-            updatedAt?: string;
-        } & {
-            [key: string]: unknown;
-        };
-        InstanceCreateResult: {
-            instance: components["schemas"]["InstanceRecord"];
-            command: components["schemas"]["CommandRecord"];
-            hostId?: string;
-        };
-        CommandRequest: {
-            commandId?: string;
-            operation?: string;
-            payload?: {
-                [key: string]: unknown;
-            };
-            idempotencyKey?: string;
-            prompt?: string;
-        };
-        CommandResult: {
-            command: components["schemas"]["CommandRecord"];
-            replayed?: boolean;
-        };
-        JournalPage: {
-            instanceId: string;
-            durableSeq: string;
-            events: {
-                [key: string]: unknown;
-            }[];
-        };
         PlacementResolve: {
+            delegation?: string;
+            driver?: string;
             hostId?: string;
             placement?: {
                 [key: string]: unknown;
             };
-            driver?: string;
-            delegation?: string;
         } & {
             [key: string]: unknown;
-        };
-        FleetCreate: {
-            spec?: {
-                [key: string]: unknown;
-            };
-            hosts?: string[];
-            labels?: string[];
-            max?: number;
-            kind?: string;
-            driver?: string;
-            prompt?: string;
-        };
-        FleetCreateResult: {
-            fleetId?: string;
-            instanceIds?: string[];
         };
         PushSubscribe: {
+            deviceId?: string;
             endpoint: string;
             keys: {
-                p256dh: string;
                 auth: string;
+                p256dh: string;
             };
-            deviceId?: string;
         };
     };
     responses: {
@@ -549,7 +549,48 @@ export interface operations {
             };
         };
     };
-    login: {
+    nodeConnectAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Switching Protocols */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    pushConfig: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description VAPID public key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        public_key: string;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+        };
+    };
+    pushSubscribe: {
         parameters: {
             query?: never;
             header?: never;
@@ -558,11 +599,81 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["LoginRequest"];
+                "application/json": components["schemas"]["PushSubscribe"];
             };
         };
         responses: {
-            /** @description Device session */
+            /** @description Stored */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok?: boolean;
+                    };
+                };
+            };
+        };
+    };
+    pushUnsubscribe: {
+        parameters: {
+            query: {
+                endpoint: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok?: boolean;
+                    };
+                };
+            };
+        };
+    };
+    deviceList: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Devices */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DevicePage"];
+                };
+            };
+        };
+    };
+    devicePairRedeem: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PairRedeem"];
+            };
+        };
+        responses: {
+            /** @description New device session */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -572,6 +683,149 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+        };
+    };
+    devicePairCode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One-time code */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PairCode"];
+                };
+            };
+        };
+    };
+    deviceRevoke: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok: boolean;
+                    };
+                };
+            };
+            404: components["responses"]["Error"];
+        };
+    };
+    fleetCreate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["FleetCreate"];
+            };
+        };
+        responses: {
+            /** @description Fleet */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FleetCreateResult"];
+                };
+            };
+            422: components["responses"]["Error"];
+        };
+    };
+    fleetGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fleet aggregate */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            404: components["responses"]["Error"];
+        };
+    };
+    fleetCommands: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Per-instance commands */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    follow: {
+        parameters: {
+            query?: {
+                instanceId?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Switching Protocols */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     hostList: {
@@ -750,6 +1004,49 @@ export interface operations {
             404: components["responses"]["Error"];
         };
     };
+    login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Device session */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeviceSession"];
+                };
+            };
+            401: components["responses"]["Error"];
+        };
+    };
+    nodeSocket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Switching Protocols */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     placementResolve: {
         parameters: {
             query?: never;
@@ -775,303 +1072,6 @@ export interface operations {
                 };
             };
             422: components["responses"]["Error"];
-        };
-    };
-    fleetCreate: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["FleetCreate"];
-            };
-        };
-        responses: {
-            /** @description Fleet */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["FleetCreateResult"];
-                };
-            };
-            422: components["responses"]["Error"];
-        };
-    };
-    fleetGet: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["IdPath"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Fleet aggregate */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            404: components["responses"]["Error"];
-        };
-    };
-    fleetCommands: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["IdPath"];
-            };
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["CommandRequest"];
-            };
-        };
-        responses: {
-            /** @description Per-instance commands */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-        };
-    };
-    deviceList: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Devices */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DevicePage"];
-                };
-            };
-        };
-    };
-    deviceRevoke: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["IdPath"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Revoked */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        ok: boolean;
-                    };
-                };
-            };
-            404: components["responses"]["Error"];
-        };
-    };
-    devicePairCode: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description One-time code */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PairCode"];
-                };
-            };
-        };
-    };
-    devicePairRedeem: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PairRedeem"];
-            };
-        };
-        responses: {
-            /** @description New device session */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeviceSession"];
-                };
-            };
-            401: components["responses"]["Error"];
-        };
-    };
-    pushConfig: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description VAPID public key */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        public_key: string;
-                    };
-                };
-            };
-            401: components["responses"]["Error"];
-        };
-    };
-    pushSubscribe: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PushSubscribe"];
-            };
-        };
-        responses: {
-            /** @description Stored */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        ok?: boolean;
-                    };
-                };
-            };
-        };
-    };
-    pushUnsubscribe: {
-        parameters: {
-            query: {
-                endpoint: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Removed */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        ok?: boolean;
-                    };
-                };
-            };
-        };
-    };
-    follow: {
-        parameters: {
-            query?: {
-                instanceId?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Switching Protocols */
-            101: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    nodeSocket: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Switching Protocols */
-            101: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    nodeConnectAlias: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Switching Protocols */
-            101: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
         };
     };
 }

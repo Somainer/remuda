@@ -10,7 +10,7 @@
     "test:e2e": "playwright test",
     "lint": "oxlint src --ignore-pattern src/lib/api.generated.ts",
     "preview": "vite preview",
-    "gen:api": "openapi-typescript ../crates/remuda-hub/openapi/openapi.json -o src/lib/api.generated.ts"
+    "gen:api": "node ./scripts/gen-api.mjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",

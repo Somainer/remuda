@@ -23,11 +23,11 @@ mod secrets;
 mod fake;
 
 pub use binary::{BinaryPin, default_command, pin_binary, resolve_binary};
-pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
-pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
 pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
 };
+pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
+pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
 pub use materializer::{

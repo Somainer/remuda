@@ -255,7 +255,9 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
             continue;
         };
         events.push(format!("{:?}", obs.body.kind()));
-        if let ObservationPayload::Lifecycle(payload) = &obs.body { if let LifecyclePayload::Native(native) = payload.as_ref() {
+        if let ObservationPayload::Lifecycle(payload) = &obs.body
+            && let LifecyclePayload::Native(native) = payload.as_ref()
+        {
             if native.native_name == "SessionStart" {
                 hook = true;
                 if let Some(path) = native.related_ids.get("transcriptPath") {
@@ -272,7 +274,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
                 idle = true;
                 break;
             }
-        } }
+        }
     }
     append_evidence(&format!(
         "- idle={} hook={} elapsed={}ms events={:?}",

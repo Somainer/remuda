@@ -14,6 +14,7 @@ import type { Workspace } from "../types/workspace";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import { printCapabilities } from "./capabilities";
 import { digestPlaceholder, id, now } from "./ids";
+import { thisDeviceId } from "./interactionStatus";
 
 const ts = now();
 
@@ -508,6 +509,90 @@ const summaries = new Map<Id, string>([
   [insQuestion, "AskUserQuestion · 1 题"],
 ]);
 
+const hostOfflineId = id("hst_");
+hosts.push({
+  ...meta(hostOfflineId),
+  label: "devbox-cn",
+  ownerPrincipalId: id("prn_"),
+  state: "offline",
+  transport: { mode: "outbound-wss", endpointRef: id("obj_") },
+});
+const wspOffline = id("wsp_");
+workspaces.push({
+  ...meta(wspOffline),
+  hostId: hostOfflineId,
+  label: "valhalla",
+  rootPath: "/home/valhalla",
+  writePolicy: "workspace-write",
+  canonicalRoot: known("/home/valhalla"),
+});
+const insPaused = id("ins_");
+const paused = instanceBase(insPaused, id("obj_"), "ready", known("waiting-interaction"));
+paused.hostId = hostOfflineId;
+paused.workspaceId = wspOffline;
+paused.connectivity = "disconnected";
+instances.push(paused);
+titles.set(insPaused, "离线主机上的审批");
+
+const expiredId = id("int_");
+const supersededId = id("int_");
+const pausedIntId = id("int_");
+const planId = id("int_");
+
+interactions.push({
+  ...pendingInteraction,
+  ...meta(expiredId),
+  id: expiredId,
+  instanceId: insIdle,
+  state: "expired",
+  answerable: false,
+  request: { kind: "approval", title: "Bash", description: "expired rm", toolCallId: null, actionRef: id("obj_"), options: pendingInteraction.request.kind === "approval" ? pendingInteraction.request.options : [], requestedPermissionsRef: null, inputDigest: digestPlaceholder() },
+});
+interactions.push({
+  ...pendingInteraction,
+  ...meta(supersededId),
+  id: supersededId,
+  instanceId: insIdle,
+  state: "answer-committed",
+  answerable: false,
+  answer: known({
+    commandId: id("cmd_"),
+    actor: { principalId: id("prn_"), type: "human", deviceId: "dev_other-mac", instanceId: null },
+    value: { kind: "approval", optionId: "allow-once", inputDigest: digestPlaceholder() },
+    committedAt: ts,
+  }),
+  request: { kind: "approval", title: "Bash", description: "already answered elsewhere", toolCallId: null, actionRef: id("obj_"), options: pendingInteraction.request.kind === "approval" ? pendingInteraction.request.options : [], requestedPermissionsRef: null, inputDigest: digestPlaceholder() },
+});
+interactions.push({
+  ...pendingInteraction,
+  ...meta(pausedIntId),
+  id: pausedIntId,
+  instanceId: insPaused,
+  hostId: hostOfflineId,
+  state: "pending",
+  request: { kind: "approval", title: "Bash", description: "host offline cmd", toolCallId: null, actionRef: id("obj_"), options: pendingInteraction.request.kind === "approval" ? pendingInteraction.request.options : [], requestedPermissionsRef: null, inputDigest: digestPlaceholder() },
+});
+interactions.push({
+  ...pendingInteraction,
+  ...meta(planId),
+  id: planId,
+  instanceId: insWorking,
+  kind: "plan-review",
+  request: {
+    kind: "plan-review",
+    title: "实施计划",
+    planRef: id("obj_"),
+    planRevision: "1",
+    planDigest: digestPlaceholder(),
+    options: [
+      { id: "approve", label: "同意", effect: "allow-once", nativeValueRef: id("obj_") },
+      { id: "deny", label: "拒绝", effect: "deny", nativeValueRef: id("obj_") },
+    ],
+    allowFeedback: true,
+  },
+});
+titles.set(insPaused, "离线主机上的审批");
+
 export const mockInstanceIds = { insWorking, insBlocked, insIdle, insQuestion, insStarting, insExited };
 
 export type MockDb = {
@@ -556,7 +641,7 @@ export function mockRespond(interactionIdArg: Id, answer: InteractionAnswer): Co
   found.state = "answer-committed";
   found.answer = known({
     commandId,
-    actor: { principalId: id("prn_"), type: "human", deviceId: id("dev_"), instanceId: null },
+    actor: { principalId: id("prn_"), type: "human", deviceId: thisDeviceId(), instanceId: null },
     value: answer,
     committedAt: now(),
   });
@@ -701,9 +786,14 @@ export function mockClose(instanceId: Id): CommandResult {
   };
 }
 
-export function mockCreate(prompt: string): Instance {
+export function mockCreate(prompt: string, extras?: { hostId?: Id; workspaceId?: Id; driver?: Instance["driver"]; kind?: Instance["kind"] }): Instance {
   const journalId = id("obj_");
-  const ins = instanceBase(id("ins_"), journalId, "ready", known("working"));
+  const ins = instanceBase(id("ins_"), journalId, "starting", unknownKnowledge("starting"));
+  if (extras?.hostId) ins.hostId = extras.hostId;
+  if (extras?.workspaceId) ins.workspaceId = extras.workspaceId;
+  if (extras?.driver) ins.driver = extras.driver;
+  if (extras?.kind) ins.kind = extras.kind;
+  ins.activeRunIds = [];
   instances.unshift(ins);
   titles.set(ins.id, prompt.slice(0, 80) || "新会话");
   journals.set(journalId, [

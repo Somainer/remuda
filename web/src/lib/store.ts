@@ -37,6 +37,7 @@ export type HubState = {
   bubbles: LocalBubble[];
   permissionMode: Record<string, string>;
   compact: boolean;
+  answering: Record<string, true>;
 };
 
 const initial: HubState = {
@@ -54,6 +55,7 @@ const initial: HubState = {
   bubbles: [],
   permissionMode: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
+  answering: {},
 };
 
 type Listener = () => void;
@@ -247,10 +249,23 @@ class HubStore {
   }
 
   async respond(interactionId: Id, answer: InteractionAnswer) {
-    await api.interactionRespond(interactionId, answer);
-    await this.refresh();
-    const interaction = this.state.interactions.find((i) => i.id === interactionId);
-    if (interaction) await this.catchup(interaction.instanceId);
+    this.emit({ answering: { ...this.state.answering, [interactionId]: true } });
+    try {
+      await api.interactionRespond(interactionId, answer);
+      await this.refresh();
+      const interaction = this.state.interactions.find((i) => i.id === interactionId);
+      if (interaction) await this.catchup(interaction.instanceId);
+    } finally {
+      const interaction = this.state.interactions.find((i) => i.id === interactionId);
+      const events = interaction ? (this.state.events[interaction.instanceId] ?? []) : [];
+      const answered = events.some(
+        (ev) => ev.kind === "interaction.answered" && (ev.payload as { interactionId?: Id }).interactionId === interactionId,
+      );
+      if (!interaction || interaction.state !== "pending" || answered) {
+        const { [interactionId]: _removed, ...rest } = this.state.answering;
+        this.emit({ answering: rest });
+      }
+    }
   }
 
   titleOf(instanceId: Id) {

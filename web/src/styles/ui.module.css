@@ -255,6 +255,11 @@
   width: 100%;
 }
 
+.touchSelect {
+  min-height: 44px;
+  font-size: 16px;
+}
+
 .textarea {
   min-height: 88px;
   resize: vertical;

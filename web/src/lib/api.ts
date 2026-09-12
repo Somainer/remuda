@@ -20,6 +20,7 @@ import {
   mockWorkspaceLabel,
 } from "./mock";
 import { digestPlaceholder, id, now } from "./ids";
+import { accessHeaders } from "./accessCode";
 
 export const MOCK = import.meta.env.VITE_MOCK === "1";
 
@@ -34,12 +35,17 @@ export type HelloResult = {
 export type InstanceCreateSpec = {
   hostId: Id;
   workspaceId: Id;
-  kind: "claude";
-  driver: "claude-print";
+  kind: "claude" | "codex" | "grok" | "agy";
+  driver: "claude-print" | "claude-pty" | "claude-bg";
   model: string;
   providerProfileId: string;
   permissionMode: string;
   prompt: string;
+  worktree?: boolean;
+  settingsOverlayPath?: string;
+  claudeConfigDir?: string;
+  maxBudgetUsd?: string;
+  name?: string;
 };
 
 export type RpcError = { code: number; message: string; data?: unknown };
@@ -86,7 +92,7 @@ export type HubApi = {
   disconnect(): void;
 };
 
-/** Live Hub origin. remuda-node HTTP router is not shipped yet (M0-11); JSON-RPC per protocol.md. */
+/** Live remuda-node / Hub origin. Default `remuda dev` is loopback :8787. */
 function hubBase(): string {
   const raw = import.meta.env.VITE_API_BASE ?? import.meta.env.VITE_HUB_URL ?? "";
   return raw.replace(/\/$/, "");
@@ -100,15 +106,26 @@ function wsUrl(): string {
   return `${proto}://${location.host}/v1/client`;
 }
 
+async function rest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${hubBase()}${path}`, {
+    credentials: "include",
+    ...init,
+    headers: { ...accessHeaders(), ...(init.headers as Record<string, string> | undefined) },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
 async function postRpc<T>(method: string, params: unknown): Promise<T> {
   const rpcId = crypto.randomUUID();
-  const res = await fetch(`${hubBase()}/v1/rpc`, {
+  const body = await rest<JsonRpcResponse<T>>("/v1/rpc", {
     method: "POST",
-    credentials: "include",
-    headers: { "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: rpcId, method, params }),
   });
-  const body = (await res.json()) as JsonRpcResponse<T>;
   if ("error" in body) throw new Error(body.error.message);
   return body.result;
 }
@@ -139,7 +156,12 @@ function createMockApi(): HubApi {
       return found;
     },
     async instanceCreate(spec) {
-      const instance = mockCreate(spec.prompt);
+      const instance = mockCreate(spec.prompt, {
+        hostId: spec.hostId,
+        workspaceId: spec.workspaceId,
+        driver: spec.driver,
+        kind: spec.kind,
+      });
       instance.hostId = spec.hostId;
       instance.workspaceId = spec.workspaceId;
       return {
@@ -279,11 +301,15 @@ function createLiveApi(): HubApi {
     if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(wsUrl());
+      ws.binaryType = "arraybuffer";
       socket = ws;
       ws.addEventListener("open", () => resolve());
       ws.addEventListener("error", () => reject(new Error("WSS_CONNECT_FAILED")));
       ws.addEventListener("message", (ev) => {
-        if (typeof ev.data !== "string") return;
+        if (typeof ev.data !== "string") {
+          // tty-binary-v1 / object chunks on the same /v1/client socket; tty/ owns decode.
+          return;
+        }
         const msg = JSON.parse(ev.data) as JsonRpcResponse<unknown> & { method?: string; params?: EventsBatch["params"] };
         if (msg.method === "events.batch" && msg.params) {
           const handler = batchHandlers.get(msg.params.subscriptionId);
@@ -304,6 +330,22 @@ function createLiveApi(): HubApi {
     });
   }
 
+  async function command(instanceId: Id, body: Record<string, unknown>): Promise<CommandResult> {
+    try {
+      return await rest<CommandResult>(`/v1/instances/${instanceId}/commands`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    } catch {
+      // TODO(M0-11): remuda-node HTTP router may still be landing; JSON-RPC per protocol.md.
+      const operation = String(body.operation ?? "instance.send");
+      return send<CommandResult>(
+        operation === "send" ? "instance.send" : operation === "close" ? "instance.close" : "interaction.respond",
+        body,
+      );
+    }
+  }
+
   return {
     mock: false,
     async hello() {
@@ -315,45 +357,107 @@ function createLiveApi(): HubApi {
       });
     },
     async instanceList(q) {
-      return send<Page<Instance>>("instance.list", q ?? {});
+      try {
+        return await rest<Page<Instance>>(`/v1/instances${q?.hostId ? `?hostId=${q.hostId}` : ""}`);
+      } catch {
+        return send<Page<Instance>>("instance.list", q ?? {});
+      }
     },
     async instanceGet(instanceId) {
-      return send<Instance>("instance.get", { instanceId });
+      try {
+        return await rest<Instance>(`/v1/instances/${instanceId}`);
+      } catch {
+        return send<Instance>("instance.get", { instanceId });
+      }
     },
     async instanceCreate(spec) {
-      return send("instance.create", { spec, initialInput: { type: "prompt", text: spec.prompt } });
+      try {
+        const created = await rest<{ command: CommandResult["command"]; instance: Instance }>("/v1/instances", {
+          method: "POST",
+          body: JSON.stringify({
+            hostId: spec.hostId,
+            workspaceId: spec.workspaceId,
+            kind: spec.kind,
+            driver: spec.driver,
+            model: spec.model,
+            providerProfileId: spec.providerProfileId,
+            permissionMode: spec.permissionMode,
+            prompt: spec.prompt,
+            settingsOverlayPath: spec.settingsOverlayPath,
+            claudeConfigDir: spec.claudeConfigDir,
+            maxBudgetUsd: spec.maxBudgetUsd,
+            name: spec.name,
+            worktree: spec.worktree,
+          }),
+        });
+        titles.set(created.instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
+        return created;
+      } catch {
+        // TODO(M0-11): remuda-node HTTP router may still be landing; JSON-RPC per protocol.md.
+        return send("instance.create", { spec, initialInput: { type: "prompt", text: spec.prompt } });
+      }
     },
     async instanceSend(instanceId, prompt) {
-      return send<CommandResult>("instance.send", {
-        instanceId,
-        input: { type: "prompt", text: prompt },
-        completionScope: "native-turn",
-      });
+      return command(instanceId, { operation: "send", prompt });
     },
     async instanceClose(instanceId) {
-      return send<CommandResult>("instance.close", { instanceId, mode: "terminate", retainNativeSession: true });
+      return command(instanceId, { operation: "close" });
     },
     async instanceResume(instanceId) {
-      return send<CommandResult>("instance.resume", { instanceId });
+      try {
+        return await command(instanceId, { operation: "resume" });
+      } catch {
+        return send<CommandResult>("instance.resume", { instanceId });
+      }
     },
     async instanceConfigure(instanceId, permissionMode) {
-      // TODO(M0-11): remuda-node router not shipped; method name from protocol.md instance.configure.
       return send<CommandResult>("instance.configure", { instanceId, permissionMode, effective: "next-turn" });
     },
     async interactionList(q) {
-      const page = await send<{ items?: Interaction[] } | Interaction[]>("interaction.list", q ?? {});
-      return Array.isArray(page) ? page : (page.items ?? []);
+      try {
+        const page = await rest<{ items?: Interaction[] } | Interaction[]>("/v1/interactions");
+        const items = Array.isArray(page) ? page : (page.items ?? []);
+        return items.filter((i) => {
+          if (q?.instanceId && i.instanceId !== q.instanceId) return false;
+          if (q?.state && i.state !== q.state) return false;
+          return true;
+        });
+      } catch {
+        const page = await send<{ items?: Interaction[] } | Interaction[]>("interaction.list", q ?? {});
+        return Array.isArray(page) ? page : (page.items ?? []);
+      }
     },
     async interactionGet(interactionId) {
-      return send<Interaction>("interaction.get", { interactionId });
+      try {
+        return await rest<Interaction>(`/v1/interactions/${interactionId}`);
+      } catch {
+        return send<Interaction>("interaction.get", { interactionId });
+      }
     },
     async interactionRespond(interactionId, answer) {
-      return send<CommandResult>("interaction.respond", { interactionId, answer });
+      const found = await (async () => {
+        try {
+          return await rest<Interaction>(`/v1/interactions/${interactionId}`);
+        } catch {
+          return send<Interaction>("interaction.get", { interactionId });
+        }
+      })();
+      return command(found.instanceId, {
+        operation: "respond_interaction",
+        interactionId,
+        answer,
+      });
     },
     async hostList() {
-      const page = await send<Page<Host>>("host.list", {});
-      for (const h of page.items) hosts.set(h.id, h);
-      return page;
+      try {
+        const page = await rest<Page<Host>>("/v1/hosts");
+        for (const h of page.items) hosts.set(h.id, h);
+        return page;
+      } catch {
+        const page = await send<Page<Host>>("host.list", {});
+        for (const h of page.items) hosts.set(h.id, h);
+        return page;
+      }
     },
     async hostGet(hostId) {
       const host = await send<Host>("host.get", { hostId });
@@ -361,9 +465,15 @@ function createLiveApi(): HubApi {
       return host;
     },
     async workspaceList(hostId) {
-      const page = await send<Page<Workspace>>("workspace.list", { hostId });
-      for (const w of page.items) workspaces.set(w.id, w);
-      return page;
+      try {
+        const page = await rest<Page<Workspace>>(hostId ? `/v1/workspaces?hostId=${hostId}` : "/v1/workspaces");
+        for (const w of page.items) workspaces.set(w.id, w);
+        return page;
+      } catch {
+        const page = await send<Page<Workspace>>("workspace.list", { hostId });
+        for (const w of page.items) workspaces.set(w.id, w);
+        return page;
+      }
     },
     eventsRead: (args) => send("events.read", args),
     async eventsSubscribe(journalId, afterSeq, onBatch) {

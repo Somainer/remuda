@@ -57,6 +57,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   return (
     <div
       data-testid="session-page"
+      data-status={status}
       style={{ display: "flex", flexDirection: "column", minHeight: "100%", paddingBottom: offsetTop ? 0 : undefined }}
     >
       <header style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--line)", flexWrap: "wrap" }}>

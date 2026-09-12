@@ -24,10 +24,10 @@ pnpm dev
 VITE_MOCK=1 pnpm dev
 ```
 
-接真实 Hub（JSON-RPC `POST /v1/rpc` + `WSS /v1/client`）。`remuda-node` HTTP 路由尚未落地（M0-11），live client 按 `protocol.md` 写，origin 用 `VITE_API_BASE`：
+接 `remuda dev`（默认 loopback `:8787`）。REST：`POST /v1/instances`、`POST /v1/instances/:id/commands`；journal 仍走 JSON-RPC + `WSS /v1/client`（同一连接上的 binary 帧是 tty-binary-v1，本页不解码）。访问码 header `X-Remuda-Access-Code`（也可 `Authorization: Bearer`）；不要把长期 token 放进 WS URL。若 REST 404 则回退 `POST /v1/rpc`（M0-11 router 若尚未合入）。
 
 ```bash
-VITE_MOCK=0 VITE_API_BASE=http://127.0.0.1:8787 pnpm dev
+VITE_MOCK=0 VITE_API_BASE=http://127.0.0.1:8787 VITE_ACCESS_CODE=dev pnpm dev
 ```
 
 ## 脚本
@@ -37,7 +37,7 @@ VITE_MOCK=0 VITE_API_BASE=http://127.0.0.1:8787 pnpm dev
 | `pnpm dev` | Vite 开发服 |
 | `pnpm build` | `tsc -b` + 生产包 |
 | `pnpm test` | Vitest（status 投影、tool registry、journal seq/gap、transcript assemble） |
-| `pnpm test:e2e` | Playwright `tests/e2e/session-structured.spec.ts`（chromium + mobile-webkit） |
+| `pnpm test:e2e` | Playwright `session-structured` / `new-session` / `approvals`（chromium + mobile-webkit） |
 | `pnpm lint` | oxlint `src` |
 | `pnpm preview` | 预览生产包（注册 `public/sw.js`） |
 

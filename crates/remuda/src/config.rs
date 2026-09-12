@@ -33,7 +33,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fmt,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -61,6 +61,10 @@ pub(crate) struct Hub {
     pub bootstrap_token: Option<SecretRef>,
     #[serde(alias = "cookieSecure")]
     pub cookie_secure: bool,
+    #[serde(alias = "publicOrigin")]
+    pub public_origin: Option<String>,
+    #[serde(alias = "trustedProxies")]
+    pub trusted_proxies: Vec<IpAddr>,
     #[serde(alias = "allowedOrigins")]
     pub allowed_origins: Vec<String>,
     #[serde(alias = "webRoot")]
@@ -354,6 +358,8 @@ impl Default for Hub {
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             bootstrap_token: None,
             cookie_secure: true,
+            public_origin: None,
+            trusted_proxies: Vec::new(),
             allowed_origins: Vec::new(),
             web_root: None,
             command_accept_timeout_ms: remuda_hub::DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
@@ -491,6 +497,12 @@ impl Config {
                 "0" | "false" => false,
                 _ => bail!("REMUDA_COOKIE_SECURE must be true, false, 1 or 0"),
             };
+        }
+        if let Some(value) = env_text(env, "REMUDA_PUBLIC_ORIGIN")? {
+            self.hub.public_origin = Some(value);
+        }
+        if let Some(value) = env_text(env, "REMUDA_TRUSTED_PROXIES")? {
+            self.hub.trusted_proxies = parse_json_env(&value, "REMUDA_TRUSTED_PROXIES")?;
         }
         if let Some(value) = env_text(env, "REMUDA_LABELS")? {
             self.node.labels = parse_json_env(&value, "REMUDA_LABELS")?;
@@ -792,6 +804,38 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn public_exposure_environment_overrides_file_and_rejects_non_ip_trust() {
+        let fixture = Fixture::new(
+            "[hub]\npublic_origin = 'https://file.invalid'\ntrusted_proxies = ['192.0.2.1']\n",
+        );
+        let config = fixture
+            .load(&[
+                ("REMUDA_PUBLIC_ORIGIN", "https://env.invalid"),
+                ("REMUDA_TRUSTED_PROXIES", "[\"192.0.2.2\",\"::1\"]"),
+            ])
+            .unwrap();
+        assert_eq!(
+            config.hub.public_origin.as_deref(),
+            Some("https://env.invalid")
+        );
+        assert_eq!(
+            config.hub.trusted_proxies,
+            [
+                "192.0.2.2".parse::<IpAddr>().unwrap(),
+                "::1".parse().unwrap(),
+            ]
+        );
+        for value in [
+            "[\"*\"]",
+            "[\"192.0.2.0/24\"]",
+            "[\"proxy.invalid\"]",
+            "192.0.2.2",
+        ] {
+            assert!(fixture.load(&[("REMUDA_TRUSTED_PROXIES", value)]).is_err());
         }
     }
 

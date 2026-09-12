@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 mod runtime_wss;
-use runtime_wss::SeqWatermark;
+use crate::transport::hubnode::SeqWatermark;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 

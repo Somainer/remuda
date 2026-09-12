@@ -185,6 +185,8 @@ struct Inner {
     policy: Mutex<PermissionPolicy>,
     events: Mutex<Option<mpsc::Sender<Observation>>>,
     closed: AtomicBool,
+    /// Last successfully launched spec; `resume` re-materializes from this.
+    last_spec: Mutex<Option<InstanceSpec>>,
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -218,6 +220,7 @@ impl ClaudePrintDriver {
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                last_spec: Mutex::new(None),
             }),
             reader: Mutex::new(None),
         }
@@ -254,6 +257,7 @@ impl ClaudePrintDriver {
         };
         let mut recipe = materialize(&request)?;
         apply_bypass_flag(&mut recipe);
+        refuse_prohibited_argv(&recipe.argv)?;
         let policy = policy_from_recipe(&recipe, &spec);
         let env = self.resolve_env(&spec, &recipe).await?;
         let mut command = Command::new(&recipe.binary.abs_path);
@@ -295,6 +299,7 @@ impl ClaudePrintDriver {
         }
         *self.inner.policy.lock().await = policy;
         *self.inner.events.lock().await = Some(tx);
+        *self.inner.last_spec.lock().await = Some(spec.clone());
         self.inner.closed.store(false, Ordering::SeqCst);
 
         let mut ack = DriverAck::transport_written();
@@ -491,7 +496,13 @@ impl Driver for ClaudePrintDriver {
             Some(id) if !id.is_empty() => id,
             _ => return Err(DriverError::NativeSessionNotFound),
         };
-        let mut spec = stub_spec_for_resume(&native_ref)?;
+        let mut spec = self
+            .inner
+            .last_spec
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::NativeSessionNotFound)?;
         spec.host = native_ref.host_id.clone();
         spec.driver = DriverKind::ClaudePrint;
         spec.kind = remuda_protocol::AgentKind::Claude;
@@ -931,6 +942,10 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
     } else {
         "turn_done"
     };
+    // Workflow emits result_index 0 then 1; the first is not process completion
+    // (stream-json §5: do not tear down on the first result).
+    let affects_completion =
+        result.result_index.unwrap_or(0) > 0 && result.queued_turn_count.unwrap_or(0) == 0;
     let session_id = mapper.session_id.clone();
     let mut out = vec![mapper.lifecycle_related(
         LifecycleTopic::Turn,
@@ -938,7 +953,7 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
         Knowledge::Known { value: session_id },
         status,
         related,
-        true,
+        affects_completion,
     )?];
     if let Some(usage) = usage_from_result(mapper, result)? {
         out.push(usage);
@@ -1520,11 +1535,14 @@ fn prompt_text(blocks: &[ContentBlock]) -> DriverResult<String> {
 }
 
 fn reject_bot_bypass(spec: &InstanceSpec, origin: InputOrigin) -> DriverResult<()> {
-    let bypass = match &spec.permission_mode {
-        PermissionMode::Claude(claude) => claude.mode == ClaudePermissionMode::BypassPermissions,
+    let gated = match &spec.permission_mode {
+        PermissionMode::Claude(claude) => matches!(
+            claude.mode,
+            ClaudePermissionMode::BypassPermissions | ClaudePermissionMode::DontAsk
+        ),
         _ => false,
     };
-    if bypass && matches!(origin, InputOrigin::Bot | InputOrigin::Agent) {
+    if gated && matches!(origin, InputOrigin::Bot | InputOrigin::Agent) {
         return Err(DriverError::BypassNotAllowedForBot);
     }
     Ok(())
@@ -1579,6 +1597,21 @@ fn apply_bypass_flag(recipe: &mut LaunchRecipe) {
     }
 }
 
+fn refuse_prohibited_argv(argv: &[String]) -> DriverResult<()> {
+    if argv.iter().any(|token| {
+        crate::flags::is_banned_flag_token(token)
+            || matches!(
+                token.as_str(),
+                "--bare" | "--safe-mode" | "--no-session-persistence" | "--continue"
+            )
+    }) {
+        return Err(DriverError::NativeFeatureDisabled(
+            "refusing prohibited flag on claude-print argv".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn map_wire(error: remuda_claude_wire::Error) -> DriverError {
     match error {
         remuda_claude_wire::Error::Io(error)
@@ -1598,14 +1631,6 @@ fn map_wire(error: remuda_claude_wire::Error) -> DriverError {
             DriverError::InvalidLaunchSpec(error.to_string())
         }
     }
-}
-
-fn stub_spec_for_resume(native_ref: &NativeRef) -> DriverResult<InstanceSpec> {
-    let mut spec: InstanceSpec =
-        serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json"))?;
-    spec.host = native_ref.host_id.clone();
-    spec.cwd = "/tmp".into();
-    Ok(spec)
 }
 
 fn now() -> DriverResult<Timestamp> {
@@ -1681,5 +1706,52 @@ fn workflow_state(status: &str) -> WorkflowState {
         "failed" => WorkflowState::Failed,
         "killed" | "stopped" | "cancelled" => WorkflowState::Cancelled,
         _ => WorkflowState::Unknown,
+    }
+}
+
+/// Mapping / gating helpers used by `tests/claude_print_review.rs`.
+#[doc(hidden)]
+pub mod review {
+    use super::*;
+
+    /// Map one stdout JSON object the same way the live reader does.
+    pub fn map_stdout_json(value: Value) -> DriverResult<Vec<Observation>> {
+        let frame = Outbound::from_value(value);
+        let mut mapper = Mapper {
+            ids: NativeIds::default(),
+            seq: 0,
+            instance_id: InstanceId::new(),
+            run_id: RunId::new(),
+            journal_id: fallback_obj(),
+            host_id: fallback_host(),
+            session_id: "review-session".into(),
+            pin: BinaryPin {
+                abs_path: String::new(),
+                version: "review".into(),
+                sha256: dummy_digest(),
+            },
+        };
+        map_outbound(&mut mapper, &frame)
+    }
+
+    /// Serialize a host `control_response` for a permission answer.
+    pub fn permission_control_json(
+        request_id: &str,
+        input: &Value,
+        answer: &InteractionAnswer,
+    ) -> DriverResult<Value> {
+        let payload = permission_from_answer(input, answer)?;
+        let inbound = Inbound::control_success(request_id, payload);
+        Ok(serde_json::to_value(&inbound)?)
+    }
+
+    /// Driver-level bot/dontAsk/bypass gate.
+    pub fn reject_bot(spec: &InstanceSpec, origin: InputOrigin) -> DriverResult<()> {
+        reject_bot_bypass(spec, origin)
+    }
+
+    /// Final argv check for `--bare` / `--no-session-persistence`.
+    pub fn refuse_argv(argv: &[String]) -> DriverResult<()> {
+        refuse_prohibited_argv(argv)
     }
 }

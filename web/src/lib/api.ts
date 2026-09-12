@@ -293,8 +293,6 @@ export type WorktreeCreateSpec = {
   hostId?: string;
   name: string;
   base?: string;
-  path?: string;
-  repo?: string;
 };
 
 export type PtyKey = "enter" | "esc" | "ctrl+c";
@@ -562,7 +560,7 @@ function createMockApi(): HubApi {
     async worktreeCreate(spec) {
       return {
         name: spec.name,
-        path: spec.path ?? `/tmp/remuda-wt/${spec.name}`,
+        path: `/tmp/remuda-wt/${spec.name}`,
         branch: `wt/${spec.name}/work`,
         base: spec.base ?? "main",
         hostId: spec.hostId,

@@ -6,6 +6,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
+use remuda_protocol::path_guard;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -56,8 +57,8 @@ pub(crate) enum WorktreeCommand {
         /// Start-point (branch, tag, or commit). Defaults to `main`.
         #[arg(long, default_value = "main")]
         base: String,
-        /// Directory for the worktree. Defaults to `../remuda-wt/<name>`
-        /// relative to the repository root.
+        /// Directory for the worktree. Must resolve inside `../remuda-wt`
+        /// relative to the repository root; defaults to `../remuda-wt/<name>`.
         #[arg(long)]
         path: Option<PathBuf>,
         /// Git repository (default: current directory).
@@ -238,15 +239,8 @@ pub(crate) fn lookup(name: &str, repo: Option<&Path>) -> Result<WorktreeRecord> 
 }
 
 pub(crate) fn validate_name(name: &str) -> Result<()> {
-    let valid = (1..=32).contains(&name.len())
-        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-    if !valid {
-        bail!("worktree name must match [a-z][a-z0-9_-]{{0,31}}, got {name:?}");
-    }
-    Ok(())
+    remuda_protocol::path_guard::safe_segment(name)
+        .map_err(|error| anyhow::anyhow!("worktree {error}"))
 }
 
 fn repo_root(repo: Option<&Path>) -> Result<PathBuf> {
@@ -270,16 +264,20 @@ fn git_common_dir(repo: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Resolve the worktree directory and require it under `<repo>/../remuda-wt`.
+///
+/// A caller-supplied `path` is accepted only when it lands inside that root,
+/// so neither an absolute path nor `..` can place a checkout elsewhere
+/// (`security-review-2.md` M4).
 fn resolve_path(repo: &Path, name: &str, path: Option<&Path>) -> Result<PathBuf> {
+    let root =
+        path_guard::worktree_root(repo).map_err(|error| anyhow::anyhow!("worktree {error}"))?;
     let raw = match path {
-        Some(p) => p.to_path_buf(),
-        None => PathBuf::from("..").join("remuda-wt").join(name),
+        Some(p) => path_guard::absolutize(repo, p),
+        None => root.join(name),
     };
-    Ok(if raw.is_absolute() {
-        raw
-    } else {
-        repo.join(raw)
-    })
+    path_guard::contain_strict(&[root.as_path()], &raw)
+        .map_err(|error| anyhow::anyhow!("worktree path rejected: {error}"))
 }
 
 fn unique_branch(repo: &Path, name: &str) -> Result<String> {
@@ -547,8 +545,14 @@ mod tests {
 
     fn init_repo() -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        git(&root, &["init", "-b", "main"]).unwrap();
+        // The worktree root is the repo's sibling, so the repo cannot be the
+        // tempdir itself — it needs a parent inside the tempdir to hold it.
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]).unwrap();
+        // `git init -b main` needs git >= 2.28; set HEAD directly instead so
+        // the test runs on older hosts too.
+        git(&root, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
         git(&root, &["config", "user.email", "test@example.com"]).unwrap();
         git(&root, &["config", "user.name", "test"]).unwrap();
         git(&root, &["commit", "--allow-empty", "-m", "init"]).unwrap();
@@ -561,12 +565,14 @@ mod tests {
         assert!(validate_name("1abc").is_err());
         assert!(validate_name("ok").is_ok());
         assert!(validate_name("x-acpwire").is_ok());
+        assert!(validate_name("../escape").is_err());
+        assert!(validate_name("a/b").is_err());
     }
 
     #[test]
     fn create_adds_branch_and_catalog() {
-        let (_keep, root) = init_repo();
-        let path = root.join("wt-agent");
+        let (keep, root) = init_repo();
+        let path = keep.path().join("remuda-wt").join("agent1");
         let record = create("agent1", "main", Some(&path), Some(&root)).expect("create");
         assert_eq!(record.name, "agent1");
         assert!(record.branch.starts_with("wt/agent1/"));
@@ -576,5 +582,38 @@ mod tests {
         assert_eq!(again.branch, record.branch);
         let found = lookup("agent1", Some(&root)).expect("lookup");
         assert_eq!(found.branch, record.branch);
+    }
+
+    #[test]
+    fn default_path_is_the_repo_sibling_worktree_root() {
+        let (keep, root) = init_repo();
+        let record = create("agent2", "main", None, Some(&root)).expect("create");
+        let expected = keep.path().canonicalize().unwrap().join("remuda-wt");
+        assert!(
+            Path::new(&record.path).starts_with(&expected),
+            "{} is not under {}",
+            record.path,
+            expected.display()
+        );
+    }
+
+    #[test]
+    fn rejects_path_outside_the_worktree_root() {
+        let (keep, root) = init_repo();
+        let outside = keep.path().join("evil");
+        let err = create("agent3", "main", Some(&outside), Some(&root))
+            .expect_err("absolute path outside the root must be rejected");
+        assert!(
+            err.to_string().contains("worktree path rejected"),
+            "unexpected error: {err}"
+        );
+        assert!(!outside.exists(), "the rejected directory must not exist");
+
+        // Traversal out of the root, spelled relative to the repo.
+        let escape = PathBuf::from("..").join("..").join("evil-relative");
+        assert!(create("agent4", "main", Some(&escape), Some(&root)).is_err());
+
+        // A plausible-looking systemd unit directory (the review's PoC).
+        assert!(create("agent5", "main", Some(Path::new("/tmp")), Some(&root)).is_err());
     }
 }

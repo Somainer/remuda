@@ -162,6 +162,8 @@ Host 被 retired 后禁止新命令，不因此自动杀进程。重新启用须
 
 `WorktreeRecord` 字段：`id: Id`、`hostId: Id`、`repositoryId: Id`、`parentWorkspaceId: Id`、`path: string`、`branch: Knowledge<string>`、`baseOid: Knowledge<string>`、`headOid: Knowledge<string>`、`managedBy: runtime|native|external`、`state: creating|ready|unavailable|removed|failed`、`dirty: Knowledge<boolean>`、`createdByCommandId: Id|null`。分支名不是永久身份；checkout、reset、native worktree 行为作为新 observation 更新 head，不偷偷改同一 Run 的启动 cwd。
 
+**路径约束（`security-review-2.md` M4/G5）。** worktree 名必须是单个安全段 `[a-z][a-z0-9_-]{0,31}`——不含 `/`、`\`、`.`，因此永远不是 `..` 或穿越路径。worktree 目录固定落在 `<repo>/../remuda-wt/<name>`：调用方给出的 `path` 只有解析后仍在该根内才接受，`repo` 不再从线上接受（Node 自己的 workspace root 就是仓库）。`CreateInstanceRequest.cwd` 同样受限，必须解析到已登记的 workspace root 或其旁边的某个 worktree 之内；`cwd` 省略时回落到 workspace root。两处共用 `remuda-protocol::path_guard`：先按字面消解 `..`，再对已存在的前缀 `canonicalize` 后做 `starts_with`，所以符号链接祖先不能用来离开该根。绝对路径、`..` 穿越、以及解析到根之外的符号链接一律拒绝，且拒绝发生在 `git worktree add` 建目录之前。MCP 的 `remuda_worktree_create` 不暴露 `path`/`repo`。
+
 ~~~mermaid
 stateDiagram-v2
     [*] --> registering
@@ -525,6 +527,8 @@ type MaterializedLaunch = {
 `MaterializedLaunch` 是进程内结构，含 env 值的部分不准序列化到 RPC、Observation 或错误。持久 LaunchManifest 只存 audit、配置对象引用、binary/cwd/nativeStore/ProviderSelection；重启从 secret store 重新解析相同 credential version，不从日志恢复 secret。私有 settingsOverlay 的明文也不返回 UI；可审查的界面展示 key 名、非敏感 provider/model 字段和凭据引用。`args` 是原生 argv 数组，不是 shell 字符串；materializer 用 allowlist 解析器拒绝与保留 flag 冲突、重复 flag、未知危险启动模式和不兼容 driver 的 flag，不能只搜索子字符串。
 
 物化顺序：验证 spec/tag/capability → Node 验证 host-local cwd、worktree 和 writer lease → 选择已健康且 ingress 匹配的 provider/profile → 固定 binary digest → 读取注册的持久 native home → 合并私有 overlay → 校验权限/模型/环境 → 原子写 launch 文件 → 持久 manifest 与命令 intent → spawn。失败时只清理本 launch 创建的临时文件，不改用户现有配置；生成文件夹 `0700`、文件 `0600`，Windows 使用等效 ACL。原生 home、sessions、登录存储不是临时文件，close 和 resume 后都保留。
+
+**子进程环境（`security-review-2.md` S1/S2）。** agent 子进程不继承 Node 的环境：spawn 前先 `env_clear()`，再只注入两部分——一个封闭 allowlist 从本进程继承的名字（`PATH`、`HOME`、`LANG`/`LC_*`、`TERM`、`TMPDIR`、`SHELL`、`USER`、`XDG_*`），以及 materializer 解析出的 `env_allowlist`（driver 提供的 provider 变量，是算出来的值而非继承来的值）。名字不在 allowlist 上就不进入子进程。denylist 与之正交，无论来源（spec、profile、`extra_env`、Node 环境）一律拒绝：`LD_*`、`DYLD_*`、`*_PROXY`（大小写不敏感）、`REMUDA_*`，以及 `NODE_OPTIONS`、`BASH_ENV`、`GIT_SSH_COMMAND`、`SSL_CERT_FILE`/`NODE_EXTRA_CA_CERTS` 等加载器与 TLS 覆盖项。`host-env` binding 的源名也要过同一 denylist，否则 `FOO: host-env(REMUDA_BOOTSTRAP_TOKEN)` 可以绕开 key 检查。规则集中在 `remuda-driver::child_env`，materializer 与各 spawn 点共用。
 
 ### 4.2 Claude 硬约束与配置继承
 

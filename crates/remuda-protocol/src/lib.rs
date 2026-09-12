@@ -15,6 +15,7 @@ mod json;
 mod launch;
 mod native;
 mod observation;
+pub mod path_guard;
 mod rpc;
 mod scalar;
 pub mod schema;

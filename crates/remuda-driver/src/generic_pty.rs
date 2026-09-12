@@ -379,6 +379,9 @@ impl GenericPtyDriver {
             env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
         }
         for (key, value) in &self.options.extra_env {
+            if crate::child_env::is_denied(key) {
+                continue;
+            }
             env.insert(key.clone(), value.clone());
         }
         let created = self

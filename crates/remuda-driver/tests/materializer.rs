@@ -858,3 +858,80 @@ fn cleanup_leaves_native_store_files_alone() {
     recipe.cleanup_launch_files();
     assert!(keep.is_file(), "native-store files must survive cleanup");
 }
+
+/// `security-review-2.md` S2: the materializer is the boundary that is meant
+/// to stop a spec injecting loader, proxy, or TLS variables. Before the fix
+/// its denylist held two names, so all of these passed.
+#[test]
+fn spec_env_cannot_inject_loader_proxy_or_tls_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let profile = profile();
+
+    for name in [
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "NODE_OPTIONS",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+        "REMUDA_BOOTSTRAP_TOKEN",
+    ] {
+        let mut spec = load_spec();
+        spec.args = vec![];
+        spec.env.insert(
+            name.to_owned(),
+            EnvBinding::Literal(Box::new(LiteralEnv {
+                value: "/tmp/injected".into(),
+                visibility: EnvVisibility::Private,
+            })),
+        );
+        let result = materialize(&request(
+            &spec,
+            &profile,
+            &launch,
+            &home,
+            pin_source(&binary),
+        ));
+        assert!(
+            matches!(result, Err(DriverError::NativeFeatureDisabled(_))),
+            "{name} was accepted into spec.env"
+        );
+    }
+}
+
+/// A `host-env` binding names the source variable independently of the key it
+/// is injected under, so checking only the key lets the token through.
+#[test]
+fn host_env_binding_cannot_launder_a_denied_source_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.args = vec![];
+    spec.env.insert(
+        // An innocuous key pointing at the bootstrap token.
+        "HARMLESS_NAME".to_owned(),
+        EnvBinding::HostEnv(Box::new(remuda_protocol::HostEnv {
+            name: "REMUDA_BOOTSTRAP_TOKEN".into(),
+        })),
+    );
+    let result = materialize(&request(
+        &spec,
+        &profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ));
+    assert!(
+        matches!(result, Err(DriverError::NativeFeatureDisabled(_))),
+        "a host-env binding laundered a denied source name"
+    );
+}

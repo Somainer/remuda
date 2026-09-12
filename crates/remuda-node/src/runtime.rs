@@ -21,11 +21,7 @@ use remuda_protocol::{
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tokio::sync::{RwLock, mpsc};
 
 struct QueuedCommand {
@@ -246,12 +242,10 @@ impl DevNode {
             workspace_id,
             request.driver,
         )?;
-        let workspace_root = request
-            .cwd
-            .as_deref()
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .unwrap_or_else(|| self.inner.workspace.root_path.clone().into());
+        let workspace_root = crate::worktree::resolve_instance_cwd(
+            Path::new(&self.inner.workspace.root_path),
+            request.cwd.as_deref(),
+        )?;
         let driver = self.inner.drivers.build(
             request.driver,
             DriverLaunch {

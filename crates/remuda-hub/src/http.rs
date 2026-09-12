@@ -126,10 +126,6 @@ pub struct CreateWorktreeBody {
     name: String,
     #[serde(default)]
     base: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    repo: Option<String>,
 }
 
 const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -370,17 +366,13 @@ pub async fn create_worktree(
         return Err(HubError::BadRequest("worktree name required".into()));
     }
     let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
-    let mut params = json!({
+    // `path` / `repo` are deliberately not forwarded: the Node picks the
+    // directory under its own `<repo>/../remuda-wt` root (security-review-2 M4).
+    let params = json!({
         "hostId": host.host_id,
         "name": body.name,
         "base": body.base.as_deref().unwrap_or("main"),
     });
-    if let Some(path) = body.path {
-        params["path"] = json!(path);
-    }
-    if let Some(repo) = body.repo {
-        params["repo"] = json!(repo);
-    }
     let created = call_node(&state, &host.host_id, "worktree.create", params).await?;
     Ok(Json(created))
 }

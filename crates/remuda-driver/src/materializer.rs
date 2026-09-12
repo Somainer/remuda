@@ -906,6 +906,13 @@ fn reject_spec_env(spec: &InstanceSpec) -> DriverResult<()> {
             EnvBinding::Credential(_) | EnvBinding::HostEnv(_) => None,
         };
         reject_banned_env(name, literal)?;
+        // A HostEnv binding names the *source* variable in the Node's
+        // environment, which need not match the map key it is injected under.
+        // Check it too, or `FOO: host-env(REMUDA_BOOTSTRAP_TOKEN)` walks the
+        // token straight past the key check (`security-review-2.md` S2).
+        if let EnvBinding::HostEnv(host) = binding {
+            reject_banned_env(&host.name, None)?;
+        }
     }
     Ok(())
 }

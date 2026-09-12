@@ -1,13 +1,14 @@
 //! `remuda worktree create` against an isolated git repository.
 
 use serde_json::Value;
+use std::path::Path;
 use std::process::Command;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_remuda")
 }
 
-fn git(repo: &std::path::Path, args: &[&str]) {
+fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(repo)
         .args(args)
@@ -20,30 +21,34 @@ fn git(repo: &std::path::Path, args: &[&str]) {
     );
 }
 
-#[test]
-fn worktree_create_adds_branch_and_prints_json() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let repo = dir.path().join("repo");
+/// A repo with one empty commit on `main`, created inside `parent`.
+fn init_repo(parent: &Path) -> std::path::PathBuf {
+    let repo = parent.join("repo");
     std::fs::create_dir_all(&repo).expect("repo");
-    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["init", "-q"]);
+    // `git init -b main` needs git >= 2.28; set HEAD directly so this runs on
+    // older hosts too.
+    git(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "test"]);
     git(&repo, &["commit", "--allow-empty", "-m", "init"]);
-    let path = dir.path().join("agent-wt");
-    let output = Command::new(bin())
-        .args([
-            "worktree",
-            "create",
-            "agent1",
-            "--base",
-            "main",
-            "--path",
-            path.to_str().expect("utf8"),
-            "--repo",
-            repo.to_str().expect("utf8"),
-        ])
+    repo
+}
+
+fn create(repo: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(["worktree", "create"])
+        .args(args)
+        .args(["--repo", repo.to_str().expect("utf8")])
         .output()
-        .expect("worktree create");
+        .expect("worktree create")
+}
+
+#[test]
+fn worktree_create_adds_branch_and_prints_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = init_repo(dir.path());
+    let output = create(&repo, &["agent1", "--base", "main"]);
     assert!(
         output.status.success(),
         "stderr={} stdout={}",
@@ -59,7 +64,48 @@ fn worktree_create_adds_branch_and_prints_json() {
             .starts_with("wt/agent1/"),
         "{value}"
     );
-    assert!(path.join(".git").exists() || path.exists());
+    // The worktree lands beside the repo, under `remuda-wt/`.
+    let path = Path::new(value["path"].as_str().expect("path"));
+    assert!(path.join(".git").exists(), "{value}");
+    assert_eq!(
+        path.parent().and_then(Path::file_name).unwrap(),
+        "remuda-wt",
+        "{value}"
+    );
+}
+
+/// `security-review-2.md` M4: an explicit `--path` is honoured only inside the
+/// worktree root, so a checkout cannot be written to an attacker-chosen place.
+#[test]
+fn worktree_create_rejects_a_path_outside_the_worktree_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = init_repo(dir.path());
+
+    // Inside the root: accepted.
+    let inside = dir.path().join("remuda-wt").join("agent-ok");
+    let output = create(&repo, &["agent1", "--path", inside.to_str().expect("utf8")]);
+    assert!(
+        output.status.success(),
+        "a path inside the worktree root was rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Outside the root: refused, and nothing is created.
+    let outside = dir.path().join("evil");
+    let output = create(
+        &repo,
+        &["agent2", "--path", outside.to_str().expect("utf8")],
+    );
+    assert!(
+        !output.status.success(),
+        "a path outside the worktree root was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("worktree path rejected"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!outside.exists(), "the rejected directory was created");
 }
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {

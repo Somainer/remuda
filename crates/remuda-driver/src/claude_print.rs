@@ -274,10 +274,20 @@ impl ClaudePrintDriver {
         let env = self.resolve_env(&spec, &recipe).await?;
         let mut command = Command::new(&recipe.binary.abs_path);
         command.args(&recipe.argv).current_dir(&recipe.cwd);
+        // Start from nothing: the Node's own environment holds the bootstrap
+        // and host tokens, and inheriting it hands them to the model
+        // (security-review-2 S1).
+        command.env_clear();
+        for (key, value) in crate::child_env::base_env() {
+            command.env(key, value);
+        }
         for (key, value) in &env {
             command.env(key, value);
         }
         for (key, value) in &self.options.extra_env {
+            if crate::child_env::is_denied(key) {
+                continue;
+            }
             command.env(key, value);
         }
         configure_native_home(
@@ -347,6 +357,12 @@ impl ClaudePrintDriver {
     ) -> DriverResult<std::collections::BTreeMap<String, String>> {
         let mut env = std::collections::BTreeMap::new();
         for entry in &recipe.env_allowlist {
+            // The materializer already refuses these, but this is the last
+            // gate before the value reaches a process (security-review-2 S2).
+            if crate::child_env::is_denied(&entry.name) {
+                debug!(name = %entry.name, "refusing a denied env name");
+                continue;
+            }
             match entry.source {
                 EnvAllowlistSource::NativeHome => {
                     env.insert(entry.name.clone(), recipe.native_home.clone());

@@ -72,6 +72,9 @@ fn public_wire_types_are_registered_for_generation() {
         "WireValueError",
         "BinaryFrameError",
         "SchemaExportError",
+        // Local path-containment rejection reason (`pub mod path_guard`); a
+        // host-side validation error, never serialized to the wire.
+        "PathGuardError",
         // M1 Hub↔Node operational frames (`pub mod hubnode`); not protocol.md §12 catalog.
         "HubNodeRequest",
         "HubNodeResponse",

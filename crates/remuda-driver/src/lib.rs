@@ -6,6 +6,7 @@
 
 mod binary;
 mod capabilities;
+pub mod child_env;
 pub mod claude_bg;
 pub mod claude_print;
 pub mod claude_pty;

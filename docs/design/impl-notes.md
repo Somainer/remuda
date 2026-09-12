@@ -238,3 +238,22 @@ Remaining steps:
 - Adopt the Node owner's evolving runtime WSS dispatcher after it supports configured labels/maxInstances and bounded cancellation during reconnect. The current root uses `WssCarrier` for enrollment, private host-token persistence and heartbeat; unsupported Hub commands receive JSON-RPC `-32601` rather than a success ACK. A disconnect exits without replay.
 - `StdioCarrier` exposes inventory/hello/ping only. Provider profiles and their secret references are loaded and validated, but the current local Node composition does not register those profiles or enforce configured placement/capacity. Native driver/provider integration belongs in the next composition increment after the Node API lands.
 - `RunningHub` exposes shutdown on Drop but no awaited server-drain handle. Local Node driver close commands are awaited with a deadline; the Node API still needs cancellation of upgraded WebSockets and a shutdown gate for existing command streams.
+
+### GitHub Actions `34684080230` (`c73bd06`, 2026-09-12)
+
+**remuda-driver** — `cargo test --workspace --locked` failed compiling `tests/live_claude.rs`:
+
+```
+error[E0599]: no method named `session_transcript` found for struct `ClaudePtyDriver` in the current scope
+   --> crates/remuda-driver/tests/live_claude.rs:247:49
+247 |             if !hook && let Some(path) = driver.session_transcript().await {
+error[E0277]: the size for values of type `str` cannot be known at compilation time
+   --> crates/remuda-driver/tests/live_claude.rs:247:34
+error[E0599]: no method named `session_transcript` found for struct `ClaudePtyDriver`
+   --> crates/remuda-driver/tests/live_claude.rs:309:32
+309 |     if let Some(path) = driver.session_transcript().await {
+error: could not compile `remuda-driver` (test "live_claude") due to 5 previous errors
+```
+
+web job also failed: `pnpm-lock.yaml` still has `registry.npmjs.org` tarball URLs (lockfile; rewritten separately).
+

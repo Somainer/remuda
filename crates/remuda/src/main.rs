@@ -1,33 +1,46 @@
-//! Remuda Hub, Node, and local development command entry points.
+//! Remuda composition root. Operational command modules remain independently owned.
 
-use clap::{Parser, Subcommand};
-
+mod build_info;
 mod cmd;
+mod config;
+#[path = "cmd/dev.rs"]
+mod dev;
+#[path = "cmd/hub.rs"]
+mod hub;
+#[path = "cmd/node.rs"]
+mod node;
 
-/// Hub–Node wire protocol major; matches `remuda_protocol::PROTOCOL_VERSION.major`.
-const WIRE_MAJOR: u16 = 1;
-/// SQLite schema major. `0` until the first Hub/Node migration ships.
-const SCHEMA_MAJOR: u16 = 0;
+use anyhow::{Context, ensure};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
-/// Remuda process selection.
 #[derive(Parser)]
 #[command(name = "remuda", version, about = "Unified remote agent runtime")]
 struct Cli {
+    /// TOML configuration; defaults to REMUDA_CONFIG or ./remuda.toml when present.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Override the configured data directory.
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
-/// Bootstrap process modes; these do not launch services yet.
 #[derive(Subcommand)]
 enum Command {
-    /// Run the central Hub (bootstrap placeholder).
-    Hub,
-    /// Run an execution Node (bootstrap placeholder).
-    Node,
-    /// Run the local development environment (bootstrap placeholder).
-    Dev,
-    /// Print semver, commit, rustc, target, and wire/schema majors.
-    Version,
+    /// Run the Hub, authentication store, and embedded Web application.
+    Hub(hub::Args),
+    /// Run a Node over an outbound WSS or SSH-friendly stdio carrier.
+    Node(node::Args),
+    /// Run a loopback Hub and local Node with a shared development access code.
+    Dev(dev::Args),
+    /// Print build identity without loading configuration or starting services.
+    Version {
+        /// Emit exactly one JSON object on stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// SSH remote hosts: list, probe, bootstrap, and stdio node.
     Ssh(cmd::ssh::SshArgs),
     /// Create, send, wait, read, or stop a Hub-backed instance.
@@ -51,56 +64,109 @@ enum Command {
     },
 }
 
-fn version_text() -> String {
-    format!(
-        "remuda {semver}\ncommit={commit}\nrustc={rustc}\ntarget={target}\nwire={wire}\nschema={schema}\n",
-        semver = env!("CARGO_PKG_VERSION"),
-        commit = env!("REMUDA_GIT_SHA"),
-        rustc = env!("REMUDA_RUSTC_VERSION"),
-        target = env!("REMUDA_TARGET"),
-        wire = WIRE_MAJOR,
-        schema = SCHEMA_MAJOR,
-    )
+impl Cli {
+    fn load_config(&self) -> anyhow::Result<config::Config> {
+        let mut config = config::Config::load(self.config.as_deref())?;
+        if let Some(path) = &self.data_dir {
+            ensure!(!path.as_os_str().is_empty(), "--data-dir must not be empty");
+            config.data_dir = path.clone();
+        }
+        Ok(config)
+    }
 }
 
-fn main() {
-    match Cli::parse().command {
-        Command::Hub => {
-            println!("remuda hub: bootstrap placeholder; no service started");
-        }
-        Command::Node => {
-            println!("remuda node: bootstrap placeholder; no service started");
-        }
-        Command::Dev => {
-            println!("remuda dev: bootstrap placeholder; no service started");
-        }
-        Command::Version => {
-            print!("{}", version_text());
-        }
-        Command::Ssh(args) => {
-            if let Err(error) = cmd::ssh::run_blocking(args) {
-                eprintln!("{error:#}");
-                std::process::exit(1);
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    if let Command::Version { json } = cli.command {
+        return build_info::write(json, &mut std::io::stdout().lock());
+    }
+    init_tracing()?;
+    if matches!(
+        &cli.command,
+        Command::Hub(_) | Command::Node(_) | Command::Dev(_)
+    ) {
+        let config = cli.load_config()?;
+        let timeout = config.shutdown_timeout();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("cannot create service runtime")?;
+        let result = runtime.block_on(async move {
+            let shutdown = Shutdown::install()?;
+            match cli.command {
+                Command::Hub(args) => hub::run(config, args, shutdown).await,
+                Command::Node(args) => node::run(config, args, shutdown).await,
+                Command::Dev(args) => dev::run(config, args, shutdown).await,
+                _ => unreachable!("only service commands enter the service runtime"),
             }
+        });
+        // Tokio stdin uses a blocking reader that cannot be cancelled on signal.
+        // Drivers have already drained; bound the remaining runtime teardown.
+        runtime.shutdown_timeout(timeout);
+        return result;
+    }
+    // These modules own synchronous entry points that create their own runtimes.
+    match cli.command {
+        Command::Ssh(args) => cmd::ssh::run_blocking(args),
+        Command::Instance { hub, command } => cmd::instance::run(hub, command),
+        Command::Fleet { hub, command } => cmd::fleet::run(hub, command),
+        Command::Mcp { hub } => cmd::mcp::run(hub),
+        _ => unreachable!("version and service commands are handled above"),
+    }
+}
+
+fn init_tracing() -> anyhow::Result<()> {
+    let directive = match std::env::var("RUST_LOG") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "info".to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("RUST_LOG is not valid UTF-8"),
+    };
+    let filter = tracing_subscriber::EnvFilter::try_new(directive)
+        .map_err(|_| anyhow::anyhow!("invalid RUST_LOG filter"))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(false)
+        .try_init()
+        .map_err(|_| anyhow::anyhow!("cannot install tracing subscriber"))
+}
+
+/// Install handlers before binding listeners; every process mode owns its cleanup.
+struct Shutdown {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("cannot install SIGTERM handler")?,
+            #[cfg(unix)]
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("cannot install SIGINT handler")?,
+        })
+    }
+
+    async fn wait(&mut self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            let signal = tokio::select! {
+                value = self.terminate.recv() => value,
+                value = self.interrupt.recv() => value,
+            };
+            signal.context("process signal stream ended")?;
         }
-        Command::Instance { hub, command } => {
-            if let Err(error) = cmd::instance::run(hub, command) {
-                eprintln!("{error:#}");
-                std::process::exit(1);
-            }
-        }
-        Command::Fleet { hub, command } => {
-            if let Err(error) = cmd::fleet::run(hub, command) {
-                eprintln!("{error:#}");
-                std::process::exit(1);
-            }
-        }
-        Command::Mcp { hub } => {
-            if let Err(error) = cmd::mcp::run(hub) {
-                eprintln!("{error:#}");
-                std::process::exit(1);
-            }
-        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c()
+            .await
+            .context("cannot receive Ctrl-C")?;
+        tracing::info!("shutdown requested");
+        Ok(())
     }
 }
 
@@ -110,30 +176,75 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn declares_version_and_dev_subcommands() {
+    fn version_json_uses_the_cli_dispatch_and_contains_build_identity() {
+        let cli = Cli::try_parse_from([
+            "remuda",
+            "--config",
+            "/missing/remuda.toml",
+            "version",
+            "--json",
+        ])
+        .expect("version CLI");
+        let Command::Version { json } = cli.command else {
+            panic!("version command")
+        };
+        let mut bytes = Vec::new();
+        build_info::write(json, &mut bytes).expect("version output");
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("one JSON object");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["git_sha"], env!("REMUDA_GIT_SHA"));
+        assert_eq!(value["build_date"], env!("REMUDA_BUILD_DATE"));
+        assert_eq!(value["target"], env!("REMUDA_TARGET"));
+    }
+
+    #[test]
+    fn declares_modes_and_accepts_global_flags_after_subcommands() {
+        Cli::command().debug_assert();
+        let cli = Cli::try_parse_from([
+            "remuda",
+            "hub",
+            "--config",
+            "test.toml",
+            "--data-dir",
+            "cli-data",
+            "--listen",
+            "127.0.0.1:1234",
+        ])
+        .expect("hub flags");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("test.toml"))
+        );
+        assert_eq!(
+            cli.data_dir.as_deref(),
+            Some(std::path::Path::new("cli-data"))
+        );
+        let Command::Hub(args) = cli.command else {
+            panic!("hub command")
+        };
+        let mut config = config::Config::default();
+        config.hub.listen.set_port(4567);
+        args.apply(&mut config);
+        assert_eq!(config.hub.listen.port(), 1234);
+        assert!(
+            Cli::try_parse_from([
+                "remuda",
+                "node",
+                "--stdio",
+                "--hub-url",
+                "wss://host/v1/node"
+            ])
+            .is_err()
+        );
         let names: Vec<_> = Cli::command()
             .get_subcommands()
             .map(|c| c.get_name().to_string())
             .collect();
-        assert!(names.contains(&"version".to_string()));
-        assert!(names.contains(&"dev".to_string()));
-        assert!(names.contains(&"hub".to_string()));
-        assert!(names.contains(&"node".to_string()));
-        assert!(names.contains(&"ssh".to_string()));
         assert!(names.contains(&"instance".to_string()));
         assert!(names.contains(&"fleet".to_string()));
         assert!(names.contains(&"mcp".to_string()));
-    }
-
-    #[test]
-    fn version_text_includes_identity_fields() {
-        let text = version_text();
-        assert!(text.contains(env!("CARGO_PKG_VERSION")));
-        assert!(text.contains("commit="));
-        assert!(text.contains("rustc="));
-        assert!(text.contains("target="));
-        assert!(text.contains("wire=1"));
-        assert!(text.contains("schema=0"));
     }
 
     #[test]

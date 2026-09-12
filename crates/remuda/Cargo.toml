@@ -13,14 +13,23 @@ workspace = true
 [dependencies]
 time = { workspace = true }
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
+remuda-hub = { workspace = true, features = ["embed-web"] }
+remuda-node.workspace = true
+remuda-protocol.workspace = true
 remuda-ssh.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+time.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

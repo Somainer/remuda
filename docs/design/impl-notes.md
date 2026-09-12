@@ -223,3 +223,17 @@ git diff --exit-code -- web/src/lib/api.generated.ts
 
 Committed `web/src/lib/api.generated.ts` is stale vs Hub OpenAPI. Crate owners should regenerate and commit the client (do not drop the CI check).
 
+## remuda composition root status
+
+The first composition increment implements typed `remuda.toml` configuration with environment/CLI precedence, reference-only provider credentials, Hub startup with `embed-web`, WSS/stdio Node inventory, a local Hub plus FakeDriver Node protected by one development access code, stderr tracing via `RUST_LOG`, signal-driven driver close/drain, and build identity through `remuda version --json`.
+
+Validation used an isolated archive of `63d6cf4801c46f3c8b46d2661eeefc8b740189e3` plus the selected composition files and dependency manifest. `cargo build --offline -p remuda` and `cargo test --offline -p remuda` passed (26 unit tests and 5 integration tests). Localhost binary smokes verified configuration precedence, Hub health and exact embedded Web index bytes, authenticated dev creation and Hub enrollment, SIGINT/SIGTERM, persistent stdio host identity, and shutdown while stdin remains open. Build metadata also passed a `SOURCE_DATE_EPOCH=0`/explicit-SHA check. No real model was run by this task.
+
+The Clippy workaround is `cargo clippy --offline -p remuda --no-deps -- -D warnings -A unused-imports`. The unowned `cmd/ssh.rs` re-exports an unused `run_cli as run`; the earlier full dependency lint also found `remuda-node::transport::session_task` exceeding Clippy's argument count (subsequently addressed by its owner). This exception changes the validation command, not lint policy in source. Other command modules are unchanged by this task.
+
+Remaining steps:
+
+- Synchronize the Remuda entry in `Cargo.lock` in a separate scoped commit, preserving the unrelated Node/Feishu dependency edits in the shared working tree.
+- Adopt the Node owner's evolving runtime WSS dispatcher after it supports configured labels/maxInstances and bounded cancellation during reconnect. The current root uses `WssCarrier` for enrollment, private host-token persistence and heartbeat; unsupported Hub commands receive JSON-RPC `-32601` rather than a success ACK. A disconnect exits without replay.
+- `StdioCarrier` exposes inventory/hello/ping only. Provider profiles and their secret references are loaded and validated, but the current local Node composition does not register those profiles or enforce configured placement/capacity. Native driver/provider integration belongs in the next composition increment after the Node API lands.
+- `RunningHub` exposes shutdown on Drop but no awaited server-drain handle. Local Node driver close commands are awaited with a deadline; the Node API still needs cancellation of upgraded WebSockets and a shutdown gate for existing command streams.

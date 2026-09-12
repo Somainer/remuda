@@ -421,7 +421,12 @@ impl Store {
         self.run(move |conn| {
             conn.execute(
                 "UPDATE hosts SET state = 'offline' WHERE id = ?1 AND state = 'online'",
-                params![host_id],
+                params![&host_id],
+            )?;
+            conn.execute(
+                "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
+                 WHERE host_id = ?2 AND connectivity != 'disconnected'",
+                params![now_rfc3339(), host_id],
             )?;
             Ok(())
         })
@@ -439,7 +444,12 @@ impl Store {
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE hosts SET last_seen_at = ?1, state = 'online' WHERE id = ?2",
-                params![now, host_id],
+                params![&now, &host_id],
+            )?;
+            conn.execute(
+                "UPDATE instances SET connectivity = 'connected', updated_at = ?1
+                 WHERE host_id = ?2 AND connectivity != 'connected'",
+                params![&now, &host_id],
             )?;
             if let Some(label) = update.display_label {
                 conn.execute(
@@ -557,18 +567,24 @@ impl Store {
             let instance_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
             let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
             let now = now_rfc3339();
+            let connectivity = if host.online {
+                "connected"
+            } else {
+                "disconnected"
+            };
             conn.execute(
                 "INSERT INTO instances
                     (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                      title, journal_id, durable_seq, spec_json, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', 'disconnected',
-                         ?6, ?7, 0, ?8, ?9, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
+                         ?7, ?8, 0, ?9, ?10, ?10)",
                 params![
                     instance_id,
                     host_id,
                     workspace_id,
                     kind,
                     driver,
+                    connectivity,
                     title,
                     journal_id,
                     spec.to_string(),
@@ -731,11 +747,31 @@ impl Store {
         self.run(move |conn| {
             let now = now_rfc3339();
             conn.execute(
-                "UPDATE commands SET state = 'accepted', resolution = 'clear', updated_at = ?1 WHERE id = ?2",
+                "UPDATE commands SET state = 'accepted', resolution = 'clear', updated_at = ?1
+                 WHERE id = ?2 AND state = 'queued'",
                 params![now, command_id],
             )?;
-            load_command(conn, &command_id)?
-                .ok_or_else(|| StoreError::Id("unknown command".into()))
+            load_command(conn, &command_id)?.ok_or_else(|| StoreError::Id("unknown command".into()))
+        })
+        .await
+    }
+
+    /// Expire the create settlement watch without changing its three-state progress.
+    pub async fn mark_settlement_timed_out(
+        &self,
+        command_id: String,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            let changed = conn.execute(
+                "UPDATE commands SET resolution = 'unknown', updated_at = ?1
+                 WHERE id = ?2 AND state = 'accepted' AND resolution = 'clear'",
+                params![now, command_id],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            load_command(conn, &command_id)
         })
         .await
     }
@@ -822,6 +858,7 @@ impl Store {
                 params![instance_id, seq, event_id, event.to_string(), now],
             )?;
             apply_instance_projection(conn, &instance_id, &event, seq, &now)?;
+            apply_command_projection(conn, &host_id, &instance_id, &event, &now)?;
             apply_interaction_event(conn, &host_id, &instance_id, &event)?;
             apply_instance_lifecycle(conn, &instance_id, &event)?;
             Ok(JournalAppend {
@@ -1288,11 +1325,12 @@ fn apply_instance_projection(
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let mut lifecycle: Option<&str> = None;
     let mut last_error: Option<String> = None;
-    let mut connectivity = "connected";
-    if kind == "lifecycle" && payload_type == "entity" {
+    if kind == "lifecycle"
+        && payload_type == "entity"
+        && payload.get("entityType").and_then(Value::as_str) == Some("instance")
+    {
         if payload.get("state").and_then(Value::as_str) == Some("failed") {
             lifecycle = Some("failed");
-            connectivity = "disconnected";
             last_error = payload
                 .get("reasonCode")
                 .and_then(Value::as_str)
@@ -1301,7 +1339,6 @@ fn apply_instance_projection(
             lifecycle = Some("ready");
         } else if payload.get("state").and_then(Value::as_str) == Some("exited") {
             lifecycle = Some("exited");
-            connectivity = "disconnected";
         }
         if let Some(entity_error) = payload.pointer("/entity/lastError").and_then(Value::as_str) {
             last_error = Some(entity_error.to_string());
@@ -1325,7 +1362,6 @@ fn apply_instance_projection(
             || native_name.contains("shell");
         if failed {
             lifecycle = Some("failed");
-            connectivity = "disconnected";
             last_error = payload
                 .pointer("/relatedIds/lastError")
                 .and_then(Value::as_str)
@@ -1340,16 +1376,77 @@ fn apply_instance_projection(
     }
     if let Some(lifecycle) = lifecycle {
         conn.execute(
-            "UPDATE instances SET durable_seq = ?1, connectivity = ?2, lifecycle = ?3,
-                    last_error = COALESCE(?4, last_error), updated_at = ?5
-             WHERE id = ?6",
-            params![seq, connectivity, lifecycle, last_error, now, instance_id],
+            "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
+                    last_error = COALESCE(?3, last_error), updated_at = ?4
+             WHERE id = ?5",
+            params![seq, lifecycle, last_error, now, instance_id],
         )?;
     } else {
         conn.execute(
-            "UPDATE instances SET durable_seq = ?1, connectivity = 'connected', updated_at = ?2 WHERE id = ?3",
+            "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
             params![seq, now, instance_id],
         )?;
+    }
+    Ok(())
+}
+
+fn apply_command_projection(
+    conn: &Connection,
+    host_id: &str,
+    instance_id: &str,
+    event: &Value,
+    now: &str,
+) -> Result<(), StoreError> {
+    if event.get("kind").and_then(Value::as_str) != Some("lifecycle") {
+        return Ok(());
+    }
+    let Some(payload) = event.get("payload") else {
+        return Ok(());
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("entity")
+        || payload.get("entityType").and_then(Value::as_str) != Some("command")
+    {
+        return Ok(());
+    }
+    let Some(command_id) = payload
+        .pointer("/entity/commandId")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("entityId").and_then(Value::as_str))
+    else {
+        return Ok(());
+    };
+    let Some(command) = load_command(conn, command_id)? else {
+        return Ok(());
+    };
+    if command.host_id != host_id || command.instance_id.as_deref() != Some(instance_id) {
+        return Err(StoreError::Id(
+            "command lifecycle belongs to another host or instance".into(),
+        ));
+    }
+    let state = payload.get("state").and_then(Value::as_str).unwrap_or("");
+    if let Some(entity_state) = payload.pointer("/entity/state").and_then(Value::as_str)
+        && entity_state != state
+    {
+        return Err(StoreError::Id(
+            "command lifecycle state does not match its entity".into(),
+        ));
+    }
+    match state {
+        "accepted" => {
+            conn.execute(
+                "UPDATE commands SET state = 'accepted', resolution = 'clear', updated_at = ?1
+                 WHERE id = ?2 AND state = 'queued'",
+                params![now, command_id],
+            )?;
+        }
+        "settled" => {
+            conn.execute(
+                "UPDATE commands SET state = 'settled', resolution = 'clear', updated_at = ?1
+                 WHERE id = ?2 AND state != 'settled'",
+                params![now, command_id],
+            )?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1369,6 +1466,145 @@ fn ensure_column(
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn journal_settles_commands_while_connectivity_follows_the_host_link() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host_id = new_id("hst").expect("host id");
+        let outcome = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: "bootstrap".into(),
+                    bootstrap: "bootstrap".into(),
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("slow-node".into()),
+                    node_version: Some("test".into()),
+                },
+                |_, _| false,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .expect("host enroll");
+        assert!(matches!(outcome, HostAuthOutcome::Authenticated { .. }));
+
+        let instance = store
+            .insert_instance(
+                host_id.clone(),
+                None,
+                "claude".into(),
+                "generic-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .expect("instance");
+        assert_eq!(instance.connectivity, "connected");
+        let (command, _) = store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host_id.clone(),
+                "instance.create".into(),
+                json!({"instanceId": instance.instance_id}),
+                None,
+            )
+            .await
+            .expect("command");
+        store
+            .mark_forward_intent(command.command_id.clone())
+            .await
+            .expect("forward intent");
+
+        for state in ["accepted", "settled"] {
+            store
+                .append_journal(
+                    host_id.clone(),
+                    instance.instance_id.clone(),
+                    None,
+                    json!({
+                        "kind": "lifecycle",
+                        "payload": {
+                            "type": "entity",
+                            "entityType": "command",
+                            "entityId": command.command_id,
+                            "state": state,
+                            "entity": {
+                                "commandId": command.command_id,
+                                "state": state
+                            }
+                        }
+                    }),
+                )
+                .await
+                .expect("command lifecycle");
+        }
+        let projected = store
+            .get_command(command.command_id.clone())
+            .await
+            .expect("command query")
+            .expect("command row");
+        assert_eq!(projected.state, "settled");
+        assert_eq!(projected.resolution, "clear");
+
+        store
+            .append_journal(
+                host_id.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity",
+                        "entityType": "instance",
+                        "entityId": instance.instance_id,
+                        "state": "failed",
+                        "reasonCode": "native-start-failed",
+                        "entity": {"lastError": "native-start-failed"}
+                    }
+                }),
+            )
+            .await
+            .expect("instance failure");
+        let failed = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("instance query")
+            .expect("instance row");
+        assert_eq!(failed.lifecycle, "failed");
+        assert_eq!(failed.connectivity, "connected");
+
+        store
+            .mark_host_offline(host_id.clone())
+            .await
+            .expect("offline");
+        let offline = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("instance query")
+            .expect("instance row");
+        assert_eq!(offline.connectivity, "disconnected");
+
+        store
+            .apply_inventory(
+                host_id,
+                crate::inventory::HostInventoryUpdate::default(),
+                None,
+            )
+            .await
+            .expect("online");
+        let online = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("instance query")
+            .expect("instance row");
+        assert_eq!(online.connectivity, "connected");
+    }
 }
 
 fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreError> {

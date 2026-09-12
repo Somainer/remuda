@@ -168,6 +168,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         })
         .map(str::to_string);
     Ok(CreateInstanceRequest {
+        command_id: command_id_of(params),
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
         workspace_id: None,

@@ -177,7 +177,12 @@ async fn create_send_follow_cancel_and_reconnect_catch_up_without_duplicates() {
     let fixture = include_str!("fixtures/create-instance.json");
     let created = http_json(server.address, "POST", "/v1/instances", Some(fixture), &[]).await;
     assert_eq!(created.status, 201);
-    assert_eq!(created.body["command"]["state"], "settled");
+    assert_eq!(created.body["command"]["state"], "accepted");
+    let create_command_id = created.body["command"]["commandId"]
+        .as_str()
+        .expect("create command id");
+    let created_settled = wait_for_settled(server.address, create_command_id).await;
+    assert_eq!(created_settled["state"], "settled");
     let instance_id = created.body["instance"]["id"]
         .as_str()
         .expect("instance id")

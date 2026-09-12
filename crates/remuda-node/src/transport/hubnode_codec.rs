@@ -253,6 +253,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
     let mut request: CreateInstanceRequest = match serde_json::from_value(spec_for_request) {
         Ok(request) => request,
         Err(_) => CreateInstanceRequest {
+            command_id: None,
             instance_id: None,
             host_id: None,
             workspace_id: None,
@@ -285,6 +286,14 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             .or_else(|| params.get("instanceId").and_then(Value::as_str))
     {
         request.instance_id = Some(InstanceId::from_str(id)?);
+    }
+    if request.command_id.is_none()
+        && let Some(id) = parsed
+            .command_id
+            .as_deref()
+            .or_else(|| params.get("commandId").and_then(Value::as_str))
+    {
+        request.command_id = Some(remuda_protocol::CommandId::from_str(id)?);
     }
     if request.host_id.is_none() {
         let raw = parsed

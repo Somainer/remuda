@@ -330,21 +330,41 @@ pub(crate) async fn forward_if_online(
             .await?
             .ok_or(HubError::NotFound);
     }
+    let mut params = command.payload.clone();
+    let object = params
+        .as_object_mut()
+        .ok_or_else(|| HubError::BadRequest("command payload must be an object".into()))?;
+    object.insert("commandId".into(), json!(command.command_id));
     match state
         .nodes
         .call(
             &command.host_id,
             &command.operation,
-            command.payload.clone(),
-            Duration::from_secs(5),
+            params,
+            Duration::from_millis(state.config.command_accept_timeout_ms.max(1)),
         )
         .await
     {
-        Ok(Some(_)) => state
-            .store
-            .mark_accepted(command.command_id.clone())
-            .await
-            .map_err(HubError::from),
+        Ok(Some(response)) if node_accepted(&response, &command.command_id) => {
+            let accepted = state
+                .store
+                .mark_accepted(command.command_id.clone())
+                .await?;
+            schedule_create_settlement_watch(state, &accepted);
+            Ok(accepted)
+        }
+        Ok(Some(response)) => {
+            tracing::warn!(
+                command_id = %command.command_id,
+                response = %response,
+                "node did not durably accept command; will not resend"
+            );
+            state
+                .store
+                .get_command(command.command_id.clone())
+                .await?
+                .ok_or(HubError::NotFound)
+        }
         Ok(None) => {
             tracing::debug!(command_id = %command.command_id, "node offline at forward; not resent");
             state
@@ -362,6 +382,51 @@ pub(crate) async fn forward_if_online(
                 .ok_or(HubError::NotFound)
         }
     }
+}
+
+fn node_accepted(response: &Value, command_id: &str) -> bool {
+    if response.get("error").is_some() {
+        return false;
+    }
+    let result = response.get("result").unwrap_or(response);
+    if let Some(returned_id) = result.pointer("/command/commandId").and_then(Value::as_str)
+        && returned_id != command_id
+    {
+        return false;
+    }
+    matches!(
+        result.pointer("/command/state").and_then(Value::as_str),
+        Some("accepted" | "settled")
+    ) || result.get("accepted").and_then(Value::as_bool) == Some(true)
+}
+
+fn schedule_create_settlement_watch(state: &AppState, command: &CommandRecord) {
+    if command.operation != "instance.create" || command.state != "accepted" {
+        return;
+    }
+    let state = state.clone();
+    let command_id = command.command_id.clone();
+    let timeout = Duration::from_millis(state.config.create_settle_timeout_ms());
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        match state
+            .store
+            .mark_settlement_timed_out(command_id.clone())
+            .await
+        {
+            Ok(Some(_)) => tracing::warn!(
+                %command_id,
+                timeout_ms = timeout.as_millis(),
+                "create command accepted but settlement observation is overdue"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::error!(
+                %command_id,
+                %error,
+                "failed to record create settlement timeout"
+            ),
+        }
+    });
 }
 
 pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {

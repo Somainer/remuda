@@ -11,11 +11,7 @@ use remuda_protocol::{AgentKind, DriverKind, InstanceId, JournalEvent, U64};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
-
-/// Wait for FakeDriver output that is persisted after the create/send RPC acks.
-const DRIVER_CATCHUP: Duration = Duration::from_millis(30);
 
 pub(crate) struct RuntimeLink {
     pub node: DevNode,
@@ -117,8 +113,6 @@ async fn dispatch_hub(
 
 async fn catch_up(runtime: &RuntimeLink, instance_id: &InstanceId) -> Result<(), NodeError> {
     ensure_pump(runtime, instance_id);
-    flush_journal(runtime, instance_id).await?;
-    tokio::time::sleep(DRIVER_CATCHUP).await;
     flush_journal(runtime, instance_id).await
 }
 
@@ -172,6 +166,13 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         }
     };
     Ok(CreateInstanceRequest {
+        command_id: parsed
+            .command_id
+            .as_deref()
+            .or_else(|| params.get("commandId").and_then(Value::as_str))
+            .map(|raw| remuda_protocol::CommandId::try_from(raw.to_owned()))
+            .transpose()
+            .map_err(|err| NodeError::InvalidRequest(err.to_string()))?,
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
         workspace_id: None,

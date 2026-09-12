@@ -468,6 +468,7 @@ mod tests {
                 fixture_instance(InstanceId::new(), HostId::new(), WorkspaceId::new(), kind)
                     .expect("instance");
             let request = crate::CreateInstanceRequest {
+                command_id: None,
                 instance_id: Some(instance.meta.id.clone()),
                 host_id: Some(instance.host_id.clone()),
                 workspace_id: Some(instance.workspace_id.clone()),

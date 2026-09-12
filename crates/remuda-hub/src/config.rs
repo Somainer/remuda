@@ -7,6 +7,10 @@ use uuid::Uuid;
 
 /// Cookie carrying the device session token.
 pub const DEVICE_COOKIE: &str = "remuda_device";
+/// Default deadline for the Node to durably accept a command.
+pub const DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS: u64 = 5_000;
+/// Minimum create settlement deadline; native cold starts must fit inside it.
+pub const MIN_CREATE_SETTLE_TIMEOUT_MS: u64 = 120_000;
 
 /// How Hub binds and authenticates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +34,12 @@ pub struct HubConfig {
     /// Per-follow-socket outbound queue. Overflow emits `{type:gap}` and a resync snapshot.
     #[serde(default = "default_follow_buffer_events")]
     pub follow_buffer_events: usize,
+    /// Deadline for the Node's durable command-accept response (ms).
+    #[serde(default = "default_command_accept_timeout_ms")]
+    pub command_accept_timeout_ms: u64,
+    /// Deadline for a later create settlement observation (ms, minimum 120 seconds).
+    #[serde(default = "default_create_settle_timeout_ms")]
+    pub create_settle_timeout_ms: u64,
 }
 
 fn default_push_block_ms() -> u64 {
@@ -38,6 +48,14 @@ fn default_push_block_ms() -> u64 {
 
 fn default_follow_buffer_events() -> usize {
     256
+}
+
+fn default_command_accept_timeout_ms() -> u64 {
+    DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS
+}
+
+fn default_create_settle_timeout_ms() -> u64 {
+    MIN_CREATE_SETTLE_TIMEOUT_MS
 }
 
 impl Default for HubConfig {
@@ -51,6 +69,8 @@ impl Default for HubConfig {
             web_root: None,
             push_block_ms: default_push_block_ms(),
             follow_buffer_events: default_follow_buffer_events(),
+            command_accept_timeout_ms: default_command_accept_timeout_ms(),
+            create_settle_timeout_ms: default_create_settle_timeout_ms(),
         }
     }
 }
@@ -67,7 +87,15 @@ impl HubConfig {
             web_root: None,
             push_block_ms: 80,
             follow_buffer_events: default_follow_buffer_events(),
+            command_accept_timeout_ms: default_command_accept_timeout_ms(),
+            create_settle_timeout_ms: default_create_settle_timeout_ms(),
         }
+    }
+
+    /// Effective create settlement deadline, clamped to the protocol safety floor.
+    pub(crate) fn create_settle_timeout_ms(&self) -> u64 {
+        self.create_settle_timeout_ms
+            .max(MIN_CREATE_SETTLE_TIMEOUT_MS)
     }
 }
 

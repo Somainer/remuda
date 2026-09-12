@@ -23,5 +23,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+remuda-testing.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -3,6 +3,7 @@ import { readAccessCode } from "../../../lib/accessCode";
 import { readSession } from "../../../lib/session";
 import {
   CHANNEL_TTY_OUTPUT,
+  bytesToUuid,
   concatBytes,
   decodeTtyBinaryFrame,
   encodeTtyInputFrame,
@@ -181,6 +182,8 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     streamUuid = uuid;
   };
 
+  let flushInput = () => {};
+
   const deliverOutput = (payload: Uint8Array, offset: bigint, id: string) => {
     const reset = resetNext;
     resetNext = false;
@@ -193,11 +196,10 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     if (decoded.frame.channelType !== CHANNEL_TTY_OUTPUT) return;
     if (!streamUuid) streamUuid = decoded.frame.streamUuid;
     else if (!sameUuid(decoded.frame.streamUuid, streamUuid)) return;
-    if (!streamId) streamId = `tty_${[...decoded.frame.streamUuid].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+    if (!streamId) streamId = `tty_${bytesToUuid(decoded.frame.streamUuid)}`;
     deliverOutput(decoded.frame.payload, decoded.frame.offset, streamId);
-    if (sawSnapshot) {
-      handlers.onStatus("live");
-    }
+    handlers.onStatus("live");
+    if (inputQueue.length) flushInput();
   };
 
   const handleJson = (raw: string) => {
@@ -228,10 +230,18 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
       return;
     }
     const event = msg.event && typeof msg.event === "object" ? (msg.event as Record<string, unknown>) : msg;
-    const eventType = typeof event.type === "string" ? event.type : "";
+    const eventType =
+      typeof event.type === "string"
+        ? event.type
+        : typeof event.method === "string"
+          ? event.method
+          : "";
     if (eventType === "tty.frame" || type === "tty.frame") {
       const sid = extractStreamId(event) ?? extractStreamId(msg);
-      if (sid) setStream(sid);
+      if (sid) {
+        setStream(sid);
+        if (inputQueue.length) flushInput();
+      }
       const b64 = extractBase64(event) ?? extractBase64(msg);
       if (!b64) return;
       const payload = bytesFromBase64(b64);
@@ -241,7 +251,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     }
   };
 
-  const flushInput = () => {
+  flushInput = () => {
     inputTimer = 0;
     if (!socket || socket.readyState !== WebSocket.OPEN || !streamUuid || !inputQueue.length) return;
     const payload = concatBytes(inputQueue.splice(0));
@@ -249,7 +259,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     while (rest.byteLength) {
       const chunk = rest.subarray(0, MAX_TTY_INPUT);
       rest = rest.subarray(chunk.byteLength);
-      const frame = encodeTtyInputFrame(streamUuid, inputOffset, chunk);
+      const frame = encodeTtyInputFrame(streamUuid, 0n, chunk);
       inputOffset += BigInt(chunk.byteLength);
       socket.send(frame.slice().buffer);
     }
@@ -266,7 +276,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     lastCols = cols;
     lastRows = rows;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: "tty.resize", cols, rows, instanceId: instance.id }));
+    socket.send(JSON.stringify({ type: "tty.resize", cols, rows }));
   };
 
   const openSocket = () => {

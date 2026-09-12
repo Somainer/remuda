@@ -75,6 +75,7 @@ export function TerminalView({
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [preview, setPreview] = useState("");
+  const [rawTail, setRawTail] = useState("");
   const [ready, setReady] = useState(false);
   const frozen = status === "reconnecting" || status === "failed";
 
@@ -209,7 +210,9 @@ export function TerminalView({
         }
         const bytes = payloadForStreamWrite(payload, false);
         const text = stripAnsi(payload);
+        const latin1 = Array.from(payload, (b) => String.fromCharCode(b)).join("");
         setPreview((current) => (shouldReset ? text : current + text));
+        setRawTail((current) => (shouldReset ? latin1 : (current + latin1).slice(-4000)));
         outQueue.push(bytes);
         if (!outRaf) outRaf = requestAnimationFrame(flushOut);
       },
@@ -404,6 +407,9 @@ export function TerminalView({
         <div className={css.host} ref={hostRef} />
         <pre className={css.preview} data-testid="tty-ansi-preview">
           {preview}
+        </pre>
+        <pre className={css.preview} data-testid="tty-raw-tail">
+          {rawTail}
         </pre>
       </div>
       <div className={css.dock}>

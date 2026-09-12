@@ -287,24 +287,27 @@
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: hidden;
   padding: 8px 10px;
   background: var(--ink-2, #1a212b);
   border-top: 1px solid var(--line);
+  -webkit-overflow-scrolling: touch;
 }
 
 .keys button {
-  height: 36px;
+  height: 44px;
   min-width: 44px;
-  min-height: 36px;
+  min-height: 44px;
   border: 1px solid var(--line);
   border-radius: 4px;
   background: transparent;
   color: var(--paper);
   font-family: var(--mono);
   font-size: 12px;
-  padding: 0 9px;
+  padding: 0 10px;
   flex: none;
+  touch-action: manipulation;
 }
 
 .preview {
@@ -350,6 +353,18 @@
     min-height: 44px;
     padding: 0;
     font-size: 15px;
+  }
+
+  .keys {
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+    gap: 8px;
+  }
+
+  .keys button {
+    height: 44px;
+    min-height: 44px;
+    min-width: 44px;
+    font-size: 13px;
   }
 }
 

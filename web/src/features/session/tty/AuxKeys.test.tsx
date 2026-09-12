@@ -10,8 +10,17 @@ describe("terminal aux keys", () => {
     render(<AuxKeys disabled={false} onKey={onKey} />);
     await user.click(screen.getByTestId("tty-key-esc"));
     await user.click(screen.getByTestId("tty-key-tab"));
+    await user.click(screen.getByTestId("tty-key-left"));
     await user.click(screen.getByTestId("tty-key-pgup"));
+    await user.click(screen.getByTestId("tty-key-pgdn"));
     await user.click(screen.getByTestId("tty-key-ctrl-c"));
-    expect(onKey.mock.calls.map((call) => call[0])).toEqual(["\u001b", "\t", "\u001b[5~", "\u0003"]);
+    expect(onKey.mock.calls.map((call) => call[0])).toEqual([
+      "\u001b",
+      "\t",
+      "\u001b[D",
+      "\u001b[5~",
+      "\u001b[6~",
+      "\u0003",
+    ]);
   });
 });

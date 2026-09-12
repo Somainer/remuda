@@ -24,6 +24,10 @@ const STRIP: KeyDef[] = [
   { id: "alt", label: "⌥", mod: "alt" },
   { id: "up", label: "↑", data: "\u001b[A" },
   { id: "down", label: "↓", data: "\u001b[B" },
+  { id: "left", label: "←", data: "\u001b[D" },
+  { id: "right", label: "→", data: "\u001b[C" },
+  { id: "pgup", label: "PgUp", data: "\u001b[5~" },
+  { id: "pgdn", label: "PgDn", data: "\u001b[6~" },
   { id: "ctrl-c", label: "⌃C", data: "\u0003" },
 ];
 

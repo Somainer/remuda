@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const TTY_LAB = "ins_01993ab0-0000-7000-8000-00000000aa01";
+const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence");
 
 test.describe("mobile visual QA", () => {
   test.use({ viewport: { width: 390, height: 844 } });
@@ -27,6 +30,20 @@ test.describe("mobile visual QA", () => {
     expect(bar).toBeTruthy();
     expect(box!.y + box!.height).toBeLessThanOrEqual(bar!.y + 2);
     expect(box!.height).toBeGreaterThanOrEqual(44);
+  });
+
+  test("tty key bar keys are at least 44px", async ({ page }) => {
+    await page.goto(`/s/${TTY_LAB}/tty`);
+    await expect(page.getByTestId("tty-keybar")).toBeVisible({ timeout: 15_000 });
+    for (const id of ["esc", "tab", "ctrl", "alt", "up", "down", "left", "right", "pgup", "pgdn", "ctrl-c"]) {
+      const key = page.getByTestId(`tty-key-${id}`);
+      await expect(key).toBeVisible();
+      const box = await key.boundingBox();
+      expect(box, id).toBeTruthy();
+      expect(box!.height, id).toBeGreaterThanOrEqual(44);
+      expect(box!.width, id).toBeGreaterThanOrEqual(44);
+    }
+    await page.screenshot({ path: path.join(evidence, "terminal-1-keybar.png"), animations: "disabled" });
   });
 
   test("bottom bar and more menu tap targets are at least 44px", async ({ page }) => {

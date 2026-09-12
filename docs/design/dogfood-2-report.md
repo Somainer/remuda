@@ -59,7 +59,10 @@ generic-pty logs: `agent.start dispatched` for both kinds (no
 3. **`tty.write` / keys** still not dispatched Hub→Node WSS (`_ => ok`).
 4. Hub instance lifecycle can stay `requested` while the Node is ready.
 5. Committed `docs/design/remuda-mcp.json` still defaults `REMUDA_HUB` to
-   `:8080`; the demo injects `:18080` + a device token at runtime.
+   `:8080`; the demo injects `HUB_LISTEN` + a device token at runtime.
+   Override `REMUDA_DOGFOOD_HUB_LISTEN` / `REMUDA_DOGFOOD_NODE_LISTEN`
+   (this worktree uses `:28080` / `:28787`) so dogfood does not bind the
+   coordinator demo ports `:18080` / `:18787`.
 6. `wait --until line:(?m)^DONE` does not match TUI bullets (`• DONE`).
    Use `line:DONE` or strip list markers if wait must succeed on TUI text.
 

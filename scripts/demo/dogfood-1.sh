@@ -13,6 +13,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 EVIDENCE="$ROOT/docs/design/evidence/dogfood-1.jsonl"
 MCP_CONFIG="$ROOT/docs/design/remuda-mcp.json"
 DEMO_DIR="${REMUDA_DOGFOOD_DIR:-${TMPDIR:-/tmp}/remuda-dogfood-1}"
+# Override when 18080/18787 are already bound (coordinator demo).
 HUB_LISTEN="${REMUDA_DOGFOOD_HUB_LISTEN:-127.0.0.1:18080}"
 NODE_LISTEN="${REMUDA_DOGFOOD_NODE_LISTEN:-127.0.0.1:18787}"
 ACCESS_CODE="${REMUDA_DOGFOOD_ACCESS_CODE:-dogfood-1-access}"
@@ -139,7 +140,7 @@ meta = {
         "redacted": True,
         "model": "haiku",
         "maxBudgetUsd": 0.5,
-        "hub": "http://127.0.0.1:18080",
+        "hub": hub,
     }
 }
 lines.append(json.dumps(meta, sort_keys=True))

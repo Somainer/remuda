@@ -24,6 +24,9 @@ describe("sessionOptions", () => {
     expect(normalizeDelegation("gateway")).toBe("gateway");
     expect(providerProfileForDelegation("none")).toBe("none");
     expect(providerProfileForDelegation("gateway")).toBe("gateway");
+    expect(providerProfileForDelegation("gateway", "pvp_01993ab0-0000-7000-8000-000000000010")).toBe(
+      "pvp_01993ab0-0000-7000-8000-000000000010",
+    );
     expect(DELEGATION_OPTIONS.map((o) => o.id)).toEqual(["none", "gateway"]);
     expect(DELEGATION_OPTIONS.some((o) => /astergate/i.test(o.label))).toBe(false);
   });

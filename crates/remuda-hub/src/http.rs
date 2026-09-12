@@ -235,6 +235,7 @@ pub async fn create_instance(
     {
         obj.insert("delegation".into(), json!(delegation));
     }
+    crate::providers::attach_provider_to_spec(&state, &mut spec).await?;
     let placement =
         crate::placement::Placement::from_value(body.placement.as_ref(), body.host_id.as_deref())?;
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
@@ -467,6 +468,9 @@ pub(crate) async fn forward_if_online(
         .as_object_mut()
         .ok_or_else(|| HubError::BadRequest("command payload must be an object".into()))?;
     object.insert("commandId".into(), json!(command.command_id));
+    if command.operation == "instance.create" {
+        params = crate::providers::with_launch_secret(state, params).await?;
+    }
     match state
         .nodes
         .call(
@@ -563,7 +567,11 @@ fn schedule_create_settlement_watch(state: &AppState, command: &CommandRecord) {
 
 pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
     match &err {
-        crate::store::StoreError::Id(msg) if msg.contains("unknown host") => HubError::NotFound,
+        crate::store::StoreError::Id(msg)
+            if msg.contains("unknown host") || msg.contains("unknown provider") =>
+        {
+            HubError::NotFound
+        }
         crate::store::StoreError::Id(msg)
             if msg.contains("reused") || msg.contains("idempotency") =>
         {

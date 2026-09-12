@@ -41,6 +41,7 @@ export function normalizeDelegation(value: string | undefined): DelegationId {
 }
 
 /** Profile id sent on create. Wire uses none | gateway; never an astergate-specific name. */
-export function providerProfileForDelegation(delegation: DelegationId): "none" | "gateway" {
-  return delegation;
+export function providerProfileForDelegation(delegation: DelegationId, defaultGatewayId?: string): string {
+  if (delegation === "gateway") return defaultGatewayId || "gateway";
+  return "none";
 }

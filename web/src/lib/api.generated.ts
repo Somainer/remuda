@@ -380,6 +380,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List provider profiles (secret never returned) */
+        get: operations["providerList"];
+        put?: never;
+        /** Create a gateway or direct profile; authToken stored encrypted */
+        post: operations["providerCreate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["providerGet"];
+        put?: never;
+        post?: never;
+        delete: operations["providerDelete"];
+        options?: never;
+        head?: never;
+        /** Update metadata and/or rotate authToken */
+        patch: operations["providerPatch"];
+        trace?: never;
+    };
+    "/v1/providers/{id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Probe models list / reachability against the gateway */
+        post: operations["providerTest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/worktrees": {
         parameters: {
             query?: never;
@@ -602,6 +654,75 @@ export interface components {
             };
         } & {
             [key: string]: unknown;
+        };
+        ProviderCreate: {
+            authToken: string;
+            baseUrl?: string;
+            defaultGateway?: boolean;
+            defaultModel?: string;
+            headers?: {
+                [key: string]: string;
+            };
+            /** @enum {string} */
+            kind?: "gateway" | "direct";
+            models?: string[];
+            name: string;
+        };
+        ProviderHealth: {
+            checkedAt?: string | null;
+            latencyMs?: number | null;
+            message?: string | null;
+            ok: boolean;
+            status?: number | null;
+        };
+        ProviderPage: {
+            items: components["schemas"]["ProviderProfile"][];
+            nextCursor?: string | null;
+        };
+        ProviderPatch: {
+            /** @description Rotate the stored token. */
+            authToken?: string;
+            baseUrl?: string;
+            defaultGateway?: boolean;
+            defaultModel?: string | null;
+            headers?: {
+                [key: string]: string;
+            };
+            /** @enum {string} */
+            kind?: "gateway" | "direct";
+            models?: string[];
+            name?: string;
+        };
+        ProviderProfile: {
+            baseUrl: string;
+            createdAt?: string;
+            defaultGateway: boolean;
+            defaultModel?: string | null;
+            headers?: {
+                [key: string]: string;
+            };
+            health?: components["schemas"]["ProviderHealth"] | null;
+            id: string;
+            /** @enum {string} */
+            kind: "gateway" | "direct";
+            models: string[];
+            name: string;
+            revision: string;
+            secret: components["schemas"]["ProviderSecretView"];
+            updatedAt?: string;
+        };
+        ProviderSecretView: {
+            fingerprint?: string | null;
+            last4?: string | null;
+            present: boolean;
+        };
+        ProviderTestResult: {
+            latencyMs?: number;
+            message: string;
+            models?: string[];
+            ok: boolean;
+            reachable: boolean;
+            status?: number | null;
         };
         PushSubscribe: {
             deviceId?: string;
@@ -1280,6 +1401,155 @@ export interface operations {
                 };
             };
             422: components["responses"]["Error"];
+        };
+    };
+    providerList: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Provider page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+        };
+    };
+    providerCreate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderCreate"];
+            };
+        };
+        responses: {
+            /** @description Created profile (fingerprint/last4 only) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderProfile"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+        };
+    };
+    providerGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Profile */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderProfile"];
+                };
+            };
+            401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    providerDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok: boolean;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    providerPatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderPatch"];
+            };
+        };
+        responses: {
+            /** @description Updated profile */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderProfile"];
+                };
+            };
+            401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    providerTest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Probe result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderTestResult"];
+                };
+            };
+            401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     worktreeList: {

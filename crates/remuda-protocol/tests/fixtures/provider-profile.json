@@ -1,0 +1,18 @@
+{
+  "id": "pvp_01993ab0-0000-7000-8000-000000000010",
+  "revision": "1",
+  "name": "example-gateway",
+  "kind": "gateway",
+  "baseUrl": "https://gateway.example/v1",
+  "models": ["passthrough/auto"],
+  "defaultModel": "passthrough/auto",
+  "headers": {},
+  "defaultGateway": true,
+  "secret": {
+    "present": true,
+    "last4": "t0k1",
+    "fingerprint": "0123456789abcdef"
+  },
+  "createdAt": "2026-09-13T00:00:00.000Z",
+  "updatedAt": "2026-09-13T00:00:00.000Z"
+}

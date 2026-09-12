@@ -14,6 +14,7 @@
     { "name": "worktrees" },
     { "name": "fleet" },
     { "name": "devices" },
+    { "name": "providers" },
     { "name": "push" },
     { "name": "realtime" }
   ],
@@ -521,6 +522,121 @@
         }
       }
     },
+    "/v1/providers": {
+      "get": {
+        "tags": ["providers"],
+        "operationId": "providerList",
+        "summary": "List provider profiles (secret never returned)",
+        "responses": {
+          "200": {
+            "description": "Provider page",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ProviderPage" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "tags": ["providers"],
+        "operationId": "providerCreate",
+        "summary": "Create a gateway or direct profile; authToken stored encrypted",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/ProviderCreate" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created profile (fingerprint/last4 only)",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ProviderProfile" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/providers/{id}": {
+      "get": {
+        "tags": ["providers"],
+        "operationId": "providerGet",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Profile",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ProviderProfile" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "tags": ["providers"],
+        "operationId": "providerPatch",
+        "summary": "Update metadata and/or rotate authToken",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/ProviderPatch" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated profile",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ProviderProfile" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "tags": ["providers"],
+        "operationId": "providerDelete",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok"],
+                  "properties": { "ok": { "type": "boolean" } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/providers/{id}/test": {
+      "post": {
+        "tags": ["providers"],
+        "operationId": "providerTest",
+        "summary": "Probe models list / reachability against the gateway",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Probe result",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ProviderTestResult" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/follow": {
       "get": {
         "tags": ["realtime"],
@@ -624,6 +740,92 @@
         "properties": {
           "code": { "type": "string" },
           "expiresAt": { "type": "string" }
+        }
+      },
+      "ProviderSecretView": {
+        "type": "object",
+        "required": ["present"],
+        "properties": {
+          "present": { "type": "boolean" },
+          "last4": { "type": ["string", "null"] },
+          "fingerprint": { "type": ["string", "null"] }
+        }
+      },
+      "ProviderHealth": {
+        "type": "object",
+        "required": ["ok"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "checkedAt": { "type": ["string", "null"] },
+          "message": { "type": ["string", "null"] },
+          "status": { "type": ["integer", "null"] },
+          "latencyMs": { "type": ["integer", "null"] }
+        }
+      },
+      "ProviderProfile": {
+        "type": "object",
+        "required": ["id", "name", "kind", "baseUrl", "models", "defaultGateway", "revision", "secret"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["gateway", "direct"] },
+          "baseUrl": { "type": "string" },
+          "models": { "type": "array", "items": { "type": "string" } },
+          "defaultModel": { "type": ["string", "null"] },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "defaultGateway": { "type": "boolean" },
+          "revision": { "type": "string" },
+          "secret": { "$ref": "#/components/schemas/ProviderSecretView" },
+          "health": { "oneOf": [{ "$ref": "#/components/schemas/ProviderHealth" }, { "type": "null" }] },
+          "createdAt": { "type": "string" },
+          "updatedAt": { "type": "string" }
+        }
+      },
+      "ProviderPage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/ProviderProfile" } },
+          "nextCursor": { "type": ["string", "null"] }
+        }
+      },
+      "ProviderCreate": {
+        "type": "object",
+        "required": ["name", "authToken"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["gateway", "direct"] },
+          "baseUrl": { "type": "string" },
+          "models": { "type": "array", "items": { "type": "string" } },
+          "defaultModel": { "type": "string" },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "authToken": { "type": "string" },
+          "defaultGateway": { "type": "boolean" }
+        }
+      },
+      "ProviderPatch": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["gateway", "direct"] },
+          "baseUrl": { "type": "string" },
+          "models": { "type": "array", "items": { "type": "string" } },
+          "defaultModel": { "type": ["string", "null"] },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "authToken": { "type": "string", "description": "Rotate the stored token." },
+          "defaultGateway": { "type": "boolean" }
+        }
+      },
+      "ProviderTestResult": {
+        "type": "object",
+        "required": ["ok", "reachable", "message"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "reachable": { "type": "boolean" },
+          "status": { "type": ["integer", "null"] },
+          "latencyMs": { "type": "integer" },
+          "message": { "type": "string" },
+          "models": { "type": "array", "items": { "type": "string" } }
         }
       },
       "PairRedeem": {

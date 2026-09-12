@@ -781,10 +781,10 @@ function addPty(kind: Kind, driver: DriverKind, name: string, activity: Instance
   return ins.id;
 }
 
-const wspCodex = addWorktree("codex-worker", "wt/x-codexdrv/wire-review", "/Users/dev/Documents/Projects/Community/remuda-wt/x-codexdrv");
-const wspGrok = addWorktree("grok-canary", "wt/x-acpwire/canary", "/Users/dev/Documents/Projects/Community/remuda-wt/x-acpwire");
-const wspAgy = addWorktree("agy-board", "wt/x-design/agent-board", "/Users/dev/Documents/Projects/Community/remuda-wt/x-design2");
-const wspClaudePty = addWorktree("claude-pty", "wt/x-tty/push-ui", "/Users/dev/Documents/Projects/Community/remuda-wt/x-tty");
+const wspCodex = addWorktree("codex-worker", "wt/x-codexdrv/wire-review", "/home/dev/projects/remuda-wt/x-codexdrv");
+const wspGrok = addWorktree("grok-canary", "wt/x-acpwire/canary", "/home/dev/projects/remuda-wt/x-acpwire");
+const wspAgy = addWorktree("agy-board", "wt/x-design/agent-board", "/home/dev/projects/remuda-wt/x-design2");
+const wspClaudePty = addWorktree("claude-pty", "wt/x-tty/push-ui", "/home/dev/projects/remuda-wt/x-tty");
 
 export const mockBoardIds = {
   insCodexPty: addPty("codex", "generic-pty", "codex-worker", known("working"), wspCodex, [

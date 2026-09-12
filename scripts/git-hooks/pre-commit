@@ -1,0 +1,10 @@
+#!/bin/sh
+# Block commits that add undeclared secrets or private tokens (same scanner as CI).
+# Enable once per clone (applies to every worktree): git config core.hooksPath scripts/git-hooks
+root=$(git rev-parse --show-toplevel) || exit 1
+if [ -x "$root/scripts/ci/secret-scan.sh" ]; then
+  if ! "$root/scripts/ci/secret-scan.sh"; then
+    echo "pre-commit: secret-scan failed; remove the secret/private token (see scripts/ci/README or CI job secret-scan)" >&2
+    exit 1
+  fi
+fi

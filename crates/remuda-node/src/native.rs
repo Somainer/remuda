@@ -6,9 +6,10 @@ use crate::{
 };
 use remuda_driver::claude_print::{ClaudePrintDriver, ClaudePrintOptions};
 use remuda_driver::{
-    BinarySource, ClaudeBgDriver, ClaudeBgOptions, ClaudePtyDriver, ClaudePtyOptions, Delegation,
-    Driver as NativeDriver, GenericPtyDriver, GenericPtyOptions, ProviderHealth, ProviderKind,
-    ProviderProfile, ShellPtyDriver, ShellPtyOptions, preset_by_id,
+    BinarySource, ClaudeBgDriver, ClaudeBgOptions, ClaudeProviderOverlay, ClaudePtyDriver,
+    ClaudePtyOptions, Delegation, Driver as NativeDriver, GenericPtyDriver, GenericPtyOptions,
+    ProviderHealth, ProviderKind, ProviderProfile, Secret, ShellPtyDriver, ShellPtyOptions,
+    preset_by_id, write_claude_provider_overlay,
 };
 use remuda_protocol::{
     ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode, ClaudePermission,
@@ -19,7 +20,12 @@ use remuda_protocol::{
 };
 use std::future::Future;
 use std::pin::Pin;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 /// Filesystem and binary settings shared by native Claude driver factories.
 #[derive(Debug, Clone)]
@@ -149,18 +155,17 @@ impl DriverFactory for NativeClaudeFactory {
             .join("instances")
             .join(launch.instance.meta.id.as_id().as_str());
         let launch_dir = instance_dir.join("launch");
-        let overlay = if self.kind == DriverKind::GenericPty {
-            None
-        } else {
-            launch
-                .request
-                .settings_overlay_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(resolve_overlay_path)
-                .transpose()?
-        };
+        std::fs::create_dir_all(&launch_dir)
+            .map_err(|error| DriverError::Failed(error.to_string()))?;
+        let delegation = parse_delegation(&launch.request);
+        let profile = provider_profile(&launch, delegation)?;
+        let overlay = resolve_claude_overlay(
+            &launch.request,
+            &launch_dir,
+            self.kind,
+            delegation,
+            &profile,
+        )?;
         let explicit_config_dir = launch
             .request
             .claude_config_dir
@@ -175,7 +180,6 @@ impl DriverFactory for NativeClaudeFactory {
                 "CLAUDE_CONFIG_DIR must be an absolute path".into(),
             ));
         }
-        let delegation = parse_delegation(&launch.request);
         let inherit_default_config = self.kind != DriverKind::GenericPty
             && explicit_config_dir.is_none()
             && matches!(delegation, Delegation::None);
@@ -189,13 +193,10 @@ impl DriverFactory for NativeClaudeFactory {
                 .clone()
                 .unwrap_or_else(|| instance_dir.join("native-home"))
         };
-        std::fs::create_dir_all(&launch_dir)
-            .map_err(|error| DriverError::Failed(error.to_string()))?;
         if !inherit_default_config {
             std::fs::create_dir_all(&native_home)
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
         }
-        let profile = provider_profile(&launch, delegation)?;
         let spec = instance_spec(&launch, &self.config, &profile)?;
         let binary = match self.kind {
             DriverKind::GenericPty => {
@@ -430,6 +431,75 @@ fn provider_profile(
         models: vec![model],
         health: ProviderHealth::Healthy,
     })
+}
+
+fn resolve_claude_overlay(
+    request: &crate::CreateInstanceRequest,
+    launch_dir: &Path,
+    kind: DriverKind,
+    delegation: Delegation,
+    profile: &ProviderProfile,
+) -> Result<Option<PathBuf>, DriverError> {
+    if matches!(kind, DriverKind::GenericPty | DriverKind::ShellPty) {
+        return Ok(None);
+    }
+    let user = request
+        .settings_overlay_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(resolve_overlay_path)
+        .transpose()?;
+    if delegation != Delegation::Gateway {
+        return Ok(user);
+    }
+    match try_write_generated_gateway_overlay(profile, launch_dir, &request.model) {
+        Ok(path) => Ok(Some(path)),
+        Err(_) => user
+            .ok_or_else(|| {
+                DriverError::Failed("gateway delegation requires a settings overlay".into())
+            })
+            .map(Some),
+    }
+}
+
+fn try_write_generated_gateway_overlay(
+    profile: &ProviderProfile,
+    launch_dir: &Path,
+    model: &str,
+) -> Result<PathBuf, remuda_driver::DriverError> {
+    if profile.base_url.trim().is_empty() {
+        return Err(remuda_driver::DriverError::SettingsIsolationUnavailable(
+            "gateway profile has no base_url".into(),
+        ));
+    }
+    let secret_ref = profile.secret_ref.as_ref().ok_or_else(|| {
+        remuda_driver::DriverError::SettingsIsolationUnavailable(
+            "gateway profile has no secret_ref".into(),
+        )
+    })?;
+    let name = secret_ref.env_name().ok_or_else(|| {
+        remuda_driver::DriverError::SettingsIsolationUnavailable(
+            "generated overlay at factory build requires an env secret_ref".into(),
+        )
+    })?;
+    let value = std::env::var(name).map_err(|_| {
+        remuda_driver::DriverError::CredentialUnavailable(format!(
+            "environment variable {name} is unset"
+        ))
+    })?;
+    let secret = Secret::new(value.into_bytes());
+    let extra = BTreeMap::new();
+    write_claude_provider_overlay(
+        launch_dir,
+        &ClaudeProviderOverlay {
+            delegation: Delegation::Gateway,
+            base_url: &profile.base_url,
+            model,
+            secret: &secret,
+            extra_env: &extra,
+        },
+    )
 }
 
 fn parse_delegation(request: &crate::CreateInstanceRequest) -> Delegation {
@@ -690,6 +760,94 @@ mod tests {
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.provider_profile_id = "native-login".into();
         assert_eq!(parse_delegation(&request), Delegation::None);
+    }
+
+    #[test]
+    fn gateway_falls_back_to_user_overlay_when_generated_overlay_is_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let overlay = dir.path().join("settings.relay.json");
+        std::fs::write(&overlay, r#"{"model":"example"}"#).expect("overlay");
+        let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
+            .expect("registry");
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePrint,
+        )
+        .expect("instance");
+        let request = crate::CreateInstanceRequest {
+            command_id: None,
+            instance_id: Some(instance.meta.id.clone()),
+            host_id: Some(instance.host_id.clone()),
+            workspace_id: Some(instance.workspace_id.clone()),
+            kind: AgentKind::Claude,
+            driver: DriverKind::ClaudePrint,
+            model: "haiku".into(),
+            args: Vec::new(),
+            provider_profile_id: "gateway".into(),
+            permission_mode: "dontAsk".into(),
+            prompt: String::new(),
+            cwd: None,
+            delegation: Some("gateway".into()),
+            settings_overlay_path: Some(overlay.to_string_lossy().into_owned()),
+            claude_config_dir: None,
+            max_budget_usd: None,
+        };
+        registry
+            .build(
+                DriverKind::ClaudePrint,
+                DriverLaunch {
+                    instance,
+                    request,
+                    workspace_root: dir.path().to_path_buf(),
+                },
+            )
+            .expect("user overlay must be accepted while generated overlay is unavailable");
+    }
+
+    #[test]
+    fn gateway_without_overlay_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
+            .expect("registry");
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePrint,
+        )
+        .expect("instance");
+        let request = crate::CreateInstanceRequest {
+            command_id: None,
+            instance_id: Some(instance.meta.id.clone()),
+            host_id: Some(instance.host_id.clone()),
+            workspace_id: Some(instance.workspace_id.clone()),
+            kind: AgentKind::Claude,
+            driver: DriverKind::ClaudePrint,
+            model: "haiku".into(),
+            args: Vec::new(),
+            provider_profile_id: "gateway".into(),
+            permission_mode: "dontAsk".into(),
+            prompt: String::new(),
+            cwd: None,
+            delegation: Some("gateway".into()),
+            settings_overlay_path: None,
+            claude_config_dir: None,
+            max_budget_usd: None,
+        };
+        let error = match registry.build(
+            DriverKind::ClaudePrint,
+            DriverLaunch {
+                instance,
+                request,
+                workspace_root: dir.path().to_path_buf(),
+            },
+        ) {
+            Ok(_) => panic!("gateway without overlay must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("settings overlay"), "{error}");
     }
 
     #[test]

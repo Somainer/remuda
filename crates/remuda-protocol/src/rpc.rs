@@ -4,7 +4,7 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 
 /// ProtocolVersion; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolVersion {
     /// `major`; protocol §7.1.
@@ -14,7 +14,7 @@ pub struct ProtocolVersion {
 }
 
 /// ProtocolRange; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolRange {
     /// `major`; protocol §7.1.
@@ -26,7 +26,7 @@ pub struct ProtocolRange {
 }
 
 /// JournalWatermark; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct JournalWatermark {
     /// `journal_id`; protocol §7.1.
@@ -36,7 +36,7 @@ pub struct JournalWatermark {
 }
 
 /// ResumeCursor; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeCursor {
     /// `journal_id`; protocol §7.1.
@@ -45,10 +45,8 @@ pub struct ResumeCursor {
     pub after_seq: U64,
 }
 
-// TODO(protocol §7.1): resumeCursors element fields were not specified; v1 uses {journalId,afterSeq} as recorded in implementation feedback.
-
 /// HelloParams; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloParams {
     /// `host_id`; protocol §7.1.
@@ -68,7 +66,7 @@ pub struct HelloParams {
 }
 
 /// TransportLimits; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TransportLimits {
     /// `max_json_frame_bytes`; protocol §7.4.
@@ -92,7 +90,7 @@ pub struct TransportLimits {
 }
 
 /// ConnectionLease; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionLease {
     /// `lease_id`; protocol §7.1.
@@ -104,7 +102,7 @@ pub struct ConnectionLease {
 }
 
 /// HelloResult; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloResult {
     /// `protocol`; protocol §7.1.
@@ -126,7 +124,7 @@ pub struct HelloResult {
 }
 
 /// HeartbeatParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatParams {
     /// `connection_id`; protocol §7.2.
@@ -140,7 +138,7 @@ pub struct HeartbeatParams {
 }
 
 /// HeartbeatResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatResult {
     /// `server_time`; protocol §7.2.
@@ -150,7 +148,7 @@ pub struct HeartbeatResult {
 }
 
 /// HostReportParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HostReportParams {
     /// `host_id`; protocol §7.2.
@@ -168,7 +166,7 @@ pub struct HostReportParams {
 }
 
 /// HostReportResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HostReportResult {
     /// `host_revision`; protocol §7.2.
@@ -178,7 +176,7 @@ pub struct HostReportResult {
 }
 
 /// HostParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HostParams {
     /// `host_id`; protocol §7.2.
@@ -186,7 +184,7 @@ pub struct HostParams {
 }
 
 /// PageParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PageParams {
     /// `cursor`; protocol §7.2.
@@ -197,7 +195,7 @@ pub struct PageParams {
 }
 
 /// DriverCapabilitiesParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DriverCapabilitiesParams {
     /// `driver_kind`; protocol §7.2.
@@ -208,10 +206,8 @@ pub struct DriverCapabilitiesParams {
     pub profile_ref: ProfileRef,
 }
 
-// TODO(protocol §7.2): profileRef is concretized as {id,revision}; a changing registry default cannot silently select a different launch profile.
-
 /// WorkspaceRegisterParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRegisterParams {
     /// `workspace_id`; protocol §7.2.
@@ -225,7 +221,7 @@ pub struct WorkspaceRegisterParams {
 }
 
 /// WorkspaceParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceParams {
     /// `workspace_id`; protocol §7.2.
@@ -233,7 +229,7 @@ pub struct WorkspaceParams {
 }
 
 /// WorkspaceListParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceListParams {
     /// `host_id`; protocol §7.2.
@@ -246,7 +242,7 @@ pub struct WorkspaceListParams {
 }
 
 /// WorktreeCreateParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeCreateParams {
     /// `worktree_id`; protocol §7.2.
@@ -263,7 +259,7 @@ pub struct WorktreeCreateParams {
 }
 
 /// WorktreeRemoveParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeRemoveParams {
     /// `worktree_id`; protocol §7.2.
@@ -275,7 +271,7 @@ pub struct WorktreeRemoveParams {
 }
 
 /// InstanceCreateParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceCreateParams {
     /// `instance_id`; protocol §7.2.
@@ -288,7 +284,7 @@ pub struct InstanceCreateParams {
 }
 
 /// CreateInitialInput; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum CreateInitialInput {
     /// `prompt` payload; §7.2.
@@ -297,7 +293,7 @@ pub enum CreateInitialInput {
 }
 
 /// InstanceCreateResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceCreateResult {
     /// `command`; protocol §7.2.
@@ -315,7 +311,7 @@ pub struct InstanceCreateResult {
 }
 
 /// InstanceAttachParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceAttachParams {
     /// `instance_id`; protocol §7.2.
@@ -325,8 +321,22 @@ pub struct InstanceAttachParams {
     pub reference: AttachRef,
 }
 
+/// Explicit human request to create a Claude background attach pane; §7.2.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstanceOpenTerminalParams {
+    /// Existing claude-bg Instance; no new Run or prompt is created.
+    pub instance_id: InstanceId,
+    /// Exact daemon job bound to that Instance's native store.
+    pub background_job_id: String,
+    /// Explicit acknowledgement that `claude attach` may wake the job.
+    pub allow_wake: BoolLiteral<true>,
+    /// Pinned Herdr server and named session for the new attach pane.
+    pub carrier: PtyCarrier,
+}
+
 /// InstanceResumeParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceResumeParams {
     /// `instance_id`; protocol §7.2.
@@ -340,7 +350,7 @@ pub struct InstanceResumeParams {
 }
 
 /// InstanceSendParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceSendParams {
     /// `instance_id`; protocol §7.2.
@@ -354,7 +364,7 @@ pub struct InstanceSendParams {
 }
 
 /// InstanceConfigureParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceConfigureParams {
     /// `instance_id`; protocol §7.2.
@@ -366,7 +376,7 @@ pub struct InstanceConfigureParams {
 }
 
 /// ForkBoundary; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkBoundary {
     /// `actor_type`; protocol §7.2.
@@ -375,7 +385,7 @@ pub struct ForkBoundary {
 }
 
 /// InstanceForkParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceForkParams {
     /// `source_instance_id`; protocol §7.2.
@@ -389,7 +399,7 @@ pub struct InstanceForkParams {
 }
 
 /// InstanceCancelParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceCancelParams {
     /// `instance_id`; protocol §7.2.
@@ -399,7 +409,7 @@ pub struct InstanceCancelParams {
 }
 
 /// InstanceCloseParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceCloseParams {
     /// `instance_id`; protocol §7.2.
@@ -411,7 +421,7 @@ pub struct InstanceCloseParams {
 }
 
 /// InstanceParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceParams {
     /// `instance_id`; protocol §7.2.
@@ -419,7 +429,7 @@ pub struct InstanceParams {
 }
 
 /// InstanceListParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceListParams {
     /// `workspace_id`; protocol §7.2.
@@ -433,7 +443,7 @@ pub struct InstanceListParams {
 }
 
 /// CommandParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandParams {
     /// `command_id`; protocol §7.2.
@@ -441,7 +451,7 @@ pub struct CommandParams {
 }
 
 /// CommandListParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandListParams {
     /// `instance_id`; protocol §7.2.
@@ -458,7 +468,7 @@ pub struct CommandListParams {
 }
 
 /// RunParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunParams {
     /// `run_id`; protocol §7.2.
@@ -466,7 +476,7 @@ pub struct RunParams {
 }
 
 /// RunListParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunListParams {
     /// `instance_id`; protocol §7.2.
@@ -479,7 +489,7 @@ pub struct RunListParams {
 }
 
 /// RunWaitParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunWaitParams {
     /// `run_id`; protocol §7.2.
@@ -494,7 +504,7 @@ pub struct RunWaitParams {
 }
 
 /// RunWaitResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunWaitResult {
     /// `reason`; protocol §7.2.
@@ -508,7 +518,7 @@ pub struct RunWaitResult {
 }
 
 /// WorkflowWaitParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowWaitParams {
     /// `instance_id`; protocol §7.2.
@@ -523,7 +533,7 @@ pub struct WorkflowWaitParams {
 }
 
 /// WorkflowWaitResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowWaitResult {
     /// `reason`; protocol §7.2.
@@ -535,7 +545,7 @@ pub struct WorkflowWaitResult {
 }
 
 /// InteractionListParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractionListParams {
     /// `instance_id`; protocol §7.2.
@@ -546,7 +556,7 @@ pub struct InteractionListParams {
 }
 
 /// InteractionParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractionParams {
     /// `interaction_id`; protocol §7.2.
@@ -554,7 +564,7 @@ pub struct InteractionParams {
 }
 
 /// InteractionRespondParams; `protocol.md` §6.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractionRespondParams {
     /// `interaction_id`; protocol §6.1.
@@ -573,7 +583,7 @@ pub struct InteractionRespondParams {
 }
 
 /// InteractionRespondResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractionRespondResult {
     /// `command`; protocol §7.2.
@@ -583,7 +593,7 @@ pub struct InteractionRespondResult {
 }
 
 /// EventsSubscribeParams; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsSubscribeParams {
     /// `journal_id`; protocol §7.3.
@@ -600,7 +610,7 @@ pub struct EventsSubscribeParams {
 }
 
 /// HistoryCoverage; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryCoverage {
     /// `earliest_retained_seq`; protocol §7.3.
@@ -610,7 +620,7 @@ pub struct HistoryCoverage {
 }
 
 /// InstanceSnapshot; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceSnapshot {
     /// `projection_version`; protocol §7.3.
@@ -634,7 +644,7 @@ pub struct InstanceSnapshot {
 }
 
 /// ConversationNode; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", content = "payload")]
 pub enum ConversationNode {
     /// `message` payload; §7.3.
@@ -652,7 +662,7 @@ pub enum ConversationNode {
 }
 
 /// RegistrySnapshot; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistrySnapshot {
     /// `projection_version`; protocol §7.3.
@@ -672,7 +682,7 @@ pub struct RegistrySnapshot {
 }
 
 /// Snapshot; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "scope")]
 pub enum Snapshot {
     /// `instance` payload; §7.3.
@@ -683,10 +693,8 @@ pub enum Snapshot {
     Registry(Box<RegistrySnapshot>),
 }
 
-// TODO(protocol §7.3): registry snapshot lacked a schema; v1 uses scope plus typed hosts/workspaces/commands arrays, documented in implementation feedback.
-
 /// EventsSubscribeResult; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsSubscribeResult {
     /// `subscription_id`; protocol §7.3.
@@ -710,7 +718,7 @@ pub struct EventsSubscribeResult {
 }
 
 /// EventsReadParams; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsReadParams {
     /// `journal_id`; protocol §7.3.
@@ -729,7 +737,7 @@ pub struct EventsReadParams {
 }
 
 /// EventsReadResult; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsReadResult {
     /// `events`; protocol §7.3.
@@ -744,7 +752,7 @@ pub struct EventsReadResult {
 }
 
 /// EventsAckParams; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsAckParams {
     /// `subscription_id`; protocol §7.3.
@@ -756,7 +764,7 @@ pub struct EventsAckParams {
 }
 
 /// EventsAckResult; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsAckResult {
     /// `acknowledged_seq`; protocol §7.3.
@@ -764,7 +772,7 @@ pub struct EventsAckResult {
 }
 
 /// SubscriptionParams; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionParams {
     /// `subscription_id`; protocol §7.3.
@@ -772,7 +780,7 @@ pub struct SubscriptionParams {
 }
 
 /// ReconcileInstanceParams; `protocol.md` §7.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconcileInstanceParams {
     /// `instance_id`; protocol §7.5.
@@ -784,7 +792,7 @@ pub struct ReconcileInstanceParams {
 }
 
 /// ReconcileInstanceResult; `protocol.md` §7.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReconcileInstanceResult {
     /// `state`; protocol §7.5.
@@ -796,8 +804,8 @@ pub struct ReconcileInstanceResult {
 }
 
 /// TtyAttachParams; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TtyAttachParams {
     /// `instance_id`; protocol §7.4.
     pub instance_id: InstanceId,
@@ -814,7 +822,7 @@ pub struct TtyAttachParams {
 }
 
 /// TtyWriterLease; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TtyWriterLease {
     /// `lease_id`; protocol §7.4.
@@ -826,7 +834,7 @@ pub struct TtyWriterLease {
 }
 
 /// TtyAttachResult; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TtyAttachResult {
     /// `stream_id`; protocol §7.4.
@@ -850,7 +858,7 @@ pub struct TtyAttachResult {
 }
 
 /// TtyDetachParams; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TtyDetachParams {
     /// `instance_id`; protocol §7.4.
@@ -862,10 +870,8 @@ pub struct TtyDetachParams {
     pub writer_lease_id: Option<Id>,
 }
 
-// TODO(protocol §7.4): detach has no original parameter schema; v1 names instanceId/streamId and the optional writer lease, never closes the native process.
-
 /// TtyWriteParams; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TtyWriteParams {
     /// `instance_id`; protocol §7.4.
@@ -885,7 +891,7 @@ pub struct TtyWriteParams {
 }
 
 /// TtyResizeParams; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TtyResizeParams {
     /// `instance_id`; protocol §7.4.
@@ -903,7 +909,7 @@ pub struct TtyResizeParams {
 }
 
 /// TtyResizeResult; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TtyResizeResult {
     /// `resize_revision`; protocol §7.4.
@@ -915,7 +921,7 @@ pub struct TtyResizeResult {
 }
 
 /// ObjectParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectParams {
     /// `object_id`; protocol §7.2.
@@ -923,7 +929,7 @@ pub struct ObjectParams {
 }
 
 /// ObjectReadParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectReadParams {
     /// `object_id`; protocol §7.2.
@@ -937,7 +943,7 @@ pub struct ObjectReadParams {
 }
 
 /// ObjectMetadata; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMetadata {
     /// `object_id`; protocol §7.2.
@@ -951,7 +957,7 @@ pub struct ObjectMetadata {
 }
 
 /// ObjectReadResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectReadResult {
     /// `stream_id`; protocol §7.2.
@@ -967,7 +973,7 @@ pub struct ObjectReadResult {
 }
 
 /// ObjectPrepareParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectPrepareParams {
     /// `object_id`; protocol §7.2.
@@ -987,7 +993,7 @@ pub struct ObjectPrepareParams {
 }
 
 /// ObjectPrepareResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectPrepareResult {
     /// `upload_id`; protocol §7.2.
@@ -1001,7 +1007,7 @@ pub struct ObjectPrepareResult {
 }
 
 /// ObjectWriteParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectWriteParams {
     /// `upload_id`; protocol §7.2.
@@ -1015,7 +1021,7 @@ pub struct ObjectWriteParams {
 }
 
 /// ObjectWriteResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectWriteResult {
     /// `next_offset`; protocol §7.2.
@@ -1023,7 +1029,7 @@ pub struct ObjectWriteResult {
 }
 
 /// ObjectCommitParams; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectCommitParams {
     /// `upload_id`; protocol §7.2.
@@ -1033,7 +1039,7 @@ pub struct ObjectCommitParams {
 }
 
 /// ObjectCommitResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectCommitResult {
     /// `object_id`; protocol §7.2.
@@ -1044,10 +1050,8 @@ pub struct ObjectCommitResult {
     pub digest: Digest,
 }
 
-// TODO(protocol §7.2): object.stat/read response metadata was unnamed; ObjectMetadata/ObjectReadResult give its concrete v1 fields. Stream encoding remains §7.4, not an arbitrary path read.
-
 /// CommandEnvelope; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandEnvelope<P> {
     /// `command_id`; protocol §7.2.
@@ -1063,7 +1067,7 @@ pub struct CommandEnvelope<P> {
 }
 
 /// CommandResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandResult {
     /// `command`; protocol §7.2.
@@ -1073,7 +1077,7 @@ pub struct CommandResult {
 }
 
 /// Page; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Page<T> {
     /// `items`; protocol §7.2.
@@ -1084,12 +1088,12 @@ pub struct Page<T> {
 }
 
 /// EmptyResult; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EmptyResult {}
 
 /// MethodCall; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "method", content = "params")]
 pub enum MethodCall {
     /// `runtime.hello` payload; §7.2.
@@ -1134,6 +1138,9 @@ pub enum MethodCall {
     /// `instance.attach` payload; §7.2.
     #[serde(rename = "instance.attach")]
     InstanceAttach(Box<CommandEnvelope<InstanceAttachParams>>),
+    /// Explicitly create an attach pane; never invoked by tty.attach or recovery; §7.2.
+    #[serde(rename = "instance.open_terminal")]
+    InstanceOpenTerminal(Box<CommandEnvelope<InstanceOpenTerminalParams>>),
     /// `instance.resume` payload; §7.2.
     #[serde(rename = "instance.resume")]
     InstanceResume(Box<CommandEnvelope<InstanceResumeParams>>),
@@ -1247,6 +1254,7 @@ impl MethodCall {
             Self::WorktreeRemove(..) => MethodName::WorktreeRemove,
             Self::InstanceCreate(..) => MethodName::InstanceCreate,
             Self::InstanceAttach(..) => MethodName::InstanceAttach,
+            Self::InstanceOpenTerminal(..) => MethodName::InstanceOpenTerminal,
             Self::InstanceResume(..) => MethodName::InstanceResume,
             Self::InstanceSend(..) => MethodName::InstanceSend,
             Self::InstanceConfigure(..) => MethodName::InstanceConfigure,
@@ -1283,7 +1291,7 @@ impl MethodCall {
 }
 
 /// RpcRequest; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcRequest {
     /// `jsonrpc`; protocol §7.1.
@@ -1296,7 +1304,7 @@ pub struct RpcRequest {
 }
 
 /// RpcSuccess; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct RpcSuccess<R> {
@@ -1309,7 +1317,7 @@ pub struct RpcSuccess<R> {
 }
 
 /// RpcFailure; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct RpcFailure {
@@ -1322,7 +1330,7 @@ pub struct RpcFailure {
 }
 
 /// A response contains exactly one of result/error; `protocol.md` §7.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum RpcResponse<R> {
     /// Successful response with method-specific result type.
@@ -1332,7 +1340,7 @@ pub enum RpcResponse<R> {
 }
 
 /// EventsBatch; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsBatch {
     /// `subscription_id`; protocol §7.3.
@@ -1385,7 +1393,7 @@ impl EventsBatch {
 }
 
 /// NotificationBody; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "method", content = "params")]
 pub enum NotificationBody {
     /// `events.batch` payload; §7.3.
@@ -1394,7 +1402,7 @@ pub enum NotificationBody {
 }
 
 /// RpcNotification; `protocol.md` §7.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcNotification {
     /// `jsonrpc`; protocol §7.3.

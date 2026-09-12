@@ -1,0 +1,7 @@
+{
+  "model": "passthrough/example-model",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://gateway.example",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+  }
+}

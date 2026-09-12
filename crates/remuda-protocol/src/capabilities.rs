@@ -4,7 +4,7 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 
 /// CapabilityEvidence; `protocol.md` §3.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityEvidence {
     /// `actor_type`; protocol §3.2.
@@ -18,7 +18,7 @@ pub struct CapabilityEvidence {
 }
 
 /// Capability; `protocol.md` §3.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Capability {
     /// `state`; protocol §3.2.
@@ -34,7 +34,7 @@ pub struct Capability {
 }
 
 /// Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub struct CapabilitySet {
     /// Capability `resume`; §3.2.
@@ -70,9 +70,11 @@ pub struct CapabilitySet {
 }
 
 /// CapabilitySnapshot; `protocol.md` §3.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilitySnapshot {
+    /// Adapter transport is part of capability evidence identity; §3.2.
+    pub adapter_transport: AdapterTransport,
     /// `id`; protocol §3.2.
     pub id: Id,
     /// `driver_kind`; protocol §3.2.
@@ -94,7 +96,7 @@ pub struct CapabilitySnapshot {
 }
 
 /// DriverDescriptor; `protocol.md` §3.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DriverDescriptor {
     /// `kind`; protocol §3.2.

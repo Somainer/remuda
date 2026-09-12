@@ -1,0 +1,23 @@
+{
+  "jsonrpc": "2.0",
+  "id": "hello-1",
+  "method": "runtime.hello",
+  "params": {
+    "hostId": "hst_01993ab0-0000-7000-8000-000000000004",
+    "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000005",
+    "nodeVersion": "0.1.0",
+    "protocol": {
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    "observationSchemaMajors": [
+      1
+    ],
+    "features": [
+      "snapshot-follow-v1",
+      "tty-binary-v1"
+    ],
+    "resumeCursors": []
+  }
+}

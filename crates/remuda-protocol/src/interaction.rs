@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// InteractionRequestKey; `protocol.md` §2.6.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractionRequestKey {
     /// `native`; protocol §2.6.
@@ -20,7 +20,7 @@ pub struct InteractionRequestKey {
 }
 
 /// CommittedAnswer; `protocol.md` §2.6.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommittedAnswer {
     /// `command_id`; protocol §2.6.
@@ -34,7 +34,7 @@ pub struct CommittedAnswer {
 }
 
 /// InteractionResolution; `protocol.md` §2.6.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InteractionResolution {
     /// `reason`; protocol §2.6.
@@ -44,7 +44,7 @@ pub struct InteractionResolution {
 }
 
 /// Interaction; `protocol.md` §2.6.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Interaction {
     /// `meta`; protocol §2.6.
@@ -86,7 +86,7 @@ pub struct Interaction {
 }
 
 /// DecisionOption; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DecisionOption {
     /// `id`; protocol §5.4.
@@ -100,7 +100,7 @@ pub struct DecisionOption {
 }
 
 /// QuestionOption; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionOption {
     /// `id`; protocol §5.4.
@@ -110,7 +110,7 @@ pub struct QuestionOption {
 }
 
 /// QuestionField; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionField {
     /// `id`; protocol §5.4.
@@ -133,7 +133,7 @@ pub struct QuestionField {
 }
 
 /// ApprovalRequest; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequest {
     /// `title`; protocol §5.4.
@@ -155,7 +155,7 @@ pub struct ApprovalRequest {
 }
 
 /// QuestionRequest; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionRequest {
     /// `title`; protocol §5.4.
@@ -165,7 +165,7 @@ pub struct QuestionRequest {
 }
 
 /// PlanReviewRequest; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanReviewRequest {
     /// `title`; protocol §5.4.
@@ -183,7 +183,7 @@ pub struct PlanReviewRequest {
 }
 
 /// ElicitationRequest; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ElicitationRequest {
     /// `title`; protocol §5.4.
@@ -207,7 +207,7 @@ pub struct ElicitationRequest {
 }
 
 /// InteractionRequest; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind")]
 pub enum InteractionRequest {
     /// `approval` payload; §5.4.
@@ -225,7 +225,7 @@ pub enum InteractionRequest {
 }
 
 /// QuestionFieldAnswer; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionFieldAnswer {
     /// `option_ids`; protocol §5.4.
@@ -236,7 +236,7 @@ pub struct QuestionFieldAnswer {
 }
 
 /// ApprovalAnswer; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalAnswer {
     /// `option_id`; protocol §5.4.
@@ -246,7 +246,7 @@ pub struct ApprovalAnswer {
 }
 
 /// QuestionAnswer; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionAnswer {
     /// `answers`; protocol §5.4.
@@ -254,7 +254,7 @@ pub struct QuestionAnswer {
 }
 
 /// PlanReviewAnswer; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanReviewAnswer {
     /// `option_id`; protocol §5.4.
@@ -269,7 +269,7 @@ pub struct PlanReviewAnswer {
 }
 
 /// ElicitationAnswer; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ElicitationAnswer {
     /// `action`; protocol §5.4.
@@ -280,7 +280,7 @@ pub struct ElicitationAnswer {
 }
 
 /// InteractionAnswer; `protocol.md` §5.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind")]
 pub enum InteractionAnswer {
     /// `approval` payload; §5.4.

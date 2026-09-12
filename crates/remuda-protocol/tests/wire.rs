@@ -70,7 +70,7 @@ fn protocol_examples_and_all_methods_round_trip() {
         let request = round_trip::<RpcRequest>(value.clone());
         methods.insert(request.call.method());
     }
-    assert_eq!(methods.len(), 45);
+    assert_eq!(methods.len(), 46);
 }
 
 #[test]

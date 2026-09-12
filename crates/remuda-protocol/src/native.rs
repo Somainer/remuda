@@ -4,7 +4,7 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 
 /// TranscriptRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptRef {
     /// `object_id`; protocol §1.3.
@@ -14,7 +14,7 @@ pub struct TranscriptRef {
 }
 
 /// CodexRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRef {
     /// `thread_id`; protocol §1.3.
@@ -22,7 +22,7 @@ pub struct CodexRef {
 }
 
 /// AcpRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpRef {
     /// `session_id`; protocol §1.3.
@@ -32,38 +32,64 @@ pub struct AcpRef {
 }
 
 /// ClaudeRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaudeRef {
     /// `session_id`; protocol §1.3.
     pub session_id: String,
-    /// `background_job_id`; protocol §1.3.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background_job_id: Option<String>,
 }
 
 /// AgyRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AgyRef {
     /// `conversation_id`; protocol §1.3.
     pub conversation_id: String,
 }
 
-/// HerdrRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Pinned Herdr binary and current server lifetime; `protocol.md` §1.3.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HerdrServer {
+    /// Absolute path selected by the Node.
+    pub binary_path: String,
+    /// Reported Herdr binary version.
+    pub version: String,
+    /// SHA-256 of the selected executable.
+    pub digest: Digest,
+    /// Negotiated native socket protocol version, independent of Remuda's version.
+    pub protocol_version: String,
+    /// Durable identity of the registered Herdr server.
+    pub server_identity: Id,
+    /// Changes whenever the server process is replaced.
+    pub server_epoch: Id,
+    /// Herdr exposes rendered terminal frames, not original PTY bytes.
+    pub representation: HerdrRepresentation,
+}
+
+/// Herdr pane identity within a named server session; `protocol.md` §1.3.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HerdrRef {
-    /// `server_identity`; protocol §1.3.
-    pub server_identity: Id,
-    /// `server_epoch`; protocol §1.3.
-    pub server_epoch: Id,
-    /// `pane_id`; protocol §1.3.
+    /// Binary pin and server lifetime attached to this observation.
+    #[serde(flatten)]
+    pub server: HerdrServer,
+    /// Explicit Herdr session name; never inferred from inherited environment.
+    pub session: String,
+    /// Native pane ID; not a Claude session or background job ID.
     pub pane_id: String,
 }
 
+/// A Claude daemon job that may exist before its native session is known; §1.3.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeBgRef {
+    /// Full native job ID, scoped by NativeRef's host and native store.
+    pub job_id: String,
+}
+
 /// NativeRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeRef {
     /// `host_id`; protocol §1.3.
@@ -85,6 +111,9 @@ pub struct NativeRef {
     /// `claude`; protocol §1.3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude: Option<ClaudeRef>,
+    /// Background job identity independent of the native conversation identity; §1.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_bg: Option<ClaudeBgRef>,
     /// `agy`; protocol §1.3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy: Option<AgyRef>,
@@ -94,7 +123,7 @@ pub struct NativeRef {
 }
 
 /// ProcessIdentity; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessIdentity {
     /// `pid`; protocol §1.3.
@@ -106,7 +135,7 @@ pub struct ProcessIdentity {
 }
 
 /// ProcessRef; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessRef {
     /// `process_generation`; protocol §1.3.
@@ -118,7 +147,7 @@ pub struct ProcessRef {
 }
 
 /// Correlation of a native RPC, blocking hook, or absent request; `protocol.md` §1.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(
     tag = "type",
     rename_all = "kebab-case",
@@ -142,7 +171,7 @@ pub enum NativeRequestKey {
 }
 
 /// AttachRef; `protocol.md` §3.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachRef {
     /// `native_ref`; protocol §3.1.

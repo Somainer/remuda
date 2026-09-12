@@ -5,6 +5,11 @@ use std::{fmt, str::FromStr};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::{Uuid, Variant};
 
+const ID_PREFIXES: &[&str] = &[
+    "hst", "wsp", "wkt", "ins", "run", "cmd", "int", "evt", "dev", "prn", "pvp", "cred", "obj",
+    "sub", "tty", "launch", "epoch",
+];
+
 /// Deserialize a required field whose explicit wire value may be null; §1.1.
 pub(crate) fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
@@ -65,12 +70,7 @@ impl TryFrom<String> for Id {
         let (prefix, suffix) = value
             .split_once('_')
             .ok_or_else(|| WireValueError("missing ID prefix".into()))?;
-        if ![
-            "hst", "wsp", "wkt", "ins", "run", "cmd", "int", "evt", "dev", "prn", "pvp", "cred",
-            "obj", "sub", "tty", "launch", "epoch",
-        ]
-        .contains(&prefix)
-        {
+        if !ID_PREFIXES.contains(&prefix) {
             return Err(WireValueError("unknown ID prefix".into()));
         }
         let uuid = Uuid::parse_str(suffix).map_err(|_| WireValueError("invalid UUID".into()))?;
@@ -114,6 +114,12 @@ macro_rules! branded_id {
             /// Return the validated untyped identity; §1.2.
             pub fn as_id(&self) -> &Id { &self.0 }
         }
+        impl schemars::JsonSchema for $name {
+            fn schema_name() -> std::borrow::Cow<'static, str> { stringify!($name).into() }
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                identity_schema($prefix)
+            }
+        }
         impl Default for $name { fn default() -> Self { Self::new() } }
         impl TryFrom<String> for $name {
             type Error = WireValueError;
@@ -153,8 +159,14 @@ impl TryFrom<String> for Timestamp {
                 "expected UTC RFC3339 with milliseconds".into(),
             ));
         }
+        if value.as_bytes()[10] != b'T' {
+            return Err(WireValueError("timestamp requires uppercase T".into()));
+        }
         OffsetDateTime::parse(&value, &Rfc3339)
             .map_err(|_| WireValueError("invalid timestamp".into()))?;
+        if &value[17..19] == "60" {
+            return Err(WireValueError("leap seconds are not supported".into()));
+        }
         Ok(Self(value))
     }
 }
@@ -191,7 +203,7 @@ impl From<Digest> for String {
 }
 
 /// Explicit knowledge, distinct from an absent relationship; `protocol.md` §1.1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(
     tag = "state",
     rename_all = "kebab-case",
@@ -273,5 +285,89 @@ impl<T> NonEmpty<T> {
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for NonEmpty<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Self::new(Vec::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+fn identity_schema(prefix: &str) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "pattern": format!("^({prefix})_[0-9a-f]{{8}}-[0-9a-f]{{4}}-7[0-9a-f]{{3}}-[89ab][0-9a-f]{{3}}-[0-9a-f]{{12}}$")
+    })
+}
+
+impl schemars::JsonSchema for Id {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Id".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        identity_schema(&ID_PREFIXES.join("|"))
+    }
+}
+
+impl schemars::JsonSchema for U64 {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "U64".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let max = u64::MAX.to_string();
+        let mut alternatives = vec!["0".to_owned(), "[1-9][0-9]{0,18}".to_owned(), max.clone()];
+        for (index, digit) in max.bytes().enumerate() {
+            let lower = if index == 0 { b'1' } else { b'0' };
+            if digit > lower {
+                alternatives.push(format!(
+                    "{}[{}-{}][0-9]{{{}}}",
+                    &max[..index],
+                    char::from(lower),
+                    char::from(digit - 1),
+                    max.len() - index - 1
+                ));
+            }
+        }
+        schemars::json_schema!({"type":"string", "pattern":format!("^({})$", alternatives.join("|"))})
+    }
+}
+
+impl schemars::JsonSchema for Timestamp {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Timestamp".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":"string", "format":"date-time", "pattern":r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9]\.[0-9]{3}Z$"})
+    }
+}
+
+impl schemars::JsonSchema for Digest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Digest".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":"string", "pattern":"^sha256:[0-9a-f]{64}$"})
+    }
+}
+
+impl schemars::JsonSchema for SchemaVersion {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SchemaVersion".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":"integer", "const":1})
+    }
+}
+
+impl<const VALUE: bool> schemars::JsonSchema for BoolLiteral<VALUE> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("BoolLiteral_{VALUE}").into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":"boolean", "const":VALUE})
+    }
+}
+
+impl<T: schemars::JsonSchema> schemars::JsonSchema for NonEmpty<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("NonEmpty_{}", T::schema_name()).into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type":"array", "minItems":1, "items":generator.subschema_for::<T>()})
     }
 }

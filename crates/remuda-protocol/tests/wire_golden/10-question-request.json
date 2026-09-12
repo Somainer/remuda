@@ -1,0 +1,25 @@
+{
+  "kind": "question",
+  "title": "Beverage",
+  "fields": [
+    {
+      "id": "beverage",
+      "title": "Tea or coffee?",
+      "description": null,
+      "input": "single-select",
+      "required": true,
+      "options": [
+        {
+          "id": "tea",
+          "label": "Tea"
+        },
+        {
+          "id": "coffee",
+          "label": "Coffee"
+        }
+      ],
+      "allowFreeText": false,
+      "sensitive": false
+    }
+  ]
+}

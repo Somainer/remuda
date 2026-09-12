@@ -1,0 +1,130 @@
+[
+  {
+    "file": "01-settings-overlay.json",
+    "source": "docs/design/protocol.md",
+    "section": "4.3 各 driver 的实际启动配方",
+    "block": 1,
+    "frame": 1,
+    "kind": "native-json"
+  },
+  {
+    "file": "02-initialize-request.json",
+    "source": "docs/design/protocol.md",
+    "section": "6.2 Claude 的三个承载方式",
+    "block": 2,
+    "frame": 1,
+    "kind": "native-json"
+  },
+  {
+    "file": "03-initialize-response.json",
+    "source": "docs/design/protocol.md",
+    "section": "6.2 Claude 的三个承载方式",
+    "block": 2,
+    "frame": 2,
+    "kind": "native-json"
+  },
+  {
+    "file": "04-native-user-message.json",
+    "source": "docs/design/protocol.md",
+    "section": "6.2 Claude 的三个承载方式",
+    "block": 2,
+    "frame": 3,
+    "kind": "native-json"
+  },
+  {
+    "file": "05-can-use-tool-request.json",
+    "source": "docs/design/protocol.md",
+    "section": "6.2 Claude 的三个承载方式",
+    "block": 2,
+    "frame": 4,
+    "kind": "native-json"
+  },
+  {
+    "file": "06-can-use-tool-response.json",
+    "source": "docs/design/protocol.md",
+    "section": "6.2 Claude 的三个承载方式",
+    "block": 2,
+    "frame": 5,
+    "kind": "native-json"
+  },
+  {
+    "file": "07-native-question-answer.json",
+    "source": "docs/design/protocol.md",
+    "section": "6.2 Claude 的三个承载方式",
+    "block": 3,
+    "frame": 1,
+    "kind": "native-json"
+  },
+  {
+    "file": "08-permission-hook-deny.json",
+    "source": "docs/design/protocol.md",
+    "section": "6.3 Claude hook 的输入、输出与冲突",
+    "block": 4,
+    "frame": 1,
+    "kind": "native-json"
+  },
+  {
+    "file": "09-runtime-hello.json",
+    "source": "docs/design/protocol.md",
+    "section": "7.1 网络、版本和身份",
+    "block": 5,
+    "frame": 1,
+    "kind": "rpc-request"
+  },
+  {
+    "file": "10-question-request.json",
+    "source": "docs/design/protocol.md",
+    "section": "12.3 规范化 wire 示例",
+    "block": 6,
+    "frame": 1,
+    "kind": "interaction-request"
+  },
+  {
+    "file": "11-instance-send.json",
+    "source": "docs/design/protocol.md",
+    "section": "12.3 规范化 wire 示例",
+    "block": 7,
+    "frame": 1,
+    "kind": "rpc-request"
+  },
+  {
+    "file": "12-native-bg-herdr.json",
+    "source": "docs/design/protocol.md",
+    "section": "12.3 规范化 wire 示例",
+    "block": 8,
+    "frame": 1,
+    "kind": "native-ref"
+  },
+  {
+    "file": "13-claude-bg-carrier.json",
+    "source": "docs/design/protocol.md",
+    "section": "12.3 规范化 wire 示例",
+    "block": 9,
+    "frame": 1,
+    "kind": "carrier-spec"
+  },
+  {
+    "file": "14-herdr-carrier.json",
+    "source": "docs/design/protocol.md",
+    "section": "12.3 规范化 wire 示例",
+    "block": 10,
+    "frame": 1,
+    "kind": "carrier-spec"
+  },
+  {
+    "file": "15-open-terminal.json",
+    "source": "docs/design/protocol.md",
+    "section": "12.3 规范化 wire 示例",
+    "block": 11,
+    "frame": 1,
+    "kind": "rpc-request"
+  },
+  {
+    "file": "16-binary-header.json",
+    "source": "docs/design/protocol.md",
+    "section": "12.3 规范化 wire 示例",
+    "block": 12,
+    "frame": 1,
+    "kind": "binary-header"
+  }
+]

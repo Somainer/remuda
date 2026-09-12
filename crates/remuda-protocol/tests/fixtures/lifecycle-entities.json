@@ -265,7 +265,8 @@
             "prerequisites": [],
             "evidence": []
           }
-        }
+        },
+        "adapterTransport": "native-rust-wire"
       },
       "ownerFence": "1",
       "activeRunIds": [

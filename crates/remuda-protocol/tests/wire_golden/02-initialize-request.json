@@ -1,0 +1,7 @@
+{
+  "type": "control_request",
+  "request_id": "runtime-init-1",
+  "request": {
+    "subtype": "initialize"
+  }
+}

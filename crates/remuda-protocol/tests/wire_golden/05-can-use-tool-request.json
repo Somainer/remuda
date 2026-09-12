@@ -1,0 +1,12 @@
+{
+  "type": "control_request",
+  "request_id": "native-perm-1",
+  "request": {
+    "subtype": "can_use_tool",
+    "tool_name": "Read",
+    "input": {
+      "file_path": "/work/project/README.md"
+    },
+    "tool_use_id": "toolu_example"
+  }
+}

@@ -3,7 +3,7 @@
 macro_rules! wire_enum {
     ($name:ident, $section:literal, { $($variant:ident => $wire:literal),+ $(,)? }) => {
         #[doc = concat!(stringify!($name), " wire values; `protocol.md` §", $section, ".")]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
         pub enum $name {
             $(#[doc = concat!("Wire value `", $wire, "`.")]
               #[serde(rename = $wire)] $variant),+

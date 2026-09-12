@@ -1,0 +1,14 @@
+{
+  "type": "user",
+  "uuid": "01993ab0-0000-7000-8000-000000000002",
+  "session_id": "01993ab0-0000-7000-8000-000000000003",
+  "message": {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Read the project README."
+      }
+    ]
+  }
+}

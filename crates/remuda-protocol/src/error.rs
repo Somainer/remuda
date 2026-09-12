@@ -59,7 +59,7 @@ impl ErrorCode {
 }
 
 /// ErrorDetails; `protocol.md` §9.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorDetails {
     /// `command_id`; protocol §9.1.
@@ -89,7 +89,7 @@ pub struct ErrorDetails {
 }
 
 /// RuntimeError; `protocol.md` §9.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeError {
     /// `code`; protocol §9.1.
@@ -107,7 +107,7 @@ pub struct RuntimeError {
 }
 
 /// RpcErrorData; `protocol.md` §9.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcErrorData {
     /// `code`; protocol §9.1.
@@ -121,7 +121,7 @@ pub struct RpcErrorData {
 }
 
 /// RpcError; `protocol.md` §9.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcError {
     /// `code`; protocol §9.1.
@@ -147,3 +147,34 @@ impl From<RuntimeError> for RpcError {
         }
     }
 }
+
+/// Mandatory M0 error vocabulary; numeric assignments remain those of `protocol.md` §9.1.
+///
+/// No member authorizes replay. In particular unknown delivery requires a read-only
+/// command query or reconciliation; this list does not implement those operations.
+pub const M0_REQUIRED_ERROR_CODES: &[ErrorCode] = &[
+    ErrorCode::Unauthenticated,
+    ErrorCode::ScopeDenied,
+    ErrorCode::HostOffline,
+    ErrorCode::OwnerFenced,
+    ErrorCode::ProtocolVersionUnsupported,
+    ErrorCode::SchemaVersionUnsupported,
+    ErrorCode::CapabilityUnsupported,
+    ErrorCode::CapabilityUnknown,
+    ErrorCode::BinaryChanged,
+    ErrorCode::InvalidLaunchSpec,
+    ErrorCode::NativeGenerationMismatch,
+    ErrorCode::AttachWouldWake,
+    ErrorCode::ControlUnavailable,
+    ErrorCode::CommandIdConflict,
+    ErrorCode::CommandExpired,
+    ErrorCode::CommandOutcomeUnknown,
+    ErrorCode::NativeResponseUnknown,
+    ErrorCode::JournalGap,
+    ErrorCode::JournalDiverged,
+    ErrorCode::JournalUnavailable,
+    ErrorCode::StateUnknown,
+    ErrorCode::ResourceLimit,
+    ErrorCode::TtyLeaseLost,
+    ErrorCode::TtyHistoryGap,
+];

@@ -713,5 +713,35 @@
       "uploadId": "obj_01993ab0-0000-7000-8000-000000000002",
       "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-open-terminal",
+    "method": "instance.open_terminal",
+    "params": {
+      "commandId": "cmd_01993ab0-0000-7000-8000-000000000050",
+      "payload": {
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+        "backgroundJobId": "native-job-fixture-1",
+        "allowWake": true,
+        "carrier": {
+          "backend": "herdr",
+          "server": {
+            "binaryPath": "/opt/herdr/herdr",
+            "version": "fixture-0.9.0",
+            "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "protocolVersion": "fixture-v1",
+            "serverIdentity": "obj_01993ab0-0000-7000-8000-000000000010",
+            "serverEpoch": "epoch_01993ab0-0000-7000-8000-000000000011",
+            "representation": "rendered-ansi"
+          },
+          "session": "remuda-test"
+        }
+      },
+      "expected": {
+        "ownerFence": "1",
+        "processGeneration": "1"
+      }
+    }
   }
 ]

@@ -148,6 +148,7 @@ wire_enum!(CommandOrigin, "2.5", {
 wire_enum!(CommandOperation, "2.5", {
     InstanceCreate => "instance.create",
     InstanceAttach => "instance.attach",
+    InstanceOpenTerminal => "instance.open_terminal",
     InstanceResume => "instance.resume",
     InstanceSend => "instance.send",
     InstanceCancel => "instance.cancel",
@@ -364,7 +365,6 @@ wire_enum!(NativeHomeMode, "4.1", {
 });
 
 wire_enum!(PtyBackend, "4.1", {
-    Node => "node",
     Herdr => "herdr",
 });
 
@@ -693,8 +693,6 @@ wire_enum!(RegistryKind, "5.5", {
     Lifecycle => "lifecycle",
 });
 
-// TODO(protocol §3.1): decisions.md D-004 adds claude-bg; its carrier and capability validation remain driver work.
-
 wire_enum!(EnvVisibility, "4.1", {
     Private => "private",
 });
@@ -782,6 +780,7 @@ wire_enum!(MethodName, "7.2", {
     WorktreeRemove => "worktree.remove",
     InstanceCreate => "instance.create",
     InstanceAttach => "instance.attach",
+    InstanceOpenTerminal => "instance.open_terminal",
     InstanceResume => "instance.resume",
     InstanceSend => "instance.send",
     InstanceConfigure => "instance.configure",
@@ -817,4 +816,28 @@ wire_enum!(MethodName, "7.2", {
 
 wire_enum!(NotificationName, "7.3", {
     EventsBatch => "events.batch",
+});
+
+wire_enum!(HerdrRepresentation, "1.3", {
+    RenderedAnsi => "rendered-ansi",
+});
+
+wire_enum!(BgInputDelivery, "4.1", {
+    DeferredArgv => "deferred-argv",
+});
+
+wire_enum!(ArgvInputPolicy, "4.1", {
+    ExplicitNonSecret => "explicit-non-secret",
+});
+
+wire_enum!(AdapterTransport, "3.2", {
+    NativeRustWire => "native-rust-wire",
+    ClaudeSdkSidecar => "claude-sdk-sidecar",
+    ClaudePtyHerdr => "claude-pty-herdr",
+    ClaudeBgHerdrAttach => "claude-bg-herdr-attach",
+    CodexAppserverSpawn => "codex-appserver-spawn",
+    CodexEmbedded => "codex-embedded",
+    GrokAcp => "grok-acp",
+    AgyNative => "agy-native",
+    GenericHerdr => "generic-herdr",
 });

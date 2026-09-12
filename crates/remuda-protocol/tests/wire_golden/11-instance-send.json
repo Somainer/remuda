@@ -1,0 +1,29 @@
+{
+  "jsonrpc": "2.0",
+  "id": "request-16",
+  "method": "instance.send",
+  "params": {
+    "commandId": "cmd_01993ab0-0000-7000-8000-000000000001",
+    "payload": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "runId": "run_01993ab0-0000-7000-8000-000000000001",
+      "input": {
+        "type": "prompt",
+        "mode": "new-turn",
+        "blocks": [
+          {
+            "type": "text",
+            "text": "Read the project README."
+          }
+        ],
+        "origin": "human",
+        "nativeClientMessageId": "user-fixture-1"
+      },
+      "completionScope": "native-turn"
+    },
+    "expected": {
+      "ownerFence": "1",
+      "processGeneration": "1"
+    }
+  }
+}

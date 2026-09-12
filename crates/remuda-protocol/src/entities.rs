@@ -4,7 +4,7 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 
 /// EntityMeta; `protocol.md` §1.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EntityMeta<I = Id> {
     /// `id`; protocol §1.1.
@@ -18,7 +18,7 @@ pub struct EntityMeta<I = Id> {
 }
 
 /// ActorRef; `protocol.md` §1.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ActorRef {
     /// `principal_id`; protocol §1.1.
@@ -35,7 +35,7 @@ pub struct ActorRef {
 }
 
 /// Platform; `protocol.md` §2.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Platform {
     /// `os`; protocol §2.1.
@@ -47,7 +47,7 @@ pub struct Platform {
 }
 
 /// HostTransport; `protocol.md` §2.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HostTransport {
     /// `mode`; protocol §2.1.
@@ -57,7 +57,7 @@ pub struct HostTransport {
 }
 
 /// Host; `protocol.md` §2.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Host {
     /// `meta`; protocol §2.1.
@@ -92,7 +92,7 @@ pub struct Host {
 }
 
 /// RepositoryRef; `protocol.md` §2.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryRef {
     /// `repository_id`; protocol §2.2.
@@ -104,7 +104,7 @@ pub struct RepositoryRef {
 }
 
 /// WriterLease; `protocol.md` §2.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WriterLease {
     /// `instance_id`; protocol §2.2.
@@ -114,7 +114,7 @@ pub struct WriterLease {
 }
 
 /// WorktreeRecord; `protocol.md` §2.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeRecord {
     /// `id`; protocol §2.2.
@@ -145,7 +145,7 @@ pub struct WorktreeRecord {
 }
 
 /// Workspace; `protocol.md` §2.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
     /// `meta`; protocol §2.2.
@@ -179,7 +179,7 @@ pub struct Workspace {
 }
 
 /// InstanceParent; `protocol.md` §2.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceParent {
     /// `instance_id`; protocol §2.3.
@@ -191,7 +191,7 @@ pub struct InstanceParent {
 }
 
 /// ProcessExit; `protocol.md` §2.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessExit {
     /// `code`; protocol §2.3.
@@ -205,7 +205,7 @@ pub struct ProcessExit {
 }
 
 /// Instance; `protocol.md` §2.3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Instance {
     /// `meta`; protocol §2.3.
@@ -255,7 +255,7 @@ pub struct Instance {
 }
 
 /// RunCause; `protocol.md` §2.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunCause {
     /// `actor_type`; protocol §2.4.
@@ -270,7 +270,7 @@ pub struct RunCause {
 }
 
 /// NativeTurn; `protocol.md` §2.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeTurn {
     /// `id`; protocol §2.4.
@@ -282,7 +282,7 @@ pub struct NativeTurn {
 }
 
 /// TerminalEvidence; `protocol.md` §2.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalEvidence {
     /// `event_ids`; protocol §2.4.
@@ -294,7 +294,7 @@ pub struct TerminalEvidence {
 }
 
 /// RunResult; `protocol.md` §2.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunResult {
     /// `message_ids`; protocol §2.4.
@@ -307,7 +307,7 @@ pub struct RunResult {
 }
 
 /// OutstandingWork; `protocol.md` §2.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OutstandingWork {
     /// `workflow_ids`; protocol §2.4.
@@ -319,7 +319,7 @@ pub struct OutstandingWork {
 }
 
 /// Run; `protocol.md` §2.4.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
     /// `meta`; protocol §2.4.
@@ -372,7 +372,7 @@ pub struct Run {
 }
 
 /// CommandTarget; `protocol.md` §2.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandTarget {
     /// `host_id`; protocol §2.5.
@@ -386,7 +386,7 @@ pub struct CommandTarget {
 }
 
 /// ExpectedState; `protocol.md` §2.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExpectedState {
     /// `instance_revision`; protocol §2.5.
@@ -407,7 +407,7 @@ pub struct ExpectedState {
 }
 
 /// ForwardIntent; `protocol.md` §2.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForwardIntent {
     /// `host_id`; protocol §2.5.
@@ -421,7 +421,7 @@ pub struct ForwardIntent {
 }
 
 /// Acceptance; `protocol.md` §2.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Acceptance {
     /// `scope`; protocol §2.5.
@@ -431,7 +431,7 @@ pub struct Acceptance {
 }
 
 /// Settlement; `protocol.md` §2.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Settlement {
     /// `outcome`; protocol §2.5.
@@ -445,7 +445,7 @@ pub struct Settlement {
 }
 
 /// NodeReceipt; `protocol.md` §2.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeReceipt {
     /// `node_epoch`; protocol §2.5.
@@ -455,7 +455,7 @@ pub struct NodeReceipt {
 }
 
 /// Command; `protocol.md` §2.5.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Command {
     /// `meta`; protocol §2.5.

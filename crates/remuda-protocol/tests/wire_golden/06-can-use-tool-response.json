@@ -1,0 +1,13 @@
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "native-perm-1",
+    "response": {
+      "behavior": "allow",
+      "updatedInput": {
+        "file_path": "/work/project/README.md"
+      }
+    }
+  }
+}

@@ -4,6 +4,7 @@
 
 #[macro_use]
 mod macros;
+mod binary;
 mod capabilities;
 mod entities;
 mod enums;
@@ -15,7 +16,9 @@ mod native;
 mod observation;
 mod rpc;
 mod scalar;
+pub mod schema;
 
+pub use binary::*;
 pub use capabilities::*;
 pub use entities::*;
 pub use enums::*;

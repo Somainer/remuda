@@ -1,0 +1,31 @@
+{
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+  "nativeStoreId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "kind": "claude",
+  "sessionId": {
+    "state": "known",
+    "value": "01993ab0-0000-7000-8000-000000000003"
+  },
+  "transcript": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "claude": {
+    "sessionId": "01993ab0-0000-7000-8000-000000000003"
+  },
+  "claudeBg": {
+    "jobId": "native-job-fixture-1"
+  },
+  "herdr": {
+    "binaryPath": "/opt/herdr/herdr",
+    "version": "fixture-0.9.0",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "protocolVersion": "fixture-v1",
+    "serverIdentity": "obj_01993ab0-0000-7000-8000-000000000010",
+    "serverEpoch": "epoch_01993ab0-0000-7000-8000-000000000011",
+    "representation": "rendered-ansi",
+    "session": "remuda-test",
+    "paneId": "w5:p1"
+  }
+}

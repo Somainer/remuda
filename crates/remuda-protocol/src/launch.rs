@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// ProfileRef; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileRef {
     /// `id`; protocol §4.1.
@@ -15,7 +15,7 @@ pub struct ProfileRef {
 }
 
 /// SettingsOverlay; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsOverlay {
     /// `format`; protocol §4.1.
@@ -28,7 +28,7 @@ pub struct SettingsOverlay {
 }
 
 /// NativeHome; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeHome {
     /// `mode`; protocol §4.1.
@@ -38,7 +38,7 @@ pub struct NativeHome {
 }
 
 /// InstanceSpec; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceSpec {
     /// `schema_version`; protocol §4.1.
@@ -85,7 +85,7 @@ pub struct InstanceSpec {
 }
 
 /// ProviderSelection; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSelection {
     /// `profile_id`; protocol §4.1.
@@ -111,7 +111,7 @@ pub struct ProviderSelection {
 }
 
 /// PromptInput; `protocol.md` §3.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptInput {
     /// `mode`; protocol §3.1.
@@ -125,7 +125,7 @@ pub struct PromptInput {
 }
 
 /// SteerInput; `protocol.md` §3.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SteerInput {
     /// `expected_native_turn_id`; protocol §3.1.
@@ -137,7 +137,7 @@ pub struct SteerInput {
 }
 
 /// ModelSwitchInput; `protocol.md` §3.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSwitchInput {
     /// `model_id`; protocol §3.1.
@@ -147,7 +147,7 @@ pub struct ModelSwitchInput {
 }
 
 /// DriverInput; `protocol.md` §3.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum DriverInput {
     /// `prompt` payload; §3.1.
@@ -162,7 +162,7 @@ pub enum DriverInput {
 }
 
 /// SendInput; `protocol.md` §7.2.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum SendInput {
     /// `prompt` payload; §7.2.
@@ -174,7 +174,7 @@ pub enum SendInput {
 }
 
 /// LiteralEnv; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LiteralEnv {
     /// `value`; protocol §4.1.
@@ -184,7 +184,7 @@ pub struct LiteralEnv {
 }
 
 /// CredentialEnv; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialEnv {
     /// `credential_ref`; protocol §4.1.
@@ -194,7 +194,7 @@ pub struct CredentialEnv {
 }
 
 /// HostEnv; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HostEnv {
     /// `name`; protocol §4.1.
@@ -202,7 +202,7 @@ pub struct HostEnv {
 }
 
 /// EnvBinding; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "source")]
 pub enum EnvBinding {
     /// `literal` payload; §4.1.
@@ -217,7 +217,7 @@ pub enum EnvBinding {
 }
 
 /// ClaudePermission; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudePermission {
     /// `mode`; protocol §4.1.
@@ -227,7 +227,7 @@ pub struct ClaudePermission {
 }
 
 /// CodexPermission; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexPermission {
     /// `approval_policy`; protocol §4.1.
@@ -239,7 +239,7 @@ pub struct CodexPermission {
 }
 
 /// SandboxExecution; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct SandboxExecution {
@@ -248,7 +248,7 @@ pub struct SandboxExecution {
 }
 
 /// NamedPermissions; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct NamedPermissions {
@@ -257,7 +257,7 @@ pub struct NamedPermissions {
 }
 
 /// Mutually exclusive Codex sandbox or permission profile; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum CodexExecution {
     /// Built-in sandbox choice.
@@ -267,7 +267,7 @@ pub enum CodexExecution {
 }
 
 /// GrokPermission; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GrokPermission {
     /// `mode`; protocol §4.1.
@@ -275,7 +275,7 @@ pub struct GrokPermission {
 }
 
 /// AgyPermission; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AgyPermission {
     /// `mode`; protocol §4.1.
@@ -283,7 +283,7 @@ pub struct AgyPermission {
 }
 
 /// GenericPermission; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GenericPermission {
     /// `mode`; protocol §4.1.
@@ -291,7 +291,7 @@ pub struct GenericPermission {
 }
 
 /// PermissionMode; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind")]
 pub enum PermissionMode {
     /// `claude` payload; §4.1.
@@ -312,7 +312,7 @@ pub enum PermissionMode {
 }
 
 /// ExistingWorktree; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExistingWorktree {
     /// `worktree_id`; protocol §4.1.
@@ -320,7 +320,7 @@ pub struct ExistingWorktree {
 }
 
 /// CreateWorktree; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorktree {
     /// `worktree_id`; protocol §4.1.
@@ -332,7 +332,7 @@ pub struct CreateWorktree {
 }
 
 /// WorktreeSpec; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "mode")]
 pub enum WorktreeSpec {
     /// `existing` payload; §4.1.
@@ -343,25 +343,61 @@ pub enum WorktreeSpec {
     Create(Box<CreateWorktree>),
 }
 
-/// PtyCarrier; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Herdr-backed PTY launch, pinned before dispatch; `protocol.md` §4.1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PtyCarrier {
-    /// `backend`; protocol §4.1.
+    /// Phase 0 production PTYs are hosted by Herdr.
     pub backend: PtyBackend,
-    /// `server_ref`; protocol §4.1.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_ref: Option<Id>,
+    /// Resolved binary and server lifetime; no ambient default server.
+    pub server: HerdrServer,
+    /// Explicit Herdr session to own the new pane.
+    pub session: String,
 }
 
-/// CarrierSpec; `protocol.md` §4.1.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+/// Deferred first input for Claude background launch; `protocol.md` §4.1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeBgCarrier {
+    /// Initial input starts the job only after its send Command is durable.
+    pub input_delivery: BgInputDelivery,
+    /// Requires explicit human opt-in for one text block; bots cannot use it.
+    pub argv_input_policy: ArgvInputPolicy,
+}
+
+/// Native process carrier; changing it requires a new Instance; `protocol.md` §4.1.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum CarrierSpec {
-    /// `stdio` payload; §4.1.
+    /// Native structured stdio transport.
     #[serde(rename = "stdio")]
     Stdio,
-    /// `pty` payload; §4.1.
+    /// Herdr owns the PTY process and pane.
     #[serde(rename = "pty")]
     Pty(Box<PtyCarrier>),
+    /// Native daemon job; opening an attach pane is a separate explicit Command.
+    #[serde(rename = "claude-bg")]
+    ClaudeBg(Box<ClaudeBgCarrier>),
+}
+
+impl<'de> Deserialize<'de> for CarrierSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut fields = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let kind = fields
+            .remove("type")
+            .ok_or_else(|| serde::de::Error::missing_field("type"))?;
+        match kind.as_str() {
+            Some("stdio") if fields.is_empty() => Ok(Self::Stdio),
+            Some("stdio") => Err(serde::de::Error::custom("stdio carrier accepts only type")),
+            Some("pty") => serde_json::from_value(serde_json::Value::Object(fields))
+                .map(Box::new)
+                .map(Self::Pty)
+                .map_err(serde::de::Error::custom),
+            Some("claude-bg") => serde_json::from_value(serde_json::Value::Object(fields))
+                .map(Box::new)
+                .map(Self::ClaudeBg)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom("unknown carrier type")),
+        }
+    }
 }

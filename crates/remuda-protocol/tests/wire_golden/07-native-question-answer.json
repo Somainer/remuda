@@ -1,0 +1,25 @@
+{
+  "behavior": "allow",
+  "updatedInput": {
+    "questions": [
+      {
+        "question": "Tea or coffee?",
+        "header": "Beverage",
+        "options": [
+          {
+            "label": "Tea",
+            "description": "Tea"
+          },
+          {
+            "label": "Coffee",
+            "description": "Coffee"
+          }
+        ],
+        "multiSelect": false
+      }
+    ],
+    "answers": {
+      "Tea or coffee?": "Tea"
+    }
+  }
+}

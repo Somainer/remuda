@@ -1,0 +1,5 @@
+{
+  "type": "claude-bg",
+  "inputDelivery": "deferred-argv",
+  "argvInputPolicy": "explicit-non-secret"
+}

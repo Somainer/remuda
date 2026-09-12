@@ -77,7 +77,7 @@ test.describe("transcript virtualization and session chrome", () => {
   test("Cmd/Ctrl+Enter sends on desktop", async ({ page }, info) => {
     test.skip(info.project.name === "mobile-webkit", "Cmd+Enter is desktop");
     await openNamedSession(page, "空闲会话");
-    const box = page.locator("[data-testid=composer] textarea");
+    const box = page.getByTestId("composer-input");
     await box.fill("from shortcut");
     await box.press("ControlOrMeta+Enter");
     await expect(page.getByText("from shortcut").first()).toBeVisible();

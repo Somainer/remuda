@@ -169,6 +169,7 @@ export function Composer({
       <div className={css.composer}>
         <textarea
           className={css.input}
+          data-testid="composer-input"
           value={text}
           disabled={disabled}
           placeholder={mobile ? "输入提示词…" : "输入提示词…  Enter 送出 · Shift+Enter 换行 · IME 组字期间不送"}
@@ -182,6 +183,7 @@ export function Composer({
           <button
             type="button"
             className={css.sendIcon}
+            data-testid="composer-send"
             aria-label="送出"
             disabled={disabled || sending || !text.trim()}
             onClick={() => void submit()}
@@ -246,7 +248,7 @@ export function Composer({
         ) : null}
         <span className={css.barSpacer} />
         {mobile ? null : (
-          <button type="button" className={css.send} disabled={disabled || sending || !text.trim()} onClick={() => void submit()}>
+          <button type="button" className={css.send} data-testid="composer-send" disabled={disabled || sending || !text.trim()} onClick={() => void submit()}>
             {sending ? "发送中" : "送出"}
           </button>
         )}

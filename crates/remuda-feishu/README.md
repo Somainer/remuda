@@ -48,13 +48,15 @@ feishu:{chat_id}:{thread_id || root_id || main}
 
 Topic groups must consider `root_id` when `thread_id` is absent. Replies in a topic should use `lark-cli im +messages-reply --reply-in-thread`.
 
-Inbound idempotency: IM uses `message_id` (not `event_id`). Card deliveries prefer `event_id`.
+Inbound idempotency: IM uses `message_id` (not `event_id`). Card deliveries prefer `event_id`. `InboundLog` keeps these keys in SQLite beside the session map, so a Feishu redelivery after a restart does not re-run a first prompt; entries older than `INBOUND_RETENTION` (24 h) are pruned.
 
 ## Commands
 
 Owner-only, always win over heuristics: `/new` `/host` `/agent` `/model` `/status` `/stop` `/yes` `/no`.
 
-Allowlist: `owner_open_ids`, `chat_allowlist`. Groups require `@bot` unless `allow_unaddressed`. Card clicks re-check `operator_id`.
+`/yes` and `/no` bind to one ticket — an explicit `/yes <tid>`, the card the message replies to, or the single open card. Two pending cards with no reference is refused with both ids rather than answering the newest. Any trailing words make the line an unknown command, so relayed text starting with `/yes` approves nothing. `/yes` grants `allow-once`; `allow-session` requires a deliberate card click. `/new` and `/stop` expire the topic's open tickets.
+
+Allowlist: `owner_open_ids`, `chat_allowlist`. Groups require `@bot` unless `allow_unaddressed`. Card clicks re-check `operator_id`, and get the same chat gate as a message in that chat — cards carry no `chat_type`, so a chat not yet seen in an admitted message is treated as a group.
 
 ## Cards and Interaction expiry
 

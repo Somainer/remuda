@@ -159,3 +159,48 @@ fn pty_cards_preserve_native_labels_option_ids_and_excerpt() {
     assert!(card.to_string().contains("Permission requested? [y/N]"));
     assert!(card.to_string().contains("Yes (y)"));
 }
+
+// ---- F12: agent-controlled card bodies are non-forwardable and capped ----
+
+/// Progress and completion cards render journal text the agent controls. A
+/// markdown link in that text must not become a forwardable message in the
+/// owner's Feishu — approval/question cards already set this.
+#[test]
+fn agent_text_cards_disable_forwarding() {
+    let progress = render_progress_card("Running", "Bash", "step", 3).unwrap();
+    assert_eq!(progress["config"]["enable_forward"], false);
+    let completion = render_completion_card("Done", "finished", true).unwrap();
+    assert_eq!(completion["config"]["enable_forward"], false);
+    let failed = render_completion_card("Failed", "oops", false).unwrap();
+    assert_eq!(failed["config"]["enable_forward"], false);
+}
+
+/// The "30 KB" cap in the outbound doc was never enforced. A long agent turn
+/// must be truncated rather than pushing the card over Feishu's payload limit.
+#[test]
+fn agent_text_is_capped_and_marked_truncated() {
+    let long = "A".repeat(remuda_feishu::MAX_CARD_TEXT_BYTES * 3);
+    let card = render_completion_card("Done", &long, true).unwrap();
+    let body = card["body"]["elements"][0]["content"].as_str().unwrap();
+    assert!(
+        body.len() <= remuda_feishu::MAX_CARD_TEXT_BYTES,
+        "body was {} bytes",
+        body.len()
+    );
+    assert!(body.contains("truncated"), "truncation must be visible");
+
+    let card = render_progress_card("Running", "Bash", &long, 1).unwrap();
+    let body = card["body"]["elements"][0]["content"].as_str().unwrap();
+    assert!(body.len() <= remuda_feishu::MAX_CARD_TEXT_BYTES);
+}
+
+/// Truncation must not split a UTF-8 character.
+#[test]
+fn clamp_respects_char_boundaries() {
+    let text = "锦".repeat(remuda_feishu::MAX_CARD_TEXT_BYTES);
+    let clamped = remuda_feishu::clamp_card_text(&text);
+    assert!(clamped.len() <= remuda_feishu::MAX_CARD_TEXT_BYTES);
+    assert!(clamped.starts_with('锦'));
+    // Short text is passed through untouched.
+    assert_eq!(remuda_feishu::clamp_card_text("short"), "short");
+}

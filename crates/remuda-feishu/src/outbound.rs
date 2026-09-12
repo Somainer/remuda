@@ -325,12 +325,129 @@ impl LarkCli {
         if !output.status.success() {
             return Err(Error::Cli {
                 status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stderr: redact_cli_stderr(&String::from_utf8_lossy(&output.stderr)),
             });
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(extract_message_id(&stdout))
     }
+}
+
+/// Cap on captured `lark-cli` stderr after redaction (F14).
+pub const MAX_CLI_STDERR_BYTES: usize = 2048;
+
+/// Scrub and truncate `lark-cli` stderr before it reaches [`Error::Cli`].
+///
+/// The error is rendered by `Debug`/`Display` and logged (`consume.rs`,
+/// `cmd/dispatcher.rs`), so this is the last point before a `tenant_access_token`
+/// or app secret printed on a failure path would land in the log. Redaction is
+/// keyed on the token *shape* rather than on a list of known key names, so an
+/// unfamiliar credential spelling is still caught.
+#[must_use]
+pub fn redact_cli_stderr(stderr: &str) -> String {
+    let mut out = String::with_capacity(stderr.len().min(MAX_CLI_STDERR_BYTES));
+    for (i, line) in stderr.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&redact_line(line));
+        if out.len() >= MAX_CLI_STDERR_BYTES {
+            break;
+        }
+    }
+    truncate_on_char_boundary(out)
+}
+
+fn redact_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    // Redact `name=value` / `name: value` where the name looks credential-ish.
+    while let Some(idx) = rest.find(['=', ':']) {
+        let (head, tail) = rest.split_at(idx);
+        let sep = &tail[..1];
+        let value = &tail[1..];
+        let name = head
+            .rsplit(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '{' || c == ',')
+            .next()
+            .unwrap_or("");
+        out.push_str(head);
+        out.push_str(sep);
+        if is_secret_name(name) {
+            let end = value
+                .find(|c: char| c.is_whitespace() || c == ',' || c == '}' || c == '"')
+                .unwrap_or(value.len());
+            if end > 0 {
+                out.push_str("[redacted]");
+            }
+            rest = &value[end..];
+        } else {
+            rest = value;
+        }
+    }
+    out.push_str(rest);
+    // Redact bare high-entropy blobs (a token printed with no name at all).
+    out.split_whitespace()
+        .map(|tok| {
+            if looks_like_secret_blob(tok) {
+                "[redacted]"
+            } else {
+                tok
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_secret_name(name: &str) -> bool {
+    let lower = name.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
+    let lower = lower.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "auth",
+        "credential",
+        "key",
+        "cookie",
+        "signature",
+        "sign",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Feishu `tenant_access_token`s are `t-…` / `u-…` blobs; treat any long
+/// unbroken credential-shaped run as one.
+fn looks_like_secret_blob(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if trimmed.len() < 24 {
+        return false;
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return false;
+    }
+    // Mixed case or digits inside a long unbroken run: not prose.
+    let has_digit = trimmed.bytes().any(|b| b.is_ascii_digit());
+    let has_upper = trimmed.bytes().any(|b| b.is_ascii_uppercase());
+    has_digit || has_upper
+}
+
+fn truncate_on_char_boundary(mut text: String) -> String {
+    if text.len() <= MAX_CLI_STDERR_BYTES {
+        return text;
+    }
+    let mut end = MAX_CLI_STDERR_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("… (truncated)");
+    text
 }
 
 fn push_body(argv: &mut Vec<String>, body: &OutboundBody) {

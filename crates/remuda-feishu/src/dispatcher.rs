@@ -19,7 +19,7 @@ use crate::cards::{render_completion_card, render_progress_card};
 use crate::consume::ConsumeEvent;
 use crate::error::Error;
 use crate::inbound::{
-    CallbackValue, Deduper, ExplicitCommand, GateDecision, Inbound, InboundKind, InboundPolicy,
+    CallbackValue, ExplicitCommand, GateDecision, Inbound, InboundKind, InboundLog, InboundPolicy,
     Intent, SessionKey, admit,
 };
 use crate::outbound::{LarkCli, OutboundBody};
@@ -230,6 +230,15 @@ fn row_to_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionBinding> {
 
 fn store_err(err: rusqlite::Error) -> Error {
     Error::SessionStore(err.to_string())
+}
+
+/// Inbound gate state lives beside the session map, as `<stem>-inbound.sqlite`.
+fn inbound_log_path(sessions: &std::path::Path) -> PathBuf {
+    let stem = sessions
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dispatcher");
+    sessions.with_file_name(format!("{stem}-inbound.sqlite"))
 }
 
 /// Defaults applied when a session has no `/host` `/agent` `/model` pins yet.
@@ -546,12 +555,12 @@ pub struct Dispatcher<A> {
     sessions: SessionStore,
     tickets: TicketStore,
     policy: InboundPolicy,
-    dedup: Deduper,
+    log: InboundLog,
     defaults: RouteDefaults,
 }
 
 impl<A: InstanceApi> Dispatcher<A> {
-    /// In-memory session map (tests).
+    /// In-memory session map and inbound gate state (tests).
     pub fn memory(
         api: A,
         outbound: LarkCli,
@@ -564,12 +573,15 @@ impl<A: InstanceApi> Dispatcher<A> {
             sessions: SessionStore::memory()?,
             tickets: TicketStore::with_default_ttl(),
             policy,
-            dedup: Deduper::default(),
+            log: InboundLog::memory(),
             defaults,
         })
     }
 
-    /// Persist the session map under `path`.
+    /// Persist the session map under `path`, and the inbound gate state beside it.
+    ///
+    /// Delivery ids outlive the process so a Feishu redelivery after a restart cannot
+    /// re-run a first prompt (F11).
     pub fn open(
         path: impl Into<PathBuf>,
         api: A,
@@ -577,13 +589,15 @@ impl<A: InstanceApi> Dispatcher<A> {
         policy: InboundPolicy,
         defaults: RouteDefaults,
     ) -> Result<Self, Error> {
+        let path = path.into();
+        let log = InboundLog::open(inbound_log_path(&path))?;
         Ok(Self {
             api,
             outbound,
             sessions: SessionStore::open(path)?,
             tickets: TicketStore::with_default_ttl(),
             policy,
-            dedup: Deduper::default(),
+            log,
             defaults,
         })
     }
@@ -644,7 +658,7 @@ impl<A: InstanceApi> Dispatcher<A> {
         let ConsumeEvent::Event { event, .. } = event else {
             return Ok(Vec::new());
         };
-        match admit(*event, &self.policy, &mut self.dedup)? {
+        match admit(*event, &self.policy, &mut self.log, now)? {
             GateDecision::Take(inbound) => self.handle(*inbound, now).await,
             GateDecision::Drop { reason } => {
                 debug!(?reason, "dispatcher dropped inbound");

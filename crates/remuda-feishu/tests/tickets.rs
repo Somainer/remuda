@@ -7,6 +7,10 @@ use remuda_feishu::{
 use remuda_protocol::{Interaction, InteractionAnswer};
 use std::time::{Duration, SystemTime};
 
+fn now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
 fn load_interaction(name: &str) -> Interaction {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -147,15 +151,22 @@ fn render_interaction_card_matches_kind() {
 
 #[test]
 fn card_action_non_owner_is_not_this_layer() {
-    let mut dedup = remuda_feishu::Deduper::default();
+    let mut log = remuda_feishu::InboundLog::memory();
     let mut policy = remuda_feishu::InboundPolicy::default();
     policy
         .owner_open_ids
         .push("ou_owner_aaaaaaaaaaaaaaaaaaaaaaaaaa".into());
     let action = load_card_action("card-action-allow.jsonl");
+    // F10: a card's chat gets the message path's gate, and cards carry no
+    // `chat_type` — so the chat must first be known from an admitted message.
+    log.remember_chat(
+        &action.chat_id.clone().unwrap(),
+        remuda_feishu::ChatType::P2p,
+    )
+    .unwrap();
     let event = remuda_feishu::RawEvent::CardAction(action);
     assert!(matches!(
-        admit(event, &policy, &mut dedup).unwrap(),
+        admit(event, &policy, &mut log, now()).unwrap(),
         remuda_feishu::GateDecision::Take(_)
     ));
 }

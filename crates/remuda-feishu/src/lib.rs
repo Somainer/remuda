@@ -23,9 +23,9 @@ mod runtime;
 mod tickets;
 
 pub use cards::{
-    CardKitOp, CardKitStream, PROGRESS_ELEMENT_ID, card_kind, render_approval_card,
-    render_completion_card, render_expired_card, render_interaction_card, render_progress_card,
-    render_question_card, render_recorded_card, validate_card,
+    CardKitOp, CardKitStream, MAX_CARD_TEXT_BYTES, PROGRESS_ELEMENT_ID, card_kind, clamp_card_text,
+    render_approval_card, render_completion_card, render_expired_card, render_interaction_card,
+    render_progress_card, render_question_card, render_recorded_card, validate_card,
 };
 pub use consume::{Backoff, ConsumeEvent, ConsumeSettings, ConsumeSupervisor};
 pub use dispatcher::{
@@ -37,12 +37,12 @@ pub use error::Error;
 pub use hub_api::HubInstanceApi;
 pub use inbound::{
     CallbackValue, CardAction, ChatType, Deduper, DropReason, ExplicitCommand, GateDecision,
-    ImMessage, Inbound, InboundKind, InboundPolicy, Intent, Mention, RawEvent, SessionKey,
-    ThreadRef, admit, parse_event_line, parse_intent,
+    INBOUND_RETENTION, ImMessage, Inbound, InboundKind, InboundLog, InboundPolicy, Intent, Mention,
+    RawEvent, SessionKey, ThreadRef, admit, parse_event_line, parse_intent,
 };
 pub use outbound::{
-    ExecutionMode, LarkCli, OutboundBody, OutboundReceipt, OutboundTarget, PlannedCommand,
-    idempotency_key,
+    ExecutionMode, LarkCli, MAX_CLI_STDERR_BYTES, OutboundBody, OutboundReceipt, OutboundTarget,
+    PlannedCommand, idempotency_key, redact_cli_stderr,
 };
 pub use runtime::{DispatcherRun, run_dispatcher};
 pub use tickets::{

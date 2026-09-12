@@ -13,6 +13,30 @@ pub const PROGRESS_ELEMENT_ID: &str = "progress_md";
 /// Official CardKit per-card write cap (Hz). Adapter should stay well below this.
 pub const CARDKIT_MAX_HZ: u32 = 10;
 
+/// Per-element cap on agent-controlled markdown in progress/completion cards (F12).
+///
+/// Feishu's own card limit is ~30 KB for the whole payload; this bounds the one
+/// element journal text reaches so a long agent turn cannot push the card over it.
+pub const MAX_CARD_TEXT_BYTES: usize = 4096;
+
+/// Truncate agent-controlled text to [`MAX_CARD_TEXT_BYTES`] on a char boundary.
+///
+/// Cards render this as markdown, so an over-long turn would otherwise either blow
+/// the payload limit or push the actual content out of view.
+#[must_use]
+pub fn clamp_card_text(text: &str) -> String {
+    if text.len() <= MAX_CARD_TEXT_BYTES {
+        return text.to_string();
+    }
+    const NOTE: &str = "\n\n… truncated; open the PWA for the full output.";
+    let budget = MAX_CARD_TEXT_BYTES - NOTE.len();
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{NOTE}", &text[..end])
+}
+
 /// Reserved CardKit streaming handle. Live HTTP is M2-06; v1 progress cards are static.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardKitStream {
@@ -257,19 +281,26 @@ pub fn render_question_card(
 }
 
 /// Static progress card. CardKit streaming is [`CardKitStream`], not this renderer.
+///
+/// `tool` and `summary` are agent-controlled, so the body is capped and the card is
+/// not forwardable (F12) — a markdown link in agent output must not become a
+/// clickable, shareable message in the owner's Feishu.
 pub fn render_progress_card(
     title: &str,
     tool: &str,
     summary: &str,
     elapsed_secs: u64,
 ) -> Result<Value, Error> {
-    let content = format!("**Tool:** {tool}\n\n{summary}\n\nElapsed: {elapsed_secs}s");
+    let content = clamp_card_text(&format!(
+        "**Tool:** {tool}\n\n{summary}\n\nElapsed: {elapsed_secs}s"
+    ));
     let card = json!({
         "schema": "2.0",
         "config": {
             "compact_width": false,
             "update_multi": true,
-            "streaming_mode": false
+            "streaming_mode": false,
+            "enable_forward": false
         },
         "header": {
             "template": "blue",
@@ -289,6 +320,8 @@ pub fn render_progress_card(
 }
 
 /// Terminal success / failure card. Long bodies should go out as `--file`.
+///
+/// `conclusion` is agent-controlled: capped and non-forwardable, as for progress.
 pub fn render_completion_card(title: &str, conclusion: &str, ok: bool) -> Result<Value, Error> {
     let template = if ok { "green" } else { "red" };
     let card = json!({
@@ -296,7 +329,8 @@ pub fn render_completion_card(title: &str, conclusion: &str, ok: bool) -> Result
         "config": {
             "compact_width": false,
             "update_multi": true,
-            "streaming_mode": false
+            "streaming_mode": false,
+            "enable_forward": false
         },
         "header": {
             "template": template,
@@ -305,7 +339,7 @@ pub fn render_completion_card(title: &str, conclusion: &str, ok: bool) -> Result
         "body": {
             "elements": [{
                 "tag": "markdown",
-                "content": conclusion,
+                "content": clamp_card_text(conclusion),
                 "text_align": "left"
             }]
         }

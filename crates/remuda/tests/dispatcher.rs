@@ -10,16 +10,12 @@ use tokio::process::Command;
 
 const BOOTSTRAP: &str = "dispatcher-test-bootstrap-credential";
 
-fn write_config(dir: &Path, with_token: bool) -> Result<std::path::PathBuf> {
+/// `credential` is the `[dispatcher]` credential stanza under test.
+fn write_config_with(dir: &Path, credential: &str) -> Result<std::path::PathBuf> {
     let binary =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-dispatcher-lark.py");
     let token = dir.join("bootstrap-token");
     std::fs::write(&token, BOOTSTRAP)?;
-    let credential = if with_token {
-        "token = 'file:deliberately-absent-device-token'\n"
-    } else {
-        ""
-    };
     let text = format!(
         "data_dir = {}\nshutdown_timeout_secs = 2\n[hub]\nbootstrap_token = {}\n[dispatcher]\nprofile = 'dispatcher-test'\nowner_open_ids = ['ou_dispatcher_owner']\nlark_cli = {}\nhub_url = 'https://unused.example'\n{credential}",
         serde_json::to_string(&dir.join("data"))?,
@@ -29,6 +25,15 @@ fn write_config(dir: &Path, with_token: bool) -> Result<std::path::PathBuf> {
     let path = dir.join("remuda.toml");
     std::fs::write(&path, text)?;
     Ok(path)
+}
+
+fn write_config(dir: &Path, with_token: bool) -> Result<std::path::PathBuf> {
+    let credential = if with_token {
+        "token = 'file:deliberately-absent-device-token'\n"
+    } else {
+        ""
+    };
+    write_config_with(dir, credential)
 }
 
 fn command(dir: &Path, config: &Path) -> Result<Command> {
@@ -151,13 +156,52 @@ async fn standalone_missing_credentials_fails_before_starting_consume() -> Resul
         .await?;
     ensure!(!output.status.success(), "missing credentials must fail");
     ensure!(
+        String::from_utf8_lossy(&output.stderr).contains("dispatcher.token"),
+        "unexpected error: {}",
         String::from_utf8_lossy(&output.stderr)
-            .contains("Hub token or bootstrap_token secret reference"),
-        "unexpected error"
     );
     ensure!(
         !dir.path().join("im.message.receive_v1.starts").exists(),
         "consume started before auth validation"
+    );
+    Ok(())
+}
+
+/// F13: the dispatcher holds its credential for the process lifetime, so it must
+/// not be given the Hub bootstrap — an unlimited, unrotatable join secret that
+/// also mints device tokens. Configuring one is a startup error, not a fallback.
+#[tokio::test]
+async fn standalone_refuses_a_bootstrap_token() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let secret = dir.path().join("dispatcher-bootstrap");
+    std::fs::write(&secret, BOOTSTRAP)?;
+    let config = write_config_with(
+        dir.path(),
+        &format!(
+            "bootstrap_token = {}\n",
+            serde_json::to_string(&format!("file:{}", secret.display()))?
+        ),
+    )?;
+    let output = command(dir.path(), &config)?
+        .arg("dispatcher")
+        .output()
+        .await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        !output.status.success(),
+        "a bootstrap token must be refused for the dispatcher role"
+    );
+    ensure!(
+        stderr.contains("dispatcher.bootstrap_token is not accepted"),
+        "unexpected error: {stderr}"
+    );
+    ensure!(
+        !stderr.contains(BOOTSTRAP),
+        "the refusal must not echo the credential: {stderr}"
+    );
+    ensure!(
+        !dir.path().join("im.message.receive_v1.starts").exists(),
+        "consume started despite a refused credential"
     );
     Ok(())
 }

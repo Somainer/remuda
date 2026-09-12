@@ -504,9 +504,10 @@ async fn group_without_mention_is_dropped() {
 
 #[test]
 fn admit_still_parses_command_fixture() {
-    let mut dedup = remuda_feishu::Deduper::default();
+    let mut log = remuda_feishu::InboundLog::memory();
     let event = parse_event_line(&load_line("im-message-commands.jsonl", 0)).unwrap();
-    let remuda_feishu::GateDecision::Take(inbound) = admit(event, &policy(), &mut dedup).unwrap()
+    let remuda_feishu::GateDecision::Take(inbound) =
+        admit(event, &policy(), &mut log, now()).unwrap()
     else {
         panic!("take");
     };

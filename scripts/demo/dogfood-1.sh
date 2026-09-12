@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-EVIDENCE="$ROOT/docs/design/evidence/dogfood-1.jsonl"
+EVIDENCE="${REMUDA_DOGFOOD_EVIDENCE:-$ROOT/docs/design/evidence/dogfood-1.jsonl}"
 MCP_CONFIG="$ROOT/docs/design/remuda-mcp.json"
 DEMO_DIR="${REMUDA_DOGFOOD_DIR:-${TMPDIR:-/tmp}/remuda-dogfood-1}"
 # Override when 18080/18787 are already bound (coordinator demo).
@@ -110,6 +110,7 @@ def scrub(obj):
                 out = out.replace(s, "<redacted>")
         if home:
             out = out.replace(home, "<home>")
+        out = re.sub(r"/Users/[A-Za-z0-9._-]*", "<home>", out)
         if workdir:
             out = out.replace(workdir, "<workdir>")
         if hub:
@@ -143,6 +144,9 @@ meta = {
         "hub": hub,
     }
 }
+round_name = os.environ.get("REMUDA_DOGFOOD_ROUND")
+if round_name:
+    meta["_meta"]["round"] = round_name
 lines.append(json.dumps(meta, sort_keys=True))
 if os.path.isfile(src):
     with open(src, encoding="utf-8", errors="replace") as fh:
@@ -313,7 +317,7 @@ run_claude() {
   local raw="$DEMO_DIR/claude-$attempt.jsonl"
   local prompt
   prompt="$(cat <<PROMPT
-You are the Remuda dogfood coordinator. Use only Remuda MCP tools (names remuda_worktree_create, remuda_instance_create, remuda_instance_wait, remuda_instance_read, remuda_instance_stop, remuda_instance_list). Do not use Bash. Do not compile. Do not mention tokens.
+You are the Remuda dogfood coordinator. Use only Remuda MCP tools (names remuda_worktree_create, remuda_instance_create, remuda_instance_wait, remuda_instance_send, remuda_instance_read, remuda_instance_stop, remuda_instance_list). Do not use Bash. Do not compile. Do not mention tokens.
 
 Work from this git repository: ${ROOT}
 Use worktree name "${WORKTREE_NAME}" and path "${WORKTREE_PATH}". If remuda_worktree_create needs a repo path, pass repo="${ROOT}".
@@ -325,7 +329,7 @@ Do these steps in order:
    - remuda_instance_create kind="codex" driver="pty" worktree="${WORKTREE_NAME}" name="df-codex" prompt="In the current directory create a file named dogfood-codex.txt containing exactly the line codex-ok. Then print a line that starts with DONE (for example: DONE). Do not wait for further input."
    - remuda_instance_create kind="grok" driver="pty" worktree="${WORKTREE_NAME}" name="df-grok" prompt="In the current directory create a file named dogfood-grok.txt containing exactly the line grok-ok. Then print a line that starts with DONE (for example: DONE). Do not wait for further input."
 3. From each create result, parse instanceId (field instance.instanceId or instanceId).
-4. For each instance, call remuda_instance_wait with until="line:(?m)^DONE" and timeoutMs=180000. Do not treat the task brief itself as a match.
+4. For each instance, call remuda_instance_wait with until="line:(?m)^DONE" and timeoutMs=180000. Do not treat the task brief itself as a match. Done is true only when the wait JSON reason is "condition-met" (matchedLine may be "• DONE" or similar). If reason is timeout, call remuda_instance_send with text "Print DONE as its own line now." then wait once more with timeoutMs=60000.
 5. For each instance, call remuda_instance_read with source="screen" and lines=80. If screen is empty, retry with source="journal".
 6. For each instance, call remuda_instance_stop with scope="instance".
 7. Reply with one JSON object only:
@@ -346,7 +350,7 @@ PROMPT
   if [[ "$attempt" == "1" ]]; then
     cmd+=(
       --allowedTools
-      mcp__remuda__remuda_worktree_create,mcp__remuda__remuda_instance_create,mcp__remuda__remuda_instance_wait,mcp__remuda__remuda_instance_read,mcp__remuda__remuda_instance_stop,mcp__remuda__remuda_instance_list
+      mcp__remuda__remuda_worktree_create,mcp__remuda__remuda_instance_create,mcp__remuda__remuda_instance_wait,mcp__remuda__remuda_instance_send,mcp__remuda__remuda_instance_read,mcp__remuda__remuda_instance_stop,mcp__remuda__remuda_instance_list
     )
   fi
   log "==> claude attempt $attempt"

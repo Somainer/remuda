@@ -461,6 +461,7 @@ pub(crate) async fn wait(
         let lifecycle = snapshot.get("lifecycle").and_then(Value::as_str);
         let activity = snapshot.get("activity").and_then(Value::as_str);
         if until_met(condition, &events, lifecycle, activity)? {
+            let matched_line = matching_wait_line(condition, &events);
             return Ok(json!({
                 "reason": "condition-met",
                 "instanceId": instance_id,
@@ -469,7 +470,8 @@ pub(crate) async fn wait(
                 "asOfSeq": after,
                 "lifecycle": lifecycle,
                 "activity": activity,
-                "events": events,
+                "matchedLine": matched_line,
+                "eventCount": events.len(),
                 "outstandingWork": false,
             }));
         }
@@ -482,7 +484,8 @@ pub(crate) async fn wait(
                 "asOfSeq": after,
                 "lifecycle": lifecycle,
                 "activity": activity,
-                "events": events,
+                "matchedLine": Value::Null,
+                "eventCount": events.len(),
                 "outstandingWork": true,
             }));
         }
@@ -680,6 +683,40 @@ pub(crate) fn project_instance(item: &Value, hosts: &[Value]) -> Value {
     })
 }
 
+/// Strip leading whitespace and one TUI list marker so `(?m)^DONE` matches
+/// pane text like `• DONE`. The raw journal line is unchanged; this is
+/// match-time only.
+pub(crate) fn normalize_wait_line(raw: &str) -> &str {
+    let trimmed = raw.trim_start();
+    for marker in ["•", "●", "◆", "▸", "▪", "-", "*", ">"] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return rest.trim_start();
+        }
+    }
+    trimmed
+}
+
+fn line_regex_matches(re: &regex::Regex, text: &str) -> bool {
+    first_matching_wait_line(re, text).is_some()
+}
+
+fn looks_like_wait_brief_echo(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("further input")
+        || lower.contains("tui bullet")
+        || lower.contains("for example")
+}
+
+/// Raw (unnormalized) line that satisfies `re`, if any.
+fn first_matching_wait_line<'a>(re: &regex::Regex, text: &'a str) -> Option<&'a str> {
+    text.lines().find(|line| {
+        if looks_like_wait_brief_echo(line) {
+            return false;
+        }
+        re.is_match(line) || re.is_match(normalize_wait_line(line))
+    })
+}
+
 pub(crate) fn normalize_driver(driver: &str) -> String {
     match driver {
         "pty" | "generic-pty" | "generic_pty" | "genericPty" => "generic-pty".into(),
@@ -709,7 +746,7 @@ pub(crate) fn until_met(
             .cloned()
             .collect();
         let text = collect_strings(&Value::Array(filtered));
-        return Ok(re.is_match(&text));
+        return Ok(line_regex_matches(&re, &text));
     }
     Ok(match until {
         "idle" => is_idle(lifecycle, activity),
@@ -737,6 +774,18 @@ pub(crate) fn until_met(
                 || other == "done"
         }
     })
+}
+
+fn matching_wait_line(until: &str, events: &[Value]) -> Option<String> {
+    let pattern = until.strip_prefix("line:")?;
+    let re = regex::Regex::new(pattern).ok()?;
+    let filtered: Vec<Value> = events
+        .iter()
+        .filter(|event| line_wait_event(event))
+        .cloned()
+        .collect();
+    let text = collect_strings(&Value::Array(filtered));
+    first_matching_wait_line(&re, &text).map(str::to_string)
 }
 
 fn is_idle(lifecycle: Option<&str>, activity: Option<&str>) -> bool {
@@ -1024,6 +1073,64 @@ mod tests {
         })];
         assert!(until_met("line:(?m)^DONE", &events, None, None).unwrap());
         assert!(is_screen_event(&events[0]));
+    }
+
+    #[test]
+    fn normalize_wait_line_strips_indent_and_one_marker() {
+        assert_eq!(normalize_wait_line("DONE"), "DONE");
+        assert_eq!(normalize_wait_line("  DONE"), "DONE");
+        assert_eq!(normalize_wait_line("\tDONE"), "DONE");
+        assert_eq!(normalize_wait_line("• DONE"), "DONE");
+        assert_eq!(normalize_wait_line("- DONE"), "DONE");
+        assert_eq!(normalize_wait_line("* DONE"), "DONE");
+        assert_eq!(normalize_wait_line("> DONE"), "DONE");
+        assert_eq!(normalize_wait_line("◆ DONE"), "DONE");
+        assert_eq!(normalize_wait_line("  • DONE"), "DONE");
+        assert_eq!(normalize_wait_line("  -  DONE"), "DONE");
+        assert_eq!(normalize_wait_line("\t* DONE extra"), "DONE extra");
+        assert_eq!(normalize_wait_line("• • DONE"), "• DONE");
+        assert_eq!(normalize_wait_line("DONE •"), "DONE •");
+    }
+
+    #[test]
+    fn until_line_matches_tui_list_markers() {
+        for status in [
+            "• DONE",
+            "- DONE",
+            "* DONE",
+            "> DONE",
+            "◆ DONE",
+            "  • DONE",
+            "\t* DONE",
+            "output\n  > DONE\n",
+        ] {
+            let events = [json!({
+                "nativeName": "screen",
+                "completeness": "screen-derived",
+                "status": status,
+            })];
+            assert!(
+                until_met("line:(?m)^DONE", &events, None, None).unwrap(),
+                "{status:?}"
+            );
+        }
+        let raw = json!({
+            "nativeName": "screen",
+            "status": "• DONE"
+        });
+        assert_eq!(raw["status"], "• DONE");
+        assert_eq!(
+            matching_wait_line("line:(?m)^DONE", std::slice::from_ref(&raw)).as_deref(),
+            Some("• DONE")
+        );
+        let miss = [json!({ "nativeName": "screen", "status": "not yet" })];
+        assert!(!until_met("line:(?m)^DONE", &miss, None, None).unwrap());
+        let wrapped_brief = [json!({
+            "nativeName": "screen",
+            "status": "print a standalone line that starts with\n  DONE (a TUI bullet before DONE is fine). Do not wait for\nfurther input."
+        })];
+        assert!(!until_met("line:(?m)^DONE", &wrapped_brief, None, None).unwrap());
+        assert!(matching_wait_line("line:(?m)^DONE", &wrapped_brief).is_none());
     }
 
     #[test]

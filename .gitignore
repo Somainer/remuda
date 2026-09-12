@@ -1,0 +1,11 @@
+/target/
+node_modules/
+/web/dist/
+.env
+.env.*
+!.env.example
+*.local.*
+.DS_Store
+
+# raw research notes contain private infra details; kept local until sanitized
+/docs/research/

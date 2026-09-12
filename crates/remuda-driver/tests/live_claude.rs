@@ -224,7 +224,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
             .pane_send_keys(&pane_id, vec!["down".into(), "enter".into()])
             .await;
         append_evidence("- bypass warning visible; pane_send_keys down+enter");
-        let dismissed = wait_screen_contains(&client, &agent, "Yes, I accept", 2).await == false
+        let dismissed = !wait_screen_contains(&client, &agent, "Yes, I accept", 2).await
             || !read_screen(&client, &agent).await.contains("Yes, I accept");
         append_evidence(&format!("- bypass warning dismissed={dismissed}"));
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -255,30 +255,24 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
             continue;
         };
         events.push(format!("{:?}", obs.body.kind()));
-        match &obs.body {
-            ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
-                LifecyclePayload::Native(native) => {
-                    if native.native_name == "SessionStart" {
-                        hook = true;
-                        if let Some(path) = native.related_ids.get("transcriptPath") {
-                            append_evidence(&format!(
-                                "- SessionStart event transcript `{}`",
-                                redact_path(path)
-                            ));
-                        }
-                    }
-                    if native.native_name == "agent_status"
-                        && let Knowledge::Known { value } = &native.status
-                        && value == "idle"
-                    {
-                        idle = true;
-                        break;
-                    }
+        if let ObservationPayload::Lifecycle(payload) = &obs.body { if let LifecyclePayload::Native(native) = payload.as_ref() {
+            if native.native_name == "SessionStart" {
+                hook = true;
+                if let Some(path) = native.related_ids.get("transcriptPath") {
+                    append_evidence(&format!(
+                        "- SessionStart event transcript `{}`",
+                        redact_path(path)
+                    ));
                 }
-                _ => {}
-            },
-            _ => {}
-        }
+            }
+            if native.native_name == "agent_status"
+                && let Knowledge::Known { value } = &native.status
+                && value == "idle"
+            {
+                idle = true;
+                break;
+            }
+        } }
     }
     append_evidence(&format!(
         "- idle={} hook={} elapsed={}ms events={:?}",

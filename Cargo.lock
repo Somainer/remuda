@@ -2882,11 +2882,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
+ "remuda-hub",
+ "remuda-protocol",
  "remuda-ssh",
  "reqwest",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
+ "time",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3032,6 +3038,7 @@ name = "remuda-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "futures",
  "remuda-hub",
@@ -3041,9 +3048,11 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

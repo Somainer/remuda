@@ -11,6 +11,7 @@ description = "Remuda Hub, Node, and local development command entry points."
 workspace = true
 
 [dependencies]
+time = { workspace = true }
 anyhow.workspace = true
 clap.workspace = true
 remuda-ssh.workspace = true

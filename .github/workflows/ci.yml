@@ -8,6 +8,46 @@ permissions:
   contents: read
 
 jobs:
+  deploy-public:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-c-deploy
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and package check tools
+        run: |
+          rustup show active-toolchain
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools shellcheck
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build embedded web assets
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Lint public deployment scripts
+        run: shellcheck deploy/public/*.sh scripts/ci/deploy-public.sh
+      - name: Build the M1 musl image for the public package
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --locked -p remuda --target x86_64-unknown-linux-musl
+          mkdir -p deploy/out
+          cp "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/debug/remuda" deploy/out/remuda-linux-musl
+          cp NOTICE LICENSE deploy/out/
+          docker build -f deploy/m1/Dockerfile -t remuda-hub:ci deploy/out
+      - name: Compose config and HTTPS smoke through internal Caddy
+        run: ./scripts/ci/deploy-public.sh
+
   rust:
     runs-on: ubuntu-latest
     env:

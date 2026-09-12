@@ -1,0 +1,120 @@
+# Intranet Hub behind the existing Caddy
+
+Status: **prepared only — awaiting-caddy-restart-approval**. The latest user
+instruction requires reviewable apply/rollback scripts and explicit approval
+before restarting Caddy. Do not activate the staged site or proceed with
+Node acceptance while waiting. Earlier live probes and baseline restoration
+are recorded in the evidence file; they are not final activation evidence.
+
+This is the immediate [D-020](../../docs/design/decisions.md) deployment
+path. Run Hub on the SG host, join its existing `deploy_default` network,
+and add one dedicated `remuda.<zone>` site to the existing Caddy. Use the
+existing Cloudflare DNS-01 setup. The A record is private; clients need an
+approved intranet route. Certificates do not provide public reachability.
+No cloudflared, frp, ngrok, reverse-SSH tunnel or other penetration service
+is part of this package. The public VPS variant remains in [public](../public/README.md).
+
+The detailed sequence, acceptance checks and rollback are in the
+[deploy runbook](../../docs/design/deploy-runbook.md). Actual execution
+evidence belongs in [intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md).
+
+The inspected SG host is Debian 10 x86_64. Use that observed platform for
+binary compatibility; the public package's Ubuntu installer is not used
+here. Existing Caddy has named volumes at `/config` and `/data`, with a
+separate bind mount for its main Caddyfile.
+
+Prepare a private operator `.env` with an explicit `HUB_IMAGE` tag,
+`HUB_DOMAIN=remuda.<zone>`, the chosen `DATA_DIR`, its actual
+`HUB_UID` / `HUB_GID`, and `REMUDA_TRUSTED_PROXIES` as a JSON array containing only
+the existing Caddy container's verified network IP. The default UID/GID
+are 65532; adapt these to the host's verified mount ownership. Create the
+data directory `/data00/remuda/hub` mode 0700, owned by the chosen Compose
+runtime user, and preserve any existing database/bootstrap.
+Do not commit real hostnames, addresses or credentials.
+
+The preparation check is read-only with respect to running services:
+
+```bash
+docker compose --env-file .env -p remuda-intranet -f compose.hub.yml config
+```
+
+Hub publishes no host ports and uses the unique network alias
+`remuda-intranet-hub` as Caddy's upstream. The external network must already exist;
+do not create a replacement or recreate the gateway stack. Instantiate
+`Caddyfile.snippet` as a new site include and verify its DNS provider
+credential environment variable against the existing Caddy setup. Back up
+the current Caddyfile. Keep the inactive operator source at
+`~/astergate/deploy/Caddyfile.d/remuda.caddy`. Preparation copies the inactive
+include to `/config/remuda/Caddyfile.d/remuda.caddy` inside Caddy's existing persistent
+`/config` named volume; retaining that volume preserves the include across
+container recreation. Do not add the active import before approval.
+
+Stage [caddy-change.py](caddy-change.py) on the host as
+`~/astergate/deploy/remuda-caddy-change.py`. Its private mode-0600 settings
+file `.remuda-caddy-change.json` contains `gateway_health_url`,
+`hub_health_url`, `baseline_caddy_sha256`, `baseline_started_at`,
+`include_sha256` and `gateway_health_sha256` from the reviewed baseline;
+it never contains the DNS token.
+
+```bash
+cd "$HOME/astergate/deploy"
+python3 remuda-caddy-change.py prepare --settings .remuda-caddy-change.json
+```
+
+`prepare` verifies baseline hashes, Caddy start time and gateway readiness,
+writes `Caddyfile.remuda-prepared`, copies the candidate and inactive
+include into `/config`, validates with Caddy, then checks gateway health
+again. It leaves the active Caddyfile unchanged and performs no reload or
+restart. Preparation does not authorize activation.
+
+After explicit approval, `apply` repeats those checks, saves
+`Caddyfile.pre-remuda-approved` and recovery state,
+installs the dedicated include, adds
+`import /config/remuda/Caddyfile.d/*.caddy` only if absent, and changes the
+global admin setting from `off` to `localhost:2019`. Keep that endpoint on
+container loopback without publishing host port 2019. The gateway site and
+its `/v1` route remain unchanged. The script validates the candidate config,
+then runs `docker restart deploy-caddy-1` and checks the gateway response
+hash plus Remuda HTTPS `/healthz` with certificate verification. That restart
+may interrupt connections served by Caddy and is
+the action awaiting approval. Current preparation does not run it. Earlier
+API/SIGUSR1 attempts belong only in the evidence record.
+
+The following is for use **after approval**, not during preparation:
+
+```bash
+python3 remuda-caddy-change.py apply --settings .remuda-caddy-change.json
+```
+
+Approval for `apply` includes its automatic recovery: if restart or health
+verification fails after the active file changes, the script restores the
+original file and restarts Caddy again, then checks gateway health. No
+additional approval is requested in that failure path.
+
+After activation is approved and verified, open
+`https://remuda.<zone>/login` from the intranet. The operator stores
+the first-login access code at `/data00/remuda/secrets/access-code`, mode
+0600; read it privately to log in. A logged-in browser can
+generate a phone pairing code in Settings; the phone uses `/login?pair`.
+Subsequent Node acceptance is pending. Follow [NODES.md](../public/NODES.md)
+for the current outbound carrier and
+the future daemon installer. Store provider gateway configuration on the
+Node that reaches it; the Hub does not proxy provider requests. The inspected
+remote PATH lacks native agent CLIs and Herdr. Node enrollment can report
+these missing tools; an online Node does not establish session execution
+readiness.
+
+The prepared `rollback` path restores the original global admin setting
+(currently `admin off`) and import state, deactivating the staged Remuda
+include, then validates, restarts `deploy-caddy-1` and checks gateway health.
+Rollback also contains a restart and must not run before approval. Preserve
+Hub data, the `/config` and certificate volumes, and the shared
+network. The standalone public VPS scripts are not intended to manage this
+existing Caddy deployment.
+
+Keep this explicit rollback command for approved recovery; it is not run
+while awaiting restart approval:
+
+```bash
+python3 remuda-caddy-change.py rollback --settings .remuda-caddy-change.json
+```

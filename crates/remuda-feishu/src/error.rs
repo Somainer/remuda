@@ -37,6 +37,14 @@ pub enum Error {
     /// Ticket is past its runtime deadline (10–15 min, shorter than the 30 min card token).
     #[error("ticket {0} expired")]
     TicketExpired(String),
+    /// Answer arrived from a session/chat the ticket was never posted to.
+    #[error("ticket {ticket_id} does not belong to {scope}")]
+    TicketScope {
+        /// Callback `tid` that was presented.
+        ticket_id: String,
+        /// Session key or chat id that tried to answer it.
+        scope: String,
+    },
     /// This Interaction kind has no Feishu card encoder yet.
     #[error("unsupported interaction kind for Feishu cards")]
     UnsupportedInteraction,

@@ -148,8 +148,14 @@ fn explicit_commands() {
     assert_eq!(model, "passthrough/auto_model/alwaysday1_max");
     assert!(matches!(kinds[4], Intent::Command(ExplicitCommand::Status)));
     assert!(matches!(kinds[5], Intent::Command(ExplicitCommand::Stop)));
-    assert!(matches!(kinds[6], Intent::Command(ExplicitCommand::Yes)));
-    assert!(matches!(kinds[7], Intent::Command(ExplicitCommand::No)));
+    assert!(matches!(
+        kinds[6],
+        Intent::Command(ExplicitCommand::Yes { ticket_id: None })
+    ));
+    assert!(matches!(
+        kinds[7],
+        Intent::Command(ExplicitCommand::No { ticket_id: None })
+    ));
 }
 
 #[test]

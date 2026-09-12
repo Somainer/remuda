@@ -46,12 +46,64 @@ pub struct CardTicket {
     pub request: InteractionRequest,
     /// Session this card was sent to.
     pub session_key: String,
+    /// Message id of the posted card, once the outbound receipt is known.
+    ///
+    /// A `/yes` that replies to this message binds to this ticket without a typed id.
+    pub card_message_id: Option<String>,
     /// When the ticket was issued.
     pub created_at: SystemTime,
     /// Runtime deadline.
     pub expires_at: SystemTime,
     /// Open / answered / expired.
     pub state: TicketState,
+}
+
+/// Who is allowed to answer a ticket (F9: the answer must reach its own session).
+///
+/// Messages carry full topic identity, so they bind to the exact `session_key`.
+/// `card.action.trigger` has no `thread_id`/`root_id` (`inbound.rs` builds an empty
+/// [`crate::ThreadRef`]), so a card in a topic would never match the topic session key —
+/// cards bind to the chat instead, which is still the gate the message path enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerScope<'a> {
+    /// Ticket must belong to exactly this `session_key`.
+    Session(&'a str),
+    /// Ticket's session must live in this `chat_id`.
+    Chat(&'a str),
+}
+
+impl AnswerScope<'_> {
+    fn admits(&self, ticket: &CardTicket) -> bool {
+        match self {
+            Self::Session(key) => ticket.session_key == *key,
+            Self::Chat(chat_id) => session_chat(&ticket.session_key) == Some(*chat_id),
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Session(key) => key,
+            Self::Chat(chat_id) => chat_id,
+        }
+    }
+}
+
+/// `chat_id` inside a `feishu:{chat_id}:{thread||root||main}` session key.
+#[must_use]
+pub fn session_chat(session_key: &str) -> Option<&str> {
+    let rest = session_key.strip_prefix("feishu:")?;
+    let (chat_id, _suffix) = rest.rsplit_once(':')?;
+    (!chat_id.is_empty()).then_some(chat_id)
+}
+
+/// Human-readable title of a pending request, for echoing what `/yes` approved.
+#[must_use]
+pub fn request_title(request: &InteractionRequest) -> &str {
+    match request {
+        InteractionRequest::Approval(req) => &req.title,
+        InteractionRequest::Question(req) => &req.title,
+        InteractionRequest::PlanReview(_) | InteractionRequest::Elicitation(_) => "request",
+    }
 }
 
 /// First-writer-wins result of a card action.
@@ -134,6 +186,7 @@ impl TicketStore {
             process_generation: interaction.request_key.process_generation,
             request: interaction.request.clone(),
             session_key: session_key.to_string(),
+            card_message_id: None,
             created_at: now,
             expires_at: now + self.ttl,
             state: TicketState::Open,
@@ -145,19 +198,24 @@ impl TicketStore {
     }
 
     /// Map a card callback onto an InteractionAnswer. First valid writer wins.
+    ///
+    /// `scope` must admit the ticket — a card action may only answer a ticket whose
+    /// session lives in the same chat (F9).
     pub fn answer_card(
         &mut self,
         action: &CardAction,
+        scope: AnswerScope<'_>,
         now: SystemTime,
     ) -> Result<MappedAnswer, Error> {
-        self.answer_card_parsed(action, now)
+        self.answer_card_parsed(action, scope, now)
     }
 
-    /// Map `{tid,a}` plus optional form payload.
+    /// Map `{tid,a}` plus optional form payload, rejecting cross-session answers.
     pub fn answer_callback(
         &mut self,
         callback: &CallbackValue,
         form: Option<&Value>,
+        scope: AnswerScope<'_>,
         now: SystemTime,
     ) -> Result<MappedAnswer, Error> {
         let ticket = self
@@ -165,6 +223,14 @@ impl TicketStore {
             .get(&callback.tid)
             .cloned()
             .ok_or_else(|| Error::TicketNotFound(callback.tid.clone()))?;
+        // F9: the ticket, the answering session, and the chat must agree. Without this
+        // any owner could answer any other topic's pending call.
+        if !scope.admits(&ticket) {
+            return Err(Error::TicketScope {
+                ticket_id: callback.tid.clone(),
+                scope: scope.label().to_string(),
+            });
+        }
         if ticket.state == TicketState::Answered {
             return Err(Error::TicketAnswered(callback.tid.clone()));
         }
@@ -212,23 +278,91 @@ impl TicketStore {
         self.tickets.get(ticket_id)
     }
 
+    /// Record the message id of the posted card so a threaded `/yes` can bind to it.
+    pub fn set_card_message_id(&mut self, ticket_id: &str, message_id: &str) {
+        if let Some(ticket) = self.tickets.get_mut(ticket_id) {
+            ticket.card_message_id = Some(message_id.to_string());
+        }
+    }
+
     /// Newest still-open ticket for `session_key`, if the deadline has not passed.
     #[must_use]
     pub fn latest_open(&self, session_key: &str, now: SystemTime) -> Option<&CardTicket> {
-        self.tickets
-            .values()
-            .filter(|ticket| {
-                ticket.session_key == session_key
-                    && ticket.state == TicketState::Open
-                    && now < ticket.expires_at
-            })
+        self.open_for_session(session_key, now)
             .max_by_key(|ticket| ticket.created_at)
+    }
+
+    /// Every still-open ticket for `session_key`, oldest ticket id first.
+    pub fn open_for_session(
+        &self,
+        session_key: &str,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &CardTicket> {
+        self.tickets.values().filter(move |ticket| {
+            ticket.session_key == session_key
+                && ticket.state == TicketState::Open
+                && now < ticket.expires_at
+        })
+    }
+
+    /// Resolve the ticket a `/yes` `/no` shortcut refers to (F8).
+    ///
+    /// The shortcut never guesses: it binds to an explicit ticket id, to the card the
+    /// message replies to, or — only when the session has exactly one pending card —
+    /// to that unambiguous ticket. Two open tickets without a reference is an error,
+    /// so the owner is told to name one rather than silently approving the newest.
+    pub fn resolve_shortcut(
+        &self,
+        session_key: &str,
+        reference: ShortcutRef<'_>,
+        now: SystemTime,
+    ) -> Result<&CardTicket, ShortcutMiss> {
+        if let Some(ticket_id) = reference.ticket_id {
+            return self
+                .open_for_session(session_key, now)
+                .find(|ticket| ticket.ticket_id == ticket_id)
+                .ok_or_else(|| ShortcutMiss::UnknownTicket(ticket_id.to_string()));
+        }
+        if let Some(reply_to) = reference.reply_to
+            && let Some(ticket) = self
+                .open_for_session(session_key, now)
+                .find(|ticket| ticket.card_message_id.as_deref() == Some(reply_to))
+        {
+            return Ok(ticket);
+        }
+        let mut open = self.open_for_session(session_key, now);
+        let Some(only) = open.next() else {
+            return Err(ShortcutMiss::NoneOpen);
+        };
+        if open.next().is_some() {
+            let mut ids: Vec<String> = self
+                .open_for_session(session_key, now)
+                .map(|ticket| ticket.ticket_id.clone())
+                .collect();
+            ids.sort();
+            return Err(ShortcutMiss::Ambiguous(ids));
+        }
+        Ok(only)
+    }
+
+    /// Expire every open ticket for a session (`/new`, `/stop`) so a later `/yes`
+    /// cannot answer a retired instance's pending call.
+    pub fn expire_session(&mut self, session_key: &str) -> Vec<String> {
+        let mut expired = Vec::new();
+        for ticket in self.tickets.values_mut() {
+            if ticket.session_key == session_key && ticket.state == TicketState::Open {
+                ticket.state = TicketState::Expired;
+                expired.push(ticket.ticket_id.clone());
+            }
+        }
+        expired
     }
 
     /// Decode a card action, parsing string `form_value` when needed.
     pub fn answer_card_parsed(
         &mut self,
         action: &CardAction,
+        scope: AnswerScope<'_>,
         now: SystemTime,
     ) -> Result<MappedAnswer, Error> {
         let callback = action.callback()?;
@@ -236,8 +370,28 @@ impl TicketStore {
             None => None,
             Some(v) => Some(parse_form_value(Some(v))?),
         };
-        self.answer_callback(&callback, parsed.as_ref(), now)
+        self.answer_callback(&callback, parsed.as_ref(), scope, now)
     }
+}
+
+/// How a `/yes` `/no` message names the ticket it answers (F8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShortcutRef<'a> {
+    /// Ticket id typed as an argument: `/yes t1a2b3c4d5`.
+    pub ticket_id: Option<&'a str>,
+    /// `message_id` the command replied to, matched against the posted card.
+    pub reply_to: Option<&'a str>,
+}
+
+/// Why a `/yes` `/no` shortcut could not be bound to exactly one ticket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShortcutMiss {
+    /// No open ticket in this session.
+    NoneOpen,
+    /// A ticket id was given but no open ticket in this session matches it.
+    UnknownTicket(String),
+    /// More than one card is pending and the command named none of them.
+    Ambiguous(Vec<String>),
 }
 
 fn new_ticket_id() -> String {
@@ -305,6 +459,7 @@ fn effect_for_a(a: &str) -> Option<DecisionEffect> {
     match a {
         "allow" => Some(DecisionEffect::AllowSession),
         "deny" => Some(DecisionEffect::Deny),
+        // `/yes` maps here (F8): a typed shortcut grants one use, never the session.
         "once" => Some(DecisionEffect::AllowOnce),
         _ => None,
     }

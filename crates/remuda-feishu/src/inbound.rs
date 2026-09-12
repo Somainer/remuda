@@ -321,10 +321,17 @@ pub enum ExplicitCommand {
     Status,
     /// Stop the current run/instance.
     Stop,
-    /// Approval shortcut when the card is unavailable.
-    Yes,
+    /// Approval shortcut when the card is unavailable. Grants one use, not the session.
+    Yes {
+        /// Ticket id typed as `/yes <tid>`; otherwise the reply target or the single
+        /// open card decides. Never "whatever is newest".
+        ticket_id: Option<String>,
+    },
     /// Denial shortcut when the card is unavailable.
-    No,
+    No {
+        /// Ticket id typed as `/no <tid>`.
+        ticket_id: Option<String>,
+    },
 }
 
 /// User intent extracted from a message.
@@ -469,12 +476,35 @@ pub fn parse_intent(content: &str) -> Intent {
         }
         "status" => Intent::Command(ExplicitCommand::Status),
         "stop" => Intent::Command(ExplicitCommand::Stop),
-        "yes" => Intent::Command(ExplicitCommand::Yes),
-        "no" => Intent::Command(ExplicitCommand::No),
+        // F8: `/yes` and `/no` take at most one ticket id and nothing else. A relayed
+        // or quoted block that merely *starts* with `/yes` has trailing words, so it
+        // falls through to UnknownCommand instead of approving a pending call.
+        "yes" | "no" => {
+            let rest: Vec<&str> = parts.collect();
+            let ticket_id = match rest.as_slice() {
+                [] => None,
+                [one] if is_ticket_id(one) => Some((*one).to_string()),
+                _ => {
+                    return Intent::UnknownCommand {
+                        raw: trimmed.to_string(),
+                    };
+                }
+            };
+            if cmd.eq_ignore_ascii_case("yes") {
+                Intent::Command(ExplicitCommand::Yes { ticket_id })
+            } else {
+                Intent::Command(ExplicitCommand::No { ticket_id })
+            }
+        }
         _ => Intent::UnknownCommand {
             raw: trimmed.to_string(),
         },
     }
+}
+
+/// Ticket ids are the first 10 hex chars of a v4 UUID (`tickets.rs` `new_ticket_id`).
+fn is_ticket_id(token: &str) -> bool {
+    token.len() == 10 && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Apply allowlist, mention, and idempotency gates.

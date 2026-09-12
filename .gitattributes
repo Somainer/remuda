@@ -1,0 +1,2 @@
+# Append-only logs: union-merge instead of conflicting on adjacent sections
+docs/design/impl-notes.md merge=union

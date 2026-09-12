@@ -339,6 +339,21 @@ test result: FAILED. 12 passed; 1 failed; 0 ignored
 
 Likely ETXTBSY while replacing a still-running stub binary. Crate test isolation, not a workflow/lockfile issue.
 
+## Outbound WSS runtime peer (2026-09-12)
+
+`WssLink::connect_runtime` is the stdio peer for Hub `GET /v1/node`: it
+dispatches `instance.create` / `send` / `cancel` / `respond` into `DevNode`,
+streams `journal.append` with seq watermarks and a bounded queue, and on
+reconnect resumes from the Hub-acked watermark (no Command replay).
+
+Frames use `remuda_protocol::hubnode` (`rpc_request` / `NodeHelloParams` /
+`JournalAppendParams` / `HubNodeMethod`, landed in `f8826c6`). This Node
+transport does not commit the protocol crate.
+
+Stdio now has the matching composed runtime: `run_stdio_runtime_opts` binds a
+caller `DevNode` (native or fake) so SSH `node --stdio` and outbound WSS share
+the same dispatch + journal pump.
+
 ## hubnode codec status
 
 Landed on main: `remuda_protocol::hubnode` (`f8826c6`, `pub mod hubnode` +

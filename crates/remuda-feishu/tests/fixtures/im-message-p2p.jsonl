@@ -1,0 +1,2 @@
+# Source: synthetic from `lark-cli event schema im.message.receive_v1 --json` (2026-09-12).
+{"type":"im.message.receive_v1","chat_id":"oc_p2p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa","chat_type":"p2p","message_id":"om_p2p_0000000000000000000000000001","event_id":"ev_p2p_1","sender_id":"ou_owner_aaaaaaaaaaaaaaaaaaaaaaaaaa","sender_type":"user","mentions":[],"message_type":"text","content":"please read the README","create_time":"1760000000000","timestamp":"1760000000000"}

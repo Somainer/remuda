@@ -1,0 +1,2 @@
+# Source: synthetic. Topic-group pitfall: no thread_id, only root_id (see bot-dispatcher §1.5 / OpenClaw #53765).
+{"type":"im.message.receive_v1","chat_id":"oc_group_bbbbbbbbbbbbbbbbbbbbbbbbbb","chat_type":"group","message_id":"om_grp_root_only","event_id":"ev_root_only","sender_id":"ou_owner_aaaaaaaaaaaaaaaaaaaaaaaaaa","sender_type":"user","mentions":[{"id":"ou_bot_cccccccccccccccccccccccccccc","key":"@_user_1","name":"Remuda"}],"root_id":"om_root_only_1","message_type":"text","content":"@Remuda continue in this topic"}

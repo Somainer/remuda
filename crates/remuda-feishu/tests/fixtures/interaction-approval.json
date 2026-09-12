@@ -1,0 +1,71 @@
+{
+  "id": "int_01993ab0-0000-7000-8000-000000000002",
+  "revision": "1",
+  "createdAt": "2026-09-12T10:00:00.000Z",
+  "updatedAt": "2026-09-12T10:00:00.000Z",
+  "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+  "runId": "run_01993ab0-0000-7000-8000-000000000001",
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+  "kind": "approval",
+  "requestKey": {
+    "native": {
+      "type": "rpc",
+      "valueType": "string",
+      "value": "native-perm-2"
+    },
+    "processGeneration": "1",
+    "runGeneration": "1",
+    "connectionEpoch": "epoch_01993ab0-0000-7000-8000-000000000001"
+  },
+  "requestVersion": "1",
+  "state": "pending",
+  "blocking": true,
+  "answerable": true,
+  "carrier": "claude-control",
+  "request": {
+    "kind": "approval",
+    "title": "Read README.md",
+    "description": "Claude wants to Read /work/project/README.md",
+    "toolCallId": "obj_01993ab0-0000-7000-8000-000000000001",
+    "actionRef": "obj_01993ab0-0000-7000-8000-000000000002",
+    "options": [
+      {
+        "id": "allow",
+        "label": "Allow",
+        "effect": "allow-session",
+        "nativeValueRef": "obj_01993ab0-0000-7000-8000-000000000003"
+      },
+      {
+        "id": "once",
+        "label": "Allow once",
+        "effect": "allow-once",
+        "nativeValueRef": "obj_01993ab0-0000-7000-8000-000000000004"
+      },
+      {
+        "id": "deny",
+        "label": "Deny",
+        "effect": "deny",
+        "nativeValueRef": "obj_01993ab0-0000-7000-8000-000000000005"
+      }
+    ],
+    "requestedPermissionsRef": null,
+    "inputDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "deadline": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "deadlineSource": "runtime-policy",
+  "answer": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "delivery": "not-sent",
+  "resolution": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  }
+}

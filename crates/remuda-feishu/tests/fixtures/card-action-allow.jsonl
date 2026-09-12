@@ -1,0 +1,2 @@
+# Source: synthetic from `lark-cli event schema card.action.trigger --json` (2026-09-12). action_value is a JSON string.
+{"type":"card.action.trigger","token":"tok_test_allow","action_tag":"button","action_value":"{\"tid\":\"tidallow01\",\"a\":\"allow\"}","action_name":"allow","operator_id":"ou_owner_aaaaaaaaaaaaaaaaaaaaaaaaaa","message_id":"om_card_approval_1","chat_id":"oc_p2p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa","event_id":"ev_card_allow_1","timestamp":"1760000003000"}

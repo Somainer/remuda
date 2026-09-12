@@ -1,0 +1,2 @@
+# Source: synthetic from `lark-cli event schema im.message.receive_v1 --json` (2026-09-12).
+{"type":"im.message.receive_v1","chat_id":"oc_group_bbbbbbbbbbbbbbbbbbbbbbbbbb","chat_type":"group","message_id":"om_grp_0000000000000000000000000002","event_id":"ev_grp_nomention_1","sender_id":"ou_owner_aaaaaaaaaaaaaaaaaaaaaaaaaa","sender_type":"user","mentions":[],"message_type":"text","content":"random group chatter","create_time":"1760000002000","timestamp":"1760000002000"}

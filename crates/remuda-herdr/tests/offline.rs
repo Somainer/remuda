@@ -1,8 +1,11 @@
 //! Offline create→start→prompt→wait→read→close against `fake-herdr`.
 //!
 //! Fixtures: `crates/remuda-testing/fixtures/herdr/` (live herdr 0.9.0 capture).
+//! The `fake-herdr` binary comes from [`remuda_testing::fake_herdr_bin`] (env
+//! `REMUDA_FAKE_HERDR_BIN`, then the already-built target artifact). Nested
+//! `cargo build` is only a last resort and never targets a parent cargo test's
+//! `--target-dir`.
 
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -10,6 +13,7 @@ use remuda_herdr::{
     AgentPromptParams, AgentReadParams, AgentStartParams, AgentStatus, AgentWaitParams, Client,
     PaneSplitParams, ReadSource, SplitDirection, TerminalObserver, WorkspaceCreateParams,
 };
+use remuda_testing::{fake_herdr_bin, herdr_session_ok_path};
 
 struct ChildGuard(Option<Child>);
 
@@ -20,82 +24,6 @@ impl Drop for ChildGuard {
             let _ = child.wait();
         }
     }
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-}
-
-fn cargo_target_dir() -> PathBuf {
-    for key in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-        if let Ok(dir) = std::env::var(key) {
-            let path = PathBuf::from(dir);
-            if path.as_os_str().is_empty() {
-                continue;
-            }
-            if path.is_absolute() {
-                return path;
-            }
-            return workspace_root().join(path);
-        }
-    }
-    workspace_root().join("target")
-}
-
-fn locate_fake_herdr(target_dir: &std::path::Path) -> Option<PathBuf> {
-    let mut dirs = vec![target_dir.to_path_buf()];
-    for key in ["CARGO_BUILD_TARGET", "TARGET"] {
-        if let Ok(triple) = std::env::var(key)
-            && !triple.is_empty()
-        {
-            dirs.push(target_dir.join(triple));
-        }
-    }
-    let names = ["fake-herdr", "fake-herdr.exe"];
-    for dir in dirs {
-        for profile in ["debug", "release"] {
-            for name in names {
-                let candidate = dir.join(profile).join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn fake_herdr_bin() -> PathBuf {
-    let target_dir = cargo_target_dir();
-    let status = Command::new(env!("CARGO"))
-        .current_dir(workspace_root())
-        .args([
-            "build",
-            "-p",
-            "remuda-testing",
-            "--bin",
-            "fake-herdr",
-            "--quiet",
-            "--target-dir",
-        ])
-        .arg(&target_dir)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .env("CARGO_BUILD_TARGET_DIR", &target_dir)
-        .status()
-        .expect("cargo build -p remuda-testing --bin fake-herdr");
-    assert!(
-        status.success(),
-        "cargo build -p remuda-testing --bin fake-herdr failed with {status}"
-    );
-    locate_fake_herdr(&target_dir).unwrap_or_else(|| {
-        panic!(
-            "fake-herdr binary not found under {}/{{debug,release}}",
-            target_dir.display()
-        )
-    })
 }
 
 fn spawn_fake(socket: &std::path::Path, script: &str) -> ChildGuard {
@@ -232,7 +160,7 @@ async fn fake_herdr_ok_flow() {
 
 #[tokio::test]
 async fn recorded_ok_fixture_round_trips_client_types() {
-    let path = workspace_root().join("crates/remuda-testing/fixtures/herdr/session-ok.jsonl");
+    let path = herdr_session_ok_path();
     let body = std::fs::read_to_string(path).unwrap();
     for line in body.lines() {
         let wrapper: serde_json::Value = serde_json::from_str(line).unwrap();

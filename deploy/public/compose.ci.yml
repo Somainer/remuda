@@ -8,14 +8,19 @@ services:
     network_mode: none
   remuda-hub:
     environment:
-      REMUDA_PUBLIC_ORIGIN: https://localhost:${CI_HTTPS_PORT:-18443}
+      REMUDA_PUBLIC_ORIGIN: https://localhost
+    # Keep the Hub from dynamically taking Caddy's reserved proxy address.
+    networks:
+      hub_proxy:
+        ipv4_address: ${CI_HUB_IP:-172.30.29.3}
     depends_on:
       init-data:
         condition: service_completed_successfully
   caddy:
     ports: !override
-      - "127.0.0.1:${CI_HTTP_PORT:-18080}:80"
-      - "127.0.0.1:${CI_HTTPS_PORT:-18443}:443"
+      - target: 443
+        host_ip: 127.0.0.1
+        protocol: tcp
     volumes:
       - ./Caddyfile.ci:/etc/caddy/Caddyfile:ro
 volumes:

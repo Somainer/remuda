@@ -95,8 +95,12 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
                     "hostId": "hst_1",
                     "kind": "claude",
                     "driver": "claude-print",
-                    "lifecycle": "requested",
-                    "activity": "idle"
+                    "lifecycle": "ready",
+                    "activity": "idle",
+                    "title": "reviewer",
+                    "name": "reviewer",
+                    "cwd": "/tmp/wt",
+                    "workspaceId": "/tmp/wt"
                 }],
                 "nextCursor": null
             }),
@@ -118,7 +122,12 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
                         "lifecycle": "requested",
                         "activity": "idle",
                         "connectivity": "disconnected",
-                        "durableSeq": "0"
+                        "durableSeq": "0",
+                        "title": parsed.get("title").cloned().or_else(|| parsed.get("name").cloned()).unwrap_or(json!("ins_test")),
+                        "name": parsed.get("name").cloned(),
+                        "cwd": parsed.get("cwd").cloned(),
+                        "workspaceId": parsed.get("workspaceId").cloned().or_else(|| parsed.get("cwd").cloned()),
+                        "worktree": parsed.get("worktree").cloned()
                     },
                     "command": {
                         "commandId": "cmd_create",
@@ -147,7 +156,10 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
             json!({
                 "instanceId": "ins_test",
                 "durableSeq": "1",
-                "events": [{ "seq": 1, "type": "run.terminal", "event": { "type": "run.terminal" } }]
+                "events": [
+                    { "seq": 1, "type": "run.terminal", "event": { "type": "run.terminal", "text": "DONE abc" } },
+                    { "seq": 2, "type": "raw_tty", "event": { "type": "raw_tty", "text": "screen line" } }
+                ]
             }),
         ),
         (_, path) if path.starts_with("/v1/fleet") => {

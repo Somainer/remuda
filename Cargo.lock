@@ -2905,6 +2905,8 @@ dependencies = [
  "clap",
  "futures",
  "openssl",
+ "regex",
+ "remuda-driver",
  "remuda-hub",
  "remuda-hub-client",
  "remuda-node",

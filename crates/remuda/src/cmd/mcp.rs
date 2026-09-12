@@ -10,9 +10,10 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 
-use super::fleet::{FleetRunOpts, fleet_run};
+use super::fleet::{FleetRunOpts, FleetSendOpts, fleet_run, fleet_send_opts};
 use super::hub_client::{HubClient, HubOpts, block_on};
-use super::instance::{CreateOpts, create, read, send, stop, wait};
+use super::instance::{CreateOpts, create, list_instances, read, send, send_keys, stop, wait};
+use super::worktree;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -95,7 +96,7 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
     vec![
         tool(
             "remuda_instance_create",
-            "Create a Remuda instance on a Hub host (`host`) or matching `labels`.",
+            "Create a Remuda instance on a Hub host (`host`) or matching `labels`. Optional `worktree` runs `git worktree add -b wt/<name>/…` and records the path as the instance workspace cwd.",
             json!({
                 "type": "object",
                 "properties": {
@@ -106,23 +107,38 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
                         "description": "Placement labels (key=value)"
                     },
                     "kind": { "type": "string" },
-                    "driver": { "type": "string" },
+                    "driver": { "type": "string", "description": "claude-print or generic-pty (`pty` alias)" },
                     "workspaceId": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "worktree": { "type": "string" },
+                    "name": { "type": "string" },
                     "title": { "type": "string" },
                     "prompt": { "type": "string" },
+                    "promptFile": { "type": "string" },
                     "commandId": { "type": "string" }
                 }
             }),
         ),
         tool(
-            "remuda_instance_send",
-            "Send a prompt to a running instance.",
+            "remuda_instance_list",
+            "List instances (name, kind, status, cwd, host).",
             json!({
                 "type": "object",
-                "required": ["instanceId", "text"],
+                "properties": {
+                    "host": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "remuda_instance_send",
+            "Send a prompt to a running instance. `file` is a local path read by this MCP process.",
+            json!({
+                "type": "object",
+                "required": ["instanceId"],
                 "properties": {
                     "instanceId": { "type": "string" },
                     "text": { "type": "string" },
+                    "file": { "type": "string" },
                     "commandId": { "type": "string" },
                     "completionScope": { "type": "string" }
                 }
@@ -130,12 +146,13 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
         ),
         tool(
             "remuda_instance_wait",
-            "Wait until a run is terminal, or timeout (default 30000 ms).",
+            "Wait until idle, done, blocked, or line:<regex> (default done, timeout 30000 ms).",
             json!({
                 "type": "object",
                 "required": ["instanceId"],
                 "properties": {
                     "instanceId": { "type": "string" },
+                    "until": { "type": "string", "description": "idle | done | blocked | line:<regex>" },
                     "condition": { "type": "string" },
                     "afterSeq": { "type": "string" },
                     "timeoutMs": { "type": "integer" }
@@ -144,14 +161,28 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
         ),
         tool(
             "remuda_instance_read",
-            "Read mirrored journal observations for an instance.",
+            "Read the last N lines from screen (tty) or journal.",
             json!({
                 "type": "object",
                 "required": ["instanceId"],
                 "properties": {
                     "instanceId": { "type": "string" },
                     "afterSeq": { "type": "string" },
-                    "limit": { "type": "integer" }
+                    "lines": { "type": "integer" },
+                    "limit": { "type": "integer" },
+                    "source": { "type": "string", "description": "screen | journal" }
+                }
+            }),
+        ),
+        tool(
+            "remuda_instance_keys",
+            "Send logical keys (enter, esc, ctrl+c) via tty.write. Requires a tty-attach driver (generic-pty).",
+            json!({
+                "type": "object",
+                "required": ["instanceId", "keys"],
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "keys": { "type": "array", "items": { "type": "string" } }
                 }
             }),
         ),
@@ -166,6 +197,32 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
                     "scope": { "type": "string" },
                     "runId": { "type": "string" },
                     "commandId": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "remuda_instance_rm",
+            "Close an instance (`instance.close`).",
+            json!({
+                "type": "object",
+                "required": ["instanceId"],
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "commandId": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "remuda_worktree_create",
+            "Create a git worktree (`git worktree add -b wt/<name>/…`). Default path `../remuda-wt/<name>`.",
+            json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "base": { "type": "string" },
+                    "path": { "type": "string" },
+                    "repo": { "type": "string" }
                 }
             }),
         ),
@@ -186,6 +243,19 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
                 }
             }),
         ),
+        tool(
+            "remuda_fleet_send",
+            "Broadcast a prompt to running instances (`all` or `labels`).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "all": { "type": "boolean" },
+                    "labels": { "type": "array", "items": { "type": "string" } },
+                    "text": { "type": "string" },
+                    "file": { "type": "string" }
+                }
+            }),
+        ),
     ]
 }
 
@@ -200,17 +270,14 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value> {
     match name {
         "remuda_instance_create" => create(client, create_opts_from_json(&args)?).await,
+        "remuda_instance_list" => list_instances(client, opt_str(&args, "host")).await,
         "remuda_instance_send" => {
             let instance_id = required_str(&args, "instanceId")?;
-            let text = args
-                .get("text")
-                .and_then(Value::as_str)
-                .or_else(|| args.get("input").and_then(Value::as_str))
-                .ok_or_else(|| anyhow!("text is required"))?;
+            let text = send_text_from_args(&args)?;
             send(
                 client,
                 instance_id,
-                text,
+                &text,
                 opt_str(&args, "commandId"),
                 opt_str(&args, "completionScope").unwrap_or("native-turn"),
                 "mcp",
@@ -222,11 +289,15 @@ async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value>
             let timeout_ms = args
                 .get("timeoutMs")
                 .and_then(Value::as_u64)
+                .or_else(|| args.get("timeout").and_then(Value::as_u64))
                 .unwrap_or(30_000);
+            let until = opt_str(&args, "until")
+                .or_else(|| opt_str(&args, "condition"))
+                .unwrap_or("done");
             wait(
                 client,
                 instance_id,
-                opt_str(&args, "condition").unwrap_or("run-terminal"),
+                until,
                 opt_str(&args, "afterSeq"),
                 timeout_ms,
             )
@@ -234,8 +305,23 @@ async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value>
         }
         "remuda_instance_read" => {
             let instance_id = required_str(&args, "instanceId")?;
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-            read(client, instance_id, opt_str(&args, "afterSeq"), limit).await
+            let lines = args
+                .get("lines")
+                .and_then(Value::as_u64)
+                .or_else(|| args.get("limit").and_then(Value::as_u64))
+                .unwrap_or(120) as usize;
+            read(
+                client,
+                instance_id,
+                opt_str(&args, "afterSeq"),
+                lines,
+                opt_str(&args, "source").unwrap_or("journal"),
+            )
+            .await
+        }
+        "remuda_instance_keys" => {
+            let instance_id = required_str(&args, "instanceId")?;
+            send_keys(client, instance_id, &string_list(&args, "keys")).await
         }
         "remuda_instance_stop" => {
             let instance_id = required_str(&args, "instanceId")?;
@@ -248,12 +334,66 @@ async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value>
             )
             .await
         }
+        "remuda_instance_rm" => {
+            let instance_id = required_str(&args, "instanceId")?;
+            stop(
+                client,
+                instance_id,
+                "instance",
+                None,
+                opt_str(&args, "commandId"),
+            )
+            .await
+        }
+        "remuda_worktree_create" => {
+            let name = required_str(&args, "name")?;
+            let base = opt_str(&args, "base").unwrap_or("main");
+            let path = opt_str(&args, "path").map(std::path::PathBuf::from);
+            let repo = opt_str(&args, "repo").map(std::path::PathBuf::from);
+            let record = worktree::create(name, base, path.as_deref(), repo.as_deref())?;
+            Ok(json!({
+                "name": record.name,
+                "path": record.path,
+                "branch": record.branch,
+                "base": record.base,
+            }))
+        }
         "remuda_fleet_run" => fleet_run(client, fleet_opts_from_json(&args)?).await,
+        "remuda_fleet_send" => {
+            let text = send_text_from_args(&args)?;
+            fleet_send_opts(
+                client,
+                FleetSendOpts {
+                    all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+                    labels: string_list(&args, "labels"),
+                    text,
+                },
+            )
+            .await
+        }
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
 
+fn send_text_from_args(args: &Value) -> Result<String> {
+    if let Some(path) = opt_str(args, "file") {
+        return std::fs::read_to_string(path).map_err(|err| anyhow!("read {path}: {err}"));
+    }
+    args.get("text")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("input").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("text or file is required"))
+}
+
 fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
+    let mut prompt = opt_str(args, "prompt").map(str::to_string);
+    if prompt.is_none()
+        && let Some(path) = opt_str(args, "promptFile")
+    {
+        prompt = Some(std::fs::read_to_string(path).map_err(|err| anyhow!("read {path}: {err}"))?);
+    }
     Ok(CreateOpts {
         host: opt_str(args, "host").map(str::to_string),
         labels: string_list(args, "labels"),
@@ -263,8 +403,11 @@ fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
             other => other.to_string(),
         },
         workspace_id: opt_str(args, "workspaceId").map(str::to_string),
+        cwd: opt_str(args, "cwd").map(str::to_string),
+        worktree: opt_str(args, "worktree").map(str::to_string),
+        name: opt_str(args, "name").map(str::to_string),
         title: opt_str(args, "title").map(str::to_string),
-        prompt: opt_str(args, "prompt").map(str::to_string),
+        prompt,
         command_id: opt_str(args, "commandId").map(str::to_string),
     })
 }
@@ -470,11 +613,16 @@ mod tests {
             .collect();
         for expected in [
             "remuda_instance_create",
+            "remuda_instance_list",
             "remuda_instance_send",
             "remuda_instance_wait",
             "remuda_instance_read",
+            "remuda_instance_keys",
             "remuda_instance_stop",
+            "remuda_instance_rm",
+            "remuda_worktree_create",
             "remuda_fleet_run",
+            "remuda_fleet_send",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
@@ -486,6 +634,52 @@ mod tests {
         let msg = json!({"jsonrpc":"2.0","id":9,"method":"nope"});
         let resp = handle_rpc(&msg, &client).await.expect("response");
         assert_eq!(resp["error"]["code"], json!(-32601));
+    }
+
+    #[tokio::test]
+    async fn tools_call_list_keys_and_fleet_send_against_mock_hub() {
+        let mock = spawn_mock_hub().await;
+        let client = connect_for_test(format!("http://{}", mock.addr), "t".into()).expect("client");
+        let list = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": { "name": "remuda_instance_list", "arguments": {} }
+        });
+        let resp = handle_rpc(&list, &client).await.expect("list");
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+        let body: Value = serde_json::from_str(text).expect("json");
+        assert_eq!(body["items"][0]["name"], json!("reviewer"));
+        assert_eq!(body["items"][0]["cwd"], json!("/tmp/wt"));
+        assert_eq!(body["items"][0]["host"], json!("sg"));
+
+        let keys = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "remuda_instance_keys",
+                "arguments": { "instanceId": "ins_test", "keys": ["enter"] }
+            }
+        });
+        let resp = handle_rpc(&keys, &client).await.expect("keys");
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+
+        let send = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "remuda_fleet_send",
+                "arguments": { "all": true, "text": "PAUSE git commits" }
+            }
+        });
+        let resp = handle_rpc(&send, &client).await.expect("fleet send");
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+        let body: Value = serde_json::from_str(text).expect("json");
+        assert_eq!(body["sent"], json!(1));
     }
 
     #[tokio::test]

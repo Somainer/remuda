@@ -23,13 +23,23 @@ Device bearer auth is sent as `Authorization: Bearer`. Mutating Hub calls omit
 ## `remuda instance`
 
 ```text
-remuda instance create --host hst_… --prompt "cargo test -p remuda"
-remuda instance create --labels region=sg --kind claude --driver claude-print
-remuda instance send ins_… --text "continue"
-remuda instance wait ins_… --condition run-terminal --timeout-ms 30000
-remuda instance read ins_… --after-seq 0 --limit 100
-remuda instance stop ins_… --scope run
+remuda worktree create reviewer --base main --path ../remuda-wt/reviewer
+remuda instance create --name reviewer --kind codex --driver generic-pty --worktree reviewer --prompt-file brief.md
+remuda instance list
+remuda instance send reviewer --file brief.md
+remuda instance wait reviewer --until idle --timeout 120000
+remuda instance wait reviewer --until 'line:DONE ' --timeout 120000
+remuda instance read reviewer --lines 120 --source journal
+remuda instance keys reviewer enter
+remuda instance stop reviewer --scope run
+remuda instance rm reviewer
+remuda fleet send --all "PAUSE git commits"
 ```
+
+`--worktree <name>` runs `git worktree add -b wt/<name>/…` when needed and
+records the path as the instance workspace `cwd`. `pty` is an alias for
+`generic-pty` (tty-attach). `wait --timeout` is milliseconds (alias
+`--timeout-ms`). `send --file` is an alias of `--input-file`.
 
 `--host` and `--labels` are mutually exclusive. Until Hub placement ships,
 `--labels` (or neither flag: `placement.any`) is resolved client-side from
@@ -48,6 +58,9 @@ remuda fleet run --labels region=sg --max 3 --prompt "cargo test"
 
 Always `POST /v1/fleet/instances` with `{spec, hosts|labels, max}` as in
 proposal §4.6.
+
+`remuda fleet send --all|--labels` broadcasts `instance.send` to matching
+running instances (no fleet id required).
 
 ## `remuda mcp`
 
@@ -69,9 +82,13 @@ stdio JSON-RPC 2.0 MCP server for Claude Code `--mcp-config`. Framing is LSP
 }
 ```
 
-Tools: `remuda_instance_create`, `remuda_instance_send`,
-`remuda_instance_wait`, `remuda_instance_read`, `remuda_instance_stop`,
-`remuda_fleet_run`.
+Checked-in example: `docs/design/remuda-mcp.json` (`docs/design/remuda-mcp.md`).
+
+Tools: `remuda_instance_create`, `remuda_instance_list`, `remuda_instance_send`,
+`remuda_instance_wait`, `remuda_instance_read`, `remuda_instance_keys`,
+`remuda_instance_stop`, `remuda_instance_rm`, `remuda_worktree_create`,
+`remuda_fleet_run`, `remuda_fleet_send`. Coordinator skill:
+`skills/remuda/SKILL.md`.
 
 ## Workflow example
 

@@ -12,6 +12,77 @@ fn bin() -> &'static str {
 }
 
 #[test]
+fn instance_create_help_lists_worktree_and_name() {
+    let output = Command::new(bin())
+        .args(["instance", "create", "--help"])
+        .output()
+        .expect("help");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--worktree"), "{stdout}");
+    assert!(stdout.contains("--name"), "{stdout}");
+    assert!(stdout.contains("--cwd"), "{stdout}");
+}
+
+#[test]
+fn instance_wait_help_lists_until() {
+    let output = Command::new(bin())
+        .args(["instance", "wait", "--help"])
+        .output()
+        .expect("help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--until"), "{stdout}");
+    assert!(stdout.contains("--timeout"), "{stdout}");
+}
+
+#[test]
+fn instance_read_help_lists_lines_and_source() {
+    let output = Command::new(bin())
+        .args(["instance", "read", "--help"])
+        .output()
+        .expect("help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--lines"), "{stdout}");
+    assert!(stdout.contains("--source"), "{stdout}");
+}
+
+#[test]
+fn worktree_create_help_lists_base_and_path() {
+    let output = Command::new(bin())
+        .args(["worktree", "create", "--help"])
+        .output()
+        .expect("help");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--base"), "{stdout}");
+    assert!(stdout.contains("--path"), "{stdout}");
+}
+
+#[test]
+fn fleet_send_help_lists_all_and_labels() {
+    let output = Command::new(bin())
+        .args(["fleet", "send", "--help"])
+        .output()
+        .expect("help");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--all"), "{stdout}");
+    assert!(stdout.contains("--labels"), "{stdout}");
+}
+
+#[test]
 fn instance_create_help_lists_host_and_labels() {
     let output = Command::new(bin())
         .args(["instance", "create", "--help"])
@@ -134,7 +205,11 @@ fn mcp_stdio_initialize_list_and_call() {
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
     assert!(names.contains(&"remuda_instance_create".into()));
+    assert!(names.contains(&"remuda_instance_list".into()));
+    assert!(names.contains(&"remuda_instance_keys".into()));
+    assert!(names.contains(&"remuda_worktree_create".into()));
     assert!(names.contains(&"remuda_fleet_run".into()));
+    assert!(names.contains(&"remuda_fleet_send".into()));
 
     let call: Value = serde_json::from_str(lines[2]).expect("call");
     assert_eq!(call["result"]["isError"], json!(false));

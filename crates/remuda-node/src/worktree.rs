@@ -163,14 +163,27 @@ pub fn resolve_instance_cwd(
     workspace_root: &Path,
     cwd: Option<&str>,
 ) -> Result<PathBuf, NodeError> {
-    let Some(raw) = cwd.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok(workspace_root.to_path_buf());
+    // The configured root may be relative (`DevServerConfig` defaults to
+    // `"."`); resolve it against the process cwd before anything else.
+    let workspace_root = if workspace_root.is_absolute() {
+        workspace_root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace_root)
     };
-    let candidate = path_guard::absolutize(workspace_root, Path::new(raw));
+    // Always return a canonical path, whichever branch produced it. The
+    // `Some` branch gets one from `contain`, so the fallback must canonicalize
+    // too or callers see two different spellings of the same directory — on
+    // macOS the temp dir is `/var/...`, a symlink to `/private/var/...`.
+    let Some(raw) = cwd.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return path_guard::real_path(&workspace_root).map_err(|error| {
+            NodeError::InvalidRequest(format!("workspace root is unusable: {error}"))
+        });
+    };
+    let candidate = path_guard::absolutize(&workspace_root, Path::new(raw));
     // The worktree root is advisory here: a Node whose workspace has no parent
     // simply has no second root, rather than failing every create.
-    let worktrees = path_guard::worktree_root(workspace_root).ok();
-    let mut roots: Vec<&Path> = vec![workspace_root];
+    let worktrees = path_guard::worktree_root(&workspace_root).ok();
+    let mut roots: Vec<&Path> = vec![&workspace_root];
     if let Some(worktrees) = worktrees.as_deref() {
         roots.push(worktrees);
     }
@@ -478,6 +491,62 @@ mod tests {
         assert_eq!(resolved, root.canonicalize().unwrap());
         assert_eq!(resolve_instance_cwd(&root, Some("  ")).unwrap(), resolved);
         drop(keep);
+    }
+
+    /// Every branch must return the same spelling of the same directory.
+    ///
+    /// On macOS the temp dir is `/var/folders/…`, and `/var` is a symlink to
+    /// `/private/var`, so a workspace root reached through a symlink has two
+    /// valid spellings. The `Some` branch canonicalizes via `contain`; if the
+    /// `None` fallback did not, callers would get different paths for the same
+    /// workspace depending on whether `cwd` was supplied. This test builds
+    /// that symlink shape explicitly so it fails on Linux too.
+    #[test]
+    #[cfg(unix)]
+    fn instance_cwd_is_canonical_through_a_symlinked_root() {
+        let keep = TempDir::new().expect("tempdir");
+        let real_parent = keep.path().join("private");
+        fs::create_dir_all(real_parent.join("repo")).unwrap();
+        // `link` stands in for macOS's /var -> /private/var.
+        let link = keep.path().join("var");
+        std::os::unix::fs::symlink(&real_parent, &link).unwrap();
+
+        let via_symlink = link.join("repo");
+        let canonical = via_symlink.canonicalize().unwrap();
+        assert_ne!(
+            via_symlink, canonical,
+            "the fixture must exercise a symlink"
+        );
+
+        // Default (no cwd) and explicit cwd must agree, and both must be the
+        // resolved path rather than the symlinked spelling.
+        let defaulted = resolve_instance_cwd(&via_symlink, None).expect("default cwd");
+        assert_eq!(defaulted, canonical);
+        let explicit = resolve_instance_cwd(&via_symlink, Some(&via_symlink.to_string_lossy()))
+            .expect("explicit cwd");
+        assert_eq!(explicit, defaulted);
+
+        // A real directory under the symlinked root is still accepted: this is
+        // the case that would break every launch on a macOS host if the
+        // containment check compared a canonical path against a raw root.
+        let sub = via_symlink.join("crates");
+        fs::create_dir_all(&sub).unwrap();
+        let resolved = resolve_instance_cwd(&via_symlink, Some(&sub.to_string_lossy()))
+            .expect("a directory under the symlinked root must be accepted");
+        assert_eq!(resolved, sub.canonicalize().unwrap());
+    }
+
+    /// A Node may be configured with a relative workspace root
+    /// (`DevServerConfig` defaults to `"."`), which must still resolve rather
+    /// than being rejected as "not a plain absolute path".
+    #[test]
+    fn instance_cwd_accepts_a_relative_workspace_root() {
+        let resolved = resolve_instance_cwd(Path::new("."), None).expect("relative root");
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
     }
 
     #[test]

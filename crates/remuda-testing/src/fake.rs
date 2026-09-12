@@ -29,6 +29,13 @@ pub enum FakeClaudeError {
 
 /// Run the fake until stdin EOF. Returns the process exit code.
 pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("2.1.268 (Claude Code)");
+        return Ok(0);
+    }
     let flags = ClaudeFlags::parse(std::env::args().skip(1));
     let session_id = flags
         .session_id

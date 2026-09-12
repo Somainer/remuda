@@ -248,3 +248,18 @@ fn captured_fixtures_are_present() {
         assert!(path.is_file(), "missing {}", path.display());
     }
 }
+
+#[test]
+fn fake_claude_prints_version_and_exits() {
+    let bin = env!("CARGO_BIN_EXE_fake-claude");
+    let output = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .expect("run fake-claude --version");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("2.1.268"),
+        "unexpected --version output: {stdout}"
+    );
+}

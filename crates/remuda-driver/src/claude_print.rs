@@ -62,6 +62,12 @@ pub struct ClaudePrintOptions {
     pub launch_dir: PathBuf,
     /// Registered `CLAUDE_CONFIG_DIR`.
     pub native_home: PathBuf,
+    /// Let Claude resolve its default config directory instead of exporting
+    /// `CLAUDE_CONFIG_DIR`.
+    ///
+    /// This is opt-in because it exposes the host user's native Claude login
+    /// and settings to the launched process.
+    pub inherit_default_config: bool,
     /// Binary to pin and exec.
     pub binary: BinarySource,
     /// Launch origin; bot/agent cannot request bypass (D-011).
@@ -88,6 +94,7 @@ impl ClaudePrintOptions {
             profile,
             launch_dir,
             native_home,
+            inherit_default_config: false,
             binary,
             origin: InputOrigin::Human,
             broker: Arc::new(EnvFileSecretBroker),
@@ -268,7 +275,11 @@ impl ClaudePrintDriver {
         for (key, value) in &self.options.extra_env {
             command.env(key, value);
         }
-        command.env("CLAUDE_CONFIG_DIR", &recipe.native_home);
+        configure_native_home(
+            &mut command,
+            &recipe.native_home,
+            self.options.inherit_default_config,
+        );
 
         let (inbound, outbound, process) = ClaudeProcess::spawn_command(
             command,
@@ -381,6 +392,45 @@ impl ClaudePrintDriver {
             }
         }
         Ok(env)
+    }
+}
+
+fn configure_native_home(command: &mut Command, native_home: &str, inherit_default: bool) {
+    // Claude Code's macOS login lookup changes namespaces when this variable is
+    // present, even when it names the default ~/.claude directory. Omit it only
+    // for the explicit host-login opt-in; isolated homes remain the default.
+    if !inherit_default {
+        command.env("CLAUDE_CONFIG_DIR", native_home);
+    }
+}
+
+#[cfg(test)]
+mod native_home_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn configured_value(command: &Command) -> Option<Option<&OsStr>> {
+        command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "CLAUDE_CONFIG_DIR").then_some(value))
+    }
+
+    #[test]
+    fn isolated_home_is_exported() {
+        let mut command = Command::new("claude");
+        configure_native_home(&mut command, "/tmp/isolated-claude", false);
+        assert_eq!(
+            configured_value(&command).flatten(),
+            Some(OsStr::new("/tmp/isolated-claude"))
+        );
+    }
+
+    #[test]
+    fn inherited_default_does_not_override_environment() {
+        let mut command = Command::new("claude");
+        configure_native_home(&mut command, "/tmp/not-exported", true);
+        assert_eq!(configured_value(&command), None);
     }
 }
 

@@ -19,6 +19,9 @@ a{color:var(--cold);text-decoration:none}
 a:hover{color:var(--paper)}
 @keyframes dim{0%,100%{opacity:1}50%{opacity:.35}}
 @keyframes spin{to{transform:rotate(360deg)}}
+@keyframes ember{0%{background-position:0% 50%}100%{background-position:200% 50%}}
+@keyframes halo{0%,100%{box-shadow:0 0 0 0 rgba(201,132,42,.5),0 0 10px 2px rgba(201,132,42,.35)}50%{box-shadow:0 0 0 8px rgba(201,132,42,0),0 0 16px 4px rgba(201,132,42,.5)}}
+@keyframes spark{0%{transform:translateY(0) scale(1);opacity:0}20%{opacity:1}100%{transform:translateY(-13px) scale(.4);opacity:0}}
 @media (prefers-reduced-motion:reduce){*{animation:none !important}}
 </style>
 </helmet>
@@ -419,7 +422,7 @@ a:hover{color:var(--paper)}
 </div>
 </div>
 
-<div style="flex:1;overflow:hidden;padding:14px 18px;display:flex;flex-direction:column;gap:11px">
+<div style="flex:1;overflow:hidden;padding:14px 18px;display:flex;flex-direction:column;gap:6px">
 
 <div style="display:flex;flex-direction:column;gap:5px;align-items:flex-end">
 <div style="display:flex;align-items:baseline;gap:8px"><div style="font-size:12px;color:var(--mute)">You</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">12:01</div></div>
@@ -428,7 +431,7 @@ a:hover{color:var(--paper)}
 
 <div style="display:flex;align-items:center;gap:8px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)"><span>▸</span><span>思考 · 2 段</span><span style="color:var(--line)">·</span><span>默认折叠</span></div>
 
-<div style="border:1px solid var(--line);border-radius:4px;background:var(--ink-2);overflow:hidden">
+<div style="flex:none;border:1px solid var(--line);border-radius:4px;background:var(--ink-2);overflow:hidden">
 <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line)">
 <div style="font-size:13px;font-weight:600;color:var(--paper)">Bash</div>
 <div style="display:flex;align-items:center;gap:6px"><div style="width:7px;height:7px;border-radius:50%;background:var(--cold);animation:dim 1.4s ease-in-out infinite"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">running · 无 exit，不画成功</div></div>
@@ -438,12 +441,11 @@ a:hover{color:var(--paper)}
 <div style="padding:9px 12px 7px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper)">$ ninja -C build QueueFlushTest</div>
 <div style="padding:0 12px 6px;display:flex;align-items:center;gap:7px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)"><span>▾</span><span>stdout · 12 行</span></div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute);line-height:1.6;border-left:1px solid var(--line);margin:0 12px 10px;padding-left:10px">
-<div>[12/48] Building CXX object src/queue.cc.o</div>
 <div>[13/48] Building CXX object src/exec.cc.o</div>
 </div>
 </div>
 
-<div style="border:1px solid var(--line);border-radius:4px;background:var(--ink-2);overflow:hidden">
+<div style="flex:none;border:1px solid var(--line);border-radius:4px;background:var(--ink-2);overflow:hidden">
 <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line)">
 <div style="font-size:13px;font-weight:600;color:var(--paper)">Edit</div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">src/queue.cc</div>
@@ -460,7 +462,7 @@ a:hover{color:var(--paper)}
 </div>
 </div>
 
-<div style="border:1px solid var(--line);border-radius:4px;background:var(--ink-2);overflow:hidden">
+<div style="flex:none;border:1px solid var(--line);border-radius:4px;background:var(--ink-2);overflow:hidden">
 <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line)">
 <div style="font-size:13px;font-weight:600;color:var(--paper)">Workflow</div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">wf_9f3</div>
@@ -516,21 +518,25 @@ a:hover{color:var(--paper)}
 </div>
 </sc-if>
 
-<div style="flex:none;border-top:1px solid var(--line);padding:12px 18px;display:flex;align-items:flex-end;gap:12px">
-<div style="flex:1;min-height:44px;border:1px solid var(--line);border-radius:4px;background:var(--ink-0);padding:11px 12px;font-size:14px;color:var(--mute)">输入提示词…<span style="font-family:'IBM Plex Mono',monospace;font-size:11px;margin-left:10px">Enter 送出 · Shift+Enter 换行 · IME 组字期间不送</span></div>
-<div style="position:relative;display:flex">
-<div style="position:absolute;bottom:40px;left:0;width:326px;border:1px solid var(--line);border-radius:4px;background:var(--ink-2);padding:7px 0;display:flex;flex-direction:column">
-<div style="padding:5px 12px 8px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute);letter-spacing:0.06em">EFFORT · 本回合生效，发 Command 不只改本地</div>
-<div style="display:flex;align-items:center;gap:10px;padding:7px 12px"><div style="width:11px;height:11px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper);width:92px">fast</div><div style="font-size:12px;color:var(--mute);flex:1">少想，直接动手</div></div>
-<div style="display:flex;align-items:center;gap:10px;padding:7px 12px;background:var(--ink)"><div style="width:11px;height:11px;border-radius:50%;border:3px solid var(--paper);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper);width:92px">standard</div><div style="font-size:12px;color:var(--mute);flex:1">默认</div></div>
-<div style="display:flex;align-items:center;gap:10px;padding:7px 12px"><div style="width:11px;height:11px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper);width:92px">deep</div><div style="font-size:12px;color:var(--mute);flex:1">跨文件重构、长任务</div></div>
-<div style="display:flex;align-items:center;gap:10px;padding:7px 12px"><div style="width:11px;height:11px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--dust);width:92px">ultracode</div><div style="font-size:12px;color:var(--mute);flex:1">最高预算 · 慢且贵</div></div>
-<div style="border-top:1px solid var(--line);margin-top:5px;padding:8px 12px 3px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute);line-height:1.5">切换只影响后续回合，不重写已发出的 prompt</div>
+<div style="flex:none;border-top:1px solid var(--line);padding:12px 18px 13px;display:flex;flex-direction:column;gap:9px">
+<div style="min-height:44px;border:1px solid var(--line);border-radius:4px;background:var(--ink-0);padding:11px 12px;font-size:14px;color:var(--mute)">输入提示词…<span style="font-family:'IBM Plex Mono',monospace;font-size:11px;margin-left:10px">Enter 送出 · Shift+Enter 换行 · IME 组字期间不送</span></div>
+<div style="display:flex;align-items:center;gap:7px">
+<div style="height:30px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;gap:7px;flex:none">
+<div style="width:16px;height:16px;border:1px solid var(--line);border-radius:3px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--paper)">C</div>
+<div style="font-size:12.5px">Claude Code</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">▾</div>
 </div>
-<div style="height:32px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 11px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--paper)">effort standard ▴</div>
+<div style="height:30px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;gap:7px;flex:none">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)">opus</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--paper)">think</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">▾</div>
 </div>
-<div style="height:32px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 11px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">权限 询问 ▾</div>
-<div style="height:32px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 16px;font-size:13px;color:var(--paper);font-weight:500">送出</div>
+<div style="height:30px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;gap:7px;flex:none">
+<div style="width:14px;height:14px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;position:relative;flex:none"><div style="position:absolute;inset:2px;border-radius:50%;background:var(--cold);clip-path:polygon(0 0,100% 0,100% 74%,0 74%)"></div></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)">74%</div>
+</div>
+<div style="height:30px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute);flex:none">权限 询问 ▾</div>
+<div style="flex:1"></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">控件按 harness 能力表出现</div>
+<div style="height:32px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 16px;font-size:13px;color:var(--paper);font-weight:500;flex:none">送出</div>
+</div>
 </div>
 </div>
 
@@ -610,10 +616,11 @@ a:hover{color:var(--paper)}
 <div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;background:var(--ink-0);display:flex;align-items:center;padding:0 12px;font-size:14px;color:var(--mute)">输入提示词…</div>
 <div style="width:44px;height:44px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:15px;color:var(--paper)">↑</div>
 </div>
-<div style="flex:none;padding:0 14px 10px;display:flex;align-items:center;gap:10px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">
-<div style="height:26px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px">权限 询问 ▾</div>
-<div style="height:26px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px">effort standard ▾</div>
-<div>Enter 换行</div>
+<div style="flex:none;padding:0 14px 10px;display:flex;align-items:center;gap:7px">
+<div style="height:32px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;gap:6px;flex:none"><div style="width:15px;height:15px;border:1px solid var(--line);border-radius:3px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:9px">C</div><div style="font-size:12px">Claude</div><div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">▾</div></div>
+<div style="height:32px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;gap:6px;flex:none"><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--paper)">think</div><div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">▾</div></div>
+<div style="height:32px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;gap:6px;flex:none"><div style="width:13px;height:13px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;position:relative"><div style="position:absolute;inset:2px;border-radius:50%;background:var(--cold);clip-path:polygon(0 0,100% 0,100% 74%,0 74%)"></div></div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">74%</div></div>
+<div style="height:32px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 9px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);flex:none">询问 ▾</div>
 </div>
 <div style="height:20px;flex:none;display:flex;align-items:flex-start;justify-content:center"><div style="width:134px;height:5px;border-radius:3px;background:var(--line)"></div></div>
 </div>
@@ -683,6 +690,10 @@ a:hover{color:var(--paper)}
 <div style="border-left:1px solid var(--line);padding-left:14px;display:flex;flex-direction:column;gap:6px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">Workflow member ≠ Instance</div>
 <div style="font-size:13px;color:var(--mute);line-height:1.55">只有 <span style="font-family:'IBM Plex Mono',monospace;color:var(--paper)">childInstanceId</span> 存在才可点进 /s/:id，否则「打开」是虚线禁用态而不是隐藏 —— 让人看得见为什么点不了。</div>
+</div>
+<div style="border-left:1px solid var(--line);padding-left:14px;display:flex;flex-direction:column;gap:6px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">composer 控件条</div>
+<div style="font-size:13px;color:var(--mute);line-height:1.55">harness / 模型+effort / 上下文 / 权限 四枚芯片常驻在输入框下方，全部收起态；展开形态见 <a href="#1k">1k</a>。</div>
 </div>
 <div style="border-left:1px solid var(--line);padding-left:14px;display:flex;flex-direction:column;gap:6px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">print 没有终端 tab</div>
@@ -942,11 +953,11 @@ a:hover{color:var(--paper)}
 <div style="display:flex;flex-direction:column;gap:7px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">effort</div>
 <div style="display:flex;gap:8px;align-items:center">
-<div style="height:36px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">fast</div>
-<div style="height:36px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper)">standard</div>
-<div style="height:36px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">deep</div>
+<div style="height:36px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">default</div>
+<div style="height:36px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper)">think</div>
+<div style="height:36px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">think-hard</div>
 <div style="height:36px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 14px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--dust)">ultracode</div>
-<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">写进 InstanceSpec，会话内可再改</div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">Claude Code 档位表 · 换 harness 整排换名</div>
 </div>
 </div>
 <div style="border-top:1px solid var(--line);padding-top:13px;display:flex;flex-direction:column;gap:10px">
@@ -1016,9 +1027,9 @@ a:hover{color:var(--paper)}
 <div style="display:flex;flex-direction:column;gap:8px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">effort</div>
 <div style="display:flex;gap:7px">
-<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">fast</div>
-<div style="flex:1;height:44px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--paper)">standard</div>
-<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">deep</div>
+<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">default</div>
+<div style="flex:1;height:44px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--paper)">think</div>
+<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">think-hard</div>
 <div style="flex:1.25;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--dust)">ultracode</div>
 </div>
 </div>
@@ -1557,7 +1568,7 @@ a:hover{color:var(--paper)}
 <div style="height:22px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 9px;font-size:12px;color:var(--paper)">打开</div>
 </div>
 <div style="padding:9px 12px;display:flex;flex-direction:column;gap:8px">
-<div style="display:flex;align-items:center;gap:8px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)"><span>passthrough/fast</span><span style="color:var(--line)">·</span><span>ins_4e77</span><span style="color:var(--line)">·</span><span style="color:var(--paper)">effort standard</span></div>
+<div style="display:flex;align-items:center;gap:8px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)"><span>passthrough/fast</span><span style="color:var(--line)">·</span><span>ins_4e77</span><span style="color:var(--line)">·</span><span style="color:var(--paper)">effort think</span></div>
 <div style="border:1px solid var(--line);border-radius:4px;padding:8px 10px;display:flex;flex-direction:column;gap:6px;background:var(--ink)">
 <div style="display:flex;align-items:center;gap:8px"><div style="font-size:12.5px;font-weight:600">Bash</div><div style="width:6px;height:6px;border-radius:50%;background:var(--cold)"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">当前工具</div></div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--paper);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">cargo test -p uploader -- --nocapture</div>
@@ -1724,7 +1735,7 @@ a:hover{color:var(--paper)}
 </div>
 <div style="border-left:1px solid var(--line);padding-left:14px;display:flex;flex-direction:column;gap:6px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">effort 落在 member 上</div>
-<div style="font-size:13px;color:var(--mute);line-height:1.55">最高档用琥珀描边标出来 —— 它是花钱的那一档，值得在 run 视图里一眼认出。</div>
+<div style="font-size:13px;color:var(--mute);line-height:1.55">最高档（ultracode / ultra / max）用琥珀标出 —— 它是花钱的那一档，值得在 run 视图里一眼认出。</div>
 </div>
 <div style="border-left:1px solid var(--line);padding-left:14px;display:flex;flex-direction:column;gap:6px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">不猜 DAG</div>
@@ -1811,19 +1822,33 @@ a:hover{color:var(--paper)}
 <div style="display:flex;flex-direction:column;gap:11px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">默认 effort</div>
 <div style="display:flex;gap:8px;align-items:center">
-<div style="height:38px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">fast</div>
-<div style="height:38px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper)">standard</div>
-<div style="height:38px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">deep</div>
+<div style="height:38px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">default</div>
+<div style="height:38px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;padding:0 15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper)">think</div>
+<div style="height:38px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--mute)">think-hard</div>
 <div style="height:38px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--dust)">ultracode</div>
 </div>
-<div style="border:1px solid var(--line);border-radius:4px;padding:11px 13px;display:flex;flex-direction:column;gap:9px">
-<div style="font-size:13px;color:var(--paper)">最高档按运行时取原生名</div>
-<div style="display:grid;grid-template-columns:auto 1fr;gap:7px 14px;font-family:'IBM Plex Mono',monospace;font-size:11.5px">
-<div style="color:var(--mute)">claude</div><div style="color:var(--dust)">ultracode</div>
-<div style="color:var(--mute)">codex</div><div style="color:var(--dust)">ultra</div>
-<div style="color:var(--mute)">其它 kind</div><div style="color:var(--mute)">该 CLI 自己的最高档；缺失则回落 deep</div>
+<div style="display:flex;flex-direction:column;gap:9px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">composer 内展开态</div>
+<div style="display:flex;align-items:flex-end;gap:12px">
+<div style="width:326px;border:1px solid var(--line);border-radius:4px;background:var(--ink-2);padding:7px 0;display:flex;flex-direction:column;flex:none">
+<div style="padding:5px 12px 8px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute);letter-spacing:0.06em">EFFORT · 本回合生效，发 Command 不只改本地</div>
+<div style="display:flex;align-items:center;gap:10px;padding:7px 12px"><div style="width:11px;height:11px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper);width:92px">default</div><div style="font-size:12px;color:var(--mute);flex:1">不额外思考</div></div>
+<div style="display:flex;align-items:center;gap:10px;padding:7px 12px;background:var(--ink)"><div style="width:11px;height:11px;border-radius:50%;border:3px solid var(--paper);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper);width:92px">think</div><div style="font-size:12px;color:var(--mute);flex:1">默认档</div></div>
+<div style="display:flex;align-items:center;gap:10px;padding:7px 12px"><div style="width:11px;height:11px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--paper);width:92px">think-hard</div><div style="font-size:12px;color:var(--mute);flex:1">跨文件重构、长任务</div></div>
+<div style="display:flex;align-items:center;gap:10px;padding:7px 12px"><div style="width:11px;height:11px;border-radius:50%;border:1px solid var(--line);box-sizing:border-box;flex:none"></div><div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--dust);width:92px">ultracode</div><div style="font-size:12px;color:var(--mute);flex:1">最高档 · 慢且贵</div></div>
+<div style="border-top:1px solid var(--line);margin-top:5px;padding:8px 12px 3px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute);line-height:1.5">切换只影响后续回合，不重写已发出的 prompt</div>
 </div>
-<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.55">UI 里第四格永远是「最高档」这个槽位，标签随 kind 变，不做二次确认。</div>
+<div style="flex:1;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.6;padding-bottom:4px">1b 的 composer 里这个菜单默认折叠成一枚芯片 —— 审批卡就在它正上方，展开态不能压住审批按钮。</div>
+</div>
+</div>
+<div style="border:1px solid var(--line);border-radius:4px;padding:11px 13px;display:flex;flex-direction:column;gap:9px">
+<div style="font-size:13px;color:var(--paper)">档位表按 harness 走</div>
+<div style="display:grid;grid-template-columns:auto 1fr;gap:7px 14px;font-family:'IBM Plex Mono',monospace;font-size:11.5px">
+<div style="color:var(--mute)">claude</div><div>default · think · think-hard · <span style="color:var(--dust)">ultracode</span></div>
+<div style="color:var(--mute)">codex</div><div>low · medium · high · <span style="color:var(--dust)">ultra</span></div>
+<div style="color:var(--mute)">grok</div><div>quick · standard · <span style="color:var(--dust)">max</span></div>
+</div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.55">档数不一定是四。这里存序号，换 harness 后按新表就近映射；最高档恒为 ember 档。</div>
 </div>
 </div>
 </div>
@@ -1892,9 +1917,9 @@ a:hover{color:var(--paper)}
 <div style="display:flex;flex-direction:column;gap:9px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">默认 effort</div>
 <div style="display:flex;gap:7px">
-<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">fast</div>
-<div style="flex:1;height:44px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px">standard</div>
-<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">deep</div>
+<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">default</div>
+<div style="flex:1;height:44px;border:1px solid var(--paper);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px">think</div>
+<div style="flex:1;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">think-hard</div>
 <div style="flex:1.25;height:44px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;justify-content:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--dust)">ultracode</div>
 </div>
 </div>
@@ -1994,7 +2019,7 @@ a:hover{color:var(--paper)}
 </div>
 <div style="border-left:1px solid var(--line);padding-left:14px;display:flex;flex-direction:column;gap:6px">
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">effort 三个落点</div>
-<div style="font-size:13px;color:var(--mute);line-height:1.55">设置里定默认、新建会话里定本次、composer 里改本回合；ultracode 全程琥珀描边；不支持这个名字的 kind 就用它自己的最高档。</div>
+<div style="font-size:13px;color:var(--mute);line-height:1.55">设置里定默认、新建会话里定本次、composer 里改本回合；最高档全程琥珀；档位名永远取 harness 原生表。</div>
 </div>
 </div>
 </sc-if>
@@ -2038,7 +2063,7 @@ a:hover{color:var(--paper)}
 <div style="display:flex;align-items:center;gap:9px">
 <div style="width:8px;height:8px;border-radius:50%;background:var(--cold);animation:dim 1.5s ease-in-out infinite;flex:none"></div>
 <div style="font-size:14px;font-weight:600;flex:1">attempt A</div>
-<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">deep</div>
+<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">high</div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">02:41</div>
 </div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);padding-left:17px">wt/backpressure-a · ins_9a01</div>
@@ -2062,7 +2087,7 @@ a:hover{color:var(--paper)}
 <div style="display:flex;align-items:center;gap:9px">
 <div style="width:8px;height:8px;border-radius:50%;background:var(--cold);animation:dim 1.5s ease-in-out infinite;flex:none"></div>
 <div style="font-size:14px;font-weight:600;flex:1;color:var(--mute)">attempt C</div>
-<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">standard</div>
+<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">medium</div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">01:58</div>
 </div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);padding-left:17px">wt/backpressure-c · ins_9a03</div>
@@ -2073,7 +2098,7 @@ a:hover{color:var(--paper)}
 <div style="display:flex;align-items:center;gap:9px">
 <div style="width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none"></div>
 <div style="font-size:14px;font-weight:600;flex:1;color:var(--mute)">attempt D</div>
-<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">fast</div>
+<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">low</div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">00:52</div>
 </div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);padding-left:17px">wt/backpressure-d · ins_9a04 · idle</div>
@@ -2101,7 +2126,7 @@ a:hover{color:var(--paper)}
 <div style="width:110px">attempt</div><div style="width:96px">状态</div><div style="width:110px">改动</div><div style="width:92px">测试</div><div style="width:78px">用时</div><div style="width:70px">成本</div><div style="flex:1">摘要</div>
 </div>
 <div style="display:flex;align-items:center;padding:11px 12px;border-bottom:1px solid var(--line);background:var(--ink-2);font-size:13px">
-<div style="width:110px;display:flex;align-items:center;gap:8px"><div style="width:7px;height:7px;border-radius:50%;background:var(--cold)"></div><span style="font-weight:600">A</span><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">deep</span></div>
+<div style="width:110px;display:flex;align-items:center;gap:8px"><div style="width:7px;height:7px;border-radius:50%;background:var(--cold)"></div><span style="font-weight:600">A</span><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">high</span></div>
 <div style="width:96px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)">running</div>
 <div style="width:110px;font-family:'IBM Plex Mono',monospace;font-size:11.5px"><span style="color:var(--ok)">+128</span> <span style="color:var(--mute)">−34 / 6</span></div>
 <div style="width:92px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)">— 未跑完</div>
@@ -2119,7 +2144,7 @@ a:hover{color:var(--paper)}
 <div style="flex:1;color:var(--dust);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">卡在审批 · rm -rf target/ 前置清理</div>
 </div>
 <div style="display:flex;align-items:center;padding:11px 12px;border-bottom:1px solid var(--line);font-size:13px">
-<div style="width:110px;display:flex;align-items:center;gap:8px"><div style="width:7px;height:7px;border-radius:50%;background:var(--cold)"></div><span style="font-weight:600">C</span><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">standard</span></div>
+<div style="width:110px;display:flex;align-items:center;gap:8px"><div style="width:7px;height:7px;border-radius:50%;background:var(--cold)"></div><span style="font-weight:600">C</span><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">medium</span></div>
 <div style="width:96px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)">running</div>
 <div style="width:110px;font-family:'IBM Plex Mono',monospace;font-size:11.5px"><span style="color:var(--ok)">+41</span> <span style="color:var(--mute)">−12 / 2</span></div>
 <div style="width:92px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)">— 未跑完</div>
@@ -2128,7 +2153,7 @@ a:hover{color:var(--paper)}
 <div style="flex:1;color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">只在 send 路径加信号量，动得最少</div>
 </div>
 <div style="display:flex;align-items:center;padding:11px 12px;font-size:13px">
-<div style="width:110px;display:flex;align-items:center;gap:8px"><div style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></div><span style="font-weight:600">D</span><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">fast</span></div>
+<div style="width:110px;display:flex;align-items:center;gap:8px"><div style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></div><span style="font-weight:600">D</span><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">low</span></div>
 <div style="width:96px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--mute)">idle</div>
 <div style="width:110px;font-family:'IBM Plex Mono',monospace;font-size:11.5px"><span style="color:var(--ok)">+63</span> <span style="color:var(--mute)">−8 / 3</span></div>
 <div style="width:92px;font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:var(--ok)">48 / 48 通过</div>
@@ -2237,7 +2262,7 @@ a:hover{color:var(--paper)}
 <div style="display:flex;align-items:center;gap:9px">
 <div style="width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none"></div>
 <div style="font-size:15px;font-weight:600;flex:1">attempt D</div>
-<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">fast</div>
+<div style="height:19px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 6px;font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute)">low</div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">00:52</div>
 </div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">wt/backpressure-d · <span style="color:var(--ok)">+63</span> −8 / 3 文件</div>
@@ -2266,7 +2291,7 @@ a:hover{color:var(--paper)}
 <div style="width:8px;height:8px;border-radius:50%;background:var(--cold);animation:dim 1.5s ease-in-out infinite;flex:none"></div>
 <div style="flex:1;display:flex;flex-direction:column;gap:4px">
 <div style="font-size:15px">attempt A</div>
-<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">deep · +128 −34 / 6 · 02:41</div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">high · +128 −34 / 6 · 02:41</div>
 </div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--mute)">›</div>
 </div>
@@ -2275,7 +2300,7 @@ a:hover{color:var(--paper)}
 <div style="width:8px;height:8px;border-radius:50%;background:var(--cold);animation:dim 1.5s ease-in-out infinite;flex:none"></div>
 <div style="flex:1;display:flex;flex-direction:column;gap:4px">
 <div style="font-size:15px">attempt C</div>
-<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">standard · +41 −12 / 2 · 01:58</div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">medium · +41 −12 / 2 · 01:58</div>
 </div>
 <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--mute)">›</div>
 </div>
@@ -2318,41 +2343,121 @@ a:hover{color:var(--paper)}
 </div>
 </div>
 
-</section>
-</x-dc>
-<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;night&quot;,&quot;ledger&quot;],&quot;default&quot;:&quot;night&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;主题&quot;},&quot;showAnnotations&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;画板&quot;},&quot;showMobile&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;画板&quot;},&quot;composerSurface&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;approval&quot;,&quot;question&quot;,&quot;none&quot;],&quot;default&quot;:&quot;approval&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;会话页&quot;}}">
-class Component extends DCLogic {
-  state = { override: null };
+<div id="1j" style="display:flex;flex-direction:column;gap:18px">
+<div style="display:flex;align-items:center;gap:12px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink);background:var(--paper);border-radius:4px;padding:3px 8px;font-weight:500">1j</div>
+<div style="font-size:19px;font-weight:600;color:var(--paper)">终端模拟 · 行为与交互</div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">§2.3 展开 · 1c 是版面，这张是终端本身怎么表现</div>
+</div>
+<div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap">
 
-  theme() { return this.state.override ?? this.props.theme ?? 'night'; }
-  apply() { document.body.setAttribute('data-theme', this.theme()); }
-  componentDidMount() { this.apply(); }
-  componentDidUpdate(prev) {
-    if (prev.theme !== this.props.theme && this.state.override) this.setState({ override: null });
-    this.apply();
-  }
+<div style="display:flex;flex-direction:column;gap:10px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">桌面 1440 × 900 · 选区 + 搜索 + 回滚缓冲</div>
+<div style="width:1440px;height:900px;background:var(--ink);border:1px solid var(--line);border-radius:4px;overflow:hidden;display:flex;flex-direction:column;color:var(--paper);font-size:14px">
 
-  renderVals() {
-    const surface = this.props.composerSurface ?? 'approval';
-    const theme = this.theme();
-    const t = theme === 'ledger'
-      ? { name: '方案 B · Shop Ledger', ink: 'ink F3F0EA', ink2: 'ink-2 FAF8F3', line: 'line C5C1B7', paper: 'paper 1E2A32', mute: 'mute 5E6B72', dust: 'stamp 8C6A16', cold: 'steel 3D5A68', ok: 'ok 556A3C' }
-      : { name: '方案 A · Night Corral', ink: 'ink 12161C', ink2: 'ink-2 1A212B', line: 'line 2A3340', paper: 'paper E7DCC8', mute: 'mute 8B7F6A', dust: 'dust C9842A', cold: 'cold 6A8B9A', ok: 'ok 7A8F62' };
-    return {
-      schemeName: t.name,
-      tokInk: t.ink, tokInk2: t.ink2, tokLine: t.line, tokPaper: t.paper,
-      tokMute: t.mute, tokDust: t.dust, tokCold: t.cold, tokOk: t.ok,
-      isNight: theme === 'night',
-      isLedger: theme === 'ledger',
-      setNight: () => this.setState({ override: 'night' }, () => this.apply()),
-      setLedger: () => this.setState({ override: 'ledger' }, () => this.apply()),
-      showAnnotations: this.props.showAnnotations ?? true,
-      showMobile: this.props.showMobile ?? true,
-      showApproval: surface === 'approval',
-      showQuestion: surface === 'question'
-    };
-  }
-}
-</script>
-</body>
-</html>
+<div style="flex:none;border-bottom:1px solid var(--line);padding:10px 18px;display:flex;align-items:center;gap:14px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:14px;color:var(--mute)">←</div>
+<div style="font-size:15px;font-weight:600">stream-svc / uploader</div>
+<div style="display:flex;border:1px solid var(--line);border-radius:4px;overflow:hidden;height:28px">
+<div style="display:flex;align-items:center;padding:0 13px;font-size:13px;color:var(--mute)">结构</div>
+<div style="display:flex;align-items:center;padding:0 13px;font-size:13px;background:var(--ink-2);gap:7px"><div style="width:7px;height:7px;border-radius:50%;background:var(--cold)"></div>终端</div>
+</div>
+<div style="flex:1"></div>
+<div style="display:flex;align-items:center;gap:9px;border:1px solid var(--paper);border-radius:4px;height:28px;padding:0 10px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--mute)">⌕</div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--paper);width:96px">backpressure<span style="display:inline-block;width:1px;height:13px;background:var(--paper);vertical-align:-2px"></span></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--dust)">3 / 12</div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">↑ ↓ Esc</div>
+</div>
+<div style="height:28px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 10px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">120×34</div>
+<div style="height:28px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 10px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">A 13px ▾</div>
+</div>
+
+<div style="flex:1;display:flex;min-height:0">
+<div style="flex:1;min-width:0;background:var(--ink-0);position:relative;display:flex;flex-direction:column">
+
+<div style="flex:none;padding:7px 20px;background:var(--ink-2);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--dust)">已上滚 214 行 · 实时输出暂停跟随</div>
+<div style="flex:1"></div>
+<div style="height:22px;border:1px solid var(--dust);border-radius:4px;display:flex;align-items:center;padding:0 9px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--dust)">跳到底部 ↓</div>
+</div>
+
+<div style="flex:1;padding:14px 20px;overflow:hidden;font-family:'IBM Plex Mono',monospace;font-size:13px;line-height:1.72;color:var(--paper);position:relative">
+<div style="color:var(--mute)">  Compiling uploader v0.4.1 (/home/dev/stream-svc/uploader)</div>
+<div style="color:var(--mute)">    Finished test profile in 2.41s</div>
+<div style="height:8px"></div>
+<div style="color:var(--mute)">running 48 tests</div>
+<div><span style="background:var(--paper);color:var(--ink-0)">test backpressure::drops_when_full … ok</span></div>
+<div><span style="background:var(--paper);color:var(--ink-0)">test backpressure::blocks_sender … ok</span></div>
+<div><span style="background:var(--paper);color:var(--ink-0)">test backpressure::resumes_after_drain … ok</span></div>
+<div style="color:var(--mute)">test queue::flush_guarded … ok</div>
+<div style="color:var(--mute)">test queue::drain_budget … ok</div>
+<div style="height:8px"></div>
+<div style="color:var(--mute)">  ⎿ 3 行已选中 · ⌘C 复制 · 双击选词 · 三击选行</div>
+<div style="height:8px"></div>
+<div><span style="color:var(--cold)">✻</span> Waiting on 12 remaining tests <span style="color:var(--mute)">(esc to interrupt · 41s)</span></div>
+<div style="height:10px"></div>
+<div><span style="color:var(--mute)">&gt; </span><span style="background:var(--paper);color:var(--ink-0)">&nbsp;</span></div>
+
+<div style="position:absolute;right:20px;top:14px;bottom:14px;width:4px;background:var(--line);border-radius:2px">
+<div style="position:absolute;top:34%;height:26%;left:0;right:0;background:var(--mute);border-radius:2px"></div>
+<div style="position:absolute;top:38%;left:-4px;width:12px;height:2px;background:var(--dust)"></div>
+<div style="position:absolute;top:46%;left:-4px;width:12px;height:2px;background:var(--dust)"></div>
+<div style="position:absolute;top:61%;left:-4px;width:12px;height:2px;background:var(--dust)"></div>
+</div>
+</div>
+
+<div style="flex:none;border-top:1px solid var(--line);padding:9px 20px;display:flex;align-items:center;gap:14px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">
+<span>scrollback 5000 行 · 环形缓冲</span><span style="color:var(--line)">·</span><span>alternate-screen 不进 scrollback</span><span style="color:var(--line)">·</span><span>选区期间不自动跟随</span>
+<div style="flex:1"></div>
+<span style="color:var(--paper)">直连</span><span>· 击键即 PTY</span>
+</div>
+</div>
+
+<div style="width:400px;flex:none;border-left:1px solid var(--line);display:flex;flex-direction:column;overflow:hidden">
+<div style="flex:none;padding:12px 16px;border-bottom:1px solid var(--line);font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);letter-spacing:0.06em">模拟契约 · 这些必须明确</div>
+<div style="flex:1;padding:14px 16px;display:flex;flex-direction:column;gap:11px;overflow:hidden">
+
+<div style="border:1px solid var(--line);border-radius:4px;padding:11px 13px;display:flex;flex-direction:column;gap:7px">
+<div style="display:flex;align-items:center;gap:9px"><div style="font-size:13px;font-weight:600;flex:1">尺寸协商</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">resize</div></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.6">前端 fit 出 cols×rows → 发 <span style="color:var(--paper)">tty.resize</span> → Node Agent 对 PTY 发 SIGWINCH。多端同看时以<span style="color:var(--paper)">最小公共尺寸</span>为准，另一端显示「已按 80×24 收窄」而不是各画各的。</div>
+</div>
+
+<div style="border:1px solid var(--line);border-radius:4px;padding:11px 13px;display:flex;flex-direction:column;gap:7px">
+<div style="display:flex;align-items:center;gap:9px"><div style="font-size:13px;font-weight:600;flex:1">重放与补洞</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">replay</div></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.6">附着时服务端回放最后 N KB raw 字节重建屏幕，不回放整段历史。断线重连按 <span style="color:var(--paper)">seq</span> 续传；缺口无法补时插一条可见分隔线，不静默拼接。</div>
+</div>
+
+<div style="border:1px solid var(--line);border-radius:4px;padding:11px 13px;display:flex;flex-direction:column;gap:7px">
+<div style="display:flex;align-items:center;gap:9px"><div style="font-size:13px;font-weight:600;flex:1">粘贴保护</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">bracketed paste</div></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.6">默认走 bracketed paste。含换行的多行粘贴先弹确认——远端可能直接执行。</div>
+<div style="border:1px solid var(--dust);border-radius:4px;padding:8px 10px;display:flex;flex-direction:column;gap:6px">
+<div style="font-size:12px;color:var(--dust)">粘贴 6 行，其中 4 行会立即执行</div>
+<div style="display:flex;gap:7px"><div style="height:26px;border:1px solid var(--dust);border-radius:4px;display:flex;align-items:center;padding:0 10px;font-size:12px;color:var(--dust)">仍然粘贴</div><div style="height:26px;border:1px solid var(--line);border-radius:4px;display:flex;align-items:center;padding:0 10px;font-size:12px">取消</div></div>
+</div>
+</div>
+
+<div style="border:1px solid var(--line);border-radius:4px;padding:11px 13px;display:flex;flex-direction:column;gap:7px">
+<div style="display:flex;align-items:center;gap:9px"><div style="font-size:13px;font-weight:600;flex:1">鼠标上报</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">mouse tracking</div></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.6">远端开启上报时，拖拽归远端、选区归 <span style="color:var(--paper)">⌥ 拖拽</span>；状态栏常驻一枚 <span style="color:var(--paper)">mouse</span> 标记说明当前归属，不让人以为选不中是 bug。</div>
+</div>
+
+<div style="border:1px solid var(--line);border-radius:4px;padding:11px 13px;display:flex;flex-direction:column;gap:7px">
+<div style="display:flex;align-items:center;gap:9px"><div style="font-size:13px;font-weight:600;flex:1">渲染与降级</div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">renderer</div></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute);line-height:1.6">WebGL 优先，失败回落 canvas。高频输出触发节流合帧，状态栏出现 <span style="color:var(--paper)">输出受限</span> 而不是让页面卡死。</div>
+</div>
+
+<div style="flex:1"></div>
+<div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute);line-height:1.6;border-top:1px solid var(--line);padding-top:11px">终端只负责画字节。它不解析 Claude 的框线、不因为看见 ANSI 就切视图 —— 结构化信息永远从 journal 来。</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+<sc-if value="{{ showMobile }}" hint-placeholder-val="{{ true }}">
+<div style="display:flex;gap:24px">
+<div style="display:flex;flex-direction:column;gap:10px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--mute)">手机 · 手势与选区</div>
+<div style="width:390px;height:844px;background:var(--ink);border:1px solid var(--line);border-radius:4px;overflow:hidden;display:flex;flex-direction:column;color:var(--paper);font-size:14px">
+<div style="height:34px;flex:

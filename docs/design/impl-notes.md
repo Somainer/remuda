@@ -381,3 +381,318 @@ acks, duplicate journal-gap acks, reconnects, hello rejects, clock skew,
 pending drops). Chaos suite and `remuda node --self-test` are not in this
 slice.
 
+## M1 local end-to-end (2026-09-12)
+
+**Result: PASS on this Mac.** A loopback Hub served the embedded production web build, enrolled a native Node over outbound WebSocket, exposed its host inventory, drove a two-turn fake `claude-print` instance through Hub HTTP while observing the Hub follow WebSocket, and completed one authenticated real Haiku turn. The real turn returned `REAL_OK`, `turn_done`, 53 reported tokens, and USD `0.019000499999999997`, below the USD 0.3 hard cap. All bootstrap, device, and host token values below are redacted; the machine hostname returned by inventory is also intentionally omitted.
+
+Runtime evidence was kept below `/tmp/remuda-m1`; it is not repository state. The shared target directory required by the implementation rules was used throughout:
+
+```sh
+cd /Users/dev/Documents/Projects/Community/remuda-wt/x-gate
+export CARGO_TARGET_DIR=/Users/dev/Documents/Projects/Community/hybrid-harness/target
+
+(cd web && pnpm install --frozen-lockfile && pnpm build)
+cargo build -p remuda -p remuda-testing --bin remuda --bin fake-claude --locked
+
+mkdir -p /tmp/remuda-m1/hub /tmp/remuda-m1/node /tmp/remuda-m1/logs \
+  /tmp/remuda-m1/workspace /tmp/remuda-m1/fake-transcripts
+openssl rand -hex 32 > /tmp/remuda-m1/bootstrap-token
+cp /tmp/remuda-m1/bootstrap-token /tmp/remuda-m1/host-enrollment-token
+chmod 600 /tmp/remuda-m1/bootstrap-token /tmp/remuda-m1/host-enrollment-token
+```
+
+The web build completed with 391 modules and emitted `dist/index.html`, 58.57 kB of CSS, and 986 kB of JavaScript (Vite also emitted its normal chunk-size warning). The Hub was started with its data directory exactly under the requested root:
+
+```sh
+env REMUDA_WEB_PASSWORD_FILE=/tmp/remuda-m1/bootstrap-token \
+  REMUDA_COOKIE_SECURE=false RUST_LOG=info \
+  "$CARGO_TARGET_DIR/debug/remuda" \
+  --data-dir /tmp/remuda-m1/hub \
+  hub --listen 127.0.0.1:18180
+```
+
+```text
+2026-09-12T10:27:00.943221Z INFO remuda hub listening address=127.0.0.1:18180
+```
+
+The embedded web asset—not a `--web-root` override—was read back from that Hub:
+
+```sh
+curl --silent --show-error --dump-header /tmp/remuda-m1/logs/web.headers \
+  --output /tmp/remuda-m1/logs/web.html http://127.0.0.1:18180/
+awk 'NR == 1 { print $2 }' /tmp/remuda-m1/logs/web.headers
+awk 'BEGIN { IGNORECASE=1 } /^content-type:/ { gsub("\\r", ""); print $2 }' \
+  /tmp/remuda-m1/logs/web.headers
+rg -o '<title>[^<]+' /tmp/remuda-m1/logs/web.html
+```
+
+```text
+200
+text/html;
+<title>runtime
+```
+
+Login used the bootstrap secret from its private file and persisted the returned device token in another private file. Secret values are deliberately not reproduced:
+
+```sh
+jq -n --rawfile bootstrapToken /tmp/remuda-m1/bootstrap-token \
+  '{bootstrapToken:($bootstrapToken | rtrimstr("\n")),deviceName:"m1-local"}' \
+  > /tmp/remuda-m1/login.json
+curl --silent --show-error -X POST http://127.0.0.1:18180/v1/login \
+  -H 'Content-Type: application/json' --data-binary @/tmp/remuda-m1/login.json \
+  > /tmp/remuda-m1/login-response.json
+jq -r .token /tmp/remuda-m1/login-response.json > /tmp/remuda-m1/device-token
+chmod 600 /tmp/remuda-m1/device-token
+jq '{deviceId,name,token:"[REDACTED]"}' /tmp/remuda-m1/login-response.json
+```
+
+```json
+{"deviceId":"dev_01a09528-b810-7388-9c02-034e169e949d","name":"m1-local","token":"[REDACTED]"}
+```
+
+### Enrollment and inventory
+
+The first Node connection presented the bootstrap/enrollment token. `remuda` persisted the Hub-issued per-host token as mode 0600 and reused it for every subsequent connection:
+
+```sh
+env REMUDA_CLAUDE_BIN="$CARGO_TARGET_DIR/debug/fake-claude" \
+  FAKE_CLAUDE_SCRIPT="$PWD/crates/remuda-testing/fixtures/scripts/ok.jsonl" \
+  FAKE_CLAUDE_TRANSCRIPT_DIR=/tmp/remuda-m1/fake-transcripts RUST_LOG=info \
+  "$CARGO_TARGET_DIR/debug/remuda" --data-dir /tmp/remuda-m1/node node \
+  --hub-url ws://127.0.0.1:18180/v1/node \
+  --host-token-file /tmp/remuda-m1/host-enrollment-token \
+  --label site=local --label mode=m1 --max-instances 2
+
+stat -f '%Sp %z %N' /tmp/remuda-m1/node/node/host-token \
+  /tmp/remuda-m1/node/node/host-id
+```
+
+```text
+2026-09-12T10:27:44.208816Z INFO Node enrolled with Hub and runtime dispatch is active host_id=hst_01a09528-6abf-753a-be54-05cedb3c51f5
+-rw------- 65 /tmp/remuda-m1/node/node/host-token
+-rw------- 41 /tmp/remuda-m1/node/node/host-id
+```
+
+The authenticated `GET /v1/hosts` result, reduced only to the requested inventory fields, was:
+
+```json
+{
+  "hostId": "hst_01a09528-6abf-753a-be54-05cedb3c51f5",
+  "online": true,
+  "transport": "outbound-wss",
+  "labels": ["mode=m1", "site=local"],
+  "maxInstances": 2,
+  "cli": [
+    {"kind":"claude","path":"/Users/dev/.local/share/claude/versions/2.1.269","version":"2.1.269 (Claude Code)","auth":"logged_in"},
+    {"kind":"codex","path":"/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js","version":"codex-cli 0.145.0","auth":"logged_in"},
+    {"kind":"grok","path":"/Users/dev/.grok/downloads/grok-1.0.30-macos-aarch64","version":"grok 1.0.30 (04b7ffed98c6) [stable]","auth":"logged_in"},
+    {"kind":"agy","path":"/Users/dev/.local/bin/agy","version":"1.2.2","auth":"logged_out"},
+    {"kind":"gemini","path":null,"version":null,"auth":"unknown"}
+  ],
+  "herdr": {
+    "path": "/Users/dev/.local/bin/herdr",
+    "version": "herdr 0.9.0",
+    "socket": "/Users/dev/.config/herdr/herdr.sock"
+  }
+}
+```
+
+### Fake `claude-print`: create, follow, second turn, cancel
+
+The canonical fake request body and HTTP call were:
+
+```json
+{
+  "hostId": "hst_01a09528-6abf-753a-be54-05cedb3c51f5",
+  "kind": "claude",
+  "driver": "claude-print",
+  "model": "haiku",
+  "permissionMode": "dontAsk",
+  "title": "m1-fake-canonical",
+  "prompt": "First fake turn."
+}
+```
+
+```sh
+read -r REMUDA_M1_DEVICE_TOKEN < /tmp/remuda-m1/device-token
+curl --silent --show-error -X POST http://127.0.0.1:18180/v1/instances \
+  -H "Authorization: Bearer ${REMUDA_M1_DEVICE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/remuda-m1/fake-create-canonical.json
+```
+
+```json
+{"instanceId":"ins_01a0952b-6d12-7093-99a4-e169be031b1e","operation":"instance.create","state":"accepted","resolution":"clear","forwarded":true}
+```
+
+The Hub follow socket was opened with the device bearer token. Its initial snapshot had `asOfSeq=9`; while that socket remained open, the second turn and cancellation below produced live event frames at sequences 10 through 17:
+
+```sh
+python3 -c 'import json,websocket; token=open("/tmp/remuda-m1/device-token").read().strip(); iid=open("/tmp/remuda-m1/fake-canonical-id").read().strip(); ws=websocket.create_connection(f"ws://127.0.0.1:18180/v1/follow?instanceId={iid}",header=[f"Authorization: Bearer {token}"],timeout=10); [print(json.dumps((lambda f: {"type":f["type"],"seq":f.get("seq"),"kind":f.get("event",{}).get("kind"),"asOfSeq":f.get("asOfSeq"),"eventCount":len(f.get("events",[]))})(json.loads(ws.recv())))) for _ in range(9)]; ws.close()'
+```
+
+```text
+{"type":"snapshot","seq":null,"kind":null,"asOfSeq":"9","eventCount":9}
+{"type":"event","seq":"10","kind":"lifecycle"}
+{"type":"event","seq":"11","kind":"message"}
+{"type":"event","seq":"12","kind":"lifecycle"}
+{"type":"event","seq":"13","kind":"message"}
+{"type":"event","seq":"14","kind":"lifecycle"}
+{"type":"event","seq":"15","kind":"lifecycle"}
+{"type":"event","seq":"16","kind":"lifecycle"}
+{"type":"event","seq":"17","kind":"usage"}
+```
+
+```sh
+REMUDA_M1_FAKE_ID=$(< /tmp/remuda-m1/fake-canonical-id)
+curl --silent --show-error -X POST \
+  "http://127.0.0.1:18180/v1/instances/${REMUDA_M1_FAKE_ID}/commands" \
+  -H "Authorization: Bearer ${REMUDA_M1_DEVICE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/remuda-m1/fake-canonical-send.json
+curl --silent --show-error -X POST \
+  "http://127.0.0.1:18180/v1/instances/${REMUDA_M1_FAKE_ID}/commands" \
+  -H "Authorization: Bearer ${REMUDA_M1_DEVICE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/remuda-m1/fake-canonical-cancel.json
+```
+
+```json
+{"operation":"instance.send","state":"accepted","resolution":"clear","forwarded":true,"replayed":false}
+{"operation":"instance.cancel","state":"accepted","resolution":"clear","forwarded":true,"replayed":false}
+```
+
+The durable journal reached sequence 19 after Node shutdown. It contains `First fake turn.` at seq 4/6, assistant `OK` at seq 7, `Second fake turn through Hub HTTP.` at seq 11/13, accepted/settled send at seq 10/12, and accepted/settled cancel at seq 14/15. The paired user entries are the Node command-intent observation and Claude-compatible native echo, not duplicate HTTP sends.
+
+### One real Haiku model turn
+
+The first live-login design used an isolated `CLAUDE_CONFIG_DIR`. On Claude Code 2.1.269 for macOS, even setting that variable to the normal `~/.claude` path changes the credential namespace. Two preflight driver launches therefore returned `Not logged in · Please run /login`; both journals reported zero input tokens, zero output tokens, and USD 0, so neither reached an upstream model. These fail-closed instances were `ins_01a09531-8324-77b7-a533-9a480a414475` and `ins_01a0953b-7243-7037-9f16-5285b2cea68f`. No prompt was replayed.
+
+The fix adds an explicit, default-off `REMUDA_CLAUDE_INHERIT_DEFAULT_CONFIG=1` mode. It removes `CLAUDE_CONFIG_DIR` after materialized environment resolution, rejects combining the mode with an explicit config directory, and retains isolated per-instance homes by default. Before the bounded request, the non-model probe was:
+
+```sh
+/Users/dev/.local/bin/claude auth status \
+  | jq '{loggedIn,authMethod,configDirectory}'
+```
+
+```json
+{"loggedIn":true,"authMethod":"claude.ai","configDirectory":"/Users/dev/.claude"}
+```
+
+The real Node used a workspace-only config:
+
+```toml
+[node]
+workspace = "/tmp/remuda-m1/workspace"
+```
+
+```sh
+env REMUDA_CLAUDE_BIN=/Users/dev/.local/bin/claude \
+  REMUDA_CLAUDE_INHERIT_DEFAULT_CONFIG=1 RUST_LOG=info \
+  /tmp/remuda-m1/remuda-x-gate \
+  --data-dir /tmp/remuda-m1/node --config /tmp/remuda-m1/real-node.toml node \
+  --hub-url ws://127.0.0.1:18180/v1/node \
+  --host-token-file /tmp/remuda-m1/node/node/host-token \
+  --label site=local --label mode=m1 --max-instances 2
+```
+
+```text
+2026-09-12T10:52:07.317541Z INFO Node enrolled with Hub and runtime dispatch is active host_id=hst_01a09528-6abf-753a-be54-05cedb3c51f5
+```
+
+The only request that reached the model was capped in the HTTP spec:
+
+```json
+{
+  "hostId": "hst_01a09528-6abf-753a-be54-05cedb3c51f5",
+  "kind": "claude",
+  "driver": "claude-print",
+  "model": "haiku",
+  "args": ["--max-budget-usd", "0.3"],
+  "permissionMode": "dontAsk",
+  "providerProfileId": "native-login",
+  "title": "m1-real-haiku",
+  "prompt": "Reply with exactly REAL_OK. Do not use tools."
+}
+```
+
+```sh
+read -r REMUDA_M1_DEVICE_TOKEN < /tmp/remuda-m1/device-token
+curl --silent --show-error --max-time 20 -X POST \
+  http://127.0.0.1:18180/v1/instances \
+  -H "Authorization: Bearer ${REMUDA_M1_DEVICE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @/tmp/remuda-m1/real-create.json
+```
+
+```json
+{"instanceId":"ins_01a0953f-393c-76fe-97ac-d0eb5b40f7df","operation":"instance.create","state":"queued","resolution":"unknown","forwarded":true}
+```
+
+The HTTP result is intentionally fail-closed: Claude initialization exceeded the Hub's five-second Node RPC deadline, so the Hub did not claim acceptance and did not resend. The running process proved the exact real argv and that the default config variable was absent:
+
+```text
+/Users/dev/.local/share/claude/versions/2.1.269 -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --include-hook-events --forward-subagent-text --replay-user-messages --permission-mode dontAsk --permission-prompts none --setting-sources user,project,local --model haiku --session-id 5dda9874-70c1-444d-9bf8-7a4d98b462c7 --max-budget-usd 0.3
+claude_config_dir=unset
+```
+
+Reconciliation used `GET /v1/instances/:id/journal`; it did not replay the prompt. The durable result before cancel was:
+
+```json
+{
+  "instanceId": "ins_01a0953f-393c-76fe-97ac-d0eb5b40f7df",
+  "durableSeq": "29",
+  "eventCount": 29,
+  "assistant": {"seq":21,"status":"complete","text":"REAL_OK"},
+  "result": {"seq":28,"status":"turn_done","numTurns":"1"},
+  "usage": {
+    "seq": 29,
+    "inputTokens": "10",
+    "outputTokens": "43",
+    "totalTokens": "53",
+    "cost": {"amount":"0.019000499999999997","currency":"USD"}
+  }
+}
+```
+
+The real instance was then cancelled through Hub control; its command settled at journal seq 31:
+
+```json
+{"operation":"instance.cancel","state":"accepted","resolution":"clear","forwarded":true,"replayed":false}
+```
+
+Finally, the authenticated Hub follow socket returned the real journal snapshot:
+
+```sh
+python3 -c 'import json,websocket; token=open("/tmp/remuda-m1/device-token").read().strip(); iid=open("/tmp/remuda-m1/real-auth-instance-id").read().strip(); ws=websocket.create_connection(f"ws://127.0.0.1:18180/v1/follow?instanceId={iid}",header=[f"Authorization: Bearer {token}"],timeout=5); frame=json.loads(ws.recv()); print(json.dumps({"type":frame["type"],"instanceId":frame["instanceId"],"asOfSeq":frame["asOfSeq"],"eventCount":len(frame["events"])})); ws.close()'
+```
+
+```json
+{"type":"snapshot","instanceId":"ins_01a0953f-393c-76fe-97ac-d0eb5b40f7df","asOfSeq":"31","eventCount":31}
+```
+
+### Gaps fixed and remaining behavior
+
+- `remuda node` now composes the native driver runtime behind outbound WSS, persists both host identity and the Hub-issued host token, and sends the full detected inventory in hello/heartbeat.
+- Hub create now forwards `model`, `args`, provider profile id, and permission mode into the Node launch. Node rejects malformed argv rather than flattening it.
+- A configured fake binary override and an explicitly registered Claude home are supported. Host-default Claude credentials require the new explicit opt-in; isolated per-instance native homes remain the safe default.
+- `WssLink::shutdown` now allows one second for cooperative shutdown and aborts an unresponsive session task. This bounds shutdown when the Hub disappears during reconnect; a regression test holds the session task forever and verifies shutdown finishes within two seconds.
+- Hub's fixed five-second Node RPC deadline can expire during a cold real-Claude launch. The persisted command remains `queued/unknown`; operators must reconcile journal/command state and must not replay. Changing that deadline or introducing an early durable Node acceptance is still open architecture work.
+- Loopback `ws://` is accepted only for `127.0.0.0/8`, `::1`, or `localhost`; non-loopback transport still requires `wss://`.
+
+### Validation
+
+Focused validation completed before the final branch rebase:
+
+```text
+cargo test -p remuda-driver --lib native_home_tests --locked
+  2 passed; 0 failed
+cargo test -p remuda-node --lib native::tests --locked
+  3 passed; 0 failed
+cargo test -p remuda-node --lib transport::wss::tests::shutdown_aborts_an_unresponsive_session_task --locked
+  1 passed; 0 failed
+cargo clippy -p remuda-driver -p remuda-node --all-targets --locked -- -D warnings
+  PASS
+```
+
+The complete post-rebase workspace and web gate results are recorded in the final follow-up commit for this section.

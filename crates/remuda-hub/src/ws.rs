@@ -20,10 +20,14 @@ use remuda_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+
+/// Per-socket cap on remembered tty stream bindings. A Node with more live
+/// streams than this recycles the map rather than growing it without bound.
+const MAX_TTY_STREAMS_PER_SOCKET: usize = 1_024;
 
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
@@ -182,6 +186,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     let mut host_id: Option<String> = None;
     let mut hello_done = false;
     let mut session_generation: Option<u64> = None;
+    // Stream UUIDs this socket bound via a host-validated `tty.frame`. The
+    // `TtyRelay` registry is process-wide, so binary frames — which carry no
+    // instance or host id — are honoured only for streams in this set (T2).
+    let mut tty_streams: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -195,7 +203,7 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                 let Some(Ok(msg)) = incoming else { break; };
                 if let Message::Binary(bytes) = &msg {
                     if hello_done {
-                        handle_tty_binary(&state, host_id.as_deref(), bytes);
+                        handle_tty_binary(&state, &tty_streams, bytes);
                     }
                     continue;
                 }
@@ -226,7 +234,7 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                     }
                     break;
                 }
-                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, method, params, &out_tx, &pending).await {
+                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, &mut tty_streams, method, params, &out_tx, &pending).await {
                     Ok(Some(result)) => {
                         if !id.is_null() {
                             let _ = sink.send(Message::Text(rpc_ok(id, result).to_string().into())).await;
@@ -269,6 +277,7 @@ pub(crate) async fn handle_node_method(
     host_id: &mut Option<String>,
     hello_done: &mut bool,
     session_generation: &mut Option<u64>,
+    tty_streams: &mut HashSet<String>,
     method: &str,
     params: Value,
     out_tx: &mpsc::Sender<Value>,
@@ -514,6 +523,13 @@ pub(crate) async fn handle_node_method(
                         })
                     && let Some(uuid) = stream_uuid_of(&stream_id)
                 {
+                    // Record ownership on this socket too: `TtyRelay` is
+                    // process-wide, so without this a Node could push binary
+                    // frames onto a stream another Node bound (T2).
+                    if tty_streams.len() >= MAX_TTY_STREAMS_PER_SOCKET {
+                        tty_streams.clear();
+                    }
+                    tty_streams.insert(uuid.clone());
                     state.tty.bind(&uuid, &instance_id);
                 }
                 if let Some(b64) =
@@ -574,16 +590,31 @@ pub(crate) async fn handle_node_method(
     }
 }
 
-fn handle_tty_binary(state: &AppState, host_id: Option<&str>, bytes: &[u8]) {
+/// Strip the `tty_` registry prefix from a stream ID, keeping the bare UUID.
+///
+/// Binary headers carry the UUID without the prefix, so both sides of the
+/// stream registry are keyed on the canonical UUID text.
+/// Publish a binary tty frame to the instance that registered its stream.
+///
+/// The frame header carries only a stream UUID — no instance or host id — so
+/// attribution comes from the stream registry, never from the sending host.
+/// `tty_streams` additionally scopes that lookup to the streams *this* socket
+/// bound, because [`TtyRelay`] is process-wide: without it a Node could push
+/// binary frames onto a stream a different Node registered. An unregistered
+/// stream is dropped rather than published under a guessed id.
+fn handle_tty_binary(state: &AppState, tty_streams: &HashSet<String>, bytes: &[u8]) {
     let max = default_limits().max_binary_chunk_bytes;
     let Ok((header, payload)) = hubnode::decode_tty_binary_frame(bytes, max) else {
         return;
     };
-    let _ = host_id;
     if header.channel != remuda_protocol::BinaryChannel::TtyOutput {
         return;
     }
     let uuid = header.stream_uuid.uuid().to_string();
+    // Only streams this socket registered: `TtyRelay` is shared across Nodes.
+    if !tty_streams.contains(&uuid) {
+        return;
+    }
     let Some(instance_id) = state.tty.instance_of(&uuid) else {
         return;
     };
@@ -594,6 +625,7 @@ fn handle_tty_binary(state: &AppState, host_id: Option<&str>, bytes: &[u8]) {
         event: json!({
             "type": "tty.frame",
             "binary": true,
+            "streamId": uuid,
             "channel": header.channel as u8,
             "offset": header.offset,
             "payloadLength": payload.len(),

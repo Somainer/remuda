@@ -1480,6 +1480,150 @@ async fn follow_tty_relays_snapshot_input_and_resize() -> Result<()> {
     Ok(())
 }
 
+/// T2: `TtyRelay` is process-wide, so a binary frame is honoured only on the
+/// socket that registered its stream. Host B must not be able to inject output
+/// into an instance on host A by replaying A's stream UUID.
+#[tokio::test]
+async fn tty_binary_frames_are_scoped_to_the_registering_socket() -> Result<()> {
+    use remuda_protocol::{BinaryChannel, StreamUuid, encode_binary_frame};
+
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let host_a = HostId::new();
+    let instance_a = InstanceId::new();
+    let stream_id = remuda_protocol::Id::new("tty")?;
+
+    let mut node_a = node_socket(hub.addr, &bootstrap, &host_a, "tty-host-a").await?;
+    // Seed the instance so `tty.frame` passes the host-binding check.
+    node_a
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "seed",
+                "method": "journal.append",
+                "params": {
+                    "instanceId": instance_a.as_id().as_str(),
+                    "event": { "kind": "lifecycle", "payload": { "status": "ready" } }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let _ = recv_json(&mut node_a).await?;
+
+    // Host A registers the stream for its own instance.
+    node_a
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "bind",
+                "method": "tty.frame",
+                "params": {
+                    "instanceId": instance_a.as_id().as_str(),
+                    "streamId": stream_id.as_str(),
+                    "channel": 1
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let ack = recv_json(&mut node_a).await?;
+    anyhow::ensure!(ack["result"]["ok"] == json!(true), "{ack}");
+
+    let mut follow_req = format!(
+        "ws://{}/v1/follow?instanceId={}",
+        hub.addr,
+        instance_a.as_id().as_str()
+    )
+    .into_client_request()?;
+    follow_req
+        .headers_mut()
+        .insert("Cookie", cookie.parse().unwrap());
+    let (mut follow, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(follow_req)).await??;
+    let snapshot = recv_json(&mut follow).await?;
+    assert_eq!(snapshot["type"], json!("snapshot"));
+    // Opt into binary delivery in-band; the query flag would trigger tty.attach.
+    follow
+        .send(Message::Text(
+            json!({
+                "type": "subscribe",
+                "instanceIds": [instance_a.as_id().as_str()],
+                "tty": 1
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let resnapshot = recv_json(&mut follow).await?;
+    assert_eq!(resnapshot["type"], json!("snapshot"));
+
+    // Host B replays A's stream UUID on its own socket.
+    let host_b = HostId::new();
+    let mut node_b = node_socket(hub.addr, &bootstrap, &host_b, "tty-host-b").await?;
+    let uuid = StreamUuid::from_prefixed_id(stream_id.as_str()).expect("stream uuid");
+    let forged = encode_binary_frame(BinaryChannel::TtyOutput, uuid, 0, b"forged")?;
+    node_b.send(Message::Binary(forged.into())).await?;
+
+    // Nothing must reach A's follower from B.
+    let leaked = tokio::time::timeout(Duration::from_millis(400), follow.next()).await;
+    anyhow::ensure!(
+        leaked.is_err(),
+        "host B must not publish into host A's instance: {leaked:?}"
+    );
+
+    // The owning socket still works.
+    let genuine = encode_binary_frame(BinaryChannel::TtyOutput, uuid, 0, b"real")?;
+    node_a.send(Message::Binary(genuine.into())).await?;
+    let frame = tokio::time::timeout(TIMEOUT, follow.next())
+        .await?
+        .context("follow closed")??;
+    match frame {
+        Message::Binary(bytes) => assert!(bytes.ends_with(b"real"), "{bytes:?}"),
+        Message::Text(text) => {
+            let value: Value = serde_json::from_str(&text)?;
+            assert_eq!(value["instanceId"], json!(instance_a.as_id().as_str()));
+        }
+        other => anyhow::bail!("unexpected follow frame {other:?}"),
+    }
+    Ok(())
+}
+
+/// Open a `/v1/node` socket and complete `runtime.hello` for `host_id`.
+async fn node_socket(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    host_id: &HostId,
+    label: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>> {
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {bearer}").parse().unwrap());
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("node connect")??;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hello",
+            "method": "runtime.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "label": label
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    anyhow::ensure!(hello.get("result").is_some(), "{hello}");
+    Ok(node)
+}
+
 async fn recv_json<S>(ws: &mut S) -> Result<Value>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,

@@ -45,6 +45,8 @@ pub struct WssConfig {
     pub node_version: String,
     /// CLI inventory included in hello/heartbeat (`cli` array).
     pub cli: Value,
+    /// Full nested host inventory included in hello/heartbeat.
+    pub host: Option<Value>,
     /// Heartbeat period. Hub lease TTL is 60s; 15s matches Hub limits.
     pub heartbeat_interval: Duration,
     /// Reconnect delay policy. Commands are never replayed.
@@ -68,6 +70,7 @@ impl WssConfig {
                 "path": "/usr/bin/claude",
                 "auth": "unknown"
             }]),
+            host: None,
             heartbeat_interval: Duration::from_secs(15),
             backoff: Backoff::default(),
             journal_queue: DEFAULT_JOURNAL_QUEUE,
@@ -694,7 +697,10 @@ fn encode_hello_params(
             "minor": PROTOCOL_VERSION.minor,
             "framing": "websocket-message",
         })),
-        host: None,
+        host: config
+            .host
+            .clone()
+            .and_then(|host| serde_json::from_value(host).ok()),
         capabilities: None,
         cli: Some(config.cli.clone()),
     });
@@ -719,7 +725,10 @@ fn encode_heartbeat_params(
         lease_id: lease_id.map(str::to_owned),
         node_version: Some(config.node_version.clone()),
         transport: Some("outbound-wss".into()),
-        host: None,
+        host: config
+            .host
+            .clone()
+            .and_then(|host| serde_json::from_value(host).ok()),
         cli: Some(config.cli.clone()),
         capabilities: None,
         instance_watermarks: journal_watermarks(watermarks),

@@ -14,6 +14,12 @@ On disconnect it reconnects with exponential backoff and does **not** replay
 Hub `instance.*` commands. First enroll uses the bootstrap bearer; later
 dials use `nodeToken` from hello.
 
+`WssLink::connect_runtime` is the stdio peer: it dispatches Hub
+`instance.create` / `send` / `cancel` / `respond` into `DevNode`, streams
+`journal.append` with sequence watermarks, and on reconnect resumes from the
+Hub-acked seq (no Command replay, no duplicate appends). Frames use
+`remuda_protocol::hubnode`.
+
 ## Host inventory
 
 `inventory::collect` probes `claude` / `codex` / `grok` / `agy` / `gemini` on

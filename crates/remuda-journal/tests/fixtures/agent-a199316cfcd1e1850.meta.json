@@ -1,0 +1,1 @@
+{"agentType":"workflow-subagent","description":"Reply with exactly one line stating which model you are. Do","spawnDepth":1,"requestShape":"foreground","requestNonInteractive":true,"model":"passthrough/model_hub/es1_orange_o50"}

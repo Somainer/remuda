@@ -1,0 +1,9 @@
+{"type":"ai-title","aiTitle":"Confirmation response","sessionId":"11111111-1111-4111-8111-111111111111"}
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-11T18:18:45.599Z","sessionId":"11111111-1111-4111-8111-111111111111","content":"Reply with exactly the word OK. Do not use any tools."}
+{"type":"queue-operation","operation":"dequeue","timestamp":"2026-09-11T18:18:45.600Z","sessionId":"11111111-1111-4111-8111-111111111111"}
+{"type":"user","uuid":"427f0049-430e-4668-9994-0d10dade1edf","timestamp":"2026-09-11T18:18:46.113Z","sessionId":"11111111-1111-4111-8111-111111111111","message":{"role":"user","content":"Reply with exactly the word OK. Do not use any tools."}}
+{"type":"assistant","uuid":"c487ef91-2dbb-4c88-8d15-b95c6bb12128","timestamp":"2026-09-11T18:18:47.738Z","sessionId":"11111111-1111-4111-8111-111111111111","message":{"id":"msg_011Cex7VaErZ6N9pUjg4kY74","role":"assistant","content":[{"type":"thinking","thinking":""}]}}
+{"type":"assistant","uuid":"11577bfc-b164-4a8a-a269-6e1c8c0287c2","timestamp":"2026-09-11T18:18:47.754Z","sessionId":"11111111-1111-4111-8111-111111111111","message":{"id":"msg_011Cex7VaErZ6N9pUjg4kY74","role":"assistant","content":[{"type":"text","text":"OK"}]}}
+{"type":"assistant","uuid":"tool-call-1","timestamp":"2026-09-11T18:18:47.000Z","sessionId":"11111111-1111-4111-8111-111111111111","message":{"id":"msg_tool","role":"assistant","content":[{"type":"tool_use","id":"toolu_bash1","name":"Bash","input":{"command":"true"}}]}}
+{"type":"user","uuid":"tool-result-1","timestamp":"2026-09-11T18:18:47.100Z","sessionId":"11111111-1111-4111-8111-111111111111","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash1","content":"ok"}]}}
+{"type":"system","subtype":"compact_boundary","uuid":"compact-1","session_id":"11111111-1111-4111-8111-111111111111"}

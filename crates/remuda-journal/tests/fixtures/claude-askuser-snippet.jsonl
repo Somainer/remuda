@@ -1,0 +1,5 @@
+{"type":"control_request","request_id":"init-1e32a385","request":{"subtype":"initialize"}}
+{"type":"user","message":{"role":"user","content":"You MUST call the AskUserQuestion tool exactly once. Ask a single two-option question: tea or coffee. Do not answer yourself before the tool call. Do not use any other tools."}}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50,"session_id":"1e32a385-8f90-460c-acb5-92700a06d969","uuid":"aaf6c0bc-ced6-4d63-9c69-81d2c1b391c1"}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":144,"estimated_tokens_delta":94,"session_id":"1e32a385-8f90-460c-acb5-92700a06d969","uuid":"5111f3fe-3c94-40e4-bf39-9331071a0331"}
+{"type":"control_request","request_id":"929cd526-fe69-4b59-8eec-e482ff5e81e0","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Tea or coffee?","options":[{"label":"Tea"},{"label":"Coffee"}]}]},"tool_use_id":"toolu_01GtYFUN7JoLBLBXbybUzBtC"}}

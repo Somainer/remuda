@@ -516,7 +516,9 @@ fn cli_from_snapshot(entry: &crate::inventory::CliEntry) -> CliInventory {
             AuthState::NotInstalled
         } else {
             match entry.auth {
-                crate::inventory::CliAuth::LoggedIn => AuthState::LoggedIn,
+                crate::inventory::CliAuth::GatewayNative | crate::inventory::CliAuth::LoggedIn => {
+                    AuthState::LoggedIn
+                }
                 crate::inventory::CliAuth::LoggedOut => AuthState::LoggedOut,
                 crate::inventory::CliAuth::Unknown => AuthState::Unknown,
             }

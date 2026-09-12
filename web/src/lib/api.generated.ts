@@ -601,8 +601,10 @@ export interface components {
         };
         HostCli: {
             /** @enum {string} */
-            auth?: "logged_in" | "logged_out" | "unknown";
+            auth?: "logged_in" | "logged_out" | "unknown" | "gateway-native" | "none";
+            installed?: boolean;
             kind: string;
+            nativeGateway?: boolean;
             path?: string | null;
             version?: string | null;
         } & {

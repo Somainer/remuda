@@ -101,16 +101,27 @@ fn normalize_cli(value: Option<&Value>) -> Option<Value> {
                 .or_else(|| item.get("authState").and_then(Value::as_str))
                 .unwrap_or("unknown");
             let auth = match auth {
+                "gateway-native" | "gateway_native" => "gateway-native",
                 "logged_in" | "logged-in" => "logged_in",
                 "logged_out" | "logged-out" => "logged_out",
+                "none" => "none",
                 _ => "unknown",
             };
-            json!({
+            let installed = item
+                .get("installed")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| path.as_str().is_some_and(|s| !s.is_empty()));
+            let mut row = json!({
                 "kind": item.get("kind").cloned().unwrap_or(Value::Null),
                 "version": item.get("version").cloned().unwrap_or(Value::Null),
                 "path": path,
                 "auth": auth,
-            })
+                "installed": installed,
+            });
+            if let Some(flag) = item.get("nativeGateway").and_then(Value::as_bool) {
+                row["nativeGateway"] = json!(flag);
+            }
+            row
         })
         .collect();
     Some(Value::Array(mapped))
@@ -165,7 +176,25 @@ mod tests {
         assert!(tags.contains(&"region=sg"));
         assert_eq!(inv.cli.as_ref().unwrap()[0]["path"], "/usr/bin/claude");
         assert_eq!(inv.cli.as_ref().unwrap()[0]["auth"], "unknown");
+        assert_eq!(inv.cli.as_ref().unwrap()[0]["installed"], true);
         assert_eq!(inv.herdr.as_ref().unwrap()["socket"], "/tmp/herdr.sock");
         assert_eq!(inv.resources.as_ref().unwrap()["cpuPct"], 8);
+    }
+
+    #[test]
+    fn gateway_native_auth_is_preserved() {
+        let params = json!({
+            "cli": [{
+                "kind": "claude",
+                "path": "/usr/bin/claude",
+                "auth": "gateway-native",
+                "installed": true,
+                "nativeGateway": true
+            }]
+        });
+        let inv = from_node_params(&params);
+        assert_eq!(inv.cli.as_ref().unwrap()[0]["auth"], "gateway-native");
+        assert_eq!(inv.cli.as_ref().unwrap()[0]["nativeGateway"], true);
+        assert_eq!(inv.cli.as_ref().unwrap()[0]["installed"], true);
     }
 }

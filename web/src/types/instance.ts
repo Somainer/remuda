@@ -50,13 +50,15 @@ export type Instance = EntityMeta & {
 
 export type HostTransport = "outbound-wss" | "ssh-dev";
 
-export type HostCliAuth = "logged_in" | "logged_out" | "unknown";
+export type HostCliAuth = "logged_in" | "logged_out" | "unknown" | "gateway-native" | "none";
 
 export type HostCli = {
   kind: string;
   version?: string;
   path?: string;
   auth?: HostCliAuth;
+  nativeGateway?: boolean;
+  installed?: boolean;
 };
 
 export type Host = EntityMeta & {

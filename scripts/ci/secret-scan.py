@@ -55,7 +55,7 @@ SKIP_FILE_NAMES = {
 MAX_BYTES = 2_000_000
 MASK = set("*xX•.…][)(") | {"…"}
 DUMMY_PART = re.compile(
-    r"(?i)(^|[-_/])(secret|example|placeholder|dummy|redacted|fake|sample|yourkey|xxx+)([-_]|$)"
+    r"(?i)(^|[-_/])(secret|example|placeholder|dummy|redacted|fake|sample|yourkey|xxx+|should-not)([-_]|$)"
 )
 PLACEHOLDER = re.compile(
     r"^(<[^>]+>|\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})"

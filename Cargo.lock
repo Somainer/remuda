@@ -1866,11 +1866,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "remuda"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "clap",
- "remuda-node",
- "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1878,14 +1874,11 @@ name = "remuda-acp-wire"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
- "anyhow",
  "futures",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
- "tokio-tungstenite 0.28.0",
  "tokio-util",
  "tracing",
 ]
@@ -2005,21 +1998,6 @@ dependencies = [
 [[package]]
 name = "remuda-node"
 version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "futures",
- "remuda-protocol",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror",
- "time",
- "tokio",
- "tokio-tungstenite 0.28.0",
- "tracing",
- "uuid",
-]
 
 [[package]]
 name = "remuda-protocol"
@@ -2405,9 +2383,9 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shellexpand"
-version = "3.1.1"
+version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b1fdf65dd6331831494dd616b30351c38e96e45921a27745cf98490458b90bb"
+checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
  "dirs",
 ]
@@ -2666,9 +2644,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.17"
+version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2efa149fe76073d6e8fd97ef4f4eca7b67f599660115591483572e406e165594"
+checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",

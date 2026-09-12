@@ -34,10 +34,14 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: rustsec audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - name: cargo audit
+        # --locked pins cargo-audit's own lockfile so it builds on rustc 1.94.1
+        # (unlocked latest pulls crates that require 1.96).
+        run: |
+          cargo install cargo-audit --locked --version 0.21.2
+          cargo audit
 
   web:
     runs-on: ubuntu-latest

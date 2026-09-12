@@ -39,8 +39,10 @@ export function readSession(): DeviceSession | null {
   }
 }
 
-export function writeSession(session: DeviceSession): void {
-  memorySession = { ...session };
+export function writeSession(session: DeviceSession, { mock = false } = {}): void {
+  // Live browser requests authenticate with the HttpOnly cookie. Only the
+  // in-process mock API needs a bearer; do not expose live tokens to WS helpers.
+  memorySession = { ...session, token: mock ? session.token : "" };
   try {
     localStorage.removeItem(LEGACY_ACCESS_KEY);
     localStorage.setItem(SESSION_KEY, JSON.stringify({ deviceId: session.deviceId, name: session.name }));

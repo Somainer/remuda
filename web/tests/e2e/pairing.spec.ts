@@ -1,11 +1,16 @@
 import { expect, test } from "@playwright/test";
+import { bootstrapToken, expectCookieSession, login, logout } from "./hub-auth";
 
 test.describe("device pairing", () => {
+  test.beforeEach(async ({ page }) => { await login(page); });
+
   test("logout redirects protected routes to /login", async ({ page }) => {
     await page.goto("/settings");
     await expect(page.getByTestId("settings-page")).toBeVisible();
-    await page.getByTestId("settings-logout").click();
+    await logout(page);
     await expect(page).toHaveURL(/\/login/);
+    await expect(page.getByTestId("login-page")).toBeVisible();
+    await page.reload();
     await expect(page.getByTestId("login-page")).toBeVisible();
     await page.goto("/approvals");
     await expect(page).toHaveURL(/\/login/);
@@ -15,20 +20,21 @@ test.describe("device pairing", () => {
   test("bootstrap token logs a device in after logout", async ({ page }) => {
     await page.goto("/settings");
     await expect(page.getByTestId("settings-page")).toBeVisible();
-    await page.getByTestId("settings-logout").click();
+    await logout(page);
     await expect(page.getByTestId("login-page")).toBeVisible();
     await page.getByTestId("login-tab-bootstrap").click();
-    await page.getByTestId("login-bootstrap-token").fill("dev-bootstrap");
+    await page.getByTestId("login-bootstrap-token").fill(bootstrapToken);
     await page.getByTestId("login-device-name").fill("desk");
     await page.getByTestId("login-submit").click();
     await expect(page.getByTestId("login-page")).toHaveCount(0);
     await page.goto("/sessions");
     await expect(page.getByTestId("session-list").first()).toBeVisible();
+    await expectCookieSession(page);
   });
 
   test("wrong bootstrap token stays on login", async ({ page }) => {
     await page.goto("/settings");
-    await page.getByTestId("settings-logout").click();
+    await logout(page);
     await page.getByTestId("login-tab-bootstrap").click();
     await page.getByTestId("login-bootstrap-token").fill("nope");
     await page.getByTestId("login-submit").click();
@@ -43,7 +49,7 @@ test.describe("device pairing", () => {
     await expect(page.getByTestId("settings-pair-code-value")).toBeVisible();
     const code = (await page.getByTestId("settings-pair-code-value").innerText()).trim();
     expect(code.length).toBe(8);
-    await page.getByTestId("settings-logout").click();
+    await logout(page);
     await expect(page.getByTestId("login-page")).toBeVisible();
     await page.getByTestId("login-tab-pair").click();
     await page.getByTestId("login-pair-code").fill(code);
@@ -52,5 +58,16 @@ test.describe("device pairing", () => {
     await expect(page.getByTestId("login-page")).toHaveCount(0);
     await page.goto("/settings");
     await expect(page.getByTestId("settings-device-row").filter({ hasText: "phone" })).toBeVisible();
+    await expectCookieSession(page);
+    await page.reload();
+    await expect(page.getByTestId("settings-device-row").filter({ hasText: "phone" })).toBeVisible();
   });
+});
+
+test("API clients still authenticate with a device bearer without cookies", async ({ request }) => {
+  const response = await request.post("/v1/login", { data: { bootstrapToken, deviceName: "api-client" } });
+  expect(response.ok()).toBe(true);
+  const { token } = await response.json();
+  expect((await request.get("/v1/devices", { headers: { Cookie: "" } })).status()).toBe(401);
+  expect((await request.get("/v1/devices", { headers: { Cookie: "", Authorization: `Bearer ${token}` } })).ok()).toBe(true);
 });

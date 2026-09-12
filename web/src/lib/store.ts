@@ -134,8 +134,8 @@ class HubStore {
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
-      writeSession(session);
-      this.emit({ session });
+      writeSession(session, { mock: api.mock });
+      this.emit({ session: readSession() });
     }
     try {
       await api.hello();
@@ -185,8 +185,9 @@ class HubStore {
   async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
     const session =
       kind === "pair" ? await api.pairRedeem(secret, deviceName) : await api.login(secret, deviceName);
-    writeSession(session);
-    this.emit({ session, authed: true, error: null });
+    writeSession(session, { mock: api.mock });
+    // bootstrap marks the session authenticated after cookie-backed reads finish.
+    this.emit({ session: readSession(), error: null });
     await this.bootstrap();
   }
 

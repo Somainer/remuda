@@ -1,5 +1,7 @@
 //! Coordinator merge: verify an immutable merge, then compare-and-swap main.
 
+mod web_e2e;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -106,6 +108,7 @@ pub(crate) struct MergeReport {
     target_dir: Option<PathBuf>,
     gate_override: bool,
     web: bool,
+    web_e2e: bool,
     main_updated: bool,
     pushed: bool,
     conflicts: Vec<String>,
@@ -172,6 +175,7 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
         gate_override: std::env::var_os("REMUDA_MERGE_GATE_COMMAND")
             .is_some_and(|value| !value.is_empty()),
         web: args.web,
+        web_e2e: false,
         main_updated: false,
         pushed: false,
         conflicts: Vec::new(),
@@ -263,11 +267,16 @@ fn execute_inner(
         )?;
         successful(&diff)?;
         report.web |= web_changed(&diff.stdout);
+        report.web_e2e = web_e2e::changed(&diff.stdout);
+        report.web |= report.web_e2e;
         report.steps.push(Step::planned("worktree"));
         report.steps.push(Step::planned("merge"));
-        report
-            .steps
-            .extend(gate_plan(&repo, report.web, test_range(report))?);
+        report.steps.extend(gate_plan(
+            &repo,
+            report.web,
+            test_range(report),
+            report.web_e2e,
+        )?);
         report.steps.push(Step::planned("verify-tree"));
         report.steps.push(Step::planned("update-main"));
         if !args.no_push {
@@ -324,6 +333,8 @@ fn execute_inner(
     )?;
     successful(&diff)?;
     report.web |= web_changed(&diff.stdout);
+    report.web_e2e = web_e2e::changed(&diff.stdout);
+    report.web |= report.web_e2e;
     let report_file = worktree.with_file_name("gate.jsonl");
     run_gate(report, &worktree, &target, &report_file)?;
     record(report, "verify-tree", || {
@@ -401,7 +412,7 @@ fn test_range(report: &MergeReport) -> Option<(&str, &str)> {
         .filter(|_| report.affected)
 }
 
-fn gate_command(repo: &Path, web: bool, range: Option<(&str, &str)>) -> Command {
+fn gate_command(repo: &Path, web: bool, range: Option<(&str, &str)>, web_e2e: bool) -> Command {
     let mut command = Command::new("bash");
     command
         .arg(repo.join("scripts/ci/gate.sh"))
@@ -409,6 +420,9 @@ fn gate_command(repo: &Path, web: bool, range: Option<(&str, &str)>) -> Command 
         .stdin(Stdio::null());
     if web {
         command.arg("--web");
+    }
+    if web_e2e {
+        command.arg("--web-e2e");
     }
     if let Some((base, head)) = range {
         command.args(["--affected", "--base", base, "--head", head]);
@@ -418,8 +432,13 @@ fn gate_command(repo: &Path, web: bool, range: Option<(&str, &str)>) -> Command 
     command
 }
 
-fn gate_plan(repo: &Path, web: bool, range: Option<(&str, &str)>) -> Result<Vec<Step>> {
-    let output = gate_command(repo, web, range)
+fn gate_plan(
+    repo: &Path,
+    web: bool,
+    range: Option<(&str, &str)>,
+    web_e2e: bool,
+) -> Result<Vec<Step>> {
+    let output = gate_command(repo, web, range, web_e2e)
         .arg("--list")
         .output()
         .context("read gate plan")?;
@@ -433,8 +452,8 @@ fn run_gate(
     target: &Path,
     report_file: &Path,
 ) -> Result<()> {
-    let planned = gate_plan(repo, report.web, test_range(report))?;
-    let status = gate_command(repo, report.web, test_range(report))
+    let planned = gate_plan(repo, report.web, test_range(report), report.web_e2e)?;
+    let status = gate_command(repo, report.web, test_range(report), report.web_e2e)
         .arg("--report")
         .arg(report_file)
         .env("CARGO_TARGET_DIR", target)
@@ -690,7 +709,7 @@ mod tests {
     #[test]
     fn gate_plan_has_shared_order_and_optional_web_steps() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let plan = gate_plan(&repo, false, None).unwrap();
+        let plan = gate_plan(&repo, false, None, false).unwrap();
         let names: Vec<_> = plan.iter().map(|step| step.name.as_str()).collect();
         assert_eq!(
             names,
@@ -702,23 +721,25 @@ mod tests {
                 "cargo-test",
                 "web-install",
                 "web-build",
-                "web-test"
+                "web-test",
+                "web-hub-e2e"
             ]
         );
         assert!(plan[5..].iter().all(|step| step.status == "skipped"));
         assert!(
-            gate_plan(&repo, true, None)
+            gate_plan(&repo, true, None, true)
                 .unwrap()
                 .iter()
                 .all(|step| step.status == "planned")
         );
-        let output = gate_command(&repo, false, None)
+        let output = gate_command(&repo, false, None, false)
             .args(["--list", "--web-only"])
             .output()
             .unwrap();
         assert!(output.status.success());
         let web_only: Vec<Step> = serde_json::from_slice(&output.stdout).unwrap();
         assert!(web_only[..5].iter().all(|step| step.status == "skipped"));
-        assert!(web_only[5..].iter().all(|step| step.status == "planned"));
+        assert!(web_only[5..8].iter().all(|step| step.status == "planned"));
+        assert_eq!(web_only[8].status, "skipped");
     }
 }

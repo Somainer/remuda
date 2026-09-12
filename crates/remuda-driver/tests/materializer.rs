@@ -424,3 +424,22 @@ fn bot_origin_rejects_bypass() {
             .contains("not allowed for bot/dispatcher-originated specs")
     );
 }
+
+#[test]
+fn bot_origin_rejects_dont_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
+        mode: ClaudePermissionMode::DontAsk,
+        interaction: ClaudeInteractionMode::Host,
+    }));
+    let profile = native_profile();
+    let mut req = request(&spec, &profile, &launch, &home, pin_source(&binary));
+    req.origin = LaunchOrigin::Bot;
+    let error = materialize(&req).unwrap_err();
+    assert!(matches!(error, DriverError::BypassNotAllowedForBot));
+}

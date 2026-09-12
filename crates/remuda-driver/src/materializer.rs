@@ -464,7 +464,10 @@ fn permission_plan(
 ) -> DriverResult<(RecipePermission, Vec<String>, ApprovalAuthority)> {
     match &spec.permission_mode {
         PermissionMode::Claude(claude) => {
-            if claude.mode == ClaudePermissionMode::BypassPermissions && origin == LaunchOrigin::Bot
+            if matches!(
+                claude.mode,
+                ClaudePermissionMode::BypassPermissions | ClaudePermissionMode::DontAsk
+            ) && origin == LaunchOrigin::Bot
             {
                 return Err(DriverError::BypassNotAllowedForBot);
             }

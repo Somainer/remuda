@@ -558,7 +558,7 @@ impl Store {
                 "INSERT INTO instances
                     (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                      title, journal_id, durable_seq, spec_json, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'idle', 'disconnected',
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', 'disconnected',
                          ?6, ?7, 0, ?8, ?9, ?9)",
                 params![
                     instance_id,
@@ -597,7 +597,7 @@ impl Store {
                 "INSERT INTO instances
                     (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                      title, journal_id, durable_seq, spec_json, created_at, updated_at)
-                 VALUES (?1, ?2, NULL, 'claude', 'claude-print', 'ready', 'idle', 'connected',
+                 VALUES (?1, ?2, NULL, 'claude', 'claude-print', 'requested', 'unknown', 'connected',
                          NULL, ?3, 0, '{}', ?4, ?4)",
                 params![instance_id, host_id, journal_id, now],
             )?;
@@ -829,6 +829,7 @@ impl Store {
                 params![seq, now, instance_id],
             )?;
             apply_interaction_event(conn, &host_id, &instance_id, &event)?;
+            apply_instance_lifecycle(conn, &instance_id, &event)?;
             Ok(JournalAppend {
                 record: JournalRecord {
                     instance_id,
@@ -1526,7 +1527,7 @@ fn apply_interaction_event(
             params![id, instance_id, host_id, ikind, event.to_string(), now],
         )?;
         conn.execute(
-            "UPDATE instances SET activity = 'waiting-interaction', updated_at = ?1 WHERE id = ?2",
+            "UPDATE instances SET activity = 'blocked', updated_at = ?1 WHERE id = ?2",
             params![now, instance_id],
         )?;
     } else if kind == "interaction.answered"
@@ -1547,6 +1548,142 @@ fn apply_interaction_event(
     Ok(())
 }
 
+fn knowledge_value(value: Option<&Value>) -> Option<&str> {
+    let value = value?;
+    value
+        .as_str()
+        .or_else(|| value.get("value").and_then(Value::as_str))
+}
+
+fn lifecycle_rank(state: &str) -> i32 {
+    match state {
+        "requested" => 0,
+        "preparing" | "starting" => 1,
+        "ready" | "running" => 2,
+        "closing" => 3,
+        "exited" | "failed" => 4,
+        _ => 0,
+    }
+}
+
+fn normalize_lifecycle(state: &str) -> Option<&'static str> {
+    match state {
+        "requested" => Some("requested"),
+        "preparing" | "starting" => Some("starting"),
+        "ready" | "running" => Some("running"),
+        "closing" => Some("closing"),
+        "exited" => Some("exited"),
+        "failed" => Some("failed"),
+        _ => None,
+    }
+}
+
+fn normalize_activity(status: &str) -> Option<&'static str> {
+    match status {
+        "idle" | "done" => Some("idle"),
+        "working" => Some("working"),
+        "blocked" | "waiting-interaction" => Some("blocked"),
+        "draining" => Some("draining"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    }
+}
+
+/// Derive Hub lifecycle/activity from a mirrored Node observation.
+///
+/// `activity=idle` is only set from a Node/herdr idle observation, never as a
+/// create default. Start-failure observations (`native-driver-start-failed`,
+/// entity `failed`) mark `lifecycle=failed`.
+fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'static str>) {
+    let kind = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("subtype").and_then(Value::as_str))
+        .unwrap_or("");
+    let payload = event.get("payload").unwrap_or(event);
+    let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    let reason = payload
+        .get("reasonCode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let native_name = payload
+        .get("nativeName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let entity_state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("state").and_then(Value::as_str));
+    let status = knowledge_value(payload.get("status"))
+        .or_else(|| event.get("activity").and_then(Value::as_str));
+
+    let start_failed = reason == "native-driver-start-failed"
+        || native_name == "native-driver-start-failed"
+        || native_name.contains("start-fail")
+        || status.is_some_and(|s| s == "failed" || s == "error")
+        || entity_state == Some("failed");
+    if start_failed && (kind == "lifecycle" || payload_type == "native" || payload_type == "entity")
+    {
+        return (Some("failed"), None);
+    }
+
+    if kind == "interaction.requested" || kind == "interactionRequested" {
+        return (Some("running"), Some("blocked"));
+    }
+
+    let mut lifecycle = None;
+    let mut activity = None;
+    if let Some(state) = entity_state {
+        lifecycle = normalize_lifecycle(state);
+    }
+    let herdr_idle_proof =
+        native_name == "agent_status" || native_name == "session" || payload_type == "native";
+    if herdr_idle_proof && let Some(status) = status {
+        match status {
+            "starting" | "started" => {
+                lifecycle = Some(if status == "starting" {
+                    "starting"
+                } else {
+                    "running"
+                });
+            }
+            "idle" | "done" | "working" | "blocked" | "waiting-interaction" => {
+                lifecycle = Some("running");
+                activity = normalize_activity(status);
+            }
+            "exited" => lifecycle = Some("exited"),
+            "failed" | "error" => lifecycle = Some("failed"),
+            _ => {}
+        }
+    }
+    (lifecycle, activity)
+}
+
+fn apply_instance_lifecycle(
+    conn: &Connection,
+    instance_id: &str,
+    event: &Value,
+) -> Result<(), StoreError> {
+    let (next_life, next_act) = derive_instance_state(event);
+    if next_life.is_none() && next_act.is_none() {
+        return Ok(());
+    }
+    let Some(current) = load_instance(conn, instance_id)? else {
+        return Ok(());
+    };
+    let now = now_rfc3339();
+    let lifecycle = match next_life {
+        Some(next) if lifecycle_rank(next) >= lifecycle_rank(&current.lifecycle) => next,
+        _ => current.lifecycle.as_str(),
+    };
+    let activity = next_act.unwrap_or(current.activity.as_str());
+    conn.execute(
+        "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
+        params![lifecycle, activity, now, instance_id],
+    )?;
+    Ok(())
+}
+
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
     let payload: String = row.get(7)?;
     let forwarded: i64 = row.get(6)?;
@@ -1563,4 +1700,54 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::derive_instance_state;
+    use serde_json::json;
+
+    #[test]
+    fn create_default_is_not_idle() {
+        let (life, act) = derive_instance_state(&json!({"kind": "message"}));
+        assert_eq!(life, None);
+        assert_eq!(act, None);
+    }
+
+    #[test]
+    fn entity_ready_is_running_not_idle() {
+        let (life, act) = derive_instance_state(&json!({
+            "kind": "lifecycle",
+            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+        }));
+        assert_eq!(life, Some("running"));
+        assert_eq!(act, None);
+    }
+
+    #[test]
+    fn herdr_agent_status_idle_is_idle_proof() {
+        let (life, act) = derive_instance_state(&json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native",
+                "nativeName": "agent_status",
+                "status": { "state": "known", "value": "idle" }
+            }
+        }));
+        assert_eq!(life, Some("running"));
+        assert_eq!(act, Some("idle"));
+    }
+
+    #[test]
+    fn start_failure_marks_failed() {
+        let (life, _) = derive_instance_state(&json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity",
+                "state": "failed",
+                "reasonCode": "native-driver-start-failed"
+            }
+        }));
+        assert_eq!(life, Some("failed"));
+    }
 }

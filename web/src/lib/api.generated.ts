@@ -502,7 +502,11 @@ export interface components {
             nextCursor?: string | null;
         };
         InstanceRecord: {
-            activity: string;
+            /**
+             * @description idle only after a Node/herdr agent_status or session idle observation. Create default is unknown.
+             * @enum {string}
+             */
+            activity: "unknown" | "idle" | "working" | "blocked" | "draining";
             connectivity: string;
             createdAt?: string;
             driver: string;
@@ -511,7 +515,11 @@ export interface components {
             instanceId: string;
             journalId: string;
             kind: string;
-            lifecycle: string;
+            /**
+             * @description Derived from Node lifecycle observations in journal.append. Create default is requested, not running.
+             * @enum {string}
+             */
+            lifecycle: "requested" | "starting" | "running" | "closing" | "exited" | "failed";
             title?: string | null;
             updatedAt?: string;
             workspaceId?: string | null;
@@ -975,7 +983,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Instance page */
+            /** @description Instance page. lifecycle is derived from Node journal observations (requested→starting→running→exited/failed). activity=idle only after a herdr/Node idle observation, never the create default. */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -127,7 +127,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Instance page",
+            "description": "Instance page. lifecycle is derived from Node journal observations (requested→starting→running→exited/failed). activity=idle only after a herdr/Node idle observation, never the create default.",
             "content": {
               "application/json": { "schema": { "$ref": "#/components/schemas/InstancePage" } }
             }
@@ -647,8 +647,16 @@
           "workspaceId": { "type": ["string", "null"] },
           "kind": { "type": "string" },
           "driver": { "type": "string" },
-          "lifecycle": { "type": "string" },
-          "activity": { "type": "string" },
+          "lifecycle": {
+            "type": "string",
+            "enum": ["requested", "starting", "running", "closing", "exited", "failed"],
+            "description": "Derived from Node lifecycle observations in journal.append. Create default is requested, not running."
+          },
+          "activity": {
+            "type": "string",
+            "enum": ["unknown", "idle", "working", "blocked", "draining"],
+            "description": "idle only after a Node/herdr agent_status or session idle observation. Create default is unknown."
+          },
           "connectivity": { "type": "string" },
           "title": { "type": ["string", "null"] },
           "journalId": { "type": "string" },

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { Link, Navigate, useNavigate, useParams } from "react-router-dom";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
@@ -7,25 +7,13 @@ import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { Transcript } from "../features/session/Transcript";
-import { TerminalView } from "../features/session/tty/TerminalView";
-import type { Instance } from "../types/instance";
-import { nativeShort, projectStatus, uiMode } from "../lib/status";
+import { canShowTtyLab, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
+import { nativeShort, projectStatus } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { formatTokens } from "../lib/format";
 import ui from "../styles/ui.module.css";
 import type { UsagePayload } from "../types/observation";
-
-function TtyPane({ instance }: { instance: Instance }) {
-  const Pane = TerminalView as (props: { instance?: Instance; instanceId?: string; onAttachFailed?: (reason: string) => void }) => ReactNode;
-  return (
-    <Pane
-      instance={instance}
-      instanceId={instance.id}
-      onAttachFailed={(reason) => hubStore.toast(reason)}
-    />
-  );
-}
 
 export function SessionPage({ view = "structured" }: { view?: "structured" | "tty" | "files" }) {
   const { instanceId = "" } = useParams();
@@ -48,7 +36,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
   const usageEvent = events.findLast((e) => e.kind === "usage");
   const usage = usageEvent?.payload as UsagePayload | undefined;
-  const snapshotLoading = Boolean(instance) && hub.events[instanceId] === undefined;
+  const snapshotLoading = Boolean(instance) && hub.events[instanceId] === undefined && !isTtyLabFixtureId(instanceId);
 
   if (!instance && hub.ready) {
     return <p style={{ padding: 16 }}>会话不存在</p>;
@@ -128,11 +116,17 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
         {journalStatus === "readonly-stale" ? " · 只读" : ""}
         {status === "idle" ? " · 回合结束、进程仍在" : ""}
       </div>
-      <div style={{ flex: 1, overflow: "auto" }}>
+      <div style={{ flex: 1, overflow: view === "tty" ? "hidden" : "auto", minHeight: 0, display: view === "tty" ? "flex" : undefined }}>
         {view === "files" ? (
           <p style={{ padding: 16, color: "var(--mute)" }}>文件 / diff 栏占位。空间不够时走这条全屏路由。</p>
         ) : view === "tty" ? (
-          <TtyPane instance={instance} />
+          <TerminalView
+            instance={instance}
+            onAttachFailed={(reason) => {
+              hubStore.toast(reason);
+              navigate(`/s/${instance.id}`, { replace: true });
+            }}
+          />
         ) : snapshotLoading ? (
           <p style={{ padding: 16, color: "var(--mute)" }} data-testid="loading-snapshot">
             加载 snapshot…

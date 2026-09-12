@@ -1,40 +1,325 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
+import { Button } from "../../../components/Button";
+import { ConnectionIndicator } from "../../../components/ConnectionIndicator";
+import { useWorkbenchViewport } from "../../../lib/viewport";
+import type { Instance } from "../../../types/instance";
+import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
+import { AuxKeys } from "./AuxKeys";
+import { openTtySession, type TtySession, type TtyStatus } from "./client";
+import { LocalInput } from "./LocalInput";
+import { createFontMeasure, fittedTerminalFont, responsiveTerminalSize, whenFontsReady } from "./terminalFit";
+import { attachTerminalTouch } from "./terminalTouch";
+import { NIGHT_CORRAL_THEME, TERMINAL_FONT_FAMILY } from "./theme";
+import css from "./TerminalView.module.css";
 
-export function TerminalView({ instanceId }: { instanceId: string }) {
-  const host = useRef<HTMLDivElement>(null);
+export type TtyLabHandle = {
+  disconnect: () => void;
+  reconnect: () => void;
+};
+
+declare global {
+  interface Window {
+    __ttyLab?: TtyLabHandle;
+  }
+}
+
+type DisplayMode = "fit" | "fixed" | "responsive";
+
+export function TerminalView({
+  instance,
+  onAttachFailed,
+}: {
+  instance: Instance;
+  onAttachFailed?: (reason: string) => void;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const searchRef = useRef<SearchAddon | null>(null);
+  const sessionRef = useRef<TtySession | null>(null);
+  const resetStreamRef = useRef(true);
+  const generationRef = useRef(0);
+  const { mobile, offsetTop } = useWorkbenchViewport();
+  const [inputOverride, setInputOverride] = useState<{ direct: boolean; mode: DisplayMode } | null>(null);
+  const [status, setStatus] = useState<TtyStatus>("connecting");
+  const [cols, setCols] = useState(80);
+  const [rows, setRows] = useState(24);
+  const directInput = inputOverride?.direct ?? !mobile;
+  const mode = inputOverride?.mode ?? (mobile ? "responsive" : "fit");
+  const modeRef = useRef<DisplayMode>(mode);
+  const failRef = useRef(onAttachFailed);
+  const applyFitRef = useRef<() => void>(() => {});
+  const instanceRef = useRef(instance);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [preview, setPreview] = useState("");
+  const [ready, setReady] = useState(false);
+  const [auxOpen, setAuxOpen] = useState(true);
+  const frozen = status === "reconnecting" || status === "failed";
+
+  const send = (data: string) => {
+    void sessionRef.current?.write(data);
+  };
 
   useEffect(() => {
-    const el = host.current;
-    if (!el) return;
+    failRef.current = onAttachFailed;
+  }, [onAttachFailed]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    instanceRef.current = instance;
+  }, [instance]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    const viewport = viewportRef.current;
+    if (!host || !viewport) return;
+
     const term = new Terminal({
-      fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+      allowProposedApi: true,
+      cursorBlink: true,
+      cursorStyle: "block",
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 14,
-      theme: { background: "#12161C", foreground: "#E7DCC8", cursor: "#C9842A" },
+      lineHeight: 1,
+      scrollback: 0,
+      convertEol: false,
+      disableStdin: true,
+      screenReaderMode: true,
+      theme: NIGHT_CORRAL_THEME,
     });
     const fit = new FitAddon();
+    const search = new SearchAddon();
     const unicode = new Unicode11Addon();
     term.loadAddon(fit);
-    term.loadAddon(new SearchAddon());
+    term.loadAddon(search);
     term.loadAddon(new WebLinksAddon());
     term.loadAddon(unicode);
     term.unicode.activeVersion = "11";
-    term.open(el);
-    fit.fit();
-    term.writeln(`tty attach placeholder · instance ${instanceId}`);
-    term.writeln("print driver has no TUI; this view is for claude-pty / claude-bg.");
-    const onResize = () => fit.fit();
-    window.addEventListener("resize", onResize);
-    return () => {
-      window.removeEventListener("resize", onResize);
-      term.dispose();
-    };
-  }, [instanceId]);
+    term.open(host);
+    termRef.current = term;
+    searchRef.current = search;
+    const font = createFontMeasure(host, TERMINAL_FONT_FAMILY);
 
-  return <div ref={host} style={{ height: "100%", minHeight: 240, padding: 8 }} />;
+    const applyFit = () => {
+      if (!termRef.current || !viewportRef.current) return;
+      const bounds = {
+        width: viewport.clientWidth,
+        height: viewport.clientHeight,
+        dpr: window.devicePixelRatio || 1,
+        lineHeight: term.options.lineHeight || 1,
+        letterSpacing: term.options.letterSpacing || 0,
+      };
+      if (modeRef.current === "responsive") {
+        const size = responsiveTerminalSize(bounds, font.measure, 14);
+        if (size && (term.cols !== size.cols || term.rows !== size.rows)) term.resize(size.cols, size.rows);
+        if (size) {
+          setCols(size.cols);
+          setRows(size.rows);
+          void sessionRef.current?.resize(size.cols, size.rows);
+        }
+        return;
+      }
+      fit.fit();
+      if (modeRef.current === "fit") {
+        const fitted = fittedTerminalFont(
+          { ...bounds, cols: term.cols, rows: term.rows },
+          font.measure,
+          14,
+        );
+        if (fitted != null && term.options.fontSize !== fitted) term.options.fontSize = fitted;
+        fit.fit();
+      }
+      setCols(term.cols);
+      setRows(term.rows);
+      void sessionRef.current?.resize(term.cols, term.rows);
+    };
+
+    const inputDisposable = term.onData((data) => {
+      if (term.options.disableStdin) return;
+      send(data);
+    });
+
+    applyFitRef.current = applyFit;
+    void whenFontsReady().then(() => applyFitRef.current());
+    applyFit();
+
+    const session = openTtySession(instanceRef.current, {
+      onFrame: (payload, _offset, _streamId, representation) => {
+        const reset = resetStreamRef.current;
+        if (reset && representation === "rendered-ansi") term.options.scrollback = 0;
+        const bytes = payloadForStreamWrite(payload, reset && representation === "rendered-ansi");
+        resetStreamRef.current = false;
+        const text = stripAnsi(payload);
+        setPreview((current) => (reset ? text : current + text));
+        term.write(bytes, () => {
+          setReady(true);
+        });
+      },
+      onStatus: (next, message) => {
+        setStatus(next);
+        if (next === "connecting") resetStreamRef.current = true;
+        if (next === "failed") failRef.current?.(message ?? "tty.attach failed");
+      },
+    });
+    sessionRef.current = session;
+    generationRef.current += 1;
+
+    const observer = new ResizeObserver(() => applyFit());
+    observer.observe(viewport);
+    const onViewport = () => {
+      if (window.visualViewport && window.visualViewport.scale !== 1) return;
+      applyFit();
+    };
+    window.visualViewport?.addEventListener("resize", onViewport);
+    window.addEventListener("resize", onViewport);
+
+    const detachTouch = attachTerminalTouch(viewport, {
+      onScrollPixels: (deltaY) => {
+        const line = Math.max(1, host.querySelector<HTMLElement>(".xterm-rows > div")?.getBoundingClientRect().height || 16);
+        term.scrollLines(Math.trunc(deltaY / line));
+      },
+      getGeneration: () => generationRef.current,
+      hasSelection: () => term.hasSelection(),
+    });
+
+    window.__ttyLab = {
+      disconnect: () => session.disconnectForTest(),
+      reconnect: () => {
+        resetStreamRef.current = true;
+        session.reconnectForTest();
+      },
+    };
+
+    return () => {
+      delete window.__ttyLab;
+      detachTouch();
+      observer.disconnect();
+      window.visualViewport?.removeEventListener("resize", onViewport);
+      window.removeEventListener("resize", onViewport);
+      inputDisposable.dispose();
+      font.dispose();
+      void session.detach();
+      sessionRef.current = null;
+      term.dispose();
+      termRef.current = null;
+    };
+  }, [instance.id]);
+
+  useEffect(() => {
+    applyFitRef.current();
+  }, [mode]);
+
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.disableStdin = frozen || !directInput;
+    if (directInput && !frozen) term.focus();
+  }, [directInput, frozen]);
+
+  const conn = status === "live" ? "live" : status === "reconnecting" ? "reconnecting" : "offline";
+
+  return (
+    <section
+      className={css.lab}
+      data-tty-lab="1"
+      data-tty-ready={ready ? "1" : "0"}
+      data-tty-status={status}
+      data-tty-cols={cols}
+      data-tty-rows={rows}
+      style={{ paddingBottom: offsetTop ? 0 : undefined }}
+    >
+      <header className={css.toolbar}>
+        <span>
+          {cols}×{rows} {mode}
+        </span>
+        <ConnectionIndicator status={conn} />
+        <Button
+          className={!directInput ? css.toggleOn : undefined}
+          aria-pressed={!directInput}
+          onClick={() => setInputOverride((current) => ({ direct: false, mode: current?.mode ?? mode }))}
+        >
+          本地输入
+        </Button>
+        <Button
+          className={directInput ? css.toggleOn : undefined}
+          aria-pressed={directInput}
+          onClick={() => setInputOverride((current) => ({ direct: true, mode: current?.mode ?? mode }))}
+        >
+          直连
+        </Button>
+        <Button
+          onClick={() =>
+            setInputOverride((current) => {
+              const next = mode === "fit" ? "fixed" : mode === "fixed" ? "responsive" : "fit";
+              return { direct: current?.direct ?? directInput, mode: next };
+            })
+          }
+        >
+          {mode}
+        </Button>
+        <Button aria-pressed={searchOpen} onClick={() => setSearchOpen((open) => !open)}>
+          搜索
+        </Button>
+        <Button aria-pressed={auxOpen} onClick={() => setAuxOpen((open) => !open)}>
+          辅助键
+        </Button>
+        {searchOpen ? (
+          <form
+            className={css.search}
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (searchQuery) searchRef.current?.findNext(searchQuery);
+            }}
+          >
+            <input
+              aria-label="搜索终端"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+            <Button
+              onClick={() => {
+                if (searchQuery) searchRef.current?.findNext(searchQuery);
+              }}
+            >
+              下一个
+            </Button>
+          </form>
+        ) : null}
+      </header>
+      <div className={css.viewport} ref={viewportRef} role="region" aria-label="终端画面">
+        {status !== "live" ? (
+          <div className={css.banner} role="status">
+            {status === "connecting" ? "正在连接终端…" : status === "reconnecting" ? "reconnecting" : "终端连接失败"}
+            {status === "reconnecting" || status === "failed" ? (
+              <Button
+                variant="primary"
+                onClick={() => {
+                  resetStreamRef.current = true;
+                  sessionRef.current?.reconnectForTest();
+                }}
+              >
+                重连
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+        <div className={css.host} ref={hostRef} />
+        <pre className={css.preview} data-testid="tty-ansi-preview">
+          {preview}
+        </pre>
+      </div>
+      <div className={css.dock}>
+        {!directInput ? <LocalInput disabled={frozen} mobile={mobile} onSend={send} /> : null}
+        {auxOpen ? <AuxKeys disabled={frozen} onKey={send} /> : null}
+      </div>
+    </section>
+  );
 }

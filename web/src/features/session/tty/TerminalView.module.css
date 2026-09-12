@@ -1,0 +1,91 @@
+.lab {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  background: var(--ink);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.viewport {
+  flex: 1;
+  min-height: 240px;
+  overflow: auto;
+  position: relative;
+}
+
+.host {
+  height: 100%;
+  min-height: 240px;
+  padding: 8px;
+}
+
+.host :global(.xterm) {
+  height: 100%;
+}
+
+.banner {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ink-2) 92%, transparent);
+  color: var(--paper);
+  font-size: 12px;
+}
+
+.dock {
+  padding: 8px 12px calc(8px + var(--safe-bottom));
+  border-top: 1px solid var(--line);
+  background: var(--ink-2);
+}
+
+.keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.keys button {
+  min-height: 44px;
+}
+
+.search {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex: 1;
+  min-width: 160px;
+}
+
+.preview {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.toggleOn {
+  border-color: var(--dust);
+  color: var(--paper);
+}

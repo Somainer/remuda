@@ -1,10 +1,42 @@
 Remuda
 Copyright 2026 Ruming Wang
 
-No third-party source has been copied into this bootstrap.
+This product includes code derived from the following Apache-2.0 projects.
+Remuda's MIT license does not replace the licenses of imported third-party
+code. Upstream LICENSE/NOTICE text must travel with source and binary
+distributions of the copied files.
+
+vibe-kanban (Apache-2.0)
+  Copyright 2025 Bloop AI Labs Ltd
+  Source: https://github.com/BloopAI/vibe-kanban
+  Revision: 4deb7eca8f381f7cbc1f9d15515a9ab8f8009053
+  Lifted path: crates/executors/src/executors/codex/jsonrpc.rs
+  Local path: crates/remuda-codex-wire/src/peer.rs
+  Modifications: Remuda `WireError`; omit the `jsonrpc` field; classify
+  inbound notifications and server→client requests onto an mpsc stream;
+  NDJSON line cap; skip empty/`#` lines; no vibe-kanban executor callbacks.
 
 Future imports from vibe-kanban, herdr, or other Apache-2.0 projects must
 retain the applicable copyright notices, LICENSE, and upstream NOTICE
 contents, identify the imported revision and local modifications, and add
-the required attribution here. Remuda's MIT license does not replace the
-licenses of imported third-party code.
+the required attribution here.
+
+---
+
+`crates/remuda-claude-wire` implements the Claude Code stream-json control
+protocol from Remuda research notes (`docs/research/claude-stream-json-protocol.md`)
+and live CLI 2.1.268 fixtures. It was cross-checked against vibe-kanban
+(Apache-2.0) `crates/executors/src/executors/claude/{types.rs,protocol.rs,client.rs}`
+as a protocol subset. No vibe-kanban source was copied; differences (initialize
+handshake wait, `--include-hook-events`, `--forward-subagent-text`, not
+breaking on the first `result`) are documented in
+`crates/remuda-claude-wire/README.md`.
+
+herdrx (MIT)
+Copyright (c) 2026 riba2534
+Source: herdrx/web/src/lib/terminalFit.ts, herdrx/web/src/lib/terminalTouch.ts,
+herdrx/web/src/components/TerminalPane.tsx, herdrx/web/src/pages/WorkbenchPage.tsx
+Local: web/src/features/session/tty/{terminalFit.ts,terminalTouch.ts,TerminalView.tsx}
+Algorithms rewritten for Remuda Hub tty-binary-v1 and Night Corral tokens;
+not imported from herdrx. Fit/touch/IME/aux-key/viewport behaviour preserved
+in simplified form. Font family is IBM Plex Mono instead of JetBrains Mono.

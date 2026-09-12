@@ -1,0 +1,169 @@
+/**
+ * Terminal touch scrolling.
+ * Algorithm rewritten from herdrx/web/src/lib/terminalTouch.ts
+ * (MIT, Copyright (c) 2026 riba2534). Wired to Remuda xterm, not Herdr.
+ */
+
+export interface TerminalTouchOptions {
+  onScrollPixels: (deltaY: number, clientX: number, clientY: number) => void;
+  onGestureCancel?: () => void;
+  getGeneration: () => number | string | null;
+  hasSelection?: () => boolean;
+  enabled?: () => boolean;
+}
+
+/** Keep single-finger vertical movement in the terminal, including at its edges. */
+export function attachTerminalTouch(viewport: HTMLElement, options: TerminalTouchOptions): () => void {
+  const threshold = 6;
+  let gesture: {
+    identifier: number;
+    startX: number;
+    startY: number;
+    lastY: number;
+    panTop: number;
+    axis: "pending" | "vertical" | "horizontal";
+    generation: number | string | null;
+  } | null = null;
+  let blocked = false;
+  const previousTouchAction = viewport.style.touchAction;
+  const zoomed = () => (window.visualViewport?.scale || 1) > 1.01;
+  const active = () => options.enabled?.() !== false;
+  const updateTouchAction = () => {
+    viewport.style.touchAction = !active() || zoomed() ? "auto" : "pan-x pinch-zoom";
+  };
+  const selected = () => {
+    if (options.hasSelection?.()) return true;
+    const selection = window.getSelection();
+    return (
+      !!selection &&
+      !selection.isCollapsed &&
+      (viewport.contains(selection.anchorNode) || viewport.contains(selection.focusNode))
+    );
+  };
+  const cancel = () => {
+    if (gesture) options.onGestureCancel?.();
+    blocked = blocked || !!gesture;
+    gesture = null;
+  };
+  const start = (event: TouchEvent) => {
+    if (!active()) return;
+    event.stopImmediatePropagation();
+    if (event.touches.length !== 1) {
+      cancel();
+      blocked = true;
+      return;
+    }
+    if (blocked || zoomed() || selected()) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest("a, button, input, textarea, select, [contenteditable='true']")) return;
+    const touch = event.touches[0];
+    gesture = {
+      identifier: touch.identifier,
+      startX: touch.clientX,
+      startY: touch.clientY,
+      lastY: touch.clientY,
+      panTop: viewport.scrollTop,
+      axis: "pending",
+      generation: options.getGeneration(),
+    };
+  };
+  const move = (event: TouchEvent) => {
+    if (!active()) return;
+    event.stopImmediatePropagation();
+    if (event.touches.length !== 1) {
+      cancel();
+      blocked = true;
+      return;
+    }
+    if (!gesture || blocked) return;
+    if (gesture.generation !== options.getGeneration() || zoomed() || selected()) {
+      cancel();
+      return;
+    }
+    const touch = Array.from(event.touches).find((point) => point.identifier === gesture!.identifier);
+    if (!touch) {
+      cancel();
+      return;
+    }
+    if (gesture.axis === "pending") {
+      const distanceX = Math.abs(touch.clientX - gesture.startX);
+      const distanceY = Math.abs(touch.clientY - gesture.startY);
+      if (Math.max(distanceX, distanceY) < threshold) return;
+      gesture.axis = distanceY >= distanceX ? "vertical" : "horizontal";
+      gesture.lastY = gesture.startY + Math.sign(touch.clientY - gesture.startY) * threshold;
+    }
+    if (gesture.axis === "horizontal") return;
+    if (!event.cancelable) {
+      cancel();
+      return;
+    }
+    event.preventDefault();
+    const deltaY = gesture.lastY - touch.clientY;
+    gesture.lastY = touch.clientY;
+    if (!deltaY) return;
+    const max = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    const before = Math.max(0, Math.min(max, Math.abs(viewport.scrollTop - gesture.panTop) > 1 ? viewport.scrollTop : gesture.panTop));
+    const next = Math.max(0, Math.min(max, before + deltaY));
+    gesture.panTop = next;
+    viewport.scrollTop = next;
+    const remaining = deltaY - (next - before);
+    if (remaining) options.onScrollPixels(remaining, touch.clientX, touch.clientY);
+  };
+  const end = (event: TouchEvent) => {
+    if (!active()) return;
+    event.stopImmediatePropagation();
+    if (event.type === "touchcancel") cancel();
+    gesture = null;
+    if (!event.touches.length) blocked = false;
+  };
+  const contextMenu = () => cancel();
+  const resume = () => {
+    gesture = null;
+    blocked = false;
+  };
+  const visibility = () => {
+    if (document.hidden) cancel();
+    else resume();
+  };
+  const otherStart = (event: TouchEvent) => {
+    if (event.touches.length > 1 && gesture) {
+      cancel();
+      blocked = true;
+    }
+  };
+  const otherEnd = (event: TouchEvent) => {
+    if (!event.touches.length) blocked = false;
+  };
+  updateTouchAction();
+  const classObserver = typeof MutationObserver === "undefined" ? null : new MutationObserver(updateTouchAction);
+  classObserver?.observe(viewport, { attributes: true, attributeFilter: ["class"] });
+  viewport.addEventListener("touchstart", start, { capture: true, passive: true });
+  viewport.addEventListener("touchmove", move, { capture: true, passive: false });
+  viewport.addEventListener("touchend", end, { capture: true, passive: true });
+  viewport.addEventListener("touchcancel", end, { capture: true, passive: true });
+  viewport.addEventListener("contextmenu", contextMenu, true);
+  window.visualViewport?.addEventListener("resize", updateTouchAction);
+  window.addEventListener("blur", cancel);
+  window.addEventListener("focus", resume);
+  document.addEventListener("visibilitychange", visibility);
+  document.addEventListener("touchstart", otherStart, { capture: true, passive: true });
+  document.addEventListener("touchend", otherEnd, { capture: true, passive: true });
+  document.addEventListener("touchcancel", otherEnd, { capture: true, passive: true });
+  return () => {
+    cancel();
+    classObserver?.disconnect();
+    viewport.style.touchAction = previousTouchAction;
+    viewport.removeEventListener("touchstart", start, true);
+    viewport.removeEventListener("touchmove", move, true);
+    viewport.removeEventListener("touchend", end, true);
+    viewport.removeEventListener("touchcancel", end, true);
+    viewport.removeEventListener("contextmenu", contextMenu, true);
+    window.visualViewport?.removeEventListener("resize", updateTouchAction);
+    window.removeEventListener("blur", cancel);
+    window.removeEventListener("focus", resume);
+    document.removeEventListener("visibilitychange", visibility);
+    document.removeEventListener("touchstart", otherStart, true);
+    document.removeEventListener("touchend", otherEnd, true);
+    document.removeEventListener("touchcancel", otherEnd, true);
+  };
+}

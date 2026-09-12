@@ -9,8 +9,8 @@
 use crate::binary::{BinaryPin, pin_binary};
 use crate::capabilities::capability_snapshot;
 use crate::claude_pty::{
-    ObsCtx, argv_for_resume, emit_on, map_herdr, obs_ctx, prompt_text, refuse_bare,
-    strip_named_flags,
+    ObsCtx, apply_tty_bypass_flag, argv_for_resume, emit_on, inject_session_start_hook, map_herdr,
+    obs_ctx, prompt_text, refuse_bare, strip_named_flags,
 };
 use crate::driver::{Driver, DriverAck, RunHandle};
 use crate::error::{DriverError, DriverResult};
@@ -111,6 +111,8 @@ pub struct ClaudeBgDriver {
     options: ClaudeBgOptions,
     inner: Mutex<Option<BgLive>>,
     last_recipe: Mutex<Option<LaunchRecipe>>,
+    /// Last successfully materialized spec; `resume` re-materializes from this.
+    last_spec: Mutex<Option<InstanceSpec>>,
     closed: AtomicBool,
     seq: Arc<AtomicU64>,
 }
@@ -122,6 +124,7 @@ impl ClaudeBgDriver {
             options,
             inner: Mutex::new(None),
             last_recipe: Mutex::new(None),
+            last_spec: Mutex::new(None),
             closed: AtomicBool::new(false),
             seq: Arc::new(AtomicU64::new(0)),
         }
@@ -231,8 +234,12 @@ impl ClaudeBgDriver {
         if !recipe.argv.iter().any(|token| token == "--bg") {
             recipe.argv.insert(0, "--bg".into());
         }
+        apply_tty_bypass_flag(&mut recipe);
+        recipe = inject_session_start_hook(&mut recipe, &self.options.launch_dir)?;
+        apply_tty_bypass_flag(&mut recipe);
         refuse_bare(&recipe.argv)?;
         *self.last_recipe.lock().await = Some(recipe.clone());
+        *self.last_spec.lock().await = Some(spec.clone());
 
         let name = bg_instance_name(&spec);
         let (tx, rx) = mpsc::channel(64);
@@ -414,8 +421,7 @@ impl ClaudeBgDriver {
         if live.dispatched && !live.short_id.is_empty() {
             let mut command = Command::new(&live.recipe.binary.abs_path);
             command
-                .arg("stop")
-                .arg(&live.short_id)
+                .args(stop_args(&live.short_id))
                 .current_dir(&live.recipe.cwd)
                 .kill_on_drop(true)
                 .stdin(Stdio::null())
@@ -527,29 +533,34 @@ impl Driver for ClaudeBgDriver {
             .map(|bg| bg.job_id.clone())
             .filter(|id| !id.is_empty())
             .ok_or(DriverError::NativeSessionNotFound)?;
-        if job_is_stopped(&self.options.native_home, &job_id) {
-            return Err(DriverError::AttachWouldWake);
-        }
-        let mut spec: InstanceSpec =
-            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json"))?;
+        let mut spec = self
+            .last_spec
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::NativeSessionNotFound)?;
         spec.driver = DriverKind::ClaudeBg;
         spec.kind = AgentKind::Claude;
         spec.host = native_ref.host_id.clone();
-        spec.cwd = self
-            .last_recipe
-            .lock()
-            .await
-            .as_ref()
-            .map(|recipe| recipe.cwd.clone())
-            .unwrap_or_else(|| spec.cwd.clone());
         let handle = self.prepare(spec).await?;
-        if let Some(live) = self.inner.lock().await.as_mut() {
-            live.short_id = job_id;
+        let mut inner = self.inner.lock().await;
+        if let Some(live) = inner.as_mut() {
+            live.short_id = job_id.clone();
             live.dispatched = true;
+            live.stopped = false;
             live.session_id = match native_ref.session_id {
                 Knowledge::Known { value } => Some(value),
                 _ => native_ref.claude.map(|claude| claude.session_id),
             };
+            if live.observer.is_none() {
+                let ctx = self.ctx_locked(live);
+                live.observer = Some(spawn_job_observer(
+                    job_dir(&live.recipe.native_home, &job_id),
+                    live.events.clone(),
+                    ctx,
+                    Arc::clone(&self.seq),
+                ));
+            }
         }
         Ok(handle)
     }
@@ -562,17 +573,38 @@ pub fn parse_backgrounded(stdout: &str) -> Option<String> {
         let rest = trimmed.strip_prefix("backgrounded")?;
         let rest = rest.trim_start_matches([' ', '·', '•', '-', ':']);
         let rest = rest.trim_start();
-        let id = rest
-            .split_whitespace()
-            .next()
+        let token = rest
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, '·' | '•' | ':' | ','))
+            .find(|part| !part.is_empty())
             .unwrap_or("")
-            .trim_matches('·')
-            .trim();
-        if id.len() >= 6 && id.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            return Some(id.to_string());
+            .trim_matches(|ch: char| matches!(ch, '·' | '•' | ':'));
+        if let Some(id) = short_job_id(token) {
+            return Some(id);
         }
     }
     None
+}
+
+fn short_job_id(token: &str) -> Option<String> {
+    if token.len() >= 8 {
+        let head = &token[..8];
+        if head.chars().all(|ch| ch.is_ascii_hexdigit())
+            && (token.len() == 8
+                || token.as_bytes().get(8).copied() == Some(b'-')
+                || token.chars().all(|ch| ch.is_ascii_hexdigit()))
+        {
+            return Some(head.to_string());
+        }
+    }
+    if token.len() >= 6 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(token.to_string());
+    }
+    None
+}
+
+/// `claude stop <shortId>` — never `rm`.
+pub(crate) fn stop_args(short_id: &str) -> [&str; 2] {
+    ["stop", short_id]
 }
 
 fn spawn_job_observer(
@@ -728,4 +760,21 @@ fn pin_source(source: &BinarySource) -> DriverResult<BinaryPin> {
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Mapping helpers used by `tests/claude_pty_review.rs`.
+#[doc(hidden)]
+pub mod review {
+    /// `claude stop <shortId>` argv. Never `rm`.
+    pub fn stop_invocation(short_id: &str) -> Vec<String> {
+        super::stop_args(short_id)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// First 8 hex of a UUID or a 6–8 char short id.
+    pub fn short_id(token: &str) -> Option<String> {
+        super::short_job_id(token)
+    }
 }

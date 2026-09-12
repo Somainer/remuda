@@ -1,10 +1,13 @@
 //! Minimal `remuda node --stdio` / `remuda version` binary for SSH bootstrap.
 //!
-//! The composition-root `remuda` binary currently fails to build against the
-//! split Node crate. This bin is uploaded as `remuda` on the remote host.
+//! Uploaded as `remuda` on the remote host. Speaks Hub NDJSON and dispatches
+//! `instance.*` through the native driver registry (`generic-pty` included).
 
 use clap::{Parser, Subcommand};
-use remuda_node::StdioOptions;
+use remuda_node::{
+    DevServerConfig, LocalDrivers, NativeDriverConfig, ServeConfig, StdioOptions, compose,
+    run_stdio_with_node,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -73,17 +76,36 @@ fn main() -> anyhow::Result<()> {
         } => {
             anyhow::ensure!(stdio, "remuda node requires --stdio on this binary");
             let labels = parse_labels(&labels)?;
+            let data_dir = data_dir.unwrap_or_else(|| StdioOptions::default().data_dir);
+            std::fs::create_dir_all(data_dir.join("workspace"))?;
+            std::fs::create_dir_all(data_dir.join("herdr"))?;
+            let mut native = NativeDriverConfig::new(data_dir.clone());
+            native.herdr_socket_dir = Some(data_dir.join("herdr"));
+            native.herdr_session = "remuda-dogfood".into();
+            // Isolated CLAUDE_CONFIG_DIR copies of ~/.claude.json are rejected
+            // by this host's Claude (API Usage Billing). Leave login unset so
+            // the pane inherits the user's existing oauth. Herdr stays under
+            // data_dir/herdr.
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             runtime.block_on(async move {
-                remuda_node::run_stdio_opts(StdioOptions {
-                    labels,
-                    max_instances,
-                    display_label,
-                    transport,
-                    data_dir: data_dir.unwrap_or_else(|| StdioOptions::default().data_dir),
-                })
+                let node = compose(&ServeConfig {
+                    http: DevServerConfig::loopback(0)
+                        .with_workspace_root(data_dir.join("workspace")),
+                    data_dir: data_dir.clone(),
+                    drivers: LocalDrivers::Native(native),
+                })?;
+                run_stdio_with_node(
+                    node,
+                    StdioOptions {
+                        labels,
+                        max_instances,
+                        display_label,
+                        transport,
+                        data_dir,
+                    },
+                )
                 .await
                 .map_err(|err| anyhow::anyhow!("{err}"))
             })

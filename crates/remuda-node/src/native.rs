@@ -62,7 +62,9 @@ impl NativeDriverConfig {
             )
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true")),
             herdr_socket_dir: None,
-            herdr_binary: None,
+            herdr_binary: std::env::var_os("REMUDA_HERDR_BIN")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
             herdr_session: "remuda-node".to_owned(),
             print_handshake_timeout: Duration::from_secs(30),
             extra_env,

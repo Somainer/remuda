@@ -1,0 +1,6 @@
+{"id":"sub1","result":{"type":"subscription_started"}}
+{"data":{"agent":"claude","agent_status":"working","pane_id":"w1:p2","workspace_id":"w1"},"event":"pane.agent_status_changed"}
+{"data":{"agent":"claude","agent_status":"idle","pane_id":"w1:p2","workspace_id":"w1"},"event":"pane.agent_status_changed"}
+{"event":"pane_created","data":{"type":"pane_created","pane":{"pane_id":"w1:p3","workspace_id":"w1","tab_id":"w1:t1"}}}
+{"event":"pane_exited","data":{"type":"pane_exited","pane_id":"w1:p3","workspace_id":"w1"}}
+{"event":"pane_output_changed","data":{"type":"pane_output_changed","pane_id":"w1:p2","workspace_id":"w1","revision":4}}

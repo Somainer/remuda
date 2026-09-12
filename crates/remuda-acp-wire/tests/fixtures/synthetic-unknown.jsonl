@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"plan","entries":[{"content":"write file","priority":"medium","status":"pending"}]}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"hook_execution","hook":"pre_tool_use"}}}
+{"jsonrpc":"2.0","method":"totally/unknown","params":{"x":1}}
+{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionUpdate":"pending_interaction","kind":"permission"}}
+{"jsonrpc":"2.0","id":"1","method":"x.ai/fs/list","params":{}}

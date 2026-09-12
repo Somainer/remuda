@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/remuda-protocol",
     "crates/remuda-claude-wire",
+    "crates/remuda-acp-wire",
     "crates/remuda-herdr",
     "crates/remuda-driver",
     "crates/remuda-journal",
@@ -20,10 +21,14 @@ rust-version = "1.94.1"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = "=1.2.2"
+jsonschema = { version = "0.56", default-features = false }
 thiserror = "2"
 anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
@@ -31,13 +36,17 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+agent-client-protocol = "2.1.0"
 futures = "0.3"
 bytes = { version = "1", features = ["serde"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
 rust-embed = "8"
 portable-pty = "0.9"
 remuda-protocol = { path = "crates/remuda-protocol" }
 remuda-claude-wire = { path = "crates/remuda-claude-wire" }
+remuda-acp-wire = { path = "crates/remuda-acp-wire" }
+remuda-codex-wire = { path = "crates/remuda-codex-wire" }
 remuda-herdr = { path = "crates/remuda-herdr" }
 remuda-driver = { path = "crates/remuda-driver" }
 remuda-journal = { path = "crates/remuda-journal" }

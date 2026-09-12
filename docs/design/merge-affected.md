@@ -5,7 +5,10 @@ scan, formatting, workspace check and workspace clippy gates, then runs
 `cargo test --locked -p <crate> …` for changed crates and their transitive
 reverse dependencies. `--full` restores `cargo test --locked --workspace`.
 Tests retain the single automatic retry; web checks retain their existing
-change detection and `--web` override.
+change detection and `--web` override. `--web-e2e` forwards to
+`gate.sh --web-e2e` (the live Hub Playwright job) and is also auto-enabled
+when the merge touches `web/src/lib/{api,session}.ts`,
+`web/src/features/session/**`, Hub auth files, or the Hub live e2e specs.
 
 The candidate worktree supplies both the gate script and `cargo metadata
 --format-version 1 --locked --all-features`. Selection compares the pinned

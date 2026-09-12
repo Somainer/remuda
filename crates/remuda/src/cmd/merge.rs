@@ -24,7 +24,7 @@ pub(crate) struct MergeArgs {
     #[serde(default)]
     pub gate: bool,
     /// Show local wt/* branches ahead of main and their mergeability.
-    #[arg(long, visible_alias = "pending", conflicts_with_all = ["branch", "gate", "dry_run", "message", "web", "no_push"])]
+    #[arg(long, visible_alias = "pending", conflicts_with_all = ["branch", "gate", "dry_run", "message", "web", "web_e2e", "no_push"])]
     #[serde(default)]
     pub list: bool,
     /// Override the merge title; the gate summary is still appended to the body.
@@ -46,6 +46,10 @@ pub(crate) struct MergeArgs {
     #[arg(long)]
     #[serde(default)]
     pub web: bool,
+    /// Include the live Hub Playwright suite (`gate.sh --web-e2e`).
+    #[arg(long)]
+    #[serde(default)]
+    pub web_e2e: bool,
     /// Advance local main after verification without pushing origin.
     #[arg(long)]
     #[serde(default)]
@@ -226,7 +230,7 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
         gate_override: std::env::var_os("REMUDA_MERGE_GATE_COMMAND")
             .is_some_and(|value| !value.is_empty()),
         web: args.web,
-        web_e2e: false,
+        web_e2e: args.web_e2e,
         main_updated: false,
         pushed: false,
         conflicts: Vec::new(),
@@ -332,7 +336,7 @@ fn execute_inner(
         )?;
         successful(&diff)?;
         report.web |= web_changed(&diff.stdout);
-        report.web_e2e = web_e2e::changed(&diff.stdout);
+        report.web_e2e |= web_e2e::changed(&diff.stdout);
         report.web |= report.web_e2e;
         report.steps.push(Step::planned("worktree"));
         report.steps.push(Step::planned("merge"));
@@ -407,7 +411,7 @@ fn execute_inner(
     )?;
     successful(&diff)?;
     report.web |= web_changed(&diff.stdout);
-    report.web_e2e = web_e2e::changed(&diff.stdout);
+    report.web_e2e |= web_e2e::changed(&diff.stdout);
     report.web |= report.web_e2e;
     let report_file = worktree.with_file_name("gate.jsonl");
     run_gate(report, &worktree, &target, &report_file)?;
@@ -886,7 +890,16 @@ mod tests {
         assert!(Cli::try_parse_from(["merge", "topic", "--gate", "--full", "--affected"]).is_err());
         let mcp: MergeArgs =
             serde_json::from_value(serde_json::json!({"branch":"topic", "gate":true})).unwrap();
-        assert!(mcp.affected && !mcp.full);
+        assert!(mcp.affected && !mcp.full && !mcp.web_e2e);
+        let e2e = Cli::try_parse_from(["merge", "topic", "--gate", "--web-e2e"])
+            .unwrap()
+            .args;
+        assert!(e2e.web_e2e);
+        let mcp_e2e: MergeArgs = serde_json::from_value(
+            serde_json::json!({"branch":"topic", "gate":true, "webE2e":true}),
+        )
+        .unwrap();
+        assert!(mcp_e2e.web_e2e);
     }
 
     #[test]

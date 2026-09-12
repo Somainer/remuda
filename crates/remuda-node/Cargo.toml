@@ -41,6 +41,7 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+nix = { version = "0.28", features = ["process", "fs"] }
 
 [dev-dependencies]
 remuda-hub.workspace = true

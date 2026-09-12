@@ -1,4 +1,5 @@
-//! Preflight for Hub-supervised hosts. All remote writes stay in a private /tmp directory.
+//! Preflight for Hub-supervised daemon bridges. Remote writes use a private
+//! /tmp data directory and an optional user service unit.
 
 use crate::{Error, SshClient, bootstrap, sh_single_quote};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,33 @@ pub enum BinaryPolicy {
 pub struct ManagedNode {
     /// Command passed to the existing SSH stdio carrier.
     pub argv: Vec<String>,
+}
+
+impl ManagedNode {
+    /// Probe the daemon independently of a failed bridge, without remote writes.
+    pub async fn daemon_reachable(client: &SshClient, host_id: &str) -> Result<bool, Error> {
+        validate_host_id(host_id)?;
+        let dir = sh_single_quote(&format!("/tmp/remuda-ssh-{host_id}"))?;
+        let script = format!(
+            "set -eu; if [ -x {dir}/remuda ]; then binary={dir}/remuda; else binary=$(command -v remuda); fi; \
+             exec env REMUDA_DATA_DIR={dir} REMUDA_CONFIG={dir}/remuda.toml \"$binary\" node status --data-dir {dir}"
+        );
+        let result = client
+            .exec(&["sh", "-c", &script], None, Duration::from_secs(15))
+            .await?;
+        Ok(result.status == Some(0))
+    }
+}
+
+fn validate_host_id(host_id: &str) -> Result<(), Error> {
+    if !host_id.starts_with("hst_")
+        || !host_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(Error::Enroll("invalid managed host identity".into()));
+    }
+    Ok(())
 }
 
 /// Accept SSH aliases or user@host; never flags, URLs or shell expressions.
@@ -57,13 +85,7 @@ pub async fn prepare_managed_node(
     upload_binary: Option<&Path>,
 ) -> Result<ManagedNode, Error> {
     validate_target(&client.alias)?;
-    if !host_id.starts_with("hst_")
-        || !host_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return Err(Error::Enroll("invalid managed host identity".into()));
-    }
+    validate_host_id(host_id)?;
     let timeout = Duration::from_secs(30);
     let dir = format!("/tmp/remuda-ssh-{host_id}");
     let qdir = sh_single_quote(&dir)?;
@@ -129,7 +151,6 @@ pub async fn prepare_managed_node(
     let mut command = vec![
         binary,
         "node".into(),
-        "--stdio".into(),
         "--data-dir".into(),
         dir.clone(),
         "--display-label".into(),
@@ -147,13 +168,39 @@ pub async fn prepare_managed_node(
         .map(|arg| sh_single_quote(arg))
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
+    let launch = format!(
+        "cd {qdir}/workspace && exec env CODEX_HOME={qdir}/codex REMUDA_DATA_DIR={qdir} REMUDA_CONFIG={qdir}/remuda.toml {command}"
+    );
+    let status = client
+        .exec(&["sh", "-c", &format!("{launch} status")], None, timeout)
+        .await?;
+    if status.status != Some(0) {
+        let installed = client
+            .exec(&["sh", "-c", &format!("{launch} install")], None, timeout)
+            .await?;
+        if installed.status != Some(0) {
+            // Headless SSH accounts may have no user service manager. Keep the
+            // daemon detached, and report that this start is not an enabled unit.
+            tracing::warn!(host_id, stderr = %installed.stderr, "user service unavailable; starting detached daemon");
+            client
+                .exec(
+                    &["sh", "-c", &format!("{launch} run --daemon")],
+                    None,
+                    timeout,
+                )
+                .await?
+                .ok()?;
+        }
+        client
+            .exec(&["sh", "-c", &format!("{launch} status")], None, timeout)
+            .await?
+            .ok()?;
+    }
     Ok(ManagedNode {
         argv: vec![
             "sh".into(),
             "-c".into(),
-            format!(
-                "cd {qdir}/workspace && exec env CODEX_HOME={qdir}/codex REMUDA_DATA_DIR={qdir} REMUDA_CONFIG={qdir}/remuda.toml {command}"
-            ),
+            format!("{launch} bridge --no-start"),
         ],
     })
 }
@@ -186,6 +233,72 @@ fn musl_artifact() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_starts_detached_daemon_when_user_manager_is_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let binary = fixture.path().join("remuda");
+        let ssh = fixture.path().join("ssh");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$*\" in *version*) echo 'remuda 0.1.0'; exit 0;; esac\nfor arg do command=$arg; done\nprintf '%s\\n' \"$command\" >> \"$REMUDA_DATA_DIR/calls\"\ncase \"$command\" in status) test -f \"$REMUDA_DATA_DIR/alive\";; install) echo 'no user service manager' >&2; exit 1;; --daemon) touch \"$REMUDA_DATA_DIR/alive\";; *) exit 2;; esac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let report = format!(
+            "printf 'Linux\\nx86_64\\n%s\\n' {}",
+            sh_single_quote(binary.to_str().unwrap()).unwrap()
+        );
+        std::fs::write(&ssh, format!("#!/bin/sh\nfor arg do command=$arg; done\ncase \"$command\" in *'uname -s'*) {report};; *) exec /bin/sh -c \"$command\";; esac\n")).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let client = SshClient::new(
+            "fixture-node",
+            crate::SshOptions {
+                ssh_binary: ssh,
+                ..Default::default()
+            },
+        );
+        let id = format!(
+            "hst_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let remote = PathBuf::from(format!("/tmp/remuda-ssh-{id}"));
+        let prepared = prepare_managed_node(
+            &client,
+            &id,
+            "worker's label",
+            &[],
+            BinaryPolicy::RequireInstalled,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(prepared.argv[2].ends_with("bridge --no-start"));
+        assert!(!prepared.argv[2].contains("--stdio"));
+        assert_eq!(
+            std::fs::read_to_string(remote.join("calls")).unwrap(),
+            "status\ninstall\n--daemon\nstatus\n"
+        );
+        prepare_managed_node(
+            &client,
+            &id,
+            "worker's label",
+            &[],
+            BinaryPolicy::RequireInstalled,
+            None,
+        )
+        .await
+        .unwrap();
+        let calls = std::fs::read_to_string(remote.join("calls")).unwrap();
+        assert_eq!(
+            calls.matches("install").count(),
+            1,
+            "live daemon is reused on reconnect"
+        );
+        std::fs::remove_dir_all(remote).unwrap();
+    }
     #[test]
     fn targets_and_versions_fail_closed() {
         for target in ["sg-node", "dev@sg.example", "192.0.2.1"] {

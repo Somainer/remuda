@@ -87,6 +87,39 @@ fn fake_ssh(root: &Path, node: &Path) -> PathBuf {
     ssh
 }
 
+struct FixtureDaemon(PathBuf);
+
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let Ok(pid) = std::fs::read_to_string(self.0.join("node.pid")) else {
+            return;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            return;
+        };
+        // The unique fixture directory must still identify this exact process;
+        // never signal an unrelated process if a stale pidfile was left behind.
+        let Ok(command) = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+        else {
+            return;
+        };
+        if !String::from_utf8_lossy(&command.stdout).contains(self.0.to_string_lossy().as_ref()) {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        for _ in 0..100 {
+            if !self.0.join("node.pid").exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_stdio_node_upload_dispatch_and_stop() {
     let dir = tempfile::tempdir().unwrap();
@@ -121,6 +154,7 @@ async fn actual_stdio_node_upload_dispatch_and_stop() {
     assert_eq!(status, 201, "{added}");
     let id = added["id"].as_str().unwrap();
     let remote = PathBuf::from(format!("/tmp/remuda-ssh-{id}"));
+    let daemon = FixtureDaemon(remote.clone());
     wait_host(&hub, &token, id, |host| host["online"] == true).await;
     assert!(remote.join("remuda").is_file());
     assert!(!remote.join("codex/auth.json").exists());
@@ -188,5 +222,14 @@ async fn actual_stdio_node_upload_dispatch_and_stop() {
     .await
     .expect("close settles before remove");
     hub.shutdown().await;
+    assert!(
+        remuda_node::daemon_is_running(&remote).await.unwrap(),
+        "Hub shutdown must leave the persistent Node alive"
+    );
+    drop(daemon);
+    assert!(
+        !remote.join("node.pid").exists(),
+        "fixture daemon shutdown must complete before cleanup"
+    );
     std::fs::remove_dir_all(remote).unwrap();
 }

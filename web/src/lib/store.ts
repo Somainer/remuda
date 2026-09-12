@@ -6,8 +6,9 @@ import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
 import type { Workspace } from "../types/workspace";
 import { api, observationText, type InstanceCreateSpec } from "./api";
-import { JournalClient } from "./journal";
+import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
+import { mockGappedTail, mockJournalIds } from "./mock";
 
 export type ConnectionUi = "live" | "reconnecting" | "offline";
 export type Toast = { id: string; text: string } | null;
@@ -142,11 +143,25 @@ class HubStore {
     }
     if (this.journals.has(instance.journalId)) return;
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
-    const history = await api.eventsRead({ journalId: instance.journalId, limit: 512 });
+    const history: Observation[] = [];
+    let afterSeq: Observation["seq"] | undefined;
+    for (;;) {
+      const page = await api.eventsRead({ journalId: instance.journalId, afterSeq, limit: 512 });
+      history.push(...page.events);
+      if (page.events.length < 512) break;
+      afterSeq = page.events[page.events.length - 1].seq;
+      if (history.length >= 8192) break;
+    }
     this.emit({
-      events: { ...this.state.events, [instanceId]: history.events },
+      events: { ...this.state.events, [instanceId]: history },
     });
-    const client = new JournalClient(instance.journalId, api.eventsRead, {
+    const read: JournalRead = async (args) => {
+      if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return api.eventsRead(args);
+    };
+    const client = new JournalClient(instance.journalId, read, {
       onEvents: (events) => {
         const current = this.state.events[instanceId] ?? [];
         const next = current.concat(events);
@@ -172,7 +187,14 @@ class HubStore {
     });
     this.subs.set(instance.journalId, sub.subscriptionId);
     client.applySnapshot(sub.snapshot);
-    if (history.events.length === 0 && sub.snapshot.asOfSeq !== "0") {
+    const tail = mockGappedTail(instance.journalId);
+    if (tail) {
+      setTimeout(() => {
+        const result = client.applyBatch({ ...tail, subscriptionId: sub.subscriptionId });
+        if (result.gap) void client.fillGap(result.gap.from, result.gap.to);
+      }, 0);
+    }
+    if (history.length === 0 && sub.snapshot.asOfSeq !== "0") {
       const page = await api.eventsRead({ journalId: instance.journalId, limit: 512 });
       this.emit({ events: { ...this.state.events, [instanceId]: page.events } });
     }

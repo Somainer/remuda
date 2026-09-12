@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import { knowledgeValue } from "../../types/command";
 import { asRecord, asString, jsonPreview } from "../../lib/format";
@@ -181,6 +182,8 @@ export function ToolCard({
   diffState,
   workflowTitle,
   workflowMembers,
+  defaultFolded = false,
+  settle = true,
 }: {
   driverKind: string;
   call: ToolCallPayload;
@@ -189,14 +192,45 @@ export function ToolCard({
   diffState: DiffState;
   workflowTitle?: string;
   workflowMembers?: { label: string; state: string }[];
+  defaultFolded?: boolean;
+  settle?: boolean;
 }) {
-  const name = knowledgeValue(call.toolName);
-  const family = familyFor(driverKind, name);
-  if (family === "Bash") return <BashCard call={call} result={result} completeness={completeness} />;
-  if (family === "Edit" || family === "Write") return <EditWriteCard family={family} call={call} result={result} diffState={diffState} />;
-  if (family === "Read") return <ReadCard call={call} result={result} />;
-  if (family === "Workflow") return <WorkflowCard runTitle={workflowTitle} members={workflowMembers} />;
-  if (family === "Task") return <TaskCard call={call} />;
-  if (family === "MCP") return <McpCard call={call} result={result} />;
-  return <GenericCard call={call} result={result} />;
+  const [folded, setFolded] = useState(defaultFolded);
+  const shown = settle ? result : null;
+  const name = knowledgeValue(call.displayTitle) ?? knowledgeValue(call.toolName) ?? "tool";
+  const family = familyFor(driverKind, knowledgeValue(call.toolName));
+  if (folded) {
+    return (
+      <article className={ui.card} data-testid="tool-card" data-folded="1">
+        <div className={ui.cardHead}>
+          <strong>{name}</strong>
+          <span>{family}</span>
+          <button type="button" className={ui.chip} onClick={() => setFolded(false)}>
+            展开
+          </button>
+        </div>
+      </article>
+    );
+  }
+  const inner =
+    family === "Bash" ? (
+      <BashCard call={call} result={shown} completeness={completeness} />
+    ) : family === "Edit" || family === "Write" ? (
+      <EditWriteCard family={family} call={call} result={shown} diffState={diffState} />
+    ) : family === "Read" ? (
+      <ReadCard call={call} result={shown} />
+    ) : family === "Workflow" ? (
+      <WorkflowCard runTitle={workflowTitle} members={workflowMembers} />
+    ) : family === "Task" ? (
+      <TaskCard call={call} />
+    ) : family === "MCP" ? (
+      <McpCard call={call} result={shown} />
+    ) : (
+      <GenericCard call={call} result={shown} />
+    );
+  return (
+    <div data-testid="tool-card" data-folded="0">
+      {inner}
+    </div>
+  );
 }

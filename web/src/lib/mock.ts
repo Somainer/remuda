@@ -15,6 +15,7 @@ import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import { printCapabilities } from "./capabilities";
 import { digestPlaceholder, id, now } from "./ids";
 import { thisDeviceId } from "./interactionStatus";
+import { LONG_EVENT_COUNT, LONG_SESSION_TITLE, buildLongObservations } from "../fixtures/session/longEvents";
 
 const ts = now();
 
@@ -609,7 +610,160 @@ interactions.push({
 });
 titles.set(insPaused, "离线主机上的审批");
 
-export const mockInstanceIds = { insWorking, insBlocked, insIdle, insQuestion, insStarting, insExited };
+const journalGap = "obj_mock_gap" as Id;
+const journalStale = "obj_mock_stale" as Id;
+const journalLong = "obj_mock_long" as Id;
+const insGap = "ins_mock_gap" as Id;
+const insStale = "ins_mock_stale" as Id;
+const insLong = "ins_mock_long" as Id;
+
+export const GAP_HISTORY_SEQ = 4;
+export const GAP_TAIL_SEQ = 10;
+
+function messagePayload(role: "user" | "assistant", text: string) {
+  return {
+    nodeId: id("obj_"),
+    revision: "1",
+    operation: "open",
+    baseRevision: null,
+    messageId: id("obj_"),
+    role,
+    phase: role === "user" ? "input" : "final",
+    blocks: [{ type: "text", text }],
+    targetBlock: null,
+    parentToolCallId: null,
+    nativeOrigin: known(role === "user" ? "ui" : "assistant"),
+    status: "complete",
+  };
+}
+
+function usagePayload() {
+  return {
+    usageId: id("obj_"),
+    scope: "turn",
+    scopeId: runWorking,
+    mode: "snapshot",
+    metricRevision: "1",
+    inputTokens: known("100"),
+    inputAccounting: "unknown",
+    outputTokens: known("20"),
+    reasoningTokens: unknownKnowledge("none"),
+    cacheReadTokens: unknownKnowledge("none"),
+    cacheWriteTokens: unknownKnowledge("none"),
+    totalTokens: unknownKnowledge("none"),
+    cost: known({ amount: "0.01", currency: "USD" }),
+    accounting: "estimated",
+    nativeFieldsRef: null,
+  };
+}
+
+function gapJournalEvents(instanceId: Id, journalId: Id): Observation[] {
+  const call = bashCall();
+  return [
+    obs(instanceId, journalId, 1, "message", messagePayload("user", "模拟缺口")),
+    obs(instanceId, journalId, 2, "tool_call", call),
+    obs(instanceId, journalId, 3, "thought", {
+      nodeId: id("obj_"),
+      revision: "1",
+      operation: "open",
+      baseRevision: null,
+      thoughtId: id("obj_"),
+      representation: "summary",
+      text: "还没补到 result。",
+      partIndex: 0,
+      status: "complete",
+    }),
+    obs(instanceId, journalId, 4, "message", messagePayload("user", "继续")),
+    obs(instanceId, journalId, 5, "tool_result", bashResult(call.toolCallId)),
+    obs(instanceId, journalId, 6, "tool_call", {
+      ...bashCall(),
+      toolCallId: id("obj_"),
+      toolName: known("Read"),
+      displayTitle: known("Read"),
+      category: "file-read",
+      input: known({ file_path: "gap.cc" }),
+    }),
+    obs(instanceId, journalId, 7, "thought", {
+      nodeId: id("obj_"),
+      revision: "1",
+      operation: "open",
+      baseRevision: null,
+      thoughtId: id("obj_"),
+      representation: "summary",
+      text: "补页中。",
+      partIndex: 0,
+      status: "complete",
+    }),
+    obs(instanceId, journalId, 8, "tool_call", {
+      ...bashCall(),
+      toolCallId: id("obj_"),
+      toolName: known("Write"),
+      displayTitle: known("Write"),
+      category: "file-write",
+      input: known({ file_path: "gap.md", content: "gap" }),
+    }),
+    obs(instanceId, journalId, 9, "thought", {
+      nodeId: id("obj_"),
+      revision: "1",
+      operation: "open",
+      baseRevision: null,
+      thoughtId: id("obj_"),
+      representation: "summary",
+      text: "快齐了。",
+      partIndex: 0,
+      status: "complete",
+    }),
+    obs(instanceId, journalId, 10, "message", messagePayload("assistant", "缺口已补齐。")),
+    obs(instanceId, journalId, 11, "usage", usagePayload()),
+    obs(instanceId, journalId, 12, "opaque", {
+      nativeType: "gap_tail",
+      reason: "unmapped-fields",
+      rawRef: {
+        objectId: id("obj_"),
+        offset: "0",
+        length: "0",
+        digest: digestPlaceholder(),
+        mediaType: "application/json",
+        redaction: "none",
+      },
+      affects: [],
+      summary: "gap_tail",
+    }),
+  ];
+}
+
+instances.push({ ...instanceBase(insGap, journalGap, "ready", known("working")), activeRunIds: [] });
+instances.push({ ...instanceBase(insStale, journalStale, "ready", known("working")), activeRunIds: [] });
+instances.push({ ...instanceBase(insLong, journalLong, "ready", known("idle")), activeRunIds: [] });
+journals.set(journalGap, gapJournalEvents(insGap, journalGap));
+journals.set(journalStale, gapJournalEvents(insStale, journalStale));
+journals.set(journalLong, []);
+titles.set(insGap, "补页缺口会话");
+titles.set(insStale, "只读缺口会话");
+titles.set(insLong, LONG_SESSION_TITLE);
+summaries.set(insGap, "mock gap backfill");
+summaries.set(insStale, "mock fill fail");
+summaries.set(insLong, `${LONG_EVENT_COUNT} events`);
+
+function ensureLongJournal() {
+  const cur = journals.get(journalLong);
+  if (cur && cur.length >= LONG_EVENT_COUNT) return;
+  journals.set(journalLong, buildLongObservations({ instanceId: insLong, journalId: journalLong, hostId }));
+}
+
+export const mockInstanceIds = {
+  insWorking,
+  insBlocked,
+  insIdle,
+  insQuestion,
+  insStarting,
+  insExited,
+  insGap,
+  insStale,
+  insLong,
+};
+
+export const mockJournalIds = { journalGap, journalStale, journalLong };
 
 export type MockDb = {
   hosts: Host[];
@@ -627,16 +781,40 @@ const permissionMode = new Map<Id, string>();
 export const mockDb: MockDb = { hosts, workspaces, instances, interactions, journals, titles, summaries, permissionMode };
 
 export function mockReadJournal(journalId: Id, afterSeq?: U64, limit = 128) {
-  const all = journals.get(journalId) ?? [];
+  if (journalId === journalLong) ensureLongJournal();
   const after = afterSeq ? Number(afterSeq) : 0;
-  const events = all.filter((e) => Number(e.seq) > after).slice(0, limit);
+  if (journalId === journalStale && after > 0) {
+    throw new Error("GAP_FILL_FAILED");
+  }
+  const all = journals.get(journalId) ?? [];
+  const truncated = (journalId === journalGap || journalId === journalStale) && after === 0;
+  const source = truncated ? all.filter((e) => Number(e.seq) <= GAP_HISTORY_SEQ) : all.filter((e) => Number(e.seq) > after);
+  const cap = journalId === journalLong ? Math.max(limit, LONG_EVENT_COUNT) : limit;
+  const events = source.slice(0, cap);
   const durableSeq = all.length ? all[all.length - 1].seq : "0";
   return { events, durableSeq, floorSeq: "1" as U64 };
 }
 
+export function mockGappedTail(journalId: Id): EventsBatch["params"] | null {
+  if (journalId !== journalGap && journalId !== journalStale) return null;
+  const all = journals.get(journalId) ?? [];
+  const tail = all.filter((e) => Number(e.seq) >= GAP_TAIL_SEQ);
+  if (!tail.length) return null;
+  return {
+    subscriptionId: "sub_gap" as Id,
+    journalId,
+    fromSeq: tail[0].seq,
+    toSeq: tail[tail.length - 1].seq,
+    events: tail,
+    durableSeq: all.at(-1)?.seq ?? "0",
+  };
+}
+
 export function mockSnapshot(instance: Instance): Snapshot {
+  if (instance.journalId === journalLong) ensureLongJournal();
   const events = journals.get(instance.journalId) ?? [];
-  const asOf = events.length ? events[events.length - 1].seq : "0";
+  const gapped = instance.id === insGap || instance.id === insStale;
+  const asOf = gapped ? String(GAP_HISTORY_SEQ) : events.length ? events[events.length - 1].seq : "0";
   return {
     projectionVersion: "v1",
     projectionEpoch: id("epoch_"),

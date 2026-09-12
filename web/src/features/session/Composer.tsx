@@ -37,7 +37,8 @@ export function Composer({
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (composing(event)) return;
-    if (!mobile && event.key === "Enter" && !event.shiftKey) {
+    if (mobile) return;
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
       void submit();
     }
@@ -58,7 +59,7 @@ export function Composer({
         className={ui.textarea}
         value={text}
         disabled={disabled}
-        placeholder="输入提示词…"
+        placeholder={mobile ? "输入提示词…" : "输入提示词… ⌘/Ctrl+Enter 发送"}
         onChange={(e) => {
           setText(e.target.value);
           writeDraft(instanceId, e.target.value);

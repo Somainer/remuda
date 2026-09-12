@@ -58,6 +58,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
     <div
       data-testid="session-page"
       data-status={status}
+      data-journal={journalStatus}
       style={{ display: "flex", flexDirection: "column", minHeight: "100%", paddingBottom: offsetTop ? 0 : undefined }}
     >
       <header style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--line)", flexWrap: "wrap" }}>
@@ -82,9 +83,11 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
         ) : null}
         <Button
           variant="ghost"
+          data-testid="density-toggle"
+          data-mode={hub.compact ? "compact" : "full"}
           onClick={() => hubStore.setCompact(!hub.compact)}
         >
-          {hub.compact ? "Compact 开" : "Compact 关"}
+          {hub.compact ? "Compact" : "Full"}
         </Button>
         {status === "exited" ? (
           canResume ? (
@@ -117,7 +120,15 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
         {journalStatus === "readonly-stale" ? " · 只读" : ""}
         {status === "idle" ? " · 回合结束、进程仍在" : ""}
       </div>
-      <div style={{ flex: 1, overflow: view === "tty" ? "hidden" : "auto", minHeight: 0, display: view === "tty" ? "flex" : undefined }}>
+      <div
+        style={{
+          flex: 1,
+          overflow: view === "tty" || view === "structured" ? "hidden" : "auto",
+          minHeight: 0,
+          display: view === "tty" || view === "structured" ? "flex" : undefined,
+          flexDirection: view === "tty" || view === "structured" ? "column" : undefined,
+        }}
+      >
         {view === "events" ? (
           <RawEvents events={events} />
         ) : view === "files" ? (
@@ -135,7 +146,15 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
             加载 snapshot…
           </p>
         ) : (
-          <Transcript events={events} bubbles={bubbles} compact={hub.compact} />
+          <Transcript
+            events={events}
+            bubbles={bubbles}
+            compact={hub.compact}
+            journalStatus={journalStatus}
+            onRetryJournal={() => {
+              void hubStore.catchup(instance.id);
+            }}
+          />
         )}
       </div>
       {view === "tty" || view === "events" ? null : <div style={{ padding: 12, borderTop: "1px solid var(--line)" }}>

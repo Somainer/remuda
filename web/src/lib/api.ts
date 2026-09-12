@@ -5,7 +5,7 @@ import type { EventsBatch, Observation, Snapshot } from "../types/observation";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import type { Workspace } from "../types/workspace";
 import type { components, paths } from "./api.generated";
-import { printCapabilities } from "./capabilities";
+import { printCapabilities, ptyCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
 import {
   mockClose,
@@ -71,6 +71,7 @@ const LIFECYCLES: Instance["lifecycle"][] = [
   "preparing",
   "starting",
   "ready",
+  "running",
   "closing",
   "exited",
   "failed",
@@ -89,6 +90,8 @@ function mapDriver(raw: string): Instance["driver"] {
 }
 
 function mapLifecycle(raw: string): Instance["lifecycle"] {
+  if (raw === "running") return "running";
+  if (raw === "ready") return "ready";
   return LIFECYCLES.find((s) => s === raw) ?? "unknown";
 }
 
@@ -100,6 +103,12 @@ function mapHostCli(raw: { kind?: unknown; version?: unknown; path?: unknown; au
     path: typeof raw.path === "string" ? raw.path : undefined,
     auth,
   };
+}
+
+function mapActivity(raw: string | undefined): Instance["activity"] {
+  if (raw === "blocked" || raw === "waiting-interaction") return known("waiting-interaction");
+  const activity = ACTIVITIES.find((a) => a === raw);
+  return activity ? known(activity) : unknownKnowledge(raw ?? "unknown");
 }
 
 function mapHost(h: components["schemas"]["HostView"]): Host {
@@ -146,18 +155,19 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
   const id = rec.instanceId as Id;
   const hostId = rec.hostId as Id;
   const kind = mapKind(rec.kind);
-  const activity = ACTIVITIES.find((a) => a === rec.activity);
+  const driver = mapDriver(rec.driver);
+  const extra = rec as components["schemas"]["InstanceRecord"] & { cwd?: string | null; name?: string | null };
   return {
     id,
     revision: "1",
     createdAt: rec.createdAt ?? "",
     updatedAt: rec.updatedAt ?? "",
     hostId,
-    workspaceId: (rec.workspaceId ?? hostId) as Id,
+    workspaceId: (rec.workspaceId ?? extra.cwd ?? hostId) as Id,
     kind,
-    driver: mapDriver(rec.driver),
+    driver,
     lifecycle: mapLifecycle(rec.lifecycle),
-    activity: activity ? known(activity) : unknownKnowledge(rec.activity),
+    activity: mapActivity(rec.activity),
     connectivity:
       rec.connectivity === "disconnected" || rec.connectivity === "reconciling" ? rec.connectivity : "connected",
     ownership: "managed",
@@ -175,13 +185,15 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     },
     specRevision: "1",
     launchId: unknownKnowledge("hub"),
-    capabilities: HUB_CAPABILITIES,
+    capabilities: driver === "generic-pty" || driver === "claude-pty" ? ptyCapabilities(driver) : HUB_CAPABILITIES,
     ownerFence: "1",
     activeRunIds: [],
     parent: null,
     journalId: rec.journalId as Id,
     durableSeq: rec.durableSeq as U64,
     exit: { state: "not-applicable" },
+    cwd: extra.cwd ?? rec.workspaceId ?? null,
+    name: extra.name ?? rec.title ?? null,
   };
 }
 
@@ -230,20 +242,46 @@ export type HelloResult = {
 
 export type InstanceCreateSpec = {
   hostId: Id;
-  workspaceId: Id;
+  workspaceId?: Id;
   kind: "claude" | "codex" | "grok" | "agy";
-  driver: "claude-print" | "claude-pty" | "claude-bg";
+  driver: "claude-print" | "claude-pty" | "claude-bg" | "generic-pty";
   model: string;
   providerProfileId: string;
   permissionMode: string;
   delegation?: "none" | "gateway";
   prompt: string;
-  worktree?: boolean;
+  worktree?: boolean | string;
+  cwd?: string;
   settingsOverlayPath?: string;
   claudeConfigDir?: string;
   maxBudgetUsd?: string;
   name?: string;
 };
+
+export type WorktreeRecord = {
+  name: string;
+  path: string;
+  branch?: string;
+  base?: string;
+  hostId?: string;
+};
+
+export type WorktreePage = {
+  items: WorktreeRecord[];
+  hostId?: string;
+  workspaceRoot?: string | null;
+  nextCursor?: string | null;
+};
+
+export type WorktreeCreateSpec = {
+  hostId?: string;
+  name: string;
+  base?: string;
+  path?: string;
+  repo?: string;
+};
+
+export type PtyKey = "enter" | "esc" | "ctrl+c";
 
 export type HubApi = {
   mock: boolean;
@@ -258,7 +296,9 @@ export type HubApi = {
   instanceGet(instanceId: Id): Promise<Instance>;
   instanceCreate(spec: InstanceCreateSpec): Promise<{ command: CommandResult["command"]; instance: Instance }>;
   instanceSend(instanceId: Id, prompt: string): Promise<CommandResult>;
-  instanceKeys(instanceId: Id, key: "enter" | "esc"): Promise<CommandResult>;
+  instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
+  worktreeList(hostId?: string): Promise<WorktreePage>;
+  worktreeCreate(spec: WorktreeCreateSpec): Promise<WorktreeRecord>;
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
   instanceResume(instanceId: Id): Promise<CommandResult>;
@@ -386,14 +426,16 @@ function createMockApi(): HubApi {
       return found;
     },
     async instanceCreate(spec) {
+      const workspaceId = (spec.workspaceId ?? spec.cwd ?? spec.hostId) as Id;
       const instance = mockCreate(spec.prompt, {
         hostId: spec.hostId,
-        workspaceId: spec.workspaceId,
+        workspaceId,
         driver: spec.driver,
         kind: spec.kind,
       });
       instance.hostId = spec.hostId;
-      instance.workspaceId = spec.workspaceId;
+      instance.workspaceId = workspaceId;
+      instance.cwd = spec.cwd ?? null;
       return {
         instance,
         command: {
@@ -418,6 +460,28 @@ function createMockApi(): HubApi {
     },
     async instanceKeys(instanceId, key) {
       return mockKeys(instanceId, key);
+    },
+    async worktreeList() {
+      return {
+        items: mockDb.workspaces
+          .filter((w) => w.worktreeLabel)
+          .map((w) => ({
+            name: w.worktreeLabel ?? w.label,
+            path: w.rootPath,
+            branch: w.branch,
+            hostId: w.hostId,
+          })),
+        workspaceRoot: mockDb.workspaces[0]?.rootPath ?? "/",
+      };
+    },
+    async worktreeCreate(spec) {
+      return {
+        name: spec.name,
+        path: spec.path ?? `/tmp/remuda-wt/${spec.name}`,
+        branch: `wt/${spec.name}/work`,
+        base: spec.base ?? "main",
+        hostId: spec.hostId,
+      };
     },
     async screenRead(instanceId, lines = 3) {
       return mockScreenRead(instanceId, lines);
@@ -601,9 +665,10 @@ function createLiveApi(): HubApi {
       return remember(mapInstance(rec), instanceTitle(rec));
     },
     async instanceCreate(spec) {
+      const worktreeName = typeof spec.worktree === "string" ? spec.worktree : undefined;
       const body: HubBody<"/v1/instances", "post"> = {
         hostId: spec.hostId,
-        workspaceId: spec.workspaceId,
+        workspaceId: spec.workspaceId ?? spec.cwd,
         kind: spec.kind,
         driver: spec.driver,
         model: spec.model,
@@ -613,6 +678,8 @@ function createLiveApi(): HubApi {
         prompt: spec.prompt,
         name: spec.name,
         title: spec.name ?? spec.prompt.slice(0, 80),
+        cwd: spec.cwd,
+        worktree: worktreeName,
       };
       const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
         method: "POST",
@@ -626,7 +693,14 @@ function createLiveApi(): HubApi {
       return command(instanceId, "instance.send", { prompt });
     },
     async instanceKeys(instanceId, key) {
-      return command(instanceId, "tty.write", { keys: key });
+      return command(instanceId, "tty.write", { keys: [key], source: "ui" });
+    },
+    async worktreeList(hostId) {
+      const qs = hostId ? `?hostId=${encodeURIComponent(hostId)}` : "";
+      return rest<WorktreePage>(`/v1/worktrees${qs}`);
+    },
+    async worktreeCreate(spec) {
+      return rest<WorktreeRecord>("/v1/worktrees", { method: "POST", body: JSON.stringify(spec) });
     },
     async screenRead(instanceId, lines = 3) {
       try {
@@ -703,17 +777,32 @@ function createLiveApi(): HubApi {
     },
     async workspaceList(hostId) {
       const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;
-      const items: Workspace[] = listed.map((h) => ({
+      const trees = await this.worktreeList(hostId).catch(() => ({ items: [] as WorktreeRecord[], workspaceRoot: null as string | null }));
+      const fromHosts: Workspace[] = listed.map((h) => ({
         id: h.id,
         revision: "1",
         createdAt: h.createdAt,
         updatedAt: h.updatedAt,
         hostId: h.id,
         label: h.label,
-        rootPath: "/",
+        rootPath: trees.workspaceRoot || "/",
         writePolicy: "default",
-        canonicalRoot: unknownKnowledge("none"),
+        canonicalRoot: trees.workspaceRoot ? known(trees.workspaceRoot) : unknownKnowledge("none"),
       }));
+      const fromTrees: Workspace[] = trees.items.map((row) => ({
+        id: row.path as Id,
+        revision: "1",
+        createdAt: "",
+        updatedAt: "",
+        hostId: (row.hostId ?? listed[0]?.id ?? "") as Id,
+        label: row.name,
+        rootPath: row.path,
+        writePolicy: "isolated-worktree",
+        canonicalRoot: known(row.path),
+        worktreeLabel: row.name,
+        branch: row.branch,
+      }));
+      const items = [...fromTrees, ...fromHosts.filter((h) => !fromTrees.some((t) => t.hostId === h.hostId && t.rootPath === h.rootPath))];
       for (const w of items) workspaces.set(w.id, w);
       return { items, nextCursor: null };
     },

@@ -6,10 +6,12 @@ import { readNewSessionPrefs, rememberNewSessionSuccess, sortRecent } from "../l
 import {
   DELEGATION_OPTIONS,
   PERMISSION_OPTIONS,
+  PTY_YOLO_FLAGS,
   YOLO_HINT,
   normalizeDelegation,
   normalizePermissionMode,
   providerProfileForDelegation,
+  ptyYoloHint,
   type DelegationId,
 } from "../lib/sessionOptions";
 import type { DriverKind } from "../types/nativeRef";
@@ -18,12 +20,13 @@ import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst } from "
 import css from "./NewSessionPage.module.css";
 
 type CreateKind = Exclude<Kind, "generic">;
+type CwdMode = "existing" | "worktree";
 
-const KINDS: { id: CreateKind; label: string; enabled: boolean }[] = [
-  { id: "claude", label: "Claude", enabled: true },
-  { id: "codex", label: "Codex", enabled: false },
-  { id: "grok", label: "Grok", enabled: false },
-  { id: "agy", label: "agy", enabled: false },
+const KINDS: { id: CreateKind; label: string }[] = [
+  { id: "claude", label: "Claude" },
+  { id: "codex", label: "Codex" },
+  { id: "grok", label: "Grok" },
+  { id: "agy", label: "agy" },
 ];
 
 export function NewSessionPage() {
@@ -41,7 +44,9 @@ export function NewSessionPage() {
   const [delegation, setDelegation] = useState<DelegationId>(normalizeDelegation(prefs.delegation));
   const [kind, setKind] = useState<CreateKind>("claude");
   const [wantTty, setWantTty] = useState(false);
-  const [worktree, setWorktree] = useState(false);
+  const [cwdMode, setCwdMode] = useState<CwdMode>("existing");
+  const [cwdPath, setCwdPath] = useState("");
+  const [worktreeName, setWorktreeName] = useState("");
   const [advanced, setAdvanced] = useState(false);
   const [settingsOverlayPath, setSettingsOverlayPath] = useState("");
   const [claudeConfigDir, setClaudeConfigDir] = useState("");
@@ -77,8 +82,13 @@ export function NewSessionPage() {
   const offline = host?.state !== "online" && host?.state !== "enrolled";
   const hostWorkspaces = hub.workspaces.filter((w) => !hostId || w.hostId === hostId);
   const workspace = hostWorkspaces.find((w) => w.id === workspaceId) ?? hostWorkspaces[0];
-  const driver: DriverKind = mobile || !wantTty ? "claude-print" : "claude-pty";
-  const canStart = Boolean(hostId && workspace?.id && !offline && !busy);
+  const existingCwd = cwdPath.trim() || workspace?.rootPath || "";
+  const canStart = Boolean(
+    hostId &&
+      !offline &&
+      !busy &&
+      (cwdMode === "existing" ? existingCwd : worktreeName.trim()),
+  );
   const hosts = pickerHosts;
   const workspaces = sortRecent(hostWorkspaces, prefs.recentWorkspaceIds);
   const hostCli = cliSummary(host?.cli);
@@ -87,6 +97,8 @@ export function NewSessionPage() {
   const activeKind: CreateKind = kindEnabled(kind)
     ? kind
     : (KINDS.find((item) => kindEnabled(item.id))?.id ?? "claude");
+  const driver: DriverKind =
+    activeKind === "claude" ? (mobile || !wantTty ? "claude-print" : "claude-pty") : "generic-pty";
   const close = () => navigate("/sessions");
 
   return (
@@ -97,30 +109,48 @@ export function NewSessionPage() {
         data-testid="new-session-sheet"
         onSubmit={(e) => {
           e.preventDefault();
-          if (!canStart || !workspace) return;
+          if (!canStart) return;
           setBusy(true);
           setError(null);
-          void hubStore
-            .create({
+          void (async () => {
+            let cwd = existingCwd;
+            let worktree: string | undefined;
+            if (cwdMode === "worktree") {
+              const created = await hubStore.createWorktree({
+                hostId,
+                name: worktreeName.trim(),
+                base: "main",
+              });
+              cwd = created.path;
+              worktree = created.name;
+            }
+            const instance = await hubStore.create({
               hostId,
-              workspaceId: workspace.id,
+              workspaceId: (cwd || workspace?.id) as string,
               kind: activeKind,
               driver,
               model,
               providerProfileId: providerProfileForDelegation(delegation),
-              permissionMode,
+              permissionMode: activeKind === "claude" ? permissionMode : "bypassPermissions",
               delegation,
               prompt,
+              cwd,
               worktree,
               settingsOverlayPath: settingsOverlayPath || undefined,
               claudeConfigDir: claudeConfigDir || undefined,
               maxBudgetUsd: maxBudgetUsd || undefined,
-              name: name || undefined,
-            })
-            .then((instance) => {
-              rememberNewSessionSuccess({ hostId, workspaceId: workspace.id, model, permissionMode, driver, delegation });
-              navigate(`/s/${instance.id}`);
-            })
+              name: name || worktree || undefined,
+            });
+            rememberNewSessionSuccess({
+              hostId,
+              workspaceId: workspace?.id ?? cwd,
+              model,
+              permissionMode,
+              driver,
+              delegation,
+            });
+            navigate(`/s/${instance.id}`);
+          })()
             .catch((err: unknown) => setError(err instanceof Error ? err.message : "create failed"))
             .finally(() => setBusy(false));
         }}
@@ -177,27 +207,70 @@ export function NewSessionPage() {
               </span>
             </label>
             <label className={css.field}>
-              <span className={css.label}>项目 · Workspace</span>
-              <div className={css.selectWrap}>
-                <select
-                  className={css.select}
-                  data-testid="new-session-workspace"
-                  value={workspace?.id ?? ""}
-                  onChange={(e) => setWorkspaceId(e.target.value)}
+              <span className={css.label}>cwd / worktree</span>
+              <div className={css.seg}>
+                <button
+                  type="button"
+                  className={`${css.choice} ${cwdMode === "existing" ? css.choiceOn : ""}`}
+                  data-testid="cwd-mode-existing"
+                  onClick={() => setCwdMode("existing")}
                 >
-                  {workspaces.map((w) => (
-                    <option key={w.id} value={w.id}>
-                      {w.label} · {w.rootPath}
-                    </option>
-                  ))}
-                </select>
+                  已有目录
+                </button>
+                <button
+                  type="button"
+                  className={`${css.choice} ${cwdMode === "worktree" ? css.choiceOn : ""}`}
+                  data-testid="cwd-mode-worktree"
+                  onClick={() => setCwdMode("worktree")}
+                >
+                  新 worktree from main
+                </button>
               </div>
+              {cwdMode === "existing" ? (
+                <>
+                  <div className={css.selectWrap}>
+                    <select
+                      className={css.select}
+                      data-testid="new-session-workspace"
+                      value={workspace?.id ?? ""}
+                      onChange={(e) => {
+                        setWorkspaceId(e.target.value);
+                        const next = hostWorkspaces.find((w) => w.id === e.target.value);
+                        if (next?.rootPath) setCwdPath(next.rootPath);
+                      }}
+                    >
+                      {workspaces.map((w) => (
+                        <option key={w.id} value={w.id}>
+                          {w.label} · {w.rootPath}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className={css.selectWrap}>
+                    <input
+                      className={css.select}
+                      data-testid="new-session-cwd"
+                      placeholder="absolute path on the host"
+                      value={cwdPath || workspace?.rootPath || ""}
+                      onChange={(e) => setCwdPath(e.target.value)}
+                    />
+                  </div>
+                </>
+              ) : (
+                <div className={css.selectWrap}>
+                  <input
+                    className={css.select}
+                    data-testid="new-session-worktree-name"
+                    placeholder="name (e.g. grok-pong)"
+                    value={worktreeName}
+                    onChange={(e) => setWorktreeName(e.target.value.toLowerCase())}
+                  />
+                </div>
+              )}
               <span className={css.hint}>
-                <span>{workspace?.rootPath}</span>
-                <span className={css.worktree}>
-                  <input type="checkbox" checked={worktree} onChange={(e) => setWorktree(e.target.checked)} />
-                  新 worktree
-                </span>
+                {cwdMode === "worktree"
+                  ? "POST /v1/worktrees → git worktree add -b wt/<name>/… from main"
+                  : existingCwd || "host directory"}
               </span>
             </label>
           </div>
@@ -210,6 +283,7 @@ export function NewSessionPage() {
                     key={k.id}
                     type="button"
                     className={`${css.choice} ${activeKind === k.id ? css.choiceOn : ""} ${kindEnabled(k.id) ? "" : css.choiceDisabled}`}
+                    data-testid={`new-session-kind-${k.id}`}
                     disabled={!kindEnabled(k.id)}
                     onClick={() => kindEnabled(k.id) && setKind(k.id)}
                   >
@@ -246,13 +320,24 @@ export function NewSessionPage() {
                 </button>
               ))}
             </div>
-            {permissionMode === "bypassPermissions" ? (
+            {permissionMode === "bypassPermissions" && activeKind === "claude" ? (
               <div className={css.yolo} data-testid="new-session-yolo-hint">
                 <div className={css.yoloHead}>
                   <span className={css.yoloDot} />
                   <span className={css.yoloTitle}>yolo · 该会话不再产生任何审批</span>
                 </div>
                 <div className={css.yoloBody}>{YOLO_HINT}</div>
+              </div>
+            ) : null}
+            {activeKind !== "claude" ? (
+              <div className={css.yolo} data-testid="new-session-pty-hint">
+                <div className={css.yoloHead}>
+                  <span className={css.yoloDot} />
+                  <span className={css.yoloTitle}>driver generic-pty</span>
+                </div>
+                <div className={css.yoloBody}>
+                  {ptyYoloHint(activeKind)} · {PTY_YOLO_FLAGS[activeKind]}
+                </div>
               </div>
             ) : null}
           </fieldset>
@@ -276,7 +361,7 @@ export function NewSessionPage() {
             <button type="button" className={css.advancedToggle} onClick={() => setAdvanced(!advanced)}>
               <span>{advanced ? "▾" : "▸"}</span>
               <span>高级 · 驱动</span>
-              <span className={css.m3}>M3 才启用</span>
+              <span className={css.m3}>{activeKind === "claude" ? "claude-print / claude-pty" : "generic-pty"}</span>
             </button>
             {advanced ? (
               <div className={css.driverList}>

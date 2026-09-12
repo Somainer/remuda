@@ -299,6 +299,7 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
                   className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""} ${compactRecent ? css.rowIdle : ""}`}
                   data-testid="board-card"
                   data-status={status}
+                  data-lifecycle={instance.lifecycle}
                   data-kind={instance.kind}
                 >
                   <label className={css.check}>
@@ -318,7 +319,7 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
                     data-status={status}
                     data-kind={instance.kind}
                   >
-                    <div className={css.meta}>
+                    <div className={css.meta} data-testid="session-lifecycle">
                       <span>{instance.lifecycle}</span>
                       <span className={css.sep}>·</span>
                       <span>{activity}</span>
@@ -406,6 +407,17 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
                       }}
                     >
                       esc
+                    </button>
+                    <button
+                      type="button"
+                      className={css.actionBtn}
+                      data-testid="board-key-ctrl-c"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void hubStore.sendKeys(instance.id, "ctrl+c");
+                      }}
+                    >
+                      ctrl+c
                     </button>
                     <button
                       type="button"

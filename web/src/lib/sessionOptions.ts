@@ -18,6 +18,18 @@ export type DelegationId = (typeof DELEGATION_OPTIONS)[number]["id"];
 export const YOLO_HINT =
   "全自动（yolo）会跳过工具批准并允许危险权限（bypassPermissions）。仅限你本人发起的会话；不要用于 bot，也不要在生产目录上用。";
 
+/** Node `generic-pty` yolo argv applied server-side per kind. */
+export const PTY_YOLO_FLAGS: Record<"claude" | "codex" | "grok" | "agy", string> = {
+  claude: "--dangerously-skip-permissions",
+  codex: "--dangerously-bypass-approvals-and-sandbox",
+  grok: "--always-approve",
+  agy: "--dangerously-skip-permissions",
+};
+
+export function ptyYoloHint(kind: keyof typeof PTY_YOLO_FLAGS): string {
+  return `generic-pty · Node applies ${PTY_YOLO_FLAGS[kind]} (server-side yolo preset)`;
+}
+
 export function normalizePermissionMode(value: string | undefined): PermissionModeId {
   if (value === "bypassPermissions" || value === "dontAsk") return "bypassPermissions";
   if (value === "acceptEdits") return "acceptEdits";

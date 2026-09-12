@@ -11,7 +11,8 @@ import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { canShowTtyLab, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
-import { nativeShort, projectStatus, uiMode } from "../lib/status";
+import { ScreenView } from "../features/session/ScreenView";
+import { nativeShort, isGenericPty, projectStatus, uiMode } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import ui from "../styles/ui.module.css";
@@ -57,12 +58,17 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   const workspace = hubStore.workspaceOf(instance.workspaceId)?.label;
   const title = hubStore.titleOf(instance.id);
   const structuredOnly = uiMode(instance) === "structured-only";
+  const genericPty = isGenericPty(instance);
+  const activity = instance.activity.state === "known" ? instance.activity.value : instance.activity.state;
 
   return (
     <div
       className={session.page}
       data-testid="session-page"
       data-status={status}
+      data-lifecycle={instance.lifecycle}
+      data-activity={activity}
+      data-driver={instance.driver}
       data-journal={journalStatus}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
@@ -137,6 +143,8 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           <span className={session.dotSep}>·</span>
           <span>{instance.driver}</span>
           <span className={session.dotSep}>·</span>
+          <span data-testid="session-lifecycle">{instance.lifecycle}</span>
+          <span className={session.dotSep}>·</span>
           <span>seq {events.at(-1)?.seq ?? instance.durableSeq}</span>
           <span className={session.dotSep}>·</span>
           <span>{instance.connectivity}</span>
@@ -184,6 +192,8 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           <p style={{ padding: 16, color: "var(--mute)" }} data-testid="loading-snapshot">
             加载 snapshot…
           </p>
+        ) : genericPty ? (
+          <ScreenView instance={instance} events={events} />
         ) : (
           <Transcript
             events={events}
@@ -221,6 +231,24 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
             />
           ),
         )}
+        {genericPty ? (
+          <div className={session.keys} data-testid="keys-row">
+            {(["enter", "esc", "ctrl+c"] as const).map((key) => (
+              <button
+                key={key}
+                type="button"
+                className={session.keyBtn}
+                data-testid={`keys-${key === "ctrl+c" ? "ctrl-c" : key}`}
+                disabled={status === "exited"}
+                onClick={() => {
+                  void hubStore.sendKeys(instance.id, key);
+                }}
+              >
+                {key}
+              </button>
+            ))}
+          </div>
+        ) : null}
         {status === "blocked" ? null : (
           <Composer
             key={instance.id}
@@ -229,9 +257,13 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
             sending={sending}
             disabled={status === "exited"}
             permissionMode={hubStore.permissionModeOf(instance.id)}
-            onPermission={(mode) => {
-              void hubStore.configure(instance.id, mode);
-            }}
+            onPermission={
+              genericPty
+                ? undefined
+                : (mode) => {
+                    void hubStore.configure(instance.id, mode);
+                  }
+            }
             onSend={async (text: string) => {
               setSending(true);
               try {

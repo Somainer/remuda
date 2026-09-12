@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { mockBoardIds, mockKeys, mockScreenRead, mockSend } from "./mock";
-import { doneFromLines, lastLines, parseScreenBody } from "./screen";
+import type { Observation } from "../types/observation";
+import { doneFromLines, lastLines, latestScreenFromObservations, parseScreenBody } from "./screen";
 
 describe("screen snippet", () => {
   it("keeps the last three nonempty lines", () => {
@@ -16,6 +17,30 @@ describe("screen snippet", () => {
   it("parses lines or text bodies", () => {
     expect(parseScreenBody({ lines: ["x", "y"] }).lines).toEqual(["x", "y"]);
     expect(parseScreenBody({ text: "a\nb" }).lines).toEqual(["a", "b"]);
+  });
+});
+
+describe("screen-derived journal", () => {
+  it("picks the latest nativeName=screen snapshot", () => {
+    const events = [
+      {
+        kind: "lifecycle",
+        completeness: "screen-derived",
+        payload: { type: "native", nativeName: "screen", status: { state: "known", value: "hello\nPONG" } },
+      },
+      {
+        kind: "lifecycle",
+        completeness: "screen-derived",
+        payload: { type: "native", nativeName: "prompt_echo", status: { state: "known", value: "ignore me" } },
+      },
+      {
+        kind: "lifecycle",
+        completeness: "screen-derived",
+        payload: { type: "native", nativeName: "agent_status", status: { state: "known", value: "done" } },
+      },
+    ] as unknown as Observation[];
+    expect(latestScreenFromObservations(events).lines.join("\n")).toContain("PONG");
+    expect(latestScreenFromObservations(events).lines.join("\n")).not.toBe("done");
   });
 });
 

@@ -54,8 +54,15 @@ describe("projectStatus lifecycle × activity × connectivity", () => {
     expect(projectStatus(instance({ lifecycle: "starting", activity: known("idle"), connectivity: "connected" }))).toBe("starting");
   });
 
-  it("idle is ready + idle, including --bg done-but-alive", () => {
+  it("idle is ready/running + idle, including --bg done-but-alive", () => {
     expect(projectStatus(instance({ lifecycle: "ready", activity: known("idle"), connectivity: "connected" }))).toBe("idle");
+    expect(projectStatus(instance({ lifecycle: "running", activity: known("idle"), connectivity: "connected" }))).toBe("idle");
+  });
+
+  it("running with unknown activity is working, not idle", () => {
+    expect(
+      projectStatus(instance({ lifecycle: "running", activity: unknownKnowledge("unknown"), connectivity: "connected" })),
+    ).toBe("working");
   });
 
   it("exited from exited/failed/closing", () => {

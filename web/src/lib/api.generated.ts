@@ -1065,8 +1065,6 @@ export interface operations {
         parameters: {
             query?: {
                 instanceId?: string;
-                /** @description Device token when the browser cannot set WS headers */
-                token?: string;
             };
             header?: never;
             path?: never;

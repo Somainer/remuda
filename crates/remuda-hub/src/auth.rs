@@ -118,6 +118,15 @@ pub fn device_cookie(token: &str, secure: bool) -> String {
     cookie
 }
 
+/// Expire the browser session using the same flags as the issued cookie.
+pub fn expired_device_cookie(secure: bool) -> String {
+    let mut cookie = format!("{DEVICE_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
 /// Extract a bearer token or the device cookie.
 pub fn presented_token(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {

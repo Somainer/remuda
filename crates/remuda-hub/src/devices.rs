@@ -1,7 +1,10 @@
 //! Device list, revoke, and phone pairing-code flow.
 
 use crate::AppState;
-use crate::auth::{device_cookie, hash_secret, require_device, require_origin, verify_secret};
+use crate::auth::{
+    device_cookie, expired_device_cookie, hash_secret, require_device, require_origin,
+    verify_secret,
+};
 use crate::config::now_rfc3339;
 use crate::error::HubError;
 use axum::Json;
@@ -48,14 +51,24 @@ async fn revoke_device(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<Value>, HubError> {
+) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = require_device(&state.store, &headers).await?;
+    let revoking_self = device.id == id;
     let ok = state.store.delete_device(id).await?;
     if !ok {
         return Err(HubError::NotFound);
     }
-    Ok(Json(json!({ "ok": true })))
+    let mut response = Json(json!({ "ok": true })).into_response();
+    if revoking_self {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            expired_device_cookie(state.config.cookie_secure)
+                .parse()
+                .map_err(|_| HubError::Internal("invalid expiry cookie".into()))?,
+        );
+    }
+    Ok(response)
 }
 
 async fn issue_pair_code(

@@ -143,8 +143,6 @@ pub fn routes() -> axum::Router<crate::AppState> {
 pub struct FollowQuery {
     #[serde(rename = "instanceId")]
     instance_id: Option<String>,
-    /// Device token for browsers that cannot set WS headers.
-    token: Option<String>,
     /// `tty=1` attaches the instance TTY (snapshot then live binary frames).
     #[serde(default)]
     tty: Option<u8>,
@@ -169,15 +167,9 @@ pub async fn follow_socket(
     ws: WebSocketUpgrade,
 ) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
-    let device = if let Some(token) = query.token.as_deref().filter(|s| !s.is_empty()) {
-        state
-            .store
-            .find_device_by_token(token.to_string(), verify_secret)
-            .await?
-            .ok_or(HubError::Unauthenticated)?
-    } else {
-        require_device(&state.store, &headers).await?
-    };
+    // Browsers send the HttpOnly device cookie with the same-origin handshake.
+    // Native clients may use Authorization; URL parameters never authenticate.
+    let device = require_device(&state.store, &headers).await?;
     let filter = query.instance_id;
     let tty = query.tty == Some(1);
     Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device.id, tty)))

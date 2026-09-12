@@ -3,6 +3,8 @@ import { expect, test } from "@playwright/test";
 test.describe.configure({ mode: "serial" });
 
 test("device login, hosts, create/send/close, follow, approvals", async ({ page }) => {
+  const followUrls: string[] = [];
+  page.on("websocket", (socket) => followUrls.push(socket.url()));
   await page.goto("/login");
   await expect(page.getByTestId("login-page")).toBeVisible();
   await page.getByTestId("login-tab-bootstrap").click();
@@ -10,6 +12,14 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   await page.getByTestId("login-bootstrap-token").fill("e2e-bootstrap-token");
   await page.getByTestId("login-submit").click();
   await expect(page).toHaveURL(/\/sessions/, { timeout: 20_000 });
+  await expect(page.getByTestId("session-list")).toBeVisible();
+  const cookie = (await page.context().cookies()).find((item) => item.name === "remuda_device");
+  expect(cookie?.httpOnly).toBe(true);
+  expect(cookie?.sameSite).toBe("Strict");
+  const stored = await page.evaluate(() => ({ session: localStorage.getItem("runtime.device-session"), access: localStorage.getItem("runtime.access-code") }));
+  expect(JSON.parse(stored.session!)).not.toHaveProperty("token");
+  expect(stored.access).toBeNull();
+  await page.reload();
   await expect(page.getByTestId("session-list")).toBeVisible();
 
   await page.goto("/hosts");
@@ -33,6 +43,8 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1, {
     timeout: 20_000,
   });
+  await expect.poll(() => followUrls.length).toBeGreaterThan(0);
+  expect(followUrls.every((url) => !new URL(url).searchParams.has("token"))).toBe(true);
 
   await page.getByTestId("composer").locator("textarea").fill("second turn");
   await page.getByRole("button", { name: "送出" }).click();

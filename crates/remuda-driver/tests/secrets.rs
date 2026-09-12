@@ -156,14 +156,14 @@ async fn keychain_put_and_resolve() {
             .as_nanos()
     );
     broker
-        .put(&account, "sk-keychain-test-value")
+        .put(&account, "sk-fake-keychain-test-value")
         .await
         .unwrap();
     let secret = broker
         .resolve(&SecretRef::parse(format!("keychain:{account}")).unwrap())
         .await
         .unwrap();
-    assert_eq!(secret.expose_str().unwrap(), "sk-keychain-test-value");
+    assert_eq!(secret.expose_str().unwrap(), "sk-fake-keychain-test-value");
     let _ = tokio::process::Command::new("security")
         .args(["delete-generic-password", "-s", "remuda", "-a", &account])
         .output()

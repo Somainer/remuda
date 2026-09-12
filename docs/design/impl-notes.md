@@ -373,8 +373,11 @@ test result: FAILED. 12 passed; 1 failed; 1 ignored
 
 Same ETXTBSY class as `claude_pty_review` (writing a stub binary while it is still mapped). Crate test isolation, not workflow/lockfile.
 
-## WIP node-chaos (wt/x-codexwire/node-chaos, 2026-09-12)
+## node-chaos (wt/x-codexwire/node-chaos, 2026-09-12)
 
-Partial: `Backoff::jittered_delay` (±25% default) and `TransportMetrics`
-counters. Not yet wired into `WssLink`, chaos tests, or `remuda node --self-test`.
+`Backoff::jittered_delay` (±25% default) is used on WSS reconnect. Bounded
+`journal.append` records `TransportMetrics` (enqueue, backpressure waits,
+acks, duplicate journal-gap acks, reconnects, hello rejects, clock skew,
+pending drops). Chaos suite and `remuda node --self-test` are not in this
+slice.
 

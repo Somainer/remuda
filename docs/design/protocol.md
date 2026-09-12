@@ -646,7 +646,7 @@ agy 的单次 argv 模式是接口的显式例外：`inputDelivery=deferred-argv
 
 agy 没有在现有 help 中建立 `--settings`/专属 config-dir 参数；不伪造 `AGY_HOME`。v1 只在已注册 OS 用户配置中运行，overlay 必须与该 home 的已登记 settings 一致；需要另一份设置时用独立执行用户/容器文件系统，是否保留登录态与原生能力须另验收。只确认 BYOK 的 `modelProvider:"gemini"` + `GEMINI_API_KEY` + 可选 `GOOGLE_GEMINI_BASE_URL`，后者需要 Gemini-native ingress，不能把它指向只有 Messages/Responses 的 AsterGate。未完成独立 profile 准备时返回 `SETTINGS_ISOLATION_UNAVAILABLE`，不改用户现用 settings。`--dangerously-skip-permissions` 只映射明确的 always-proceed；`--mode plan|accept-edits` 保留原生含义。gateway-auth §5.4
 
-**generic-pty：**只运行登记的 executable 与 argv，分配 PTY、继承经过策略选择的 env；不存在通用 provider 配置编码器，profile 必须显式声明 `native-login` 或已注册的 env 模板。它不接受 Claude/Codex settingsOverlay，不提供 semantic resume/approval。未知 binary 不通过尝试不同旗标猜协议。
+**generic-pty：**只运行登记的 executable 与 argv，分配 PTY、继承经过策略选择的 env；不存在通用 provider 配置编码器，profile 必须显式声明 `native-login` 或已注册的 env 模板。它不接受 Claude/Codex settingsOverlay，不提供 semantic resume；屏幕派生的人工 approval/question 回答按 §6 的 PTY 规则处理。未知 binary 不通过尝试不同旗标猜协议。
 
 ### 4.4 环境审计、provider 轮换与配置一致性
 
@@ -1111,7 +1111,15 @@ hook invocation 自身可使用小型本地持久 spool，把 invocationId、启
 | --- | --- | --- |
 | `--permission-prompts host` + `--permission-prompt-tool stdio` + stream-json control | claude-print 首选；2.1.268 已验证 allow/deny 和 AskUserQuestion 单选 | 必须先 initialize，持续读流并回写；单独 host flag 已验证不足，多选/plan/elicitation 仍逐 schema 验收 |
 | `PermissionRequest` hook | 已验证 print 下阻塞 allow/deny；claude-pty 仅在 runtime 是唯一等待 responder 时启用 | 没有 tool_use_id/requestId；hook invocation 本身是 callback 身份；不覆盖所有 question、sandbox prompt 或 TUI 交互 |
-| PTY 原生 TUI | Claude 完整人机体验的默认保留通道；手机展示原生终端，持写入 lease 的人操作 | 无稳定 requestId 时 Interaction.answerable=false；不得从屏幕“Allow?”创建具有语义授权的按钮，禁止按坐标/文案自动送 y/Enter |
+| PTY 原生 TUI | generic-pty / claude-pty 保留原生终端；herdr blocked + 有界屏幕生成 approval/question | 按下文的显式人工回答规则发送按键；无原生语义 ACK，不自动同意、不按坐标点击 |
+
+**PTY blocked adapter（2026-09-13，本次任务明确替换上述屏幕不可答限制）：**
+
+- `generic-pty`（codex/grok/agy 等）和 `claude-pty` 只在 `agent.get.agent_status=blocked` 时建卡；读取和回复绑定精确 pane ID，agent alias 每次启动唯一。取当前 visible pane 最多 32 行、4096 UTF-8 bytes 的 excerpt。重复状态/屏幕不重建卡；截断、空屏幕或重复编号的歧义菜单不可答。
+- `carrier=native-tty`、`completeness=screen-derived`、`nativeRequestKey=none`，每次阻塞/屏幕变化生成新的 Interaction ID 和 epoch。`[y/n]` 暴露原生 y/n；编号菜单保留编号/标签，光标标记明确时编码相对 up/down + Enter，否则编号字符 + Enter；明确的 `Enter to continue` 只发送 Enter。其余提示提供单行文本，最多 1024 bytes，禁止控制字符。
+- 人工回答统一走 Hub answer → Node first-answer-wins broker → driver，与 `tty.write` 共用 `agent.send_keys` 传输。发送前再次检查 blocked、状态序号和屏幕；旧卡/变屏拒绝。保存已消费 ticket 后才写入，任何可能写过的回答不重放；原生终端的外部写者仍可能在检查后改变状态，不能声称有跨 herdr/本地人的原子输入租约。
+- 按键写入只证明 `delivery=written`。观察到 idle/working/done 或旧屏幕被替换，发 Interaction entity lifecycle `resolved`、`resolution.reason=native-cleared`；答案对工具执行的效果仍未证明。进程关闭使未完成 ticket invalidated。Node 重启没有原生 waiter 时旧 pending 行不可答，已消费/已结算行不重新出现在待答列表。
+- 协议的 Instance lifecycle 仍为 running，activity 是 waiting-interaction；Hub/CLI 显示 blocked。`instance wait --until blocked` 使用当前状态，历史 interaction 事件不会让已 idle 的实例再次命中。CLI `instance respond <id>` 列出待答项，`--option`、`--text` 或 `--answer` 回答；MCP 为 `remuda_instance_respond`。Feishu 卡片保留 PTY 候选项 ID 与屏幕摘要，回调走相同 Hub answer endpoint。
 
 以下是 SDK 定义与 2.1.268 交互探针 支持的**线协议示例**，ID、工具和路径为示意，初始化 response 省略已知可选目录。adapter 必须锁定 CLI/SDK 版本并回放真实 fixture；未知 subtype 使用已知 control error 机制报告并将交互标不可答/unknown，不自动同意。`request_user_dialog` 只在 initialize 的 supportedDialogKinds 中声明已完整实现的种类；未声明种类不会因可以画表单就自动获得回写能力。SDK 类型参考
 

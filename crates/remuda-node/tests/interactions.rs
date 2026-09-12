@@ -233,3 +233,181 @@ async fn fake_can_use_tool_answered_via_hub_http() {
         "driver should record the answer: {journal}"
     );
 }
+
+/// Handwritten fake-herdr approval through the real native driver and Hub broker.
+#[tokio::test]
+async fn pty_approval_hub_cas_settlement_and_restart_do_not_replay() {
+    use remuda_node::{MemoryStore, NativeDriverConfig, native_driver_registry};
+    use remuda_testing::{
+        FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin,
+        install_executable,
+    };
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join("herdr");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
+    fake_options.script = FakeHerdrScript::Approval;
+    let _fake = FakeHerdrServer::spawn(fake_options).unwrap();
+    let binary = install_executable(dir.path(), "claude", "#!/bin/sh\necho 'stub 1.0'\n");
+    let mut config = NativeDriverConfig::new(dir.path().join("native")).with_claude_binary(binary);
+    config.herdr_socket_dir = Some(socket_dir);
+    config.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
+    let node_path = dir.path().join("node");
+    let store = Arc::new(MemoryStore::open_journaled(&node_path, 128).unwrap());
+    let mut node_config = DevServerConfig::loopback(0);
+    node_config.workspace_root = dir.path().to_path_buf();
+    let node = DevNode::with_parts(
+        &node_config,
+        store.clone(),
+        native_driver_registry(config).unwrap(),
+    )
+    .unwrap();
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
+        .await
+        .unwrap();
+    let host = node.host().meta.id.as_id().to_string();
+    let link = WssLink::connect_runtime(
+        WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host.clone()),
+        node.clone(),
+    )
+    .await
+    .unwrap();
+    let _link = link;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await;
+    let (status, body) = http(hub.addr, "POST", "/v1/instances", &[("Cookie", &cookie)], Some(&json!({"hostId":host,"kind":"claude","driver":"generic-pty","cwd":dir.path(),"prompt":""}).to_string())).await;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(&body).unwrap();
+    let instance = created["instance"]["instanceId"]
+        .as_str()
+        .or_else(|| created["instance"]["id"].as_str())
+        .unwrap();
+    let item = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (_, body) = http(
+                hub.addr,
+                "GET",
+                &format!("/v1/interactions?instanceId={instance}"),
+                &[("Cookie", &cookie)],
+                None,
+            )
+            .await;
+            let page: Value = serde_json::from_str(&body).unwrap();
+            if let Some(item) = page["items"].as_array().and_then(|items| items.first()) {
+                break item.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if item.is_err() {
+        let (_, journal) = http(
+            hub.addr,
+            "GET",
+            &format!("/v1/instances/{instance}/journal"),
+            &[("Cookie", &cookie)],
+            None,
+        )
+        .await;
+        panic!("no interaction; journal={journal}");
+    }
+    let item = item.unwrap();
+    assert_eq!(item["instanceId"], instance);
+    assert_eq!(item["carrier"], "native-tty");
+    assert!(
+        item["request"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("[y/N]")
+    );
+    let id = item["id"].as_str().unwrap();
+    let path = format!("/v1/interactions/{id}/answer");
+    let command = CommandId::new().as_id().to_string();
+    let reply = json!({"commandId":command,"answer":{"kind":"approval","optionId":"y","inputDigest":item["request"]["inputDigest"]}});
+    let mut invalid = reply.clone();
+    invalid["answer"]["optionId"] = json!("unoffered-option");
+    let (status, _) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&invalid.to_string()),
+    )
+    .await;
+    assert_eq!(status, 400, "invalid answer cannot consume CAS");
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&reply.to_string()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["outcome"],
+        "accepted"
+    );
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&reply.to_string()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["outcome"],
+        "idempotent"
+    );
+    let mut losing = reply.clone();
+    losing["commandId"] = json!(CommandId::new().as_id().as_str());
+    let (status, _) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&losing.to_string()),
+    )
+    .await;
+    assert_eq!(status, 409);
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (_, body) = http(
+                hub.addr,
+                "GET",
+                &format!("/v1/instances/{instance}/journal"),
+                &[("Cookie", &cookie)],
+                None,
+            )
+            .await;
+            if body.contains("native-cleared") && body.contains("resolved") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("native settlement mirrored");
+    let (_, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/interactions?instanceId={instance}"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await;
+    assert!(
+        serde_json::from_str::<Value>(&body).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let restarted = remuda_node::InteractionRuntime::spawn(store.clone()).unwrap();
+    assert!(
+        restarted.list(None, None).await.is_empty(),
+        "settled ticket must not resurrect on restart"
+    );
+    hub.shutdown().await;
+}

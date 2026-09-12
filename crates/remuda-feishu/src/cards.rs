@@ -96,6 +96,45 @@ pub enum CardKitOp {
 
 /// Render the card that matches an Interaction kind.
 pub fn render_interaction_card(interaction: &Interaction, ticket_id: &str) -> Result<Value, Error> {
+    if interaction.carrier == remuda_protocol::InteractionCarrier::NativeTty {
+        let (mut card, excerpt) = match &interaction.request {
+            InteractionRequest::Approval(request) => {
+                let buttons = if interaction.answerable {
+                    request
+                        .options
+                        .iter()
+                        .map(|option| {
+                            callback_button(&option.label, "default", ticket_id, &option.id)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let card = json!({"schema":"2.0", "config":{"compact_width":false,"update_multi":true,"enable_forward":false},
+                    "header":{"template":"orange", "title":plain_text(&request.title)},
+                    "body":{"elements":[button_row(buttons)]}});
+                (card, request.description.clone())
+            }
+            InteractionRequest::Question(request) if interaction.answerable => (
+                render_question_card(ticket_id, &request.title, &request.fields)?,
+                request
+                    .fields
+                    .iter()
+                    .filter_map(|field| field.description.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => return Err(Error::UnsupportedInteraction),
+        };
+        if let Some(elements) = card
+            .pointer_mut("/body/elements")
+            .and_then(Value::as_array_mut)
+        {
+            elements.insert(0, json!({"tag":"markdown", "content":format!("Terminal prompt (reply sends keys):\n```text\n{}\n```", excerpt.replace("```", "~~~"))}));
+        }
+        validate_card(&card)?;
+        return Ok(card);
+    }
     match &interaction.request {
         InteractionRequest::Approval(req) => render_approval_card(
             ticket_id,

@@ -398,6 +398,11 @@ impl InteractionBroker {
         n
     }
 
+    /// Native request cleared/replaced. Retire the waiter without sending keys.
+    pub async fn retire(&self, id: &InteractionId) {
+        self.inner.lock().await.pending.remove(id);
+    }
+
     /// Background sweeper. Interval should be well under [`DEFAULT_TTL`].
     pub fn spawn_sweeper(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -437,6 +442,63 @@ impl InteractionBroker {
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
+}
+
+/// Validate the displayed schema before consuming the first-answer CAS.
+pub fn validate_answer(
+    request: &InteractionRequest,
+    answer: &InteractionAnswer,
+) -> Result<(), BrokerError> {
+    let invalid = || BrokerError::Protocol("answer does not match the interaction request".into());
+    match (request, answer) {
+        (InteractionRequest::Approval(request), InteractionAnswer::Approval(answer)) => {
+            if request.input_digest != answer.input_digest
+                || !request
+                    .options
+                    .iter()
+                    .any(|option| option.id == answer.option_id)
+            {
+                return Err(invalid());
+            }
+        }
+        (InteractionRequest::Question(request), InteractionAnswer::Question(answer)) => {
+            if answer
+                .answers
+                .keys()
+                .any(|id| !request.fields.iter().any(|field| &field.id == id))
+            {
+                return Err(invalid());
+            }
+            for field in &request.fields {
+                let Some(value) = answer.answers.get(&field.id) else {
+                    if field.required {
+                        return Err(invalid());
+                    }
+                    continue;
+                };
+                let text = value.text.as_deref().unwrap_or("");
+                if value
+                    .option_ids
+                    .iter()
+                    .any(|id| !field.options.iter().any(|option| &option.id == id))
+                    || value.option_ids.iter().collect::<BTreeSet<_>>().len()
+                        != value.option_ids.len()
+                    || (field.input != remuda_protocol::QuestionInput::MultiSelect
+                        && value.option_ids.len() > 1)
+                    || (field.input == remuda_protocol::QuestionInput::Text
+                        && !value.option_ids.is_empty())
+                    || (!field.allow_free_text && value.text.is_some())
+                    || (field.required && value.option_ids.is_empty() && text.is_empty())
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        (InteractionRequest::PlanReview(_), InteractionAnswer::PlanReview(_))
+        | (InteractionRequest::Elicitation(_), InteractionAnswer::Elicitation(_)) => {}
+        _ => return Err(invalid()),
+    }
+    Ok(())
 }
 
 fn kind_of(payload: &InteractionRequest) -> InteractionKind {

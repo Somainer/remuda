@@ -675,6 +675,29 @@ impl LocalStore for MemoryStore {
                 .get_mut(instance_id)
                 .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
             let seq = U64(record.instance.durable_seq.0.saturating_add(1));
+            // Drivers mint local envelope IDs; bind nested interaction entities
+            // to the actual Node-owned instance before journaling or brokering.
+            let interaction = match &mut observation.body {
+                ObservationPayload::InteractionRequested(payload) => Some(&mut payload.interaction),
+                ObservationPayload::Lifecycle(payload) => match payload.as_mut() {
+                    remuda_protocol::LifecyclePayload::Entity(entity) => {
+                        match &mut entity.entity_value {
+                            remuda_protocol::LifecycleEntity::Interaction(interaction) => {
+                                Some(interaction.as_mut())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(interaction) = interaction {
+                interaction.instance_id = instance_id.clone();
+                interaction.host_id = record.instance.host_id.clone();
+                interaction.request_key.process_generation =
+                    record.instance.process_ref.process_generation;
+            }
             let event = if let Some(durable) = durable.as_ref() {
                 durable.append(
                     instance_id,

@@ -139,3 +139,23 @@ fn question_field_round_trip_from_protocol_fixture() {
     };
     assert_eq!(fields[0].id, "beverage");
 }
+
+#[test]
+fn pty_cards_preserve_native_labels_option_ids_and_excerpt() {
+    let mut interaction = load_interaction("interaction-approval.json");
+    interaction.carrier = remuda_protocol::InteractionCarrier::NativeTty;
+    let remuda_protocol::InteractionRequest::Approval(request) = &mut interaction.request else {
+        panic!("approval");
+    };
+    request.description = "Permission requested? [y/N]".into();
+    request.options.truncate(1);
+    request.options[0].id = "y".into();
+    request.options[0].label = "Yes (y)".into();
+    request.options[0].effect = remuda_protocol::DecisionEffect::NativeSpecific;
+    let card = remuda_feishu::render_interaction_card(&interaction, "pty-ticket").unwrap();
+    let mut callbacks = vec![];
+    find_callbacks(&card, &mut callbacks);
+    assert_eq!(callbacks, vec![json!({"tid":"pty-ticket", "a":"y"})]);
+    assert!(card.to_string().contains("Permission requested? [y/N]"));
+    assert!(card.to_string().contains("Yes (y)"));
+}

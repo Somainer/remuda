@@ -15,6 +15,7 @@ use crate::materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, materialize,
 };
 use crate::profile::{EnvFileSecretBroker, ProviderProfile, SecretBroker};
+use crate::pty_interaction::PtyInteractions;
 use crate::recipe::LaunchRecipe;
 use async_trait::async_trait;
 use remuda_herdr::{
@@ -217,6 +218,8 @@ struct PtyLive {
     recipe: LaunchRecipe,
     events: mpsc::Sender<Observation>,
     status_task: Option<JoinHandle<()>>,
+    interactions: Arc<PtyInteractions>,
+    interaction_task: JoinHandle<()>,
     matcher_task: Option<JoinHandle<()>>,
     closed: bool,
     failed: Arc<AtomicBool>,
@@ -269,12 +272,15 @@ impl GenericPtyDriver {
 
     /// Send named keys (`enter`, `esc`, `ctrl+c`, …).
     pub async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
-        let (client, agent_name) = self.live_client().await?;
-        client
-            .agent_send_keys(&agent_name, keys)
+        self.live_client().await?;
+        let interactions = self
+            .inner
+            .lock()
             .await
-            .map_err(map_herdr)?;
-        Ok(DriverAck::transport_written())
+            .as_ref()
+            .map(|live| Arc::clone(&live.interactions))
+            .ok_or(DriverError::ControlUnavailable)?;
+        interactions.send_keys(keys).await
     }
 
     /// Wait until herdr reports idle, done, or blocked.
@@ -405,22 +411,19 @@ impl GenericPtyDriver {
             .record(&client, &session_name, &created, &pane_id)
             .await?;
         wait_shell_prompt(&client, &pane_id).await;
-        let started = client
-            .agent_start(AgentStartParams {
+        let started = crate::pty_interaction::start_agent(
+            &client,
+            AgentStartParams {
                 name: agent_name.clone(),
                 kind: preset.herdr_kind.into(),
                 pane_id: pane_id.clone(),
                 args: recipe.argv.clone(),
                 timeout_ms: Some(self.options.agent_start_timeout_ms),
-            })
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, kind = preset.id, "generic-pty agent.start failed");
-                map_herdr(err)
-            })?;
+            },
+        )
+        .await?;
         refuse_bare(&started.argv)?;
         let _ = started;
-        dismiss_startup_prompt(&client, &agent_name).await;
 
         let stream = client
             .subscribe(vec![
@@ -504,6 +507,14 @@ impl GenericPtyDriver {
             )))),
         )
         .await?;
+        let interactions = PtyInteractions::new(
+            client.clone(),
+            pane_id.clone(),
+            ctx.clone(),
+            tx.clone(),
+            Arc::clone(&self.seq),
+        );
+        let interaction_task = interactions.spawn();
         let status_task = spawn_status_pump(
             stream,
             tx.clone(),
@@ -511,6 +522,7 @@ impl GenericPtyDriver {
             Arc::clone(&self.seq),
             pane_id.clone(),
             Arc::clone(&failed),
+            Arc::clone(&interactions),
         );
         let matcher_task = Some(spawn_screen_pump(
             client.clone(),
@@ -534,6 +546,8 @@ impl GenericPtyDriver {
             recipe: recipe.clone(),
             events: tx,
             status_task: Some(status_task),
+            interactions,
+            interaction_task,
             matcher_task,
             closed: false,
             failed,
@@ -677,12 +691,18 @@ impl Driver for GenericPtyDriver {
 
     async fn respond_interaction(
         &self,
-        _id: InteractionId,
-        _answer: InteractionAnswer,
+        id: InteractionId,
+        answer: InteractionAnswer,
     ) -> DriverResult<DriverAck> {
-        Err(DriverError::CapabilityUnsupported(
-            "generic-pty has no structured interaction channel".into(),
-        ))
+        let interactions = self
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .filter(|live| !live.closed)
+            .map(|live| Arc::clone(&live.interactions))
+            .ok_or(DriverError::ControlUnavailable)?;
+        interactions.respond(id, answer).await
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
@@ -699,12 +719,14 @@ impl Driver for GenericPtyDriver {
             return Ok(DriverAck::not_dispatched());
         }
         live.closed = true;
+        live.interaction_task.abort();
         if let Some(task) = live.status_task.take() {
             task.abort();
         }
         if let Some(task) = live.matcher_task.take() {
             task.abort();
         }
+        live.interactions.close().await?;
         let events = live.events.clone();
         let ctx = live.ctx.clone();
         drop(inner);
@@ -728,6 +750,7 @@ fn spawn_status_pump(
     seq: Arc<AtomicU64>,
     pane_id: String,
     failed: Arc<AtomicBool>,
+    interactions: Arc<PtyInteractions>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(item) = stream.next_event().await {
@@ -739,6 +762,7 @@ fn spawn_status_pump(
                     continue;
                 }
                 failed.store(true, Ordering::SeqCst);
+                let _ = interactions.close().await;
                 let payload = failure_lifecycle(
                     "exit",
                     &ctx.session_id,
@@ -763,44 +787,8 @@ fn spawn_status_pump(
             if event.kind != EventKind::PaneAgentStatusChanged {
                 continue;
             }
-            let Some(status) = event.agent_status() else {
-                continue;
-            };
-            let label = match status {
-                AgentStatus::Working => "working",
-                AgentStatus::Idle => "idle",
-                AgentStatus::Blocked => "blocked",
-                AgentStatus::Done => "done",
-                AgentStatus::Unknown => "unknown",
-            };
-            let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(
-                Box::new(NativeLifecycle {
-                    topic: LifecycleTopic::Turn,
-                    native_name: "agent_status".into(),
-                    native_id: Knowledge::Known {
-                        value: ctx.session_id.clone(),
-                    },
-                    status: Knowledge::Known {
-                        value: label.into(),
-                    },
-                    related_ids: BTreeMap::new(),
-                    data_ref: None,
-                    severity: Severity::Info,
-                    affects_completion: false,
-                }),
-            )));
-            if emit_on(
-                &tx,
-                &seq,
-                &ctx,
-                SourceChannel::Herdr,
-                Completeness::ScreenDerived,
-                payload,
-            )
-            .await
-            .is_err()
-            {
-                break;
+            if event.pane_id() == Some(pane_id.as_str()) {
+                let _ = interactions.observe().await;
             }
         }
     })
@@ -986,31 +974,6 @@ async fn wait_shell_prompt(client: &Client, pane_id: &str) {
             }
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-}
-
-async fn dismiss_startup_prompt(client: &Client, agent_name: &str) {
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let Ok(read) = client
-        .agent_read(AgentReadParams {
-            target: agent_name.to_owned(),
-            source: ReadSource::RecentUnwrapped,
-            lines: Some(40),
-            format: ReadFormat::Text,
-            strip_ansi: true,
-        })
-        .await
-    else {
-        return;
-    };
-    let text = read.text();
-    if text.contains("Do you trust")
-        || text.contains("Yes, continue")
-        || text.contains("Trust this")
-    {
-        let _ = client
-            .agent_send_keys(agent_name, vec!["enter".into()])
-            .await;
     }
 }
 
@@ -1302,12 +1265,9 @@ fn agent_name_for(spec: &InstanceSpec) -> String {
         AgentKind::Generic => "pty",
         AgentKind::Terminal => "term",
     };
-    let uniq: String = uuid::Uuid::now_v7()
-        .simple()
-        .to_string()
-        .chars()
-        .take(8)
-        .collect();
+    // UUID v7's leading bytes are a timestamp shared by nearby launches.
+    let uuid = uuid::Uuid::now_v7().simple().to_string();
+    let uniq = &uuid[20..];
     format!("rmd-{kind}-{uniq}")
 }
 

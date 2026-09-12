@@ -72,6 +72,15 @@ impl InteractionOwner for DriverOwner {
                 .cloned()
                 .ok_or(BrokerError::NotFound)?
         };
+        // Persist a consumed ticket before any possible native key write. A
+        // restart cannot re-create an answerable waiter from this record.
+        if let Some(mut row) = self.glue.lock().await.pending.get(&native).cloned() {
+            row.interaction.state = InteractionState::AnswerCommitted;
+            row.interaction.delivery = remuda_protocol::DeliveryState::IntentDurable;
+            self.store
+                .put_pending_interaction(&row)
+                .map_err(|error| BrokerError::Forward(error.to_string()))?;
+        }
         let value =
             serde_json::to_value(&answer).map_err(|err| BrokerError::Forward(err.to_string()))?;
         let emissions = self
@@ -113,7 +122,13 @@ impl InteractionRuntime {
         let mut seen_native = HashSet::new();
         for row in store.pending_interactions()? {
             seen_native.insert(row.interaction_id.clone());
-            pending.insert(row.interaction_id.clone(), row);
+            if row.interaction.state == InteractionState::Pending {
+                // A restarted Node has no proven native waiter; keep it visible,
+                // but do not claim this old ticket is answerable.
+                let mut row = row;
+                row.interaction.answerable = false;
+                pending.insert(row.interaction_id.clone(), row);
+            }
         }
         let runtime = Arc::new(Self {
             broker: Arc::clone(&broker),
@@ -156,6 +171,59 @@ impl InteractionRuntime {
 
     /// Fold a committed observation into the broker pending table.
     pub async fn ingest(&self, observation: &Observation) -> Result<(), NodeError> {
+        if let ObservationPayload::Lifecycle(payload) = &observation.body {
+            if let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
+                && matches!(native.native_name.as_str(), "agent_status" | "session")
+                && let remuda_protocol::Knowledge::Known { value } = &native.status
+            {
+                let activity = match value.as_str() {
+                    "blocked" => Some(remuda_protocol::Activity::WaitingInteraction),
+                    "idle" | "done" => Some(remuda_protocol::Activity::Idle),
+                    "working" => Some(remuda_protocol::Activity::Working),
+                    _ => None,
+                };
+                if let Some(activity) = activity {
+                    self.store.set_instance_state(
+                        &observation.instance_id,
+                        None,
+                        Some(remuda_protocol::Knowledge::Known { value: activity }),
+                    )?;
+                }
+            }
+            if let remuda_protocol::LifecyclePayload::Entity(entity) = payload.as_ref()
+                && let remuda_protocol::LifecycleEntity::Interaction(interaction) =
+                    &entity.entity_value
+                && interaction.state != InteractionState::Pending
+            {
+                let native = &interaction.meta.id;
+                let mut glue = self.glue.lock().await;
+                let ticket = glue.native_to_broker.get(native).cloned();
+                glue.pending.remove(native);
+                drop(glue);
+                if let Some(ticket) = ticket {
+                    self.broker.retire(&ticket).await;
+                }
+                self.store.put_pending_interaction(&PendingInteraction {
+                    interaction_id: native.clone(),
+                    instance_id: interaction.instance_id.clone(),
+                    host_id: interaction.host_id.clone(),
+                    kind: interaction.kind,
+                    interaction: *interaction.clone(),
+                })?;
+            }
+        }
+        if let ObservationPayload::InteractionExpired(payload) = &observation.body {
+            let mut glue = self.glue.lock().await;
+            let ticket = glue.native_to_broker.get(&payload.interaction_id).cloned();
+            if let Some(mut row) = glue.pending.remove(&payload.interaction_id) {
+                row.interaction.state = InteractionState::Expired;
+                self.store.put_pending_interaction(&row)?;
+            }
+            drop(glue);
+            if let Some(ticket) = ticket {
+                self.broker.retire(&ticket).await;
+            }
+        }
         let ObservationPayload::InteractionRequested(payload) = &observation.body else {
             return Ok(());
         };
@@ -219,6 +287,37 @@ impl InteractionRuntime {
     ) -> Result<Value, NodeError> {
         let ticket = {
             let glue = self.glue.lock().await;
+            if let Some(row) = glue.pending.get(&interaction_id)
+                && row.interaction.carrier == InteractionCarrier::NativeTty
+            {
+                remuda_driver::interaction::validate_answer(&row.interaction.request, &answer)
+                    .map_err(map_broker)?;
+            }
+            if glue
+                .pending
+                .get(&interaction_id)
+                .is_some_and(|row| row.interaction.carrier == InteractionCarrier::NativeTty)
+                && let InteractionAnswer::Question(question) = &answer
+                && question.answers.values().any(|field| {
+                    field
+                        .text
+                        .as_ref()
+                        .is_some_and(|text| text.len() > 1024 || text.chars().any(char::is_control))
+                })
+            {
+                return Err(NodeError::InvalidRequest(
+                    "PTY text reply must be a single line of at most 1024 bytes".into(),
+                ));
+            }
+            if glue
+                .pending
+                .get(&interaction_id)
+                .is_some_and(|row| !row.interaction.answerable)
+            {
+                return Err(NodeError::InvalidRequest(
+                    "interaction is not answerable".into(),
+                ));
+            }
             glue.native_to_broker
                 .get(&interaction_id)
                 .cloned()
@@ -274,7 +373,15 @@ impl InteractionRuntime {
                 _ => {}
             }
             let mut glue = self.glue.lock().await;
-            glue.pending.remove(&native);
+            if let Some(mut row) = glue.pending.remove(&native) {
+                row.interaction.state =
+                    if matches!(observation.body, ObservationPayload::InteractionExpired(_)) {
+                        InteractionState::Expired
+                    } else {
+                        InteractionState::AnswerCommitted
+                    };
+                self.store.put_pending_interaction(&row)?;
+            }
         }
         let instance_id = observation.instance_id.clone();
         if self.store.get_instance(&instance_id).is_err() {
@@ -436,6 +543,7 @@ fn map_broker(err: BrokerError) -> NodeError {
             id: "unknown".into(),
         },
         BrokerError::Expired => NodeError::InteractionExpired,
+        BrokerError::Protocol(message) => NodeError::InvalidRequest(message),
         BrokerError::Superseded { winner } => NodeError::InteractionSuperseded {
             winner: winner.as_id().to_string(),
         },

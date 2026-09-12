@@ -179,7 +179,38 @@
   align-items: center;
   gap: 9px;
   flex: none;
+  flex-wrap: wrap;
+  max-width: 48%;
 }
+
+.excerpt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  max-height: 24em;
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin: 0;
+}
+
+.terminalNote {
+  color: var(--mute);
+  font-size: 12px;
+  margin: 0;
+}
+
+.actions button, .actions input {
+  min-height: 36px;
+  padding: 6px 12px;
+  margin: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+}
+
+.actions button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .btn {
   height: 36px;
@@ -328,6 +359,7 @@
 
   .actions {
     width: 100%;
+    max-width: 100%;
   }
 
   .btn {

@@ -782,7 +782,25 @@ async fn execute_queued(
         }
     }
 
-    match driver.execute(queued.request.clone()).await {
+    let execution = match &queued.request {
+        DriverRequest::RespondInteraction {
+            interaction_id,
+            answer,
+        } => interactions
+            .dispatch_rpc(
+                "interaction.answer",
+                serde_json::json!({
+                    "interactionId": interaction_id,
+                    "answer": answer,
+                    "commandId": command.command_id.as_id().as_str(),
+                }),
+            )
+            .await
+            .map(|_| Vec::new())
+            .map_err(|error| crate::DriverError::Failed(error.to_string())),
+        request => driver.execute(request.clone()).await,
+    };
+    match execution {
         Ok(emissions) => {
             for emission in emissions {
                 let observation = store.append_observation(

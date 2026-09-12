@@ -130,6 +130,7 @@ fn merge_requires_gate_or_dry_run_and_accepts_gate_options() {
             "topic",
             mode,
             "--web",
+            "--web-e2e",
             "--no-push",
             "--json",
             "--repo",
@@ -144,7 +145,7 @@ fn merge_requires_gate_or_dry_run_and_accepts_gate_options() {
         assert_eq!(args.branch.as_deref(), Some("topic"));
         assert_eq!(args.gate, mode == "--gate");
         assert_eq!(args.dry_run, mode == "--dry-run");
-        assert!(args.web && args.no_push && args.json);
+        assert!(args.web && args.web_e2e && args.no_push && args.json);
         assert_eq!(
             args.target_dir.as_deref(),
             Some(std::path::Path::new("target-coordinator"))

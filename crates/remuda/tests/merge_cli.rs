@@ -408,10 +408,26 @@ fn web_changes_automatically_enable_web_checks() {
 }
 
 #[test]
+fn web_e2e_flag_runs_live_hub_e2e_without_auth_paths() {
+    let repo = Repo::new();
+    commit_file(&repo.source, "web/a new file.txt", "web branch change\n");
+    let (output, report) = repo.merge(&["--dry-run", "--web-e2e"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(report["webE2e"], true);
+    assert_eq!(step(&report, "web-hub-e2e")["status"], "planned");
+    let (output, report) = repo.merge(&["--gate", "--web-e2e", "--no-push"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(report["webE2e"], true);
+    assert_eq!(step(&report, "web-hub-e2e")["status"], "ok");
+    repo.assert_cleaned();
+}
+
+#[test]
 fn auth_changes_select_live_web_e2e_in_both_dry_run_and_execution() {
     for path in [
         "web/src/lib/api.ts",
         "web/src/lib/session.ts",
+        "web/src/features/session/Composer.tsx",
         "crates/remuda-hub/src/auth.rs",
     ] {
         let repo = Repo::new();

@@ -6,6 +6,10 @@ test.describe("new session sheet", () => {
     const prompt = page.getByTestId("new-session-prompt");
     await expect(page.getByTestId("new-session-sheet")).toBeVisible();
     await expect(prompt).toBeFocused();
+    await expect(page.getByTestId("new-session-perm-bypassPermissions")).toBeVisible();
+    await expect(page.getByTestId("new-session-delegation-none")).toBeVisible();
+    await page.getByTestId("new-session-perm-bypassPermissions").click();
+    await expect(page.getByTestId("new-session-yolo-hint")).toBeVisible();
     await prompt.fill("查 bolt TaskManager spill");
     await expect(page.getByTestId("new-session-start")).toBeEnabled();
     await page.getByTestId("new-session-start").click();

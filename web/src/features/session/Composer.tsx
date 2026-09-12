@@ -1,14 +1,11 @@
 import { useState, type KeyboardEvent } from "react";
 import { Button } from "../../components/Button";
 import { readDraft, writeDraft } from "../../lib/drafts";
+import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
 import ui from "../../styles/ui.module.css";
 
-const MODES = [
-  { id: "manual", label: "询问" },
-  { id: "acceptEdits", label: "可改文件" },
-  { id: "dontAsk", label: "全自动" },
-];
+const MODES = PERMISSION_OPTIONS;
 
 export function Composer({
   instanceId,

@@ -40,6 +40,7 @@ export type InstanceCreateSpec = {
   model: string;
   providerProfileId: string;
   permissionMode: string;
+  delegation?: "none" | "gateway";
   prompt: string;
   worktree?: boolean;
   settingsOverlayPath?: string;
@@ -382,6 +383,7 @@ function createLiveApi(): HubApi {
             model: spec.model,
             providerProfileId: spec.providerProfileId,
             permissionMode: spec.permissionMode,
+            delegation: spec.delegation ?? "none",
             prompt: spec.prompt,
             settingsOverlayPath: spec.settingsOverlayPath,
             claudeConfigDir: spec.claudeConfigDir,

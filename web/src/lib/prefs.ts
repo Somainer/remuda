@@ -6,6 +6,7 @@ export type NewSessionPrefs = {
   model: string;
   permissionMode: string;
   driver: string;
+  delegation: string;
   recentHostIds: string[];
   recentWorkspaceIds: string[];
 };
@@ -16,6 +17,7 @@ const empty: NewSessionPrefs = {
   model: "passthrough/auto",
   permissionMode: "manual",
   driver: "claude-print",
+  delegation: "none",
   recentHostIds: [],
   recentWorkspaceIds: [],
 };
@@ -35,7 +37,9 @@ function touch(list: string[], value: string): string[] {
   return [value, ...list.filter((id) => id !== value)].slice(0, 5);
 }
 
-export function rememberNewSessionSuccess(patch: Pick<NewSessionPrefs, "hostId" | "workspaceId" | "model" | "permissionMode" | "driver">): void {
+export function rememberNewSessionSuccess(
+  patch: Pick<NewSessionPrefs, "hostId" | "workspaceId" | "model" | "permissionMode" | "driver" | "delegation">,
+): void {
   const prev = readNewSessionPrefs();
   const next: NewSessionPrefs = {
     ...prev,

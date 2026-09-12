@@ -4,6 +4,15 @@ import { Button } from "../components/Button";
 import { hubStore, useHub } from "../lib/store";
 import { composing, useWorkbenchViewport } from "../lib/viewport";
 import { readNewSessionPrefs, rememberNewSessionSuccess, sortRecent } from "../lib/prefs";
+import {
+  DELEGATION_OPTIONS,
+  PERMISSION_OPTIONS,
+  YOLO_HINT,
+  normalizeDelegation,
+  normalizePermissionMode,
+  providerProfileForDelegation,
+  type DelegationId,
+} from "../lib/sessionOptions";
 import ui from "../styles/ui.module.css";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
@@ -17,12 +26,6 @@ const KINDS: { id: CreateKind; label: string; enabled: boolean }[] = [
   { id: "agy", label: "agy", enabled: false },
 ];
 
-const PERMS = [
-  { id: "manual", label: "询问" },
-  { id: "acceptEdits", label: "可改文件" },
-  { id: "dontAsk", label: "全自动" },
-];
-
 export function NewSessionPage() {
   const hub = useHub();
   const navigate = useNavigate();
@@ -34,7 +37,8 @@ export function NewSessionPage() {
   const [hostId, setHostId] = useState(params.get("host") ?? prefs.hostId);
   const [workspaceId, setWorkspaceId] = useState(params.get("workspace") ?? prefs.workspaceId);
   const [model, setModel] = useState(prefs.model || "passthrough/auto");
-  const [permissionMode, setPermissionMode] = useState(prefs.permissionMode || "manual");
+  const [permissionMode, setPermissionMode] = useState(normalizePermissionMode(prefs.permissionMode));
+  const [delegation, setDelegation] = useState<DelegationId>(normalizeDelegation(prefs.delegation));
   const [kind, setKind] = useState<CreateKind>("claude");
   const [wantTty, setWantTty] = useState(false);
   const [worktree, setWorktree] = useState(false);
@@ -87,8 +91,9 @@ export function NewSessionPage() {
             kind,
             driver,
             model,
-            providerProfileId: "astergate-default",
+            providerProfileId: providerProfileForDelegation(delegation),
             permissionMode,
+            delegation,
             prompt,
             worktree,
             settingsOverlayPath: settingsOverlayPath || undefined,
@@ -97,7 +102,7 @@ export function NewSessionPage() {
             name: name || undefined,
           })
           .then((instance) => {
-            rememberNewSessionSuccess({ hostId, workspaceId: workspace.id, model, permissionMode, driver });
+            rememberNewSessionSuccess({ hostId, workspaceId: workspace.id, model, permissionMode, driver, delegation });
             navigate(`/s/${instance.id}`);
           })
           .catch((err: unknown) => setError(err instanceof Error ? err.message : "create failed"))
@@ -187,11 +192,12 @@ export function NewSessionPage() {
       <fieldset style={{ border: 0, padding: 0, marginTop: 12 }}>
         <legend className={ui.listMeta}>权限</legend>
         <div className={ui.row}>
-          {PERMS.map((opt) => (
+          {PERMISSION_OPTIONS.map((opt) => (
             <button
               key={opt.id}
               type="button"
               className={`${ui.chip} ${permissionMode === opt.id ? ui.chipOn : ""}`}
+              data-testid={`new-session-perm-${opt.id}`}
               onClick={() => setPermissionMode(opt.id)}
             >
               {opt.label}
@@ -199,11 +205,33 @@ export function NewSessionPage() {
             </button>
           ))}
         </div>
-        {permissionMode === "dontAsk" ? (
-          <p className={ui.listMeta} style={{ color: "var(--dust)" }}>
-            全自动会跳过工具批准，仅限个人遥控；不要用于 bot 或写生产。
+        {permissionMode === "bypassPermissions" ? (
+          <p className={ui.listMeta} data-testid="new-session-yolo-hint" style={{ color: "var(--dust)" }}>
+            {YOLO_HINT}
           </p>
         ) : null}
+      </fieldset>
+      <fieldset style={{ border: 0, padding: 0, marginTop: 12 }}>
+        <legend className={ui.listMeta}>Provider / 鉴权</legend>
+        <div className={ui.row}>
+          {DELEGATION_OPTIONS.map((opt) => (
+            <button
+              key={opt.id}
+              type="button"
+              className={`${ui.chip} ${delegation === opt.id ? ui.chipOn : ""}`}
+              data-testid={`new-session-delegation-${opt.id}`}
+              onClick={() => setDelegation(opt.id)}
+            >
+              {opt.label}
+              {opt.id === "none" ? " ●" : ""}
+            </button>
+          ))}
+        </div>
+        <p className={ui.listMeta}>
+          {delegation === "none"
+            ? "使用该主机上 CLI 的原生登录态（Claude 订阅 / Codex ChatGPT / grok xAI / agy Google）。"
+            : "走 Anthropic-Messages 兼容网关；模型名原样传递。"}
+        </p>
       </fieldset>
       {mobile ? (
         <p className={ui.listMeta}>手机固定 structured print。</p>

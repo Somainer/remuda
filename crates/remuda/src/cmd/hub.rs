@@ -48,6 +48,7 @@ pub(crate) async fn start(config: &Config) -> anyhow::Result<remuda_hub::Running
         web_root: config.hub.web_root.clone(),
         command_accept_timeout_ms: config.hub.command_accept_timeout_ms,
         create_settle_timeout_ms: config.hub.create_settle_timeout_ms,
+        host_lost_grace_ms: config.hub.host_lost_grace_ms,
         ..remuda_hub::HubConfig::default()
     })
     .await

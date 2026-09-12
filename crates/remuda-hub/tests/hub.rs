@@ -13,6 +13,96 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 
+#[tokio::test]
+async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HubConfig::for_test(dir.path().join("data"));
+    config.host_lost_grace_ms = 20;
+    let hub = spawn(config).await?;
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await?;
+    let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", hub.bootstrap_token).parse()?,
+    );
+    let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+    let instance_id = InstanceId::new();
+    node.send(Message::Text(json!({"jsonrpc":"2.0", "id":"1", "method":"node.hello",
+        "params":{"hostId":HostId::new().as_id().as_str(), "nodeVersion":"test", "label":"reclaim-test"}
+    }).to_string().into())).await?;
+    assert!(recv_json(&mut node).await?.get("result").is_some());
+    let event: Value = serde_json::from_str(include_str!("fixtures/journal-event.json"))?;
+    node.send(Message::Text(
+        json!({"jsonrpc":"2.0", "id":"2", "method":"journal.append",
+            "params":{"instanceId":instance_id.as_id().as_str(), "event":event}
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    assert!(recv_json(&mut node).await?.get("result").is_some());
+    let (_, _, body) = http(
+        hub.addr,
+        "GET",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body)?["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    node.close(None).await?;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (_, _, body) = http(
+                hub.addr,
+                "GET",
+                "/v1/instances",
+                &[("Cookie", &cookie)],
+                None,
+            )
+            .await?;
+            if serde_json::from_str::<Value>(&body)?["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let (_, _, body) = http(
+        hub.addr,
+        "GET",
+        "/v1/instances?includeHistory=true",
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    let history: Value = serde_json::from_str(&body)?;
+    assert_eq!(history["items"][0]["lifecycle"], "exited");
+    assert_eq!(history["items"][0]["lastError"], "host-lost");
+    let (status, _, _) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{}", instance_id.as_id()),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+    hub.shutdown().await;
+    Ok(())
+}
+
 async fn boot() -> Result<(remuda_hub::RunningHub, String, tempfile::TempDir)> {
     let dir = tempfile::tempdir()?;
     let config = HubConfig::for_test(dir.path().join("data"));

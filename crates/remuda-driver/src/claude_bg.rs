@@ -108,6 +108,7 @@ struct BgLive {
 
 /// Native `claude --bg` job driver.
 pub struct ClaudeBgDriver {
+    resources: crate::pty_resource::PtyResources,
     options: ClaudeBgOptions,
     inner: Mutex<Option<BgLive>>,
     last_recipe: Mutex<Option<LaunchRecipe>>,
@@ -121,6 +122,7 @@ impl ClaudeBgDriver {
     /// Build a driver from explicit options.
     pub fn new(options: ClaudeBgOptions) -> Self {
         Self {
+            resources: Default::default(),
             options,
             inner: Mutex::new(None),
             last_recipe: Mutex::new(None),
@@ -160,15 +162,19 @@ impl ClaudeBgDriver {
         if let Some(herdr) = &self.options.herdr_binary {
             client = client.with_binary(herdr);
         }
-        let created = client
-            .workspace_create(WorkspaceCreateParams {
-                cwd: Some(cwd.clone()),
-                label: Some("remuda-bg-attach".into()),
-                focus: false,
-                ..WorkspaceCreateParams::default()
-            })
-            .await
-            .map_err(map_herdr)?;
+        let created = self
+            .resources
+            .create_workspace(
+                &client,
+                &self.options.session_name,
+                WorkspaceCreateParams {
+                    cwd: Some(cwd.clone()),
+                    label: Some(format!("remuda-bg-{}", uuid::Uuid::now_v7())),
+                    focus: false,
+                    ..WorkspaceCreateParams::default()
+                },
+            )
+            .await?;
         let split = client
             .pane_split(PaneSplitParams {
                 direction: SplitDirection::Right,
@@ -182,6 +188,9 @@ impl ClaudeBgDriver {
             .await
             .map_err(map_herdr)?;
         let pane_id = split.pane.pane_id.clone();
+        self.resources
+            .record(&client, &self.options.session_name, &created, &pane_id)
+            .await?;
         let command = format!(
             "{} attach {}\n",
             shell_single_quote(&binary),
@@ -414,7 +423,9 @@ impl ClaudeBgDriver {
 
     async fn stop_job(&self) -> DriverResult<DriverAck> {
         let mut inner = self.inner.lock().await;
-        let live = inner.as_mut().ok_or(DriverError::ControlUnavailable)?;
+        let Some(live) = inner.as_mut() else {
+            return Ok(DriverAck::not_dispatched());
+        };
         if let Some(task) = live.observer.take() {
             task.abort();
         }
@@ -458,6 +469,10 @@ impl ClaudeBgDriver {
 
 #[async_trait]
 impl Driver for ClaudeBgDriver {
+    fn track_pty_resources(&self, id: InstanceId, store: Arc<dyn crate::PtyResourceStore>) {
+        self.resources.configure(id, store);
+    }
+
     async fn capabilities(&self) -> DriverResult<remuda_protocol::CapabilitySnapshot> {
         let pin = pin_source(&self.options.binary)?;
         Ok(capability_snapshot(
@@ -523,7 +538,9 @@ impl Driver for ClaudeBgDriver {
 
     async fn close(&self) -> DriverResult<DriverAck> {
         self.closed.store(true, Ordering::SeqCst);
-        self.stop_job().await
+        let stopped = self.stop_job().await;
+        self.resources.close().await?;
+        stopped
     }
 
     async fn resume(&self, native_ref: NativeRef) -> DriverResult<RunHandle> {

@@ -552,6 +552,7 @@ fn handle_rpc(
         })
         .map_err(json_err),
         "tab.close" => tab_close(&mut st, &req.params),
+        "workspace.close" => workspace_close(&mut st, &req.params),
         "pane.split" => pane_split(&mut st, &req.params),
         "pane.close" => pane_close(&mut st, &req.params),
         "pane.read" => pane_read(&st, &req.params),
@@ -707,6 +708,24 @@ fn tab_create(st: &mut State, params: &Value) -> Result<Value, (&'static str, St
         root_pane: pane,
     })
     .map_err(json_err)
+}
+
+fn workspace_close(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
+    let id = params
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .ok_or(("invalid_request", "missing workspace_id".into()))?;
+    let tabs: Vec<_> = st
+        .tabs
+        .values()
+        .filter(|t| t.workspace_id == id)
+        .map(|t| t.tab_id.clone())
+        .collect();
+    for tab in tabs {
+        tab_close(st, &json!({"tab_id": tab}))?;
+    }
+    st.workspaces.remove(id);
+    ok()
 }
 
 fn tab_close(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {

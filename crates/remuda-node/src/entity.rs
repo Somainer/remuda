@@ -35,6 +35,10 @@ impl EntityDb {
                 instance_id TEXT PRIMARY KEY,
                 json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pty_resources (
+                id TEXT PRIMARY KEY,
+                json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS interactions (
                 id TEXT PRIMARY KEY,
                 json TEXT NOT NULL
@@ -137,6 +141,30 @@ impl EntityDb {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
         }
+    }
+
+    /// Persist a resource before its native launch.
+    pub fn put_pty_resource(&self, resource: &remuda_driver::PtyResource) -> Result<(), NodeError> {
+        self.lock()?.execute(
+            "INSERT OR REPLACE INTO pty_resources (id, json) VALUES (?1, ?2)",
+            params![resource.key(), serde_json::to_string(resource)?],
+        )?;
+        Ok(())
+    }
+
+    /// Load resources that still need reconciliation.
+    pub fn pty_resources(&self) -> Result<Vec<remuda_driver::PtyResource>, NodeError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT json FROM pty_resources ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Forget a verified removed carrier.
+    pub fn remove_pty_resource(&self, key: &str) -> Result<(), NodeError> {
+        self.lock()?
+            .execute("DELETE FROM pty_resources WHERE id = ?1", params![key])?;
+        Ok(())
     }
 
     /// Persist a pending Interaction JSON blob.

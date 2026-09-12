@@ -40,6 +40,13 @@ pub struct HubConfig {
     /// Deadline for a later create settlement observation (ms, minimum 120 seconds).
     #[serde(default = "default_create_settle_timeout_ms")]
     pub create_settle_timeout_ms: u64,
+    /// Offline grace before stale instances exit with reason host-lost (default ten minutes).
+    #[serde(default = "default_host_lost_grace_ms")]
+    pub host_lost_grace_ms: u64,
+}
+
+fn default_host_lost_grace_ms() -> u64 {
+    600_000
 }
 
 fn default_push_block_ms() -> u64 {
@@ -71,6 +78,7 @@ impl Default for HubConfig {
             follow_buffer_events: default_follow_buffer_events(),
             command_accept_timeout_ms: default_command_accept_timeout_ms(),
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
+            host_lost_grace_ms: default_host_lost_grace_ms(),
         }
     }
 }
@@ -89,6 +97,7 @@ impl HubConfig {
             follow_buffer_events: default_follow_buffer_events(),
             command_accept_timeout_ms: default_command_accept_timeout_ms(),
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
+            host_lost_grace_ms: default_host_lost_grace_ms(),
         }
     }
 

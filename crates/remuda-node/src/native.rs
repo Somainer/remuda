@@ -36,6 +36,8 @@ pub struct NativeDriverConfig {
     pub herdr_binary: Option<PathBuf>,
     /// Named, isolated Herdr session.
     pub herdr_session: String,
+    /// Close unknown panes on startup; disable only for deliberate manual recovery.
+    pub herdr_orphan_sweep: bool,
     /// Claude print initialize timeout.
     pub print_handshake_timeout: Duration,
     /// Non-secret development environment forwarded to drivers.
@@ -65,7 +67,10 @@ impl NativeDriverConfig {
             herdr_binary: std::env::var_os("REMUDA_HERDR_BIN")
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
-            herdr_session: "remuda-node".to_owned(),
+            herdr_session: std::env::var("REMUDA_HERDR_SESSION")
+                .unwrap_or_else(|_| "remuda-node".to_owned()),
+            herdr_orphan_sweep: !std::env::var("REMUDA_HERDR_ORPHAN_SWEEP")
+                .is_ok_and(|v| matches!(v.as_str(), "0" | "false")),
             print_handshake_timeout: Duration::from_secs(30),
             extra_env,
         }
@@ -257,6 +262,14 @@ struct NativeAdapter {
 }
 
 impl Driver for NativeAdapter {
+    fn track_pty_resources(
+        &self,
+        id: remuda_protocol::InstanceId,
+        store: Arc<dyn remuda_driver::PtyResourceStore>,
+    ) {
+        self.native.track_pty_resources(id, store);
+    }
+
     fn kind(&self) -> DriverKind {
         self.kind
     }

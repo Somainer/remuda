@@ -3092,6 +3092,7 @@ dependencies = [
  "clap",
  "futures",
  "remuda-driver",
+ "remuda-herdr",
  "remuda-hub",
  "remuda-journal",
  "remuda-protocol",

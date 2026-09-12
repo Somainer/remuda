@@ -134,6 +134,14 @@ pub enum DriverError {
 
 /// Minimal object-safe driver contract used until `remuda-driver` is integrated.
 pub trait Driver: Send + Sync {
+    /// Bind Node resource ownership before starting native work.
+    fn track_pty_resources(
+        &self,
+        _id: remuda_protocol::InstanceId,
+        _store: Arc<dyn remuda_driver::PtyResourceStore>,
+    ) {
+    }
+
     /// Driver kind registered by this implementation.
     fn kind(&self) -> DriverKind;
     /// Establish the native process and return its unsolicited observation stream.

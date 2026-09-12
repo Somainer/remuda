@@ -132,6 +132,34 @@ async fn fake_herdr_start_prompt_idle_close() {
     assert!(saw_idle, "expected idle agent_status observation");
 
     driver.close().await.expect("close");
+    let snapshot = remuda_herdr::Client::connect(&socket)
+        .session_snapshot()
+        .await
+        .unwrap();
+    assert!(
+        snapshot.panes.is_empty(),
+        "stop must reclaim both agent and root shell"
+    );
+    assert!(snapshot.tabs.is_empty(), "stop must close the tab");
+    assert!(
+        snapshot.workspaces.is_empty(),
+        "stop must close the workspace"
+    );
+    let mut exited = false;
+    while let Ok(Some(observation)) =
+        tokio::time::timeout(Duration::from_millis(100), handle.recv()).await
+    {
+        if let ObservationPayload::Lifecycle(payload) = observation.body
+            && let LifecyclePayload::Native(native) = *payload
+            && native.native_name == "carrier_closed"
+        {
+            assert!(matches!(native.status, Knowledge::Known { value } if value == "exited"));
+            exited = true;
+            break;
+        }
+    }
+    assert!(exited, "close must emit an exit observation");
+    driver.close().await.expect("idempotent close");
 }
 
 #[ignore = "live: isolated remuda-test herdr session, claude --model haiku once"]

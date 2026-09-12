@@ -17,6 +17,7 @@ pub mod interaction;
 mod materializer;
 mod process;
 mod profile;
+mod pty_resource;
 mod recipe;
 mod secrets;
 
@@ -41,6 +42,7 @@ pub use profile::{
     Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind, ProviderProfile, Secret,
     SecretBroker, SecretRef,
 };
+pub use pty_resource::{PtyResource, PtyResourceStore};
 pub use recipe::{
     EnvAllowlistEntry, EnvAllowlistSource, FileLifetime, FileRole, LaunchAudit, LaunchRecipe,
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,

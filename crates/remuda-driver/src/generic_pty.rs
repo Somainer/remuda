@@ -205,6 +205,7 @@ impl GenericPtyOptions {
 }
 
 struct PtyLive {
+    ctx: crate::claude_pty::ObsCtx,
     client: Client,
     pane_id: String,
     agent_name: String,
@@ -218,6 +219,7 @@ struct PtyLive {
 
 /// Herdr-hosted generic TUI for any registered kind.
 pub struct GenericPtyDriver {
+    resources: crate::pty_resource::PtyResources,
     options: GenericPtyOptions,
     inner: Mutex<Option<PtyLive>>,
     seq: Arc<AtomicU64>,
@@ -232,6 +234,7 @@ impl GenericPtyDriver {
     pub fn new(options: GenericPtyOptions) -> Self {
         let (ready, ready_rx) = watch::channel(false);
         Self {
+            resources: Default::default(),
             options,
             inner: Mutex::new(None),
             seq: Arc::new(AtomicU64::new(0)),
@@ -365,16 +368,20 @@ impl GenericPtyDriver {
         for (key, value) in &self.options.extra_env {
             env.insert(key.clone(), value.clone());
         }
-        let created = client
-            .workspace_create(WorkspaceCreateParams {
-                cwd: Some(recipe.cwd.clone()),
-                env: env.clone(),
-                focus: false,
-                label: Some("remuda".into()),
-                source_workspace_id: None,
-            })
-            .await
-            .map_err(map_herdr)?;
+        let created = self
+            .resources
+            .create_workspace(
+                &client,
+                &session_name,
+                WorkspaceCreateParams {
+                    cwd: Some(recipe.cwd.clone()),
+                    env: env.clone(),
+                    focus: false,
+                    label: Some(format!("remuda-{}", uuid::Uuid::now_v7())),
+                    source_workspace_id: None,
+                },
+            )
+            .await?;
         let split = client
             .pane_split(PaneSplitParams {
                 direction: SplitDirection::Right,
@@ -388,6 +395,9 @@ impl GenericPtyDriver {
             .await
             .map_err(map_herdr)?;
         let pane_id = split.pane.pane_id.clone();
+        self.resources
+            .record(&client, &session_name, &created, &pane_id)
+            .await?;
         wait_shell_prompt(&client, &pane_id).await;
         let started = client
             .agent_start(AgentStartParams {
@@ -457,6 +467,7 @@ impl GenericPtyDriver {
                 ack.native_ids.insert("lastError".into(), reason);
                 info!(kind = preset.id, "generic-pty agent.start failed liveness");
                 self.fail_control();
+                self.resources.close().await?;
                 return Ok(RunHandle::new(recipe, ack, rx));
             }
         };
@@ -510,6 +521,7 @@ impl GenericPtyDriver {
         ack.native_ids
             .insert("herdrKind".into(), preset.herdr_kind.into());
         *self.inner.lock().await = Some(PtyLive {
+            ctx,
             client,
             pane_id,
             agent_name,
@@ -528,6 +540,10 @@ impl GenericPtyDriver {
 
 #[async_trait]
 impl Driver for GenericPtyDriver {
+    fn track_pty_resources(&self, id: InstanceId, store: Arc<dyn crate::PtyResourceStore>) {
+        self.resources.configure(id, store);
+    }
+
     async fn capabilities(&self) -> DriverResult<remuda_protocol::CapabilitySnapshot> {
         let pin = pin_source(&self.options.binary)?;
         Ok(capability_snapshot(
@@ -543,6 +559,9 @@ impl Driver for GenericPtyDriver {
             Ok(handle) => Ok(handle),
             Err(error) => {
                 self.fail_control();
+                if let Err(cleanup) = self.resources.close().await {
+                    tracing::error!(%cleanup, "failed launch resource cleanup");
+                }
                 Err(error)
             }
         }
@@ -645,8 +664,15 @@ impl Driver for GenericPtyDriver {
         self.fail_control();
         let mut inner = self.inner.lock().await;
         let Some(live) = inner.as_mut() else {
+            drop(inner);
+            self.resources.close().await?;
             return Ok(DriverAck::not_dispatched());
         };
+        if live.closed {
+            drop(inner);
+            self.resources.close().await?;
+            return Ok(DriverAck::not_dispatched());
+        }
         live.closed = true;
         if let Some(task) = live.status_task.take() {
             task.abort();
@@ -654,10 +680,12 @@ impl Driver for GenericPtyDriver {
         if let Some(task) = live.matcher_task.take() {
             task.abort();
         }
-        let pane_id = live.pane_id.clone();
-        let client = live.client.clone();
+        let events = live.events.clone();
+        let ctx = live.ctx.clone();
         drop(inner);
-        let _ = client.pane_close(pane_id).await;
+        self.resources.close().await?;
+        crate::claude_pty::emit_pty_closed(&events, &self.seq, &ctx).await?;
+        self.inner.lock().await.take();
         Ok(DriverAck::not_dispatched())
     }
 

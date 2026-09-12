@@ -69,6 +69,8 @@ pub(crate) struct Hub {
     pub command_accept_timeout_ms: u64,
     #[serde(alias = "createSettleTimeoutMs")]
     pub create_settle_timeout_ms: u64,
+    #[serde(alias = "hostLostGraceMs")]
+    pub host_lost_grace_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -344,6 +346,7 @@ impl Default for Hub {
             web_root: None,
             command_accept_timeout_ms: remuda_hub::DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
             create_settle_timeout_ms: remuda_hub::MIN_CREATE_SETTLE_TIMEOUT_MS,
+            host_lost_grace_ms: 600_000,
         }
     }
 }
@@ -466,6 +469,9 @@ impl Config {
         }
         if let Some(value) = env_text(env, "REMUDA_SHUTDOWN_TIMEOUT_SECS")? {
             self.shutdown_timeout_secs = parse_env(&value, "REMUDA_SHUTDOWN_TIMEOUT_SECS")?;
+        }
+        if let Some(value) = env_text(env, "REMUDA_HOST_LOST_GRACE_MS")? {
+            self.hub.host_lost_grace_ms = parse_env(&value, "REMUDA_HOST_LOST_GRACE_MS")?;
         }
         if let Some(value) = env_text(env, "REMUDA_COOKIE_SECURE")? {
             self.hub.cookie_secure = match value.as_str() {

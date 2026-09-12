@@ -35,6 +35,7 @@ use axum::extract::State;
 use axum::http::Uri;
 use axum::response::Response;
 use remuda_push::{OpenOptions, PushService};
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,6 +158,8 @@ async fn spawn_inner(
         followers: Followers::default(),
         blocked: BlockedWatch::default(),
     };
+    store.expire_lost_hosts(config.host_lost_grace_ms).await?;
+    let reaper_store = store.clone();
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
@@ -166,11 +169,23 @@ async fn spawn_inner(
         let shutdown = async {
             let _ = rx.await;
         };
-        if let Err(err) = axum::serve(listener, app)
+        let server = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
-            .await
-        {
-            tracing::error!(error = %err, "hub server exited");
+            .into_future();
+        tokio::pin!(server);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                result = &mut server => {
+                    if let Err(err) = result { tracing::error!(error = %err, "hub server exited"); }
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(err) = reaper_store.expire_lost_hosts(config.host_lost_grace_ms).await {
+                        tracing::error!(error = %err, "host-lost sweep failed");
+                    }
+                }
+            }
         }
     });
     Ok(RunningHub {

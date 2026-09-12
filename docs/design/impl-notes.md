@@ -119,3 +119,49 @@ modules through `remuda-node`'s `lib.rs` and dependency manifest, commit the API
 fixture tests, compose `remuda dev` plus `remuda node --stdio` in the binary
 crate, then run build/test/clippy and the loopback/LAN CLI smoke checks against
 the exact staged tree.
+
+## CI failures for crate owners
+
+Recorded from GitHub Actions run `34682797402` on `a90ca96` (`fix(ci): update Cargo.lock for committed manifests`, 2026-09-12). Tests passed; **clippy `-D warnings` failed**. Do not treat this as a lockfile/workflow issue.
+
+### remuda-journal
+
+`cargo clippy --workspace --all-targets --locked -- -D warnings`
+
+```
+error: using `contains()` instead of `iter().any()` is more efficient
+   --> crates/remuda-journal/tests/journal.rs:349:9
+    |
+349 | /         kinds
+350 | |             .iter()
+351 | |             .any(|k| *k == remuda_protocol::ObservationKind::WorkflowRun)
+    | |_________________________________________________________________________^ help: try: `kinds.contains(&remuda_protocol::ObservationKind::WorkflowRun)`
+    |
+    = help: clippy::manual_contains
+    = note: `-D clippy::manual-contains` implied by `-D warnings`
+
+error: could not compile `remuda-journal` (test "journal") due to 1 previous error
+```
+
+### remuda-codex-wire
+
+Same clippy command. `clippy::result_large_err`: `error::WireError` largest variant ≥128 bytes (`error.rs:33` `Rpc` variant with `data: Option<Value>`). Call sites:
+
+- `crates/remuda-codex-wire/src/codec.rs:16`
+- `crates/remuda-codex-wire/src/process.rs:53`
+- `crates/remuda-codex-wire/src/process.rs:74`
+- `crates/remuda-codex-wire/src/process.rs:95`
+- `crates/remuda-codex-wire/src/process.rs:107`
+- `crates/remuda-codex-wire/src/process.rs:295`
+
+```
+error: the `Err`-variant returned from this function is very large
+    = help: try reducing the size of `error::WireError`, for example by boxing large elements or replacing it with `Box<error::WireError>`
+    = note: `-D clippy::result-large-err` implied by `-D warnings`
+
+error: could not compile `remuda-codex-wire` (lib) due to 6 previous errors
+```
+
+Suggested crate-side fix: `Box` the `Rpc` payload (or the whole `WireError`) so `Result<T, WireError>` is small.
+
+secret-scan on this run also failed on `crates/remuda-node/src/inventory.rs:680` (`sk-live-DO-NOT-LEAK-123456`). That is a dummy planted by tests; scanner fix is `59ae912` (scripts/), not a node source change.

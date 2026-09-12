@@ -13,6 +13,7 @@ use tokio::io::{
 use super::fleet::{FleetRunOpts, FleetSendOpts, fleet_run, fleet_send_opts};
 use super::hub_client::{HubClient, HubOpts, block_on};
 use super::instance::{CreateOpts, create, list_instances, read, send, send_keys, stop, wait};
+use super::merge;
 use super::worktree;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -65,7 +66,17 @@ pub(crate) async fn handle_rpc(msg: &Value, client: &HubClient) -> Option<Value>
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             let result = call_tool(name, args, client).await;
-            Some(rpc_ok(id, tool_content(result)))
+            let merge_report = if name == "remuda_merge" {
+                result.as_ref().ok().cloned()
+            } else {
+                None
+            };
+            let mut content = tool_content(result);
+            if let Some(report) = merge_report {
+                content["isError"] = json!(report["exitCode"] != 0);
+                content["structuredContent"] = report;
+            }
+            Some(rpc_ok(id, content))
         }
         "notifications/initialized" | "initialized" | "notifications/cancelled" => None,
         other => Some(rpc_error(id, -32601, &format!("method not found: {other}"))),
@@ -244,6 +255,24 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
             }),
         ),
         tool(
+            "remuda_merge",
+            "Merge a local branch into main in a disposable worktree, run the shared gate, compare-and-swap main and push origin. Requires gate=true or dryRun=true. dryRun only inspects local refs. Reports exitCode 0 ok / 1 gate failed / 2 conflict / 3 CAS lost with step timings. Runs on the MCP server's machine.",
+            json!({
+                "type": "object",
+                "required": ["branch"],
+                "additionalProperties": false,
+                "properties": {
+                    "branch": { "type": "string" },
+                    "gate": { "type": "boolean" },
+                    "dryRun": { "type": "boolean" },
+                    "web": { "type": "boolean" },
+                    "noPush": { "type": "boolean" },
+                    "repo": { "type": "string" },
+                    "targetDir": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
             "remuda_fleet_send",
             "Broadcast a prompt to running instances (`all` or `labels`).",
             json!({
@@ -359,6 +388,11 @@ async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value>
             }))
         }
         "remuda_fleet_run" => fleet_run(client, fleet_opts_from_json(&args)?).await,
+        "remuda_merge" => {
+            let options: merge::MergeArgs = serde_json::from_value(args)?;
+            let report = tokio::task::spawn_blocking(move || merge::execute(options)).await?;
+            Ok(serde_json::to_value(report)?)
+        }
         "remuda_fleet_send" => {
             let text = send_text_from_args(&args)?;
             fleet_send_opts(
@@ -623,6 +657,7 @@ mod tests {
             "remuda_worktree_create",
             "remuda_fleet_run",
             "remuda_fleet_send",
+            "remuda_merge",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }

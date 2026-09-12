@@ -66,6 +66,8 @@ enum Command {
         #[command(subcommand)]
         command: cmd::worktree::WorktreeCommand,
     },
+    /// Verify a branch in a temporary worktree, then advance and push main.
+    Merge(cmd::merge::MergeArgs),
     /// stdio MCP server (JSON-RPC 2.0) for the same instance/fleet/worktree tools.
     Mcp {
         #[command(flatten)]
@@ -117,6 +119,13 @@ fn main() -> anyhow::Result<()> {
     }
     // These modules own synchronous entry points that create their own runtimes.
     match cli.command {
+        Command::Merge(args) => {
+            let code = cmd::merge::run(args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Ssh(args) => cmd::ssh::run_blocking(args),
         Command::Instance { hub, command } => cmd::instance::run(hub, command),
         Command::Fleet { hub, command } => cmd::fleet::run(hub, command),
@@ -257,6 +266,39 @@ mod tests {
         assert!(names.contains(&"fleet".to_string()));
         assert!(names.contains(&"worktree".to_string()));
         assert!(names.contains(&"mcp".to_string()));
+    }
+
+    #[test]
+    fn merge_requires_gate_or_dry_run_and_accepts_gate_options() {
+        assert!(Cli::try_parse_from(["remuda", "merge", "topic"]).is_err());
+        assert!(Cli::try_parse_from(["remuda", "merge", "--gate"]).is_err());
+        for mode in ["--gate", "--dry-run"] {
+            let cli = Cli::try_parse_from([
+                "remuda",
+                "merge",
+                "topic",
+                mode,
+                "--web",
+                "--no-push",
+                "--json",
+                "--repo",
+                ".",
+                "--target-dir",
+                "target-coordinator",
+            ])
+            .expect("merge flags");
+            let Command::Merge(args) = cli.command else {
+                panic!("merge")
+            };
+            assert_eq!(args.branch, "topic");
+            assert_eq!(args.gate, mode == "--gate");
+            assert_eq!(args.dry_run, mode == "--dry-run");
+            assert!(args.web && args.no_push && args.json);
+            assert_eq!(
+                args.target_dir.as_deref(),
+                Some(std::path::Path::new("target-coordinator"))
+            );
+        }
     }
 
     #[test]

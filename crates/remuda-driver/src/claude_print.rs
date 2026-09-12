@@ -399,7 +399,9 @@ fn configure_native_home(command: &mut Command, native_home: &str, inherit_defau
     // Claude Code's macOS login lookup changes namespaces when this variable is
     // present, even when it names the default ~/.claude directory. Omit it only
     // for the explicit host-login opt-in; isolated homes remain the default.
-    if !inherit_default {
+    if inherit_default {
+        command.env_remove("CLAUDE_CONFIG_DIR");
+    } else {
         command.env("CLAUDE_CONFIG_DIR", native_home);
     }
 }
@@ -429,8 +431,11 @@ mod native_home_tests {
     #[test]
     fn inherited_default_does_not_override_environment() {
         let mut command = Command::new("claude");
+        // The materialized NativeHome allowlist is applied before this final
+        // policy step. Ensure the opt-in removes that already-set value.
+        command.env("CLAUDE_CONFIG_DIR", "/tmp/materialized-home");
         configure_native_home(&mut command, "/tmp/not-exported", true);
-        assert_eq!(configured_value(&command), None);
+        assert_eq!(configured_value(&command), Some(None));
     }
 }
 

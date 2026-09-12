@@ -185,7 +185,38 @@ unrelated in-progress crates at build time; release builds must pass
 5. Restore `/data00/remuda/hub` from backup into a **new** directory; never
    overlay a live DB.
 
-## 8. Still out of scope for this wiring
+## 8. M1 preflight (2026-09-12, read-only)
+
+`./deploy/m1/preflight.sh` against SSH aliases `devbox-sg-host` and
+`devbox-sg`. No compose up, no unit start, no Caddy reload. Output
+redacted (no host IPs, no usernames).
+
+| Check | Result | Detail |
+| --- | --- | --- |
+| ssh devbox-sg-host | GO | BatchMode ok |
+| hub os | GO | Linux 5.4.143.bsk.8-amd64 x86_64; Debian GNU/Linux 10 (buster) |
+| hub docker | GO | 26.1.4 |
+| hub compose | GO | Docker Compose version v2.27.1 |
+| network deploy_default | GO | deploy_default bridge local |
+| caddy container | GO | deploy-caddy-1 |
+| caddy import | GO | `import routes` already (add `import Caddyfile.d/*.caddy` for Remuda) |
+| hub :443 | GO | listener present (do not bind another) |
+| hub :8080 host | GO | host already has :8080; Hub must stay unpublished (compose has no ports:) |
+| hub disk | GO | /data00 1007G, 55% used |
+| hub cloudflared bin | GO | not installed yet (token-based install is in deploy/m1/README.md) |
+| hub remuda containers | GO | none |
+| ssh devbox-sg | GO | BatchMode ok |
+| node os | GO | Linux 5.4.143.bsk.8-amd64 x86_64; Ubuntu 20.04.5 LTS |
+| node pid1 | GO | systemd |
+| node /tmp | GO | 504G, 46% used |
+| node /opt/remuda | GO | empty; scp is operator-run |
+
+**PREFLIGHT: GO**
+
+Copy-paste operator steps: `deploy/m1/README.md`. Hub tarball and musl
+binary live in `deploy/out/` (gitignored).
+
+## 9. Still out of scope for this wiring
 
 - Real `remuda hub` listen / auth / migrate (M1).
 - Node enrollment and outbound WSS (M1).

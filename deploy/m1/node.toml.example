@@ -1,0 +1,11 @@
+# Node on devbox-sg. Secrets by file reference only.
+data_dir = "/var/lib/remuda"
+shutdown_timeout_secs = 15
+
+[node]
+listen = "127.0.0.1:8787"
+hub_url = "wss://remuda.example.com/v1/node"
+host_token = "file:/etc/remuda/secrets/node-token"
+maxInstances = 4
+labels = { region = "sg", role = "exec" }
+workspace = "/workspaces"

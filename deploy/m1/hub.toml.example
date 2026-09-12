@@ -1,0 +1,10 @@
+# Copy to the compose project as hub.toml (mode 0644). Secrets stay in files.
+data_dir = "/data"
+shutdown_timeout_secs = 15
+
+[hub]
+listen = "0.0.0.0:8080"
+cookieSecure = true
+# Generated on first start at /data/bootstrap-token (0600) when omitted.
+# bootstrapToken = "file:/data/bootstrap-token"
+allowedOrigins = ["https://remuda.example.com"]

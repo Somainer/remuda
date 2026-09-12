@@ -5,6 +5,8 @@ mod cmd;
 mod config;
 #[path = "cmd/dev.rs"]
 mod dev;
+#[path = "cmd/dispatcher.rs"]
+mod dispatcher;
 #[path = "cmd/hub.rs"]
 mod hub;
 #[path = "cmd/node.rs"]
@@ -35,6 +37,8 @@ enum Command {
     Node(node::Args),
     /// Run a loopback Hub and local Node with a shared development access code.
     Dev(dev::Args),
+    /// Run the Feishu dispatcher against a Hub using a dedicated lark-cli app.
+    Dispatcher(dispatcher::Args),
     /// Print build identity without loading configuration or starting services.
     Version {
         /// Emit exactly one JSON object on stdout.
@@ -88,7 +92,7 @@ fn main() -> anyhow::Result<()> {
     init_tracing()?;
     if matches!(
         &cli.command,
-        Command::Hub(_) | Command::Node(_) | Command::Dev(_)
+        Command::Hub(_) | Command::Node(_) | Command::Dev(_) | Command::Dispatcher(_)
     ) {
         let config = cli.load_config()?;
         let timeout = config.shutdown_timeout();
@@ -102,6 +106,7 @@ fn main() -> anyhow::Result<()> {
                 Command::Hub(args) => hub::run(config, args, shutdown).await,
                 Command::Node(args) => node::run(config, args, shutdown).await,
                 Command::Dev(args) => dev::run(config, args, shutdown).await,
+                Command::Dispatcher(args) => dispatcher::run(config, args, shutdown).await,
                 _ => unreachable!("only service commands enter the service runtime"),
             }
         });

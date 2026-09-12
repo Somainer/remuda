@@ -2907,6 +2907,7 @@ dependencies = [
  "openssl",
  "regex",
  "remuda-driver",
+ "remuda-feishu",
  "remuda-hub",
  "remuda-hub-client",
  "remuda-node",

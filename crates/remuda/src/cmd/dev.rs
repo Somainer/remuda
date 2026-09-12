@@ -24,6 +24,7 @@ use std::{
 };
 
 #[derive(ClapArgs)]
+#[command(about = "Run a loopback Hub and local Node with a shared development access code.")]
 pub(crate) struct Args {
     /// Preserve unknown Herdr panes at startup for manual recovery.
     #[arg(long)]
@@ -322,6 +323,12 @@ fn validate_private_access_code_file(path: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, context: super::registry::Context) -> anyhow::Result<i32> {
+        super::registry::service(context, |config, shutdown| run(config, self, shutdown))
+    }
 }
 
 #[cfg(test)]

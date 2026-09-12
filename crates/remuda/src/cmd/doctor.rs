@@ -10,6 +10,21 @@ use std::time::Duration;
 use super::hub_client::{HubClient, HubOpts, ResolveInput, block_on, print_json, resolve_hub};
 use crate::config::Config;
 
+#[derive(Args)]
+#[command(about = "Preflight local or registered remote host capabilities and connectivity.")]
+pub(crate) struct CommandArgs {
+    #[command(flatten)]
+    hub: HubOpts,
+    #[command(flatten)]
+    args: DoctorArgs,
+}
+
+impl super::registry::Entrypoint for CommandArgs {
+    fn enter(self, context: super::registry::Context) -> Result<i32> {
+        run(context.load_config()?, self.hub, self.args)
+    }
+}
+
 #[derive(Clone, Debug, Default, Args, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoctorArgs {

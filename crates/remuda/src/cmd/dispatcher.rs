@@ -23,6 +23,7 @@ use crate::{
 };
 
 #[derive(ClapArgs, Default)]
+#[command(about = "Run the Feishu dispatcher against a Hub using a dedicated lark-cli app.")]
 pub(crate) struct Args {
     /// Hub HTTP base URL; overrides dispatcher.hub_url.
     #[arg(long)]
@@ -699,5 +700,11 @@ mod tests {
             local_hub_url("127.0.0.1:54321".parse().expect("address")),
             "http://127.0.0.1:54321"
         );
+    }
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, context: super::registry::Context) -> anyhow::Result<i32> {
+        super::registry::service(context, |config, shutdown| run(config, self, shutdown))
     }
 }

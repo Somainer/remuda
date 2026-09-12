@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Args, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[command(about = "Verify a branch in a temporary worktree, then advance and push main.")]
 pub(crate) struct MergeArgs {
     /// Local branch to merge into main (the committed snapshot is pinned).
     #[arg(required_unless_present = "list")]
@@ -843,6 +844,12 @@ impl Drop for TemporaryWorktree {
         if let Err(error) = self.remove() {
             tracing::error!(%error, "temporary merge worktree cleanup failed");
         }
+    }
+}
+
+impl super::registry::Entrypoint for MergeArgs {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self)
     }
 }
 

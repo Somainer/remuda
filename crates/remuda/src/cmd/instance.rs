@@ -18,6 +18,21 @@ const MAX_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_LINES: usize = 120;
 
 /// `remuda instance` subcommands.
+#[derive(clap::Args)]
+#[command(about = "Create, list, send, wait, read, keys, stop, or rm a Hub-backed instance.")]
+pub(crate) struct Args {
+    #[command(flatten)]
+    hub: HubOpts,
+    #[command(subcommand)]
+    pub(crate) command: InstanceCommand,
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self.hub, self.command).map(|()| 0)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum InstanceCommand {
     /// Create an instance on a host (`--host`) or matching `--labels`.

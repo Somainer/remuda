@@ -232,6 +232,19 @@ async fn write_rpc<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[derive(clap::Args)]
+#[command(about = "stdio MCP server for the instance, fleet, worktree and coordinator tools.")]
+pub(crate) struct Args {
+    #[command(flatten)]
+    hub: HubOpts,
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self.hub).map(|()| 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

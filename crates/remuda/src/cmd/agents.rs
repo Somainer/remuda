@@ -11,6 +11,21 @@ use std::{
     time::Duration,
 };
 
+#[derive(Args)]
+#[command(about = "List instances across hosts (alias for instance ls).")]
+pub(crate) struct CommandArgs {
+    #[command(flatten)]
+    hub: HubOpts,
+    #[command(flatten)]
+    args: ListArgs,
+}
+
+impl super::registry::Entrypoint for CommandArgs {
+    fn enter(self, _context: super::registry::Context) -> Result<i32> {
+        run(self.hub, self.args).map(|()| 0)
+    }
+}
+
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct ListArgs {
     /// Restrict the table to one host id.

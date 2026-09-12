@@ -13,6 +13,7 @@ use remuda_node::{
 use std::{path::PathBuf, time::Duration};
 
 #[derive(ClapArgs)]
+#[command(about = "Run a Node over an outbound WSS or SSH-friendly stdio carrier.")]
 pub(crate) struct Args {
     /// Preserve unknown Herdr panes at startup for manual recovery.
     #[arg(long)]
@@ -162,6 +163,12 @@ pub(crate) async fn run(
 
 /// Enroll with configured inventory and cancellable I/O. Unsupported instance
 /// dispatch receives an explicit JSON-RPC error.
+impl super::registry::Entrypoint for Args {
+    fn enter(self, context: super::registry::Context) -> anyhow::Result<i32> {
+        super::registry::service(context, |config, shutdown| run(config, self, shutdown))
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn outbound_session(
     url: &str,

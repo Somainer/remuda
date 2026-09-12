@@ -10,6 +10,21 @@ use super::hub_client::{HubClient, HubOpts, block_on, print_json};
 use super::instance::encode_keys;
 
 /// `remuda fleet` subcommands.
+#[derive(clap::Args)]
+#[command(about = "Run a spec on many hosts, or broadcast prompts and keys.")]
+pub(crate) struct Args {
+    #[command(flatten)]
+    hub: HubOpts,
+    #[command(subcommand)]
+    pub(crate) command: FleetCommand,
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self.hub, self.command).map(|()| 0)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum FleetCommand {
     /// Create one instance per selected host and return `fleetId`.

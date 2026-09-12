@@ -10,6 +10,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// `remuda worktree` subcommands.
+#[derive(clap::Args)]
+#[command(about = "Manage repository worktrees.")]
+pub(crate) struct Args {
+    #[command(subcommand)]
+    pub(crate) command: WorktreeCommand,
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self.command).map(|()| 0)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorktreeCommand {
     /// List all registered Git worktrees, including those created outside Remuda.

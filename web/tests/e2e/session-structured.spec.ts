@@ -40,7 +40,7 @@ test.describe("structured session M0-13", () => {
     await expect(page.getByTestId("approval-card")).toBeVisible();
     await expect(page.getByText("多台设备同时点")).toBeVisible();
     await expect(page.getByTestId("composer")).toBeVisible();
-    await expect(page.getByTestId("composer").locator("textarea")).toBeDisabled();
+    await expect(page.getByTestId("composer-input")).toBeDisabled();
     await page.getByRole("button", { name: "允许一次" }).click();
     await expect(page.getByTestId("approval-card")).toHaveCount(0);
   });
@@ -50,7 +50,7 @@ test.describe("structured session M0-13", () => {
     await row(page, "spill 从哪改").click();
     await expect(page.getByTestId("question-form")).toBeVisible();
     await expect(page.getByTestId("composer")).toBeVisible();
-    await expect(page.getByTestId("composer").locator("textarea")).toBeDisabled();
+    await expect(page.getByTestId("composer-input")).toBeDisabled();
     await page.getByText("src/exec.cc").click();
     await page.getByRole("button", { name: "提交" }).click();
   });
@@ -59,7 +59,7 @@ test.describe("structured session M0-13", () => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer")).toBeVisible();
-    await page.locator("[data-testid=composer] textarea").fill("补一条");
+    await page.getByTestId("composer-input").fill("补一条");
     await page.getByRole("button", { name: "送出" }).click();
     await expect(page.getByText("补一条").first()).toBeVisible();
   });

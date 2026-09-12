@@ -9,7 +9,7 @@ describe("Composer shortcuts", () => {
     const user = userEvent.setup();
     const onSend = vi.fn();
     render(<Composer instanceId="ins_x" mobile={false} onSend={onSend} />);
-    const area = screen.getByPlaceholderText(/输入提示词/);
+    const area = screen.getByTestId("composer-input");
     await user.click(area);
     await user.type(area, "hello");
     await user.keyboard("{Enter}");
@@ -22,8 +22,7 @@ describe("Composer shortcuts", () => {
     const user = userEvent.setup();
     const onSend = vi.fn();
     render(<Composer instanceId="ins_y" mobile onSend={onSend} />);
-    const area = screen.getByTestId("composer").querySelector("textarea");
-    if (!area) throw new Error("missing textarea");
+    const area = screen.getByTestId("composer-input");
     await user.click(area);
     await user.type(area, "hello");
     await user.keyboard("{Meta>}{Enter}{/Meta}");

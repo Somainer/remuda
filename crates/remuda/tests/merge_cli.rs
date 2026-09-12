@@ -635,9 +635,20 @@ fn cleanup_removes_git_registration_when_data_directory_is_a_symlink() {
 fn mcp_merge_returns_the_same_structured_result_and_marks_failures() {
     for fail in [false, true] {
         let repo = Repo::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let identity = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /v1/caller "));
+            let body = r#"{"origin":"human","children":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
         let mut command = repo.command();
         command
-            .args(["mcp", "--hub", "http://127.0.0.1:1"])
+            .args(["mcp", "--hub", &hub])
             .env("REMUDA_TOKEN", "test-token")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -656,8 +667,9 @@ fn mcp_merge_returns_the_same_structured_result_and_marks_failures() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        identity.join().unwrap();
         let rpc: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(rpc["result"]["isError"], fail);
+        assert_eq!(rpc["result"]["isError"], fail, "{rpc}");
         let report = &rpc["result"]["structuredContent"];
         assert_eq!(report["exitCode"], if fail { 1 } else { 0 });
         assert_eq!(report["mainUpdated"], !fail);

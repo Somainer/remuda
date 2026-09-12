@@ -122,6 +122,7 @@ fn fleet_filter_from_json(args: &Value) -> FleetFilter {
     kinds.extend(string_list(args, "kind"));
     FleetFilter {
         all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+        confirm: args.get("confirm").and_then(Value::as_bool).unwrap_or(false),
         labels: string_list(args, "labels"),
         hosts,
         kinds,

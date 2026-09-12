@@ -59,6 +59,9 @@ pub(crate) enum FleetCommand {
         /// Every running instance.
         #[arg(long)]
         all: bool,
+        /// Explicit Human/Bot confirmation for --all.
+        #[arg(long)]
+        confirm: bool,
         /// Instances whose host matches these labels.
         #[arg(long, value_delimiter = ',')]
         labels: Vec<String>,
@@ -83,6 +86,9 @@ pub(crate) enum FleetCommand {
         /// Every running instance.
         #[arg(long)]
         all: bool,
+        /// Explicit Human/Bot confirmation for --all.
+        #[arg(long)]
+        confirm: bool,
         /// Instances whose host matches these labels.
         #[arg(long, value_delimiter = ',')]
         labels: Vec<String>,
@@ -147,6 +153,7 @@ pub(crate) fn run(hub: HubOpts, command: FleetCommand) -> Result<()> {
             }
             FleetCommand::Send {
                 all,
+                confirm,
                 labels,
                 hosts,
                 kinds,
@@ -160,6 +167,7 @@ pub(crate) fn run(hub: HubOpts, command: FleetCommand) -> Result<()> {
                     FleetSendOpts {
                         filter: FleetFilter {
                             all,
+                            confirm,
                             labels,
                             hosts,
                             kinds,
@@ -173,6 +181,7 @@ pub(crate) fn run(hub: HubOpts, command: FleetCommand) -> Result<()> {
             }
             FleetCommand::Keys {
                 all,
+                confirm,
                 labels,
                 hosts,
                 kinds,
@@ -184,6 +193,7 @@ pub(crate) fn run(hub: HubOpts, command: FleetCommand) -> Result<()> {
                     FleetKeysOpts {
                         filter: FleetFilter {
                             all,
+                            confirm,
                             labels,
                             hosts,
                             kinds,
@@ -246,6 +256,8 @@ pub(crate) async fn fleet_run(client: &HubClient, opts: FleetRunOpts) -> Result<
 pub(crate) struct FleetFilter {
     /// Every running instance.
     pub all: bool,
+    /// Explicit Human/Bot confirmation for all-target sends and keys.
+    pub confirm: bool,
     /// Host labels (`key=value`).
     pub labels: Vec<String>,
     /// Explicit host ids.
@@ -270,7 +282,7 @@ impl FleetFilter {
 
     /// Filter half of the `/v1/fleet/broadcast` body.
     fn to_body(&self) -> Value {
-        let mut body = json!({ "all": self.all });
+        let mut body = json!({ "all": self.all, "confirm": self.confirm });
         if !self.hosts.is_empty() {
             body["hosts"] = json!(self.hosts);
         }
@@ -305,6 +317,10 @@ pub(crate) async fn fleet_send_opts(client: &HubClient, opts: FleetSendOpts) -> 
     if opts.text.is_empty() {
         bail!("provide a prompt or --file");
     }
+    client
+        .caller_context()
+        .await?
+        .check_fleet_all(opts.filter.all, opts.filter.confirm)?;
     let mut body = opts.filter.to_body();
     body["operation"] = json!("instance.send");
     body["payload"] = json!({
@@ -330,6 +346,10 @@ pub(crate) async fn fleet_keys(client: &HubClient, opts: FleetKeysOpts) -> Resul
     opts.filter.validate()?;
     // Validate every key name before any bytes reach the Hub.
     let encoded = encode_keys(&opts.keys)?;
+    client
+        .caller_context()
+        .await?
+        .check_fleet_all(opts.filter.all, opts.filter.confirm)?;
     let mut body = opts.filter.to_body();
     body["operation"] = json!("tty.write");
     body["payload"] = json!({
@@ -371,6 +391,7 @@ mod tests {
     fn filter(all: bool) -> FleetFilter {
         FleetFilter {
             all,
+            confirm: true,
             ..Default::default()
         }
     }
@@ -412,6 +433,7 @@ mod tests {
 
         let body = FleetFilter {
             all: false,
+            confirm: false,
             labels: vec!["region=sg".into()],
             hosts: vec!["hst_1".into()],
             kinds: vec!["claude".into(), "codex".into()],
@@ -470,6 +492,7 @@ mod tests {
             FleetKeysOpts {
                 filter: FleetFilter {
                     all: true,
+                    confirm: true,
                     kinds: vec!["claude".into()],
                     ..Default::default()
                 },

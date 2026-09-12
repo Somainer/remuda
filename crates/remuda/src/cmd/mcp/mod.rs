@@ -19,6 +19,7 @@ mod fleet;
 mod instance;
 mod merge;
 mod registry;
+mod scope;
 mod worktree;
 
 macro_rules! tool_groups {
@@ -85,7 +86,7 @@ pub(crate) async fn handle_rpc(msg: &Value, client: &HubClient) -> Option<Value>
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             let content = match tools().iter().find(|tool| tool.name == name) {
-                Some(tool) => tool.call(client, args).await,
+                Some(tool) => scope::call_tool(tool, args, client).await,
                 None => tool_content(Err(anyhow!("unknown tool: {name}"))),
             };
             Some(rpc_ok(id, content))
@@ -350,7 +351,7 @@ mod tests {
             "method": "tools/call",
             "params": {
                 "name": "remuda_fleet_send",
-                "arguments": { "all": true, "text": "PAUSE git commits" }
+                "arguments": { "all": true, "confirm": true, "text": "PAUSE git commits" }
             }
         });
         let resp = handle_rpc(&send, &client).await.expect("fleet send");
@@ -368,7 +369,7 @@ mod tests {
             "method": "tools/call",
             "params": {
                 "name": "remuda_fleet_keys",
-                "arguments": { "all": true, "kind": "claude", "keys": ["esc"] }
+                "arguments": { "all": true, "confirm": true, "kind": "claude", "keys": ["esc"] }
             }
         });
         let resp = handle_rpc(&keys, &client).await.expect("fleet keys");
@@ -386,7 +387,7 @@ mod tests {
             "method": "tools/call",
             "params": {
                 "name": "remuda_fleet_send",
-                "arguments": { "all": true, "kinds": ["codex"], "text": "hi" }
+                "arguments": { "all": true, "confirm": true, "kinds": ["codex"], "text": "hi" }
             }
         });
         let resp = handle_rpc(&miss, &client).await.expect("fleet send miss");
@@ -406,7 +407,7 @@ mod tests {
             "method": "tools/call",
             "params": {
                 "name": "remuda_fleet_keys",
-                "arguments": { "all": true, "keys": ["nope"] }
+                "arguments": { "all": true, "confirm": true, "keys": ["nope"] }
             }
         });
         let resp = handle_rpc(&call, &client).await.expect("response");

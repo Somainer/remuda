@@ -1,16 +1,40 @@
 //! Node instance management and outbound Hub connection.
 
+mod carrier;
+mod config;
+mod driver;
 mod error;
 mod inventory;
+mod model;
+mod runtime;
+mod server;
 mod stdio;
+mod store;
 mod transport;
+mod tty;
 
+pub use carrier::{
+    AuthState, CarrierFuture, CarrierKind, CliInventory, HerdrInventory, HostInventory,
+    HostInventoryConfig, HubCarrier, NodeHello, NodeHelloParams, NodeHelloProtocol,
+    OutboundWssCarrier, StdioCarrier,
+};
+pub use config::{DEFAULT_DEV_PORT, DevServerConfig};
+pub use driver::{
+    Driver, DriverEmission, DriverError, DriverFuture, DriverRegistry, DriverRequest, FakeDriver,
+};
 pub use error::NodeError;
 pub use stdio::run_stdio;
 pub use inventory::{
     CLI_KINDS, CliAuth, CliEntry, CollectRequest, Collector, DEFAULT_TTL, HerdrReport, HostSnapshot,
     ProbeEnv, ResourceReport, collect, collect_fresh,
 };
+pub use model::{
+    CommandAction, CreateInstanceRequest, CreateInstanceResponse, InstanceCommandRequest,
+};
+pub use runtime::DevNode;
+pub use server::{DevServer, dev_router};
+pub use store::{LocalStore, MemoryStore};
 pub use transport::{
     Backoff, HubRequest, JournalSender, NodeTransport, WssCarrier, WssConfig, WssLink,
 };
+pub use tty::{TTY_CHANNEL_OUTPUT, TTY_FRAME_HEADER_BYTES, encode_tty_frame};

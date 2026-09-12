@@ -1,0 +1,9 @@
+{
+  "_fixtureSource": "synthetic M0-11 local API fixture; no native CLI or model invocation",
+  "kind": "claude",
+  "driver": "claude-print",
+  "model": "fake",
+  "providerProfileId": "dev-fake",
+  "permissionMode": "dontAsk",
+  "prompt": ""
+}

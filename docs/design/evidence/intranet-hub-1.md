@@ -117,8 +117,11 @@ Caddy stopped does not prevent restoration/restart of the baseline.
    `prepare` then validated the inactive candidate without activating it.
 
 Signal behavior was checked against [Caddy's official signal documentation](https://caddyserver.com/docs/command-line#signals).
-No successful final external Hub HTTPS/browser/Node acceptance is claimed from
-these transient probes.
+A concurrent read-only probe during the temporary activation returned HTTPS 200,
+`{"ok":true}`, and curl certificate verification result 0; Caddy also logged
+successful certificate issuance. The later restoration/staged-only checks above
+are the final state. This transient HTTPS success is not final enablement, browser
+login or Node acceptance.
 
 ## Validation and work deferred until approval
 

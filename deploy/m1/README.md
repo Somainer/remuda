@@ -15,7 +15,7 @@ Artifacts (gitignored binaries; checksums in `deploy/out/SHA256SUMS`):
 Build them from the repository root (macOS):
 
 ```bash
-export CARGO_TARGET_DIR=/Users/dev/Documents/Projects/Community/hybrid-harness/target
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
 SHA=$(git rev-parse --short=12 HEAD)
 mkdir -p deploy/out
 

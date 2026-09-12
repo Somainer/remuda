@@ -138,6 +138,41 @@ fixture tests, compose `remuda dev` plus `remuda node --stdio` in the binary
 crate, then run build/test/clippy and the loopback/LAN CLI smoke checks against
 the exact staged tree.
 
+## claude-pty/bg live evidence
+
+Date: 2026-09-12. Host binaries: `herdr 0.9.0`, `claude 2.1.269`. Isolation: cwd/launch under `/tmp/remuda-driver/`; native login copied into `/tmp/remuda-driver/native-home/.claude.json` (never pointed `CLAUDE_CONFIG_DIR` at `~/.claude`, which would look for `~/.claude/.claude.json` and skip oauth). Herdr session `remuda-test` only; user `default` session left running. Model: haiku, `--max-budget-usd 0.3`, once each. Prompt: `Reply with exactly OK`.
+
+### Commands
+
+```
+cargo test -p remuda-driver --test live_claude live_claude_pty_start_prompt_idle_read_close -- --ignored --nocapture --test-threads=1
+cargo test -p remuda-driver --test live_claude live_claude_bg_start_prompt_idle_read_close -- --ignored --nocapture --test-threads=1
+herdr session stop remuda-test && herdr session delete remuda-test
+```
+
+### pty
+
+- start 8833ms, `dispatch=TransportWritten`, pane `w1:p1`, session `01a094c0-e867-7768-ba1c-372880ad24ce`.
+- First-run bypass warning (`Yes, I accept`) blocked `agent.prompt` (`agent_blocked`). Driver now starts in the workspace root pane (split pane was `agent_pane_busy`) and retries `agent.prompt` on `agent_not_ready`. Live harness waits for the warning then `pane_send_keys down, enter`.
+- prompt 310ms after dismiss. Herdr lifecycle events: `["Lifecycle", "Lifecycle"]`. idle observed 18892ms from t0.
+- `agent.read` showed the launched argv (redacted): `claude --dangerously-skip-permissions --setting-sources user,project,local --model haiku --session-id 01a094c0-… --max-budget-usd 0.3 --settings /tmp/remuda-driver/pty-launch/settings.json`.
+- SessionStart hook located JSONL: `exists=true lines=17 types={"assistant":1,"user":1,"system":1,"attachment":10,…}`.
+- close + `herdr session stop/delete remuda-test` total 20473ms. Default herdr session untouched.
+
+### bg
+
+- prepare 7621ms, `dispatch=NotDispatched`, argv has `--bg`, no `--session-id`.
+- first send (deferred argv) 5651ms, `jobId=0e10a95d`, `sessionId=0e10a95d-59f5-437a-9349-5074037a4752`.
+- SessionStart hook wrote `session-meta.json`: `transcript_path=/tmp/remuda-driver/native-home/projects/-private-tmp-remuda-driver-bg-live/0e10a95d-….jsonl`.
+- job `state.json` stayed `state=blocked` / `tempo=blocked` (no TTY to accept bypass/trust UI). Overlay now also sets `bypassPermissionsModeAccepted`. `claude stop` via `close()` at 194542ms, never `rm`.
+
+### Driver fixes from this run
+
+- Use workspace root pane for `agent.start` (real herdr rejects a freshly split pane as not a shell).
+- Retry `agent.start` on `agent_pane_busy` / `agent_not_ready`; retry `agent.prompt` on `agent_not_ready`.
+- Persist SessionStart `transcript_path` on the live handle; poll hook output up to ~180s.
+- Isolated native home must be a directory that contains `.claude.json`, not `~/.claude` itself.
+
 ## CI failures for crate owners
 
 ### GitHub Actions `34683616964` (`c01250c`, 2026-09-12)

@@ -145,6 +145,8 @@ pub struct ClaudePtyDriver {
     options: ClaudePtyOptions,
     inner: Mutex<Option<PtyLive>>,
     last_recipe: Mutex<Option<LaunchRecipe>>,
+    /// Last successfully materialized spec; `resume` re-materializes from this.
+    last_spec: Mutex<Option<InstanceSpec>>,
     closed: AtomicBool,
     seq: Arc<AtomicU64>,
 }
@@ -156,6 +158,7 @@ impl ClaudePtyDriver {
             options,
             inner: Mutex::new(None),
             last_recipe: Mutex::new(None),
+            last_spec: Mutex::new(None),
             closed: AtomicBool::new(false),
             seq: Arc::new(AtomicU64::new(0)),
         }
@@ -200,10 +203,13 @@ impl ClaudePtyDriver {
             origin: self.options.origin,
         };
         let mut recipe = materialize(&request)?;
+        apply_tty_bypass_flag(&mut recipe);
         refuse_bare(&recipe.argv)?;
         recipe = inject_session_start_hook(&mut recipe, &self.options.launch_dir)?;
+        apply_tty_bypass_flag(&mut recipe);
         refuse_bare(&recipe.argv)?;
         *self.last_recipe.lock().await = Some(recipe.clone());
+        *self.last_spec.lock().await = Some(spec.clone());
 
         let session_name = herdr_session_name(&spec, &self.options.session_name);
         if session_name == "default" && self.options.socket_dir.is_none() {
@@ -512,7 +518,12 @@ impl Driver for ClaudePtyDriver {
                 .filter(|value| !value.is_empty())
                 .ok_or(DriverError::NativeSessionNotFound)?,
         };
-        let mut spec = stub_spec_from_ref(&native_ref)?;
+        let mut spec = self
+            .last_spec
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::NativeSessionNotFound)?;
         spec.driver = DriverKind::ClaudePty;
         spec.host = native_ref.host_id.clone();
         spec.kind = AgentKind::Claude;
@@ -711,9 +722,14 @@ fn status_payloads(
         AgentStatus::Done => "idle",
         AgentStatus::Unknown => "unknown",
     };
+    let status_completeness = if status == AgentStatus::Blocked {
+        Completeness::ScreenDerived
+    } else {
+        Completeness::Partial
+    };
     let mut out = vec![(
         SourceChannel::Herdr,
-        Completeness::Partial,
+        status_completeness,
         ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
             NativeLifecycle {
                 topic: LifecycleTopic::Turn,
@@ -922,16 +938,37 @@ fn blocks_to_text(blocks: &[ContentBlock]) -> DriverResult<String> {
 
 pub(crate) fn refuse_bare(argv: &[String]) -> DriverResult<()> {
     if argv.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "--bare" | "--safe-mode" | "--no-session-persistence" | "--continue"
-        )
+        crate::flags::is_banned_flag_token(token)
+            || matches!(
+                token.as_str(),
+                "--bare" | "--safe-mode" | "--no-session-persistence" | "--continue"
+            )
+            || token.starts_with("--bare=")
+            || token.starts_with("--safe-mode=")
+            || token.starts_with("--no-session-persistence=")
+            || token.starts_with("--continue=")
     }) {
         return Err(DriverError::NativeFeatureDisabled(
             "refusing prohibited flag on claude-pty/bg argv".into(),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn apply_tty_bypass_flag(recipe: &mut LaunchRecipe) {
+    const TTY: &str = "--dangerously-skip-permissions";
+    const PRINT: &str = "--allow-dangerously-skip-permissions";
+    recipe.argv.retain(|token| token != PRINT);
+    recipe.permission.extra_flags.retain(|token| token != PRINT);
+    if recipe
+        .permission
+        .extra_flags
+        .iter()
+        .any(|token| token == TTY)
+        && !recipe.argv.iter().any(|token| token == TTY)
+    {
+        recipe.argv.push(TTY.into());
+    }
 }
 
 pub(crate) fn argv_for_resume(argv: &[String], session_id: &str) -> Vec<String> {
@@ -1002,7 +1039,7 @@ pub(crate) fn strip_named_flags(argv: &[String], names: &[&str]) -> Vec<String> 
     out
 }
 
-fn inject_session_start_hook(
+pub(crate) fn inject_session_start_hook(
     recipe: &mut LaunchRecipe,
     launch_dir: &Path,
 ) -> DriverResult<LaunchRecipe> {
@@ -1027,6 +1064,11 @@ fn inject_session_start_hook(
         json!({})
     };
     merge_session_start_hook(&mut settings, &command)?;
+    if let Some(object) = settings.as_object_mut() {
+        object
+            .entry("bypassPermissionsModeAccepted")
+            .or_insert(json!(true));
+    }
     let bytes = serde_json::to_vec_pretty(&settings)?;
     write_private(&settings_path, &bytes, 0o600)?;
     let digest = hash_bytes(&bytes)?;
@@ -1048,6 +1090,7 @@ fn inject_session_start_hook(
     }
     recipe.audit.settings_digest = Some(digest);
     ensure_settings_flag(&mut recipe.argv, &settings_path);
+    ensure_setting_sources(&mut recipe.argv)?;
     recipe.audit.redacted_argv = recipe
         .argv
         .iter()
@@ -1070,15 +1113,32 @@ fn merge_session_start_hook(settings: &mut Value, command: &str) -> DriverResult
     let hooks_object = hooks.as_object_mut().ok_or_else(|| {
         DriverError::SettingsIsolationUnavailable("hooks overlay is not an object".into())
     })?;
-    hooks_object.insert(
-        "SessionStart".into(),
-        json!([{
+    let session_start = hooks_object
+        .entry("SessionStart")
+        .or_insert_with(|| json!([]));
+    let matchers = session_start.as_array_mut().ok_or_else(|| {
+        DriverError::SettingsIsolationUnavailable(
+            "SessionStart hooks overlay is not an array".into(),
+        )
+    })?;
+    let already = matchers.iter().any(|matcher| {
+        matcher
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|hook| hook.get("command").and_then(Value::as_str) == Some(command))
+            })
+    });
+    if !already {
+        matchers.push(json!({
             "hooks": [{
                 "type": "command",
                 "command": command
             }]
-        }]),
-    );
+        }));
+    }
     Ok(())
 }
 
@@ -1096,6 +1156,33 @@ fn ensure_settings_flag(argv: &mut Vec<String>, settings_path: &Path) {
     }
     argv.push("--settings".into());
     argv.push(path);
+}
+
+fn ensure_setting_sources(argv: &mut Vec<String>) -> DriverResult<()> {
+    if let Some(index) = argv.iter().position(|token| token == "--setting-sources") {
+        let value = argv.get(index + 1).map(String::as_str).unwrap_or("");
+        if value.trim().is_empty() || value.starts_with('-') {
+            return Err(DriverError::NativeFeatureDisabled(
+                "empty --setting-sources is prohibited".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(token) = argv
+        .iter()
+        .find(|token| token.starts_with("--setting-sources="))
+    {
+        let value = token.trim_start_matches("--setting-sources=");
+        if value.trim().is_empty() {
+            return Err(DriverError::NativeFeatureDisabled(
+                "empty --setting-sources is prohibited".into(),
+            ));
+        }
+        return Ok(());
+    }
+    argv.push("--setting-sources".into());
+    argv.push("user,project,local".into());
+    Ok(())
 }
 
 fn write_private(path: &Path, contents: &[u8], mode: u32) -> DriverResult<()> {
@@ -1225,18 +1312,6 @@ fn native_ref_for(live: &PtyLive) -> NativeRef {
     }
 }
 
-fn stub_spec_from_ref(native_ref: &NativeRef) -> DriverResult<InstanceSpec> {
-    let bytes = include_str!("../tests/fixtures/instance-spec.json");
-    let mut spec: InstanceSpec = serde_json::from_str(bytes)?;
-    spec.host = native_ref.host_id.clone();
-    spec.driver = DriverKind::ClaudePty;
-    spec.kind = AgentKind::Claude;
-    spec.cwd = std::env::current_dir()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "/tmp".into());
-    Ok(spec)
-}
-
 pub(crate) fn map_herdr(err: remuda_herdr::Error) -> DriverError {
     match err {
         remuda_herdr::Error::Io(error) => DriverError::Io(error),
@@ -1309,5 +1384,68 @@ mod tests {
         assert!(refuse_bare(&["--model".into(), "haiku".into()]).is_ok());
         assert!(refuse_bare(&["--bare".into()]).is_err());
         assert!(refuse_bare(&["--continue".into()]).is_err());
+    }
+}
+
+/// Mapping / gating helpers used by `tests/claude_pty_review.rs`.
+#[doc(hidden)]
+pub mod review {
+    use super::*;
+
+    /// Final argv check for `--bare` / `--continue` / banned tokens.
+    pub fn refuse_argv(argv: &[String]) -> DriverResult<()> {
+        refuse_bare(argv)
+    }
+
+    /// Rebuild resume argv from a persisted recipe, keeping `--settings`.
+    pub fn resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
+        argv_for_resume(argv, session_id)
+    }
+
+    /// Append a SessionStart command without replacing other hook events.
+    pub fn merge_hooks(settings: &mut Value, command: &str) -> DriverResult<()> {
+        merge_session_start_hook(settings, command)
+    }
+
+    /// Write the launch-dir SessionStart overlay and keep `--settings`.
+    pub fn inject_hook(recipe: &mut LaunchRecipe, launch_dir: &Path) -> DriverResult<LaunchRecipe> {
+        inject_session_start_hook(recipe, launch_dir)
+    }
+
+    /// Map print-style bypass onto the TTY flag.
+    pub fn apply_bypass(recipe: &mut LaunchRecipe) {
+        apply_tty_bypass_flag(recipe);
+    }
+
+    /// Default `--setting-sources user,project,local` when missing; reject empty.
+    pub fn ensure_sources(argv: &mut Vec<String>) -> DriverResult<()> {
+        ensure_setting_sources(argv)
+    }
+
+    /// Screen-derived blocked payloads (lifecycle + interaction).
+    pub fn blocked_status_payloads() -> DriverResult<Vec<(Completeness, ObservationPayload)>> {
+        let ctx = obs_ctx(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            HostId::new(),
+            Id::new("obj")?,
+            RunId::new(),
+            "review-session".into(),
+            "review".into(),
+        );
+        Ok(status_payloads(&ctx, AgentStatus::Blocked)
+            .into_iter()
+            .map(|(_, completeness, payload)| (completeness, payload))
+            .collect())
+    }
+
+    /// Driver-level bot/dontAsk/bypass gate.
+    pub fn reject_bot(spec: &InstanceSpec) -> DriverResult<()> {
+        reject_bot_bypass(spec)
+    }
+
+    /// Strip named flags (`--session-id`, `--cwd`, …).
+    pub fn strip_flags(argv: &[String], names: &[&str]) -> Vec<String> {
+        strip_named_flags(argv, names)
     }
 }

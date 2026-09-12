@@ -206,6 +206,7 @@ stateDiagram-v2
 | `parent` | `{instanceId: Id, runId: Id, commandId: Id}\|null` | runtime 调起的 child；与 native Workflow member 区分 |
 | `journalId` / `durableSeq` | `Id` / `U64` | instance journal；换进程不重置 seq |
 | `exit` | `Knowledge<{code: number\|null, signal: string\|null, observedAt: Timestamp}>` | 只能由 owner/supervisor 的退出证据赋值 |
+| `lastError?` | `string` | 可省略的 driver/原生诊断文本，通常随 `lifecycle=failed` 写入；只是展示用摘要，不是状态、不是终态证据，也不能替代 `exit` 或 Run 的 `terminalEvidence` |
 
 ~~~mermaid
 stateDiagram-v2
@@ -1200,6 +1201,8 @@ Hub 生成 ownerFence，Node 在本地 durable store 单调保存；旧 fence �
 
 原生执行、资源生命周期和 Interaction 决定使用 §2.5 的 Command wrapper：`{commandId,payload,expected?,expiresAt?}`；Node 和 Hub 都校验 schema/身份。表中的 payload 是该 method 的业务参数；§6/§7.4 的完整参数列表若含 commandId，该字段外置到 wrapper，不在 payload 再保留一份。公开 response 为 `{command:Command,relatedCommandIds:Id[]}`，除特别写明外不等待模型任务结束。连接握手、订阅、lease、幂等 object 上传和 resize 使用各自明确的 ID/revision，不伪装为模型任务。只读方法不启动/恢复 native process。
 
+下表是本协议的**目标方法全集**（46 个，与 `MethodName` 一一对应），不是“当前 Hub↔Node 链路已可调用”的清单。M1 阶段 Hub 与 Node 实际互通的是 [`hubnode.rs`](../../crates/remuda-protocol/src/hubnode.rs) 中更小的运维子集：`node.auth`、`node.hello`、`node.heartbeat`、`instance.create/send/cancel/respond`、`interaction.respond`、`journal.append`、`tty.frame`、`tty.write`、`instance.keys` 以及 `runtime.hello`/`runtime.heartbeat` 别名。该子集是分阶段实施的落地面，本表的语义与约束对它同样有效；两者不是两套相互竞争的语义。逐方法的实现覆盖见 [protocol-audit-1.md](protocol-audit-1.md) §7。
+
 | 方法 | 方向 | payload / result |
 | --- | --- | --- |
 | `runtime.hello` | Node→Hub | §7.1；完成版本、身份与重连协商 |
@@ -1461,6 +1464,8 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
 
 ## 12. 实现反馈与 M0-02 状态（2026-09-12）
 
+逐方法、逐实体、逐字段的文档↔实现核对见 [protocol-audit-1.md](protocol-audit-1.md)（2026-09-13）：wire 类型层与本文一致（46 方法、47 error code、15 类 Observation、各实体字段逐项对齐，生成产物为最新），差异集中在 Node/Hub/driver 的实现覆盖，该文末尾列出具体任务。
+
 [协议 crate](../../crates/remuda-protocol/src/lib.rs) 是 wire 类型的单一来源；[JSON Schema](../../crates/remuda-protocol/schema/protocol.schema.json) 与 [TypeScript](../../web/src/types/generated.ts) 由 [生成器](../../crates/remuda-protocol/examples/gen_types.rs) 同次生成。`just gen-types` 只改这两个产物；`cargo run -p remuda-protocol --example gen_types -- --check` 比较字节且不改文件。现有 CI 的 `cargo test --workspace` 会运行 generated freshness 测试，Rust 类型变化而未生成、或手改产物，均使测试失败；不新增依赖 Node 的 CI 流程。计划旧表中的 `scripts/ci/check-generated.sh` 入口由此 crate 内命令实现，避免扩大本任务文件范围。
 
 生成器使用固定版本的 [schemars](https://docs.rs/schemars/1.2.2/schemars/) 派生 Serde schema，以序列化规则保留 required nullable 与可省略字段的区别；自定义 U64/ID/时间/digest/字面量 schema 与入口解析配对测试。TypeScript 从同份 schema 输出命名实体、判别 union 与已实例化的泛型定义；未知 schema 关键字使生成失败。TypeScript 不是运行时验证器：数值范围、字符串格式、对象关系、权限与状态转移仍需 schema/Node 检查。`from_json_slice` 拒绝重复 key、非法 UTF-8 与多余 JSON 文档，网络层在解码前限制 frame 大小。
@@ -1476,7 +1481,10 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
 | Native process、bg argv/attach 与 Herdr bridge | 未在本任务实现 | driver/Node 必须核对人类授权、job/store/host、binary pin 和 owner fence，再持久 intent；bg 首次输入只接受显式非敏感单个 text block，bot 禁止。Herdr 重连换 streamId/streamEpoch 并等待 full frame，不能用 pane.read 补增量 |
 | Journal、Command/Interaction CAS 与恢复 | 未在本任务实现 | Node/journal 核对 parent ID、重复 lifecycle 字段、digest、generation、租约与状态转移；serde/schema 可解析不等于可派发。ACK 丢失、崩溃或 unknown 不自动重放 |
 | 远程审批与 bot 权限 | 未在本任务实现 | D-005 的 host broker 是目标；M0 临时 dontAsk 需记录权限债。bot 永不 bypass；CLI/模型返回文本不构成授权 |
-| MaterializedLaunch 与 secrets | 非 wire 类型 | env 明文只留 Node 进程内；不加入 schema/TS。持久 recipe 只保存受控配置/credential 引用与 digest |
+| MaterializedLaunch 与 secrets | 非 wire 类型 | env 明文只留 Node 进程内；不加入 schema/TS。持久 recipe 只保存受控配置/credential 引用与 digest。实现的 `LaunchRecipe` 只存 env **名字与来源**、不存值，强于本文的 `Record<string,string>` 描述 |
+| Driver 实现覆盖 | 部分实现 | 仅 claude-print / claude-pty / claude-bg / generic-pty 有 `Driver` impl；codex-appserver、grok-acp、agy-print 只有 materializer argv 配方，经 generic PTY 运行，§5.7 的结构化映射尚不可达。trait 以 `RunHandle` 取代 `observations()`，未实现 `DriverRecord`/`AttachRef`/`ResumeRef` |
+| Capability 快照 | 部分实现 | 15 个 CapabilityName 均有取值，但来自 §3.3 矩阵的静态转写：`S*` 直接成为 supported，evidence 固定为指向本文的 `source`，nativeProtocolVersion 恒为 unknown，settings/provider revision 硬编码为 1。§3.2 的四条件门与证据分级尚未执行 |
+| MCP / CLI 控制面 | 部分实现 | 工具以 `remuda_*` 而非 §8.1 的 `runtime_*` 命名，并多出 list/keys/rm/worktree/fleet 六个工具；§8.1 的 `--spec` 文件式 CLI 与 capability 对象（allowedHosts/maxChildren/maxDepth/expiresAt）未实现，§8.2 的深度与并发 `RESOURCE_LIMIT` 因此不可执行 |
 
 ### 12.1 已收口的字段与仍需运行校验的关系
 
@@ -1494,7 +1502,7 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
 | Command.resolution | clear / unknown / reconciling | 分开投递进度与是否能判定；unknown 不降成 rejected 或 completed |
 | Command.dispatch | not-dispatched / intent-durable / transport-written / native-acknowledged | intent 之后可能发生的 native 写入只能查询/对账，不能因无 ACK 重发 |
 | Instance.lifecycle、Run.state、Interaction.state | 各自保留 unknown / reconciling | 断线不表示进程已死或任务成功；已有答案的 Interaction 不回 pending |
-| Instance.connectivity | connected / disconnected / reconnecting | 与 activity/Run 结果独立；未知 activity 使用 Knowledge，而非默认 idle |
+| Instance.connectivity | connected / disconnected / reconciling | 与 activity/Run 结果独立；未知 activity 使用 Knowledge，而非默认 idle |
 | wait / capability / knowledge | reason:unknown / state:unknown / state:unknown | 没有足够证据时明确拒绝或返回 unknown，不提升为 supported/condition-met |
 | RuntimeError.execution / retry | possibly-dispatched / same-command-query 或 after-reconciliation | 非零 API 错误不证明 native 未收到；错误本身不授予重新执行权限 |
 

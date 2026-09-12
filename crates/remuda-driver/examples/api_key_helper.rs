@@ -1,8 +1,12 @@
 //! Claude `apiKeyHelper`: print one secret from the Node token-broker UDS.
 //!
+//! Production launches use the script [`remuda_driver::render_api_key_helper_script`]
+//! writes next to `--settings`. This binary is the same JSON-line protocol.
+//!
 //! Environment:
 //! - `REMUDA_SECRET_SOCK` — absolute path of the broker socket
 //! - `REMUDA_INSTANCE_ID` — allowlisted instance id
+//! - `REMUDA_INSTANCE_TOKEN` — per-instance bearer
 //! - `REMUDA_SECRET_REF` — e.g. `store:anthropic`
 //!
 //! stdout is only the secret plus a trailing newline. Errors go to stderr.
@@ -29,10 +33,13 @@ async fn run() -> Result<(), remuda_driver::DriverError> {
     let instance = std::env::var("REMUDA_INSTANCE_ID").map_err(|_| {
         remuda_driver::DriverError::CredentialUnavailable("REMUDA_INSTANCE_ID is unset".into())
     })?;
+    let token = std::env::var("REMUDA_INSTANCE_TOKEN").map_err(|_| {
+        remuda_driver::DriverError::CredentialUnavailable("REMUDA_INSTANCE_TOKEN is unset".into())
+    })?;
     let secret_ref = SecretRef::parse(std::env::var("REMUDA_SECRET_REF").map_err(|_| {
         remuda_driver::DriverError::CredentialUnavailable("REMUDA_SECRET_REF is unset".into())
     })?)?;
-    let secret = request_secret(&sock, &instance, &secret_ref).await?;
+    let secret = request_secret(&sock, &instance, &token, &secret_ref).await?;
     println!("{}", secret.expose_str()?);
     Ok(())
 }

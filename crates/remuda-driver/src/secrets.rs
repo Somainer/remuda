@@ -2,10 +2,12 @@
 //!
 //! Vault files and the master key are created `0600`. Ciphertext is
 //! ChaCha20-Poly1305 with a per-secret nonce. Audit lines record the
-//! [`SecretRef`] spelling and instance id, never the secret bytes.
+//! [`SecretRef`] spelling and instance id, never the secret bytes or
+//! per-instance tokens.
 //!
-//! Claude `apiKeyHelper` should run the `api_key_helper` example with
-//! `REMUDA_SECRET_SOCK`, `REMUDA_INSTANCE_ID`, and `REMUDA_SECRET_REF`.
+//! Claude `apiKeyHelper` is the script [`crate::render_api_key_helper_script`]
+//! writes into the launch overlay. The helper authenticates with a
+//! per-instance token and prints one secret to stdout.
 
 use crate::error::{DriverError, DriverResult};
 use crate::profile::{Secret, SecretBroker, SecretRef};
@@ -14,7 +16,8 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -424,7 +427,8 @@ impl SecretBroker for KeychainSecretBroker {
 #[derive(Clone)]
 pub struct TokenBroker {
     inner: Arc<dyn SecretBroker>,
-    allowlist: Arc<Mutex<HashSet<String>>>,
+    /// instance id → per-instance token. Empty map denies every request.
+    allowlist: Arc<Mutex<HashMap<String, String>>>,
     audit_path: PathBuf,
 }
 
@@ -442,15 +446,30 @@ impl TokenBroker {
     pub fn new(inner: Arc<dyn SecretBroker>, audit_path: impl Into<PathBuf>) -> Self {
         Self {
             inner,
-            allowlist: Arc::new(Mutex::new(HashSet::new())),
+            allowlist: Arc::new(Mutex::new(HashMap::new())),
             audit_path: audit_path.into(),
         }
     }
 
-    /// Permit `instance_id` to fetch secrets through this broker.
-    pub fn allow_instance(&self, instance_id: impl Into<String>) {
+    /// 32-byte hex token for a helper script. Never log the return value.
+    #[must_use]
+    pub fn random_token() -> String {
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        hex_encode(&bytes)
+    }
+
+    /// Permit `instance_id` when the helper presents `token`.
+    pub fn allow_instance(&self, instance_id: impl Into<String>, token: impl Into<String>) {
         let mut guard = self.allowlist.lock().unwrap_or_else(|err| err.into_inner());
-        guard.insert(instance_id.into());
+        guard.insert(instance_id.into(), token.into());
+    }
+
+    /// Generate a token, store it, and return it. Never log the return value.
+    pub fn issue_instance(&self, instance_id: impl Into<String>) -> String {
+        let token = Self::random_token();
+        self.allow_instance(instance_id, token.clone());
+        token
     }
 
     /// Revoke a previously allowed instance.
@@ -459,23 +478,29 @@ impl TokenBroker {
         guard.remove(instance_id);
     }
 
-    /// True when the instance is on the allowlist.
+    /// True when `instance_id` presents the stored token.
     #[must_use]
-    pub fn is_allowed(&self, instance_id: &str) -> bool {
+    pub fn is_allowed(&self, instance_id: &str, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
         let guard = self.allowlist.lock().unwrap_or_else(|err| err.into_inner());
-        guard.contains(instance_id)
+        guard
+            .get(instance_id)
+            .is_some_and(|expected| token_matches(expected, token))
     }
 
-    /// Resolve if `instance_id` is allowlisted. Writes an audit line either way.
+    /// Resolve if the instance token matches. Writes an audit line either way.
     pub async fn resolve_for(
         &self,
         instance_id: &str,
+        token: &str,
         secret_ref: &SecretRef,
     ) -> DriverResult<Secret> {
-        if !self.is_allowed(instance_id) {
+        if !self.is_allowed(instance_id, token) {
             self.audit(instance_id, secret_ref.as_str(), "deny")?;
             return Err(DriverError::CredentialUnavailable(
-                "instance is not allowlisted for the token broker".into(),
+                "token broker denied the request".into(),
             ));
         }
         match self.inner.resolve(secret_ref).await {
@@ -521,6 +546,9 @@ impl TokenBroker {
 struct BrokerRequest {
     #[serde(rename = "instanceId")]
     instance_id: String,
+    /// Per-instance bearer. Never logged.
+    #[serde(default)]
+    token: String,
     #[serde(rename = "secretRef")]
     secret_ref: String,
 }
@@ -591,7 +619,10 @@ async fn handle_broker_conn(
     let request: BrokerRequest = serde_json::from_str(&line)
         .map_err(|_| DriverError::CredentialUnavailable("invalid broker request".into()))?;
     let parsed = SecretRef::parse(request.secret_ref)?;
-    let response = match broker.resolve_for(&request.instance_id, &parsed).await {
+    let response = match broker
+        .resolve_for(&request.instance_id, &request.token, &parsed)
+        .await
+    {
         Ok(secret) => BrokerResponse {
             ok: true,
             secret: Some(secret.expose_str()?.to_string()),
@@ -614,6 +645,7 @@ async fn handle_broker_conn(
 pub async fn request_secret(
     socket_path: &Path,
     instance_id: &str,
+    token: &str,
     secret_ref: &SecretRef,
 ) -> DriverResult<Secret> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -622,6 +654,7 @@ pub async fn request_secret(
     let mut stream = UnixStream::connect(socket_path).await?;
     let request = BrokerRequest {
         instance_id: instance_id.to_string(),
+        token: token.to_string(),
         secret_ref: secret_ref.as_str().to_string(),
     };
     let mut payload = serde_json::to_vec(&request)?;
@@ -643,6 +676,16 @@ pub async fn request_secret(
             response.error.unwrap_or_else(|| "broker denied".into()),
         ))
     }
+}
+
+fn token_matches(expected: &str, presented: &str) -> bool {
+    let left = Sha256::digest(expected.as_bytes());
+    let right = Sha256::digest(presented.as_bytes());
+    let mut acc = 0_u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        acc |= a ^ b;
+    }
+    acc == 0
 }
 
 fn now_rfc3339() -> String {

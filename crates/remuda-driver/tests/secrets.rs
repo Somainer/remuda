@@ -2,7 +2,10 @@
 //!
 //! Vault fixtures are created at runtime under tempfile; they are not checked in.
 
-use remuda_driver::{FileSecretStore, SecretBroker, SecretRef, TokenBroker};
+use remuda_driver::{
+    FileSecretStore, SecretBroker, SecretRef, TokenBroker, TokenBrokerBind,
+    render_api_key_helper_script,
+};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -74,14 +77,24 @@ async fn token_broker_allowlist_and_audit_omit_secret() {
     let audit = dir.path().join("audit.jsonl");
     let broker = TokenBroker::new(Arc::new(store), audit.clone());
     let secret_ref = SecretRef::parse("store:gateway").unwrap();
+    let token = "tok_ok_instance_token_1";
     let denied = broker
-        .resolve_for("ins_denied", &secret_ref)
+        .resolve_for("ins_denied", token, &secret_ref)
         .await
         .unwrap_err();
-    assert!(denied.to_string().contains("not allowlisted"));
+    assert!(denied.to_string().contains("denied the request"));
 
-    broker.allow_instance("ins_ok");
-    let secret = broker.resolve_for("ins_ok", &secret_ref).await.unwrap();
+    broker.allow_instance("ins_ok", token);
+    let wrong = broker
+        .resolve_for("ins_ok", "tok_wrong_instance_token", &secret_ref)
+        .await
+        .unwrap_err();
+    assert!(wrong.to_string().contains("denied the request"));
+
+    let secret = broker
+        .resolve_for("ins_ok", token, &secret_ref)
+        .await
+        .unwrap();
     assert_eq!(secret.expose_str().unwrap(), value);
 
     let log = fs::read_to_string(&audit).unwrap();
@@ -89,6 +102,7 @@ async fn token_broker_allowlist_and_audit_omit_secret() {
     assert!(log.contains("ins_ok"));
     assert!(log.contains("store:gateway"));
     assert!(!log.contains(value));
+    assert!(!log.contains(token));
     let mode = fs::metadata(&audit).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
@@ -109,9 +123,9 @@ async fn file_store_rejects_non_store_refs() {
 async fn token_broker_uds_helper_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileSecretStore::open(dir.path()).unwrap();
-    store.put("anthropic", b"sk-uds-secret").unwrap();
+    store.put("anthropic", b"sk-fake-uds-secret").unwrap();
     let broker = TokenBroker::new(Arc::new(store), dir.path().join("audit.jsonl"));
-    broker.allow_instance("ins_live");
+    let token = broker.issue_instance("ins_live");
     let sock = dir.path().join("broker.sock");
     let server = broker.clone();
     let sock_server = sock.clone();
@@ -124,22 +138,42 @@ async fn token_broker_uds_helper_round_trip() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let got = remuda_driver::request_secret(
-        &sock,
-        "ins_live",
-        &SecretRef::parse("store:anthropic").unwrap(),
+    let secret_ref = SecretRef::parse("store:anthropic").unwrap();
+    let got = remuda_driver::request_secret(&sock, "ins_live", &token, &secret_ref)
+        .await
+        .unwrap();
+    assert_eq!(got.expose_str().unwrap(), "sk-fake-uds-secret");
+    let denied = remuda_driver::request_secret(&sock, "ins_other", &token, &secret_ref)
+        .await
+        .unwrap_err();
+    assert!(denied.to_string().contains("denied the request"));
+
+    let helper_path = dir.path().join("api-key-helper");
+    let script = render_api_key_helper_script(
+        &TokenBrokerBind {
+            socket_path: sock.clone(),
+            instance_id: "ins_live".into(),
+            token: token.clone(),
+        },
+        &secret_ref,
     )
-    .await
     .unwrap();
-    assert_eq!(got.expose_str().unwrap(), "sk-uds-secret");
-    let denied = remuda_driver::request_secret(
-        &sock,
-        "ins_other",
-        &SecretRef::parse("store:anthropic").unwrap(),
-    )
-    .await
-    .unwrap_err();
-    assert!(denied.to_string().contains("not allowlisted"));
+    assert!(!script.contains("sk-fake-uds-secret"));
+    fs::write(&helper_path, &script).unwrap();
+    fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = tokio::process::Command::new(&helper_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "sk-fake-uds-secret"
+    );
     task.abort();
 }
 

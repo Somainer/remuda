@@ -3,7 +3,7 @@
 use crate::binary::{BinaryPin, pin_binary};
 use crate::error::{DriverError, DriverResult};
 use crate::flags::{reject_banned_env, validate_spec_args};
-use crate::profile::{Delegation, ProviderHealth, ProviderKind, ProviderProfile};
+use crate::profile::{Delegation, ProviderHealth, ProviderKind, ProviderProfile, SecretRef};
 use crate::recipe::{
     EnvAllowlistEntry, EnvAllowlistSource, FileLifetime, FileRole, LaunchAudit, LaunchRecipe,
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
@@ -15,6 +15,7 @@ use remuda_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,31 @@ pub struct MaterializeRequest<'a> {
     pub origin: LaunchOrigin,
 }
 
+/// Node token-broker bind baked into a Claude `apiKeyHelper` script.
+///
+/// The token is a per-instance bearer for the UDS broker. It is written only
+/// into the owner-only helper script, never into the recipe or settings JSON.
+#[derive(Clone)]
+pub struct TokenBrokerBind {
+    /// Absolute path of the broker Unix socket (`0600`).
+    pub socket_path: PathBuf,
+    /// Instance id the broker allowlists.
+    pub instance_id: String,
+    /// Per-instance token presented by the helper. Never log this.
+    pub token: String,
+}
+
+impl fmt::Debug for TokenBrokerBind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenBrokerBind")
+            .field("socket_path", &self.socket_path)
+            .field("instance_id", &self.instance_id)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Origin used to gate yolo/bypass. Dispatcher commands are [`CommandOrigin::Bot`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -113,6 +139,25 @@ impl From<CommandOrigin> for LaunchOrigin {
 /// Idempotent for identical [`MaterializeRequest`] values: overlay bytes, argv,
 /// and pin are stable. Secret values and prompts are never written.
 pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecipe> {
+    materialize_inner(request, None)
+}
+
+/// Like [`materialize`], and write a Claude `apiKeyHelper` bound to `broker`.
+///
+/// The helper script authenticates with `broker.token` and prints the secret
+/// for `profile.secret_ref`. Settings overlay points `apiKeyHelper` at the
+/// script and does not inject `ANTHROPIC_AUTH_TOKEN`.
+pub fn materialize_with_token_broker(
+    request: &MaterializeRequest<'_>,
+    broker: &TokenBrokerBind,
+) -> DriverResult<LaunchRecipe> {
+    materialize_inner(request, Some(broker))
+}
+
+fn materialize_inner(
+    request: &MaterializeRequest<'_>,
+    broker: Option<&TokenBrokerBind>,
+) -> DriverResult<LaunchRecipe> {
     validate_spec_profile(request.spec, request.profile)?;
     validate_paths(request)?;
     if request.profile.delegation == Delegation::Direct {
@@ -131,6 +176,7 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
 
     let mut files = Vec::new();
     let mut env_allowlist = Vec::new();
+    let mut api_key_helper_path: Option<PathBuf> = None;
     let mut argv;
     let input_delivery;
     let session_id;
@@ -138,8 +184,12 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
     match request.spec.driver {
         DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => {
             let settings_path = if inject_provider {
+                if let Some(bind) = broker {
+                    api_key_helper_path = maybe_write_api_key_helper(request, bind, &mut files)?;
+                }
                 let path = request.launch_dir.join("settings.json");
-                let settings = claude_settings_json(request.profile, &model)?;
+                let settings =
+                    claude_settings_json(request.profile, &model, api_key_helper_path.as_deref())?;
                 let bytes = serde_json::to_vec_pretty(&settings)?;
                 write_private_file(&path, &bytes)?;
                 let digest = crate::binary::hash_bytes(&bytes)?;
@@ -187,7 +237,8 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
                     None,
                 );
                 match request.profile.secret_ref.as_ref() {
-                    Some(secret) if secret.helper_command().is_some() => {}
+                    Some(secret)
+                        if secret.helper_command().is_some() || api_key_helper_path.is_some() => {}
                     Some(secret) => push_env(
                         &mut env_allowlist,
                         "ANTHROPIC_AUTH_TOKEN",
@@ -303,10 +354,18 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
         .map(|file| file.content_digest.clone());
     let redacted_argv = redact_argv(&argv, &files);
     let env_names = env_allowlist.iter().map(|e| e.name.clone()).collect();
-    let credential_refs = env_allowlist
+    let mut credential_refs: Vec<String> = env_allowlist
         .iter()
         .filter_map(|e| e.secret_ref.clone())
         .collect();
+    if api_key_helper_path.is_some()
+        && let Some(secret) = request.profile.secret_ref.as_ref()
+    {
+        let spelling = secret.as_str().to_string();
+        if !credential_refs.iter().any(|entry| entry == &spelling) {
+            credential_refs.push(spelling);
+        }
+    }
 
     let recipe = LaunchRecipe {
         launch_id: request.launch_id.clone(),
@@ -542,7 +601,11 @@ fn map_claude_mode(mode: ClaudePermissionMode) -> (&'static str, bool) {
     }
 }
 
-fn claude_settings_json(profile: &ProviderProfile, model: &str) -> DriverResult<Value> {
+fn claude_settings_json(
+    profile: &ProviderProfile,
+    model: &str,
+    written_helper: Option<&Path>,
+) -> DriverResult<Value> {
     if profile.base_url.trim().is_empty() {
         return Err(DriverError::InvalidLaunchSpec(
             "gateway delegation requires a base_url".into(),
@@ -561,12 +624,17 @@ fn claude_settings_json(profile: &ProviderProfile, model: &str) -> DriverResult<
         "model": model,
         "env": env,
     });
-    if let Some(helper) = profile
-        .secret_ref
-        .as_ref()
-        .and_then(crate::profile::SecretRef::helper_command)
-    {
-        if !Path::new(helper).is_absolute() {
+    let helper = written_helper
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| {
+            profile
+                .secret_ref
+                .as_ref()
+                .and_then(SecretRef::helper_command)
+                .map(str::to_string)
+        });
+    if let Some(helper) = helper {
+        if !Path::new(&helper).is_absolute() {
             return Err(DriverError::InvalidLaunchSpec(
                 "apiKeyHelper command must be an absolute path".into(),
             ));
@@ -574,9 +642,112 @@ fn claude_settings_json(profile: &ProviderProfile, model: &str) -> DriverResult<
         object
             .as_object_mut()
             .ok_or_else(|| DriverError::InvalidLaunchSpec("settings object".into()))?
-            .insert("apiKeyHelper".into(), Value::String(helper.to_string()));
+            .insert("apiKeyHelper".into(), Value::String(helper));
     }
     Ok(object)
+}
+
+const API_KEY_HELPER_TEMPLATE: &str = r#"#!/usr/bin/env python3
+# Remuda apiKeyHelper. stdout is the secret only.
+import json
+import socket
+import sys
+
+SOCK = __SOCK__
+REQ = __REQ__
+
+def main():
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.connect(SOCK)
+    conn.sendall((json.dumps(REQ) + "\n").encode())
+    conn.shutdown(socket.SHUT_WR)
+    buf = b""
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    conn.close()
+    line = buf.split(b"\n", 1)[0]
+    resp = json.loads(line.decode())
+    if not resp.get("ok"):
+        print(resp.get("error") or "broker denied", file=sys.stderr)
+        sys.exit(1)
+    secret = resp.get("secret") or ""
+    if not secret:
+        print("broker omitted the secret", file=sys.stderr)
+        sys.exit(1)
+    if not secret.endswith("\n"):
+        secret += "\n"
+    sys.stdout.write(secret)
+
+if __name__ == "__main__":
+    main()
+"#;
+
+/// Render the Claude `apiKeyHelper` script for `broker` + `secret_ref`.
+///
+/// The script contains the per-instance token and socket path, never the API
+/// key. Callers must write it `0700` and must not log the bytes.
+pub fn render_api_key_helper_script(
+    broker: &TokenBrokerBind,
+    secret_ref: &SecretRef,
+) -> DriverResult<String> {
+    validate_token_broker_bind(broker)?;
+    let request = serde_json::json!({
+        "instanceId": broker.instance_id,
+        "token": broker.token,
+        "secretRef": secret_ref.as_str(),
+    });
+    let sock = serde_json::to_string(&broker.socket_path.to_string_lossy())?;
+    let req = serde_json::to_string(&request)?;
+    Ok(API_KEY_HELPER_TEMPLATE
+        .replace("__SOCK__", &sock)
+        .replace("__REQ__", &req))
+}
+
+fn validate_token_broker_bind(broker: &TokenBrokerBind) -> DriverResult<()> {
+    if !broker.socket_path.is_absolute() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "token broker socket must be an absolute path".into(),
+        ));
+    }
+    if broker.instance_id.is_empty() || broker.instance_id.len() > 128 {
+        return Err(DriverError::InvalidLaunchSpec(
+            "token broker instance id must be 1..=128 bytes".into(),
+        ));
+    }
+    if broker.token.len() < 16 || broker.token.len() > 128 {
+        return Err(DriverError::InvalidLaunchSpec(
+            "token broker instance token must be 16..=128 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn maybe_write_api_key_helper(
+    request: &MaterializeRequest<'_>,
+    broker: &TokenBrokerBind,
+    files: &mut Vec<MaterializedFile>,
+) -> DriverResult<Option<PathBuf>> {
+    let Some(secret_ref) = request.profile.secret_ref.as_ref() else {
+        return Ok(None);
+    };
+    if secret_ref.helper_command().is_some() {
+        return Ok(None);
+    }
+    let script = render_api_key_helper_script(broker, secret_ref)?;
+    let path = request.launch_dir.join("api-key-helper");
+    write_private_file_with_mode(&path, script.as_bytes(), 0o700)?;
+    let digest = crate::binary::hash_bytes(script.as_bytes())?;
+    files.push(MaterializedFile {
+        path: path.to_string_lossy().into_owned(),
+        role: FileRole::ApiKeyHelper,
+        mode: "0700".into(),
+        content_digest: digest,
+        lifetime: FileLifetime::Launch,
+    });
+    Ok(Some(path))
 }
 
 fn claude_argv(
@@ -738,25 +909,33 @@ fn redact_argv(argv: &[String], files: &[MaterializedFile]) -> Vec<String> {
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> DriverResult<()> {
+    write_private_file_with_mode(path, contents, 0o600)
+}
+
+fn write_private_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> DriverResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         set_dir_mode(parent, 0o700)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = {
+        let mut raw = path.as_os_str().to_os_string();
+        raw.push(".tmp");
+        PathBuf::from(raw)
+    };
     {
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            opts.mode(mode);
         }
         let mut file = opts.open(&tmp)?;
         file.write_all(contents)?;
         file.sync_all()?;
     }
     fs::rename(&tmp, path)?;
-    set_file_mode(path, 0o600)?;
+    set_file_mode(path, mode)?;
     Ok(())
 }
 

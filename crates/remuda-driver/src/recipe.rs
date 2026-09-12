@@ -41,6 +41,8 @@ pub struct EnvAllowlistEntry {
 pub enum FileRole {
     /// Claude `--settings` JSON overlay.
     Settings,
+    /// Claude `apiKeyHelper` script written next to the settings overlay.
+    ApiKeyHelper,
     /// Codex/Grok config overlay.
     ProviderConfig,
 }
@@ -63,7 +65,7 @@ pub struct MaterializedFile {
     pub path: String,
     /// Why the file exists.
     pub role: FileRole,
-    /// Always `0600` on Unix.
+    /// `0600` for overlays; `0700` for [`FileRole::ApiKeyHelper`].
     pub mode: String,
     /// SHA-256 of the file bytes.
     pub content_digest: Digest,

@@ -1,9 +1,9 @@
 //! Launch materializer: idempotency, secret omission, banned flags, binary pin.
 
 use remuda_driver::{
-    BinarySource, Delegation, DriverError, LaunchOrigin, LaunchRecipe, MaterializeRequest,
-    ProviderHealth, ProviderKind, ProviderProfile, SecretRef, SessionAction, TECH_DEBT_M0_PERM_01,
-    materialize, pin_binary,
+    BinarySource, Delegation, DriverError, FileRole, LaunchOrigin, LaunchRecipe,
+    MaterializeRequest, ProviderHealth, ProviderKind, ProviderProfile, SecretRef, SessionAction,
+    TECH_DEBT_M0_PERM_01, TokenBrokerBind, materialize, materialize_with_token_broker, pin_binary,
 };
 use remuda_protocol::{
     ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, CommandOrigin, DriverKind,
@@ -442,4 +442,84 @@ fn bot_origin_rejects_dont_ask() {
     req.origin = LaunchOrigin::Bot;
     let error = materialize(&req).unwrap_err();
     assert!(matches!(error, DriverError::BypassNotAllowedForBot));
+}
+
+#[test]
+fn token_broker_helper_script_in_settings_omits_auth_token_and_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let spec = load_spec();
+    let mut profile = profile();
+    profile.secret_ref = Some(SecretRef::parse("store:anthropic").unwrap());
+    let token = "tok_helper_instance_aaaa";
+    let bind = TokenBrokerBind {
+        socket_path: tmp.path().join("broker.sock"),
+        instance_id: "ins_live".into(),
+        token: token.into(),
+    };
+    let recipe = materialize_with_token_broker(
+        &request(&spec, &profile, &launch, &home, pin_source(&binary)),
+        &bind,
+    )
+    .unwrap();
+    let helper = recipe
+        .materialized_files
+        .iter()
+        .find(|file| file.role == FileRole::ApiKeyHelper)
+        .expect("apiKeyHelper script");
+    assert_eq!(helper.mode, "0700");
+    let helper_mode = fs::metadata(&helper.path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(helper_mode, 0o700);
+    let script = fs::read_to_string(&helper.path).unwrap();
+    assert!(script.contains("instanceId"));
+    assert!(script.contains(token));
+    assert!(script.contains("store:anthropic"));
+    assert!(!script.contains("sk-"));
+    let settings = recipe
+        .materialized_files
+        .iter()
+        .find(|file| file.role == FileRole::Settings)
+        .expect("settings");
+    let settings_json = fs::read_to_string(&settings.path).unwrap();
+    assert!(settings_json.contains("apiKeyHelper"));
+    assert!(settings_json.contains(&helper.path));
+    assert!(!settings_json.contains(token));
+    assert!(!settings_json.contains("ANTHROPIC_AUTH_TOKEN"));
+    assert!(
+        !recipe
+            .env_allowlist
+            .iter()
+            .any(|entry| entry.name == "ANTHROPIC_AUTH_TOKEN")
+    );
+    let json = serde_json::to_string(&recipe).unwrap();
+    assert!(!json.contains(token));
+    assert!(
+        recipe
+            .audit
+            .credential_refs
+            .iter()
+            .any(|entry| entry == "store:anthropic")
+    );
+    let again = materialize_with_token_broker(
+        &request(&spec, &profile, &launch, &home, pin_source(&binary)),
+        &bind,
+    )
+    .unwrap();
+    assert_eq!(
+        recipe
+            .materialized_files
+            .iter()
+            .find(|file| file.role == FileRole::ApiKeyHelper)
+            .unwrap()
+            .content_digest,
+        again
+            .materialized_files
+            .iter()
+            .find(|file| file.role == FileRole::ApiKeyHelper)
+            .unwrap()
+            .content_digest
+    );
 }

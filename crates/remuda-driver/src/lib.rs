@@ -31,7 +31,8 @@ pub use capabilities::{
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
 pub use materializer::{
-    BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, materialize,
+    BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
+    materialize_with_token_broker, render_api_key_helper_script,
 };
 pub use process::current_process_identity;
 pub use profile::{

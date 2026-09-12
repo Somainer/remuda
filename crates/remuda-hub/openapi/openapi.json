@@ -122,6 +122,24 @@
         }
       }
     },
+    "/v1/caller": {
+      "get": {
+        "tags": ["auth"],
+        "operationId": "callerGet",
+        "summary": "Get authenticated origin and direct instance scope",
+        "parameters": [{ "$ref": "#/components/parameters/CallerInstance" }],
+        "responses": {
+          "200": {
+            "description": "Server-derived caller identity",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/CallerContext" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/hosts": {
       "get": {
         "tags": ["hosts"],
@@ -272,6 +290,10 @@
       "post": {
         "tags": ["instances"],
         "operationId": "instanceCreate",
+        "parameters": [
+          { "$ref": "#/components/parameters/CallerInstance" },
+          { "$ref": "#/components/parameters/AgentApproval" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -286,6 +308,8 @@
             }
           },
           "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/AgentActionConflict" },
           "422": {
             "description": "PLACEMENT_UNSATISFIABLE when host availability or placement constraints cannot be satisfied; PROVIDER_NOT_CONFIGURED when explicit gateway delegation has no matching provider profile. Unspecified or direct delegation may use native authentication without a provider profile.",
             "content": {
@@ -319,11 +343,35 @@
         }
       }
     },
+    "/v1/instances/{id}/mcp-token": {
+      "post": {
+        "tags": ["instances"],
+        "operationId": "instanceMcpTokenCreate",
+        "summary": "Mint a credential bound to an agent instance",
+        "description": "Requires Human origin. The returned credential always has Agent origin and cannot be rebound to another instance.",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Scoped agent credential",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/InstanceMcpToken" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/instances/{id}/commands": {
       "post": {
         "tags": ["instances"],
         "operationId": "instanceCommand",
-        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "parameters": [
+          { "$ref": "#/components/parameters/IdPath" },
+          { "$ref": "#/components/parameters/CallerInstance" },
+          { "$ref": "#/components/parameters/AgentApproval" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -338,7 +386,9 @@
             }
           },
           "401": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/AgentActionConflict" }
         }
       }
     },
@@ -432,6 +482,10 @@
       "post": {
         "tags": ["fleet"],
         "operationId": "fleetCreate",
+        "parameters": [
+          { "$ref": "#/components/parameters/CallerInstance" },
+          { "$ref": "#/components/parameters/AgentApproval" }
+        ],
         "requestBody": {
           "content": {
             "application/json": { "schema": { "$ref": "#/components/schemas/FleetCreate" } }
@@ -444,6 +498,9 @@
               "application/json": { "schema": { "$ref": "#/components/schemas/FleetCreateResult" } }
             }
           },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/AgentActionConflict" },
           "422": { "$ref": "#/components/responses/Error" }
         }
       }
@@ -452,6 +509,10 @@
       "post": {
         "tags": ["fleet"],
         "operationId": "fleetBroadcast",
+        "parameters": [
+          { "$ref": "#/components/parameters/CallerInstance" },
+          { "$ref": "#/components/parameters/AgentApproval" }
+        ],
         "requestBody": {
           "content": {
             "application/json": { "schema": { "$ref": "#/components/schemas/FleetBroadcast" } }
@@ -464,7 +525,10 @@
               "application/json": { "schema": { "$ref": "#/components/schemas/FleetBroadcastResult" } }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/AgentActionConflict" }
         }
       }
     },
@@ -844,6 +908,20 @@
   },
   "components": {
     "parameters": {
+      "CallerInstance": {
+        "name": "x-remuda-instance-id",
+        "in": "header",
+        "required": false,
+        "description": "Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential.",
+        "schema": { "type": "string" }
+      },
+      "AgentApproval": {
+        "name": "x-remuda-approval-id",
+        "in": "header",
+        "required": false,
+        "description": "Retry an action after Human approval with its interaction ID. The grant is single-use and bound to the exact caller and action.",
+        "schema": { "type": "string" }
+      },
       "IdPath": {
         "name": "id",
         "in": "path",
@@ -852,6 +930,19 @@
       }
     },
     "responses": {
+      "AgentActionConflict": {
+        "description": "Human approval required, or an action conflict. For HUMAN_APPROVAL_REQUIRED, a Human must answer the Interaction with allow-once before retrying the exact action with x-remuda-approval-id.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "anyOf": [
+                { "$ref": "#/components/schemas/AgentApprovalRequired" },
+                { "$ref": "#/components/schemas/ErrorBody" }
+              ]
+            }
+          }
+        }
+      },
       "Error": {
         "description": "Hub error",
         "content": {
@@ -898,6 +989,41 @@
           }
         }
       },
+      "CallerContext": {
+        "type": "object",
+        "required": ["origin", "instanceId", "hostId", "children"],
+        "properties": {
+          "origin": {
+            "type": "string",
+            "enum": ["human", "bot", "agent"],
+            "description": "Authenticated origin; clients must treat an unknown origin as Agent."
+          },
+          "instanceId": { "type": ["string", "null"] },
+          "hostId": { "type": ["string", "null"] },
+          "children": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Direct children created by this instance; descendants do not inherit scope."
+          }
+        }
+      },
+      "InstanceMcpToken": {
+        "type": "object",
+        "required": ["token", "origin"],
+        "properties": {
+          "token": { "type": "string", "description": "Bearer credential; keep secret and do not journal it." },
+          "origin": { "type": "string", "const": "agent" }
+        }
+      },
+      "AgentApprovalRequired": {
+        "type": "object",
+        "required": ["error", "code", "interactionId"],
+        "properties": {
+          "error": { "type": "string" },
+          "code": { "type": "string", "const": "HUMAN_APPROVAL_REQUIRED" },
+          "interactionId": { "type": "string" }
+        }
+      },
       "ErrorBody": {
         "type": "object",
         "required": ["error", "code"],
@@ -915,7 +1041,8 @@
         "required": ["bootstrapToken"],
         "properties": {
           "bootstrapToken": { "type": "string" },
-          "deviceName": { "type": "string" }
+          "deviceName": { "type": "string" },
+          "deviceKind": { "type": "string", "enum": ["human", "bot"], "default": "human" }
         }
       },
       "DeviceSession": {
@@ -1161,6 +1288,11 @@
         "properties": {
           "instanceId": { "type": "string" },
           "hostId": { "type": "string" },
+          "parentInstanceId": {
+            "type": ["string", "null"],
+            "readOnly": true,
+            "description": "Immutable creator instance, recorded by the Hub from authenticated identity."
+          },
           "workspaceId": { "type": ["string", "null"] },
           "kind": { "type": "string" },
           "driver": { "type": "string" },
@@ -1351,9 +1483,10 @@
       },
       "FleetBroadcast": {
         "type": "object",
-        "description": "Select running instances and fan one command out. Requires `all` or at least one of `hosts` / `labels` / `kinds`; filters intersect.",
+        "description": "Select running instances and fan one command out. Requires `all` or at least one of `hosts` / `labels` / `kinds`; filters intersect. Agent broadcasts are checked before dispatch; cross-instance sends and all key input require Human approval.",
         "properties": {
-          "all": { "type": "boolean" },
+          "all": { "type": "boolean", "description": "Forbidden from Agent origin, even with filters. Human/Bot callers must also set confirm=true." },
+          "confirm": { "type": "boolean", "default": false, "description": "Explicit confirmation of an all broadcast; does not exempt Agent callers." },
           "hosts": { "type": "array", "items": { "type": "string" } },
           "labels": { "type": "array", "items": { "type": "string" } },
           "kinds": { "type": "array", "items": { "type": "string" } },

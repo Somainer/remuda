@@ -127,6 +127,14 @@ Each kind launches with its yolo preset appended when absent:
 Placement: `--host hst_…` **or** `--labels region=sg` (mutually exclusive);
 neither means "any online host". Check `remuda instance list` for what exists.
 
+## Host Claude login inventory
+
+`remuda doctor` and host `cli[]` report whether Claude is installed and
+whether a native login or API gateway is configured. `auth` is
+`gateway-native`, `logged_in`, `logged_out`, or `unknown`. Token and URL
+values are never reported. This is informational and does not change
+create defaults.
+
 ## keys
 
 ```bash

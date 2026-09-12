@@ -5,6 +5,8 @@ import {
   YOLO_HINT,
   PTY_YOLO_FLAGS,
   ptyYoloHint,
+  claudeHostAuth,
+  claudeProviderHint,
   normalizeDelegation,
   normalizePermissionMode,
   providerProfileForDelegation,
@@ -31,6 +33,17 @@ describe("sessionOptions", () => {
     );
     expect(DELEGATION_OPTIONS.map((o) => o.id)).toEqual(["none", "gateway"]);
     expect(DELEGATION_OPTIONS.some((o) => /astergate/i.test(o.label))).toBe(false);
+  });
+
+  it("hints when the host has no Claude login or native gateway", () => {
+    expect(claudeHostAuth([{ kind: "claude", auth: "gateway-native" }])).toBe("gateway-native");
+    expect(claudeHostAuth([{ kind: "claude", auth: "logged_in" }])).toBe("logged_in");
+    expect(claudeHostAuth([{ kind: "claude", auth: "logged_out" }])).toBe("none");
+    expect(claudeProviderHint("claude", [{ kind: "claude", auth: "logged_out" }])).toBe(
+      "此主机未配置 Claude 登录/网关，请选择 Provider",
+    );
+    expect(claudeProviderHint("claude", [{ kind: "claude", auth: "logged_in" }])).toBeNull();
+    expect(claudeProviderHint("codex", [{ kind: "claude", auth: "logged_out" }])).toBeNull();
   });
 
   it("exposes generic-pty yolo preset flags as a hint", () => {

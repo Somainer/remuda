@@ -19,8 +19,11 @@ support. Both the outbound WebSocket and SSH stdio carriers support the RPC.
 
 The report reuses the Node inventory collector for Claude, Codex, Grok, Agy,
 Gemini, and Herdr versions and paths. Agent login states are the same local
-credential-marker heuristics used by Node inventory (`logged_in`, `logged_out`,
-or `unknown`). They do not validate credentials with providers or start models.
+credential-marker heuristics used by Node inventory (`gateway-native`,
+`logged_in`, `logged_out`, or `unknown`). They do not validate credentials with
+providers or start models. Claude `gateway-native` means
+`~/.claude/settings.json` has gateway env keys or `apiKeyHelper` (booleans
+only; values are never reported). `doctor` also emits `gateway.claude`.
 Herdr has no provider login. Cargo and pnpm are also checked on PATH.
 
 Other checks cover the configured data directory, `enrollment.json`,

@@ -99,12 +99,21 @@ function mapLifecycle(raw: string): Instance["lifecycle"] {
 }
 
 function mapHostCli(raw: { kind?: unknown; version?: unknown; path?: unknown; auth?: unknown }): HostCli {
-  const auth = raw.auth === "logged_in" || raw.auth === "logged_out" || raw.auth === "unknown" ? raw.auth : "unknown";
+  const auth =
+    raw.auth === "logged_in" ||
+    raw.auth === "logged_out" ||
+    raw.auth === "unknown" ||
+    raw.auth === "gateway-native" ||
+    raw.auth === "none"
+      ? raw.auth
+      : "unknown";
+  const nativeGateway = "nativeGateway" in raw && raw.nativeGateway === true;
   return {
     kind: typeof raw.kind === "string" ? raw.kind : "unknown",
     version: typeof raw.version === "string" ? raw.version : undefined,
     path: typeof raw.path === "string" ? raw.path : undefined,
     auth,
+    nativeGateway: nativeGateway || auth === "gateway-native" ? true : undefined,
   };
 }
 

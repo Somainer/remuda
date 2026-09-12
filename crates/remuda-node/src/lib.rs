@@ -51,7 +51,8 @@ pub use identity::load_or_create_host_id;
 pub use interactions::{InteractionRuntime, PendingInteraction};
 pub use inventory::{
     CLI_KINDS, CliAuth, CliEntry, CollectRequest, Collector, DEFAULT_TTL, HerdrReport,
-    HostSnapshot, ProbeEnv, ResourceReport, collect, collect_fresh,
+    HostSnapshot, ProbeEnv, ResourceReport, claude_native_gateway_configured, collect,
+    collect_fresh,
 };
 pub use model::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, InstanceCommandRequest,

@@ -11,6 +11,8 @@ function mapCli(cli: Host["cli"]): HostCli[] {
     version: entry.version,
     path: entry.path,
     auth: (entry.auth ?? "unknown") as HostCliAuth,
+    nativeGateway: entry.nativeGateway,
+    installed: entry.installed,
   }));
 }
 

@@ -4,13 +4,15 @@ import type { Id } from "../../types/wire";
 /** Proposal §4.6 carriers. ssh-dev / ssh-tunnel map onto ssh-stdio. */
 export type Carrier = "ssh-stdio" | "outbound-wss" | "local";
 
-export type HostCliAuth = "logged_in" | "logged_out" | "unknown";
+export type HostCliAuth = "logged_in" | "logged_out" | "unknown" | "gateway-native" | "none";
 
 export type HostCli = {
   kind: string;
   version?: string;
   path?: string;
   auth?: HostCliAuth;
+  nativeGateway?: boolean;
+  installed?: boolean;
 };
 
 /** Offline hosts older than this are hidden unless the operator shows stale. */

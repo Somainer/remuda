@@ -1013,8 +1013,10 @@
           "path": { "type": ["string", "null"] },
           "auth": {
             "type": "string",
-            "enum": ["logged_in", "logged_out", "unknown"]
-          }
+            "enum": ["logged_in", "logged_out", "unknown", "gateway-native", "none"]
+          },
+          "installed": { "type": "boolean" },
+          "nativeGateway": { "type": "boolean" }
         }
       },
       "HostView": {

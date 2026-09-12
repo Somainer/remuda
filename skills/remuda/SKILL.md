@@ -45,7 +45,7 @@ Create responses include `instanceId` (`ins_…`). Later commands accept that id
 Write a task brief file (not a one-line prompt) when the work is more than a sentence. The brief must tell the worker:
 
 - work only in its worktree
-- `export CARGO_TARGET_DIR` to the shared checkout `target/` directory when building this repo (see `docs/research/tasks/_impl-rules.md`)
+- `export CARGO_TARGET_DIR=$PWD/target` when building this repo (shared checkout `target/`; see `docs/research/tasks/_impl-rules.md`)
 - commit on `wt/<name>/…`
 - finish with `git rebase main`, then `cargo check --workspace --all-targets --locked` and relevant tests
 - reply with a single line `DONE <sha>`

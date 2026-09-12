@@ -34,8 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Scan staged tree and worktree
-        run: ./scripts/ci/secret-scan.sh
+      - name: Scan secrets and private tokens
+        run: |
+          test -s scripts/ci/private-tokens.sha256
+          ./scripts/ci/secret-scan.sh --self-test
+          ./scripts/ci/secret-scan.sh
 
   cargo-audit:
     name: cargo-audit (optional)

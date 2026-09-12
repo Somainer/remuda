@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Scan git staged + worktree (or given paths) for undeclared secrets.
+# Scan git staged + worktree (or given paths) for undeclared secrets
+# and hashed private-token denylist (scripts/ci/private-tokens.sha256).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

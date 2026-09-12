@@ -13,6 +13,7 @@ members = [
     "crates/remuda-ssh",
     "crates/remuda-hub",
     "crates/remuda-feishu",
+    "crates/remuda-hub-client",
     "crates/remuda-testing",
     "crates/remuda",
 ]
@@ -58,6 +59,7 @@ remuda-push = { path = "crates/remuda-push" }
 remuda-node = { path = "crates/remuda-node" }
 remuda-ssh = { path = "crates/remuda-ssh" }
 remuda-hub = { path = "crates/remuda-hub" }
+remuda-hub-client = { path = "crates/remuda-hub-client" }
 remuda-feishu = { path = "crates/remuda-feishu" }
 remuda-testing = { path = "crates/remuda-testing" }
 

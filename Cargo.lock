@@ -2906,10 +2906,10 @@ dependencies = [
  "futures",
  "openssl",
  "remuda-hub",
+ "remuda-hub-client",
  "remuda-node",
  "remuda-protocol",
  "remuda-ssh",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2987,6 +2987,9 @@ dependencies = [
 name = "remuda-feishu"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "remuda-hub",
+ "remuda-hub-client",
  "remuda-protocol",
  "rusqlite",
  "serde",
@@ -2994,6 +2997,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tracing",
  "uuid",
 ]
@@ -3039,6 +3043,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "remuda-hub-client"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
 ]
 
 [[package]]

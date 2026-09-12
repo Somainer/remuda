@@ -16,8 +16,10 @@ mod cards;
 mod consume;
 mod dispatcher;
 mod error;
+mod hub_api;
 mod inbound;
 mod outbound;
+mod runtime;
 mod tickets;
 
 pub use cards::{
@@ -32,6 +34,7 @@ pub use dispatcher::{
     SendRequest, SessionBinding, SessionStatus, SessionStore,
 };
 pub use error::Error;
+pub use hub_api::HubInstanceApi;
 pub use inbound::{
     CallbackValue, CardAction, ChatType, Deduper, DropReason, ExplicitCommand, GateDecision,
     ImMessage, Inbound, InboundKind, InboundPolicy, Intent, Mention, RawEvent, SessionKey,
@@ -41,6 +44,7 @@ pub use outbound::{
     ExecutionMode, LarkCli, OutboundBody, OutboundReceipt, OutboundTarget, PlannedCommand,
     idempotency_key,
 };
+pub use runtime::{DispatcherRun, run_dispatcher};
 pub use tickets::{
     DEFAULT_INTERACTION_TTL, MAX_INTERACTION_TTL, MIN_INTERACTION_TTL, MappedAnswer, TicketState,
     TicketStore, parse_form_value,

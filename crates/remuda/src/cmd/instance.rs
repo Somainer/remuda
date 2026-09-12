@@ -118,7 +118,7 @@ pub(crate) struct CreateOpts {
 /// Run a `remuda instance` subcommand.
 pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
     block_on(async move {
-        let client = HubClient::connect(&hub)?;
+        let client = hub.connect()?;
         match command {
             InstanceCommand::Create {
                 host,

@@ -1,7 +1,7 @@
 //! Dispatcher runtime: session_key → instanceId, command routing, tickets, throttle.
 //!
-//! This is a channel adapter, not an agent loop. Hub HTTP is plugged in later
-//! via [`InstanceApi`]; this crate does not call `crates/remuda`.
+//! This is a channel adapter, not an agent loop. Hub HTTP is
+//! [`crate::HubInstanceApi`]; this crate does not depend on `crates/remuda`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -124,6 +124,22 @@ impl SessionStore {
         )
         .map_err(store_err)?;
         Ok(())
+    }
+
+    /// All mapped session keys.
+    pub fn list_keys(&self) -> Result<Vec<String>, Error> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT session_key FROM session_map ORDER BY session_key")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(store_err)?;
+        let mut keys = Vec::new();
+        for key in rows {
+            keys.push(key.map_err(store_err)?);
+        }
+        Ok(keys)
     }
 
     /// Lookup one topic.
@@ -586,6 +602,16 @@ impl<A: InstanceApi> Dispatcher<A> {
         &self.tickets
     }
 
+    /// Pull journal pages for every mapped session (tool-boundary cards).
+    pub async fn follow_live(&mut self, now: SystemTime) -> Result<Vec<DispatchReport>, Error> {
+        let keys = self.sessions.list_keys()?;
+        let mut reports = Vec::new();
+        for key in keys {
+            reports.extend(self.pump_follow(&key, now).await?);
+        }
+        Ok(reports)
+    }
+
     /// Drain a consume channel until it closes.
     pub async fn drive_consume(
         &mut self,
@@ -914,7 +940,8 @@ impl<A: InstanceApi> Dispatcher<A> {
         ])
     }
 
-    async fn pump_follow(
+    /// Pull one session's follow page and emit static cards.
+    pub async fn pump_follow(
         &mut self,
         session_key: &str,
         now: SystemTime,

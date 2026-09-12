@@ -11,6 +11,7 @@ description = "Feishu dispatcher adapter: lark-cli consume, inbound normalize, o
 workspace = true
 
 [dependencies]
+remuda-hub-client.workspace = true
 remuda-protocol.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -21,5 +22,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
+remuda-hub.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio-tungstenite.workspace = true

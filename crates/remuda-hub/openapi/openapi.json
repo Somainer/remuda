@@ -1,0 +1,717 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Remuda Hub HTTP",
+    "version": "0.1.0",
+    "description": "Device-authenticated Hub REST and WebSocket upgrade routes. JSON-RPC over `/v1/node` and `/v1/follow` is documented as GET upgrades."
+  },
+  "servers": [{ "url": "/", "description": "Same origin" }],
+  "tags": [
+    { "name": "health" },
+    { "name": "auth" },
+    { "name": "hosts" },
+    { "name": "instances" },
+    { "name": "fleet" },
+    { "name": "devices" },
+    { "name": "push" },
+    { "name": "realtime" }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["health"],
+        "operationId": "healthz",
+        "summary": "Liveness",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok"],
+                  "properties": { "ok": { "type": "boolean" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/login": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "login",
+        "summary": "Bootstrap token → device cookie",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Device session",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/DeviceSession" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/hosts": {
+      "get": {
+        "tags": ["hosts"],
+        "operationId": "hostList",
+        "summary": "List enrolled hosts",
+        "responses": {
+          "200": {
+            "description": "Host page",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/HostPage" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/hosts/{id}": {
+      "get": {
+        "tags": ["hosts"],
+        "operationId": "hostGet",
+        "summary": "Host inventory",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Host",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/HostView" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "tags": ["hosts"],
+        "operationId": "hostPatch",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/HostPatch" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated host",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/HostView" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/instances": {
+      "get": {
+        "tags": ["instances"],
+        "operationId": "instanceList",
+        "parameters": [
+          {
+            "name": "hostId",
+            "in": "query",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Instance page",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/InstancePage" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "tags": ["instances"],
+        "operationId": "instanceCreate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/InstanceCreate" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/InstanceCreateResult" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/instances/{id}/commands": {
+      "post": {
+        "tags": ["instances"],
+        "operationId": "instanceCommand",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/CommandRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Command ledger row",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/CommandResult" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/instances/{id}/journal": {
+      "get": {
+        "tags": ["instances"],
+        "operationId": "instanceJournal",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdPath" },
+          {
+            "name": "afterSeq",
+            "in": "query",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Mirrored journal",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/JournalPage" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/placement/resolve": {
+      "post": {
+        "tags": ["hosts"],
+        "operationId": "placementResolve",
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PlacementResolve" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ranked hosts",
+            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/fleet/instances": {
+      "post": {
+        "tags": ["fleet"],
+        "operationId": "fleetCreate",
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/FleetCreate" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Fleet",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/FleetCreateResult" } }
+            }
+          },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/fleet/{id}": {
+      "get": {
+        "tags": ["fleet"],
+        "operationId": "fleetGet",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Fleet aggregate",
+            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/fleet/{id}/commands": {
+      "post": {
+        "tags": ["fleet"],
+        "operationId": "fleetCommands",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/CommandRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-instance commands",
+            "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          }
+        }
+      }
+    },
+    "/v1/devices": {
+      "get": {
+        "tags": ["devices"],
+        "operationId": "deviceList",
+        "responses": {
+          "200": {
+            "description": "Devices",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/DevicePage" } }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices/{id}": {
+      "delete": {
+        "tags": ["devices"],
+        "operationId": "deviceRevoke",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok"],
+                  "properties": { "ok": { "type": "boolean" } }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/devices/pair-code": {
+      "post": {
+        "tags": ["devices"],
+        "operationId": "devicePairCode",
+        "responses": {
+          "200": {
+            "description": "One-time code",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/PairCode" } }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices/pair": {
+      "post": {
+        "tags": ["devices"],
+        "operationId": "devicePairRedeem",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PairRedeem" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "New device session",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/DeviceSession" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/push/config": {
+      "get": {
+        "tags": ["push"],
+        "operationId": "pushConfig",
+        "responses": {
+          "200": {
+            "description": "VAPID public key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["public_key"],
+                  "properties": { "public_key": { "type": "string" } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/push/subscriptions": {
+      "post": {
+        "tags": ["push"],
+        "operationId": "pushSubscribe",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PushSubscribe" } }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "ok": { "type": "boolean" } }
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["push"],
+        "operationId": "pushUnsubscribe",
+        "parameters": [
+          {
+            "name": "endpoint",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "ok": { "type": "boolean" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/follow": {
+      "get": {
+        "tags": ["realtime"],
+        "operationId": "follow",
+        "summary": "WebSocket snapshot + live journal",
+        "parameters": [
+          {
+            "name": "instanceId",
+            "in": "query",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": { "101": { "description": "Switching Protocols" } }
+      }
+    },
+    "/v1/node": {
+      "get": {
+        "tags": ["realtime"],
+        "operationId": "nodeSocket",
+        "summary": "Node JSON-RPC WebSocket",
+        "responses": { "101": { "description": "Switching Protocols" } }
+      }
+    },
+    "/node/v1/connect": {
+      "get": {
+        "tags": ["realtime"],
+        "operationId": "nodeConnectAlias",
+        "summary": "Alias of /v1/node",
+        "responses": { "101": { "description": "Switching Protocols" } }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "IdPath": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Hub error",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorBody": {
+        "type": "object",
+        "required": ["error", "code"],
+        "properties": {
+          "error": { "type": "string" },
+          "code": { "type": "string" },
+          "reasons": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": ["bootstrapToken"],
+        "properties": {
+          "bootstrapToken": { "type": "string" },
+          "deviceName": { "type": "string" }
+        }
+      },
+      "DeviceSession": {
+        "type": "object",
+        "required": ["deviceId", "token", "name"],
+        "properties": {
+          "deviceId": { "type": "string" },
+          "token": { "type": "string" },
+          "name": { "type": "string" }
+        }
+      },
+      "Device": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" }
+        }
+      },
+      "DevicePage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Device" } }
+        }
+      },
+      "PairCode": {
+        "type": "object",
+        "required": ["code", "expiresAt"],
+        "properties": {
+          "code": { "type": "string" },
+          "expiresAt": { "type": "string" }
+        }
+      },
+      "PairRedeem": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {
+          "code": { "type": "string" },
+          "deviceName": { "type": "string" }
+        }
+      },
+      "HostView": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["hostId", "label", "state", "online"],
+        "properties": {
+          "hostId": { "type": "string" },
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "label": { "type": "string" },
+          "state": { "type": "string" },
+          "online": { "type": "boolean" },
+          "lastSeenAt": { "type": ["string", "null"] },
+          "cli": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "labels": { "type": "array", "items": { "type": "string" } },
+          "herdr": { "type": ["object", "null"], "additionalProperties": true },
+          "resources": { "type": ["object", "null"], "additionalProperties": true },
+          "maxInstances": { "type": "integer" },
+          "instanceCount": { "type": "integer" },
+          "transport": { "type": "string" },
+          "hostname": { "type": ["string", "null"] }
+        }
+      },
+      "HostPage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/HostView" } },
+          "nextCursor": { "type": ["string", "null"] }
+        }
+      },
+      "HostPatch": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "labels": { "type": "array", "items": { "type": "string" } },
+          "maxInstances": { "type": "integer" }
+        }
+      },
+      "InstanceRecord": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "instanceId",
+          "hostId",
+          "kind",
+          "driver",
+          "lifecycle",
+          "activity",
+          "connectivity",
+          "journalId",
+          "durableSeq"
+        ],
+        "properties": {
+          "instanceId": { "type": "string" },
+          "hostId": { "type": "string" },
+          "workspaceId": { "type": ["string", "null"] },
+          "kind": { "type": "string" },
+          "driver": { "type": "string" },
+          "lifecycle": { "type": "string" },
+          "activity": { "type": "string" },
+          "connectivity": { "type": "string" },
+          "title": { "type": ["string", "null"] },
+          "journalId": { "type": "string" },
+          "durableSeq": { "type": "string" },
+          "createdAt": { "type": "string" },
+          "updatedAt": { "type": "string" }
+        }
+      },
+      "InstancePage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/InstanceRecord" } },
+          "nextCursor": { "type": ["string", "null"] }
+        }
+      },
+      "InstanceCreate": {
+        "type": "object",
+        "properties": {
+          "hostId": { "type": "string" },
+          "workspaceId": { "type": "string" },
+          "kind": { "type": "string" },
+          "driver": { "type": "string" },
+          "title": { "type": "string" },
+          "prompt": { "type": "string" },
+          "placement": { "type": "object", "additionalProperties": true },
+          "delegation": { "type": "string" },
+          "model": { "type": "string" },
+          "providerProfileId": { "type": "string" },
+          "permissionMode": { "type": "string" },
+          "name": { "type": "string" }
+        }
+      },
+      "CommandRecord": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["commandId", "hostId", "operation", "state"],
+        "properties": {
+          "commandId": { "type": "string" },
+          "instanceId": { "type": ["string", "null"] },
+          "hostId": { "type": "string" },
+          "operation": { "type": "string" },
+          "state": { "type": "string" },
+          "resolution": { "type": "string" },
+          "forwarded": { "type": "boolean" },
+          "createdAt": { "type": "string" },
+          "updatedAt": { "type": "string" }
+        }
+      },
+      "InstanceCreateResult": {
+        "type": "object",
+        "required": ["instance", "command"],
+        "properties": {
+          "instance": { "$ref": "#/components/schemas/InstanceRecord" },
+          "command": { "$ref": "#/components/schemas/CommandRecord" },
+          "hostId": { "type": "string" }
+        }
+      },
+      "CommandRequest": {
+        "type": "object",
+        "properties": {
+          "commandId": { "type": "string" },
+          "operation": { "type": "string" },
+          "payload": { "type": "object", "additionalProperties": true },
+          "idempotencyKey": { "type": "string" },
+          "prompt": { "type": "string" }
+        }
+      },
+      "CommandResult": {
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+          "command": { "$ref": "#/components/schemas/CommandRecord" },
+          "replayed": { "type": "boolean" }
+        }
+      },
+      "JournalPage": {
+        "type": "object",
+        "required": ["instanceId", "durableSeq", "events"],
+        "properties": {
+          "instanceId": { "type": "string" },
+          "durableSeq": { "type": "string" },
+          "events": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        }
+      },
+      "PlacementResolve": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "hostId": { "type": "string" },
+          "placement": { "type": "object", "additionalProperties": true },
+          "driver": { "type": "string" },
+          "delegation": { "type": "string" }
+        }
+      },
+      "FleetCreate": {
+        "type": "object",
+        "properties": {
+          "spec": { "type": "object", "additionalProperties": true },
+          "hosts": { "type": "array", "items": { "type": "string" } },
+          "labels": { "type": "array", "items": { "type": "string" } },
+          "max": { "type": "integer" },
+          "kind": { "type": "string" },
+          "driver": { "type": "string" },
+          "prompt": { "type": "string" }
+        }
+      },
+      "FleetCreateResult": {
+        "type": "object",
+        "properties": {
+          "fleetId": { "type": "string" },
+          "instanceIds": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "PushSubscribe": {
+        "type": "object",
+        "required": ["endpoint", "keys"],
+        "properties": {
+          "endpoint": { "type": "string" },
+          "keys": {
+            "type": "object",
+            "required": ["p256dh", "auth"],
+            "properties": {
+              "p256dh": { "type": "string" },
+              "auth": { "type": "string" }
+            }
+          },
+          "deviceId": { "type": "string" }
+        }
+      }
+    }
+  }
+}

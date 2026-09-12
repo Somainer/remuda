@@ -1,9 +1,11 @@
-import type { CommandResult, Page } from "../types/command";
+import type { Command, CommandResult, Page } from "../types/command";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
-import type { Id, U64 } from "../types/wire";
+import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import type { Workspace } from "../types/workspace";
+import type { components, paths } from "./api.generated";
+import { printCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
 import {
   mockClose,
@@ -23,6 +25,152 @@ import { digestPlaceholder, id, now } from "./ids";
 import { accessHeaders } from "./accessCode";
 
 export const MOCK = import.meta.env.VITE_MOCK === "1";
+
+/** 200-JSON for a documented Hub REST operation. */
+export type HubJson<Path extends keyof paths, Method extends keyof paths[Path]> = paths[Path][Method] extends {
+  responses: { 200: { content: { "application/json": infer R } } };
+}
+  ? R
+  : never;
+
+/** JSON request body for a documented Hub REST operation. */
+export type HubBody<Path extends keyof paths, Method extends keyof paths[Path]> = paths[Path][Method] extends {
+  requestBody: { content: { "application/json": infer B } };
+}
+  ? B
+  : paths[Path][Method] extends {
+        requestBody?: { content: { "application/json": infer B } };
+      }
+    ? B
+    : never;
+
+const HUB_CAPABILITIES = printCapabilities();
+const KINDS: Instance["kind"][] = ["claude", "codex", "grok", "agy", "generic"];
+const DRIVERS: Instance["driver"][] = [
+  "claude-print",
+  "claude-pty",
+  "claude-bg",
+  "codex-appserver",
+  "grok-acp",
+  "agy-print",
+  "generic-pty",
+];
+const LIFECYCLES: Instance["lifecycle"][] = [
+  "requested",
+  "preparing",
+  "starting",
+  "ready",
+  "closing",
+  "exited",
+  "failed",
+  "unknown",
+  "reconciling",
+];
+const ACTIVITIES = ["idle", "working", "waiting-interaction", "draining"] as const;
+const HOST_STATES: Host["state"][] = ["enrolled", "online", "offline", "reconciling", "retired"];
+
+function mapKind(raw: string): Instance["kind"] {
+  return KINDS.find((k) => k === raw) ?? "generic";
+}
+
+function mapDriver(raw: string): Instance["driver"] {
+  return DRIVERS.find((d) => d === raw) ?? "claude-print";
+}
+
+function mapLifecycle(raw: string): Instance["lifecycle"] {
+  return LIFECYCLES.find((s) => s === raw) ?? "unknown";
+}
+
+function mapHost(h: components["schemas"]["HostView"]): Host {
+  const id = (h.id ?? h.hostId) as Id;
+  const state = HOST_STATES.find((s) => s === h.state) ?? (h.online ? "online" : "offline");
+  const transport = h.transport === "ssh-dev" || h.transport === "ssh-stdio" ? "ssh-dev" : "outbound-wss";
+  return {
+    id,
+    revision: "1",
+    createdAt: h.lastSeenAt ?? "",
+    updatedAt: h.lastSeenAt ?? "",
+    label: h.label || h.name || id,
+    ownerPrincipalId: "" as Id,
+    state,
+    transport: { mode: transport, endpointRef: id },
+    hostname: h.hostname ?? undefined,
+  };
+}
+
+function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
+  const id = rec.instanceId as Id;
+  const hostId = rec.hostId as Id;
+  const kind = mapKind(rec.kind);
+  const activity = ACTIVITIES.find((a) => a === rec.activity);
+  return {
+    id,
+    revision: "1",
+    createdAt: rec.createdAt ?? "",
+    updatedAt: rec.updatedAt ?? "",
+    hostId,
+    workspaceId: (rec.workspaceId ?? hostId) as Id,
+    kind,
+    driver: mapDriver(rec.driver),
+    lifecycle: mapLifecycle(rec.lifecycle),
+    activity: activity ? known(activity) : unknownKnowledge(rec.activity),
+    connectivity:
+      rec.connectivity === "disconnected" || rec.connectivity === "reconciling" ? rec.connectivity : "connected",
+    ownership: "managed",
+    nativeRef: {
+      hostId,
+      nativeStoreId: id,
+      kind,
+      sessionId: unknownKnowledge("hub"),
+      transcript: unknownKnowledge("hub"),
+    },
+    processRef: {
+      processGeneration: "1",
+      processIdentity: unknownKnowledge("hub"),
+      connectionEpoch: hostId,
+    },
+    specRevision: "1",
+    launchId: unknownKnowledge("hub"),
+    capabilities: HUB_CAPABILITIES,
+    ownerFence: "1",
+    activeRunIds: [],
+    parent: null,
+    journalId: rec.journalId as Id,
+    durableSeq: rec.durableSeq as U64,
+    exit: { state: "not-applicable" },
+  };
+}
+
+function mapCommand(row: components["schemas"]["CommandRecord"], instanceId: Id): Command {
+  const commandId = row.commandId as Id;
+  const state: Command["state"] =
+    row.state === "queued" || row.state === "accepted" || row.state === "settled" ? row.state : "accepted";
+  const resolution: Command["resolution"] =
+    row.resolution === "unknown" || row.resolution === "reconciling" ? row.resolution : "clear";
+  return {
+    id: commandId,
+    revision: "1",
+    createdAt: row.createdAt ?? "",
+    updatedAt: row.updatedAt ?? "",
+    commandId,
+    actor: { principalId: "" as Id, type: "system", deviceId: null, instanceId },
+    origin: "ui",
+    operation: row.operation,
+    target: {
+      hostId: row.hostId as Id,
+      instanceId: (row.instanceId ?? instanceId) as Id,
+      runId: null,
+    },
+    payloadDigest: digestPlaceholder(),
+    state,
+    dispatch: row.forwarded ? "transport-written" : "intent-durable",
+    resolution,
+  };
+}
+
+function mapCommandResult(body: HubJson<"/v1/instances/{id}/commands", "post">, instanceId: Id): CommandResult {
+  return { command: mapCommand(body.command, instanceId), relatedCommandIds: [] };
+}
 
 export type HelloResult = {
   protocol: { major: number; minor: number };
@@ -286,6 +434,12 @@ function createLiveApi(): HubApi {
   const titles = new Map<Id, string>();
   const hosts = new Map<Id, Host>();
   const workspaces = new Map<Id, Workspace>();
+  const journals = new Map<Id, Id>();
+
+  function remember(instance: Instance): Instance {
+    journals.set(instance.journalId, instance.id);
+    return instance;
+  }
 
   function send<T>(method: string, params: unknown): Promise<T> {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -332,11 +486,17 @@ function createLiveApi(): HubApi {
   }
 
   async function command(instanceId: Id, body: Record<string, unknown>): Promise<CommandResult> {
+    const req: HubBody<"/v1/instances/{id}/commands", "post"> = {
+      operation: String(body.operation ?? "instance.send"),
+      prompt: typeof body.prompt === "string" ? body.prompt : undefined,
+      payload: body,
+    };
     try {
-      return await rest<CommandResult>(`/v1/instances/${instanceId}/commands`, {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
+      const result = await rest<HubJson<"/v1/instances/{id}/commands", "post">>(
+        `/v1/instances/${instanceId}/commands`,
+        { method: "POST", body: JSON.stringify(req) },
+      );
+      return mapCommandResult(result, instanceId);
     } catch {
       // TODO(M0-11): remuda-node HTTP router may still be landing; JSON-RPC per protocol.md.
       const operation = String(body.operation ?? "instance.send");
@@ -359,41 +519,43 @@ function createLiveApi(): HubApi {
     },
     async instanceList(q) {
       try {
-        return await rest<Page<Instance>>(`/v1/instances${q?.hostId ? `?hostId=${q.hostId}` : ""}`);
+        const page = await rest<HubJson<"/v1/instances", "get">>(
+          `/v1/instances${q?.hostId ? `?hostId=${encodeURIComponent(q.hostId)}` : ""}`,
+        );
+        return { items: page.items.map((row) => remember(mapInstance(row))), nextCursor: page.nextCursor ?? null };
       } catch {
         return send<Page<Instance>>("instance.list", q ?? {});
       }
     },
     async instanceGet(instanceId) {
       try {
-        return await rest<Instance>(`/v1/instances/${instanceId}`);
+        return remember(await rest<Instance>(`/v1/instances/${instanceId}`));
       } catch {
-        return send<Instance>("instance.get", { instanceId });
+        return remember(await send<Instance>("instance.get", { instanceId }));
       }
     },
     async instanceCreate(spec) {
+      const body: HubBody<"/v1/instances", "post"> = {
+        hostId: spec.hostId,
+        workspaceId: spec.workspaceId,
+        kind: spec.kind,
+        driver: spec.driver,
+        model: spec.model,
+        providerProfileId: spec.providerProfileId,
+        permissionMode: spec.permissionMode,
+        delegation: spec.delegation ?? "none",
+        prompt: spec.prompt,
+        name: spec.name,
+        title: spec.name ?? spec.prompt.slice(0, 80),
+      };
       try {
-        const created = await rest<{ command: CommandResult["command"]; instance: Instance }>("/v1/instances", {
+        const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
           method: "POST",
-          body: JSON.stringify({
-            hostId: spec.hostId,
-            workspaceId: spec.workspaceId,
-            kind: spec.kind,
-            driver: spec.driver,
-            model: spec.model,
-            providerProfileId: spec.providerProfileId,
-            permissionMode: spec.permissionMode,
-            delegation: spec.delegation ?? "none",
-            prompt: spec.prompt,
-            settingsOverlayPath: spec.settingsOverlayPath,
-            claudeConfigDir: spec.claudeConfigDir,
-            maxBudgetUsd: spec.maxBudgetUsd,
-            name: spec.name,
-            worktree: spec.worktree,
-          }),
+          body: JSON.stringify(body),
         });
-        titles.set(created.instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
-        return created;
+        const instance = remember(mapInstance(created.instance));
+        titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
+        return { instance, command: mapCommand(created.command, instance.id) };
       } catch {
         // TODO(M0-11): remuda-node HTTP router may still be landing; JSON-RPC per protocol.md.
         return send("instance.create", { spec, initialInput: { type: "prompt", text: spec.prompt } });
@@ -452,9 +614,10 @@ function createLiveApi(): HubApi {
     },
     async hostList() {
       try {
-        const page = await rest<Page<Host>>("/v1/hosts");
-        for (const h of page.items) hosts.set(h.id, h);
-        return page;
+        const page = await rest<HubJson<"/v1/hosts", "get">>("/v1/hosts");
+        const items = page.items.map(mapHost);
+        for (const h of items) hosts.set(h.id, h);
+        return { items, nextCursor: page.nextCursor ?? null };
       } catch {
         const page = await send<Page<Host>>("host.list", {});
         for (const h of page.items) hosts.set(h.id, h);
@@ -462,9 +625,15 @@ function createLiveApi(): HubApi {
       }
     },
     async hostGet(hostId) {
-      const host = await send<Host>("host.get", { hostId });
-      hosts.set(host.id, host);
-      return host;
+      try {
+        const host = mapHost(await rest<HubJson<"/v1/hosts/{id}", "get">>(`/v1/hosts/${hostId}`));
+        hosts.set(host.id, host);
+        return host;
+      } catch {
+        const host = await send<Host>("host.get", { hostId });
+        hosts.set(host.id, host);
+        return host;
+      }
     },
     async workspaceList(hostId) {
       try {
@@ -477,7 +646,26 @@ function createLiveApi(): HubApi {
         return page;
       }
     },
-    eventsRead: (args) => send("events.read", args),
+    eventsRead: async (args) => {
+      const instanceId = journals.get(args.journalId);
+      if (instanceId) {
+        try {
+          const qs = args.afterSeq ? `?afterSeq=${encodeURIComponent(args.afterSeq)}` : "";
+          const page = await rest<HubJson<"/v1/instances/{id}/journal", "get">>(
+            `/v1/instances/${instanceId}/journal${qs}`,
+          );
+          const events = page.events as unknown as Observation[];
+          return {
+            events: events.slice(0, args.limit),
+            durableSeq: page.durableSeq as U64,
+            floorSeq: "1" as U64,
+          };
+        } catch {
+          /* JSON-RPC fallback for node-local journals */
+        }
+      }
+      return send("events.read", args);
+    },
     async eventsSubscribe(journalId, afterSeq, onBatch) {
       await ensureSocket();
       const result = await send<{

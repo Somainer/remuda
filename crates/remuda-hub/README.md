@@ -41,6 +41,8 @@ Feature `embed-web` rust-embeds `web/dist` at compile time when that directory
 exists; otherwise the crate serves a 404 placeholder. `REMUDA_WEB_ROOT` can
 point at a built `web/dist` without rebuilding.
 
+OpenAPI 3.1: `openapi/openapi.json`. Web client: `pnpm --dir web run gen:api`.
+
 ## HTTP surface
 
 | Method | Path | Auth | Notes |

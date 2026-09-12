@@ -8,8 +8,9 @@
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "lint": "oxlint src",
-    "preview": "vite preview"
+    "lint": "oxlint src --ignore-pattern src/lib/api.generated.ts",
+    "preview": "vite preview",
+    "gen:api": "openapi-typescript ../crates/remuda-hub/openapi/openapi.json -o src/lib/api.generated.ts"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
@@ -39,6 +40,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.6",
     "jsdom": "^30.0.1",
+    "openapi-typescript": "7.13.0",
     "oxlint": "^1.81.0",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.70.0",

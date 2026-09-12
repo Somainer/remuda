@@ -243,6 +243,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             kind: AgentKind::Claude,
             driver: DriverKind::ClaudePrint,
             model: "fake".into(),
+            args: Vec::new(),
             provider_profile_id: "dev-fake".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),

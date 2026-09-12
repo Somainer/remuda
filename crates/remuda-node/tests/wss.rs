@@ -239,6 +239,10 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
         "hostId": host_id,
         "kind": "claude",
         "driver": "claude-print",
+        "model": "haiku",
+        "args": ["--max-budget-usd", "0.3"],
+        "providerProfileId": "native-login",
+        "permissionMode": "dontAsk",
         "prompt": "hello-runtime"
     })
     .to_string();
@@ -256,6 +260,11 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
         .as_str()
         .expect("instanceId")
         .to_owned();
+    assert_eq!(created["command"]["payload"]["spec"]["model"], json!("haiku"));
+    assert_eq!(
+        created["command"]["payload"]["spec"]["args"],
+        json!(["--max-budget-usd", "0.3"])
+    );
     let journal_path = format!("/v1/instances/{instance_id}/journal");
     let mut journal_body = String::new();
     let deadline = tokio::time::Instant::now() + TIMEOUT;

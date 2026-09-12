@@ -336,7 +336,7 @@ fn instance_spec(
         model_id,
         permission_mode: PermissionMode::Claude(Box::new(ClaudePermission { mode, interaction })),
         env: BTreeMap::new(),
-        args: Vec::new(),
+        args: launch.request.args.clone(),
         settings_overlay: SettingsOverlay {
             format: SettingsFormat::None,
             object_ref: None,
@@ -384,6 +384,7 @@ mod tests {
                 kind: agent,
                 driver: kind,
                 model: "haiku".to_owned(),
+                args: vec!["--max-budget-usd".to_owned(), "0.3".to_owned()],
                 provider_profile_id: "native".to_owned(),
                 permission_mode: "manual".to_owned(),
                 prompt: String::new(),

@@ -59,10 +59,13 @@ pub struct CreateInstanceRequest {
         deserialize_with = "deserialize_driver_kind"
     )]
     pub driver: DriverKind,
-    /// Requested model label retained only as fake-driver input metadata.
+    /// Requested native model label.
     #[serde(default = "default_model")]
     pub model: String,
-    /// Development provider profile label; no credential is resolved in M0-11.
+    /// Extra allowlisted native CLI arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Provider profile label used to construct the native launch profile.
     #[serde(default = "default_profile")]
     pub provider_profile_id: String,
     /// Development permission label; the fake driver performs no tools.

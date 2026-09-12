@@ -42,6 +42,13 @@ pub struct CreateInstanceBody {
     kind: String,
     #[serde(default = "default_driver")]
     driver: String,
+    model: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(rename = "providerProfileId")]
+    provider_profile_id: Option<String>,
+    #[serde(rename = "permissionMode")]
+    permission_mode: Option<String>,
     title: Option<String>,
     prompt: Option<String>,
     /// Live instance name (stored as title when title is omitted).
@@ -180,6 +187,10 @@ pub async fn create_instance(
     let mut spec = json!({
         "kind": body.kind,
         "driver": body.driver,
+        "model": body.model,
+        "args": body.args,
+        "providerProfileId": body.provider_profile_id,
+        "permissionMode": body.permission_mode,
         "workspaceId": workspace_id,
         "prompt": body.prompt,
         "title": title,

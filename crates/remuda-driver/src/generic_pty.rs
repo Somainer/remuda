@@ -167,6 +167,8 @@ pub struct GenericPtyOptions {
     pub extra_env: BTreeMap<String, String>,
     /// `agent.start` timeout in milliseconds.
     pub agent_start_timeout_ms: u64,
+    /// How long to wait after `agent.start` for idle/working/blocked.
+    pub liveness_timeout_ms: u64,
     /// Optional screen regex; emits a lifecycle event when a line matches.
     pub line_matcher: Option<String>,
 }
@@ -191,6 +193,7 @@ impl GenericPtyOptions {
             broker: Arc::new(EnvFileSecretBroker),
             extra_env: BTreeMap::new(),
             agent_start_timeout_ms: 120_000,
+            liveness_timeout_ms: 60_000,
             line_matcher: Some("^DONE".into()),
         }
     }
@@ -377,6 +380,7 @@ impl GenericPtyDriver {
                 map_herdr(err)
             })?;
         refuse_bare(&started.argv)?;
+        let _ = started;
         dismiss_startup_prompt(&client, &agent_name).await;
 
         let stream = client
@@ -399,29 +403,39 @@ impl GenericPtyDriver {
             recipe.binary.version.clone(),
         );
         let failed = Arc::new(AtomicBool::new(false));
-        if let Some(reason) =
-            confirm_agent_alive(&client, &agent_name, &pane_id, preset.binary, &recipe.argv).await
-        {
-            failed.store(true, Ordering::SeqCst);
-            emit_startup_failure(
-                &tx,
-                &self.seq,
-                &ctx,
-                &agent_name,
-                &pane_id,
-                preset.id,
-                &reason,
-            )
-            .await?;
-            let mut ack = DriverAck::transport_written();
-            ack.native_ids.insert("paneId".into(), pane_id);
-            ack.native_ids.insert("agentName".into(), agent_name);
-            ack.native_ids
-                .insert("herdrKind".into(), preset.herdr_kind.into());
-            ack.native_ids.insert("lastError".into(), reason);
-            info!(kind = preset.id, "generic-pty agent.start failed liveness");
-            return Ok(RunHandle::new(recipe, ack, rx));
-        }
+        let settled = wait_agent_settled(
+            &client,
+            &agent_name,
+            &pane_id,
+            preset.binary,
+            &recipe.argv,
+            self.options.liveness_timeout_ms,
+        )
+        .await;
+        let session_status = match settled {
+            Ok(status) => format!("{status:?}").to_ascii_lowercase(),
+            Err(reason) => {
+                failed.store(true, Ordering::SeqCst);
+                emit_startup_failure(
+                    &tx,
+                    &self.seq,
+                    &ctx,
+                    &agent_name,
+                    &pane_id,
+                    preset.id,
+                    &reason,
+                )
+                .await?;
+                let mut ack = DriverAck::transport_written();
+                ack.native_ids.insert("paneId".into(), pane_id);
+                ack.native_ids.insert("agentName".into(), agent_name);
+                ack.native_ids
+                    .insert("herdrKind".into(), preset.herdr_kind.into());
+                ack.native_ids.insert("lastError".into(), reason);
+                info!(kind = preset.id, "generic-pty agent.start failed liveness");
+                return Ok(RunHandle::new(recipe, ack, rx));
+            }
+        };
         emit_on(
             &tx,
             &self.seq,
@@ -436,7 +450,7 @@ impl GenericPtyDriver {
                         value: agent_name.clone(),
                     },
                     status: Knowledge::Known {
-                        value: format!("{:?}", started.agent.agent_status).to_ascii_lowercase(),
+                        value: session_status,
                     },
                     related_ids: BTreeMap::from([
                         ("paneId".into(), pane_id.clone()),
@@ -893,61 +907,60 @@ fn failure_lifecycle(
     ))))
 }
 
-async fn confirm_agent_alive(
+enum Liveness {
+    Settled(AgentStatus),
+    Crash(String),
+    Pending {
+        gone: Option<String>,
+        shell: Option<String>,
+    },
+}
+
+async fn wait_agent_settled(
     client: &Client,
     agent_name: &str,
     pane_id: &str,
     binary: &str,
     argv: &[String],
-) -> Option<String> {
-    let mut last_reason = None;
-    for attempt in 0..10 {
-        match probe_startup_failure(client, agent_name, pane_id, binary, argv).await {
-            None => return None,
-            Some(reason) => {
-                last_reason = Some(reason);
-                if attempt + 1 < 10 {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
+    timeout_ms: u64,
+) -> Result<AgentStatus, String> {
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_gone = None;
+    let mut last_shell = None;
+    loop {
+        match probe_liveness(client, agent_name, pane_id, binary, argv).await {
+            Liveness::Settled(status) => return Ok(status),
+            Liveness::Crash(reason) => return Err(reason),
+            Liveness::Pending { gone, shell } => {
+                if gone.is_some() {
+                    last_gone = gone;
+                }
+                if shell.is_some() {
+                    last_shell = shell;
                 }
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last_gone.or(last_shell).unwrap_or_else(|| {
+                format!(
+                    "agent {agent_name} did not become idle/working/blocked within {}ms",
+                    timeout.as_millis()
+                )
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    last_reason
 }
 
-async fn probe_startup_failure(
+async fn probe_liveness(
     client: &Client,
     agent_name: &str,
     pane_id: &str,
     binary: &str,
     argv: &[String],
-) -> Option<String> {
-    match client.agent_get(agent_name).await {
-        Ok(info) => {
-            if !info.agent.interactive_ready && info.agent.launch_pending {
-                return Some(format!(
-                    "herdr reports agent {agent_name} is not ready (launch still pending)"
-                ));
-            }
-        }
-        Err(remuda_herdr::Error::Api { code, message, .. })
-            if code == "agent_not_ready" || message.contains("unknown agent") =>
-        {
-            return Some(format!("agent gone / {code}: {message}"));
-        }
-        Err(_) => {}
-    }
-
-    if let Ok(info) = client.pane_process_info(Some(pane_id.to_string())).await
-        && let Some(process) = info.process_info
-        && process_is_shell_only(&process, binary, argv)
-    {
-        return Some(format!(
-            "agent process exited during startup; pane {pane_id} returned to a shell"
-        ));
-    }
-
-    match client
+) -> Liveness {
+    let screen = match client
         .agent_read(AgentReadParams {
             target: agent_name.to_string(),
             source: ReadSource::RecentUnwrapped,
@@ -957,23 +970,54 @@ async fn probe_startup_failure(
         })
         .await
     {
-        Ok(read) => {
-            let text = read.text();
-            if looks_like_cli_crash(text) {
-                return Some(cli_crash_reason(text));
-            }
-            if looks_like_shell_prompt(text) {
-                return Some(format!(
-                    "pane {pane_id} returned to a shell prompt after agent.start"
-                ));
-            }
-        }
-        Err(remuda_herdr::Error::Api { code, message, .. }) if code == "agent_not_ready" => {
-            return Some(format!("agent_not_ready: {message}"));
-        }
-        Err(_) => {}
+        Ok(read) => Some(read.text().to_string()),
+        Err(_) => client
+            .pane_read(PaneReadParams {
+                pane_id: pane_id.to_owned(),
+                source: ReadSource::RecentUnwrapped,
+                lines: Some(40),
+                format: ReadFormat::Text,
+                strip_ansi: true,
+            })
+            .await
+            .ok()
+            .map(|read| read.text().to_string()),
+    };
+    if let Some(text) = screen.as_deref()
+        && looks_like_cli_crash(text)
+    {
+        return Liveness::Crash(cli_crash_reason(text));
     }
-    None
+
+    let shell_only = client
+        .pane_process_info(Some(pane_id.to_string()))
+        .await
+        .ok()
+        .and_then(|info| info.process_info)
+        .is_some_and(|process| process_is_shell_only(&process, binary, argv));
+    let at_shell = screen.as_deref().is_some_and(looks_like_shell_prompt);
+    let shell = (shell_only && at_shell).then(|| {
+        format!("agent process exited during startup; pane {pane_id} returned to a shell prompt")
+    });
+
+    match client.agent_get(agent_name).await {
+        Ok(info) => match info.agent.agent_status {
+            AgentStatus::Idle | AgentStatus::Working | AgentStatus::Blocked => {
+                Liveness::Settled(info.agent.agent_status)
+            }
+            AgentStatus::Done => Liveness::Settled(AgentStatus::Idle),
+            AgentStatus::Unknown => Liveness::Pending { gone: None, shell },
+        },
+        Err(remuda_herdr::Error::Api { code, message, .. })
+            if code == "agent_not_ready" || message.contains("unknown agent") =>
+        {
+            Liveness::Pending {
+                gone: Some(format!("agent gone / {code}: {message}")),
+                shell,
+            }
+        }
+        Err(_) => Liveness::Pending { gone: None, shell },
+    }
 }
 
 fn process_is_shell_only(

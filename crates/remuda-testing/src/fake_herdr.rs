@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use remuda_herdr::{
     AgentInfo, AgentInfoResult, AgentList, AgentSessionInfo, AgentSessionRefKind, AgentStartParams,
@@ -51,15 +51,18 @@ pub enum FakeHerdrScript {
     Trust,
     /// `agent.start` RPC succeeds, then the process is gone / pane is a shell (startup crash).
     StartFail,
+    /// `agent.start` succeeds with launch still pending; becomes idle after a short delay.
+    SlowStart,
 }
 
 impl FakeHerdrScript {
-    /// Parse `ok` / `trust` / `start-fail`.
+    /// Parse `ok` / `trust` / `start-fail` / `slow-start`.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim() {
             "ok" | "OK" => Some(Self::Ok),
             "trust" | "trust-dialog" | "blocked" => Some(Self::Trust),
             "start-fail" | "start_fail" | "crash" | "die" => Some(Self::StartFail),
+            "slow-start" | "slow_start" | "slow" => Some(Self::SlowStart),
             _ => None,
         }
     }
@@ -303,7 +306,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
 fn print_help() {
     eprintln!(
         "fake-herdr — Herdr JSON-RPC test double\n\n\
-         Usage:\n  fake-herdr [--socket PATH] [--script ok|trust|start-fail] [--frames PATH]\n  \
+         Usage:\n  fake-herdr [--socket PATH] [--script ok|trust|start-fail|slow-start] [--frames PATH]\n  \
          fake-herdr terminal [session] observe <pane> [--cols N] [--rows N] [--frames PATH]\n"
     );
 }
@@ -382,6 +385,7 @@ struct State {
     subscribers: Vec<mpsc::UnboundedSender<Value>>,
     dead_agents: HashSet<String>,
     shell_panes: HashSet<String>,
+    slow_until: HashMap<String, Instant>,
 }
 
 impl State {
@@ -399,6 +403,7 @@ impl State {
             subscribers: Vec::new(),
             dead_agents: HashSet::new(),
             shell_panes: HashSet::new(),
+            slow_until: HashMap::new(),
         }
     }
 
@@ -532,12 +537,12 @@ fn handle_rpc(
         "pane.read" => pane_read(&st, &req.params),
         "pane.send_text" => pane_send_text(&mut st, &req.params),
         "pane.send_keys" => pane_send_keys(&mut st, &req.params),
-        "pane.process_info" => pane_process_info(&st, &req.params),
+        "pane.process_info" => pane_process_info(&mut st, &req.params),
         "agent.start" => agent_start(&mut st, &req.params),
         "agent.prompt" => agent_prompt(&mut st, &req.params),
         "agent.wait" => agent_wait_immediate(&mut st, &req.params),
-        "agent.read" => agent_read(&st, &req.params),
-        "agent.get" => agent_get(&st, &req.params),
+        "agent.read" => agent_read(&mut st, &req.params),
+        "agent.get" => agent_get(&mut st, &req.params),
         "agent.list" => serde_json::to_value(AgentList {
             kind: "agent_list".into(),
             agents: st.agents.values().cloned().collect(),
@@ -809,7 +814,8 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
     ok()
 }
 
-fn pane_process_info(st: &State, params: &Value) -> Result<Value, (&'static str, String)> {
+fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
+    promote_slow_agents(st);
     let pane_id = params
         .get("pane_id")
         .and_then(Value::as_str)
@@ -822,6 +828,13 @@ fn pane_process_info(st: &State, params: &Value) -> Result<Value, (&'static str,
             name: "zsh".into(),
             argv0: Some("zsh".into()),
             argv: Some(vec!["zsh".into()]),
+        }]
+    } else if pane_is_slow_starting(st, &pane_id) {
+        vec![PaneProcessInfoProcess {
+            pid: 4243,
+            name: "grok".into(),
+            argv0: Some("grok".into()),
+            argv: Some(vec!["grok".into()]),
         }]
     } else {
         vec![PaneProcessInfoProcess {
@@ -849,8 +862,11 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
         return Err(("invalid_request", format!("unknown pane {}", start.pane_id)));
     }
     let blocked = st.script == FakeHerdrScript::Trust;
+    let slow = st.script == FakeHerdrScript::SlowStart;
     let status = if blocked {
         AgentStatus::Blocked
+    } else if slow {
+        AgentStatus::Unknown
     } else {
         AgentStatus::Idle
     };
@@ -881,8 +897,8 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
         } else {
             Some(session_ref(&start.kind))
         },
-        interactive_ready: !blocked,
-        launch_pending: blocked,
+        interactive_ready: !blocked && !slow,
+        launch_pending: blocked || slow,
         cwd: st.panes.get(&start.pane_id).and_then(|p| p.cwd.clone()),
         terminal_title: Some("Claude Code".into()),
         terminal_title_stripped: Some("Claude Code".into()),
@@ -909,6 +925,9 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
     if st.script == FakeHerdrScript::StartFail {
         mark_agent_crashed(st, &start.name, &start.pane_id, &start.args);
     }
+    if st.script == FakeHerdrScript::SlowStart {
+        mark_agent_slow(st, &start.name);
+    }
     let mut argv = vec![start.kind.clone()];
     argv.extend(start.args);
     serde_json::to_value(AgentStarted {
@@ -917,6 +936,42 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
         argv,
     })
     .map_err(json_err)
+}
+
+fn mark_agent_slow(st: &mut State, name: &str) {
+    st.slow_until.insert(
+        name.to_string(),
+        Instant::now() + Duration::from_millis(750),
+    );
+}
+
+fn pane_is_slow_starting(st: &State, pane_id: &str) -> bool {
+    let now = Instant::now();
+    st.agents.values().any(|agent| {
+        agent.pane_id == pane_id
+            && agent
+                .name
+                .as_ref()
+                .is_some_and(|name| st.slow_until.get(name).is_some_and(|until| now < *until))
+    })
+}
+
+fn promote_slow_agents(st: &mut State) {
+    let now = Instant::now();
+    let ready: Vec<String> = st
+        .slow_until
+        .iter()
+        .filter(|(_, until)| now >= **until)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in ready {
+        st.slow_until.remove(&name);
+        set_status(st, &name, AgentStatus::Idle, &idle_screen(""));
+        if let Some(agent) = st.agents.get_mut(&name) {
+            agent.interactive_ready = true;
+            agent.launch_pending = false;
+        }
+    }
 }
 
 fn mark_agent_crashed(st: &mut State, name: &str, pane_id: &str, args: &[String]) {
@@ -993,6 +1048,7 @@ fn agent_prompt(st: &mut State, params: &Value) -> Result<Value, (&'static str, 
 }
 
 fn agent_wait_immediate(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
+    promote_slow_agents(st);
     let wait: AgentWaitParams = serde_json::from_value(params.clone())
         .map_err(|err| ("invalid_request", err.to_string()))?;
     let name = resolve_agent(st, &wait.target)?;
@@ -1024,7 +1080,8 @@ fn agent_wait_immediate(st: &mut State, params: &Value) -> Result<Value, (&'stat
     ))
 }
 
-fn agent_read(st: &State, params: &Value) -> Result<Value, (&'static str, String)> {
+fn agent_read(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
+    promote_slow_agents(st);
     let target = params
         .get("target")
         .and_then(Value::as_str)
@@ -1034,7 +1091,8 @@ fn agent_read(st: &State, params: &Value) -> Result<Value, (&'static str, String
     read_pane(st, &pane_id, source_of(params))
 }
 
-fn agent_get(st: &State, params: &Value) -> Result<Value, (&'static str, String)> {
+fn agent_get(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
+    promote_slow_agents(st);
     let target = params
         .get("target")
         .and_then(Value::as_str)

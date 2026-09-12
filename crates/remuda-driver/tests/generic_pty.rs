@@ -6,7 +6,7 @@ use remuda_driver::{
     preset_by_id,
 };
 use remuda_protocol::{
-    AgentKind, ContentBlock, DriverInput, InputOrigin, InstanceSpec, LifecyclePayload,
+    AgentKind, ContentBlock, DriverInput, InputOrigin, InstanceSpec, Knowledge, LifecyclePayload,
     ObservationPayload, PromptInput, PromptMode, TextBlock,
 };
 use remuda_testing::{FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin};
@@ -115,6 +115,7 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
         broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
         extra_env: Default::default(),
         agent_start_timeout_ms: 5_000,
+        liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE ".into()),
     });
 
@@ -199,6 +200,7 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
         broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
         extra_env: Default::default(),
         agent_start_timeout_ms: 5_000,
+        liveness_timeout_ms: 5_000,
         line_matcher: None,
     });
 
@@ -239,6 +241,84 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
         }
     }
     assert!(saw_error, "expected lifecycle error/exit observation");
+    let _ = driver.close().await;
+}
+
+#[tokio::test]
+async fn fake_herdr_slow_start_emits_ready_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let mut options = FakeHerdrOptions::new(&socket);
+    options.script = FakeHerdrScript::SlowStart;
+    let _fake = FakeHerdrServer::spawn(options).unwrap();
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let bin = stub_bin(tmp.path(), "grok");
+
+    let driver = GenericPtyDriver::new(GenericPtyOptions {
+        profile: profile(),
+        launch_dir: launch,
+        native_home: home,
+        binary: BinarySource::Pinned(pin_binary(&bin).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
+        extra_env: Default::default(),
+        agent_start_timeout_ms: 5_000,
+        liveness_timeout_ms: 5_000,
+        line_matcher: None,
+    });
+
+    let started_at = tokio::time::Instant::now();
+    let mut handle = driver
+        .start(spec(&cwd, AgentKind::Grok))
+        .await
+        .expect("slow start should settle");
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(500),
+        "liveness must wait for a delayed idle, elapsed={:?}",
+        started_at.elapsed()
+    );
+    assert!(
+        !handle.ack().native_ids.contains_key("lastError"),
+        "slow start must not set lastError"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_ready = false;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(400), handle.recv()).await
+        else {
+            continue;
+        };
+        if let ObservationPayload::Lifecycle(payload) = &obs.body
+            && let LifecyclePayload::Native(native) = payload.as_ref()
+            && native.native_name == "session"
+            && native.severity == remuda_protocol::Severity::Info
+        {
+            let Knowledge::Known { value: status } = &native.status else {
+                panic!("expected known session status, got {:?}", native.status);
+            };
+            assert!(
+                status.contains("idle"),
+                "expected idle session status, got {status}"
+            );
+            saw_ready = true;
+            break;
+        }
+    }
+    assert!(
+        saw_ready,
+        "expected session ready lifecycle after slow start"
+    );
     let _ = driver.close().await;
 }
 

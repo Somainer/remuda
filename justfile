@@ -33,3 +33,16 @@ linux-gnu:
     rustup target add x86_64-unknown-linux-gnu
     PATH="$HOME/.local/bin:$PATH" cargo zigbuild --locked --release -p remuda --target x86_64-unknown-linux-gnu.2.28
     file target/x86_64-unknown-linux-gnu/release/remuda
+
+# Regenerate Rust-derived JSON Schema and the shared frontend declarations.
+gen-types:
+    cargo run --locked -p remuda-protocol --example gen_types
+
+accept-m0:
+    ./scripts/acceptance/m0.sh --mode stub --herdr-session remuda-test
+
+herdr-test-session *args:
+    ./scripts/acceptance/herdr-isolated.sh {{args}}
+
+secret-scan:
+    ./scripts/ci/secret-scan.sh

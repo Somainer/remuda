@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   push:
@@ -20,3 +20,42 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Format
         run: cargo fmt --all -- --check
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan staged tree and worktree
+        run: ./scripts/ci/secret-scan.sh
+
+  cargo-audit:
+    name: cargo-audit (optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: rustsec audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install
+        run: pnpm --dir web install --frozen-lockfile
+      - name: Lint
+        run: pnpm --dir web lint
+      - name: Test
+        run: pnpm --dir web test
+      - name: Build
+        run: pnpm --dir web build

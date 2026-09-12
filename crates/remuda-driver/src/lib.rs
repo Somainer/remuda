@@ -10,6 +10,7 @@ pub mod claude_print;
 mod driver;
 mod error;
 mod flags;
+pub mod interaction;
 mod materializer;
 mod process;
 mod profile;

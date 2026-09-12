@@ -9,3 +9,6 @@ node_modules/
 
 # raw research notes contain private infra details; kept local until sanitized
 /docs/research/
+
+# local-only denylist for the private-token scanner
+scripts/ci/private-tokens.local

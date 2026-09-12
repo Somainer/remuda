@@ -1,0 +1,43 @@
+import { Navigate, Route, Routes } from "react-router-dom";
+import { AuthGate } from "./AuthGate";
+import { Shell } from "./Shell";
+import { LoginPage } from "../pages/LoginPage";
+import { SessionsPage } from "../pages/SessionsPage";
+import { NewSessionPage } from "../pages/NewSessionPage";
+import { SessionPage } from "../pages/SessionPage";
+import { ApprovalsPage } from "../pages/ApprovalsPage";
+import { HostsPage, HostDetailPage } from "../pages/HostsPage";
+import { ProjectsPage, ProjectDetailPage } from "../pages/ProjectsPage";
+import { ProvidersPage, ProviderDetailPage } from "../pages/ProvidersPage";
+import { BotsPage, BotDetailPage } from "../pages/BotsPage";
+import { PairPage, SettingsPage } from "../pages/SettingsPage";
+
+export function AppRouter() {
+  return (
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/pair" element={<PairPage />} />
+      <Route element={<AuthGate />}>
+        <Route element={<Shell />}>
+          <Route path="/" element={<Navigate to="/sessions" replace />} />
+          <Route path="/sessions" element={<SessionsPage />} />
+          <Route path="/sessions/new" element={<NewSessionPage />} />
+          <Route path="/s/:instanceId" element={<SessionPage />} />
+          <Route path="/s/:instanceId/tty" element={<SessionPage view="tty" />} />
+          <Route path="/s/:instanceId/files" element={<SessionPage view="files" />} />
+          <Route path="/approvals" element={<ApprovalsPage />} />
+          <Route path="/hosts" element={<HostsPage />} />
+          <Route path="/hosts/:hostId" element={<HostDetailPage />} />
+          <Route path="/projects" element={<ProjectsPage />} />
+          <Route path="/projects/:workspaceId" element={<ProjectDetailPage />} />
+          <Route path="/providers" element={<ProvidersPage />} />
+          <Route path="/providers/:profileId" element={<ProviderDetailPage />} />
+          <Route path="/bots" element={<BotsPage />} />
+          <Route path="/bots/:channelId" element={<BotDetailPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+        </Route>
+      </Route>
+      <Route path="*" element={<Navigate to="/sessions" replace />} />
+    </Routes>
+  );
+}

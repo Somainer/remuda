@@ -1,0 +1,164 @@
+.shell {
+  height: var(--workbench-height, 100dvh);
+  display: grid;
+  grid-template-columns: var(--rail) var(--list) minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto;
+  background: var(--ink);
+}
+
+.install {
+  grid-column: 1 / -1;
+}
+
+.rail {
+  grid-row: 2;
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 8px;
+  background: var(--ink-2);
+}
+
+.list {
+  grid-row: 2;
+  border-right: 1px solid var(--line);
+  overflow: auto;
+  min-width: 0;
+}
+
+.main {
+  grid-row: 2;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.bar {
+  display: none;
+}
+
+.icon {
+  width: 40px;
+  height: 40px;
+  border: 0;
+  background: transparent;
+  color: var(--mute);
+  border-radius: var(--radius);
+  display: grid;
+  place-items: center;
+  position: relative;
+}
+
+.iconActive {
+  color: var(--paper);
+  background: color-mix(in srgb, var(--paper) 8%, transparent);
+}
+
+.badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  min-width: 14px;
+  height: 14px;
+  border-radius: 99px;
+  background: var(--dust);
+  color: var(--ink);
+  font-size: 10px;
+  line-height: 14px;
+  text-align: center;
+  padding: 0 3px;
+}
+
+.more {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.toast {
+  position: fixed;
+  bottom: calc(var(--bar) + var(--safe-bottom) + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  z-index: 30;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  min-height: 48px;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
+  .shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr auto;
+  }
+
+  .rail {
+    display: none;
+  }
+
+  .list {
+    display: none;
+  }
+
+  .listMobile {
+    display: block;
+    grid-row: 2;
+    overflow: auto;
+  }
+
+  .main {
+    grid-row: 2;
+  }
+
+  .hideMainOnList.main {
+    display: none;
+  }
+
+  .bar {
+    display: flex;
+    grid-row: 3;
+    border-top: 1px solid var(--line);
+    padding-bottom: var(--safe-bottom);
+    min-height: calc(var(--bar) + var(--safe-bottom));
+    background: var(--ink-2);
+  }
+
+  .bar a,
+  .bar button {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    color: var(--mute);
+    background: transparent;
+    border: 0;
+    font-size: 11px;
+    min-height: 44px;
+    position: relative;
+  }
+
+  .barActive {
+    color: var(--paper) !important;
+  }
+}

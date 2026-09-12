@@ -1,0 +1,87 @@
+:root {
+  --ink: #12161c;
+  --ink-2: #1a212b;
+  --line: #2a3340;
+  --paper: #e7dcc8;
+  --mute: #8b7f6a;
+  --dust: #c9842a;
+  --cold: #6a8b9a;
+  --ok: #7a8f62;
+  --danger: #8f3d2c;
+  --font: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --radius: 4px;
+  --text: 14px;
+  --rail: 48px;
+  --list: 280px;
+  --aside: 300px;
+  --bar: 52px;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --workbench-height: 100dvh;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font);
+  font-size: var(--text);
+  line-height: 1.45;
+  background: var(--ink);
+  color: var(--paper);
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+input,
+textarea,
+select {
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+
+button {
+  cursor: pointer;
+}
+
+a {
+  color: var(--cold);
+  text-decoration: none;
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--mono);
+}
+
+:focus-visible {
+  outline: 1px solid var(--cold);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *:not(.spin):not(.conn-dot) {
+    animation: none !important;
+    transition: none !important;
+  }
+}

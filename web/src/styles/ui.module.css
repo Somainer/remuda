@@ -1,0 +1,363 @@
+.btn {
+  border: 1px solid var(--line);
+  background: var(--ink-2);
+  color: var(--paper);
+  border-radius: var(--radius);
+  min-height: 36px;
+  padding: 0 12px;
+}
+
+.btnPrimary {
+  composes: btn;
+  background: var(--dust);
+  border-color: var(--dust);
+  color: var(--ink);
+}
+
+.btnDanger {
+  composes: btn;
+  border-color: var(--danger);
+  color: var(--paper);
+}
+
+.btnGhost {
+  composes: btn;
+  background: transparent;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
+.dotBlocked {
+  background: var(--dust);
+}
+.dotWorking {
+  background: var(--cold);
+}
+.dotStarting {
+  background: var(--mute);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.dotIdle {
+  background: var(--ok);
+}
+.dotExited {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--mute);
+  border-radius: 0;
+  transform: rotate(45deg);
+}
+.dotUnknown {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--mute);
+  border-style: dashed;
+}
+
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.connLive {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+.connOff {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--mute);
+}
+
+.connDots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.connDot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--cold);
+  animation: blink 0.9s infinite;
+}
+
+.connDot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.connDot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+.md :global(p) {
+  margin: 0 0 0.6em;
+}
+.md :global(p:last-child) {
+  margin-bottom: 0;
+}
+.md :global(pre) {
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px;
+  overflow: auto;
+  font-size: 12px;
+}
+.md :global(code) {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.md :global(a) {
+  color: var(--cold);
+}
+
+.codeHead {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+
+.diff {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.diffUnknown {
+  border-style: dashed;
+}
+
+.diffHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--ink);
+  color: var(--mute);
+}
+
+.diffLine {
+  padding: 0 8px;
+  white-space: pre-wrap;
+}
+
+.diffAdd {
+  background: color-mix(in srgb, var(--ok) 18%, transparent);
+}
+
+.diffDel {
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--ink) 72%, transparent);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 40;
+}
+
+.modalPanel {
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  width: min(520px, calc(100% - 24px));
+  margin-bottom: 24px;
+  padding: 16px;
+}
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 10px 12px;
+}
+
+.cardPartial {
+  border-style: dashed;
+}
+
+.cardHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--mute);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.pill {
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.path {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.pre {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow: auto;
+  max-height: 220px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.input,
+.select,
+.textarea {
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  color: var(--paper);
+  width: 100%;
+}
+
+.textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.listItem {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  width: 100%;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+  border-radius: 0;
+  min-height: 44px;
+}
+
+.listItemActive {
+  background: color-mix(in srgb, var(--cold) 12%, transparent);
+}
+
+.listMeta {
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.groupTitle {
+  padding: 8px 12px 4px;
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.search {
+  margin: 8px 12px;
+}
+
+.chip {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--mute);
+  border-radius: 99px;
+  padding: 4px 10px;
+  min-height: 32px;
+}
+
+.chipOn {
+  border-color: var(--dust);
+  color: var(--paper);
+}
+
+.install {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--ink-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.approval {
+  border: 1px solid var(--dust);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--dust) 10%, var(--ink-2));
+}
+
+.usage {
+  color: var(--mute);
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.thought {
+  color: var(--mute);
+  font-size: 13px;
+}
+
+.you {
+  color: var(--mute);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes blink {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
+}

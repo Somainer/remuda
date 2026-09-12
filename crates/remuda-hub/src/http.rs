@@ -5,9 +5,11 @@ use crate::auth::{device_cookie, hash_secret, require_device, require_origin};
 use crate::error::HubError;
 use crate::store::CommandRecord;
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -67,6 +69,17 @@ fn default_operation() -> String {
     "instance.send".into()
 }
 
+/// REST routes (login, hosts, instances, journal). Placement/fleet merge later.
+pub fn routes() -> Router<crate::AppState> {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/login", post(login))
+        .route("/v1/hosts", get(list_hosts))
+        .route("/v1/instances", get(list_instances).post(create_instance))
+        .route("/v1/instances/{id}/commands", post(post_command))
+        .route("/v1/instances/{id}/journal", get(get_journal))
+}
+
 #[derive(Deserialize)]
 pub struct JournalQuery {
     #[serde(rename = "afterSeq")]
@@ -85,7 +98,7 @@ pub async fn login(
     Json(body): Json<LoginBody>,
 ) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
-    if body.bootstrap_token != state.config.bootstrap_token {
+    if !crate::config::secret_eq(&body.bootstrap_token, &state.config.bootstrap_token) {
         return Err(HubError::Unauthenticated);
     }
     let token = crate::config::random_token();

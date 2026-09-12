@@ -47,7 +47,7 @@ point at a built `web/dist` without rebuilding.
 | --- | --- | --- | --- |
 | GET | `/healthz` | no | `{ok:true}` |
 | POST | `/v1/login` | bootstrap token | Sets `remuda_device` cookie; returns device token |
-| GET | `/v1/hosts` | device | Node registry: `online`, `lastSeenAt`, `cli[]`, `capabilities` |
+| GET | `/v1/hosts` | device | Host registry: `label`, `labels[]`, `online`, `lastSeenAt`, `cli[]`, `herdr`, `resources`, `maxInstances`, `transport` |
 | GET | `/v1/instances` | device | Cross-host index |
 | POST | `/v1/instances` | device | Index + forward `instance.create` if the Node is online |
 | POST | `/v1/instances/:id/commands` | device | Command ledger (`queued`/`accepted`/`settled`); same `commandId` is idempotent and **never resent** |
@@ -64,8 +64,8 @@ request **must** be hello. Wire names follow `protocol.md` §7; the task aliases
 
 | Method | Dir | Purpose |
 | --- | --- | --- |
-| `runtime.hello` / `node.hello` | Node→Hub | Version/identity. First enroll with the bootstrap bearer returns `nodeToken`. Later connects use that host token. |
-| `runtime.heartbeat` / `node.heartbeat` | Node→Hub | `lastSeenAt`; optional `cli` / `capabilities` |
+| `runtime.hello` / `node.hello` | Node→Hub | Identity + inventory (`host.labels`, `cli`, `herdr`, `resources`, `maxInstances`). First enroll returns `nodeToken`. |
+| `runtime.heartbeat` / `node.heartbeat` | Node→Hub | Refresh `lastSeenAt` and the same inventory fields |
 | `host.report` | Node→Hub | Inventory (`driverInventory` or `cli`) |
 | `journal.append` | Node→Hub | Push an observation; Hub assigns `seq` and mirrors it |
 | `tty.frame` | Node→Hub | Fan-out to follow sockets (not a journal seq) |
@@ -76,6 +76,15 @@ request **must** be hello. Wire names follow `protocol.md` §7; the task aliases
 
 Reconnect never reissues a command that already has a forward intent. Timeouts
 leave `state=queued`, `forwarded=true`, `resolution=unknown`.
+
+### Carriers (D-013)
+
+`NodeTransport` is the Hub-side session trait. `WssTransport` serves
+`WS /v1/node` today. `StdioTransport` is the plug for
+`ssh <host> remuda node --stdio` (no Hub listen port). Placement and fleet
+HTTP are **not** in this crate yet: merge `registry::routes()`,
+`placement::routes()`, and `fleet::routes()` next to `http::routes()` /
+`ws::routes()` in `router()`.
 
 ## SQLite (`data-dir/hub.sqlite`)
 

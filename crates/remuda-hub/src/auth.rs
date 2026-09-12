@@ -6,7 +6,9 @@ use crate::store::{Device, Store};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Argon2, Params};
 use axum::http::HeaderMap;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Fast-enough Argon2id for Hub token hashes (8 MiB, 1 pass).
@@ -45,7 +47,17 @@ pub fn persist_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
     let path = data_dir.join("bootstrap-token");
-    std::fs::write(&path, token).map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?;
+    file.write_all(token.as_bytes())
+        .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?;
+    file.sync_all()
+        .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?;
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&path, perms)
         .map_err(|err| HubError::Internal(format!("bootstrap mode: {err}")))?;
@@ -72,7 +84,7 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
 /// `Set-Cookie` value for a device token.
 pub fn device_cookie(token: &str, secure: bool) -> String {
     let mut cookie =
-        format!("{DEVICE_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000");
+        format!("{DEVICE_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -110,6 +122,9 @@ pub fn origin_allowed(headers: &HeaderMap, config: &HubConfig) -> bool {
     else {
         return true;
     };
+    if config.cookie_secure && origin.starts_with("http://") {
+        return false;
+    }
     if config
         .allowed_origins
         .iter()
@@ -151,5 +166,38 @@ pub fn require_origin(headers: &HeaderMap, config: &HubConfig) -> Result<(), Hub
         Ok(())
     } else {
         Err(HubError::Forbidden)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{HubConfig, secret_eq};
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn secret_eq_is_length_sensitive() {
+        assert!(secret_eq("token", "token"));
+        assert!(!secret_eq("token", "tokenX"));
+        assert!(!secret_eq("token", "toke"));
+        assert!(!secret_eq("token", "TOKEN"));
+    }
+
+    #[test]
+    fn secure_cookie_rejects_http_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        );
+        headers.insert(
+            axum::http::header::HOST,
+            HeaderValue::from_static("127.0.0.1:8080"),
+        );
+        let mut config = HubConfig::for_test(std::path::PathBuf::from("/tmp/remuda-hub-origin"));
+        config.cookie_secure = true;
+        assert!(!origin_allowed(&headers, &config));
+        config.cookie_secure = false;
+        assert!(origin_allowed(&headers, &config));
     }
 }

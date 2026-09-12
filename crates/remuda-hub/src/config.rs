@@ -73,6 +73,21 @@ pub fn random_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// Constant-time compare for bootstrap / other plaintext secrets.
+#[must_use]
+pub fn secret_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for i in 0..len {
+        let a = left.get(i).copied().unwrap_or(0);
+        let b = right.get(i).copied().unwrap_or(0);
+        diff |= usize::from(a ^ b);
+    }
+    diff == 0
+}
+
 /// Protocol branded ID as a string.
 pub fn new_id(prefix: &str) -> Result<String, remuda_protocol::WireValueError> {
     remuda_protocol::Id::new(prefix).map(|id| id.to_string())

@@ -13,24 +13,24 @@ mod auth;
 mod config;
 mod error;
 mod http;
+mod inventory;
 mod store;
+mod transport;
 mod web;
 mod ws;
 
 use crate::auth::resolve_bootstrap;
-use crate::http::{
-    create_instance, get_journal, healthz, list_hosts, list_instances, login, post_command,
-};
 use crate::store::Store;
-use crate::ws::{Bus, NodeRegistry, follow_socket, node_socket};
+use crate::ws::Bus;
 use axum::Router;
 use axum::extract::State;
 use axum::http::Uri;
 use axum::response::Response;
-use axum::routing::{get, post};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+
+pub use transport::{ConnectedNodes, NodeTransport, StdioTransport, TransportKind, WssTransport};
 
 pub use config::HubConfig;
 pub use error::HubError;
@@ -41,7 +41,7 @@ pub struct AppState {
     /// Frozen listen/auth config.
     pub config: Arc<HubConfig>,
     store: Store,
-    nodes: NodeRegistry,
+    nodes: ConnectedNodes,
     bus: Bus,
 }
 
@@ -79,7 +79,7 @@ pub async fn spawn(mut config: HubConfig) -> anyhow::Result<RunningHub> {
     let state = AppState {
         config: Arc::new(config.clone()),
         store,
-        nodes: NodeRegistry::default(),
+        nodes: crate::transport::ConnectedNodes::default(),
         bus: Bus::new(),
     };
     let app = router(state);
@@ -105,17 +105,13 @@ pub async fn spawn(mut config: HubConfig) -> anyhow::Result<RunningHub> {
 }
 
 /// Axum router (HTTP + WS + static).
+///
+/// Later D-013 modules merge here:
+/// `registry::routes()`, `placement::routes()`, `fleet::routes()`.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/login", post(login))
-        .route("/v1/hosts", get(list_hosts))
-        .route("/v1/instances", get(list_instances).post(create_instance))
-        .route("/v1/instances/{id}/commands", post(post_command))
-        .route("/v1/instances/{id}/journal", get(get_journal))
-        .route("/v1/follow", get(follow_socket))
-        .route("/v1/node", get(node_socket))
-        .route("/node/v1/connect", get(node_socket))
+        .merge(http::routes())
+        .merge(ws::routes())
         .fallback(static_fallback)
         .with_state(state)
 }

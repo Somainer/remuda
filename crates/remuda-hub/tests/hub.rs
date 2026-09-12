@@ -158,7 +158,20 @@ async fn fake_node_hello_heartbeat_append_then_http_and_follow() -> Result<()> {
             "params": {
                 "hostId": host_id.as_id().as_str(),
                 "nodeVersion": "0.1.0-test",
-                "label": "fake-node"
+                "label": "fake-node",
+                "host": {
+                    "hostname": "fake-node.local",
+                    "labels": { "region": "sg", "role": "canary" },
+                    "maxInstances": 4,
+                    "cli": [{
+                        "kind": "claude",
+                        "version": "2.1.268",
+                        "absolutePath": "/usr/bin/claude",
+                        "authState": "unknown"
+                    }],
+                    "herdr": { "version": "0.9.0", "socket": "/tmp/herdr.sock" },
+                    "resources": { "cpuPct": 8, "memPct": 31 }
+                }
             }
         })
         .to_string()
@@ -180,8 +193,11 @@ async fn fake_node_hello_heartbeat_append_then_http_and_follow() -> Result<()> {
                     "kind": "claude",
                     "version": "2.1.268",
                     "path": "/usr/bin/claude",
-                    "auth": "unknown"
-                }]
+                    "auth": "logged_in"
+                }],
+                "herdr": { "version": "0.9.1", "socket": "/tmp/herdr.sock" },
+                "resources": { "cpuPct": 12, "memPct": 40 },
+                "maxInstances": 8
             }
         })
         .to_string()
@@ -215,7 +231,18 @@ async fn fake_node_hello_heartbeat_append_then_http_and_follow() -> Result<()> {
     assert_eq!(status, 200);
     let hosts: Value = serde_json::from_str(hosts.trim())?;
     assert_eq!(hosts["items"][0]["online"], json!(true));
+    assert_eq!(hosts["items"][0]["label"], json!("fake-node"));
+    assert_eq!(hosts["items"][0]["transport"], json!("outbound-wss"));
     assert_eq!(hosts["items"][0]["cli"][0]["kind"], json!("claude"));
+    assert_eq!(hosts["items"][0]["cli"][0]["auth"], json!("logged_in"));
+    assert_eq!(hosts["items"][0]["herdr"]["version"], json!("0.9.1"));
+    assert_eq!(hosts["items"][0]["resources"]["cpuPct"], json!(12));
+    assert_eq!(hosts["items"][0]["maxInstances"], json!(8));
+    let tags = hosts["items"][0]["labels"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(tags.iter().any(|t| t == "region=sg"));
 
     let journal_path = format!("/v1/instances/{}/journal", instance_id.as_id().as_str());
     let (status, _, journal) =
@@ -365,6 +392,88 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
     assert_eq!(status, 200, "{body}");
     let body: Value = serde_json::from_str(body.trim())?;
     assert_eq!(body["replayed"], json!(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn node_cannot_append_to_another_hosts_journal() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node_a, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_a = HostId::new();
+    let instance = InstanceId::new();
+    node_a
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "a",
+                "method": "runtime.hello",
+                "params": { "hostId": host_a.as_id().as_str() }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let _ = recv_json(&mut node_a).await?;
+    node_a
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "a2",
+                "method": "journal.append",
+                "params": {
+                    "instanceId": instance.as_id().as_str(),
+                    "event": { "kind": "message", "payload": { "text": "owner" } }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let appended = recv_json(&mut node_a).await?;
+    assert_eq!(appended["result"]["seq"], json!("1"));
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node_b, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_b = HostId::new();
+    node_b
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "b",
+                "method": "runtime.hello",
+                "params": { "hostId": host_b.as_id().as_str() }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let _ = recv_json(&mut node_b).await?;
+    node_b
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "b2",
+                "method": "journal.append",
+                "params": {
+                    "instanceId": instance.as_id().as_str(),
+                    "event": { "kind": "message", "payload": { "text": "stolen" } }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let denied = recv_json(&mut node_b).await?;
+    assert_eq!(denied["error"]["code"], json!(-32001));
     Ok(())
 }
 

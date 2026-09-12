@@ -4,7 +4,9 @@ use crate::AppState;
 use crate::auth::{hash_secret, presented_token, require_device, require_origin, verify_secret};
 use crate::config::now_rfc3339;
 use crate::error::{HubError, rpc_error as rpc_err, rpc_ok};
+use crate::inventory;
 use crate::store::{HostAuthOutcome, HostAuthRequest, HostRecord, JournalRecord};
+use crate::transport::{TransportKind, WssTransport};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
@@ -17,7 +19,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 /// Live event for `/v1/follow`.
@@ -61,63 +62,12 @@ impl Default for Bus {
     }
 }
 
-struct NodeLink {
-    outbound: mpsc::Sender<Value>,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
-}
-
-/// Connected Nodes, keyed by host id.
-#[derive(Clone, Default)]
-pub struct NodeRegistry {
-    inner: Arc<Mutex<HashMap<String, NodeLink>>>,
-}
-
-impl NodeRegistry {
-    /// Call a JSON-RPC method on a connected Node. `Ok(None)` = not connected.
-    pub async fn call(
-        &self,
-        host_id: &str,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> Result<Option<Value>, HubError> {
-        let (outbound, pending, rpc_id) = {
-            let guard = self.inner.lock().await;
-            let Some(link) = guard.get(host_id) else {
-                return Ok(None);
-            };
-            let rpc_id = uuid::Uuid::new_v4().to_string();
-            (link.outbound.clone(), link.pending.clone(), rpc_id)
-        };
-        let (tx, rx) = oneshot::channel();
-        pending.lock().await.insert(rpc_id.clone(), tx);
-        let frame = json!({
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "method": method,
-            "params": params,
-        });
-        if outbound.send(frame).await.is_err() {
-            pending.lock().await.remove(&rpc_id);
-            return Ok(None);
-        }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(value)) => Ok(Some(value)),
-            Ok(Err(_)) => Err(HubError::Internal("node rpc dropped".into())),
-            Err(_) => {
-                pending.lock().await.remove(&rpc_id);
-                Err(HubError::Internal("node rpc timeout".into()))
-            }
-        }
-    }
-
-    async fn insert(&self, host_id: String, link: NodeLink) {
-        self.inner.lock().await.insert(host_id, link);
-    }
-
-    async fn remove(&self, host_id: &str) {
-        self.inner.lock().await.remove(host_id);
-    }
+/// WS + follow routes. Placement/fleet merge on later.
+pub fn routes() -> axum::Router<crate::AppState> {
+    axum::Router::new()
+        .route("/v1/follow", axum::routing::get(follow_socket))
+        .route("/v1/node", axum::routing::get(node_socket))
+        .route("/node/v1/connect", axum::routing::get(node_socket))
 }
 
 #[derive(Deserialize)]
@@ -265,29 +215,37 @@ async fn handle_node_method(
             };
             *host_id = Some(host.host_id.clone());
             *hello_done = true;
+            let mut inventory = inventory::from_node_params(&params);
+            if inventory.transport.is_none() {
+                inventory.transport = Some(TransportKind::OutboundWss);
+            }
+            let host = state
+                .store
+                .apply_inventory(
+                    host.host_id.clone(),
+                    inventory,
+                    params.get("capabilities").cloned(),
+                )
+                .await?;
             state
                 .nodes
                 .insert(
                     host.host_id.clone(),
-                    NodeLink {
-                        outbound: out_tx.clone(),
-                        pending: pending.clone(),
-                    },
+                    Arc::new(WssTransport::new(out_tx.clone(), pending.clone())),
                 )
                 .await;
             Ok(Some(hello_result(&host, node_token)?))
         }
         "runtime.heartbeat" | "node.heartbeat" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            let cli = params.get("cli").cloned();
-            let caps = params.get("capabilities").cloned();
-            let version = params
-                .get("nodeVersion")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            let inventory = inventory::from_node_params(&params);
             let host = state
                 .store
-                .heartbeat(host_id.clone(), version, cli, caps)
+                .apply_inventory(
+                    host_id.clone(),
+                    inventory,
+                    params.get("capabilities").cloned(),
+                )
                 .await?;
             let expires = lease_expires();
             let result = HeartbeatResult {
@@ -304,18 +262,17 @@ async fn handle_node_method(
         }
         "host.report" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            let cli = params
-                .get("driverInventory")
-                .cloned()
-                .or_else(|| params.get("cli").cloned());
-            let caps = params.get("capabilities").cloned();
-            let version = params
-                .get("nodeVersion")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            let mut inventory = inventory::from_node_params(&params);
+            if inventory.cli.is_none() {
+                inventory.cli = params.get("driverInventory").cloned();
+            }
             let host = state
                 .store
-                .heartbeat(host_id.clone(), version, cli, caps)
+                .apply_inventory(
+                    host_id.clone(),
+                    inventory,
+                    params.get("capabilities").cloned(),
+                )
                 .await?;
             Ok(Some(json!({
                 "hostRevision": "1",
@@ -341,12 +298,13 @@ async fn handle_node_method(
             state
                 .store
                 .ensure_instance(host_id.clone(), instance_id.clone())
-                .await?;
+                .await
+                .map_err(map_host_store)?;
             let record = state
                 .store
-                .append_journal(instance_id.clone(), seq, event)
+                .append_journal(host_id.clone(), instance_id.clone(), seq, event)
                 .await
-                .map_err(|err| HubError::BadRequest(err.to_string()))?;
+                .map_err(map_host_store)?;
             publish_journal(&state.bus, &record);
             Ok(Some(json!({
                 "seq": record.seq.to_string(),
@@ -355,12 +313,21 @@ async fn handle_node_method(
             })))
         }
         "tty.frame" => {
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             let instance_id = params
                 .get("instanceId")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
             if !instance_id.is_empty() {
+                let instance = state
+                    .store
+                    .get_instance(instance_id.clone())
+                    .await?
+                    .ok_or(HubError::NotFound)?;
+                if instance.host_id != *host_id {
+                    return Err(HubError::Forbidden);
+                }
                 state.bus.publish(FollowEvent {
                     instance_id,
                     seq: 0,
@@ -374,16 +341,26 @@ async fn handle_node_method(
         | "instance.cancel"
         | "instance.respond"
         | "interaction.respond" => {
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             if let Some(command_id) = params
                 .get("commandId")
                 .and_then(Value::as_str)
                 .map(str::to_string)
             {
-                let _ = state.store.mark_settled(command_id).await;
+                let _ = state.store.mark_settled(command_id, host_id.clone()).await;
             }
             Ok(Some(json!({ "ok": true })))
         }
         other => Err(HubError::BadRequest(format!("unknown method {other}"))),
+    }
+}
+
+fn map_host_store(err: crate::store::StoreError) -> HubError {
+    let message = err.to_string();
+    if message.contains("another host") {
+        HubError::Forbidden
+    } else {
+        HubError::BadRequest(message)
     }
 }
 

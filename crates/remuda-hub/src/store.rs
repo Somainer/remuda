@@ -93,8 +93,21 @@ pub struct HostRecord {
     pub capabilities: Value,
     /// Instance count on this host.
     pub instance_count: i64,
-    /// Transport mode.
+    /// Transport mode (`outbound-wss` / `ssh-stdio`).
     pub transport: String,
+    /// Placement tags (`region=sg`).
+    pub labels: Vec<String>,
+    /// Herdr binary/socket when advertised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub herdr: Option<Value>,
+    /// Load snapshot when advertised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Value>,
+    /// Concurrent instance ceiling.
+    pub max_instances: i64,
+    /// Hostname or SSH alias.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Instance index row.
@@ -298,7 +311,7 @@ impl Store {
                     });
                 }
             }
-            if request.presented != request.bootstrap {
+            if !crate::config::secret_eq(&request.presented, &request.bootstrap) {
                 return Ok(HostAuthOutcome::Rejected);
             }
             let host_id = match request.hello_host_id {
@@ -316,8 +329,9 @@ impl Store {
             let label = request.label.unwrap_or_else(|| host_id.clone());
             conn.execute(
                 "INSERT INTO hosts
-                    (id, label, token_hash, state, last_seen_at, node_version, cli_json, capabilities_json, created_at, transport)
-                 VALUES (?1, ?2, ?3, 'online', ?4, ?5, '[]', '{}', ?4, 'outbound-wss')",
+                    (id, label, token_hash, state, last_seen_at, node_version, cli_json, capabilities_json,
+                     created_at, transport, labels_json, herdr_json, resources_json, max_instances, hostname)
+                 VALUES (?1, ?2, ?3, 'online', ?4, ?5, '[]', '{}', ?4, 'outbound-wss', '[]', NULL, NULL, 8, NULL)",
                 params![host_id, label, token_hash, now, request.node_version],
             )?;
             let host = load_host(conn, &host_id)?
@@ -342,37 +356,77 @@ impl Store {
         .await
     }
 
-    /// Heartbeat: lastSeen + optional inventory.
-    pub async fn heartbeat(
+    /// Heartbeat / hello: lastSeen + optional inventory (D-013).
+    pub async fn apply_inventory(
         &self,
         host_id: String,
-        node_version: Option<String>,
-        cli: Option<Value>,
+        update: crate::inventory::HostInventoryUpdate,
         capabilities: Option<Value>,
     ) -> Result<HostRecord, StoreError> {
         self.run(move |conn| {
             let now = now_rfc3339();
-            if let Some(cli) = cli {
+            conn.execute(
+                "UPDATE hosts SET last_seen_at = ?1, state = 'online' WHERE id = ?2",
+                params![now, host_id],
+            )?;
+            if let Some(label) = update.display_label {
                 conn.execute(
-                    "UPDATE hosts SET last_seen_at = ?1, state = 'online', cli_json = ?2 WHERE id = ?3",
-                    params![now, cli.to_string(), host_id],
-                )?;
-            } else {
-                conn.execute(
-                    "UPDATE hosts SET last_seen_at = ?1, state = 'online' WHERE id = ?2",
-                    params![now, host_id],
+                    "UPDATE hosts SET label = ?1 WHERE id = ?2",
+                    params![label, host_id],
                 )?;
             }
-            if let Some(version) = node_version {
+            if let Some(version) = update.node_version {
                 conn.execute(
                     "UPDATE hosts SET node_version = ?1 WHERE id = ?2",
                     params![version, host_id],
+                )?;
+            }
+            if let Some(cli) = update.cli {
+                conn.execute(
+                    "UPDATE hosts SET cli_json = ?1 WHERE id = ?2",
+                    params![cli.to_string(), host_id],
                 )?;
             }
             if let Some(caps) = capabilities {
                 conn.execute(
                     "UPDATE hosts SET capabilities_json = ?1 WHERE id = ?2",
                     params![caps.to_string(), host_id],
+                )?;
+            }
+            if let Some(labels) = update.labels {
+                conn.execute(
+                    "UPDATE hosts SET labels_json = ?1 WHERE id = ?2",
+                    params![labels.to_string(), host_id],
+                )?;
+            }
+            if let Some(herdr) = update.herdr {
+                conn.execute(
+                    "UPDATE hosts SET herdr_json = ?1 WHERE id = ?2",
+                    params![herdr.to_string(), host_id],
+                )?;
+            }
+            if let Some(resources) = update.resources {
+                conn.execute(
+                    "UPDATE hosts SET resources_json = ?1 WHERE id = ?2",
+                    params![resources.to_string(), host_id],
+                )?;
+            }
+            if let Some(max_instances) = update.max_instances {
+                conn.execute(
+                    "UPDATE hosts SET max_instances = ?1 WHERE id = ?2",
+                    params![max_instances, host_id],
+                )?;
+            }
+            if let Some(hostname) = update.hostname {
+                conn.execute(
+                    "UPDATE hosts SET hostname = ?1 WHERE id = ?2",
+                    params![hostname, host_id],
+                )?;
+            }
+            if let Some(transport) = update.transport {
+                conn.execute(
+                    "UPDATE hosts SET transport = ?1 WHERE id = ?2",
+                    params![transport.as_str(), host_id],
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
@@ -452,6 +506,9 @@ impl Store {
     ) -> Result<InstanceRecord, StoreError> {
         self.run(move |conn| {
             if let Some(existing) = load_instance(conn, &instance_id)? {
+                if existing.host_id != host_id {
+                    return Err(StoreError::Id("instance belongs to another host".into()));
+                }
                 return Ok(existing);
             }
             let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
@@ -601,8 +658,18 @@ impl Store {
     }
 
     /// Node-reported completion → `settled`.
-    pub async fn mark_settled(&self, command_id: String) -> Result<CommandRecord, StoreError> {
+    pub async fn mark_settled(
+        &self,
+        command_id: String,
+        host_id: String,
+    ) -> Result<CommandRecord, StoreError> {
         self.run(move |conn| {
+            let Some(row) = load_command(conn, &command_id)? else {
+                return Err(StoreError::Id("unknown command".into()));
+            };
+            if row.host_id != host_id {
+                return Err(StoreError::Id("command belongs to another host".into()));
+            }
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE commands SET state = 'settled', resolution = 'clear', updated_at = ?1 WHERE id = ?2",
@@ -625,6 +692,7 @@ impl Store {
     /// Append a mirrored event. `seq` None assigns durableSeq+1.
     pub async fn append_journal(
         &self,
+        host_id: String,
         instance_id: String,
         seq: Option<i64>,
         mut event: Value,
@@ -632,6 +700,9 @@ impl Store {
         self.run(move |conn| {
             let inst = load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
+            if inst.host_id != host_id {
+                return Err(StoreError::Id("instance belongs to another host".into()));
+            }
             let next = inst
                 .durable_seq
                 .parse::<i64>()
@@ -712,6 +783,11 @@ impl Store {
 
 fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -734,7 +810,12 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             cli_json TEXT NOT NULL DEFAULT '[]',
             capabilities_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
-            transport TEXT NOT NULL DEFAULT 'outbound-wss'
+            transport TEXT NOT NULL DEFAULT 'outbound-wss',
+            labels_json TEXT NOT NULL DEFAULT '[]',
+            herdr_json TEXT,
+            resources_json TEXT,
+            max_instances INTEGER NOT NULL DEFAULT 8,
+            hostname TEXT
         );
         CREATE TABLE IF NOT EXISTS instances (
             id TEXT PRIMARY KEY,
@@ -775,13 +856,41 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         ",
     )?;
+    ensure_column(&conn, "hosts", "labels_json", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(&conn, "hosts", "herdr_json", "TEXT")?;
+    ensure_column(&conn, "hosts", "resources_json", "TEXT")?;
+    ensure_column(
+        &conn,
+        "hosts",
+        "max_instances",
+        "INTEGER NOT NULL DEFAULT 8",
+    )?;
+    ensure_column(&conn, "hosts", "hostname", "TEXT")?;
     Ok(conn)
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    decl: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|col| col == name);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])?;
+    }
+    Ok(())
 }
 
 fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreError> {
     let row = conn
         .query_row(
-            "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport
+            "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
+                    labels_json, herdr_json, resources_json, max_instances, hostname
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -794,11 +903,30 @@ fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreErr
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             },
         )
         .optional()?;
-    let Some((host_id, label, state, last_seen_at, node_version, cli, caps, transport)) = row
+    let Some((
+        host_id,
+        label,
+        state,
+        last_seen_at,
+        node_version,
+        cli,
+        caps,
+        transport,
+        labels_json,
+        herdr_json,
+        resources_json,
+        max_instances,
+        hostname,
+    )) = row
     else {
         return Ok(None);
     };
@@ -807,6 +935,7 @@ fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreErr
         params![host_id],
         |row| row.get(0),
     )?;
+    let labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
     Ok(Some(HostRecord {
         host_id,
         label,
@@ -818,6 +947,11 @@ fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreErr
         capabilities: serde_json::from_str(&caps).unwrap_or(json!({})),
         instance_count,
         transport,
+        labels,
+        herdr: herdr_json.and_then(|raw| serde_json::from_str(&raw).ok()),
+        resources: resources_json.and_then(|raw| serde_json::from_str(&raw).ok()),
+        max_instances,
+        hostname,
     }))
 }
 

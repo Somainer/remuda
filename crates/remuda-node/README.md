@@ -2,6 +2,31 @@
 
 Node process: local instance APIs and Hub control-plane transports.
 
+## Durable store and fsync
+
+`compose` / `serve` open `<data_dir>/node.sqlite` (instances, commands,
+secret-free launch recipes, pending interactions) and
+`<data_dir>/journal.sqlite` plus JSONL/blobs via `remuda-journal`. Host
+identity stays in `enrollment.json` / `node/host-id` (mode `0600`,
+`fsync` on create).
+
+Default durability is [`remuda_journal::FsyncPolicy::Data`]:
+
+| Surface | Policy |
+| --- | --- |
+| `node.sqlite` | WAL + `synchronous=NORMAL` |
+| `journal.sqlite` | WAL + `synchronous=NORMAL` |
+| journal JSONL / blobs | `fdatasync` after each append |
+
+`FsyncPolicy::Never` skips explicit fsync (`synchronous=OFF`).
+`FsyncPolicy::All` uses full `fsync` / `synchronous=FULL`. Restart
+reloads entities from `node.sqlite` and observation watermarks from the
+journal; in-memory workers are not resumed. Unsettled commands on
+`Ready` instances are marked `unknown`.
+
+Use `MemoryStore::open_journaled_with` to override fsync. In-memory
+`MemoryStore::new` remains for unit tests that do not need a data dir.
+
 ## Outbound WSS (`transport::WssLink`)
 
 JSON-RPC 2.0 over Hub `GET /v1/node` (see `crates/remuda-hub` README).

@@ -4,6 +4,7 @@ mod carrier;
 mod config;
 mod driver;
 mod enroll;
+mod entity;
 mod error;
 mod identity;
 mod interactions;

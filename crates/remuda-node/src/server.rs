@@ -1073,7 +1073,9 @@ impl IntoResponse for ApiError {
             NodeError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
             NodeError::InvalidConfig(_) => StatusCode::INTERNAL_SERVER_ERROR,
             NodeError::DriverUnavailable | NodeError::Driver(_) => StatusCode::SERVICE_UNAVAILABLE,
-            NodeError::StorePoisoned | NodeError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            NodeError::StorePoisoned | NodeError::Io(_) | NodeError::Sqlite(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             NodeError::Transport(_)
             | NodeError::HubRpc { .. }
             | NodeError::Disconnected

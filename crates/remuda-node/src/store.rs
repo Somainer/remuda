@@ -1,7 +1,10 @@
 //! Store seam and the M0 in-memory implementation.
 
-use crate::{NodeError, driver::runtime_source};
-use remuda_journal::{Envelope, Journal};
+use crate::{
+    NodeError, driver::runtime_source, entity::EntityDb, interactions::PendingInteraction,
+};
+use remuda_driver::LaunchRecipe;
+use remuda_journal::{Envelope, FsyncPolicy, Journal, JournalOptions};
 use remuda_protocol::{
     Activity, Command, CommandId, CommandState, Completeness, ConversationNode, EventId,
     EventsReadResult, HistoryCoverage, Instance, InstanceId, InstanceLifecycle, InstanceSnapshot,
@@ -92,6 +95,18 @@ pub trait LocalStore: Send + Sync {
         &self,
         journal_id: &remuda_protocol::Id,
     ) -> Result<InstanceId, NodeError>;
+    /// Persist a launch recipe that contains no secrets or prompts.
+    fn put_launch_recipe(
+        &self,
+        instance_id: &InstanceId,
+        recipe: &LaunchRecipe,
+    ) -> Result<(), NodeError>;
+    /// Load a persisted launch recipe.
+    fn launch_recipe(&self, instance_id: &InstanceId) -> Result<Option<LaunchRecipe>, NodeError>;
+    /// Persist a pending Interaction for restart.
+    fn put_pending_interaction(&self, pending: &PendingInteraction) -> Result<(), NodeError>;
+    /// Load pending Interactions.
+    fn pending_interactions(&self) -> Result<Vec<PendingInteraction>, NodeError>;
 }
 
 /// Thread-safe in-memory store used by `remuda dev` and local API tests.
@@ -99,57 +114,101 @@ pub struct MemoryStore {
     state: RwLock<MemoryState>,
     follow_buffer_capacity: usize,
     durable: Option<DurableJournal>,
+    entities: Option<EntityDb>,
 }
 
 #[derive(Clone)]
 struct DurableJournal {
     journal: Journal,
-    writes: std_mpsc::SyncSender<JournalWrite>,
+    jobs: std_mpsc::SyncSender<JournalJob>,
 }
 
-struct JournalWrite {
-    instance_id: InstanceId,
-    envelope: Envelope,
-    reply: std_mpsc::SyncSender<Result<Observation, String>>,
+enum JournalJob {
+    Append {
+        instance_id: InstanceId,
+        envelope: Box<Envelope>,
+        reply: std_mpsc::SyncSender<Result<Observation, String>>,
+    },
+    ReadRange {
+        instance_id: InstanceId,
+        from_seq: u64,
+        to_seq: Option<u64>,
+        reply: std_mpsc::SyncSender<Result<Vec<Observation>, String>>,
+    },
+    DurableSeq {
+        instance_id: InstanceId,
+        reply: std_mpsc::SyncSender<Result<U64, String>>,
+    },
 }
 
 impl DurableJournal {
-    fn open(data_dir: &Path, queue_capacity: usize) -> Result<Self, NodeError> {
-        let journal = Journal::open(data_dir)
+    fn open(data_dir: &Path, queue_capacity: usize, fsync: FsyncPolicy) -> Result<Self, NodeError> {
+        let journal = Journal::open_with(data_dir, JournalOptions { fsync })
             .map_err(|error| NodeError::Driver(format!("journal open failed: {error}")))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| NodeError::Driver(format!("journal runtime failed: {error}")))?;
-        let (writes, receiver) = std_mpsc::sync_channel::<JournalWrite>(queue_capacity.max(1));
+        let (jobs, receiver) = std_mpsc::sync_channel::<JournalJob>(queue_capacity.max(1));
         let writer = journal.clone();
         thread::Builder::new()
             .name("remuda-node-journal".to_owned())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let result = runtime.block_on(async {
-                        let seq = writer
-                            .append(&job.instance_id, job.envelope)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let mut observations = writer
-                            .read_range(&job.instance_id, seq, Some(seq))
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        if observations.len() != 1 {
-                            return Err(format!(
-                                "journal returned {} observations for committed seq {}",
-                                observations.len(),
-                                seq.0
-                            ));
+                    match job {
+                        JournalJob::Append {
+                            instance_id,
+                            envelope,
+                            reply,
+                        } => {
+                            let result = runtime.block_on(async {
+                                let seq = writer
+                                    .append(&instance_id, *envelope)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                let mut observations = writer
+                                    .read_range(&instance_id, seq, Some(seq))
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                if observations.len() != 1 {
+                                    return Err(format!(
+                                        "journal returned {} observations for committed seq {}",
+                                        observations.len(),
+                                        seq.0
+                                    ));
+                                }
+                                Ok(observations.remove(0))
+                            });
+                            let _ = reply.send(result);
                         }
-                        Ok(observations.remove(0))
-                    });
-                    let _ = job.reply.send(result);
+                        JournalJob::ReadRange {
+                            instance_id,
+                            from_seq,
+                            to_seq,
+                            reply,
+                        } => {
+                            let result = runtime.block_on(async {
+                                writer
+                                    .read_range(&instance_id, U64(from_seq), to_seq.map(U64))
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            });
+                            let _ = reply.send(result);
+                        }
+                        JournalJob::DurableSeq { instance_id, reply } => {
+                            let result = runtime.block_on(async {
+                                writer
+                                    .durable_seq(&instance_id)
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            });
+                            let _ = reply.send(result);
+                        }
+                    }
                 }
             })
             .map_err(|error| NodeError::Driver(format!("journal writer failed: {error}")))?;
-        Ok(Self { journal, writes })
+        Ok(Self { journal, jobs })
     }
 
     fn append(
@@ -158,10 +217,10 @@ impl DurableJournal {
         envelope: Envelope,
     ) -> Result<Observation, NodeError> {
         let (reply, result) = std_mpsc::sync_channel(1);
-        self.writes
-            .send(JournalWrite {
+        self.jobs
+            .send(JournalJob::Append {
                 instance_id: instance_id.clone(),
-                envelope,
+                envelope: Box::new(envelope),
                 reply,
             })
             .map_err(|_| NodeError::Driver("journal writer stopped".to_owned()))?;
@@ -169,6 +228,41 @@ impl DurableJournal {
             .recv()
             .map_err(|_| NodeError::Driver("journal writer dropped its result".to_owned()))?
             .map_err(|error| NodeError::Driver(format!("journal append failed: {error}")))
+    }
+
+    fn read_range(
+        &self,
+        instance_id: &InstanceId,
+        from_seq: u64,
+        to_seq: Option<u64>,
+    ) -> Result<Vec<Observation>, NodeError> {
+        let (reply, result) = std_mpsc::sync_channel(1);
+        self.jobs
+            .send(JournalJob::ReadRange {
+                instance_id: instance_id.clone(),
+                from_seq,
+                to_seq,
+                reply,
+            })
+            .map_err(|_| NodeError::Driver("journal writer stopped".to_owned()))?;
+        result
+            .recv()
+            .map_err(|_| NodeError::Driver("journal writer dropped its result".to_owned()))?
+            .map_err(|error| NodeError::Driver(format!("journal read failed: {error}")))
+    }
+
+    fn durable_seq(&self, instance_id: &InstanceId) -> Result<U64, NodeError> {
+        let (reply, result) = std_mpsc::sync_channel(1);
+        self.jobs
+            .send(JournalJob::DurableSeq {
+                instance_id: instance_id.clone(),
+                reply,
+            })
+            .map_err(|_| NodeError::Driver("journal writer stopped".to_owned()))?;
+        result
+            .recv()
+            .map_err(|_| NodeError::Driver("journal writer dropped its result".to_owned()))?
+            .map_err(|error| NodeError::Driver(format!("journal watermark failed: {error}")))
     }
 }
 
@@ -179,22 +273,71 @@ impl MemoryStore {
             state: RwLock::new(MemoryState::default()),
             follow_buffer_capacity: follow_buffer_capacity.max(1),
             durable: None,
+            entities: None,
         }
     }
 
-    /// Create an empty entity store whose observations commit to the durable journal first.
+    /// Open a durable store under `data_dir` (`node.sqlite` + remuda-journal).
+    ///
+    /// Uses [`FsyncPolicy::Data`]: SQLite `synchronous=NORMAL` / WAL for both
+    /// `node.sqlite` and `journal.sqlite`, plus `fdatasync` on journal JSONL
+    /// and blob files.
     pub fn open_journaled(
         data_dir: impl AsRef<Path>,
         follow_buffer_capacity: usize,
     ) -> Result<Self, NodeError> {
-        Ok(Self {
-            state: RwLock::new(MemoryState::default()),
+        Self::open_journaled_with(data_dir, follow_buffer_capacity, FsyncPolicy::Data)
+    }
+
+    /// Open a durable store with an explicit journal fsync policy.
+    pub fn open_journaled_with(
+        data_dir: impl AsRef<Path>,
+        follow_buffer_capacity: usize,
+        fsync: FsyncPolicy,
+    ) -> Result<Self, NodeError> {
+        let data_dir = data_dir.as_ref();
+        let entities = EntityDb::open(data_dir)?;
+        let durable = DurableJournal::open(data_dir, follow_buffer_capacity, fsync)?;
+        let mut state = MemoryState::default();
+        for mut instance in entities.list_instances()? {
+            let seq = durable.durable_seq(&instance.meta.id)?;
+            instance.durable_seq = seq;
+            let instance_id = instance.meta.id.clone();
+            let journal_id = instance.journal_id.clone();
+            let commands = entities.commands_for(&instance_id)?;
+            let command_ids = commands
+                .iter()
+                .map(|command| command.command_id.clone())
+                .collect();
+            for command in commands {
+                state.commands.insert(command.command_id.clone(), command);
+            }
+            let (events_tx, _) = broadcast::channel(follow_buffer_capacity.max(1));
+            state
+                .journal_instances
+                .insert(journal_id, instance_id.clone());
+            state.instances.insert(
+                instance_id,
+                InstanceRecord {
+                    instance,
+                    command_ids,
+                    events: Vec::new(),
+                    events_tx,
+                },
+            );
+        }
+        let store = Self {
+            state: RwLock::new(state),
             follow_buffer_capacity: follow_buffer_capacity.max(1),
-            durable: Some(DurableJournal::open(
-                data_dir.as_ref(),
-                follow_buffer_capacity,
-            )?),
-        })
+            durable: Some(durable),
+            entities: Some(entities),
+        };
+        for instance in store.list_instances()? {
+            if matches!(instance.lifecycle, InstanceLifecycle::Ready) {
+                store.mark_unsettled_unknown(&instance.meta.id)?;
+            }
+        }
+        Ok(store)
     }
 
     /// Return the durable journal handle when this store was opened with persistence.
@@ -220,6 +363,7 @@ impl LocalStore for MemoryStore {
         }
         let instance_id = instance.meta.id.clone();
         let journal_id = instance.journal_id.clone();
+        let persisted = instance.clone();
         let (events_tx, _) = broadcast::channel(self.follow_buffer_capacity);
         state.instances.insert(
             instance_id.clone(),
@@ -231,6 +375,10 @@ impl LocalStore for MemoryStore {
             },
         );
         state.journal_instances.insert(journal_id, instance_id);
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&persisted)?;
+        }
         Ok(())
     }
 
@@ -278,7 +426,12 @@ impl LocalStore for MemoryStore {
         }
         record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
         record.instance.meta.updated_at = now;
-        Ok(record.instance.clone())
+        let instance = record.instance.clone();
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&instance)?;
+        }
+        Ok(instance)
     }
 
     fn insert_command(
@@ -304,7 +457,13 @@ impl LocalStore for MemoryStore {
             .get_mut(instance_id)
             .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
         record.command_ids.push(command.command_id.clone());
-        state.commands.insert(command.command_id.clone(), command);
+        state
+            .commands
+            .insert(command.command_id.clone(), command.clone());
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.put_command(instance_id, &command)?;
+        }
         Ok(true)
     }
 
@@ -329,7 +488,15 @@ impl LocalStore for MemoryStore {
                 command.command_id.as_id()
             )));
         }
-        state.commands.insert(command.command_id.clone(), command);
+        state
+            .commands
+            .insert(command.command_id.clone(), command.clone());
+        drop(state);
+        if let Some(entities) = &self.entities
+            && let Some(instance_id) = command.target.instance_id.as_ref()
+        {
+            entities.put_command(instance_id, &command)?;
+        }
         Ok(())
     }
 
@@ -349,6 +516,9 @@ impl LocalStore for MemoryStore {
                 command.resolution = ResolutionState::Unknown;
                 command.meta.revision.0 = command.meta.revision.0.saturating_add(1);
                 command.meta.updated_at = now.clone();
+                if let Some(entities) = &self.entities {
+                    entities.put_command(instance_id, command)?;
+                }
             }
         }
         Ok(())
@@ -363,7 +533,7 @@ impl LocalStore for MemoryStore {
     ) -> Result<Observation, NodeError> {
         let now = timestamp_now()?;
         let durable = self.durable.clone();
-        let (event, sender) = {
+        let (event, sender, persisted) = {
             let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
             let record = state
                 .instances
@@ -391,11 +561,15 @@ impl LocalStore for MemoryStore {
             };
             record.instance.durable_seq = event.seq;
             record.instance.meta.updated_at = now;
+            let persisted = record.instance.clone();
             let journal_event = JournalEvent::Instance(Box::new(event.clone()));
             record.events.push(journal_event.clone());
-            (event, (record.events_tx.clone(), journal_event))
+            (event, (record.events_tx.clone(), journal_event), persisted)
         };
         let _ = sender.0.send(sender.1);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&persisted)?;
+        }
         Ok(event)
     }
 
@@ -405,7 +579,7 @@ impl LocalStore for MemoryStore {
         mut observation: Observation,
     ) -> Result<Observation, NodeError> {
         let durable = self.durable.clone();
-        let (event, sender) = {
+        let (event, sender, persisted) = {
             let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
             let record = state
                 .instances
@@ -442,11 +616,15 @@ impl LocalStore for MemoryStore {
             };
             record.instance.durable_seq = event.seq;
             record.instance.meta.updated_at = event.observed_at.clone();
+            let persisted = record.instance.clone();
             let journal_event = JournalEvent::Instance(Box::new(event.clone()));
             record.events.push(journal_event.clone());
-            (event, (record.events_tx.clone(), journal_event))
+            (event, (record.events_tx.clone(), journal_event), persisted)
         };
         let _ = sender.0.send(sender.1);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&persisted)?;
+        }
         Ok(event)
     }
 
@@ -460,12 +638,34 @@ impl LocalStore for MemoryStore {
         let instance_id = state
             .journal_instances
             .get(journal_id)
+            .cloned()
             .ok_or_else(|| not_found("journal", journal_id.to_string()))?;
+        let durable_seq = state
+            .instances
+            .get(&instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?
+            .instance
+            .durable_seq;
+        let after = after_seq.unwrap_or_default().0;
+        if let Some(durable) = &self.durable {
+            drop(state);
+            let observations = durable.read_range(&instance_id, after + 1, None)?;
+            let events = observations
+                .into_iter()
+                .take(limit.clamp(1, 256))
+                .map(|event| JournalEvent::Instance(Box::new(event)))
+                .collect();
+            return Ok(EventsReadResult {
+                events,
+                next_cursor: None,
+                floor_seq: U64(1),
+                durable_seq,
+            });
+        }
         let record = state
             .instances
-            .get(instance_id)
+            .get(&instance_id)
             .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
-        let after = after_seq.unwrap_or_default().0;
         let events = record
             .events
             .iter()
@@ -535,6 +735,43 @@ impl LocalStore for MemoryStore {
             .get(journal_id)
             .cloned()
             .ok_or_else(|| not_found("journal", journal_id.to_string()))
+    }
+
+    fn put_launch_recipe(
+        &self,
+        instance_id: &InstanceId,
+        recipe: &LaunchRecipe,
+    ) -> Result<(), NodeError> {
+        if let Some(entities) = &self.entities {
+            entities.put_recipe(instance_id, recipe)?;
+        }
+        Ok(())
+    }
+
+    fn launch_recipe(&self, instance_id: &InstanceId) -> Result<Option<LaunchRecipe>, NodeError> {
+        match &self.entities {
+            Some(entities) => entities.recipe(instance_id),
+            None => Ok(None),
+        }
+    }
+
+    fn put_pending_interaction(&self, pending: &PendingInteraction) -> Result<(), NodeError> {
+        if let Some(entities) = &self.entities {
+            let json = serde_json::to_string(pending)?;
+            entities.put_interaction_json(pending.interaction_id.as_id().as_str(), &json)?;
+        }
+        Ok(())
+    }
+
+    fn pending_interactions(&self) -> Result<Vec<PendingInteraction>, NodeError> {
+        let Some(entities) = &self.entities else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for json in entities.list_interaction_jsons()? {
+            out.push(serde_json::from_str(&json)?);
+        }
+        Ok(out)
     }
 }
 

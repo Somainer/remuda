@@ -113,6 +113,14 @@ impl DevNode {
         self.inner.workspace.clone()
     }
 
+    /// Persisted launch recipe for an Instance, if the driver wrote one.
+    pub fn launch_recipe(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<remuda_driver::LaunchRecipe>, NodeError> {
+        self.inner.store.launch_recipe(instance_id)
+    }
+
     /// List current Instances.
     pub fn list_instances(&self) -> Result<Page<Instance>, NodeError> {
         Ok(Page {
@@ -187,6 +195,9 @@ impl DevNode {
         };
         if let Some(observations) = observations {
             self.spawn_observation_pump(instance_id.clone(), observations);
+        }
+        if let Some(recipe) = driver.launch_recipe() {
+            self.inner.store.put_launch_recipe(&instance_id, &recipe)?;
         }
         self.spawn_instance_worker(instance_id.clone(), driver)
             .await;

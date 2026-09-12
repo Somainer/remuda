@@ -143,6 +143,7 @@ impl DriverFactory for NativeClaudeFactory {
             kind: self.kind,
             native,
             spec,
+            recipe: std::sync::Mutex::new(None),
         }))
     }
 }
@@ -151,6 +152,7 @@ struct NativeAdapter {
     kind: DriverKind,
     native: Arc<dyn NativeDriver>,
     spec: InstanceSpec,
+    recipe: std::sync::Mutex<Option<remuda_driver::LaunchRecipe>>,
 }
 
 impl Driver for NativeAdapter {
@@ -165,8 +167,15 @@ impl Driver for NativeAdapter {
                 .start(self.spec.clone())
                 .await
                 .map_err(map_driver_error)?;
+            if let Ok(mut slot) = self.recipe.lock() {
+                *slot = Some(handle.recipe().clone());
+            }
             Ok(Some(handle.into_events()))
         })
+    }
+
+    fn launch_recipe(&self) -> Option<remuda_driver::LaunchRecipe> {
+        self.recipe.lock().ok().and_then(|slot| slot.clone())
     }
 
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {

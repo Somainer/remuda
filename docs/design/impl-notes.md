@@ -383,13 +383,14 @@ slice.
 
 ## M1 local end-to-end (2026-09-12)
 
-**Result: PASS on this Mac.** A loopback Hub served the embedded production web build, enrolled a native Node over outbound WebSocket, exposed its host inventory, drove a two-turn fake `claude-print` instance through Hub HTTP while observing the Hub follow WebSocket, and completed one authenticated real Haiku turn. The real turn returned `REAL_OK`, `turn_done`, 53 reported tokens, and USD `0.019000499999999997`, below the USD 0.3 hard cap. All bootstrap, device, and host token values below are redacted; the machine hostname returned by inventory is also intentionally omitted.
+**Result: PASS on this Mac.** A loopback Hub served the embedded production web build, enrolled a native Node over outbound WebSocket, exposed its host inventory, drove a two-turn fake `claude-print` instance through Hub HTTP while observing the Hub follow WebSocket, and completed one authenticated real Haiku turn. The real turn returned `REAL_OK`, `turn_done`, 53 reported tokens, and USD `0.019000499999999997`, below the USD 0.3 hard cap. All bootstrap, device, and host token values below are redacted; the machine hostname is omitted, and personal filesystem prefixes are normalized to `$HOME`, `$WORKTREE`, or `/home/dev`.
 
 Runtime evidence was kept below `/tmp/remuda-m1`; it is not repository state. The shared target directory required by the implementation rules was used throughout:
 
 ```sh
-cd /Users/dev/Documents/Projects/Community/remuda-wt/x-gate
-export CARGO_TARGET_DIR=/Users/dev/Documents/Projects/Community/hybrid-harness/target
+export WORKTREE=/home/dev/projects/remuda-wt/x-gate
+export CARGO_TARGET_DIR=/home/dev/projects/hybrid-harness/target
+cd "$WORKTREE"
 
 (cd web && pnpm install --frozen-lockfile && pnpm build)
 cargo build -p remuda -p remuda-testing --bin remuda --bin fake-claude --locked
@@ -483,16 +484,16 @@ The authenticated `GET /v1/hosts` result, reduced only to the requested inventor
   "labels": ["mode=m1", "site=local"],
   "maxInstances": 2,
   "cli": [
-    {"kind":"claude","path":"/Users/dev/.local/share/claude/versions/2.1.269","version":"2.1.269 (Claude Code)","auth":"logged_in"},
+    {"kind":"claude","path":"$HOME/.local/share/claude/versions/2.1.269","version":"2.1.269 (Claude Code)","auth":"logged_in"},
     {"kind":"codex","path":"/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js","version":"codex-cli 0.145.0","auth":"logged_in"},
-    {"kind":"grok","path":"/Users/dev/.grok/downloads/grok-1.0.30-macos-aarch64","version":"grok 1.0.30 (04b7ffed98c6) [stable]","auth":"logged_in"},
-    {"kind":"agy","path":"/Users/dev/.local/bin/agy","version":"1.2.2","auth":"logged_out"},
+    {"kind":"grok","path":"$HOME/.grok/downloads/grok-1.0.30-macos-aarch64","version":"grok 1.0.30 (04b7ffed98c6) [stable]","auth":"logged_in"},
+    {"kind":"agy","path":"$HOME/.local/bin/agy","version":"1.2.2","auth":"logged_out"},
     {"kind":"gemini","path":null,"version":null,"auth":"unknown"}
   ],
   "herdr": {
-    "path": "/Users/dev/.local/bin/herdr",
+    "path": "$HOME/.local/bin/herdr",
     "version": "herdr 0.9.0",
-    "socket": "/Users/dev/.config/herdr/herdr.sock"
+    "socket": "$HOME/.config/herdr/herdr.sock"
   }
 }
 ```
@@ -571,12 +572,12 @@ The first live-login design used an isolated `CLAUDE_CONFIG_DIR`. On Claude Code
 The fix adds an explicit, default-off `REMUDA_CLAUDE_INHERIT_DEFAULT_CONFIG=1` mode. It removes `CLAUDE_CONFIG_DIR` after materialized environment resolution, rejects combining the mode with an explicit config directory, and retains isolated per-instance homes by default. Before the bounded request, the non-model probe was:
 
 ```sh
-/Users/dev/.local/bin/claude auth status \
+"$HOME/.local/bin/claude" auth status \
   | jq '{loggedIn,authMethod,configDirectory}'
 ```
 
 ```json
-{"loggedIn":true,"authMethod":"claude.ai","configDirectory":"/Users/dev/.claude"}
+{"loggedIn":true,"authMethod":"claude.ai","configDirectory":"$HOME/.claude"}
 ```
 
 The real Node used a workspace-only config:
@@ -587,7 +588,7 @@ workspace = "/tmp/remuda-m1/workspace"
 ```
 
 ```sh
-env REMUDA_CLAUDE_BIN=/Users/dev/.local/bin/claude \
+env REMUDA_CLAUDE_BIN="$HOME/.local/bin/claude" \
   REMUDA_CLAUDE_INHERIT_DEFAULT_CONFIG=1 RUST_LOG=info \
   /tmp/remuda-m1/remuda-x-gate \
   --data-dir /tmp/remuda-m1/node --config /tmp/remuda-m1/real-node.toml node \
@@ -632,7 +633,7 @@ curl --silent --show-error --max-time 20 -X POST \
 The HTTP result is intentionally fail-closed: Claude initialization exceeded the Hub's five-second Node RPC deadline, so the Hub did not claim acceptance and did not resend. The running process proved the exact real argv and that the default config variable was absent:
 
 ```text
-/Users/dev/.local/share/claude/versions/2.1.269 -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --include-hook-events --forward-subagent-text --replay-user-messages --permission-mode dontAsk --permission-prompts none --setting-sources user,project,local --model haiku --session-id 5dda9874-70c1-444d-9bf8-7a4d98b462c7 --max-budget-usd 0.3
+$HOME/.local/share/claude/versions/2.1.269 -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --include-hook-events --forward-subagent-text --replay-user-messages --permission-mode dontAsk --permission-prompts none --setting-sources user,project,local --model haiku --session-id 5dda9874-70c1-444d-9bf8-7a4d98b462c7 --max-budget-usd 0.3
 claude_config_dir=unset
 ```
 

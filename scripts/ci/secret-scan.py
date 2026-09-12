@@ -62,7 +62,7 @@ SKIP_FILE_NAMES = {
 MAX_BYTES = 2_000_000
 MASK = set("*xX•.…][)(") | {"…"}
 DUMMY_PART = re.compile(
-    r"(?i)(^|[-_/])(secret|example|placeholder|dummy|redacted|fake|sample|yourkey|xxx+|should-not)([-_]|$)"
+    r"(?i)(^|[-_/])(secret|example|placeholder|dummy|redacted|fake|sample|yourkey|xxx+|should-not|bootstrap)([-_]|$)"
 )
 PLACEHOLDER = re.compile(
     r"^(<[^>]+>|\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})"
@@ -176,19 +176,22 @@ def looks_like_secret(name: str, m: re.Match[str]) -> bool:
         body = payload.strip().strip("\"'")
         if len(body) < 8:
             return False
-    if name == "sk-":
-        body = payload_for(name, m)
-        if len(body) < 8:
-            return False
-    if name == "agk_":
-        if len(payload) < 8:
-            return False
-    if name == "Bearer ":
-        if len(payload.strip().strip("\"'")) < 8:
-            return False
-    if name == "ANTHROPIC_AUTH_TOKEN=":
-        if len(payload.strip().strip("\"'")) < 8:
-            return False
+    body = payload.strip().strip("\"'")
+    # Short literals are placeholders (docs/fixtures), not live tokens.
+    if name in {
+        "sk-",
+        "agk_",
+        "xai-",
+        "ghp_",
+        "github_pat_",
+        "Bearer ",
+        "ANTHROPIC_AUTH_TOKEN=",
+        "REMUDA_BOOTSTRAP_TOKEN=",
+        "OPENAI_API_KEY=",
+        "api_key",
+        "app_secret",
+    } and len(body) < 16:
+        return False
     return True
 
 

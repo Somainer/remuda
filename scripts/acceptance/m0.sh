@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M0 acceptance skeleton (plan M0-15 / A-017).
-# stub: drive fake-claude's four bundled scripts over NDJSON.
+# stub: drive fake-claude through claude-print + remuda-journal for all four scripts.
 # live: print the canary commands and prerequisites; never call a model.
 set -euo pipefail
 
@@ -13,7 +13,7 @@ usage() {
   cat <<'EOF' >&2
 Usage: m0.sh --mode stub|live [--herdr-session remuda-test] [--confirm-external-calls]
 
-  --mode stub   run fake-claude ok/approval/askuser/workflow; leak + secret gates
+  --mode stub   claude-print + journal for ok/approval/askuser/workflow; leak + secret gates
   --mode live   print the live canary plan; do not invoke Claude/Herdr/models
 EOF
 }
@@ -68,9 +68,21 @@ fi
 
 STARTED="$(iso_now)"
 CASE_ID="A-017-m0-${MODE}"
-DRIVE="$ROOT/scripts/acceptance/fake-claude-drive.py"
 HERDR_SH="$ROOT/scripts/acceptance/herdr-isolated.sh"
 SCAN="$ROOT/scripts/ci/secret-scan.sh"
+
+target_dir() {
+  local dir="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-}}"
+  if [[ -n "$dir" ]]; then
+    if [[ "$dir" = /* ]]; then
+      printf '%s\n' "$dir"
+    else
+      printf '%s\n' "$ROOT/$dir"
+    fi
+  else
+    printf '%s\n' "$ROOT/target"
+  fi
+}
 
 live_plan() {
   cat <<EOF >&2
@@ -131,10 +143,9 @@ pid_set() {
 stub_run() {
   command -v python3 >/dev/null 2>&1 || die "python3 is required"
   command -v cargo >/dev/null 2>&1 || die "cargo is required"
-  [[ -f "$DRIVE" ]] || die "missing $DRIVE"
   [[ -f "$SCAN" ]] || die "missing $SCAN"
 
-  local leftover workdir bin status=0 before_s after_s
+  local leftover workdir bin stub status=0 before_s after_s target
   workdir="$(mktemp -d "${TMPDIR:-/tmp}/remuda-m0.XXXXXX")"
   cleanup() {
     if [[ -d "$workdir" ]]; then
@@ -143,29 +154,32 @@ stub_run() {
   }
   trap cleanup EXIT
 
-  log "building fake-claude"
-  if ! (cd "$ROOT" && cargo build -p remuda-testing --bin fake-claude --locked) >&2; then
-    log "Cargo.lock not in sync; rebuilding fake-claude without --locked"
-    (cd "$ROOT" && cargo build -p remuda-testing --bin fake-claude) >&2
+  target="$(target_dir)"
+  log "building fake-claude and m0-print-stub into $target"
+  if ! (cd "$ROOT" && cargo build -p remuda-testing --bin fake-claude --bin m0-print-stub --target-dir "$target" --locked) >&2; then
+    log "Cargo.lock not in sync; rebuilding without --locked"
+    (cd "$ROOT" && cargo build -p remuda-testing --bin fake-claude --bin m0-print-stub --target-dir "$target") >&2
   fi
-  bin="$ROOT/target/debug/fake-claude"
+  bin="$target/debug/fake-claude"
+  stub="$target/debug/m0-print-stub"
   [[ -x "$bin" ]] || die "fake-claude binary missing at $bin"
+  [[ -x "$stub" ]] || die "m0-print-stub binary missing at $stub"
 
   before_s="$(pid_set $(fake_claude_pids))"
 
   local script
-  mkdir -p "$workdir/logs" "$workdir/transcripts"
+  mkdir -p "$workdir/logs"
   for script in ok approval askuser workflow; do
-    log "script $script"
-    python3 "$DRIVE" \
-      --bin "$bin" \
+    log "script $script (claude-print + journal)"
+    mkdir -p "$workdir/$script"
+    "$stub" \
       --script "$script" \
-      --script-path "$ROOT/crates/remuda-testing/fixtures/scripts/${script}.jsonl" \
-      --transcript-dir "$workdir/transcripts/$script" \
-      --log "$workdir/logs/${script}.ndjson" \
+      --fake-claude "$bin" \
+      --workdir "$workdir/$script" \
       >&2
   done
 
+  sleep 0.2
   after_s="$(pid_set $(fake_claude_pids))"
   leftover="$(comm -13 <(printf '%s\n' "$before_s") <(printf '%s\n' "$after_s") | awk 'NF')"
   if [[ -n "$leftover" ]]; then

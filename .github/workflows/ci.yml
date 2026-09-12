@@ -21,6 +21,15 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+  m0-stub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - name: M0 stub acceptance
+        run: ./scripts/acceptance/m0.sh --mode stub
+
   secret-scan:
     runs-on: ubuntu-latest
     steps:
@@ -75,6 +84,10 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Install
         run: pnpm --dir web install --frozen-lockfile
+      - name: Generated OpenAPI client is current
+        run: |
+          pnpm --dir web run gen:api
+          git diff --exit-code -- web/src/lib/api.generated.ts
       - name: Lint
         run: pnpm --dir web lint
       - name: Test

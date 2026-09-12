@@ -7,8 +7,14 @@ rust-version.workspace = true
 publish = false
 description = "Node instance management and outbound Hub connection."
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+# The WSS session loop owns ten tightly coupled channel/config endpoints. Keep
+# the signature explicit until its carrier state is consolidated after M0.
+too_many_arguments = "allow"
 
 [[bin]]
 name = "remuda-node-stdio"

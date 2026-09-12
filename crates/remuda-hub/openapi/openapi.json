@@ -589,19 +589,35 @@
           "deviceName": { "type": "string" }
         }
       },
+      "HostCli": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string" },
+          "version": { "type": ["string", "null"] },
+          "path": { "type": ["string", "null"] },
+          "auth": {
+            "type": "string",
+            "enum": ["logged_in", "logged_out", "unknown"]
+          }
+        }
+      },
       "HostView": {
         "type": "object",
         "additionalProperties": true,
         "required": ["hostId", "label", "state", "online"],
         "properties": {
-          "hostId": { "type": "string" },
+          "hostId": { "type": "string", "description": "Stable Node identity (`hst_…`)." },
           "id": { "type": "string" },
           "name": { "type": "string" },
           "label": { "type": "string" },
           "state": { "type": "string" },
           "online": { "type": "boolean" },
           "lastSeenAt": { "type": ["string", "null"] },
-          "cli": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "nodeVersion": { "type": ["string", "null"] },
+          "cli": { "type": "array", "items": { "$ref": "#/components/schemas/HostCli" } },
+          "capabilities": { "type": "object", "additionalProperties": true },
           "labels": { "type": "array", "items": { "type": "string" } },
           "herdr": { "type": ["object", "null"], "additionalProperties": true },
           "resources": { "type": ["object", "null"], "additionalProperties": true },

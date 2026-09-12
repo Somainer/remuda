@@ -7,6 +7,7 @@ test.describe("hosts + fleet", () => {
     await expect(page.locator('[data-testid=host-row][data-transport=outbound-wss]').first()).toBeVisible();
     await expect(page.locator('[data-testid=host-row][data-transport=ssh-stdio]').first()).toBeVisible();
     await expect(page.locator('[data-testid=host-row][data-transport=local]').first()).toBeVisible();
+    await page.getByTestId("hosts-show-stale").click();
     await expect(page.locator('[data-testid=host-row][data-online="0"]').first()).toBeVisible();
   });
 

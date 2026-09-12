@@ -30,6 +30,10 @@ pub use driver::{
     Driver, DriverEmission, DriverError, DriverFactory, DriverFuture, DriverLaunch, DriverRegistry,
     DriverRequest, DriverStartFuture, FakeDriver,
 };
+pub use enroll::{
+    Enrollment, apply_hello_result, default_data_dir, load_or_create as load_or_create_enrollment,
+    save as save_enrollment,
+};
 pub use error::NodeError;
 pub use identity::load_or_create_host_id;
 pub use interactions::{InteractionRuntime, PendingInteraction};

@@ -1,7 +1,18 @@
 import { useSyncExternalStore } from "react";
 import type { Host, Instance } from "../../types/instance";
 import { HOST_FIXTURES } from "./fixtures";
-import { carrierOf, hostOnline, type HostView } from "./model";
+import { carrierOf, hostOnline, sortHostsOnlineFirst, type HostCli, type HostCliAuth, type HostView } from "./model";
+
+const useFixtures = import.meta.env.VITE_MOCK === "1";
+
+function mapCli(cli: Host["cli"]): HostCli[] {
+  return (cli ?? []).map((entry) => ({
+    kind: entry.kind,
+    version: entry.version,
+    path: entry.path,
+    auth: (entry.auth ?? "unknown") as HostCliAuth,
+  }));
+}
 
 type Listener = () => void;
 
@@ -39,41 +50,60 @@ class HostRegistry {
     const usedLabels = new Set<string>();
     const out: HostView[] = [];
     for (const host of hubHosts) {
-      const extra = HOST_FIXTURES.find((f) => f.label === host.label);
+      const extra = useFixtures ? HOST_FIXTURES.find((f) => f.label === host.label) : undefined;
       usedLabels.add(host.label);
+      const liveCli = mapCli(host.cli);
       const base: HostView = extra
-        ? { ...extra, id: host.id, state: host.state, online: hostOnline(host.state) }
+        ? {
+            ...extra,
+            id: host.id,
+            state: host.state,
+            online: host.online ?? hostOnline(host.state),
+            lastSeenAt: host.lastSeenAt ?? extra.lastSeenAt,
+            cli: liveCli.length ? liveCli : extra.cli,
+            agentVersion: host.nodeVersion ?? extra.agentVersion,
+            resources: host.resources ?? extra.resources,
+            labels: host.labels?.length ? host.labels : extra.labels,
+            maxInstances: host.maxInstances ?? extra.maxInstances,
+            hostname: host.hostname ?? extra.hostname,
+          }
         : {
             id: host.id,
             label: host.label,
             state: host.state,
-            online: hostOnline(host.state),
+            online: host.online ?? hostOnline(host.state),
             transport: carrierOf(host.transport.mode),
             hostname: host.hostname,
             port: host.port,
-            cli: [],
-            labels: [],
-            maxInstances: 4,
+            lastSeenAt: host.lastSeenAt,
+            agentVersion: host.nodeVersion,
+            resources: host.resources,
+            cli: liveCli,
+            labels: host.labels ?? [],
+            maxInstances: host.maxInstances ?? 8,
             instanceCount: 0,
+            herdr: host.herdr,
           };
       const count = instances.filter((i) => i.hostId === host.id).length;
       out.push({
         ...base,
         ...this.patches.get(host.id),
         id: host.id,
-        instanceCount: count || base.instanceCount,
+        instanceCount: count || host.instanceCount || base.instanceCount,
       });
     }
-    for (const extra of HOST_FIXTURES) {
-      if (usedLabels.has(extra.label)) continue;
-      usedLabels.add(extra.label);
-      out.push({ ...extra, ...this.patches.get(extra.id) });
+    if (useFixtures) {
+      for (const extra of HOST_FIXTURES) {
+        if (usedLabels.has(extra.label)) continue;
+        usedLabels.add(extra.label);
+        out.push({ ...extra, ...this.patches.get(extra.id) });
+      }
     }
     for (const host of this.enrolled) {
       if (out.some((h) => h.id === host.id || h.label === host.label)) continue;
       out.push({ ...host, ...this.patches.get(host.id) });
     }
-    return out;
+    return sortHostsOnlineFirst(out);
   }
 }
 

@@ -29,7 +29,7 @@ struct PatchHostBody {
     max_instances: Option<i64>,
 }
 
-fn host_view(host: &HostRecord) -> Value {
+pub(crate) fn host_view(host: &HostRecord) -> Value {
     json!({
         "hostId": host.host_id,
         "id": host.host_id,

@@ -142,7 +142,13 @@ pub async fn list_hosts(
     headers: HeaderMap,
 ) -> Result<Json<Value>, HubError> {
     require_device(&state.store, &headers).await?;
-    let items = state.store.list_hosts().await?;
+    let items: Vec<Value> = state
+        .store
+        .list_hosts()
+        .await?
+        .iter()
+        .map(crate::registry::host_view)
+        .collect();
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 

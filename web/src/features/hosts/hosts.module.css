@@ -43,6 +43,22 @@
   padding: 0 13px;
 }
 
+.toggle {
+  height: 30px;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--mute);
+  font-size: 12px;
+  padding: 0 10px;
+}
+
+.toggleOn {
+  border-color: var(--paper);
+  color: var(--paper);
+}
+
 .row {
   display: flex;
   align-items: center;
@@ -96,13 +112,16 @@
 }
 
 .cellCli {
-  width: 150px;
-  flex: none;
+  flex: 1;
+  min-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cellTransport {
-  flex: 1;
-  min-width: 0;
+  width: 120px;
+  flex: none;
 }
 
 .cellSessions {

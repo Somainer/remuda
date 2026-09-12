@@ -94,6 +94,12 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
         "tty.write" | "instance.keys" => {
             crate::transport::hubnode::dispatch_method(node, method, params).await
         }
+        method if crate::worktree::is_worktree_method(method) => crate::worktree::handle_rpc(
+            std::path::Path::new(&node.workspace().root_path),
+            method,
+            &params,
+        )
+        .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?,
         _ => Ok(json!({ "ok": true })),
     }
 }

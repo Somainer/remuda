@@ -1,3 +1,5 @@
+import type { Observation } from "../types/observation";
+
 export type ScreenRead = {
   lines: string[];
 };
@@ -20,6 +22,53 @@ export function parseScreenBody(body: unknown): ScreenRead {
   }
   if (typeof rec.text === "string") {
     return { lines: rec.text.split(/\r?\n/) };
+  }
+  return { lines: [] };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function knowledgeText(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  const rec = asRecord(value);
+  if (!rec) return null;
+  if (typeof rec.value === "string") return rec.value;
+  return null;
+}
+
+function payloadOf(obs: Observation): Record<string, unknown> | null {
+  return asRecord(obs.payload) ?? asRecord(obs);
+}
+
+export function isScreenObservation(obs: Observation): boolean {
+  const payload = payloadOf(obs);
+  const name = typeof payload?.nativeName === "string" ? payload.nativeName : "";
+  if (name === "prompt_echo" || name === "line-matcher" || name === "agent_status") return false;
+  if (name === "screen") return true;
+  return obs.kind === "raw_tty";
+}
+
+export function screenTextOf(obs: Observation): string {
+  const payload = payloadOf(obs);
+  if (!payload) return "";
+  return (
+    knowledgeText(payload.status) ??
+    (typeof payload.text === "string" ? payload.text : null) ??
+    (typeof payload.output === "string" ? payload.output : null) ??
+    ""
+  );
+}
+
+/** Latest screen-derived snapshot from a followed journal. */
+export function latestScreenFromObservations(events: Observation[]): ScreenRead {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const obs = events[i];
+    if (!isScreenObservation(obs)) continue;
+    const text = screenTextOf(obs);
+    if (!text) continue;
+    return { lines: text.split(/\r?\n/) };
   }
   return { lines: [] };
 }

@@ -5,8 +5,8 @@ import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
 import type { Workspace } from "../types/workspace";
-import { api, observationText, type InstanceCreateSpec } from "./api";
-import { doneFromLines, lastLines } from "./screen";
+import { api, observationText, type InstanceCreateSpec, type PtyKey, type WorktreeCreateSpec } from "./api";
+import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
@@ -89,6 +89,7 @@ class HubStore {
   private journals = new Map<Id, JournalClient>();
   private subs = new Map<Id, Id>();
   private bootGen = 0;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -163,6 +164,7 @@ class HubStore {
         workspaces: workspaces.items,
         interactions,
       });
+      this.startPoll();
     } catch (err) {
       if (gen !== this.bootGen) return;
       const unauth = isUnauthorized(err);
@@ -186,6 +188,14 @@ class HubStore {
     writeSession(session);
     this.emit({ session, authed: true, error: null });
     await this.bootstrap();
+  }
+
+  startPoll() {
+    if (this.pollTimer != null || typeof window === "undefined") return;
+    this.pollTimer = window.setInterval(() => {
+      if (!this.state.authed) return;
+      void this.refresh();
+    }, 2000);
   }
 
   logout() {
@@ -264,9 +274,16 @@ class HubStore {
         const current = this.state.events[instanceId] ?? [];
         const seen = new Set(current.map((e) => e.eventId));
         const next = current.concat(events.filter((e) => !seen.has(e.eventId)));
+        const screen = latestScreenFromObservations(next);
         this.emit({
           events: { ...this.state.events, [instanceId]: next },
           bubbles: settleBubbles(this.state.bubbles, instanceId, next),
+          screens: screen.lines.length
+            ? {
+                ...this.state.screens,
+                [instanceId]: { lines: lastLines(screen.lines, 80), done: doneFromLines(screen.lines) },
+              }
+            : this.state.screens,
         });
       },
       onStatus: (status) => {
@@ -374,9 +391,16 @@ class HubStore {
     await this.refresh();
   }
 
-  async sendKeys(instanceId: Id, key: "enter" | "esc") {
+  async sendKeys(instanceId: Id, key: PtyKey) {
     await api.instanceKeys(instanceId, key);
     await this.refreshScreen(instanceId);
+  }
+
+  async createWorktree(spec: WorktreeCreateSpec) {
+    const record = await api.worktreeCreate(spec);
+    const [workspaces] = await Promise.all([api.workspaceList()]);
+    this.emit({ workspaces: workspaces.items });
+    return record;
   }
 
   async broadcast(instanceIds: Id[], prompt: string) {
@@ -387,12 +411,15 @@ class HubStore {
   }
 
   async refreshScreen(instanceId: Id) {
-    const read = await api.screenRead(instanceId, 3);
-    const lines = lastLines(read.lines, 3);
+    let read = await api.screenRead(instanceId, 80);
+    if (!read.lines.length) {
+      read = latestScreenFromObservations(this.state.events[instanceId] ?? []);
+    }
+    const lines = lastLines(read.lines, 80);
     this.emit({
       screens: {
         ...this.state.screens,
-        [instanceId]: { lines, done: doneFromLines(read.lines) },
+        [instanceId]: { lines: lastLines(lines, 3), done: doneFromLines(read.lines) },
       },
     });
   }

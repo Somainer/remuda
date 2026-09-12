@@ -322,6 +322,14 @@ async fn handle_stdio_frame(
                 pump_instance: None,
             })
         }
+        _ if crate::worktree::is_worktree_method(request.method.as_str()) => {
+            let result =
+                hubnode_codec::dispatch_method(node, request.method.as_str(), params).await;
+            Ok(FrameOutcome {
+                response: response_for(id, result),
+                pump_instance: None,
+            })
+        }
         _ => Ok(FrameOutcome {
             response: response_for(
                 id,

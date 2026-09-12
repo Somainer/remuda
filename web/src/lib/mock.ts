@@ -814,11 +814,11 @@ export function mockScreenRead(instanceId: Id, n = 3): { lines: string[] } {
   return { lines: lines.filter((line) => line.length > 0).slice(-n) };
 }
 
-export function mockKeys(instanceId: Id, key: "enter" | "esc"): CommandResult {
+export function mockKeys(instanceId: Id, key: "enter" | "esc" | "ctrl+c"): CommandResult {
   const inst = instances.find((i) => i.id === instanceId);
   if (!inst) throw new Error("INSTANCE_NOT_FOUND");
   const lines = screens.get(instanceId) ?? [];
-  lines.push(key === "enter" ? "^ENTER" : "^ESC");
+  lines.push(key === "enter" ? "^ENTER" : key === "esc" ? "^ESC" : "^C");
   screens.set(instanceId, lines);
   inst.updatedAt = now();
   const commandId = id("cmd_");
@@ -1086,6 +1086,9 @@ export function mockCreate(prompt: string, extras?: { hostId?: Id; workspaceId?:
   if (extras?.workspaceId) ins.workspaceId = extras.workspaceId;
   if (extras?.driver) ins.driver = extras.driver;
   if (extras?.kind) ins.kind = extras.kind;
+  if (extras?.driver === "generic-pty" || extras?.driver === "claude-pty") {
+    ins.capabilities = ptyCapabilities(extras.driver);
+  }
   ins.activeRunIds = [];
   instances.unshift(ins);
   titles.set(ins.id, prompt.slice(0, 80) || "新会话");

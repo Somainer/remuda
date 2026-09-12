@@ -380,6 +380,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/worktrees": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List git worktrees on a host (Node remuda worktree catalog) */
+        get: operations["worktreeList"];
+        put?: never;
+        /** Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main) */
+        post: operations["worktreeCreate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -489,6 +507,8 @@ export interface components {
             [key: string]: unknown;
         };
         InstanceCreate: {
+            /** @description Working directory on the host. */
+            cwd?: string;
             delegation?: string;
             driver?: string;
             hostId?: string;
@@ -503,6 +523,8 @@ export interface components {
             providerProfileId?: string;
             title?: string;
             workspaceId?: string;
+            /** @description Worktree name created by remuda worktree create. */
+            worktree?: string;
         };
         InstanceCreateResult: {
             command: components["schemas"]["CommandRecord"];
@@ -521,6 +543,7 @@ export interface components {
             activity: "unknown" | "idle" | "working" | "blocked" | "draining";
             connectivity: string;
             createdAt?: string;
+            cwd?: string | null;
             driver: string;
             durableSeq: string;
             hostId: string;
@@ -532,6 +555,7 @@ export interface components {
              * @enum {string}
              */
             lifecycle: "requested" | "starting" | "running" | "closing" | "exited" | "failed";
+            name?: string | null;
             title?: string | null;
             updatedAt?: string;
             workspaceId?: string | null;
@@ -586,6 +610,28 @@ export interface components {
                 auth: string;
                 p256dh: string;
             };
+        };
+        WorktreeCreate: {
+            /** @description Start-point (default main). */
+            base?: string;
+            hostId?: string;
+            name: string;
+            path?: string;
+            repo?: string;
+        };
+        WorktreePage: {
+            hostId?: string;
+            items: components["schemas"]["WorktreeRecord"][];
+            nextCursor?: string | null;
+            workspaceRoot?: string | null;
+        };
+        WorktreeRecord: {
+            base?: string;
+            branch?: string;
+            hostId?: string;
+            name: string;
+            path: string;
+            workspaceRoot?: string;
         };
     };
     responses: {
@@ -1233,6 +1279,55 @@ export interface operations {
                     };
                 };
             };
+            422: components["responses"]["Error"];
+        };
+    };
+    worktreeList: {
+        parameters: {
+            query?: {
+                hostId?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Worktree page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorktreePage"];
+                };
+            };
+            401: components["responses"]["Error"];
+        };
+    };
+    worktreeCreate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorktreeCreate"];
+            };
+        };
+        responses: {
+            /** @description Created or reused worktree */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorktreeRecord"];
+                };
+            };
+            401: components["responses"]["Error"];
             422: components["responses"]["Error"];
         };
     };

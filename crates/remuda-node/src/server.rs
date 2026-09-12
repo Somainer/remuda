@@ -766,6 +766,8 @@ async fn dispatch_rpc(
             }
             serde_json::to_value(workspace).map_err(NodeError::from)
         }
+        "worktree.list" => node.list_worktrees(),
+        "worktree.create" => node.create_worktree(&params),
         "instance.list" => {
             let mut page = node.list_instances()?;
             if let Some(raw_workspace) = params.get("workspaceId").and_then(Value::as_str) {

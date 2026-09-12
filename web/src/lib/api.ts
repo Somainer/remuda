@@ -784,6 +784,38 @@ function createLiveApi(): HubApi {
 
 export const api: HubApi = MOCK ? createMockApi() : createLiveApi();
 
+/** Uncompressed P-256 prefix + dummy coordinates; mock VAPID only. */
+const MOCK_VAPID_PUBLIC_KEY =
+  "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+const mockPushSubs = new Map<string, components["schemas"]["PushSubscribe"]>();
+
+/** `GET /push/config` — VAPID public key for `PushManager.subscribe`. */
+export async function fetchPushConfig(): Promise<HubJson<"/push/config", "get">> {
+  if (MOCK) return { public_key: MOCK_VAPID_PUBLIC_KEY };
+  return rest<HubJson<"/push/config", "get">>("/push/config");
+}
+
+/** `POST /push/subscriptions` — upsert browser PushSubscription JSON. */
+export async function postPushSubscription(
+  body: components["schemas"]["PushSubscribe"],
+): Promise<{ ok?: boolean }> {
+  if (MOCK) {
+    mockPushSubs.set(body.endpoint, body);
+    return { ok: true };
+  }
+  return rest<{ ok?: boolean }>("/push/subscriptions", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** `DELETE /push/subscriptions?endpoint=` — drop that endpoint. */
+export async function deletePushSubscription(endpoint: string): Promise<{ ok?: boolean }> {
+  if (MOCK) {
+    mockPushSubs.delete(endpoint);
+    return { ok: true };
+  }
+  return rest<{ ok?: boolean }>(`/push/subscriptions?endpoint=${encodeURIComponent(endpoint)}`, { method: "DELETE" });
+}
+
 export function observationText(obs: Observation): string {
   const payload = obs.payload as { blocks?: { type: string; text?: string }[]; text?: string };
   if (typeof payload.text === "string") return payload.text;

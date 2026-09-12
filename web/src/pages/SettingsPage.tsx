@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { iosStandaloneHint, readDeviceSettings, writeDeviceSettings, type PermissionDefault } from "../features/settings";
 import css from "../features/settings/settings.module.css";
 import { readAccessCode, writeAccessCode } from "../lib/accessCode";
 import { clipboardIo } from "../lib/clipboard";
 import { MORE_NAV } from "../lib/nav";
-import { subscribePush } from "../lib/push";
+import { readPushStatus, subscribePush, unsubscribePush, type PushStatus } from "../lib/push";
 import { hubStore, useHub } from "../lib/store";
 import { LoginPage } from "./LoginPage";
 
@@ -20,8 +20,17 @@ export function SettingsPage() {
   const navigate = useNavigate();
   const [access, setAccess] = useState(() => readAccessCode());
   const [settings, setSettings] = useState(() => readDeviceSettings());
-  const [push, setPush] = useState(() => (typeof Notification === "undefined" ? "unsupported" : Notification.permission));
+  const [push, setPush] = useState<PushStatus>(() => ({
+    permission: typeof Notification === "undefined" ? "unsupported" : Notification.permission,
+    subscribed: false,
+    endpoint: null,
+    needsHomeScreen: false,
+  }));
   const [pairBusy, setPairBusy] = useState(false);
+
+  useEffect(() => {
+    void readPushStatus().then(setPush);
+  }, []);
 
   const patch = (next: Partial<typeof settings>) => setSettings(writeDeviceSettings(next));
 
@@ -132,19 +141,22 @@ export function SettingsPage() {
           <p className={css.hint} data-testid="settings-ios-hint">
             {iosStandaloneHint()}
           </p>
-          <p className={css.hint}>当前权限 {push}</p>
+          <p className={css.hint} data-testid="settings-push-state">
+            当前权限 {push.permission}
+            {push.subscribed ? " · 已订阅" : " · 未订阅"}
+            {push.needsHomeScreen ? " · 需加到主屏幕" : ""}
+          </p>
           <div className={css.row}>
             <button
               type="button"
               className={css.action}
               data-testid="settings-push"
+              aria-pressed={push.subscribed}
               onClick={() => {
-                void subscribePush().then((result) => {
-                  setPush(result.ok ? "granted" : typeof Notification === "undefined" ? "unsupported" : Notification.permission);
-                });
+                void (push.subscribed ? unsubscribePush() : subscribePush()).then(() => readPushStatus().then(setPush));
               }}
             >
-              开启推送
+              {push.subscribed ? "关闭推送" : "开启推送"}
             </button>
           </div>
         </section>

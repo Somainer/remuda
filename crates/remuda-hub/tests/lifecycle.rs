@@ -299,8 +299,7 @@ async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
     );
 
     drop(node);
-    drop(hub);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    hub.shutdown().await;
     let mut config = HubConfig::for_test(data_dir);
     config.bootstrap_token = bootstrap;
     let hub = spawn(config).await?;

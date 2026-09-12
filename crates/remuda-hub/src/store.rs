@@ -1,12 +1,14 @@
 //! Single-writer SQLite actor. Connections never cross `.await`.
 
 use crate::config::{new_id, now_rfc3339};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -27,12 +29,40 @@ pub enum StoreError {
     Id(String),
 }
 
-type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+enum Job {
+    Run(Box<dyn FnOnce(&mut Connection) + Send>),
+    Stop(std::sync::mpsc::Sender<()>),
+}
+
+struct StoreJoin {
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for StoreJoin {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.thread.lock()
+            && let Some(thread) = guard.take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
 
 /// Handle to the Hub database writer.
 #[derive(Clone)]
 pub struct Store {
     tx: std::sync::mpsc::Sender<Job>,
+    /// Joins the writer thread after the last clone drops its channel sender.
+    _join: Arc<StoreJoin>,
 }
 
 /// Result of presenting a Node bootstrap or host token.
@@ -265,7 +295,7 @@ impl Store {
         std::fs::create_dir_all(data_dir).map_err(|err| StoreError::Id(err.to_string()))?;
         let path = data_dir.join("hub.sqlite");
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("remuda-hub-sqlite".into())
             .spawn(move || {
                 let mut conn = match open_conn(&path) {
@@ -276,11 +306,34 @@ impl Store {
                     }
                 };
                 while let Ok(job) = rx.recv() {
-                    job(&mut conn);
+                    match job {
+                        Job::Run(work) => work(&mut conn),
+                        Job::Stop(done) => {
+                            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                            drop(conn);
+                            let _ = done.send(());
+                            return;
+                        }
+                    }
                 }
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
             })
             .map_err(|err| StoreError::Id(err.to_string()))?;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            _join: Arc::new(StoreJoin {
+                thread: Mutex::new(Some(thread)),
+            }),
+        })
+    }
+
+    /// Finish in-flight jobs, checkpoint WAL, and close the writer connection.
+    pub async fn close(&self) {
+        let (done, rx) = std::sync::mpsc::channel();
+        if self.tx.send(Job::Stop(done)).is_err() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(BUSY_WAIT)).await;
     }
 
     async fn run<T, F>(&self, f: F) -> Result<T, StoreError>
@@ -290,9 +343,9 @@ impl Store {
     {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(Box::new(move |conn| {
+            .send(Job::Run(Box::new(move |conn| {
                 let _ = tx.send(f(conn));
-            }))
+            })))
             .map_err(|_| StoreError::Closed)?;
         rx.await.map_err(|_| StoreError::Closed)?
     }
@@ -1189,14 +1242,28 @@ impl Store {
 }
 
 fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let started = Instant::now();
+    loop {
+        match try_open_conn(path) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if sqlite_is_busy(&err) && started.elapsed() < BUSY_WAIT => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(path)?;
+    conn.busy_timeout(BUSY_WAIT)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_WAIT.as_millis() as i64)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(
         "

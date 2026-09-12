@@ -2,9 +2,9 @@
 
 use remuda_protocol::hubnode::{
     self, HubNodeMethod, HubNodeRequest, InstanceCreateParams, JournalAppendParams,
-    METHOD_INSTANCE_CREATE, METHOD_JOURNAL_APPEND, METHOD_NODE_AUTH, METHOD_NODE_HELLO,
-    METHOD_TTY_FRAME, NodeAuthParams, NodeHelloParams, TTY_BINARY_HEADER_LEN,
-    TtyBinaryEnvelopeSpec, TtyFrameParams,
+    METHOD_INSTANCE_CREATE, METHOD_INSTANCE_KEYS, METHOD_JOURNAL_APPEND, METHOD_NODE_AUTH,
+    METHOD_NODE_HELLO, METHOD_TTY_FRAME, METHOD_TTY_WRITE, NodeAuthParams, NodeHelloParams,
+    TTY_BINARY_HEADER_LEN, TtyBinaryEnvelopeSpec, TtyFrameParams, TtyWriteParams,
 };
 use remuda_protocol::{BINARY_HEADER_LEN, PROTOCOL_VERSION, from_json_slice};
 use serde_json::Value;
@@ -75,6 +75,25 @@ fn tty_binary_envelope_is_32_bytes() {
     let spec = TtyBinaryEnvelopeSpec::v1();
     assert_eq!(spec.header_len as usize, BINARY_HEADER_LEN);
     assert_eq!(TTY_BINARY_HEADER_LEN, 32);
+}
+
+#[test]
+fn tty_write_is_an_instance_method() {
+    assert_eq!(
+        HubNodeMethod::parse(METHOD_TTY_WRITE),
+        Some(HubNodeMethod::TtyWrite)
+    );
+    assert_eq!(
+        HubNodeMethod::parse(METHOD_INSTANCE_KEYS),
+        Some(HubNodeMethod::InstanceKeys)
+    );
+    assert!(HubNodeMethod::TtyWrite.is_instance());
+    let params: TtyWriteParams = serde_json::from_value(serde_json::json!({
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "keys": ["enter", "esc"]
+    }))
+    .unwrap();
+    assert_eq!(params.key_names(), vec!["enter", "esc"]);
 }
 
 #[test]

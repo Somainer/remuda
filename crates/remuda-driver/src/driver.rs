@@ -119,6 +119,14 @@ pub trait Driver: Send + Sync {
     /// Deliver prompt, steer, or model-switch input.
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck>;
 
+    /// Write logical keys to the live PTY (`enter`, `esc`, `ctrl+c`, …).
+    async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
+        let _ = keys;
+        Err(crate::error::DriverError::CapabilityUnsupported(
+            "send_keys requires a tty-attach driver".into(),
+        ))
+    }
+
     /// Request cancellation of the active Run.
     async fn cancel(&self) -> DriverResult<DriverAck>;
 

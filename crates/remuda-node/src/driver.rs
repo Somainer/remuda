@@ -55,6 +55,11 @@ pub enum DriverRequest {
     },
     /// Stop the instance worker.
     Close,
+    /// Write logical keys to a tty-attach driver (`tty.write`).
+    SendKeys {
+        /// Normalized key names (`enter`, `esc`, `ctrl+c`, …).
+        keys: Vec<String>,
+    },
 }
 
 /// Structured output emitted by a local driver operation.
@@ -236,6 +241,11 @@ impl Driver for FakeDriver {
                 DriverRequest::Close => Ok(vec![DriverEmission::NativeLifecycle {
                     name: "fake-driver".to_owned(),
                     status: "closed".to_owned(),
+                    severity: Severity::Info,
+                }]),
+                DriverRequest::SendKeys { keys } => Ok(vec![DriverEmission::NativeLifecycle {
+                    name: "fake-driver-keys".to_owned(),
+                    status: keys.join(" "),
                     severity: Severity::Info,
                 }]),
             }

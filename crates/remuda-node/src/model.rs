@@ -101,6 +101,9 @@ pub enum CommandAction {
     RespondInteraction,
     /// Close the instance task and mark the Instance exited.
     Close,
+    /// Write logical keys (`tty.write` / `instance.keys`).
+    #[serde(rename = "tty.write", alias = "instance.keys")]
+    WriteTty,
 }
 
 /// Command body for the local REST surface.
@@ -124,4 +127,7 @@ pub struct InstanceCommandRequest {
     /// Opaque fake answer retained only for deterministic command hashing.
     #[serde(default)]
     pub answer: Option<serde_json::Value>,
+    /// Logical keys for `tty.write`.
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
 }

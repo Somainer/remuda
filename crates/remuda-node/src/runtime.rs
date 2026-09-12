@@ -568,7 +568,7 @@ fn finish_instance_operation(
                 "explicit-close",
             )?;
         }
-        DriverRequest::Send { .. } | DriverRequest::Cancel => {
+        DriverRequest::Send { .. } | DriverRequest::Cancel | DriverRequest::SendKeys { .. } => {
             store.set_instance_state(
                 instance_id,
                 None,
@@ -663,6 +663,19 @@ fn command_parts(
             ))
         }
         CommandAction::Close => Ok((CommandOperation::InstanceClose, DriverRequest::Close, true)),
+        CommandAction::WriteTty => {
+            let keys = request.keys.clone().unwrap_or_default();
+            if keys.is_empty() {
+                return Err(NodeError::InvalidRequest(
+                    "tty.write requires keys".to_owned(),
+                ));
+            }
+            Ok((
+                CommandOperation::TtyWrite,
+                DriverRequest::SendKeys { keys },
+                false,
+            ))
+        }
     }
 }
 
@@ -1183,5 +1196,63 @@ mod tests {
                 LifecyclePayload::Entity(entity) if entity.state == "failed"
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn tty_write_dispatches_send_keys_on_fake_driver() {
+        let node = DevNode::new(&crate::DevServerConfig::loopback(0)).expect("node");
+        let created = node
+            .create_instance(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "prompt": ""
+                }))
+                .expect("request"),
+            )
+            .await
+            .expect("create");
+        let result = crate::transport::hubnode::dispatch_method(
+            &node,
+            remuda_protocol::hubnode::METHOD_TTY_WRITE,
+            serde_json::json!({
+                "instanceId": created.instance.meta.id,
+                "keys": ["enter"]
+            }),
+        )
+        .await
+        .expect("tty.write");
+        assert!(result.get("error").is_none(), "{result}");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let instance = node
+                    .get_instance(&created.instance.meta.id)
+                    .expect("instance");
+                let page = node
+                    .read_journal(&instance.journal_id, None, 64)
+                    .expect("journal");
+                if page.events.iter().any(|event| {
+                    let JournalEvent::Instance(observation) = event else {
+                        return false;
+                    };
+                    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+                        return false;
+                    };
+                    let LifecyclePayload::Native(native) = payload.as_ref() else {
+                        return false;
+                    };
+                    native.native_name == "fake-driver-keys"
+                        && native.status
+                            == Knowledge::Known {
+                                value: "enter".into(),
+                            }
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake-driver-keys lifecycle");
     }
 }

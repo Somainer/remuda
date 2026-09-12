@@ -5,7 +5,7 @@ pub(crate) use crate::transport::hubnode::SeqWatermark;
 use crate::{CommandAction, CreateInstanceRequest, DevNode, InstanceCommandRequest, NodeError};
 use remuda_protocol::hubnode::{
     HubNodeMethod, InstanceCancelParams, InstanceCreateParams, InstanceRespondParams,
-    InstanceSendParams,
+    InstanceSendParams, TtyWriteParams,
 };
 use remuda_protocol::{AgentKind, DriverKind, InstanceId, JournalEvent, U64};
 use serde_json::{Value, json};
@@ -98,6 +98,11 @@ async fn dispatch_hub(
         }
         Some(HubNodeMethod::InstanceRespond | HubNodeMethod::InteractionRespond) => {
             let (instance_id, result) = respond_from_params(&runtime.node, params).await?;
+            catch_up(runtime, &instance_id).await?;
+            Ok(result)
+        }
+        Some(HubNodeMethod::TtyWrite | HubNodeMethod::InstanceKeys) => {
+            let (instance_id, result) = keys_from_params(&runtime.node, params).await?;
             catch_up(runtime, &instance_id).await?;
             Ok(result)
         }
@@ -225,6 +230,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 run_id,
                 interaction_id: None,
                 answer: None,
+                keys: None,
             },
         )
         .await?;
@@ -260,6 +266,7 @@ async fn cancel_from_params(
                 run_id,
                 interaction_id: None,
                 answer: None,
+                keys: None,
             },
         )
         .await?;
@@ -291,6 +298,42 @@ async fn close_from_params(
                 run_id: None,
                 interaction_id: None,
                 answer: None,
+                keys: None,
+            },
+        )
+        .await?;
+    Ok((instance_id, serde_json::to_value(&result)?))
+}
+
+async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, Value), NodeError> {
+    let parsed: TtyWriteParams = serde_json::from_value(params.clone()).unwrap_or_default();
+    let instance_id = parsed
+        .instance_id
+        .as_deref()
+        .or_else(|| params.get("instanceId").and_then(Value::as_str))
+        .ok_or_else(|| NodeError::InvalidRequest("tty.write requires instanceId".into()))?;
+    let instance_id = InstanceId::try_from(instance_id.to_owned())
+        .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
+    let keys = parsed.key_names();
+    if keys.is_empty() {
+        return Err(NodeError::InvalidRequest("tty.write requires keys".into()));
+    }
+    let command_id = parsed
+        .command_id
+        .as_deref()
+        .and_then(|raw| remuda_protocol::CommandId::try_from(raw.to_owned()).ok())
+        .or_else(|| command_id_of(&params));
+    let result = node
+        .submit_command(
+            &instance_id,
+            InstanceCommandRequest {
+                command_id,
+                operation: CommandAction::WriteTty,
+                prompt: None,
+                run_id: None,
+                interaction_id: None,
+                answer: None,
+                keys: Some(keys),
             },
         )
         .await?;
@@ -334,6 +377,7 @@ async fn respond_from_params(
                 run_id: None,
                 interaction_id,
                 answer: Some(answer),
+                keys: None,
             },
         )
         .await?;

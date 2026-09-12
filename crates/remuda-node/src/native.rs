@@ -317,6 +317,12 @@ impl Driver for NativeAdapter {
                 DriverRequest::Close => {
                     self.native.close().await.map_err(map_driver_error)?;
                 }
+                DriverRequest::SendKeys { keys } => {
+                    self.native
+                        .send_keys(keys)
+                        .await
+                        .map_err(map_driver_error)?;
+                }
             }
             Ok(Vec::new())
         })

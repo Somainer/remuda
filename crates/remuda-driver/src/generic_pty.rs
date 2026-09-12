@@ -565,8 +565,18 @@ impl Driver for GenericPtyDriver {
         Ok(DriverAck::transport_written())
     }
 
+    async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
+        let inner = self.inner.lock().await;
+        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        live.client
+            .agent_send_keys(&live.agent_name, keys)
+            .await
+            .map_err(map_herdr)?;
+        Ok(DriverAck::transport_written())
+    }
+
     async fn cancel(&self) -> DriverResult<DriverAck> {
-        self.send_keys(vec!["esc".into()]).await
+        GenericPtyDriver::send_keys(self, vec!["esc".into()]).await
     }
 
     async fn respond_interaction(

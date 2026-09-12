@@ -272,6 +272,7 @@ pub(crate) async fn shutdown_drivers(node: &DevNode, deadline: Duration) -> anyh
                 run_id: None,
                 interaction_id: None,
                 answer: None,
+                keys: None,
             }).await?;
             loop {
                 let command = node.get_command(&result.command.meta.id)?;

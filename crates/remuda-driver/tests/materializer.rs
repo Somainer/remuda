@@ -1,9 +1,10 @@
 //! Launch materializer: idempotency, secret omission, banned flags, binary pin.
 
 use remuda_driver::{
-    BinarySource, Delegation, DriverError, FileRole, LaunchOrigin, LaunchRecipe,
+    BinaryPin, BinarySource, Delegation, DriverError, FileRole, LaunchOrigin, LaunchRecipe,
     MaterializeRequest, ProviderHealth, ProviderKind, ProviderProfile, SecretRef, SessionAction,
-    TECH_DEBT_M0_PERM_01, TokenBrokerBind, materialize, materialize_with_token_broker, pin_binary,
+    TECH_DEBT_M0_PERM_01, TokenBrokerBind, hash_file, materialize, materialize_with_token_broker,
+    pin_binary,
 };
 use remuda_protocol::{
     ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, CommandOrigin, DriverKind,
@@ -70,8 +71,26 @@ fn request<'a>(
     }
 }
 
+/// Pin a test stub by hashing it. Do not exec the file: Linux CI (and some
+/// `/tmp` volumes) mount tempfile dirs `noexec`, so `pin_binary`'s `--version`
+/// probe panics while the same test passes on macOS.
 fn pin_source(path: &Path) -> BinarySource {
-    BinarySource::Pinned(pin_binary(path).unwrap())
+    BinarySource::Pinned(pin_stub(path))
+}
+
+fn pin_stub(path: &Path) -> BinaryPin {
+    let abs = fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().expect("cwd").join(path)
+        }
+    });
+    BinaryPin {
+        abs_path: abs.to_string_lossy().into_owned(),
+        version: "stub".into(),
+        sha256: hash_file(&abs).expect("hash test stub"),
+    }
 }
 
 #[test]
@@ -239,11 +258,12 @@ fn dont_ask_is_tagged_td_m0_perm_01() {
 fn binary_pin_resolves_stub_and_hashes() {
     let tmp = tempfile::tempdir().unwrap();
     let path = stub_binary(tmp.path(), "2.1.268 (Claude Code)");
-    let first = pin_binary(&path).unwrap();
-    let second = pin_binary(&path).unwrap();
+    let first = pin_stub(&path);
+    let second = pin_stub(&path);
     assert_eq!(first, second);
     assert!(first.abs_path.starts_with('/'));
-    assert_eq!(first.version, "2.1.268 (Claude Code)");
+    assert_eq!(first.sha256, second.sha256);
+    assert!(String::from(first.sha256).starts_with("sha256:"));
 }
 
 #[test]

@@ -23,7 +23,7 @@ mod secrets;
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;
 
-pub use binary::{BinaryPin, default_command, pin_binary, resolve_binary};
+pub use binary::{BinaryPin, default_command, hash_file, pin_binary, resolve_binary};
 pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
 };

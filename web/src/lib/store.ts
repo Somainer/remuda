@@ -6,6 +6,13 @@ import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
 import type { Workspace } from "../types/workspace";
 import { api, observationText, type InstanceCreateSpec, type PtyKey, type WorktreeCreateSpec } from "./api";
+import {
+  DEFAULT_EFFORT_INDEX,
+  effortAt,
+  mapEffort,
+  type EffortKind,
+  type EffortSelection,
+} from "../features/session/effort";
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -54,6 +61,8 @@ export type HubState = {
   journalStatus: Record<string, JournalClient["status"]>;
   bubbles: LocalBubble[];
   permissionMode: Record<string, string>;
+  effort: Record<string, EffortSelection>;
+  models: Record<string, string>;
   compact: boolean;
   answering: Record<string, true>;
   screens: Record<string, { lines: string[]; done: boolean }>;
@@ -76,6 +85,8 @@ const initial: HubState = {
   journalStatus: {},
   bubbles: [],
   permissionMode: {},
+  effort: {},
+  models: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
   screens: {},
@@ -353,7 +364,16 @@ class HubStore {
 
   async create(spec: InstanceCreateSpec) {
     const result = await api.instanceCreate(spec);
-    this.emit({ instances: [result.instance, ...this.state.instances.filter((i) => i.id !== result.instance.id)] });
+    const createdId = result.instance.id;
+    const kind = spec.kind as EffortKind;
+    const effort = effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX);
+    if (spec.effortName) effort.name = spec.effortName;
+    this.emit({
+      instances: [result.instance, ...this.state.instances.filter((i) => i.id !== createdId)],
+      permissionMode: { ...this.state.permissionMode, [createdId]: spec.permissionMode },
+      effort: { ...this.state.effort, [createdId]: effort },
+      models: { ...this.state.models, [createdId]: spec.model },
+    });
     await this.refresh();
     return this.state.instances.find((i) => i.id === result.instance.id) ?? result.instance;
   }
@@ -440,9 +460,25 @@ class HubStore {
     await this.refresh();
   }
 
-  async configure(instanceId: Id, permissionMode: string) {
-    await api.instanceConfigure(instanceId, permissionMode);
-    this.emit({ permissionMode: { ...this.state.permissionMode, [instanceId]: permissionMode } });
+  async configure(
+    instanceId: Id,
+    permissionMode: string,
+    extras?: { model?: string; effort?: EffortSelection },
+  ) {
+    await api.instanceConfigure(instanceId, permissionMode, extras);
+    this.emit({
+      permissionMode: { ...this.state.permissionMode, [instanceId]: permissionMode },
+      ...(extras?.effort ? { effort: { ...this.state.effort, [instanceId]: extras.effort } } : {}),
+      ...(extras?.model ? { models: { ...this.state.models, [instanceId]: extras.model } } : {}),
+    });
+  }
+
+  async setEffort(instanceId: Id, effort: EffortSelection) {
+    await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });
+  }
+
+  async setModel(instanceId: Id, model: string) {
+    await this.configure(instanceId, this.permissionModeOf(instanceId), { model });
   }
 
   async respond(interactionId: Id, answer: InteractionAnswer) {
@@ -475,6 +511,18 @@ class HubStore {
 
   permissionModeOf(instanceId: Id) {
     return this.state.permissionMode[instanceId] ?? api.permissionModeOf(instanceId);
+  }
+
+  effortOf(instanceId: Id, kind?: EffortKind | string): EffortSelection {
+    const stored = this.state.effort[instanceId];
+    const fallbackKind = (kind ?? stored?.kind ?? "claude") as EffortKind;
+    if (!stored) return effortAt(fallbackKind, readDeviceSettings().defaultEffortIndex ?? DEFAULT_EFFORT_INDEX);
+    if (kind && stored.kind !== kind) return mapEffort(stored, kind);
+    return stored;
+  }
+
+  modelOf(instanceId: Id, kind?: string): string {
+    return this.state.models[instanceId] ?? (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus");
   }
 
   hostName(hostId: Id) {

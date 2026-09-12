@@ -238,6 +238,10 @@
   color: var(--line);
 }
 
+.effortEmber {
+  color: var(--dust);
+}
+
 .headline {
   display: flex;
   align-items: center;

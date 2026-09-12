@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { iosStandaloneHint, readDeviceSettings, writeDeviceSettings, type PermissionDefault } from "../features/settings";
+import { effortTable, isEmberTier } from "../features/session/effort";
 import css from "../features/settings/settings.module.css";
 import { readAccessCode, writeAccessCode } from "../lib/accessCode";
 import { clipboardIo } from "../lib/clipboard";
@@ -12,7 +13,7 @@ import { LoginPage } from "./LoginPage";
 const PERMS: { id: PermissionDefault; label: string }[] = [
   { id: "manual", label: "询问" },
   { id: "acceptEdits", label: "可改文件" },
-  { id: "bypassPermissions", label: "全自动" },
+  { id: "dontAsk", label: "全自动" },
 ];
 
 export function SettingsPage() {
@@ -191,6 +192,30 @@ export function SettingsPage() {
                 {opt.label}
               </button>
             ))}
+          </div>
+        </section>
+
+        <section className={css.section}>
+          <div className={css.label}>默认 effort</div>
+          <p className={css.hint}>存序号，换 harness 后按新表就近映射。档位名保持英文。最高档为 ember。</p>
+          <div className={css.row} data-testid="settings-effort">
+            {effortTable("claude").map((tier, index) => {
+              const on = settings.defaultEffortIndex === index;
+              const top = isEmberTier("claude", index);
+              return (
+                <button
+                  key={tier.name}
+                  type="button"
+                  className={`${css.chip} ${on ? css.chipOn : ""} ${top ? css.chipEmber : ""}`}
+                  data-testid={`settings-effort-${tier.name}`}
+                  data-ember={top ? "1" : "0"}
+                  data-selected={on ? "1" : "0"}
+                  onClick={() => patch({ defaultEffortIndex: index })}
+                >
+                  {tier.name}
+                </button>
+              );
+            })}
           </div>
         </section>
 

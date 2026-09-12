@@ -256,6 +256,8 @@ export type HelloResult = {
   features: string[];
 };
 
+export type EffortRef = { index: number; name: string };
+
 export type InstanceCreateSpec = {
   hostId: Id;
   workspaceId?: Id;
@@ -272,6 +274,15 @@ export type InstanceCreateSpec = {
   claudeConfigDir?: string;
   maxBudgetUsd?: string;
   name?: string;
+  /** Composer/New Session effort. Stored in UI state; Hub ignores unknown create fields. */
+  effortIndex?: number;
+  effortName?: string;
+};
+
+export type InstanceConfigurePatch = {
+  permissionMode?: string;
+  model?: string;
+  effort?: EffortRef;
 };
 
 export type WorktreeRecord = {
@@ -341,7 +352,7 @@ export type HubApi = {
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
   instanceResume(instanceId: Id): Promise<CommandResult>;
-  instanceConfigure(instanceId: Id, permissionMode: string): Promise<CommandResult>;
+  instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
   interactionRespond(interactionId: Id, answer: InteractionAnswer): Promise<CommandResult>;
@@ -575,8 +586,8 @@ function createMockApi(): HubApi {
     async instanceResume(instanceId) {
       return mockResume(instanceId);
     },
-    async instanceConfigure(instanceId, permissionMode) {
-      return mockConfigure(instanceId, permissionMode);
+    async instanceConfigure(instanceId, permissionMode, extras) {
+      return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode);
     },
     async interactionList(q) {
       return mockDb.interactions.filter((i) => {
@@ -684,7 +695,12 @@ function createMockApi(): HubApi {
       const subscriptionId = id("sub_");
       subs.set(subscriptionId, onBatch);
       const snapshot = mockSnapshot(instance);
-      const page = mockReadJournal(journalId, snapshot.asOfSeq, 128);
+      let page: { events: Observation[]; durableSeq: string };
+      try {
+        page = mockReadJournal(journalId, snapshot.asOfSeq, 128);
+      } catch {
+        page = { events: [], durableSeq: snapshot.asOfSeq };
+      }
       if (page.events.length) {
         queueMicrotask(() => {
           onBatch({
@@ -877,8 +893,12 @@ function createLiveApi(): HubApi {
     async instanceResume(instanceId) {
       return command(instanceId, "instance.resume", {});
     },
-    async instanceConfigure(instanceId, permissionMode) {
-      return command(instanceId, "instance.configure", { permissionMode });
+    async instanceConfigure(instanceId, permissionMode, extras) {
+      return command(instanceId, "instance.configure", {
+        permissionMode: extras?.permissionMode ?? permissionMode,
+        ...(extras?.model ? { model: extras.model } : {}),
+        ...(extras?.effort ? { effort: extras.effort } : {}),
+      });
     },
     async interactionList(q) {
       const qs = new URLSearchParams();

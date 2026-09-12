@@ -6,6 +6,8 @@ import { Button } from "../components/Button";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
+import { contextPercent } from "../features/session/effort";
+import { useHostViews } from "../features/hosts";
 import { Transcript } from "../features/session/Transcript";
 import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
@@ -29,6 +31,7 @@ export function SessionPage({
   const { mobile, offsetTop } = useWorkbenchViewport();
   const [sending, setSending] = useState(false);
   const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
+  const hostViews = useHostViews(hub.hosts, hub.instances);
   const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
 
   useEffect(() => {
@@ -264,31 +267,44 @@ export function SessionPage({
             ))}
           </div>
         ) : null}
-        {status === "blocked" ? null : (
-          <Composer
-            key={instance.id}
-            instanceId={instance.id}
-            mobile={mobile}
-            sending={sending}
-            disabled={status === "exited"}
-            permissionMode={hubStore.permissionModeOf(instance.id)}
-            onPermission={
-              genericPty
-                ? undefined
-                : (mode) => {
-                    void hubStore.configure(instance.id, mode);
-                  }
+        <Composer
+          key={instance.id}
+          instanceId={instance.id}
+          mobile={mobile}
+          sending={sending}
+          disabled={status === "exited" || pending.length > 0}
+          permissionMode={hubStore.permissionModeOf(instance.id)}
+          kind={instance.kind}
+          model={hubStore.modelOf(instance.id, instance.kind)}
+          effort={hubStore.effortOf(instance.id, instance.kind)}
+          contextLabel={(() => {
+            const pct = contextPercent(usage, instance.kind);
+            return pct == null ? null : `${pct}%`;
+          })()}
+          hostLabel={hubStore.hostName(instance.hostId)}
+          hostCli={hostViews.find((h) => h.id === instance.hostId)?.cli ?? []}
+          onPermission={
+            genericPty
+              ? undefined
+              : (mode) => {
+                  void hubStore.configure(instance.id, mode);
+                }
+          }
+          onEffort={(next) => {
+            void hubStore.setEffort(instance.id, next);
+          }}
+          onModel={(next) => {
+            void hubStore.setModel(instance.id, next);
+          }}
+          onSend={async (text: string) => {
+            setSending(true);
+            try {
+              await hubStore.send(instance.id, text);
+            } finally {
+              setSending(false);
             }
-            onSend={async (text: string) => {
-              setSending(true);
-              try {
-                await hubStore.send(instance.id, text);
-              } finally {
-                setSending(false);
-              }
-            }}
-          />
-        )}
+          }}
+        />
       </div>}
     </div>
   );

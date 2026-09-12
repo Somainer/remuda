@@ -11,12 +11,14 @@ import {
 } from "./sessionOptions";
 
 describe("sessionOptions", () => {
-  it("maps yolo / dontAsk onto bypassPermissions", () => {
+  it("keeps dontAsk and bypassPermissions as distinct modes", () => {
     expect(normalizePermissionMode("bypassPermissions")).toBe("bypassPermissions");
-    expect(normalizePermissionMode("dontAsk")).toBe("bypassPermissions");
+    expect(normalizePermissionMode("dontAsk")).toBe("dontAsk");
     expect(normalizePermissionMode("manual")).toBe("manual");
-    expect(PERMISSION_OPTIONS.some((o) => o.id === "bypassPermissions" && o.label === "全自动")).toBe(true);
-    expect(YOLO_HINT.toLowerCase()).toContain("bypasspermissions");
+    expect(PERMISSION_OPTIONS.map((o) => o.id)).toEqual(["manual", "acceptEdits", "dontAsk", "bypassPermissions"]);
+    expect(PERMISSION_OPTIONS.some((o) => o.id === "dontAsk" && o.label === "全自动")).toBe(true);
+    expect(PERMISSION_OPTIONS.some((o) => o.id === "bypassPermissions" && o.label === "绕过全部")).toBe(true);
+    expect(YOLO_HINT).toMatch(/审批/);
   });
 
   it("defaults delegation to native none, not a named gateway vendor", () => {

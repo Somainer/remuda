@@ -3,7 +3,8 @@
 export const PERMISSION_OPTIONS = [
   { id: "manual", label: "询问" },
   { id: "acceptEdits", label: "可改文件" },
-  { id: "bypassPermissions", label: "全自动" },
+  { id: "dontAsk", label: "全自动" },
+  { id: "bypassPermissions", label: "绕过全部" },
 ] as const;
 
 export type PermissionModeId = (typeof PERMISSION_OPTIONS)[number]["id"];
@@ -16,7 +17,9 @@ export const DELEGATION_OPTIONS = [
 export type DelegationId = (typeof DELEGATION_OPTIONS)[number]["id"];
 
 export const YOLO_HINT =
-  "全自动（yolo）会跳过工具批准并允许危险权限（bypassPermissions）。仅限你本人发起的会话；不要用于 bot，也不要在生产目录上用。";
+  "审批中心不会再出现这台实例的条目，手机也收不到推送 —— 你只能靠 transcript 事后看它做了什么。仅建议用在一次性沙箱 cwd。";
+
+export const YOLO_ACK = "我明白，开始时再确认一次";
 
 /** Node `generic-pty` yolo argv applied server-side per kind. */
 export const PTY_YOLO_FLAGS: Record<"claude" | "codex" | "grok" | "agy", string> = {
@@ -31,7 +34,8 @@ export function ptyYoloHint(kind: keyof typeof PTY_YOLO_FLAGS): string {
 }
 
 export function normalizePermissionMode(value: string | undefined): PermissionModeId {
-  if (value === "bypassPermissions" || value === "dontAsk") return "bypassPermissions";
+  if (value === "bypassPermissions") return "bypassPermissions";
+  if (value === "dontAsk") return "dontAsk";
   if (value === "acceptEdits") return "acceptEdits";
   return "manual";
 }

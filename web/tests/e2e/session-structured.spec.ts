@@ -39,7 +39,8 @@ test.describe("structured session M0-13", () => {
     await row(page, "清一下 /tmp/coord-media").click();
     await expect(page.getByTestId("approval-card")).toBeVisible();
     await expect(page.getByText("多台设备同时点")).toBeVisible();
-    await expect(page.getByTestId("composer")).toHaveCount(0);
+    await expect(page.getByTestId("composer")).toBeVisible();
+    await expect(page.getByTestId("composer").locator("textarea")).toBeDisabled();
     await page.getByRole("button", { name: "允许一次" }).click();
     await expect(page.getByTestId("approval-card")).toHaveCount(0);
   });
@@ -48,7 +49,8 @@ test.describe("structured session M0-13", () => {
     await page.goto("/sessions");
     await row(page, "spill 从哪改").click();
     await expect(page.getByTestId("question-form")).toBeVisible();
-    await expect(page.getByTestId("composer")).toHaveCount(0);
+    await expect(page.getByTestId("composer")).toBeVisible();
+    await expect(page.getByTestId("composer").locator("textarea")).toBeDisabled();
     await page.getByText("src/exec.cc").click();
     await page.getByRole("button", { name: "提交" }).click();
   });

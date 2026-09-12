@@ -1,9 +1,9 @@
 # Feature-owned command and route registration
 
 Add CLI arguments, help and execution to the feature's `crates/remuda/src/cmd/`
-module. Implement `registry::Entrypoint` for its argument type. One entry in
-`cmd/mod.rs`'s `commands!` list declares the module, creates the Clap variant,
-and connects dispatch. There is no feature-specific match in `main.rs`.
+module. Implement `registry::Entrypoint` for its argument type. Declare the module in `cmd/mod.rs`, then add one entry to its `commands!`
+list to create the Clap variant and connect dispatch. Explicit module
+declarations keep feature files discoverable by `cargo fmt --all`. There is no feature-specific match in `main.rs`.
 Existing command groups add subcommands entirely inside their own module.
 
 `registry::Context` carries global `--config` and `--data-dir` options. Loading
@@ -17,7 +17,7 @@ MCP tools live in `cmd/mcp/{instance,worktree,fleet,merge,doctor}.rs`. Each
 registration. Add a tool to its group's `tools()` function; the catalog and
 dispatch pick it up together. Use `.report()` for results with an `exitCode`:
 the registry exposes `structuredContent` and maps nonzero codes to `isError`.
-A new group needs one entry in `mcp/mod.rs`'s `tool_groups!` list. Framing and
+Declare a new group module and add one entry in `mcp/mod.rs`'s `tool_groups!` list. Framing and
 JSON-RPC transport stay in `mcp/mod.rs`; generic JSON helpers stay in `args.rs`.
 
 The Hub composition root merges feature routers. Register host, instance,

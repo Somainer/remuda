@@ -1,9 +1,14 @@
 //! MCP fleet tools: metadata and handler are registered together.
 
+use super::{
+    Tool,
+    args::{opt_str, send_text_from_args, string_list},
+};
+use crate::cmd::fleet::{
+    FleetFilter, FleetKeysOpts, FleetRunOpts, FleetSendOpts, fleet_keys, fleet_run, fleet_send_opts,
+};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use super::{Tool, args::{opt_str, string_list, send_text_from_args}};
-use crate::cmd::fleet::{FleetFilter, FleetKeysOpts, FleetRunOpts, FleetSendOpts, fleet_keys, fleet_run, fleet_send_opts};
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![
@@ -23,9 +28,9 @@ pub(super) fn tools() -> Vec<Tool> {
                     "prompt": { "type": "string" }
                 }
             }),
-            |client, args| Box::pin(async move {
-fleet_run(client, fleet_opts_from_json(&args)?).await
-            }),
+            |client, args| {
+                Box::pin(async move { fleet_run(client, fleet_opts_from_json(&args)?).await })
+            },
         ),
         Tool::new(
             "remuda_fleet_send",
@@ -42,18 +47,20 @@ fleet_run(client, fleet_opts_from_json(&args)?).await
                     "file": { "type": "string" }
                 }
             }),
-            |client, args| Box::pin(async move {
-let text = send_text_from_args(&args)?;
-            fleet_send_opts(
-                client,
-                FleetSendOpts {
-                    filter: fleet_filter_from_json(&args),
-                    idempotency_key: opt_str(&args, "idempotencyKey").map(str::to_string),
-                    text,
-                },
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let text = send_text_from_args(&args)?;
+                    fleet_send_opts(
+                        client,
+                        FleetSendOpts {
+                            filter: fleet_filter_from_json(&args),
+                            idempotency_key: opt_str(&args, "idempotencyKey").map(str::to_string),
+                            text,
+                        },
+                    )
+                    .await
+                })
+            },
         ),
         Tool::new(
             "remuda_fleet_keys",
@@ -70,21 +77,23 @@ let text = send_text_from_args(&args)?;
                     "keys": { "type": "array", "items": { "type": "string" } }
                 }
             }),
-            |client, args| Box::pin(async move {
-let keys = string_list(&args, "keys");
-            if keys.is_empty() {
-                return Err(anyhow!("remuda_fleet_keys requires keys"));
-            }
-            fleet_keys(
-                client,
-                FleetKeysOpts {
-                    filter: fleet_filter_from_json(&args),
-                    idempotency_key: opt_str(&args, "idempotencyKey").map(str::to_string),
-                    keys,
-                },
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let keys = string_list(&args, "keys");
+                    if keys.is_empty() {
+                        return Err(anyhow!("remuda_fleet_keys requires keys"));
+                    }
+                    fleet_keys(
+                        client,
+                        FleetKeysOpts {
+                            filter: fleet_filter_from_json(&args),
+                            idempotency_key: opt_str(&args, "idempotencyKey").map(str::to_string),
+                            keys,
+                        },
+                    )
+                    .await
+                })
+            },
         ),
     ]
 }
@@ -119,4 +128,3 @@ fn fleet_filter_from_json(args: &Value) -> FleetFilter {
         kinds,
     }
 }
-

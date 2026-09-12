@@ -136,9 +136,11 @@ Dry-run does not construct a merge or run gate checks; its provisional step
 plan comes from the current checkout, so branch changes can alter the real plan.
 
 The gate keeps the shared CI order: secret scan, formatting, workspace check,
-Clippy, workspace tests (one automatic retry), and optional web install/build/
+Clippy, affected crate tests (one automatic retry), and optional web install/build/
 tests when forced or when `web/` changes. It uses its own target directory
-(default `<repo>/target-gate`) and `CARGO_INCREMENTAL=0`.
+(default `<repo>/target-gate`) and `CARGO_INCREMENTAL=0`. `--affected` is the
+default and includes reverse dependencies; `--full` tests the whole workspace.
+The Cargo test step reports selected crate names. See [affected test selection](merge-affected.md).
 
 Successful merge commits use `merge: <branch> into main` by default.
 `--message` overrides the message while retaining an appended gate summary.
@@ -161,7 +163,7 @@ inspect `mainUpdated` before retrying. `--no-push` skips only the push.
 | --- | --- | --- |
 | `remuda_doctor` | Optional `host` or `local`, optional local `dataDir` | Same structured diagnostic report; blockers set `isError: true` |
 | `remuda_worktree_rm` | Required `name` (name or explicit path), optional `repo`, boolean `force` | Removal result including retained branch; same protections as CLI |
-| `remuda_merge` | Required `branch`, `gate: true` or `dryRun: true`; optional `web`, `noPush`, `repo`, `targetDir`, `message` | Same merge report and exit semantics |
+| `remuda_merge` | Required `branch`, `gate: true` or `dryRun: true`; optional `web`, `noPush`, `repo`, `targetDir`, `message`, `affected`, `full` | Same merge report and exit semantics |
 
 Example tool arguments:
 

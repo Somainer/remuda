@@ -1,9 +1,12 @@
 //! MCP instance tools: metadata and handler are registered together.
 
+use super::{
+    Tool,
+    args::{opt_str, required_str, send_text_from_args, string_list},
+};
+use crate::cmd::instance::{CreateOpts, create, list_instances, read, send, send_keys, stop, wait};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use super::{Tool, args::{opt_str, required_str, string_list, send_text_from_args}};
-use crate::cmd::instance::{CreateOpts, create, list_instances, read, send, send_keys, stop, wait};
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![
@@ -31,9 +34,9 @@ pub(super) fn tools() -> Vec<Tool> {
                     "commandId": { "type": "string" }
                 }
             }),
-            |client, args| Box::pin(async move {
-create(client, create_opts_from_json(&args)?).await
-            }),
+            |client, args| {
+                Box::pin(async move { create(client, create_opts_from_json(&args)?).await })
+            },
         ),
         Tool::new(
             "remuda_instance_list",
@@ -44,9 +47,9 @@ create(client, create_opts_from_json(&args)?).await
                     "host": { "type": "string" }
                 }
             }),
-            |client, args| Box::pin(async move {
-list_instances(client, opt_str(&args, "host")).await
-            }),
+            |client, args| {
+                Box::pin(async move { list_instances(client, opt_str(&args, "host")).await })
+            },
         ),
         Tool::new(
             "remuda_instance_send",
@@ -62,19 +65,21 @@ list_instances(client, opt_str(&args, "host")).await
                     "completionScope": { "type": "string" }
                 }
             }),
-            |client, args| Box::pin(async move {
-let instance_id = required_str(&args, "instanceId")?;
-            let text = send_text_from_args(&args)?;
-            send(
-                client,
-                instance_id,
-                &text,
-                opt_str(&args, "commandId"),
-                opt_str(&args, "completionScope").unwrap_or("native-turn"),
-                "mcp",
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let instance_id = required_str(&args, "instanceId")?;
+                    let text = send_text_from_args(&args)?;
+                    send(
+                        client,
+                        instance_id,
+                        &text,
+                        opt_str(&args, "commandId"),
+                        opt_str(&args, "completionScope").unwrap_or("native-turn"),
+                        "mcp",
+                    )
+                    .await
+                })
+            },
         ),
         Tool::new(
             "remuda_instance_respond",
@@ -84,20 +89,22 @@ let instance_id = required_str(&args, "instanceId")?;
                 "option":{"type":"string"}, "text":{"type":"string"},
                 "answer":{"type":"object"}, "commandId":{"type":"string"}
             }}),
-            |client, args| Box::pin(async move {
-crate::cmd::instance_interaction::respond(
-                client,
-                crate::cmd::instance_interaction::RespondOpts {
-                    instance_id: required_str(&args, "instanceId")?.to_owned(),
-                    interaction_id: opt_str(&args, "interactionId").map(str::to_owned),
-                    option: opt_str(&args, "option").map(str::to_owned),
-                    text: opt_str(&args, "text").map(str::to_owned),
-                    answer: args.get("answer").map(Value::to_string),
-                    command_id: opt_str(&args, "commandId").map(str::to_owned),
-                },
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    crate::cmd::instance_interaction::respond(
+                        client,
+                        crate::cmd::instance_interaction::RespondOpts {
+                            instance_id: required_str(&args, "instanceId")?.to_owned(),
+                            interaction_id: opt_str(&args, "interactionId").map(str::to_owned),
+                            option: opt_str(&args, "option").map(str::to_owned),
+                            text: opt_str(&args, "text").map(str::to_owned),
+                            answer: args.get("answer").map(Value::to_string),
+                            command_id: opt_str(&args, "commandId").map(str::to_owned),
+                        },
+                    )
+                    .await
+                })
+            },
         ),
         Tool::new(
             "remuda_instance_wait",
@@ -113,25 +120,27 @@ crate::cmd::instance_interaction::respond(
                     "timeoutMs": { "type": "integer" }
                 }
             }),
-            |client, args| Box::pin(async move {
-let instance_id = required_str(&args, "instanceId")?;
-            let timeout_ms = args
-                .get("timeoutMs")
-                .and_then(Value::as_u64)
-                .or_else(|| args.get("timeout").and_then(Value::as_u64))
-                .unwrap_or(30_000);
-            let until = opt_str(&args, "until")
-                .or_else(|| opt_str(&args, "condition"))
-                .unwrap_or("done");
-            wait(
-                client,
-                instance_id,
-                until,
-                opt_str(&args, "afterSeq"),
-                timeout_ms,
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let instance_id = required_str(&args, "instanceId")?;
+                    let timeout_ms = args
+                        .get("timeoutMs")
+                        .and_then(Value::as_u64)
+                        .or_else(|| args.get("timeout").and_then(Value::as_u64))
+                        .unwrap_or(30_000);
+                    let until = opt_str(&args, "until")
+                        .or_else(|| opt_str(&args, "condition"))
+                        .unwrap_or("done");
+                    wait(
+                        client,
+                        instance_id,
+                        until,
+                        opt_str(&args, "afterSeq"),
+                        timeout_ms,
+                    )
+                    .await
+                })
+            },
         ),
         Tool::new(
             "remuda_instance_read",
@@ -147,22 +156,24 @@ let instance_id = required_str(&args, "instanceId")?;
                     "source": { "type": "string", "description": "screen | journal" }
                 }
             }),
-            |client, args| Box::pin(async move {
-let instance_id = required_str(&args, "instanceId")?;
-            let lines = args
-                .get("lines")
-                .and_then(Value::as_u64)
-                .or_else(|| args.get("limit").and_then(Value::as_u64))
-                .unwrap_or(120) as usize;
-            read(
-                client,
-                instance_id,
-                opt_str(&args, "afterSeq"),
-                lines,
-                opt_str(&args, "source").unwrap_or("journal"),
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let instance_id = required_str(&args, "instanceId")?;
+                    let lines = args
+                        .get("lines")
+                        .and_then(Value::as_u64)
+                        .or_else(|| args.get("limit").and_then(Value::as_u64))
+                        .unwrap_or(120) as usize;
+                    read(
+                        client,
+                        instance_id,
+                        opt_str(&args, "afterSeq"),
+                        lines,
+                        opt_str(&args, "source").unwrap_or("journal"),
+                    )
+                    .await
+                })
+            },
         ),
         Tool::new(
             "remuda_instance_keys",
@@ -175,10 +186,12 @@ let instance_id = required_str(&args, "instanceId")?;
                     "keys": { "type": "array", "items": { "type": "string" } }
                 }
             }),
-            |client, args| Box::pin(async move {
-let instance_id = required_str(&args, "instanceId")?;
-            send_keys(client, instance_id, &string_list(&args, "keys")).await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let instance_id = required_str(&args, "instanceId")?;
+                    send_keys(client, instance_id, &string_list(&args, "keys")).await
+                })
+            },
         ),
         Tool::new(
             "remuda_instance_stop",
@@ -193,17 +206,19 @@ let instance_id = required_str(&args, "instanceId")?;
                     "commandId": { "type": "string" }
                 }
             }),
-            |client, args| Box::pin(async move {
-let instance_id = required_str(&args, "instanceId")?;
-            stop(
-                client,
-                instance_id,
-                opt_str(&args, "scope").unwrap_or("run"),
-                opt_str(&args, "runId"),
-                opt_str(&args, "commandId"),
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let instance_id = required_str(&args, "instanceId")?;
+                    stop(
+                        client,
+                        instance_id,
+                        opt_str(&args, "scope").unwrap_or("run"),
+                        opt_str(&args, "runId"),
+                        opt_str(&args, "commandId"),
+                    )
+                    .await
+                })
+            },
         ),
         Tool::new(
             "remuda_instance_rm",
@@ -216,17 +231,19 @@ let instance_id = required_str(&args, "instanceId")?;
                     "commandId": { "type": "string" }
                 }
             }),
-            |client, args| Box::pin(async move {
-let instance_id = required_str(&args, "instanceId")?;
-            stop(
-                client,
-                instance_id,
-                "instance",
-                None,
-                opt_str(&args, "commandId"),
-            )
-            .await
-            }),
+            |client, args| {
+                Box::pin(async move {
+                    let instance_id = required_str(&args, "instanceId")?;
+                    stop(
+                        client,
+                        instance_id,
+                        "instance",
+                        None,
+                        opt_str(&args, "commandId"),
+                    )
+                    .await
+                })
+            },
         ),
     ]
 }
@@ -255,4 +272,3 @@ fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
         command_id: opt_str(args, "commandId").map(str::to_string),
     })
 }
-

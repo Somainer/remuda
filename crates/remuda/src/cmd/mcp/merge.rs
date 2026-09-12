@@ -1,8 +1,8 @@
 //! MCP merge tools: metadata and handler are registered together.
 
-use serde_json::json;
 use super::Tool;
 use crate::cmd::merge;
+use serde_json::json;
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![
@@ -26,11 +26,13 @@ pub(super) fn tools() -> Vec<Tool> {
                     "message": { "type": "string" }
                 }
             }),
-            |_client, args| Box::pin(async move {
-let options: merge::MergeArgs = serde_json::from_value(args)?;
-            let report = tokio::task::spawn_blocking(move || merge::execute(options)).await?;
-            Ok(serde_json::to_value(report)?)
-            }),
+            |_client, args| {
+                Box::pin(async move {
+                    let options: merge::MergeArgs = serde_json::from_value(args)?;
+                    let report = tokio::task::spawn_blocking(move || merge::execute(options)).await?;
+                    Ok(serde_json::to_value(report)?)
+                })
+            },
         ).report(),
     ]
 }

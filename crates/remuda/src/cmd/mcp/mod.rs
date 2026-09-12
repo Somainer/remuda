@@ -14,17 +14,21 @@ use super::hub_client::{HubClient, HubOpts, block_on};
 use registry::Tool;
 
 mod args;
+mod doctor;
+mod fleet;
+mod instance;
+mod merge;
 mod registry;
+mod worktree;
 
 macro_rules! tool_groups {
     ($($group:ident),* $(,)?) => {
-        $(mod $group;)*
         fn tools() -> Vec<Tool> {
             [$($group::tools()),*].into_iter().flatten().collect()
         }
     };
 }
-// Add tools inside their group; a new group needs just one entry here.
+// Add tools inside their group; declare new modules above and register each group once.
 tool_groups!(instance, worktree, fleet, merge, doctor);
 
 pub(crate) fn tools_catalog() -> Vec<Value> {

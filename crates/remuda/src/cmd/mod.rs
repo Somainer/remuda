@@ -1,13 +1,25 @@
 //! Command registration. Feature modules own arguments, help and execution.
 
+pub mod agents;
+pub mod dev;
+pub mod dispatcher;
+pub mod doctor;
+pub mod fleet;
+pub mod hub;
 pub mod hub_client;
+pub mod instance;
 mod instance_interaction;
+pub mod mcp;
+pub mod merge;
+pub mod node;
 pub(crate) mod registry;
+pub mod ssh;
 pub mod table;
+pub mod version;
+pub mod worktree;
 
 macro_rules! commands {
     ($($variant:ident($module:ident::$args:ident)),* $(,)?) => {
-        $(pub mod $module;)*
         #[derive(clap::Subcommand)]
         pub(crate) enum Command { $($variant($module::$args)),* }
         impl Command {
@@ -23,7 +35,7 @@ macro_rules! commands {
     };
 }
 
-// Adding a command requires its own module and one registration line.
+// Declare a module above, then register its parser and dispatch once below.
 commands! {
     Hub(hub::Args),
     Node(node::Args),

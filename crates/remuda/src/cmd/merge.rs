@@ -635,16 +635,26 @@ fn run_gate(
     target: &Path,
     report_file: &Path,
 ) -> Result<()> {
-    let planned = gate_plan(merged_worktree, report.web, test_range(report), report.web_e2e)?;
-    let status = gate_command(merged_worktree, report.web, test_range(report), report.web_e2e)
-        .arg("--report")
-        .arg(report_file)
-        .env("CARGO_TARGET_DIR", target)
-        .env("CARGO_INCREMENTAL", "0")
-        .stdout(Stdio::from(std::io::stderr()))
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run gate")?;
+    let planned = gate_plan(
+        merged_worktree,
+        report.web,
+        test_range(report),
+        report.web_e2e,
+    )?;
+    let status = gate_command(
+        merged_worktree,
+        report.web,
+        test_range(report),
+        report.web_e2e,
+    )
+    .arg("--report")
+    .arg(report_file)
+    .env("CARGO_TARGET_DIR", target)
+    .env("CARGO_INCREMENTAL", "0")
+    .stdout(Stdio::from(std::io::stderr()))
+    .stderr(Stdio::inherit())
+    .status()
+    .context("run gate")?;
     let results = fs::read_to_string(report_file).context("read gate report")?;
     let steps: Vec<Step> = results
         .lines()

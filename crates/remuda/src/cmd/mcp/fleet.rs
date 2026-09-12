@@ -43,8 +43,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "hosts": { "type": "array", "items": { "type": "string" } },
                     "kinds": { "type": "array", "items": { "type": "string" } },
                     "idempotencyKey": { "type": "string" },
-                    "text": { "type": "string" },
-                    "file": { "type": "string" }
+                    "text": { "type": "string" }
                 }
             }),
             |client, args| {

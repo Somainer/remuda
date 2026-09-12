@@ -112,7 +112,10 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let keep = tempfile::tempdir().unwrap();
     let repo = keep.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["init", "-q"]);
+    // `git init -b main` needs git >= 2.28; set HEAD directly instead so this
+    // runs on older hosts too (matches `init_repo` above).
+    git(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "test"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
@@ -254,11 +257,13 @@ fn mcp_worktree_rm_uses_the_same_safety_checks_and_preserves_the_branch() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     for (id, force) in [(1, false), (2, true)] {
+        // No `repo` argument: MCP tools resolve against the server's own
+        // repository (security-review-2 M4), which is `current_dir` above.
         writeln!(
             input,
             "{}",
             serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
-                "name":"remuda_worktree_rm","arguments":{"name":"worker","repo":repo,"force":force}
+                "name":"remuda_worktree_rm","arguments":{"name":"worker","force":force}
             }})
         )
         .unwrap();

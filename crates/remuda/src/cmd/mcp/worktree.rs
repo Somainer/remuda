@@ -2,7 +2,7 @@
 
 use super::{
     Tool,
-    args::{opt_str, required_str},
+    args::{opt_str, reject_removed_args, required_str},
 };
 use crate::cmd::worktree;
 use serde_json::json;
@@ -11,24 +11,25 @@ pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool::new(
             "remuda_worktree_create",
-            "Create a git worktree (`git worktree add -b wt/<name>/…`). Default path `../remuda-wt/<name>`.",
+            "Create a git worktree (`git worktree add -b wt/<name>/…`) at `../remuda-wt/<name>` beside the repository. The location is fixed; it is not caller-selectable.",
             json!({
                 "type": "object",
                 "required": ["name"],
+                "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string" },
-                    "base": { "type": "string" },
-                    "path": { "type": "string" },
-                    "repo": { "type": "string" }
+                    "base": { "type": "string" }
                 }
             }),
             |_client, args| {
                 Box::pin(async move {
                     let name = required_str(&args, "name")?;
                     let base = opt_str(&args, "base").unwrap_or("main");
-                    let path = opt_str(&args, "path").map(std::path::PathBuf::from);
-                    let repo = opt_str(&args, "repo").map(std::path::PathBuf::from);
-                    let record = worktree::create(name, base, path.as_deref(), repo.as_deref())?;
+                    reject_removed_args(&args, &["path", "repo"])?;
+                    // No caller-supplied path or repo: `create` places the
+                    // worktree under `<repo>/../remuda-wt/<name>`
+                    // (security-review-2 M4).
+                    let record = worktree::create(name, base, None, None)?;
                     Ok(json!({
                         "name": record.name,
                         "path": record.path,
@@ -40,23 +41,26 @@ pub(super) fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "remuda_worktree_rm",
-            "Remove a registered linked Git worktree by Remuda name or explicit path on this MCP server. Keeps the branch. Refuses primary/current/main, locks, or active merge/rebase; dirty files require explicit force=true.",
+            "Remove a registered linked Git worktree by Remuda name on this MCP server. Keeps the branch. Refuses primary/current/main, locks, or active merge/rebase; dirty files require explicit force=true.",
             json!({"type":"object","additionalProperties":false,"required":["name"],"properties":{
-                "name":{"type":"string"},"repo":{"type":"string"},"force":{"type":"boolean"}
+                "name":{"type":"string"},"force":{"type":"boolean"}
             }}),
             |_client, args| {
                 Box::pin(async move {
+                    // `repo` is not accepted: it would let an agent operate on
+                    // a repository other than this server's (M4). The name is
+                    // resolved against the local catalog.
+                    reject_removed_args(&args, &["repo"])?;
                     #[derive(serde::Deserialize)]
                     #[serde(deny_unknown_fields)]
                     struct RemoveArgs {
                         name: String,
-                        repo: Option<std::path::PathBuf>,
                         #[serde(default)]
                         force: bool,
                     }
                     let options: RemoveArgs = serde_json::from_value(args)?;
                     tokio::task::spawn_blocking(move || {
-                        worktree::remove(&options.name, options.repo.as_deref(), options.force)
+                        worktree::remove(&options.name, None, options.force)
                     })
                     .await?
                 })

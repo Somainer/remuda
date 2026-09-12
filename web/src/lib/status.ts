@@ -15,12 +15,18 @@ export function projectStatus(instance: Instance): UiStatus {
     return "exited";
   }
   if (activity === "working" || activity === "draining") return "working";
-  if (activity === "idle" && instance.lifecycle === "ready") return "idle";
+  if (activity === "idle" && (instance.lifecycle === "ready" || instance.lifecycle === "running")) return "idle";
+  if (instance.lifecycle === "running" || instance.lifecycle === "ready") return "working";
   return "unknown";
+}
+
+export function isGenericPty(instance: Instance): boolean {
+  return instance.driver === "generic-pty";
 }
 
 export function uiMode(instance: Instance): "structured-only" | "tty-attachable" {
   if (instance.driver === "claude-print") return "structured-only";
+  if (instance.driver === "generic-pty") return "tty-attachable";
   const tty = instance.capabilities.capabilities["tty-attach"];
   return tty?.state === "supported" ? "tty-attachable" : "structured-only";
 }

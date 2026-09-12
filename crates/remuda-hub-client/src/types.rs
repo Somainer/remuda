@@ -34,6 +34,15 @@ pub struct InstanceCreate {
     /// Model id (ignored by current Hub if unknown).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Live instance name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Working directory on the host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Worktree name (`remuda worktree create`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 /// `openapi.json` `#/components/schemas/InstanceRecord`.

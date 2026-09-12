@@ -101,6 +101,7 @@ pub fn routes() -> Router<crate::AppState> {
         .route("/v1/instances/{id}", get(get_instance))
         .route("/v1/instances/{id}/commands", post(post_command))
         .route("/v1/instances/{id}/journal", get(get_journal))
+        .route("/v1/worktrees", get(list_worktrees).post(create_worktree))
 }
 
 #[derive(Deserialize)]
@@ -108,6 +109,27 @@ pub struct JournalQuery {
     #[serde(rename = "afterSeq")]
     after_seq: Option<String>,
 }
+
+#[derive(Deserialize)]
+pub struct WorktreeListQuery {
+    #[serde(rename = "hostId")]
+    host_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWorktreeBody {
+    host_id: Option<String>,
+    name: String,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `GET /healthz`
 pub async fn healthz() -> Json<Value> {
@@ -286,6 +308,112 @@ pub async fn post_command(
         .unwrap_or(false);
     let command = forward_if_online(&state, command, online).await?;
     Ok(Json(json!({ "command": command, "replayed": false })))
+}
+
+/// `GET /v1/worktrees` — catalog from the Node (`worktree.list`).
+pub async fn list_worktrees(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorktreeListQuery>,
+) -> Result<Json<Value>, HubError> {
+    require_device(&state.store, &headers).await?;
+    let host = pick_worktree_host(&state, query.host_id.as_deref()).await?;
+    match call_node(
+        &state,
+        &host.host_id,
+        "worktree.list",
+        json!({ "hostId": host.host_id }),
+    )
+    .await
+    {
+        Ok(body) => {
+            let mut value = body;
+            if let Some(obj) = value.as_object_mut() {
+                obj.entry("hostId".to_string())
+                    .or_insert_with(|| json!(host.host_id));
+                obj.entry("items".to_string()).or_insert_with(|| json!([]));
+                obj.entry("nextCursor".to_string()).or_insert(Value::Null);
+            }
+            Ok(Json(value))
+        }
+        Err(HubError::Unsatisfiable { .. }) => Ok(Json(json!({
+            "hostId": host.host_id,
+            "workspaceRoot": null,
+            "items": [],
+            "nextCursor": null
+        }))),
+        Err(err) => Err(err),
+    }
+}
+
+/// `POST /v1/worktrees` — `git worktree add -b wt/<name>/…` on the Node.
+pub async fn create_worktree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateWorktreeBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    require_device(&state.store, &headers).await?;
+    if body.name.is_empty() {
+        return Err(HubError::BadRequest("worktree name required".into()));
+    }
+    let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
+    let mut params = json!({
+        "hostId": host.host_id,
+        "name": body.name,
+        "base": body.base.as_deref().unwrap_or("main"),
+    });
+    if let Some(path) = body.path {
+        params["path"] = json!(path);
+    }
+    if let Some(repo) = body.repo {
+        params["repo"] = json!(repo);
+    }
+    let created = call_node(&state, &host.host_id, "worktree.create", params).await?;
+    Ok(Json(created))
+}
+
+async fn pick_worktree_host(
+    state: &AppState,
+    host_id: Option<&str>,
+) -> Result<crate::store::HostRecord, HubError> {
+    let placement = crate::placement::Placement::from_value(None, host_id)?;
+    let spec = crate::placement::PlaceSpec::from_json(&json!({}));
+    crate::placement::pick_hosts(state, &placement, &spec)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(HubError::Unsatisfiable {
+            reasons: vec!["no online host for worktree".into()],
+        })
+}
+
+async fn call_node(
+    state: &AppState,
+    host_id: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, HubError> {
+    match state
+        .nodes
+        .call(host_id, method, params, WORKTREE_RPC_TIMEOUT)
+        .await
+    {
+        Ok(Some(response)) => {
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("node worktree rpc failed");
+                return Err(HubError::BadRequest(message.to_string()));
+            }
+            Ok(response.get("result").cloned().unwrap_or(response))
+        }
+        Ok(None) => Err(HubError::Unsatisfiable {
+            reasons: vec![format!("host {host_id} is not connected")],
+        }),
+        Err(err) => Err(err),
+    }
 }
 
 /// `GET /v1/instances/:id/journal`

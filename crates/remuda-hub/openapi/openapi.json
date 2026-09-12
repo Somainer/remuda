@@ -11,6 +11,7 @@
     { "name": "auth" },
     { "name": "hosts" },
     { "name": "instances" },
+    { "name": "worktrees" },
     { "name": "fleet" },
     { "name": "devices" },
     { "name": "push" },
@@ -217,6 +218,50 @@
           },
           "401": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/worktrees": {
+      "get": {
+        "tags": ["worktrees"],
+        "operationId": "worktreeList",
+        "summary": "List git worktrees on a host (Node remuda worktree catalog)",
+        "parameters": [
+          {
+            "name": "hostId",
+            "in": "query",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Worktree page",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WorktreePage" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "tags": ["worktrees"],
+        "operationId": "worktreeCreate",
+        "summary": "Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/WorktreeCreate" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created or reused worktree",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WorktreeRecord" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -675,6 +720,8 @@
           },
           "connectivity": { "type": "string" },
           "title": { "type": ["string", "null"] },
+          "name": { "type": ["string", "null"] },
+          "cwd": { "type": ["string", "null"] },
           "journalId": { "type": "string" },
           "durableSeq": { "type": "string" },
           "createdAt": { "type": "string" },
@@ -703,7 +750,42 @@
           "model": { "type": "string" },
           "providerProfileId": { "type": "string" },
           "permissionMode": { "type": "string" },
-          "name": { "type": "string" }
+          "name": { "type": "string" },
+          "cwd": { "type": "string", "description": "Working directory on the host." },
+          "worktree": { "type": "string", "description": "Worktree name created by remuda worktree create." }
+        }
+      },
+      "WorktreeCreate": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "hostId": { "type": "string" },
+          "name": { "type": "string" },
+          "base": { "type": "string", "description": "Start-point (default main)." },
+          "path": { "type": "string" },
+          "repo": { "type": "string" }
+        }
+      },
+      "WorktreeRecord": {
+        "type": "object",
+        "required": ["name", "path"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "branch": { "type": "string" },
+          "base": { "type": "string" },
+          "hostId": { "type": "string" },
+          "workspaceRoot": { "type": "string" }
+        }
+      },
+      "WorktreePage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/WorktreeRecord" } },
+          "hostId": { "type": "string" },
+          "workspaceRoot": { "type": ["string", "null"] },
+          "nextCursor": { "type": ["string", "null"] }
         }
       },
       "CommandRecord": {

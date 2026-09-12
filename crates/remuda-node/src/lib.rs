@@ -19,6 +19,7 @@ mod stdio;
 mod store;
 mod transport;
 mod tty;
+mod worktree;
 
 pub use carrier::{
     AuthState, CarrierFuture, CarrierKind, CliInventory, HerdrInventory, HostInventory,

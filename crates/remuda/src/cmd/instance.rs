@@ -702,9 +702,7 @@ fn line_regex_matches(re: &regex::Regex, text: &str) -> bool {
 
 fn looks_like_wait_brief_echo(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    lower.contains("further input")
-        || lower.contains("tui bullet")
-        || lower.contains("for example")
+    lower.contains("further input") || lower.contains("tui bullet") || lower.contains("for example")
 }
 
 /// Raw (unnormalized) line that satisfies `re`, if any.

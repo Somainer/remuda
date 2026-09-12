@@ -91,6 +91,8 @@ fn overlapping_web_client_operations_exist() {
         ("/v1/instances/{id}", "get"),
         ("/v1/instances/{id}/commands", "post"),
         ("/v1/instances/{id}/journal", "get"),
+        ("/v1/worktrees", "get"),
+        ("/v1/worktrees", "post"),
         ("/v1/interactions", "get"),
         ("/v1/interactions/{id}/answer", "post"),
         ("/v1/login", "post"),

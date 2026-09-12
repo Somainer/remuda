@@ -18,6 +18,7 @@ use remuda_protocol::{
     Workspace, WorkspaceId, WorkspaceState, WritePolicy,
 };
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
@@ -133,6 +134,26 @@ impl DevNode {
     /// Read one Instance.
     pub fn get_instance(&self, instance_id: &InstanceId) -> Result<Instance, NodeError> {
         self.inner.store.get_instance(instance_id)
+    }
+
+    /// Catalog of git worktrees under the Node workspace root.
+    pub fn list_worktrees(&self) -> Result<Value, NodeError> {
+        crate::worktree::handle_rpc(
+            Path::new(&self.inner.workspace.root_path),
+            "worktree.list",
+            &serde_json::json!({}),
+        )
+        .ok_or_else(|| NodeError::InvalidRequest("worktree.list".into()))?
+    }
+
+    /// Create or reuse a git worktree (`git worktree add -b wt/<name>/…`).
+    pub fn create_worktree(&self, params: &Value) -> Result<Value, NodeError> {
+        crate::worktree::handle_rpc(
+            Path::new(&self.inner.workspace.root_path),
+            "worktree.create",
+            params,
+        )
+        .ok_or_else(|| NodeError::InvalidRequest("worktree.create".into()))?
     }
 
     /// Durably accept an Instance create, then materialize it in its worker.

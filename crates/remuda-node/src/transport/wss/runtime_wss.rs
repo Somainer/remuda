@@ -107,6 +107,12 @@ async fn dispatch_hub(
             catch_up(runtime, &instance_id).await?;
             Ok(result)
         }
+        _ if crate::worktree::is_worktree_method(method) => crate::worktree::handle_rpc(
+            std::path::Path::new(&runtime.node.workspace().root_path),
+            method,
+            &params,
+        )
+        .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?,
         _ => Ok(json!({ "ok": true })),
     }
 }

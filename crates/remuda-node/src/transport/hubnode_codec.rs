@@ -180,6 +180,14 @@ pub async fn dispatch_method(
     method: &str,
     params: Value,
 ) -> Result<Value, NodeError> {
+    if crate::worktree::is_worktree_method(method) {
+        return crate::worktree::handle_rpc(
+            std::path::Path::new(&node.workspace().root_path),
+            method,
+            &params,
+        )
+        .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?;
+    }
     match HubNodeMethod::parse(method) {
         Some(HubNodeMethod::InstanceCreate) => dispatch_create(node, params).await,
         Some(HubNodeMethod::InstanceSend) => dispatch_send(node, params).await,

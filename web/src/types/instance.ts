@@ -8,6 +8,7 @@ export type Lifecycle =
   | "preparing"
   | "starting"
   | "ready"
+  | "running"
   | "closing"
   | "exited"
   | "failed"
@@ -41,6 +42,8 @@ export type Instance = EntityMeta & {
   exit: Knowledge<{ code: number | null; signal: string | null; observedAt: Timestamp }>;
   lastError?: string | null;
   activityEvidenceEventIds?: Id[];
+  cwd?: string | null;
+  name?: string | null;
 };
 
 export type HostTransport = "outbound-wss" | "ssh-dev";

@@ -1,0 +1,4 @@
+# Source: authored. The 0.154.0 stdio probe never triggered a live approval.
+{"id":7,"method":"item/commandExecution/requestApproval","params":{"itemId":"item-cmd-1","threadId":"thread-1","turnId":"turn-1","kind":"command","command":"ls","cwd":"/tmp","startedAtMs":1,"availableDecisions":["accept","decline","cancel"]}}
+{"id":7,"result":{"decision":"accept"}}
+{"method":"serverRequest/resolved","params":{"threadId":"thread-1","requestId":7}}

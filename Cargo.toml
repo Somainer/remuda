@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/remuda-protocol",
     "crates/remuda-claude-wire",
+    "crates/remuda-codex-wire",
     "crates/remuda-acp-wire",
     "crates/remuda-herdr",
     "crates/remuda-driver",

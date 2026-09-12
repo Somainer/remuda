@@ -292,14 +292,27 @@ fn command_id_of(params: &Value) -> Option<remuda_protocol::CommandId> {
 }
 
 fn prompt_of(params: &Value) -> Option<String> {
-    params
+    if let Some(text) = params
         .pointer("/initialInput/text")
         .or_else(|| params.get("prompt"))
         .or_else(|| params.pointer("/spec/prompt"))
         .or_else(|| params.pointer("/input/text"))
         .or_else(|| params.get("text"))
         .and_then(Value::as_str)
-        .map(str::to_owned)
+    {
+        return Some(text.to_owned());
+    }
+    let blocks = params.pointer("/input/blocks")?.as_array()?;
+    let mut out = String::new();
+    for block in blocks {
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn ensure_pump(runtime: &RuntimeLink, instance_id: &InstanceId) {

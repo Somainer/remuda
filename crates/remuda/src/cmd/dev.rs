@@ -1,4 +1,4 @@
-//! Loopback Hub + local FakeDriver Node, sharing one development access code.
+//! Loopback Hub + local native Claude Node, sharing one development access code.
 
 use crate::{
     Shutdown,
@@ -7,7 +7,10 @@ use crate::{
 };
 use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
-use remuda_node::{DevNode, DevServerConfig, dev_router};
+use remuda_node::{
+    DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, WssConfig, WssLink, dev_router,
+    native_driver_registry,
+};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -40,6 +43,9 @@ pub(crate) struct Args {
     /// Workspace root advertised by the local Node.
     #[arg(long)]
     workspace: Option<PathBuf>,
+    /// Serve Hub web assets from this directory (typically `web/dist`).
+    #[arg(long)]
+    web_root: Option<PathBuf>,
 }
 
 impl Args {
@@ -62,6 +68,9 @@ impl Args {
         }
         if let Some(root) = &self.workspace {
             config.node.workspace = root.clone();
+        }
+        if let Some(root) = &self.web_root {
+            config.hub.web_root = Some(root.clone());
         }
         if !self.web_origins.is_empty() {
             config.node.web_origins = self.web_origins.clone();
@@ -103,27 +112,23 @@ pub(crate) async fn run(
         .with_allowed_origins(origins)?
         .with_access_code(running_hub.bootstrap_token.clone())?;
     node_config.bind_addr = config.node.listen;
-    let node = DevNode::new(&node_config)?;
-    let (stop_link, link_stopped) = tokio::sync::oneshot::channel();
-    let link_url = format!("ws://{}/v1/node", running_hub.addr);
-    let link_token = running_hub.bootstrap_token.clone();
-    let link_hello = serde_json::json!({
-        "hostId": node.host().meta.id,
-        "label": "local-development",
-        "labels": config.node.labels,
-        "maxInstances": config.node.max_instances,
-        "nodeVersion": env!("CARGO_PKG_VERSION"),
-        "cli": [],
-        "protocol": {"major": 1, "minor": 0},
-    });
-    let deadline = config.shutdown_timeout();
-    let mut link = tokio::spawn(async move {
-        node::outbound_session(&link_url, link_token, link_hello, None, deadline, async {
-            let _ = link_stopped.await;
-            Ok(())
-        })
+    let mut native = NativeDriverConfig::new(config.data_dir.join("node"));
+    if let Some(binary) = resolve_claude_binary() {
+        tracing::info!(path = %binary.display(), "using Claude binary from PATH");
+        native = native.with_claude_binary(binary);
+    }
+    let drivers = native_driver_registry(native)?;
+    let store = Arc::new(MemoryStore::new(node_config.follow_buffer_capacity));
+    let node = DevNode::with_parts(&node_config, store, drivers)?;
+    let mut wss = WssConfig::loopback(
+        running_hub.addr,
+        running_hub.bootstrap_token.clone(),
+        node.host().meta.id.as_id().to_string(),
+    );
+    wss.label = "local-development".into();
+    let link = WssLink::connect_runtime(wss, node.clone())
         .await
-    });
+        .context("local Node could not enroll with the development Hub")?;
     let listener = tokio::net::TcpListener::bind(node_config.bind_addr).await?;
     let address = listener.local_addr()?;
     let accepting = Arc::new(AtomicBool::new(true));
@@ -158,33 +163,15 @@ pub(crate) async fn run(
     } else {
         tracing::info!(file = %config.data_dir.join("bootstrap-token").display(), "development access code file");
     }
-    // TODO(remuda-node): expose the instance dispatcher for Hub requests. The
-    // registered local host currently accepts inventory/heartbeat only; the
-    // FakeDriver instance API remains available on the direct Node listener.
-    if !config.provider_profiles.is_empty()
-        || !config.node.labels.is_empty()
-        || config.node.max_instances != 8
-    {
-        // TODO(remuda-node): expose profile, inventory and capacity configuration
-        // on DevNode; enrollment advertises inventory without configuring FakeDriver.
-        tracing::warn!(
-            "local FakeDriver Node does not yet consume provider profiles, placement labels or maxInstances"
-        );
-    }
-    let (reason, server_finished, link_finished) = tokio::select! {
-        result = shutdown.wait() => (result, false, false),
+    let (reason, server_finished) = tokio::select! {
+        result = shutdown.wait() => (result, false),
         result = &mut server => {
             let result = result.context("local Node server task failed").and_then(|result| result.map_err(Into::into));
-            (result.and_then(|()| Err(anyhow::anyhow!("local Node server exited before shutdown"))), true, false)
-        }
-        result = &mut link => {
-            let result = result.context("local Node link task failed").and_then(|result| result);
-            (result.and_then(|()| Err(anyhow::anyhow!("local Node link exited before shutdown"))), false, true)
+            (result.and_then(|()| Err(anyhow::anyhow!("local Node server exited before shutdown"))), true)
         }
     };
     accepting.store(false, Ordering::Release);
     let _ = stop.send(());
-    let _ = stop_link.send(());
     // Finish accepted HTTP mutations before enumerating driver tasks to close.
     let mut http_result = Ok(());
     if !server_finished {
@@ -195,8 +182,6 @@ pub(crate) async fn run(
                     .and_then(|result| result.map_err(Into::into));
             }
             Err(_) => {
-                // TODO(remuda-node): expose cancellation for upgraded WebSockets.
-                // DevNode also needs a shutdown gate for existing WS command streams.
                 server.abort();
                 let _ = server.await;
                 tracing::warn!("local HTTP drain deadline expired; connections were closed");
@@ -204,27 +189,31 @@ pub(crate) async fn run(
         }
     }
     let drivers = node::shutdown_drivers(&node, config.shutdown_timeout()).await;
-    let link_result = if link_finished {
-        Ok(())
-    } else {
-        match tokio::time::timeout(config.shutdown_timeout(), &mut link).await {
-            Ok(result) => result
-                .context("local Node link shutdown failed")
-                .and_then(|result| result),
-            Err(_) => {
-                link.abort();
-                let _ = link.await;
-                Err(anyhow::anyhow!(
-                    "local Node link shutdown deadline exceeded"
-                ))
-            }
-        }
-    };
+    tokio::time::timeout(config.shutdown_timeout(), link.shutdown())
+        .await
+        .ok();
     drop(running_hub);
     drivers?;
     http_result?;
-    link_result?;
     reason
+}
+
+fn resolve_claude_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("REMUDA_CLAUDE_BIN") {
+        let path = PathBuf::from(path);
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        return Some(path);
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("claude");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn validate_private_access_code_file(path: &Path) -> anyhow::Result<()> {
@@ -259,6 +248,7 @@ mod tests {
             access_code_file: None,
             web_origins: Vec::new(),
             workspace: None,
+            web_root: None,
         };
         let mut config = Config::default();
         config.hub.listen = "0.0.0.0:8080".parse().expect("fixture address");

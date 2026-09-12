@@ -716,6 +716,15 @@ fn rpc_prepare_subscription(
     )
 }
 
+/// Handle a Hub→Node JSON-RPC method against a live [`DevNode`].
+pub async fn dispatch_hub_rpc(
+    node: &DevNode,
+    method: &str,
+    params: Value,
+) -> Result<Value, NodeError> {
+    dispatch_rpc(node, method, params, None).await
+}
+
 async fn dispatch_rpc(
     node: &DevNode,
     method: &str,
@@ -807,15 +816,9 @@ async fn dispatch_rpc(
         }
         "instance.send" => {
             let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
-            let prompt = params
-                .get("input")
-                .and_then(|input| input.get("text"))
-                .or_else(|| params.get("prompt"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    NodeError::InvalidRequest("instance.send requires input.text".to_owned())
-                })?
-                .to_owned();
+            let prompt = prompt_from_params(&params).ok_or_else(|| {
+                NodeError::InvalidRequest("instance.send requires input.text".to_owned())
+            })?;
             submit_rpc_command(
                 node,
                 &params,
@@ -872,6 +875,38 @@ async fn dispatch_rpc(
             "JSON-RPC method is not implemented by remuda dev: {method}"
         ))),
     }
+}
+
+fn prompt_from_params(params: &Value) -> Option<String> {
+    if let Some(text) = params
+        .get("input")
+        .and_then(|input| input.get("text"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.to_owned());
+    }
+    if let Some(blocks) = params
+        .get("input")
+        .and_then(|input| input.get("blocks"))
+        .and_then(Value::as_array)
+    {
+        let mut out = String::new();
+        for block in blocks {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    params
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 async fn submit_rpc_command(

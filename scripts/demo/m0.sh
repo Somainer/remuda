@@ -2,8 +2,6 @@
 # M0 demo: build, remuda dev (loopback + access code), fake-claude claude-print,
 # journal follow, instance CLI + MCP, hub-embedded web.
 #
-# Owners of remuda dev / local routes: crates/remuda (codex-astra),
-# crates/remuda-node (codex-sol). This script does not patch those crates.
 # On a missing command or route it records the exact command + error under
 # docs/design/impl-notes.md "## M0 demo gaps" and exits non-zero.
 set -euo pipefail
@@ -24,6 +22,19 @@ FAKE_CLAUDE=""
 
 log() { printf '%s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
+
+target_dir() {
+  local dir="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-}}"
+  if [[ -n "$dir" ]]; then
+    if [[ "$dir" = /* ]]; then
+      printf '%s\n' "$dir"
+    else
+      printf '%s\n' "$ROOT/$dir"
+    fi
+  else
+    printf '%s\n' "$ROOT/target"
+  fi
+}
 
 usage() {
   cat <<'EOF' >&2
@@ -287,17 +298,19 @@ step_build() {
   log "==> (1) build workspace + fake-claude"
   mkdir -p "$LOG_DIR"
   local logf="$LOG_DIR/build.log"
-  if ! (cd "$ROOT" && cargo build --workspace --locked) >"$logf" 2>&1; then
+  local target
+  target="$(target_dir)"
+  if ! (cd "$ROOT" && cargo build --workspace --locked --target-dir "$target") >"$logf" 2>&1; then
     log "cargo build --workspace --locked failed; retrying without --locked"
-    if ! (cd "$ROOT" && cargo build --workspace) >"$logf" 2>&1; then
+    if ! (cd "$ROOT" && cargo build --workspace --target-dir "$target") >"$logf" 2>&1; then
       fail_gap "cargo build --workspace" "$(tail_err "$logf")" "crates/remuda (codex-astra), crates/remuda-node (codex-sol)"
     fi
   fi
-  if ! (cd "$ROOT" && cargo build -p remuda-testing --bin fake-claude) >>"$logf" 2>&1; then
+  if ! (cd "$ROOT" && cargo build -p remuda-testing --bin fake-claude --target-dir "$target") >>"$logf" 2>&1; then
     fail_gap "cargo build -p remuda-testing --bin fake-claude" "$(tail_err "$logf")" "crates/remuda-testing"
   fi
-  REMUDA_BIN="$ROOT/target/debug/remuda"
-  FAKE_CLAUDE="$ROOT/target/debug/fake-claude"
+  REMUDA_BIN="$target/debug/remuda"
+  FAKE_CLAUDE="$target/debug/fake-claude"
   [[ -x "$REMUDA_BIN" ]] || fail_gap \
     "cargo build --workspace" \
     "workspace build reported success but $REMUDA_BIN is missing" \
@@ -328,6 +341,9 @@ step_dev() {
     --access-code-file "$DEMO_DIR/access-code"
     --workspace "$ROOT"
   )
+  if [[ -d "$ROOT/web/dist" ]]; then
+    cmd+=(--web-root "$ROOT/web/dist")
+  fi
   "${cmd[@]}" >"$logf" 2>&1 &
   REMUDA_PID=$!
   local i
@@ -373,6 +389,18 @@ step_login() {
   export REMUDA_HUB="http://$HUB_LISTEN"
   export REMUDA_TOKEN="$TOKEN"
   export REMUDA_BOOTSTRAP_TOKEN="$ACCESS_CODE"
+  local i resp count
+  for i in $(seq 1 40); do
+    resp="$(http_json GET "http://$HUB_LISTEN/v1/hosts")" || true
+    count="$(python3 -c 'import json,sys; b=json.load(sys.stdin).get("body") or {}; print(len(b.get("items") or []))' <<<"$resp")"
+    if [[ "$count" != "0" ]]; then
+      log "hub has $count enrolled host(s)"
+      return 0
+    fi
+    sleep 0.15
+  done
+  fail_gap "GET http://$HUB_LISTEN/v1/hosts" "timed out waiting for an enrolled Node"$'\n'"$resp" \
+    "crates/remuda (codex-astra), crates/remuda-node (codex-sol)"
 }
 
 step_create_print() {
@@ -463,8 +491,8 @@ print("mcp tools:", ", ".join(names), file=sys.stderr)
 PY
 }
 
-step_web() {
-  log "==> (6) build web and serve via Hub embed"
+step_web_build() {
+  log "==> (6) build web for Hub embed"
   local logf="$LOG_DIR/web-build.log"
   if [[ ! -d "$ROOT/web/node_modules" ]]; then
     if ! (cd "$ROOT/web" && pnpm install) >"$logf" 2>&1; then
@@ -475,8 +503,11 @@ step_web() {
     fail_gap "pnpm --dir web build" "$(tail_err "$logf")" "web"
   fi
   [[ -f "$ROOT/web/dist/index.html" ]] || fail_gap "pnpm --dir web build" "web/dist/index.html missing" "web"
-  # remuda dev already holds the Hub. Restarting it with --web-root is a remuda
-  # flag; if the running Hub does not serve dist, try remuda hub --web-root.
+}
+
+step_web() {
+  log "==> serve web via Hub embed"
+  # remuda dev already holds the Hub. If it does not serve dist, try remuda hub --web-root.
   local page
   page="$(python3 - "$HUB_LISTEN" <<'PY'
 import sys, urllib.request
@@ -513,6 +544,7 @@ main() {
   LOG_DIR="$DEMO_DIR/logs"
   mkdir -p "$LOG_DIR"
   step_build
+  step_web_build
   step_dev
   step_login
   step_create_print

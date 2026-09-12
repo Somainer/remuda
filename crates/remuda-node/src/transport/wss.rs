@@ -245,6 +245,12 @@ impl WssLink {
         })
     }
 
+    /// Clone the bounded `journal.append` sender used by this session.
+    #[must_use]
+    pub fn journal_sender(&self) -> JournalSender {
+        self.journal.clone()
+    }
+
     /// `journal.append` with queue backpressure.
     pub async fn append_journal(
         &self,

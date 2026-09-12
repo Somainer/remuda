@@ -85,7 +85,7 @@ pub struct ClaudePrintOptions {
 }
 
 impl ClaudePrintOptions {
-    /// Human-originated print driver with the env/file broker.
+    /// Print driver with unknown (Agent) origin and the env/file broker.
     pub fn new(
         profile: ProviderProfile,
         launch_dir: PathBuf,
@@ -98,7 +98,7 @@ impl ClaudePrintOptions {
             native_home,
             inherit_default_config: false,
             binary,
-            origin: InputOrigin::Human,
+            origin: InputOrigin::Agent,
             broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: std::collections::BTreeMap::new(),
             setting_sources: None,

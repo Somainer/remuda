@@ -43,6 +43,8 @@ pub enum DriverRequest {
     Send {
         /// Plain development prompt.
         prompt: String,
+        /// Who submitted this input, independent of the instance's creator.
+        origin: remuda_protocol::InputOrigin,
     },
     /// Cancel the current fake turn.
     Cancel,
@@ -227,7 +229,7 @@ impl Driver for FakeDriver {
         Box::pin(async move {
             tokio::task::yield_now().await;
             match request {
-                DriverRequest::Send { prompt } => {
+                DriverRequest::Send { prompt, .. } => {
                     assert!(
                         !self.panic_prompts.contains(&prompt),
                         "intentional fake-driver panic"
@@ -399,7 +401,7 @@ impl Driver for NativeShellAdapter {
         Box::pin(async move {
             use remuda_driver::Driver as _;
             match request {
-                DriverRequest::Send { prompt } => {
+                DriverRequest::Send { prompt, .. } => {
                     let mut bytes = prompt.into_bytes();
                     bytes.push(b'\r');
                     self.inner

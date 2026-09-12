@@ -42,6 +42,15 @@ fn default_permission() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateInstanceRequest {
+    /// Authenticated Hub caller kind; absent or unknown means Agent.
+    #[serde(
+        default = "crate::origin::agent_origin",
+        deserialize_with = "crate::origin::deserialize_origin"
+    )]
+    pub origin: remuda_protocol::InputOrigin,
+    /// Transport-only scoped credential for this instance's MCP process.
+    #[serde(default, skip_serializing)]
+    pub agent_credential: Option<crate::origin::AgentCredential>,
     /// Optional client-selected Command identity for retry-safe Hub forwarding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_id: Option<CommandId>,
@@ -202,6 +211,12 @@ pub enum CommandAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceCommandRequest {
+    /// Authenticated Hub caller kind; absent or unknown means Agent.
+    #[serde(
+        default = "crate::origin::agent_origin",
+        deserialize_with = "crate::origin::deserialize_origin"
+    )]
+    pub origin: remuda_protocol::InputOrigin,
     /// Optional client-supplied idempotency identity.
     #[serde(default)]
     pub command_id: Option<CommandId>,

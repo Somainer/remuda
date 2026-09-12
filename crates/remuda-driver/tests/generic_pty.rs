@@ -115,10 +115,11 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
         line_matcher: Some("^DONE ".into()),
     });
 
-    let mut handle = driver
-        .start(spec(&cwd, AgentKind::Codex))
-        .await
-        .expect("start");
+    let mut requested = spec(&cwd, AgentKind::Codex);
+    if let remuda_protocol::PermissionMode::Claude(permission) = &mut requested.permission_mode {
+        permission.mode = remuda_protocol::ClaudePermissionMode::BypassPermissions;
+    }
+    let mut handle = driver.start(requested).await.expect("start");
     assert!(
         handle
             .recipe()
@@ -476,4 +477,40 @@ async fn live_grok_pty_once() {
 #[tokio::test]
 async fn live_agy_pty_once() {
     live_kind(AgentKind::Agy, "agy");
+}
+
+#[tokio::test]
+async fn agent_origin_bypass_create_uses_non_yolo_preset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let _fake =
+        FakeHerdrServer::spawn(FakeHerdrOptions::new(socket_dir.join("herdr.sock"))).unwrap();
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut options = GenericPtyOptions::new(
+        profile(),
+        tmp.path().join("launch"),
+        home,
+        BinarySource::Pinned(pin_binary(stub_bin(tmp.path(), "codex")).unwrap()),
+    );
+    options.origin = LaunchOrigin::Agent;
+    options.socket_dir = Some(socket_dir);
+    options.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
+    let driver = GenericPtyDriver::new(options);
+    let mut requested = spec(&cwd, AgentKind::Codex);
+    if let remuda_protocol::PermissionMode::Claude(permission) = &mut requested.permission_mode {
+        permission.mode = remuda_protocol::ClaudePermissionMode::BypassPermissions;
+    }
+    let handle = driver.start(requested).await.unwrap();
+    for flag in preset_by_id("codex").unwrap().yolo_argv {
+        assert!(!handle.recipe().argv.iter().any(|arg| arg == flag));
+    }
+    assert_ne!(
+        handle.recipe().permission.cli_mode.as_deref(),
+        Some("bypassPermissions")
+    );
+    driver.close().await.unwrap();
 }

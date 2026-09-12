@@ -249,7 +249,7 @@ impl Driver for AdoptedPty {
                         .remove_pty_resource(&self.resource.key())
                         .map_err(|e| DriverError::Failed(e.to_string()))?;
                 }
-                DriverRequest::Send { prompt } => {
+                DriverRequest::Send { prompt, .. } => {
                     client
                         .agent_prompt(remuda_herdr::AgentPromptParams {
                             target: pane.clone(),

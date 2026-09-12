@@ -70,7 +70,7 @@ pub struct ClaudeBgOptions {
 }
 
 impl ClaudeBgOptions {
-    /// Isolated `remuda-test` session, human origin, env/file broker.
+    /// Isolated `remuda-test` session, unknown origin, env/file broker.
     pub fn new(
         profile: ProviderProfile,
         launch_dir: PathBuf,
@@ -82,7 +82,7 @@ impl ClaudeBgOptions {
             launch_dir,
             native_home,
             binary,
-            origin: LaunchOrigin::Human,
+            origin: LaunchOrigin::default(),
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,

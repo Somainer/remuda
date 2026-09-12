@@ -230,7 +230,8 @@ impl DriverFactory for NativeClaudeFactory {
         let native: Arc<dyn NativeDriver> = match self.kind {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = self.config.extra_env.clone();
+                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.origin = launch.request.origin;
                 options.handshake_timeout = self.config.print_handshake_timeout;
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay.clone();
@@ -238,7 +239,8 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ClaudePty => {
                 let mut options = ClaudePtyOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = self.config.extra_env.clone();
+                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
@@ -248,7 +250,8 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ClaudeBg => {
                 let mut options = ClaudeBgOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = self.config.extra_env.clone();
+                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
@@ -258,7 +261,8 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::GenericPty => {
                 let mut options = GenericPtyOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = self.config.extra_env.clone();
+                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
@@ -266,7 +270,7 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ShellPty => {
                 let mut options = ShellPtyOptions::login(launch.workspace_root.clone());
-                options.extra_env = self.config.extra_env.clone();
+                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
                 options.args = launch.request.args.clone();
                 Arc::new(ShellPtyDriver::new(options))
             }
@@ -363,9 +367,9 @@ impl Driver for NativeAdapter {
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
         Box::pin(async move {
             match request {
-                DriverRequest::Send { prompt } => {
+                DriverRequest::Send { prompt, origin } => {
                     self.native
-                        .send(prompt_input(prompt))
+                        .send(prompt_input(prompt, origin))
                         .await
                         .map_err(map_driver_error)?;
                 }
@@ -442,11 +446,11 @@ impl Driver for NativeAdapter {
     }
 }
 
-fn prompt_input(prompt: String) -> DriverInput {
+fn prompt_input(prompt: String, origin: InputOrigin) -> DriverInput {
     DriverInput::Prompt(Box::new(PromptInput {
         mode: PromptMode::NewTurn,
         blocks: vec![ContentBlock::Text(Box::new(TextBlock { text: prompt }))],
-        origin: InputOrigin::Human,
+        origin,
         native_client_message_id: uuid::Uuid::now_v7().to_string(),
     }))
 }
@@ -801,6 +805,8 @@ mod tests {
                 fixture_instance(InstanceId::new(), HostId::new(), WorkspaceId::new(), kind)
                     .expect("instance");
             let request = crate::CreateInstanceRequest {
+                origin: InputOrigin::Human,
+                agent_credential: None,
                 command_id: None,
                 instance_id: Some(instance.meta.id.clone()),
                 host_id: Some(instance.host_id.clone()),
@@ -835,6 +841,16 @@ mod tests {
     }
 
     #[test]
+    fn native_prompt_preserves_each_submitting_origin() {
+        for origin in [InputOrigin::Human, InputOrigin::Bot, InputOrigin::Agent] {
+            let DriverInput::Prompt(prompt) = prompt_input("new input".into(), origin) else {
+                panic!("prompt expected")
+            };
+            assert_eq!(prompt.origin, origin);
+        }
+    }
+
+    #[test]
     fn registered_claude_home_must_be_absolute() {
         let config = NativeDriverConfig::new(PathBuf::from("/tmp/remuda-node-test"))
             .with_claude_native_home(PathBuf::from("relative-home"));
@@ -860,6 +876,8 @@ mod tests {
     #[test]
     fn parse_delegation_prefers_explicit_field_then_profile_id() {
         let mut request = crate::CreateInstanceRequest {
+            origin: InputOrigin::Human,
+            agent_credential: None,
             command_id: None,
             instance_id: None,
             host_id: None,

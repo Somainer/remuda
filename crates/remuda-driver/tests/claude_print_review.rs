@@ -74,6 +74,7 @@ fn driver_for(
     );
     extra.insert("ANTHROPIC_AUTH_TOKEN".into(), "sk-review".into());
     let mut options = ClaudePrintOptions::new(profile(), launch, home, BinarySource::Pinned(pin()));
+    options.origin = InputOrigin::Human;
     options.extra_env = extra;
     options.handshake_timeout = Duration::from_secs(5);
     let mut spec = spec;

@@ -62,6 +62,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .submit_command(
                     &instance_id,
                     InstanceCommandRequest {
+                        origin: crate::origin::wire_origin(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::Send,
                         prompt: Some(prompt_of(&params).unwrap_or_default()),
@@ -83,6 +84,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .submit_command(
                     &instance_id,
                     InstanceCommandRequest {
+                        origin: crate::origin::wire_origin(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::Cancel,
                         prompt: None,
@@ -108,6 +110,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .submit_command(
                     &instance_id,
                     InstanceCommandRequest {
+                        origin: crate::origin::wire_origin(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::RespondInteraction,
                         prompt: None,
@@ -207,6 +210,12 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         })
         .map(str::to_string);
     let mut request = CreateInstanceRequest {
+        origin: crate::origin::wire_origin(params),
+        agent_credential: params
+            .get("agentCredential")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?,
         command_id: command_id_of(params),
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
@@ -228,7 +237,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         permission_mode: spec
             .get("permissionMode")
             .and_then(Value::as_str)
-            .unwrap_or("dontAsk")
+            .unwrap_or("manual")
             .to_owned(),
         prompt: prompt_of(params).unwrap_or_default(),
         cwd,

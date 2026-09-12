@@ -957,6 +957,7 @@ async fn dispatch_rpc(
                 .submit_command(
                     &instance_id,
                     InstanceCommandRequest {
+                        origin: remuda_protocol::InputOrigin::Human,
                         command_id: optional_id_field(&params, "commandId")?,
                         operation: CommandAction::WriteTty,
                         prompt: None,
@@ -1021,6 +1022,7 @@ async fn submit_rpc_command(
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: remuda_protocol::InputOrigin::Human,
                 command_id: optional_id_field(params, "commandId")?,
                 operation,
                 prompt,

@@ -580,6 +580,11 @@ async fn session_task(
     let runtime = runtime.map(|node| runtime_wss::RuntimeLink {
         controller,
         node,
+        hub_url: config
+            .url
+            .trim_end_matches("/v1/node")
+            .replacen("wss://", "https://", 1)
+            .replacen("ws://", "http://", 1),
         journal,
         watermarks: watermarks.clone(),
         pumps,

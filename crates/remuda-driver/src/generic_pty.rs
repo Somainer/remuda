@@ -185,7 +185,7 @@ pub struct GenericPtyOptions {
 }
 
 impl GenericPtyOptions {
-    /// Isolated `remuda-test` session, human origin.
+    /// Isolated `remuda-test` session, unknown origin (Agent until authenticated).
     pub fn new(
         profile: ProviderProfile,
         launch_dir: PathBuf,
@@ -197,7 +197,7 @@ impl GenericPtyOptions {
             launch_dir,
             native_home,
             binary,
-            origin: LaunchOrigin::Human,
+            origin: LaunchOrigin::default(),
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,
@@ -321,11 +321,23 @@ impl GenericPtyDriver {
         Ok(read.text().to_string())
     }
 
-    async fn launch(&self, spec: InstanceSpec) -> DriverResult<RunHandle> {
+    async fn launch(&self, mut spec: InstanceSpec) -> DriverResult<RunHandle> {
         if spec.driver != DriverKind::GenericPty {
             return Err(DriverError::InvalidLaunchSpec(
                 "GenericPtyDriver requires driverKind generic-pty".into(),
             ));
+        }
+        // Agent-created PTYs always use the asking preset, including when an
+        // injected request explicitly asks for bypass (D-017).
+        if self.options.origin == LaunchOrigin::Agent
+            && let remuda_protocol::PermissionMode::Claude(permission) = &mut spec.permission_mode
+            && matches!(
+                permission.mode,
+                remuda_protocol::ClaudePermissionMode::BypassPermissions
+                    | remuda_protocol::ClaudePermissionMode::DontAsk
+            )
+        {
+            permission.mode = remuda_protocol::ClaudePermissionMode::Manual;
         }
         let preset = preset_for_spec(&spec)?;
         let binary = match &self.options.binary {
@@ -350,7 +362,12 @@ impl GenericPtyDriver {
             secret_policy: None,
         };
         let mut recipe = materialize(&request)?;
-        merge_yolo_argv(&mut recipe.argv, preset);
+        merge_yolo_argv(
+            &mut recipe.argv,
+            preset,
+            &spec.permission_mode,
+            self.options.origin,
+        );
         let agent_name = agent_name_for(&spec);
         if let Some(flag) = preset.name_flag {
             ensure_name_flag(&mut recipe.argv, flag, &agent_name);
@@ -1254,7 +1271,17 @@ fn map_prompt_herdr(error: remuda_herdr::Error) -> DriverError {
     }
 }
 
-fn merge_yolo_argv(argv: &mut Vec<String>, preset: &KindPreset) {
+fn merge_yolo_argv(
+    argv: &mut Vec<String>,
+    preset: &KindPreset,
+    permission: &remuda_protocol::PermissionMode,
+    origin: LaunchOrigin,
+) {
+    if !matches!(origin, LaunchOrigin::Human | LaunchOrigin::Bot)
+        || !matches!(permission, remuda_protocol::PermissionMode::Claude(mode) if mode.mode == remuda_protocol::ClaudePermissionMode::BypassPermissions)
+    {
+        return;
+    }
     for flag in preset.yolo_argv {
         if !argv.iter().any(|token| token == flag) {
             argv.push((*flag).to_string());
@@ -1347,5 +1374,43 @@ mod tests {
         ));
         assert!(!looks_like_shell_prompt("❯ \n"));
         assert!(!looks_like_shell_prompt("OK\n❯ \n"));
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use remuda_protocol::{
+        ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, PermissionMode,
+    };
+
+    #[test]
+    fn yolo_requires_explicit_bypass_and_non_agent_origin_for_every_preset() {
+        for name in ["claude", "codex", "grok", "agy", "gemini"] {
+            let preset = preset_by_id(name).unwrap();
+            for origin in [LaunchOrigin::Human, LaunchOrigin::Bot, LaunchOrigin::Agent] {
+                for mode in [
+                    ClaudePermissionMode::Manual,
+                    ClaudePermissionMode::DontAsk,
+                    ClaudePermissionMode::BypassPermissions,
+                ] {
+                    let mut argv = vec!["--name".into(), "worker".into()];
+                    let permission = PermissionMode::Claude(Box::new(ClaudePermission {
+                        mode,
+                        interaction: ClaudeInteractionMode::NativeTty,
+                    }));
+                    merge_yolo_argv(&mut argv, preset, &permission, origin);
+                    let allowed = mode == ClaudePermissionMode::BypassPermissions
+                        && origin != LaunchOrigin::Agent;
+                    for flag in preset.yolo_argv {
+                        assert_eq!(
+                            argv.iter().any(|arg| arg == flag),
+                            allowed,
+                            "{name} {origin:?} {mode:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

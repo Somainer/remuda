@@ -101,6 +101,11 @@ async fn dispatch_hub(
             catch_up(runtime, &instance_id).await?;
             Ok(result)
         }
+        _ if method == "instance.close" => {
+            let (instance_id, result) = close_from_params(&runtime.node, params).await?;
+            catch_up(runtime, &instance_id).await?;
+            Ok(result)
+        }
         _ => Ok(json!({ "ok": true })),
     }
 }
@@ -136,11 +141,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
     let driver = parsed
         .driver
         .as_deref()
-        .and_then(|raw| serde_json::from_value(json!(raw)).ok())
-        .or_else(|| {
-            spec.get("driver")
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-        })
+        .and_then(driver_kind_from_str)
+        .or_else(|| spec.get("driver").and_then(driver_kind_from_value))
         .unwrap_or(DriverKind::ClaudePrint);
     let model = spec
         .get("model")
@@ -187,6 +189,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .clone()
             .or_else(|| prompt_of(params))
             .unwrap_or_default(),
+        cwd: cwd_of(spec),
     })
 }
 
@@ -263,6 +266,37 @@ async fn cancel_from_params(
     Ok((instance_id, serde_json::to_value(&result)?))
 }
 
+async fn close_from_params(
+    node: &DevNode,
+    params: Value,
+) -> Result<(InstanceId, Value), NodeError> {
+    let parsed: Option<InstanceCancelParams> = serde_json::from_value(params.clone()).ok();
+    let instance_id = match parsed.as_ref() {
+        Some(parsed) => InstanceId::try_from(parsed.instance_id.clone())
+            .map_err(|err| NodeError::InvalidRequest(err.to_string()))?,
+        None => instance_id_of(&params)?,
+    };
+    let command_id = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.command_id.as_deref())
+        .and_then(|raw: &str| remuda_protocol::CommandId::try_from(raw.to_owned()).ok())
+        .or_else(|| command_id_of(&params));
+    let result = node
+        .submit_command(
+            &instance_id,
+            InstanceCommandRequest {
+                command_id,
+                operation: CommandAction::Close,
+                prompt: None,
+                run_id: None,
+                interaction_id: None,
+                answer: None,
+            },
+        )
+        .await?;
+    Ok((instance_id, serde_json::to_value(&result)?))
+}
+
 async fn respond_from_params(
     node: &DevNode,
     params: Value,
@@ -304,6 +338,33 @@ async fn respond_from_params(
         )
         .await?;
     Ok((instance_id, serde_json::to_value(&result)?))
+}
+
+fn driver_kind_from_str(raw: &str) -> Option<DriverKind> {
+    match raw {
+        "pty" | "generic-pty" | "generic_pty" | "genericPty" => Some(DriverKind::GenericPty),
+        other => serde_json::from_value(json!(other)).ok(),
+    }
+}
+
+fn driver_kind_from_value(value: &Value) -> Option<DriverKind> {
+    match value {
+        Value::String(raw) => driver_kind_from_str(raw),
+        other => serde_json::from_value(other.clone()).ok(),
+    }
+}
+
+fn cwd_of(spec: &Value) -> Option<String> {
+    for key in ["cwd", "workspaceId"] {
+        let Some(raw) = spec.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        if raw.is_empty() || raw.starts_with("ws_") {
+            continue;
+        }
+        return Some(raw.to_owned());
+    }
+    None
 }
 
 fn instance_id_of(params: &Value) -> Result<InstanceId, NodeError> {

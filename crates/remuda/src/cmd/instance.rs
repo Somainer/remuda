@@ -703,7 +703,12 @@ pub(crate) fn until_met(
     if let Some(pattern) = until.strip_prefix("line:") {
         let re = regex::Regex::new(pattern)
             .with_context(|| format!("invalid --until regex {pattern:?}"))?;
-        let text = collect_strings(&Value::Array(events.to_vec()));
+        let filtered: Vec<Value> = events
+            .iter()
+            .filter(|event| line_wait_event(event))
+            .cloned()
+            .collect();
+        let text = collect_strings(&Value::Array(filtered));
         return Ok(re.is_match(&text));
     }
     Ok(match until {
@@ -881,6 +886,42 @@ fn is_screen_event(event: &Value) -> bool {
     ty.contains("tty") || ty.contains("screen") || ty.contains("terminal.frame")
 }
 
+fn is_prompt_echo(event: &Value) -> bool {
+    native_name(event).as_deref() == Some("prompt_echo")
+}
+
+fn native_name(event: &Value) -> Option<String> {
+    fn walk(value: &Value) -> Option<String> {
+        match value {
+            Value::Object(map) => {
+                for key in ["nativeName", "native_name"] {
+                    if let Some(name) = map.get(key).and_then(Value::as_str) {
+                        return Some(name.to_string());
+                    }
+                }
+                map.values().find_map(walk)
+            }
+            Value::Array(items) => items.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    walk(event)
+}
+
+fn line_wait_event(event: &Value) -> bool {
+    if is_prompt_echo(event) {
+        return false;
+    }
+    if is_screen_event(event) {
+        return true;
+    }
+    if native_name(event).as_deref() == Some("line-matcher") {
+        return true;
+    }
+    let ty = event_type(event);
+    ty == "message" || ty.ends_with(".message")
+}
+
 fn event_is_run_terminal(event: &Value) -> bool {
     let ty = event_type(event);
     ty.contains("terminal")
@@ -951,6 +992,29 @@ mod tests {
         let events = [json!({ "event": { "type": "message", "text": "DONE abcdef" } })];
         assert!(until_met("line:DONE ", &events, None, None).unwrap());
         assert!(!until_met("line:MISSING", &events, None, None).unwrap());
+    }
+
+    #[test]
+    fn until_line_ignores_prompt_echo() {
+        let events = [json!({
+            "nativeName": "prompt_echo",
+            "status": "print a line that starts with DONE (for example: DONE)."
+        })];
+        assert!(!until_met("line:DONE", &events, None, None).unwrap());
+    }
+
+    #[test]
+    fn until_line_ignores_create_prompt_payload() {
+        let events = [json!({
+            "type": "command",
+            "operation": "instance.create",
+            "payload": {
+                "initialInput": {
+                    "text": "create a file then print a line that starts with DONE (for example: DONE)."
+                }
+            }
+        })];
+        assert!(!until_met("line:DONE", &events, None, None).unwrap());
     }
 
     #[test]

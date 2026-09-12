@@ -44,6 +44,8 @@ export type Instance = EntityMeta & {
   activityEvidenceEventIds?: Id[];
   cwd?: string | null;
   name?: string | null;
+  delegation?: string | null;
+  providerProfileId?: string | null;
 };
 
 export type HostTransport = "outbound-wss" | "ssh-dev";

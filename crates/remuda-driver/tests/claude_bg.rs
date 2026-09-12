@@ -136,6 +136,8 @@ async fn stub_bg_start_send_stop_does_not_rm() {
         broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
         extra_env: Default::default(),
         setting_sources: None,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
 
     let handle = driver.start(spec(&cwd)).await.expect("prepare");
@@ -226,6 +228,8 @@ async fn live_claude_bg_haiku_once() {
         broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
         extra_env: Default::default(),
         setting_sources: Some(vec!["project".into(), "local".into()]),
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
     let mut spec = spec(&cwd);
     spec.model_id = Some("haiku".into());

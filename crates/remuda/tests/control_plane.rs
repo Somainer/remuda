@@ -12,6 +12,21 @@ fn bin() -> &'static str {
 }
 
 #[test]
+fn remuda_dev_help_lists_label() {
+    let output = Command::new(bin())
+        .args(["dev", "--help"])
+        .output()
+        .expect("help");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--label"), "{stdout}");
+}
+
+#[test]
 fn instance_create_help_lists_worktree_and_name() {
     let output = Command::new(bin())
         .args(["instance", "create", "--help"])

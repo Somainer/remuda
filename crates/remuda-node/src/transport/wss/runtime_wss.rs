@@ -171,7 +171,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             ));
         }
     };
-    Ok(CreateInstanceRequest {
+    let mut request = CreateInstanceRequest {
         command_id: parsed
             .command_id
             .as_deref()
@@ -202,7 +202,13 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .or_else(|| prompt_of(params))
             .unwrap_or_default(),
         cwd: cwd_of(spec),
-    })
+        delegation: None,
+        settings_overlay_path: None,
+        claude_config_dir: None,
+        max_budget_usd: None,
+    };
+    request.apply_spec_launch_fields(spec);
+    Ok(request)
 }
 
 async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, Value), NodeError> {
@@ -631,6 +637,42 @@ mod tests {
         assert_eq!(request.provider_profile_id, "native-login");
         assert_eq!(request.permission_mode, "dontAsk");
         assert_eq!(request.prompt, "one bounded turn");
+    }
+
+    #[tokio::test]
+    async fn create_params_preserve_gateway_overlay_config_dir_and_budget() {
+        let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+        let request = create_from_params(
+            &node,
+            &json!({
+                "instanceId": InstanceId::new(),
+                "spec": {
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "model": "haiku",
+                    "providerProfileId": "gateway",
+                    "permissionMode": "bypassPermissions",
+                    "delegation": "gateway",
+                    "settingsOverlayPath": "~/.claude/settings.relay.json",
+                    "claudeConfigDir": "/tmp/remuda-claude-home",
+                    "maxBudgetUsd": 0.3
+                },
+                "initialInput": { "text": "你好，你是什么模型" }
+            }),
+        )
+        .expect("create params");
+        assert_eq!(request.delegation.as_deref(), Some("gateway"));
+        assert_eq!(request.provider_profile_id, "gateway");
+        assert_eq!(
+            request.settings_overlay_path.as_deref(),
+            Some("~/.claude/settings.relay.json")
+        );
+        assert_eq!(
+            request.claude_config_dir.as_deref(),
+            Some("/tmp/remuda-claude-home")
+        );
+        assert_eq!(request.max_budget_usd.as_deref(), Some("0.3"));
+        assert_eq!(request.prompt, "你好，你是什么模型");
     }
 
     #[tokio::test]

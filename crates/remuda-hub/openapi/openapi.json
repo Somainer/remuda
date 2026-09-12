@@ -722,6 +722,8 @@
           "title": { "type": ["string", "null"] },
           "name": { "type": ["string", "null"] },
           "cwd": { "type": ["string", "null"] },
+          "delegation": { "type": ["string", "null"] },
+          "providerProfileId": { "type": ["string", "null"] },
           "journalId": { "type": "string" },
           "durableSeq": { "type": "string" },
           "createdAt": { "type": "string" },
@@ -752,7 +754,10 @@
           "permissionMode": { "type": "string" },
           "name": { "type": "string" },
           "cwd": { "type": "string", "description": "Working directory on the host." },
-          "worktree": { "type": "string", "description": "Worktree name created by remuda worktree create." }
+          "worktree": { "type": "string", "description": "Worktree name created by remuda worktree create." },
+          "settingsOverlayPath": { "type": "string" },
+          "claudeConfigDir": { "type": "string" },
+          "maxBudgetUsd": { "type": ["string", "number"] }
         }
       },
       "WorktreeCreate": {

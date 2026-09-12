@@ -32,6 +32,10 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         permission_mode: "dontAsk".to_owned(),
         prompt: prompt.to_owned(),
         cwd: None,
+        delegation: None,
+        settings_overlay_path: None,
+        claude_config_dir: None,
+        max_budget_usd: None,
     }
 }
 

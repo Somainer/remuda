@@ -358,7 +358,7 @@ export function NewSessionPage() {
             </div>
           </fieldset>
           <div className={css.advanced}>
-            <button type="button" className={css.advancedToggle} onClick={() => setAdvanced(!advanced)}>
+            <button type="button" className={css.advancedToggle} data-testid="new-session-advanced" onClick={() => setAdvanced(!advanced)}>
               <span>{advanced ? "▾" : "▸"}</span>
               <span>高级 · 驱动</span>
               <span className={css.m3}>{activeKind === "claude" ? "claude-print / claude-pty" : "generic-pty"}</span>
@@ -389,19 +389,19 @@ export function NewSessionPage() {
                 <label className={css.field}>
                   <span className={css.label}>settings overlay 路径</span>
                   <div className={css.selectWrap}>
-                    <input className={css.select} value={settingsOverlayPath} onChange={(e) => setSettingsOverlayPath(e.target.value)} />
+                    <input className={css.select} data-testid="new-session-overlay" value={settingsOverlayPath} onChange={(e) => setSettingsOverlayPath(e.target.value)} />
                   </div>
                 </label>
                 <label className={css.field}>
                   <span className={css.label}>CLAUDE_CONFIG_DIR</span>
                   <div className={css.selectWrap}>
-                    <input className={css.select} value={claudeConfigDir} onChange={(e) => setClaudeConfigDir(e.target.value)} />
+                    <input className={css.select} data-testid="new-session-config-dir" value={claudeConfigDir} onChange={(e) => setClaudeConfigDir(e.target.value)} />
                   </div>
                 </label>
                 <label className={css.field}>
                   <span className={css.label}>max budget (USD)</span>
                   <div className={css.selectWrap}>
-                    <input className={css.select} value={maxBudgetUsd} onChange={(e) => setMaxBudgetUsd(e.target.value)} />
+                    <input className={css.select} data-testid="new-session-budget" value={maxBudgetUsd} onChange={(e) => setMaxBudgetUsd(e.target.value)} />
                   </div>
                 </label>
                 <label className={css.field}>

@@ -143,6 +143,10 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           <span className={session.dotSep}>·</span>
           <span>{instance.driver}</span>
           <span className={session.dotSep}>·</span>
+          <span data-testid="session-delegation">{instance.delegation ?? "none"}</span>
+          <span className={session.dotSep}>·</span>
+          <span data-testid="session-provider">{instance.providerProfileId ?? "none"}</span>
+          <span className={session.dotSep}>·</span>
           <span data-testid="session-lifecycle">{instance.lifecycle}</span>
           <span className={session.dotSep}>·</span>
           <span>seq {events.at(-1)?.seq ?? instance.durableSeq}</span>

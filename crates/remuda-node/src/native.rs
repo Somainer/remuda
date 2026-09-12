@@ -141,9 +141,39 @@ impl DriverFactory for NativeClaudeFactory {
             .join("instances")
             .join(launch.instance.meta.id.as_id().as_str());
         let launch_dir = instance_dir.join("launch");
-        let inherit_default_config =
-            self.kind == DriverKind::ClaudePrint && self.config.claude_print_inherit_default_config;
-        let native_home = if inherit_default_config {
+        let overlay = if self.kind == DriverKind::GenericPty {
+            None
+        } else {
+            launch
+                .request
+                .settings_overlay_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(resolve_overlay_path)
+                .transpose()?
+        };
+        let explicit_config_dir = launch
+            .request
+            .claude_config_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(expand_host_path);
+        if let Some(path) = explicit_config_dir.as_ref()
+            && !path.is_absolute()
+        {
+            return Err(DriverError::Failed(
+                "CLAUDE_CONFIG_DIR must be an absolute path".into(),
+            ));
+        }
+        let delegation = parse_delegation(&launch.request);
+        let inherit_default_config = self.kind != DriverKind::GenericPty
+            && explicit_config_dir.is_none()
+            && matches!(delegation, Delegation::None);
+        let native_home = if let Some(path) = explicit_config_dir {
+            path
+        } else if inherit_default_config {
             default_claude_home()?
         } else {
             self.config
@@ -157,7 +187,7 @@ impl DriverFactory for NativeClaudeFactory {
             std::fs::create_dir_all(&native_home)
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
         }
-        let profile = provider_profile(&launch)?;
+        let profile = provider_profile(&launch, delegation)?;
         let spec = instance_spec(&launch, &self.config, &profile)?;
         let binary = match self.kind {
             DriverKind::GenericPty => {
@@ -193,6 +223,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.extra_env = self.config.extra_env.clone();
                 options.handshake_timeout = self.config.print_handshake_timeout;
                 options.inherit_default_config = inherit_default_config;
+                options.settings_overlay_path = overlay.clone();
                 Arc::new(ClaudePrintDriver::new(options))
             }
             DriverKind::ClaudePty => {
@@ -201,6 +232,8 @@ impl DriverFactory for NativeClaudeFactory {
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
+                options.inherit_default_config = inherit_default_config;
+                options.settings_overlay_path = overlay.clone();
                 Arc::new(ClaudePtyDriver::new(options))
             }
             DriverKind::ClaudeBg => {
@@ -209,6 +242,8 @@ impl DriverFactory for NativeClaudeFactory {
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
+                options.inherit_default_config = inherit_default_config;
+                options.settings_overlay_path = overlay;
                 Arc::new(ClaudeBgDriver::new(options))
             }
             DriverKind::GenericPty => {
@@ -347,7 +382,10 @@ fn prompt_input(prompt: String) -> DriverInput {
     }))
 }
 
-fn provider_profile(launch: &DriverLaunch) -> Result<ProviderProfile, DriverError> {
+fn provider_profile(
+    launch: &DriverLaunch,
+    delegation: Delegation,
+) -> Result<ProviderProfile, DriverError> {
     let profile_id = Id::new("pvp").map_err(|error| DriverError::Failed(error.to_string()))?;
     let model = if launch.request.model.trim().is_empty() {
         "default".to_owned()
@@ -358,11 +396,73 @@ fn provider_profile(launch: &DriverLaunch) -> Result<ProviderProfile, DriverErro
         id: profile_id,
         kind: ProviderKind::Anthropic,
         base_url: String::new(),
-        delegation: Delegation::None,
+        delegation,
         secret_ref: None,
         models: vec![model],
         health: ProviderHealth::Healthy,
     })
+}
+
+fn parse_delegation(request: &crate::CreateInstanceRequest) -> Delegation {
+    let raw = request
+        .delegation
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(request.provider_profile_id.as_str());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "gateway" => Delegation::Gateway,
+        "direct" => Delegation::Direct,
+        _ => Delegation::None,
+    }
+}
+
+fn expand_host_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(trimmed));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(trimmed)
+}
+
+fn resolve_overlay_path(raw: &str) -> Result<PathBuf, DriverError> {
+    let path = expand_host_path(raw);
+    if !path.is_absolute() {
+        return Err(DriverError::Failed(
+            "settings overlay path must be absolute after expanding ~".into(),
+        ));
+    }
+    match path.metadata() {
+        Ok(meta) if meta.is_file() => Ok(path),
+        Ok(_) => Err(DriverError::Failed(
+            "settings overlay path is not a file".into(),
+        )),
+        Err(_) => Err(DriverError::Failed(
+            "settings overlay path does not exist".into(),
+        )),
+    }
+}
+
+fn with_max_budget(mut args: Vec<String>, budget: Option<&str>) -> Vec<String> {
+    let Some(budget) = budget.map(str::trim).filter(|value| !value.is_empty()) else {
+        return args;
+    };
+    if args.windows(2).any(|pair| pair[0] == "--max-budget-usd")
+        || args
+            .iter()
+            .any(|token| token.starts_with("--max-budget-usd="))
+    {
+        return args;
+    }
+    args.push("--max-budget-usd".into());
+    args.push(budget.to_owned());
+    args
 }
 
 fn instance_spec(
@@ -435,7 +535,10 @@ fn instance_spec(
         model_id,
         permission_mode: PermissionMode::Claude(Box::new(ClaudePermission { mode, interaction })),
         env: BTreeMap::new(),
-        args: launch.request.args.clone(),
+        args: with_max_budget(
+            launch.request.args.clone(),
+            launch.request.max_budget_usd.as_deref(),
+        ),
         settings_overlay: SettingsOverlay {
             format: SettingsFormat::None,
             object_ref: None,
@@ -489,6 +592,10 @@ mod tests {
                 permission_mode: "manual".to_owned(),
                 prompt: String::new(),
                 cwd: None,
+                delegation: None,
+                settings_overlay_path: None,
+                claude_config_dir: None,
+                max_budget_usd: None,
             };
             let driver = registry
                 .build(
@@ -525,5 +632,52 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn parse_delegation_prefers_explicit_field_then_profile_id() {
+        let mut request = crate::CreateInstanceRequest {
+            command_id: None,
+            instance_id: None,
+            host_id: None,
+            workspace_id: None,
+            kind: AgentKind::Claude,
+            driver: DriverKind::ClaudePrint,
+            model: "haiku".into(),
+            args: Vec::new(),
+            provider_profile_id: "none".into(),
+            permission_mode: "dontAsk".into(),
+            prompt: String::new(),
+            cwd: None,
+            delegation: Some("gateway".into()),
+            settings_overlay_path: None,
+            claude_config_dir: None,
+            max_budget_usd: None,
+        };
+        assert_eq!(parse_delegation(&request), Delegation::Gateway);
+        request.delegation = None;
+        request.provider_profile_id = "gateway".into();
+        assert_eq!(parse_delegation(&request), Delegation::Gateway);
+        request.provider_profile_id = "native-login".into();
+        assert_eq!(parse_delegation(&request), Delegation::None);
+    }
+
+    #[test]
+    fn overlay_tilde_expands_and_missing_file_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let overlay = dir.path().join("settings.relay.json");
+        std::fs::write(&overlay, r#"{"model":"example"}"#).expect("overlay");
+        let resolved = resolve_overlay_path(overlay.to_str().expect("utf8")).expect("exists");
+        assert_eq!(resolved, overlay);
+        let expanded = expand_host_path("~/settings.relay.json");
+        assert!(expanded.is_absolute());
+        assert!(expanded.ends_with("settings.relay.json"));
+        let missing = dir.path().join("missing-overlay.json");
+        let error = resolve_overlay_path(missing.to_str().expect("utf8")).expect_err("missing");
+        assert!(error.to_string().contains("does not exist"), "{error}");
+        assert!(
+            !error.to_string().contains("ANTHROPIC"),
+            "errors must not include overlay contents: {error}"
+        );
     }
 }

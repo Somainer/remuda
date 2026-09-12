@@ -66,6 +66,12 @@ pub struct CreateInstanceBody {
     placement: Option<Value>,
     #[serde(default)]
     delegation: Option<String>,
+    #[serde(default, rename = "settingsOverlayPath")]
+    settings_overlay_path: Option<String>,
+    #[serde(default, rename = "claudeConfigDir")]
+    claude_config_dir: Option<String>,
+    #[serde(default, rename = "maxBudgetUsd")]
+    max_budget_usd: Option<serde_json::Value>,
 }
 
 fn default_kind() -> String {
@@ -227,10 +233,19 @@ pub async fn create_instance(
         "worktree": body.worktree,
         "requiredCapabilities": body.required_capabilities,
     });
-    if let Some(delegation) = &body.delegation
-        && let Some(obj) = spec.as_object_mut()
-    {
-        obj.insert("delegation".into(), json!(delegation));
+    if let Some(obj) = spec.as_object_mut() {
+        if let Some(delegation) = &body.delegation {
+            obj.insert("delegation".into(), json!(delegation));
+        }
+        if let Some(path) = &body.settings_overlay_path {
+            obj.insert("settingsOverlayPath".into(), json!(path));
+        }
+        if let Some(path) = &body.claude_config_dir {
+            obj.insert("claudeConfigDir".into(), json!(path));
+        }
+        if let Some(budget) = &body.max_budget_usd {
+            obj.insert("maxBudgetUsd".into(), budget.clone());
+        }
     }
     let placement =
         crate::placement::Placement::from_value(body.placement.as_ref(), body.host_id.as_deref())?;

@@ -169,6 +169,12 @@ pub struct InstanceRecord {
     /// Working directory recorded on the workspace / spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Provider delegation persisted from the create spec (`none` / `gateway`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
+    /// Provider profile id persisted from the create spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile_id: Option<String>,
     /// Journal id (`obj_…`).
     pub journal_id: String,
     /// Durable seq as decimal string.
@@ -1955,6 +1961,14 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .or_else(|| title.clone());
+            let delegation = spec
+                .get("delegation")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let provider_profile_id = spec
+                .get("providerProfileId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 host_id: row.get(1)?,
@@ -1967,6 +1981,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 title,
                 name,
                 cwd,
+                delegation,
+                provider_profile_id,
                 journal_id: row.get(9)?,
                 durable_seq: durable.to_string(),
                 created_at: row.get(11)?,

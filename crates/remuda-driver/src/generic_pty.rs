@@ -332,6 +332,7 @@ impl GenericPtyDriver {
             binary,
             setting_sources: None,
             origin: self.options.origin,
+            settings_overlay_path: None,
         };
         let mut recipe = materialize(&request)?;
         merge_yolo_argv(&mut recipe.argv, preset);

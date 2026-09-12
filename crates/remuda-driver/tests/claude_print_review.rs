@@ -11,24 +11,29 @@ use remuda_protocol::{
     Digest, DriverInput, InputOrigin, InstanceSpec, InteractionAnswer, Knowledge, LifecyclePayload,
     NativeRef, Observation, ObservationPayload, PermissionMode, PromptInput, PromptMode, TextBlock,
 };
-use remuda_testing::{ScriptKind, script_path};
+use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 fn digest() -> Digest {
     Digest::try_from(format!("sha256:{:0>64}", "b")).unwrap()
 }
 
+fn ensure_fake_claude() -> PathBuf {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let path = ensure_workspace_bin("fake-claude");
+        assert!(path.is_file(), "missing {}", path.display());
+        path
+    })
+    .clone()
+}
+
 fn pin() -> BinaryPin {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/fake-claude");
-    assert!(
-        path.is_file(),
-        "missing {}; build remuda-testing fake-claude first",
-        path.display()
-    );
-    let path = path.canonicalize().expect("fake-claude");
+    let path = ensure_fake_claude().canonicalize().expect("fake-claude");
     BinaryPin {
         abs_path: path.to_string_lossy().into_owned(),
         version: "fake-claude".into(),

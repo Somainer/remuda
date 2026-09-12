@@ -17,15 +17,18 @@ test-stub = []
 
 [dependencies]
 async-trait = "0.1"
+remuda-claude-wire.workspace = true
 remuda-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+remuda-testing.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

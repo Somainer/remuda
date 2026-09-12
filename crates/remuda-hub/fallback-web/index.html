@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Remuda Hub</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font: 16px/1.4 system-ui, sans-serif; background: #0b0d10; color: #e8e6e1; margin: 0; }
+      main { max-width: 40rem; margin: 20vh auto; padding: 0 1.5rem; }
+      code { font-family: ui-monospace, monospace; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Web UI not embedded</h1>
+      <p>
+        Build the frontend with <code>just web-build</code>, then compile Hub with
+        <code>--features embed-web</code>. API routes under <code>/v1</code> and
+        <code>/healthz</code> are still available.
+      </p>
+    </main>
+  </body>
+</html>

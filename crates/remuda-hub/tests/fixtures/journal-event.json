@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "kind": "message",
+  "completeness": "structured",
+  "payload": {
+    "role": "assistant",
+    "text": "hello from fake-node"
+  }
+}

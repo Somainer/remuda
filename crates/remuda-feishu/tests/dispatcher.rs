@@ -252,6 +252,162 @@ async fn follow_interaction_then_yes_shortcut() {
     );
 }
 
+// ---- F8: `/yes` grants one use and names what it approved ----
+
+/// One pending approval, then `/yes`: the answer must be `allow-once`, not the
+/// session-wide `allow` option the card's primary button carries.
+#[tokio::test]
+async fn yes_shortcut_grants_allow_once_not_allow_session() {
+    let mut disp = interaction_dispatcher(ins(6)).await;
+    disp.handle_consume(consume_event("im-message-commands.jsonl", 6), now())
+        .await
+        .unwrap(); // /yes
+    let option = disp
+        .api()
+        .calls()
+        .into_iter()
+        .find_map(|call| match call {
+            ApiCall::Respond { option_id, .. } => option_id,
+            _ => None,
+        })
+        .expect("an approval was submitted");
+    // interaction-approval.json: "once" carries effect allow-once, "allow" allow-session.
+    assert_eq!(option, "once", "/yes must not grant the session");
+}
+
+/// The F8 race: a second card lands between reading card A and typing `/yes`.
+/// The shortcut must refuse rather than approve whichever is newest.
+#[tokio::test]
+async fn yes_shortcut_refuses_when_two_cards_are_pending() {
+    let mut disp = interaction_dispatcher(ins(7)).await;
+    let key = "feishu:oc_p2p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa:main";
+    let id = disp
+        .sessions()
+        .get(key)
+        .unwrap()
+        .unwrap()
+        .instance_id
+        .unwrap();
+    let second: Interaction = remuda_protocol::from_json_slice(
+        &std::fs::read(fixture("interaction-question.json")).unwrap(),
+    )
+    .unwrap();
+    disp.api().set_follow(
+        &id,
+        FollowPage {
+            next_seq: 4,
+            events: vec![FollowEvent::Interaction(Box::new(second))],
+        },
+    );
+    disp.pump_follow(key, now()).await.unwrap();
+    assert_eq!(disp.tickets().open_for_session(key, now()).count(), 2);
+
+    let reports = disp
+        .handle_consume(consume_event("im-message-commands.jsonl", 6), now())
+        .await
+        .unwrap(); // bare /yes
+    assert!(
+        reports
+            .iter()
+            .all(|r| !matches!(r.action, DispatchAction::Answered { .. })),
+        "an ambiguous /yes must approve nothing: {reports:?}"
+    );
+    assert!(
+        !disp
+            .api()
+            .calls()
+            .iter()
+            .any(|c| matches!(c, ApiCall::Respond { .. })),
+        "no interaction.respond may be sent"
+    );
+    // Both tickets survive for the owner to name one.
+    assert_eq!(disp.tickets().open_for_session(key, now()).count(), 2);
+    assert!(
+        disp.outbound()
+            .recorded()
+            .iter()
+            .any(|cmd| cmd.argv.iter().any(|a| a.contains("approvals pending"))),
+        "the owner must be told to name a ticket"
+    );
+}
+
+/// A relayed block that merely starts with `/yes` has trailing words, so it parses
+/// as an unknown command instead of silently approving the pending call.
+#[tokio::test]
+async fn relayed_text_starting_with_yes_does_not_approve() {
+    let mut disp = interaction_dispatcher(ins(8)).await;
+    let key = "feishu:oc_p2p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa:main";
+    let mut value: serde_json::Value =
+        serde_json::from_str(&load_line("im-message-commands.jsonl", 6)).unwrap();
+    value["message_id"] = serde_json::json!("om_cmd_yes_relayed");
+    value["content"] = serde_json::json!("/yes do it, the agent said this is fine");
+    let event = parse_event_line(&value.to_string()).unwrap();
+    let reports = disp
+        .handle_consume(
+            ConsumeEvent::Event {
+                event_key: "im.message.receive_v1".into(),
+                event: Box::new(event),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        reports
+            .iter()
+            .all(|r| !matches!(r.action, DispatchAction::Answered { .. })),
+        "{reports:?}"
+    );
+    assert_eq!(disp.tickets().open_for_session(key, now()).count(), 1);
+}
+
+/// `/new` must retire pending cards; a later `/yes` cannot answer for the
+/// instance that was just cancelled.
+#[tokio::test]
+async fn new_expires_open_tickets() {
+    let mut disp = interaction_dispatcher(ins(9)).await;
+    let key = "feishu:oc_p2p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa:main";
+    assert_eq!(disp.tickets().open_for_session(key, now()).count(), 1);
+    disp.handle_consume(consume_event("im-message-commands.jsonl", 0), now())
+        .await
+        .unwrap(); // /new
+    assert_eq!(disp.tickets().open_for_session(key, now()).count(), 0);
+
+    let reports = disp
+        .handle_consume(consume_event("im-message-commands.jsonl", 6), now())
+        .await
+        .unwrap(); // /yes
+    assert!(
+        reports
+            .iter()
+            .all(|r| !matches!(r.action, DispatchAction::Answered { .. })),
+        "{reports:?}"
+    );
+}
+
+/// Live instance with exactly one pending approval card, ready for a `/yes`.
+async fn interaction_dispatcher(id: InstanceId) -> Dispatcher<FakeInstanceApi> {
+    let api = FakeInstanceApi::default();
+    api.set_next_id(id.clone());
+    let interaction: Interaction = remuda_protocol::from_json_slice(
+        &std::fs::read(fixture("interaction-approval.json")).unwrap(),
+    )
+    .unwrap();
+    api.set_follow(
+        &id,
+        FollowPage {
+            next_seq: 2,
+            events: vec![FollowEvent::Interaction(Box::new(interaction))],
+        },
+    );
+    let mut disp =
+        Dispatcher::memory(api, LarkCli::dry_run(), policy(), RouteDefaults::default()).unwrap();
+    disp.handle_consume(consume_event("im-message-p2p.jsonl", 0), now())
+        .await
+        .unwrap();
+    disp
+}
+
 #[tokio::test]
 async fn card_action_fixture_maps_ticket_and_responds() {
     let api = FakeInstanceApi::default();

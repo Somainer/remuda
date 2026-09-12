@@ -46,8 +46,9 @@ pub use outbound::{
 };
 pub use runtime::{DispatcherRun, run_dispatcher};
 pub use tickets::{
-    DEFAULT_INTERACTION_TTL, MAX_INTERACTION_TTL, MIN_INTERACTION_TTL, MappedAnswer, TicketState,
-    TicketStore, parse_form_value,
+    AnswerScope, CardTicket, DEFAULT_INTERACTION_TTL, MAX_INTERACTION_TTL, MIN_INTERACTION_TTL,
+    MappedAnswer, ShortcutMiss, ShortcutRef, TicketState, TicketStore, parse_form_value,
+    request_title, session_chat,
 };
 
 /// Event key for inbound IM (one consume process).

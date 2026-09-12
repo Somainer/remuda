@@ -23,7 +23,9 @@ use crate::inbound::{
     Intent, SessionKey, admit,
 };
 use crate::outbound::{LarkCli, OutboundBody};
-use crate::tickets::{MappedAnswer, TicketStore};
+use crate::tickets::{
+    AnswerScope, MappedAnswer, ShortcutMiss, ShortcutRef, TicketStore, request_title,
+};
 
 /// Minimum gap between static progress cards (tool-boundary updates only).
 const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(500);
@@ -375,6 +377,9 @@ pub enum ApiCall {
         instance_id: InstanceId,
         /// Interaction.
         interaction_id: InteractionId,
+        /// Chosen `DecisionOption` id for approvals. Question form values are not
+        /// recorded — they may hold `sensitive` field text.
+        option_id: Option<String>,
     },
     /// [`InstanceApi::follow`].
     Follow {
@@ -452,12 +457,17 @@ impl InstanceApi for FakeInstanceApi {
     }
 
     fn respond(&self, req: RespondRequest) -> impl Future<Output = Result<(), Error>> + Send {
+        let option_id = match &req.answer {
+            InteractionAnswer::Approval(answer) => Some(answer.option_id.clone()),
+            _ => None,
+        };
         self.calls
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .push(ApiCall::Respond {
                 instance_id: req.instance_id,
                 interaction_id: req.interaction_id,
+                option_id,
             });
         async move { Ok(()) }
     }
@@ -680,8 +690,14 @@ impl<A: InstanceApi> Dispatcher<A> {
             }
             Intent::Command(ExplicitCommand::Status) => self.cmd_status(inbound).await,
             Intent::Command(ExplicitCommand::Stop) => self.cmd_stop(inbound).await,
-            Intent::Command(ExplicitCommand::Yes) => self.cmd_yes_no(inbound, "allow", now).await,
-            Intent::Command(ExplicitCommand::No) => self.cmd_yes_no(inbound, "deny", now).await,
+            Intent::Command(ExplicitCommand::Yes { ticket_id }) => {
+                self.cmd_yes_no(inbound, ticket_id.as_deref(), "once", now)
+                    .await
+            }
+            Intent::Command(ExplicitCommand::No { ticket_id }) => {
+                self.cmd_yes_no(inbound, ticket_id.as_deref(), "deny", now)
+                    .await
+            }
             Intent::UnknownCommand { raw } => {
                 self.reply_text(inbound, &format!("unknown command: {raw}"))
                     .await?;
@@ -770,6 +786,15 @@ impl<A: InstanceApi> Dispatcher<A> {
         binding.follow_seq = 0;
         self.touch_inbound(&mut binding, inbound);
         self.sessions.put(&binding)?;
+        // F9: a retired instance must not keep answerable cards behind it.
+        let dropped = self.tickets.expire_session(key);
+        if !dropped.is_empty() {
+            info!(
+                session_key = key,
+                tickets = dropped.len(),
+                "/new expired open tickets"
+            );
+        }
         self.reply_text(inbound, "new session; send a prompt to create")
             .await?;
         reports.push(report(key, DispatchAction::Routed));
@@ -844,6 +869,14 @@ impl<A: InstanceApi> Dispatcher<A> {
         binding.status = SessionStatus::Stopped;
         self.touch_inbound(&mut binding, inbound);
         self.sessions.put(&binding)?;
+        let dropped = self.tickets.expire_session(key);
+        if !dropped.is_empty() {
+            info!(
+                session_key = key,
+                tickets = dropped.len(),
+                "/stop expired open tickets"
+            );
+        }
         self.reply_text(inbound, "stopped").await?;
         Ok(reports)
     }
@@ -851,19 +884,41 @@ impl<A: InstanceApi> Dispatcher<A> {
     async fn cmd_yes_no(
         &mut self,
         inbound: &Inbound,
+        ticket_id: Option<&str>,
         a: &str,
         now: SystemTime,
     ) -> Result<Vec<DispatchReport>, Error> {
         let key = inbound.session_key.as_str();
-        let Some(ticket) = self.tickets.latest_open(key, now).cloned() else {
-            self.reply_text(inbound, "no pending approval").await?;
-            return Ok(vec![report(key, DispatchAction::Ignored)]);
+        let reference = ShortcutRef {
+            ticket_id,
+            reply_to: inbound.thread.reply_to.as_deref(),
+        };
+        let ticket = match self.tickets.resolve_shortcut(key, reference, now) {
+            Ok(ticket) => ticket.clone(),
+            Err(miss) => {
+                self.reply_text(inbound, &shortcut_miss_text(&miss)).await?;
+                return Ok(vec![report(key, DispatchAction::Ignored)]);
+            }
         };
         let callback = CallbackValue {
             tid: ticket.ticket_id.clone(),
             a: a.to_string(),
         };
-        let mapped = self.tickets.answer_callback(&callback, None, now)?;
+        let mapped =
+            self.tickets
+                .answer_callback(&callback, None, AnswerScope::Session(key), now)?;
+        // Echo what was approved: the owner sees the tool, not just "ok".
+        let verb = if a == "deny" {
+            "Denied"
+        } else {
+            "Allowed once"
+        };
+        let echo = format!(
+            "{verb}: {} ({})",
+            request_title(&mapped.ticket.request),
+            mapped.ticket.ticket_id
+        );
+        self.reply_text(inbound, &echo).await?;
         self.commit_answer(inbound, mapped).await
     }
 
@@ -875,7 +930,9 @@ impl<A: InstanceApi> Dispatcher<A> {
         let InboundKind::CardAction { action, .. } = &inbound.kind else {
             return Ok(Vec::new());
         };
-        match self.tickets.answer_card(action, now) {
+        // Card actions carry no thread identity, so they bind to the chat (F9).
+        let scope = AnswerScope::Chat(&inbound.chat_id);
+        match self.tickets.answer_card(action, scope, now) {
             Ok(mapped) => self.commit_answer(inbound, mapped).await,
             Err(Error::TicketExpired(tid)) => {
                 let card = crate::render_expired_card("Expired")?;
@@ -886,6 +943,15 @@ impl<A: InstanceApi> Dispatcher<A> {
                     DispatchAction::CardPosted {
                         kind: "expired".into(),
                     },
+                )])
+            }
+            Err(Error::TicketScope { ticket_id, scope }) => {
+                warn!(%ticket_id, %scope, "card answer rejected: ticket belongs to another chat");
+                self.reply_text(inbound, "card is not actionable here")
+                    .await?;
+                Ok(vec![report(
+                    inbound.session_key.as_str(),
+                    DispatchAction::Ignored,
                 )])
             }
             Err(Error::TicketNotFound(_)) | Err(Error::TicketAnswered(_)) => {
@@ -904,10 +970,15 @@ impl<A: InstanceApi> Dispatcher<A> {
         inbound: &Inbound,
         mapped: MappedAnswer,
     ) -> Result<Vec<DispatchReport>, Error> {
-        let key = inbound.session_key.as_str();
-        let binding = self.load_or_init(inbound)?;
+        // F9: resolve the instance from the ticket's own session, not from whichever
+        // session happened to deliver the answer.
+        let key = mapped.ticket.session_key.clone();
+        let binding = self
+            .sessions
+            .get(&key)?
+            .ok_or_else(|| Error::NoLiveInstance(key.clone()))?;
         let Some(instance_id) = binding.instance_id.clone() else {
-            return Err(Error::NoLiveInstance(key.to_string()));
+            return Err(Error::NoLiveInstance(key));
         };
         self.api
             .respond(RespondRequest {
@@ -926,13 +997,13 @@ impl<A: InstanceApi> Dispatcher<A> {
         .await?;
         Ok(vec![
             report(
-                key,
+                &key,
                 DispatchAction::Answered {
                     ticket_id: mapped.ticket.ticket_id.clone(),
                 },
             ),
             report(
-                key,
+                &key,
                 DispatchAction::CardPosted {
                     kind: "recorded".into(),
                 },
@@ -982,12 +1053,18 @@ impl<A: InstanceApi> Dispatcher<A> {
                 }
                 FollowEvent::Interaction(interaction) => {
                     let (ticket, card) = self.tickets.issue(&interaction, session_key, now)?;
-                    self.send_chat_card(
-                        &binding,
-                        &card,
-                        &format!("interaction:{}", ticket.ticket_id),
-                    )
-                    .await?;
+                    let receipt = self
+                        .send_chat_card(
+                            &binding,
+                            &card,
+                            &format!("interaction:{}", ticket.ticket_id),
+                        )
+                        .await?;
+                    // Lets `/yes` bind by replying to the card itself (F8).
+                    if let Some(message_id) = receipt.message_id.as_deref() {
+                        self.tickets
+                            .set_card_message_id(&ticket.ticket_id, message_id);
+                    }
                     reports.push(report(
                         session_key,
                         DispatchAction::CardPosted {
@@ -1109,7 +1186,7 @@ impl<A: InstanceApi> Dispatcher<A> {
         binding: &SessionBinding,
         card: &serde_json::Value,
         seed: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<crate::outbound::OutboundReceipt, Error> {
         if let Some(message_id) = binding.last_message_id.as_deref() {
             self.outbound
                 .reply(
@@ -1118,13 +1195,10 @@ impl<A: InstanceApi> Dispatcher<A> {
                     binding.in_thread,
                     seed,
                 )
-                .await?;
+                .await
         } else {
-            self.outbound
-                .send_card(&binding.chat_id, card, seed)
-                .await?;
+            self.outbound.send_card(&binding.chat_id, card, seed).await
         }
-        Ok(())
     }
 }
 
@@ -1145,6 +1219,24 @@ fn reply_target(inbound: &Inbound) -> Option<&str> {
     match &inbound.kind {
         InboundKind::Message { message_id, .. } => Some(message_id.as_str()),
         InboundKind::CardAction { action, .. } => Some(action.message_id.as_str()),
+    }
+}
+
+/// What to tell the owner when `/yes` could not be bound to exactly one ticket (F8).
+fn shortcut_miss_text(miss: &ShortcutMiss) -> String {
+    match miss {
+        ShortcutMiss::NoneOpen => "no pending approval".to_string(),
+        ShortcutMiss::UnknownTicket(tid) => {
+            format!("no pending approval {tid} in this topic")
+        }
+        ShortcutMiss::Ambiguous(ids) => format!(
+            "{} approvals pending; reply to a card or name one: {}",
+            ids.len(),
+            ids.iter()
+                .map(|id| format!("/yes {id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

@@ -127,6 +127,15 @@
 - 手机永不直连 `10.x`；官方 Remote Control 只作备选通道。
 - 待修：`forge-doloris` 的 ssh config `User` 字段带注释导致 GSSAPI 失败；`devbox-sg-small` 超时。
 
+### 4.6 多主机统领与跨主机调度（D-013，M1 主线）
+
+- **主机接入三种传输**：`ssh-stdio`（Hub/Mac 用系统 `ssh`（honor `~/.ssh/config`、ProxyJump、ControlMaster）执行 `remuda node --stdio`，Node 协议跑在 stdio 上，无需远端开端口；Hub 可先 `scp` 推送 musl 静态二进制）、`outbound-wss`（Node 常驻，主动连 Hub；生产）、`local`（同机）。三者对 Hub 暴露同一个 Node 协议，只是 carrier 不同。
+- **Host registry**：`Host {id, name, transport, labels[], online, lastSeen, cli[]{kind,path,version,auth}, herdr{version,socket}, resources, maxInstances}`；Node 上线时上报清单，Hub 缓存。
+- **Placement**：`InstanceSpec.placement = {host: <id> | labels: {...} | any}`；Hub 按标签/能力（需要 claude-pty → 主机有 herdr；需要网关 profile → 主机能出站到网关）/负载选主机；不可满足时返回明确错误，不静默降级。
+- **Fleet 操作**：`POST /v1/fleet/instances`：同一 spec 在 N 台主机各起一个 Instance（返回一组 instanceId），`fleet` 视图聚合状态；Command 可对 fleet 广播（cancel/send）。
+- **主 agent 控制面**：`remuda` CLI 子命令 + MCP server（`instance.create/send/wait/read/stop`，均带 `--host`/`placement`），让 Claude Code 主会话（或 Workflow 里的 agent()）把子任务派到指定主机的 worker 上并回收结果。
+- **一致性**：跨主机的 seq 只在各自 Instance 内单调；fleet 视图不假设跨主机因果序。
+
 ### 4.5 与现有开源产品的关系（paseo-vibekanban.md、reference-repos.md）
 
 - **不 fork Paseo**（最接近的同类：Node daemon + Expo 原生端 + relay；Claude 走 Agent SDK 重画 chat，丢 TUI；协议未稳定；栈不合）。**不 fork vibe-kanban**（已 sunset）。**不碰 claudecodeui 源码**（AGPL）。
@@ -148,6 +157,7 @@
 |---|---|---|
 | 1 | 名字 | **Remuda** ✅ |
 | 2 | 人机会话形态 | **M0 两条并行 ✅**：`claude-print` + 结构化 UI，与 `claude-pty`（herdr 承载）+ xterm 同时做 |
+| 2b | 优先级（D-013） | 次级驱动停在最小可用；**多主机统领（SSH remote + Host registry + placement + fleet + 主 agent MCP）提前为 M1 主线** |
 | 3 | PTY 底座 | **M0 = `claude-print`，不需要 PTY，也不依赖 herdr。需要 TTY 的 `claude-bg attach` / `claude-pty`（M3，或你要求提前）以每台 Node 上的 `herdr server` 为 PTY 载体**：`agent.start/prompt/wait/send_keys` + `events.subscribe` 管状态，`herdr terminal session observe/control` 给 xterm.js 原始 ANSI 流（herdrx 同款）。PTY spike 实测自建要 6–12 人周且要追 TUI 改版，不值；spike 代码留作对照 |
 | 4 | 权限默认 | **Interaction broker 询问 ✅**：`--permission-prompts host --permission-prompt-tool stdio`，`can_use_tool` 统一审批与提问；新建会话可选 **bypass（yolo）**（D-011）；bot 永不 bypass；M0 临时 dontAsk 记债 |
 | 5 | 远程拓扑 | Hub 在 `devbox-sg-host`（Docker + 现成 Caddy + Cloudflare Tunnel）；M1 第一台 Node = `devbox-sg`；CN 节点后置 |

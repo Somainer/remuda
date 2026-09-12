@@ -3,7 +3,9 @@
 use crate::binary::{BinaryPin, pin_binary};
 use crate::error::{DriverError, DriverResult};
 use crate::flags::{reject_banned_env, validate_spec_args};
-use crate::profile::{Delegation, ProviderHealth, ProviderKind, ProviderProfile, SecretRef};
+use crate::profile::{
+    Delegation, ProviderHealth, ProviderKind, ProviderProfile, SecretRef, SecretRefPolicy,
+};
 use crate::recipe::{
     EnvAllowlistEntry, EnvAllowlistSource, FileLifetime, FileRole, LaunchAudit, LaunchRecipe,
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
@@ -78,6 +80,11 @@ pub struct MaterializeRequest<'a> {
     pub origin: LaunchOrigin,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
+    /// Where `file:` / `helper:` secret refs are allowed to point (S3, S4).
+    ///
+    /// `None` refuses a profile-supplied `helper:` ref outright. A helper Remuda
+    /// writes itself is unaffected — that path and its 0700 mode are ours.
+    pub secret_policy: Option<SecretRefPolicy>,
 }
 
 /// Node token-broker bind baked into a Claude `apiKeyHelper` script.
@@ -211,8 +218,12 @@ fn materialize_inner(
                     api_key_helper_path = maybe_write_api_key_helper(request, bind, &mut files)?;
                 }
                 let path = request.launch_dir.join("settings.json");
-                let settings =
-                    claude_settings_json(request.profile, &model, api_key_helper_path.as_deref())?;
+                let settings = claude_settings_json(
+                    request.profile,
+                    &model,
+                    api_key_helper_path.as_deref(),
+                    request.secret_policy.as_ref(),
+                )?;
                 let bytes = serde_json::to_vec_pretty(&settings)?;
                 write_private_file(&path, &bytes)?;
                 let digest = crate::binary::hash_bytes(&bytes)?;
@@ -643,6 +654,7 @@ fn claude_settings_json(
     profile: &ProviderProfile,
     model: &str,
     written_helper: Option<&Path>,
+    policy: Option<&SecretRefPolicy>,
 ) -> DriverResult<Value> {
     if profile.base_url.trim().is_empty() {
         return Err(DriverError::InvalidLaunchSpec(
@@ -662,15 +674,27 @@ fn claude_settings_json(
         "model": model,
         "env": env,
     });
-    let helper = written_helper
-        .map(|path| path.to_string_lossy().into_owned())
-        .or_else(|| {
-            profile
-                .secret_ref
-                .as_ref()
-                .and_then(SecretRef::helper_command)
-                .map(str::to_string)
-        });
+    // A helper we wrote ourselves is trusted: we chose the path and the 0700 mode.
+    // A helper spelled by the profile is not — Claude runs `apiKeyHelper` as a
+    // shell command, so `is_absolute()` alone admits `/bin/sh -c '…'` (S3).
+    let helper = match written_helper {
+        Some(path) => Some(path.to_string_lossy().into_owned()),
+        None => match profile
+            .secret_ref
+            .as_ref()
+            .and_then(SecretRef::helper_command)
+        {
+            Some(raw) => {
+                let policy = policy.ok_or_else(|| {
+                    DriverError::InvalidLaunchSpec(
+                        "helper: secret refs require a configured SecretRefPolicy".into(),
+                    )
+                })?;
+                Some(policy.resolve_helper(raw)?.to_string_lossy().into_owned())
+            }
+            None => None,
+        },
+    };
     if let Some(helper) = helper {
         if !Path::new(&helper).is_absolute() {
             return Err(DriverError::InvalidLaunchSpec(

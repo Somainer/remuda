@@ -43,13 +43,14 @@ pub use materializer::{
 pub use process::current_process_identity;
 pub use profile::{
     ClaudeProviderOverlay, Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind,
-    ProviderProfile, Secret, SecretBroker, SecretRef, claude_provider_settings_json,
-    write_claude_provider_overlay,
+    ProviderProfile, Secret, SecretBroker, SecretRef, SecretRefPolicy,
+    claude_provider_settings_json, write_claude_provider_overlay,
 };
 pub use pty_resource::{PtyResource, PtyResourceStore};
 pub use recipe::{
     EnvAllowlistEntry, EnvAllowlistSource, FileLifetime, FileRole, LaunchAudit, LaunchRecipe,
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
+    report_launch_cleanup,
 };
 pub use remuda_protocol::DriverKind;
 #[cfg(all(target_os = "macos", feature = "keychain"))]

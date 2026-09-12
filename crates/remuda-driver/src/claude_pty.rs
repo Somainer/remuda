@@ -115,7 +115,7 @@ impl ClaudePtyOptions {
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,
-            broker: Arc::new(EnvFileSecretBroker),
+            broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: BTreeMap::new(),
             setting_sources: None,
             agent_start_timeout_ms: 120_000,
@@ -225,6 +225,7 @@ impl ClaudePtyDriver {
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin,
             settings_overlay_path: self.options.settings_overlay_path.clone(),
+            secret_policy: None,
         };
         let mut recipe = materialize(&request)?;
         apply_tty_bypass_flag(&mut recipe);
@@ -597,8 +598,11 @@ impl Driver for ClaudePtyDriver {
         live.interactions.close().await?;
         let events = live.events.clone();
         let ctx = live.ctx.clone();
+        let recipe = live.recipe.clone();
         drop(inner);
         self.resources.close().await?;
+        // S5: the pane is closed, so the launch overlays can go.
+        crate::recipe::report_launch_cleanup(&recipe, "claude-pty");
         crate::claude_pty::emit_pty_closed(&events, &self.seq, &ctx).await?;
         self.inner.lock().await.take();
         Ok(DriverAck::not_dispatched())

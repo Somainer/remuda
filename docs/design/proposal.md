@@ -111,7 +111,7 @@
 
 ### 4.3 Provider / 凭据层（已按 gateway-auth.md 收敛）
 
-- **MVP：astergate 作为唯一 Anthropic-Messages endpoint，runtime 不造账号池。** astergate 已有 priority/weight/并发/亲和/冷却/跨池 failover/OAuth；runtime 只持有一把受限 data-plane key。
+- **网关可选（D-012）**：`delegation: none` 为默认——各 CLI 用自己的原生登录态（herdr 现状），runtime 不碰凭据；`delegation: gateway` 时把任意 Anthropic-Messages 兼容网关（astergate 只是其中一个实例，闭源，代码不绑它）作为 Claude 的 endpoint，混合模型走 Workflow；`direct` 多 key 轮换留 v2。无网关时多模型 = Codex / grok / agy 多 CLI 并行。
 - runtime 保留一层**薄的 ProviderProfile**：`{name, protocol, base_url, secret_ref, models[], health, policy}`，只回答「哪个 CLI 用哪份配置接哪个 endpoint」和「endpoint 级故障切换」；只有直连 provider（无网关）模式才启用 runtime 自己的多 key 轮换。
 - **物化规则**：Claude → 临时 `--settings` JSON（0600；只放 endpoint/model/helper，secret 走 env 或 `apiKeyHelper`，不要同时设 `ANTHROPIC_AUTH_TOKEN` 和 `ANTHROPIC_API_KEY`）；Codex → `$CODEX_HOME/<profile>.config.toml` 的 `model_providers`（`wire_api="responses"`，先 `supports_websockets=false`、retry=0）；grok → 隔离 `$GROK_HOME/config.toml` 的 `[model.grok-4.6] base_url`；agy → **当前不能直连 astergate**（缺 Gemini ingress），MVP 不做。
 - **resume 必须重申 settings + model**：换 endpoint/key 后 `--resume` 同一 session 可续，但不指定 model 会退回默认模型。同一 session 禁止两个进程并发 resume（需要 lease；并行用 `--fork-session`）。
@@ -149,8 +149,8 @@
 | 1 | 名字 | **Remuda** ✅ |
 | 2 | 人机会话形态 | **M0 两条并行 ✅**：`claude-print` + 结构化 UI，与 `claude-pty`（herdr 承载）+ xterm 同时做 |
 | 3 | PTY 底座 | **M0 = `claude-print`，不需要 PTY，也不依赖 herdr。需要 TTY 的 `claude-bg attach` / `claude-pty`（M3，或你要求提前）以每台 Node 上的 `herdr server` 为 PTY 载体**：`agent.start/prompt/wait/send_keys` + `events.subscribe` 管状态，`herdr terminal session observe/control` 给 xterm.js 原始 ANSI 流（herdrx 同款）。PTY spike 实测自建要 6–12 人周且要追 TUI 改版，不值；spike 代码留作对照 |
-| 4 | 权限默认 | **Interaction broker 询问 ✅**：`--permission-prompts host --permission-prompt-tool stdio`，`can_use_tool` 统一审批与提问；bot 永不 bypass；M0 临时 dontAsk 记债 |
+| 4 | 权限默认 | **Interaction broker 询问 ✅**：`--permission-prompts host --permission-prompt-tool stdio`，`can_use_tool` 统一审批与提问；新建会话可选 **bypass（yolo）**（D-011）；bot 永不 bypass；M0 临时 dontAsk 记债 |
 | 5 | 远程拓扑 | Hub 在 `devbox-sg-host`（Docker + 现成 Caddy + Cloudflare Tunnel）；M1 第一台 Node = `devbox-sg`；CN 节点后置 |
-| 6 | Provider 层 | astergate 唯一 endpoint；runtime 只有薄 profile；不做多 key UI（v2） |
+| 6 | Provider 层 | **网关可选**（D-012）：默认原生登录态；有网关则用；runtime 只有薄 profile；不做多 key UI（v2） |
 | 7 | 第一个 dispatcher | 飞书独立 app（M2）；Telegram 后置 |
 | 8 | M0 范围 | 见 plan-phase0.md（待出）；核心：本机 Node 跑 print/bg 两种 spawn + journal + 最小 Web 会话页 |

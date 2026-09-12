@@ -1,29 +1,31 @@
 # Unified Remote Agent Runtime 协议规格
 
-版本：`0.1-draft`。日期：2026-09-12。统一 wire major：`1`；Observation schema：`1`。本文是设计规格，尚未实现或通过运行验收；中文说明中的“必须”“禁止”是实现要求。标识符暂用 `runtime`，不提前决定项目名。
+版本：`0.1-implementation-draft`（尚未发布 wire v1）。日期：2026-09-12。项目名 Remuda；统一 wire major：`1`、minor：`0`；Observation schema：`1`。实体、Serde 编码、binary header 与 schema/TS 生成已在 `remuda-protocol` 实现；进程、存储、网络和原生驱动验收分别见 §12 的实施表。本文的“必须”“禁止”仍约束后续执行实现；已有 `runtime.*` 方法名保持不变。
 
 ## 0. 定位、证据与对 proposal 的修正
 
-沿用 [proposal.md](proposal.md) 的 `Clients → Hub → Node Agent → native CLI` 分层。Web/PWA 是人的主界面；本文的 CLI/MCP 是主 agent 的控制工具和运维入口。Node Agent 托管进程、转发原生输入、记录观察、承接交互，绝不根据 Observation 拼模型历史、执行自己的推理循环或重写 Claude Workflow。[任务背景](../research/tasks/_context.md) 已确认：网关任意模型名可以用于 Claude dynamic Workflow 的 `agent(prompt, {model})`，不能用于普通 Agent/Task 的 `model` 参数；旧调研中对此标为“推测”的段落已被这条用户事实覆盖。
+本文只链接随仓库提交的文件或公开来源。历史本地调研名仅记录设计依据，运行能力以 §12 的实施状态和后续原生验收为准。
 
-本文采用三个权威：原生 session 是继续执行的权威；Node 的 Observation journal 是已观测事实的权威；Hub 的持久命令入口与 Node 的持久执行账本共同记录命令投递，其中 **Node 是原生命令派发与 Interaction 决定的唯一裁决者**。Hub 的索引、搜索与 UI projection 都是可重建副本。前两项来自 [DSH 报告 §3.4、§8.3–8.4](../research/deepseek-harness.md#34-外部-cli-能怎样复用这套思路)，第三项是为多设备、断线与进程重启增加的设计。
+沿用 [proposal.md](proposal.md) 的 `Clients → Hub → Node Agent → native CLI` 分层。Web/PWA 是人的主界面；本文的 CLI/MCP 是主 agent 的控制工具和运维入口。Node Agent 托管进程、转发原生输入、记录观察、承接交互，绝不根据 Observation 拼模型历史、执行自己的推理循环或重写 Claude Workflow。任务背景 已确认：网关任意模型名可以用于 Claude dynamic Workflow 的 `agent(prompt, {model})`，不能用于普通 Agent/Task 的 `model` 参数；旧调研中对此标为“推测”的段落已被这条用户事实覆盖。
+
+本文采用三个权威：原生 session 是继续执行的权威；Node 的 Observation journal 是已观测事实的权威；Hub 的持久命令入口与 Node 的持久执行账本共同记录命令投递，其中 **Node 是原生命令派发与 Interaction 决定的唯一裁决者**。Hub 的索引、搜索与 UI projection 都是可重建副本。前两项来自 DSH 报告 §3.4、§8.3–8.4，第三项是为多设备、断线与进程重启增加的设计。
 
 | 对 proposal v0.1 的修改 | 本规格决定 | 理由与证据 |
 | --- | --- | --- |
-| `Instance.status` 混用 working/done/exited | 分开 `lifecycle`、`activity`、`connectivity`；成功属于 Run | Claude background 的 `state=done` 时进程仍活着，[control-plane §1.6](../research/claude-control-plane.md#16-stop--rm-与保留多久) |
-| 首个 print `result` 代表任务结束 | `Run.completionScope` 区分 `native-turn` 和 `task`；每条 result 先作为一个原生回合结束 | 同一 Workflow 实测有两条 result；见 [control-plane §4](../research/claude-control-plane.md#4--p--workflow-端到端) |
-| `--settings` / 临时 HOME 被视为完全隔离 | overlay 按 launch 保存；原生 home 持久；共享 daemon 单列 | `--settings` 共享 daemon，空 `CLAUDE_CONFIG_DIR` 没登录态，[control-plane §3](../research/claude-control-plane.md#3-多实例隔离) |
-| 失效后换 key 重启并继续 | 只有确定原生进程已停、native resume 可用、未确认命令已对账时才允许换 generation；禁止重放原 prompt | [DSH §8.4](../research/deepseek-harness.md#84-控制重连与多设备)、[gateway-auth §5](../research/gateway-auth.md#5-各原生-agent-cli-的-provider-配置面) |
-| Herdr 状态等于任务结果 / Socket 等于原始 PTY 流 | Herdr 是可选 carrier；状态是 observation，`pane.read` 是屏幕快照；原始字节能力另外协商 | [Herdr API](../research/herdr-api-index.md#一-herdr-socket-api-全量索引)、[落盘 schema](../research/cli-help/herdr-api-schema.json) |
-| PermissionRequest hook 可以直接套用 Codex 示例 | Claude、Codex 各自编码；Claude hook 没有可假定的 `tool_use_id`，需要本地 invocation ID | [hooks 调研](../research/hooks-integrations.md)、[Claude 官方 PermissionRequest](https://code.claude.com/docs/en/hooks#permissionrequest) |
+| `Instance.status` 混用 working/done/exited | 分开 `lifecycle`、`activity`、`connectivity`；成功属于 Run | Claude background 的 `state=done` 时进程仍活着，control-plane §1.6 |
+| 首个 print `result` 代表任务结束 | `Run.completionScope` 区分 `native-turn` 和 `task`；每条 result 先作为一个原生回合结束 | 同一 Workflow 实测有两条 result；见 control-plane §4 |
+| `--settings` / 临时 HOME 被视为完全隔离 | overlay 按 launch 保存；原生 home 持久；共享 daemon 单列 | `--settings` 共享 daemon，空 `CLAUDE_CONFIG_DIR` 没登录态，control-plane §3 |
+| 失效后换 key 重启并继续 | 只有确定原生进程已停、native resume 可用、未确认命令已对账时才允许换 generation；禁止重放原 prompt | DSH §8.4、gateway-auth §5 |
+| Herdr 状态等于任务结果 / Socket 等于原始 PTY 流 | Herdr 是 Phase 0 PTY 的固定 carrier；状态是 observation，`pane.read` 是屏幕快照；原始字节能力另外协商 | Herdr API、落盘 schema |
+| PermissionRequest hook 可以直接套用 Codex 示例 | Claude、Codex 各自编码；Claude hook 没有可假定的 `tool_use_id`，需要本地 invocation ID | hooks 调研、[Claude 官方 PermissionRequest](https://code.claude.com/docs/en/hooks#permissionrequest) |
 
-已读输入：[_context](../research/tasks/_context.md)、[design-protocol task](../research/tasks/design-protocol.md)、[agent-protocols](../research/agent-protocols.md)、[DSH](../research/deepseek-harness.md)、[herdr-api-index](../research/herdr-api-index.md)、[env-inventory](../research/env-inventory.md)、[proposal](proposal.md)。专项证据采用 [hooks-integrations](../research/hooks-integrations.md)、[claude-control-plane](../research/claude-control-plane.md)、[codex-appserver-driver](../research/codex-appserver-driver.md)、[grok-acp-driver](../research/grok-acp-driver.md)、[gateway-auth 的 CLI 配置节](../research/gateway-auth.md#5-各原生-agent-cli-的-provider-配置面)，并纳入写作期间完成的 [Claude 交互探针](../research/claude-interaction-probe.md)、[Claude stream 协议参考](../research/claude-stream-json-protocol.md)、[PTY spike](../research/pty-driver-spike.md)。Claude 交互探针已验证的 stdio flag、allow/deny 和单选问答，覆盖较早协议参考中对应的待验证项；多选、plan-review、elicitation 等仍各自保留验证状态。
+已读输入：_context、design-protocol task、agent-protocols、DSH、herdr-api-index、env-inventory、[proposal](proposal.md)。专项证据采用 hooks-integrations、claude-control-plane、codex-appserver-driver、grok-acp-driver、gateway-auth 的 CLI 配置节，并纳入写作期间完成的 Claude 交互探针、Claude stream 协议参考、PTY spike。Claude 交互探针已验证的 stdio flag、allow/deny 和单选问答，覆盖较早协议参考中对应的待验证项；多选、plan-review、elicitation 等仍各自保留验证状态。
 
-补充证据包括 [agy 原始样例](../research/cli-help/agy-stream-json-sample.jsonl)、[Codex 本机生成 schema](../research/cli-help/codex-app-server-schema/ServerRequest.json)、[Codex 源码 README](../../../codex/codex-rs/app-server/README.md)、本机 Grok 随包文档 `<workspace>`。这些来源中的“实测”由原调研执行；本任务只读材料、起草规格，没有启动 agent、花费模型配额、改凭据或修改参考仓库。
+补充证据包括 agy 原始样例、Codex 本机生成 schema、Codex 源码 README、本机 Grok 随包文档 `<workspace>`。这些来源中的“实测”由原调研执行；本任务只读材料、起草规格，没有启动 agent、花费模型配额、改凭据或修改参考仓库。
 
 另核对了 Anthropic 官方 SDK 源码 [query.py](https://github.com/anthropics/claude-agent-sdk-python/blob/3379406f18fcea64617d25663d811dfdde8cd171/src/claude_agent_sdk/_internal/query.py) 与 [types.py](https://github.com/anthropics/claude-agent-sdk-python/blob/3379406f18fcea64617d25663d811dfdde8cd171/src/claude_agent_sdk/types.py)，读取时 main 为 `3379406f18fcea64617d25663d811dfdde8cd171`。这是 wire 设计参考，不是本机 Claude 2.1.268 与该 SDK 组合已通过测试的证明。其 task ledger 注释明确承认：后台任务先结束、父回合 result 后到时，仍可能有待执行的 continuation；空 ledger 不能证明整个任务结束。
 
-下文“原生已知”表示上述材料支持；“规格决定”表示新协议要求；`unknown` 表示没有足够证据。环境报告中的 PATH、版本和在线状态是历史快照：尤其 Codex 存在 `0.145.0` 与 `0.154.0` 多个安装，必须按目标 binary 的绝对路径和 digest 选择 adapter，不能按 `codex` 名称猜版本。[gateway-auth §0](../research/gateway-auth.md#0-证据口径与快照)
+下文“原生已知”表示上述材料支持；“规格决定”表示新协议要求；`unknown` 表示没有足够证据。环境报告中的 PATH、版本和在线状态是历史快照：尤其 Codex 存在 `0.145.0` 与 `0.154.0` 多个安装，必须按目标 binary 的绝对路径和 digest 选择 adapter，不能按 `codex` 名称猜版本。gateway-auth §0
 
 ## 1. Wire 基础类型、ID 与原生身份
 
@@ -72,6 +74,10 @@ type ActorRef = {
 ### 1.3 原生映射
 
 ~~~typescript
+type HerdrServer = {
+  binaryPath: string; version: string; digest: Digest; protocolVersion: string;
+  serverIdentity: Id; serverEpoch: Id; representation: "rendered-ansi";
+};
 type NativeRef = {
   hostId: Id;
   nativeStoreId: Id;
@@ -80,9 +86,10 @@ type NativeRef = {
   transcript: Knowledge<{ objectId: Id; sourcePath: string }>;
   codex?: { threadId: string };
   acp?: { sessionId: string; protocolVersion: number };
-  claude?: { sessionId: string; backgroundJobId?: string };
+  claude?: { sessionId: string };
+  claudeBg?: { jobId: string }; // job 可先于 session UUID 被观测；不是同一种身份。
   agy?: { conversationId: string };
-  herdr?: { serverIdentity: Id; serverEpoch: Id; paneId: string };
+  herdr?: HerdrServer & { session: string; paneId: string };
 };
 type ProcessRef = {
   processGeneration: U64;
@@ -95,7 +102,7 @@ type NativeRequestKey =
   | { type: "none" };
 ~~~
 
-`NativeRef` 的 kind 与对应分支必须一致；分支中的 claude.sessionId、codex.threadId、acp.sessionId、agy.conversationId 必须等于已知的统一 sessionId，缺少该身份时不生成分支。未知 session 时 `sessionId.state=unknown`，不得虚构 Claude UUID / Codex threadId。`NativeRequestKey` 将 RPC 数字原样编码成十进制字符串并保留原类型，因此 JSON-RPC 的 `1` 与 `"1"` 不碰撞。`sourcePath` 只在授权给执行主机的视图返回，公网 UI 使用 objectId；它不是允许浏览器任意读绝对路径的授权。
+`NativeRef.claudeBg` 只记录 native store 中的完整 job ID，即使统一 sessionId 为 unknown 也可保留；它不能替代 Claude UUID。未发布草案的 `claude.backgroundJobId` 移到独立 claudeBg 分支，不保留两个可分叉的 job ID 字段。Herdr 的 session 是明确选择的 server session 名，paneId 与 serverIdentity/serverEpoch 一起才标识原生 pane；server epoch 改变使旧 pane 控制失效。`NativeRef` 的 kind 与对应分支必须一致；分支中的 claude.sessionId、codex.threadId、acp.sessionId、agy.conversationId 必须等于已知的统一 sessionId，缺少该身份时不生成分支。未知 session 时 `sessionId.state=unknown`，不得虚构 Claude UUID / Codex threadId。`NativeRequestKey` 将 RPC 数字原样编码成十进制字符串并保留原类型，因此 JSON-RPC 的 `1` 与 `"1"` 不碰撞。`sourcePath` 只在授权给执行主机的视图返回，公网 UI 使用 objectId；它不是允许浏览器任意读绝对路径的授权。
 
 | 原生身份 | 统一映射 | 禁止的替代 |
 | --- | --- | --- |
@@ -106,7 +113,7 @@ type NativeRequestKey =
 | agy conversation_id / step_index | conversation→Instance；同一 input 的 step→node，key 含 generation 与 conversation | `step_index` 不能全局唯一；不能把 agy 的 `event` 当 Claude 的 `type` |
 | Herdr paneId，例如 `w5:p1` | transport carrier，必须附 serverIdentity/serverEpoch | pane ID 不是 agent session；pane 被复用后旧输入不能落到新程序 |
 
-以上原生字段来自 [Claude control-plane](../research/claude-control-plane.md)、[Codex schema](../research/cli-help/codex-app-server-schema/v2/TurnStartParams.json)、[Grok 协议调研](../research/grok-acp-driver.md)、[agy 样例](../research/cli-help/agy-stream-json-sample.jsonl)、[Herdr API](../research/herdr-api-index.md)。`processGeneration` 每次替换原生进程或加载新的原生执行环境加一；网络连接重建只换 `connectionEpoch`。仅 Hub↔Node 重连且 Node→CLI 未断时，两者均不变。`runGeneration` 是 Run 的原生执行世代，v1 固定从 `1` 开始且不提供重试同 Run 的操作；字段保留用于拒绝旧控制。native resume 恢复 conversation，不自动宣称恢复了旧 Run；新输入或可识别的 native continuation 创建新 Run。旧 Run 由历史证据补齐或保持 unknown；未来同 Run 跨 generation 执行须新增明确协商的方法。
+以上原生字段来自 Claude control-plane、Codex schema、Grok 协议调研、agy 样例、Herdr API。`processGeneration` 每次替换原生进程或加载新的原生执行环境加一；网络连接重建只换 `connectionEpoch`。仅 Hub↔Node 重连且 Node→CLI 未断时，两者均不变。`runGeneration` 是 Run 的原生执行世代，v1 固定从 `1` 开始且不提供重试同 Run 的操作；字段保留用于拒绝旧控制。native resume 恢复 conversation，不自动宣称恢复了旧 Run；新输入或可识别的 native continuation 创建新 Run。旧 Run 由历史证据补齐或保持 unknown；未来同 Run 跨 generation 执行须新增明确协商的方法。
 
 ## 2. 核心实体与生命周期
 
@@ -167,7 +174,7 @@ stateDiagram-v2
     archived --> registering: 显式重新启用
 ~~~
 
-Instance close 不删除 worktree。移除 worktree 是独立命令，要求没有运行 owner、dirty 已知为 false；否则 `WORKTREE_BUSY` / `WORKTREE_DIRTY` / `STATE_UNKNOWN`。本规格不提供默认 force 删除。Herdr 的 worktree API 可以承载创建/打开，但清理责任与 runtime writer lease 仍由 Node 管理。[Herdr worktree 方法](../research/herdr-api-index.md#代码树-worktree)
+Instance close 不删除 worktree。移除 worktree 是独立命令，要求没有运行 owner、dirty 已知为 false；否则 `WORKTREE_BUSY` / `WORKTREE_DIRTY` / `STATE_UNKNOWN`。本规格不提供默认 force 删除。Herdr 的 worktree API 可以承载创建/打开，但清理责任与 runtime writer lease 仍由 Node 管理。Herdr worktree 方法
 
 ~~~mermaid
 stateDiagram-v2
@@ -345,7 +352,7 @@ stateDiagram-v2
 ### 3.1 接口
 
 ~~~typescript
-type DriverKind = "claude-print" | "claude-pty" | "codex-appserver"
+type DriverKind = "claude-print" | "claude-pty" | "claude-bg" | "codex-appserver"
   | "grok-acp" | "agy-print" | "generic-pty";
 type CallContext = {
   commandId: Id; instanceId: Id; runId: Id | null;
@@ -390,7 +397,7 @@ type DriverRecord =
 
 这里的接口是 Node 进程内契约；wire 传输不直接序列化 Uint8Array。start/attach/resume 只建立连接和原生身份，不顺带发送 prompt；`instance.create` 可包含 initialInput，Node 将其作为独立 send 子命令并在 create 返回中提供两个 commandId，避免把“已启动”当“任务完成”。DriverAck 的 transport-written 不推进 native-input accepted；adapter 解析后追加的 observation 才可能提供接纳证据。
 
-每个 Instance 仅一个 driver handle 写控制流；读线程必须持续排空 stdout/stderr，与等待 Interaction 的线程分离。cancel 只请求取消指定 Run，close 终止这个 Instance 的托管进程并保留 native session；取消后仍等待对应终态。UI 关页、Hub WS 断开、`events.unsubscribe` 都不调用 close。attach 从不隐式启动；Claude `attach` 会 wake 已停止 job，因此不能直接实现 `allowWake:false`，必须先证明目标存活，否则 `ATTACH_WOULD_WAKE`。[control-plane §1.5–1.6](../research/claude-control-plane.md#15-attach--detach)
+每个 Instance 仅一个 driver handle 写控制流；读线程必须持续排空 stdout/stderr，与等待 Interaction 的线程分离。cancel 只请求取消指定 Run，close 终止这个 Instance 的托管进程并保留 native session；取消后仍等待对应终态。UI 关页、Hub WS 断开、`events.unsubscribe` 都不调用 close。observe/control attach 只能认领已存在的 transport；运行 `claude attach` 创建 pane 始终是有副作用的 `instance.open_terminal`，即使目前 job 仍存活也不能由只读 attach 代发。它要求显式人类动作与 `allowWake:true`；没有此授权返回 `ATTACH_WOULD_WAKE`。control-plane §1.5–1.6
 
 resume 只接受明确 NativeRef，禁止 `--continue` / “最近会话”选择器；原生数据不存在返回 `NATIVE_SESSION_NOT_FOUND`，不自动 start 新 session。不可逆的 process exit 确认之前不 resume。resume 命令只结算 native conversation 的恢复：原生若自行续跑，Node 记录 cause=native-continuation 的新 Run，并只在有明确源 ID 时关联旧 Run；原 prompt 不重投，旧命令不因 resume 成功而 settled。fork 作为可选扩展 `fork(ref, boundary:{type:"latest-terminal"}, newInstanceSpec)`，返回新 Instance 与新 native session，要求来源 Instance 无活 foreground Run、最新 native 回合已结算，且在 owner 内串行检查 expected instance revision。v1 不承诺任意历史 turn 切点；不支持时返回 `CAPABILITY_UNSUPPORTED`，不能复制 UI 文本冒充 fork。
 
@@ -411,6 +418,9 @@ type Capability = {
 };
 type CapabilitySnapshot = {
   id: Id; driverKind: DriverKind; adapterVersion: string;
+  adapterTransport: "native-rust-wire"|"claude-sdk-sidecar"|"claude-pty-herdr"
+    |"claude-bg-herdr-attach"|"codex-appserver-spawn"|"codex-embedded"
+    |"grok-acp"|"agy-native"|"generic-herdr";
   binaryVersion: string; binaryDigest: Digest;
   nativeProtocolVersion: Knowledge<string>;
   settingsRevision: U64; providerProfileRevision: U64;
@@ -424,7 +434,7 @@ type DriverDescriptor = {
 };
 ~~~
 
-native 可用、adapter 已实现、配置允许、所选 build 的验证通过，这四项同时成立才返回 supported。源码/help 只证明候选能力存在，不自动打开生产功能。unknown 不当成 false，也不当成可调用；调用返回 `CAPABILITY_UNKNOWN`，UI 显示“尚未验证”与原生通道。snapshot 必须随每个 generation 保存；native 动态能力变化生成新 snapshot，通过 lifecycle 事件宣布，只影响后续操作。
+CapabilitySnapshot 的 adapterTransport 必填，Rust print 与 SDK sidecar、spawned Codex 与 embedded Codex 分开保存证据；替换 transport 必须创建新 Instance，不能沿用另一 transport 的 supported。native 可用、adapter 已实现、配置允许、所选 build 的验证通过，这四项同时成立才返回 supported。源码/help 只证明候选能力存在，不自动打开生产功能。unknown 不当成 false，也不当成可调用；调用返回 `CAPABILITY_UNKNOWN`，UI 显示“尚未验证”与原生通道。snapshot 必须随每个 generation 保存；native 动态能力变化生成新 snapshot，通过 lifecycle 事件宣布，只影响后续操作。
 
 ### 3.3 每个 driver 的候选能力矩阵
 
@@ -434,14 +444,15 @@ native 可用、adapter 已实现、配置允许、所选 build 的验证通过�
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `claude-print` / 2.1.268 | S* `--resume`，同 store，重申 settings/model | U；持续输入不等于针对当前 turn 的 steer | S* SDK `set_model`，只在确定 idle 时 | S* `--resume` + `--fork-session`，返回新 ID | S* Workflow tool + task events + journal；完整 phase schema 未验证 | N 当前实测 init 无 Artifact；未来逐 profile 验证 | N，print 没有可 attach 的原生 TUI | S* 保留原生 hooks；stream hook lifecycle 与 hook 输入分开 |
 | `claude-pty` / 2.1.268 | S* 明确 `--resume` | N 语义 steer；只可人控 TUI 输入 | S* 仅原生 TUI `/model`，结构化 RPC 切换 U | S* 重新启动原生 fork；不复用活 session writer | S* 原生 Workflow 完整执行；结构化观察 partial，原生 `/workflows` 保留 | S* TUI + native entitlement；统一 artifact API U | S* carrier 真正支持 terminal attach 时 | S* settings 保留；runtime probe 需注册成功 |
+| `claude-bg` / 2.1.268，carrier 待运行验收 | U；不能以 attach wake 冒充 resume | N 语义 steer | U；只保留原生 attach TUI 的候选能力 | U | U；需独立 journal fixture | U；需原生登录/entitlement 与 attach 验收 | S* 显式 open_terminal 建 pane 后才可订阅 | U；blocking hook 的审批所有权独立验收 |
 | `codex-appserver` / 明确路径 0.154.0 | S* `thread/resume` | S* `turn/steer` + expectedTurnId | S* 后续 `turn/start.model`，不换当前 turn | S* `thread/fork` | N Claude Workflow；Codex 自身 collab/plan 另行观察 | S* 文件/图片/MCP resource 的已知 item；N Claude Artifact | N 此 driver 不提供 Codex TUI；另开 PTY driver 才可 | S* native hooks 与 hook notifications；信任规则须有效 |
 | `grok-acp` / 1.0.25 | S* `session/load` 同/新进程已验证；`session/resume` 仅同进程实测 | N v1；有扩展但未验证不冒充 steer | U，configOptions 有 model，但文档 set_config_option 输入实测 -32602 | U `_x.ai/session/fork` 仅字符串证据，v1 不启用 | N Claude Workflow；ACP plan 不升格 workflow | S* 已知 tool content/diff；应用专用 Artifact U | N，stdio ACP 不含 TUI | S* native hooks 与 hook 通知；完整控制覆盖 U |
 | `agy-print` / 1.2.1 | S* `--conversation`，store 可用 | N v1；持续 stdin 的语义 U | N live；新进程 `--model` 与 resume 兼容性 U | U，help 未建立 | N Claude Workflow；agy task/subagent schema U | U，工具存在不证明输出协议 | N | U，不能把 Gemini hooks 表当 agy 已验证协议 |
 | `generic-pty` / binary pin | N 默认；产品专用恢复由新 driver 声明 | N | N 语义 API；允许人控键盘 | N | N | N 语义 artifact；普通文件浏览另计 | S* 自有 PTY 或已验证 carrier | N 默认；自定义探针须另建版本化 adapter |
 
-依据：[agent-protocols §2–5、§9](../research/agent-protocols.md)、[Claude control-plane](../research/claude-control-plane.md)、[Codex schema](../research/cli-help/codex-app-server-schema/ClientRequest.json)、[Grok 专项实测](../research/grok-acp-driver.md)、[hooks-integrations](../research/hooks-integrations.md)。Grok 的 plan、Codex collab 与 runtime child 不能用 `engine=claude-workflow`。claude-pty 无法自动回答的提示继续留在原生 TUI，不以降级 print 代替。
+依据：agent-protocols §2–5、§9、Claude control-plane、Codex schema、Grok 专项实测、hooks-integrations。Grok 的 plan、Codex collab 与 runtime child 不能用 `engine=claude-workflow`。claude-pty 无法自动回答的提示继续留在原生 TUI，不以降级 print 代替。
 
-额外能力：codex-appserver 的 approval/question/elicitation 有 schema 证据但实审批尚未触发；grok-acp 的 approval 也只到协议候选，现有 always-approve 探针没有任何 `session/request_permission`，非 yolo 回填仍须验证。claude-print 的 interactive-approval allow/deny 与 AskUserQuestion 单选已有 2.1.268 实测，均可作为 S* 的 adapter fixture；多选/自由输入/plan-review/elicitation 各自 unknown，不能扩大单选证据。[Claude 交互探针](../research/claude-interaction-probe.md) agy-print/generic-pty 的统一 broker 回答默认 N。`completion-native-turn` 对结构化 Claude/Codex/Grok/已识别 agy result 可验证为 S*；`completion-task` 必须单独通过 §5.8 的终态规则，Claude 持续输入含后台续跑的整体 task 当前为 U，不能借用 native-turn 能力。
+额外能力：codex-appserver 的 approval/question/elicitation 有 schema 证据但实审批尚未触发；grok-acp 的 approval 也只到协议候选，现有 always-approve 探针没有任何 `session/request_permission`，非 yolo 回填仍须验证。claude-print 的 interactive-approval allow/deny 与 AskUserQuestion 单选已有 2.1.268 实测，均可作为 S* 的 adapter fixture；多选/自由输入/plan-review/elicitation 各自 unknown，不能扩大单选证据。Claude 交互探针 agy-print/generic-pty 的统一 broker 回答默认 N。`completion-native-turn` 对结构化 Claude/Codex/Grok/已识别 agy result 可验证为 S*；`completion-task` 必须单独通过 §5.8 的终态规则，Claude 持续输入含后台续跑的整体 task 当前为 U，不能借用 native-turn 能力。
 
 ## 4. InstanceSpec 与 Launch materializer
 
@@ -479,7 +490,9 @@ type InstanceSpec = {
   settingsOverlay: {format: "claude-json"|"codex-toml"|"grok-toml"|"agy-json"|"none";
     objectRef: Id|null; revision: U64};
   nativeHome: {mode: "registered"; storeId: Id};
-  carrier: {type: "stdio"}|{type: "pty"; backend: "node"|"herdr"; serverRef?: Id};
+  carrier: {type: "stdio"}
+    | {type: "pty"; backend: "herdr"; server: HerdrServer; session: string}
+    | {type: "claude-bg"; inputDelivery: "deferred-argv"; argvInputPolicy: "explicit-non-secret"};
   requiredCapabilities: CapabilityName[];
   completionScope: "native-turn"|"task";
   parent: {instanceId: Id; runId: Id; commandId: Id}|null;
@@ -513,13 +526,13 @@ type MaterializedLaunch = {
 
 ### 4.2 Claude 硬约束与配置继承
 
-Claude 两个 driver 必须固定 `--setting-sources user,project,local`，必须保留 native persistence，永不传 `--bare`、`--safe-mode`、`--no-session-persistence`。同义环境 `CLAUDE_CODE_SIMPLE=1`、`CLAUDE_CODE_SAFE_MODE=1` 同样拒绝；环境或上层 flags 若将原生功能关闭，返回 `NATIVE_FEATURE_DISABLED`，不悄悄继续。默认不加 `--restricted`、`--strict-mcp-config`、`--disallowedTools`、`--tools` 缩减清单、空 skills/agents 清单或替换系统提示；不从 DSH wrapper 继承 `persistSession:false` 或自动禁用提问的做法。[Claude help](../research/cli-help/claude.txt)、[DSH Claude provider](../../../deepseek-harness/packages/subagent/subagent-claude-code/src/run.ts)
+Claude 三个 driver 必须使用经审核且明确列出的 `--setting-sources`；自动化 print 默认排除未经审核的 user decision hook，再显式物化所需 MCP、skills 和 hooks。不得由继承环境决定 responder；有效配置存在第二个 decision hook 时 remote approval 保持 unknown。三者必须保留 native persistence，永不传 `--bare`、`--safe-mode`、`--no-session-persistence`。同义环境 `CLAUDE_CODE_SIMPLE=1`、`CLAUDE_CODE_SAFE_MODE=1` 同样拒绝；环境或上层 flags 若将原生功能关闭，返回 `NATIVE_FEATURE_DISABLED`，不悄悄继续。默认不加 `--restricted`、`--strict-mcp-config`、`--disallowedTools`、`--tools` 缩减清单、空 skills/agents 清单或替换系统提示；不从 DSH wrapper 继承 `persistSession:false` 或自动禁用提问的做法。Claude help、DSH Claude provider
 
-“不传 bare”不足以抵抗未来原生默认改变。每个 binary/profile 的启动验收必须确认 settings sources、Workflow、MCP/skills/hooks 发现和交互 carrier 的实际情况；若未来 print 默认精简且没有已验证的恢复选项，该 build 的 claude-print 不可作为 full-native profile 启动，返回 `NATIVE_FEATURE_DISABLED` 并保留 claude-pty 路径。Artifact 的 native entitlement 另外判断：当前 print 在订阅登录下仍未暴露 Artifact，要求 `artifact` 的 spec 不能被 print 偷偷接纳。[control-plane §5](../research/claude-control-plane.md#5-artifact-在--p--登录态)
+“不传 bare”不足以抵抗未来原生默认改变。每个 binary/profile 的启动验收必须确认 settings sources、Workflow、MCP/skills/hooks 发现和交互 carrier 的实际情况；若未来 print 默认精简且没有已验证的恢复选项，该 build 的 claude-print 不可作为 full-native profile 启动，返回 `NATIVE_FEATURE_DISABLED` 并保留 claude-pty 路径。Artifact 的 native entitlement 另外判断：当前 print 在订阅登录下仍未暴露 Artifact，要求 `artifact` 的 spec 不能被 print 偷偷接纳。control-plane §5
 
-Claude native home 默认选择已登记、已配置的持久 store。可以登记现有 home 以保留已有 plugins/hooks/MCP/skills，也可以显式准备独立 `CLAUDE_CONFIG_DIR`；独立目录必须提供其自己的配置与合法授权，不能以“目录创建成功”声称保留用户原有能力，更不能自动复制 OAuth 文件。两个独立实例只是 endpoint/key 不同时，优先共用已登记的 native 配置基座并使用各自 launch overlay；若 gateway discovery cache/用户设置写入可能相互影响，选择分别准备的持久 store。共享 home 不授予并发写同一个 session 的权限。`CLAUDE_CONFIG_DIR` 在 spawn env 中设绝对路径，不写在 settings.env 中企图延迟搬家。[control-plane §3](../research/claude-control-plane.md#3-多实例隔离)
+Claude native home 默认选择已登记、已配置的持久 store。可以登记现有 home 以保留已有 plugins/hooks/MCP/skills，也可以显式准备独立 `CLAUDE_CONFIG_DIR`；独立目录必须提供其自己的配置与合法授权，不能以“目录创建成功”声称保留用户原有能力，更不能自动复制 OAuth 文件。两个独立实例只是 endpoint/key 不同时，优先共用已登记的 native 配置基座并使用各自 launch overlay；若 gateway discovery cache/用户设置写入可能相互影响，选择分别准备的持久 store。共享 home 不授予并发写同一个 session 的权限。`CLAUDE_CONFIG_DIR` 在 spawn env 中设绝对路径，不写在 settings.env 中企图延迟搬家。control-plane §3
 
-runtime hook 与 MCP 集成以私有 overlay/已注册扩展追加，保留原有 hook 命令及其顺序语义，不替换整张 hooks 表。合并器必须按目标版本 native 配置规则测试；不把深合并的一般经验当成所有数组的合并语义。运行时探针分“只观察”与“唯一审批 responder”，后者必须满足 §6 的冲突检测；已有 Flux/Orca/herdr 的存在不证明 runtime 也能正确回答。[hooks 配置继承调研](../research/hooks-integrations.md#四-settingsrelayjson-与-settingsjson-优先级及继承性分析)
+runtime hook 与 MCP 集成以私有 overlay/已注册扩展追加，保留原有 hook 命令及其顺序语义，不替换整张 hooks 表。合并器必须按目标版本 native 配置规则测试；不把深合并的一般经验当成所有数组的合并语义。运行时探针分“只观察”与“唯一审批 responder”，后者必须满足 §6 的冲突检测；已有 Flux/Orca/herdr 的存在不证明 runtime 也能正确回答。hooks 配置继承调研
 
 ### 4.3 各 driver 的实际启动配方
 
@@ -539,9 +552,9 @@ argv: [-p, --input-format, stream-json, --output-format, stream-json,
 env: CLAUDE_CONFIG_DIR=<registered persistent directory>, plus selected bindings
 ~~~
 
-2.1.268 的 host driver **必须**带 `--permission-prompt-tool stdio` 并先完成 control initialize；仅有 `--permission-prompts host` 的对照探针没有 can_use_tool，而是直接 permission_denied。SDK 0.3.268 也在配置 canUseTool 后加入此 flag。启动模式 manual 映射 SDK/CLI 的 `default`，不把 native 别名当另一种权限策略。正常运行保持 stdin 可写，所有 control_response 与 user 输入由同一个 writer 串行发送；`--replay-user-messages` 请求 echo，仍只在实际 ID 匹配时推进 accepted。[Claude 交互探针 §1](../research/claude-interaction-probe.md#1---permission-prompts-host-的-stream-json-控制协议)
+2.1.268 的 host driver **必须**带 `--permission-prompt-tool stdio` 并先完成 control initialize；仅有 `--permission-prompts host` 的对照探针没有 can_use_tool，而是直接 permission_denied。SDK 0.3.268 也在配置 canUseTool 后加入此 flag。启动模式 manual 映射 SDK/CLI 的 `default`，不把 native 别名当另一种权限策略。正常运行保持 stdin 可写，所有 control_response 与 user 输入由同一个 writer 串行发送；`--replay-user-messages` 请求 echo，仍只在实际 ID 匹配时推进 accepted。Claude 交互探针 §1
 
-resume 配方用 `--resume <exact session UUID>` 替换新建 `--session-id`，同时重新给相同 overlay 与明确 `--model`，避免 saved custom model 被原生回退。[gateway-auth §5.1](../research/gateway-auth.md#51-claude-code-21268) 不继承探针为排除 Flux 而使用的 `--setting-sources ""`、`--permission-prompts none` 或 disableAllHooks；生产保留原生能力，实际 responder 冲突按 §6.3 处理。
+resume 配方用 `--resume <exact session UUID>` 替换新建 `--session-id`，同时重新给相同 overlay 与明确 `--model`，避免 saved custom model 被原生回退。gateway-auth §5.1 不继承探针为排除 Flux 而使用的 `--setting-sources ""`、`--permission-prompts none` 或 disableAllHooks；生产保留原生能力，实际 responder 冲突按 §6.3 处理。
 
 无 secret 的 settings 示例：
 
@@ -559,7 +572,7 @@ resume 配方用 `--resume <exact session UUID>` 替换新建 `--session-id`，�
 
 **claude-pty：**同一 Claude 配方移除 `-p`、输入/输出 stream flags 和 host permission flags；保留 settings sources、settings、model、session ID 与 native permission mode，由 carrier 分配终端。runtime 默认使用 `manual` + native TUI，已选 auto 的 profile 可原样保留；不自动 bypass。采用 Herdr 时先取得专用 pane，通过已验证的 `agent.start`/受控 launcher 执行 argv；Herdr args 若只能接受 shell 命令文本，使用只含固定 executable 与 launchId 的本地 launcher，让它读取私有 manifest 后 exec，禁止拼 prompt/env/token 到 shell。
 
-Herdr 负责 pane 生存，Node 负责 Instance/native session 对应；runtime 使用 hook 的 `SessionStart.transcript_path` 定位文件，不自己将 cwd 简单替换 `/` 来猜完整目录编码。`--bg` 是未来单独的 carrier variant，不与 print 混用；本规格不把它作为六个 driver 的隐式实现。若以后接入，必须处理它忽略 `--session-id`、attach 会 wake、多个 settings 共享 daemon、logs 是 PTY 转储的行为，不杀共享 supervisor。[control-plane §1–3](../research/claude-control-plane.md)
+Herdr 负责 pane 生存，Node 负责 Instance/native session 对应；runtime 使用 hook 的 `SessionStart.transcript_path` 定位文件，不自己将 cwd 简单替换 `/` 来猜完整目录编码。`--bg` 是未来单独的 carrier variant，不与 print 混用；本规格不把它作为六个 driver 的隐式实现。若以后接入，必须处理它忽略 `--session-id`、attach 会 wake、多个 settings 共享 daemon、logs 是 PTY 转储的行为，不杀共享 supervisor。control-plane §1–3
 
 **codex-appserver：**
 
@@ -570,7 +583,7 @@ env: CODEX_HOME=<registered persistent runtime-owned directory>, RUNTIME_PROVIDE
 cwd: <verified workspace/worktree directory>
 ~~~
 
-`$CODEX_HOME/config.toml` 由 materializer 从注册基座与 profile 写出；若同 home 供并发实例使用，配置保持不变，以版本化命名配置或独立 store 处理不同 provider，禁止两个 launch 并发覆盖该文件。默认一 Instance 一 app-server 进程。schema 中 `thread/start.sandbox` 请求用 `workspace-write` 等 kebab-case，响应对象是另一种表示；`permissions` 与 `sandbox` 互斥。initialize 之后，thread/start/resume 显式传 cwd/model/provider/权限，`ephemeral:false`；不继承研究探针的 `--disable hooks`、`approvalPolicy:never` 或删插件做法。`thread/start` 可能把项目 trust 写入 config，因此不得默认使用未登记的用户共享 `~/.codex`。[Codex 专项实测 §3、§8–9](../research/codex-appserver-driver.md)
+`$CODEX_HOME/config.toml` 由 materializer 从注册基座与 profile 写出；若同 home 供并发实例使用，配置保持不变，以版本化命名配置或独立 store 处理不同 provider，禁止两个 launch 并发覆盖该文件。默认一 Instance 一 app-server 进程。schema 中 `thread/start.sandbox` 请求用 `workspace-write` 等 kebab-case，响应对象是另一种表示；`permissions` 与 `sandbox` 互斥。initialize 之后，thread/start/resume 显式传 cwd/model/provider/权限，`ephemeral:false`；不继承研究探针的 `--disable hooks`、`approvalPolicy:never` 或删插件做法。`thread/start` 可能把项目 trust 写入 config，因此不得默认使用未登记的用户共享 `~/.codex`。Codex 专项实测 §3、§8–9
 
 ~~~toml
 model_provider = "runtime_gateway"
@@ -587,7 +600,7 @@ request_max_retries = 0
 stream_max_retries = 0
 ~~~
 
-这里关闭的是 CLI 到模型网关的 Responses WS/重试，和 Hub WSS、app-server 本地传输是三件事；profile 可在相应验收后修改，runtime 自己始终不重投不明 prompt。订阅登录使用注册 home 的原生登录，不写上述 API-key provider，也不从其它账号 home 复制 auth。原生 stdio 是省略 `jsonrpc` 字段的 JSONL；若以后选择 app-server `unix://`，它是 **WebSocket over UDS**，需 HTTP Upgrade，不能把 JSONL 写给 socket。[Codex 专项实测 §1、§9](../research/codex-appserver-driver.md)
+这里关闭的是 CLI 到模型网关的 Responses WS/重试，和 Hub WSS、app-server 本地传输是三件事；profile 可在相应验收后修改，runtime 自己始终不重投不明 prompt。订阅登录使用注册 home 的原生登录，不写上述 API-key provider，也不从其它账号 home 复制 auth。原生 stdio 是省略 `jsonrpc` 字段的 JSONL；若以后选择 app-server `unix://`，它是 **WebSocket over UDS**，需 HTTP Upgrade，不能把 JSONL 写给 socket。Codex 专项实测 §1、§9
 
 **grok-acp：**
 
@@ -610,11 +623,11 @@ api_backend = "responses"
 env_key = "RUNTIME_PROVIDER_TOKEN"
 ~~~
 
-随包 `05-configuration.md` / `26-config-reference.md` 明确区分 `GROK_CONFIG_PATH` 的软配置 overlay 与真正 endpoint/auth 配置：overlay 的 allowlist 会丢弃 endpoint/auth 等表，不能靠临时 overlay 偷改 provider。provider 进入注册的持久 `GROK_HOME/config.toml`；软设置才可写 `<launch>/grok-overlay.toml` 并设 `GROK_CONFIG_PATH`。runtime 必须先自己校验文件，原生“警告后忽略 malformed overlay”不满足本协议的 fail-loud 要求。真实 endpoint E2E 能力按 profile 验收，不将字段存在当成已接通。[gateway-auth §5.3](../research/gateway-auth.md#53-grok-cli-1025)
+随包 `05-configuration.md` / `26-config-reference.md` 明确区分 `GROK_CONFIG_PATH` 的软配置 overlay 与真正 endpoint/auth 配置：overlay 的 allowlist 会丢弃 endpoint/auth 等表，不能靠临时 overlay 偷改 provider。provider 进入注册的持久 `GROK_HOME/config.toml`；软设置才可写 `<launch>/grok-overlay.toml` 并设 `GROK_CONFIG_PATH`。runtime 必须先自己校验文件，原生“警告后忽略 malformed overlay”不满足本协议的 fail-loud 要求。真实 endpoint E2E 能力按 profile 验收，不将字段存在当成已接通。gateway-auth §5.3
 
-ACP initialize 默认 `{protocolVersion:1,clientCapabilities:{},clientInfo:{name:"runtime",version:<adapterVersion>}}`，**不声明 fs/terminal**；已验证声明它们会把写盘和 shell 反向交给 client，缺省时 Grok 在执行主机内执行。`session/new` 发送 `{cwd:<absolute>,mcpServers:<registered list>}`；只有明确 always-approve 才加 `_meta:{yoloMode:true}`，列表为空不等于禁用原生用户配置。不要传 `grok agent --no-auto-update`，该位置实测不接受，使用上面的 env。共享 leader 会收到其它 client 的会话更新，不能满足默认单 writer 归因，因此 v1 使用 `--no-leader`。[Grok 实测 §2–3、§9、§12](../research/grok-acp-driver.md)
+ACP initialize 默认 `{protocolVersion:1,clientCapabilities:{},clientInfo:{name:"runtime",version:<adapterVersion>}}`，**不声明 fs/terminal**；已验证声明它们会把写盘和 shell 反向交给 client，缺省时 Grok 在执行主机内执行。`session/new` 发送 `{cwd:<absolute>,mcpServers:<registered list>}`；只有明确 always-approve 才加 `_meta:{yoloMode:true}`，列表为空不等于禁用原生用户配置。不要传 `grok agent --no-auto-update`，该位置实测不接受，使用上面的 env。共享 leader 会收到其它 client 的会话更新，不能满足默认单 writer 归因，因此 v1 使用 `--no-leader`。Grok 实测 §2–3、§9、§12
 
-未来复用 Grok serve 可连接 loopback `/ws`，握手用 `Authorization: Bearer <secret>`；已验证 query `server-key` 也可用，但会把 secret 放入 URL，runtime 不采用。不得把 `X-Server-Key` 当可用鉴权头。此模式和 stdio 使用同一 ACP，而与 Hub WSS 是独立连接；启用前仍须单 owner、断线和恢复验收。[Grok serve 实测 §10](../research/grok-acp-driver.md)
+未来复用 Grok serve 可连接 loopback `/ws`，握手用 `Authorization: Bearer <secret>`；已验证 query `server-key` 也可用，但会把 secret 放入 URL，runtime 不采用。不得把 `X-Server-Key` 当可用鉴权头。此模式和 stdio 使用同一 ACP，而与 Hub WSS 是独立连接；启用前仍须单 owner、断线和恢复验收。Grok serve 实测 §10
 
 **agy-print：**
 
@@ -625,11 +638,11 @@ cwd: <verified directory>
 native settings: <registered OS profile home>/.gemini/antigravity-cli/settings.json
 ~~~
 
-实测 `-p` 会吞下紧随的 flag，单次 print 用 `-p=<prompt>` 作为一个 argv 元素；manifest 的 redactedArgv 将它替换成 `<inputRef>`。后续 resume 增加 `--conversation <exact conversation ID>`，不能 `--continue`。双向版可用 `--input-format stream-json` 配对 output flag，但 input schema、实时审批和多 turn 关联未验收时不得启用 live send。[agy help](../research/cli-help/agy.txt)、[control-plane §6](../research/claude-control-plane.md#6-agy-stream-json-schema)
+实测 `-p` 会吞下紧随的 flag，单次 print 用 `-p=<prompt>` 作为一个 argv 元素；manifest 的 redactedArgv 将它替换成 `<inputRef>`。后续 resume 增加 `--conversation <exact conversation ID>`，不能 `--continue`。双向版可用 `--input-format stream-json` 配对 output flag，但 input schema、实时审批和多 turn 关联未验收时不得启用 live send。agy help、control-plane §6
 
 agy 的单次 argv 模式是接口的显式例外：`inputDelivery=deferred-argv`，start/resume 只准备私有 launch template，返回 dispatch=not-dispatched，Instance 留在 preparing；create 可按 scope=runtime-resource 结算并返回 `prepared:true`，不能宣布 native ready。第一条 send 在自己的 dispatch intent 落盘后，将 inputRef 解码为单个 `-p=…` 参数并 spawn，进入 starting→ready；消息只能含该 profile 已支持的文本，超出 argv 长度限制拒绝而不截断。process exit 后再 send 必须先显式 resume；close 未 spawn 的准备态只释放资源，以 no-process 证据结束 Instance。CLI 的 input 只能在这一刻解析，持久 manifest 从不保存明文 argv prompt。其它 driver 的 start/resume 不带 prompt。
 
-agy 没有在现有 help 中建立 `--settings`/专属 config-dir 参数；不伪造 `AGY_HOME`。v1 只在已注册 OS 用户配置中运行，overlay 必须与该 home 的已登记 settings 一致；需要另一份设置时用独立执行用户/容器文件系统，是否保留登录态与原生能力须另验收。只确认 BYOK 的 `modelProvider:"gemini"` + `GEMINI_API_KEY` + 可选 `GOOGLE_GEMINI_BASE_URL`，后者需要 Gemini-native ingress，不能把它指向只有 Messages/Responses 的 AsterGate。未完成独立 profile 准备时返回 `SETTINGS_ISOLATION_UNAVAILABLE`，不改用户现用 settings。`--dangerously-skip-permissions` 只映射明确的 always-proceed；`--mode plan|accept-edits` 保留原生含义。[gateway-auth §5.4](../research/gateway-auth.md#54-antigravity-cli-agy-121)
+agy 没有在现有 help 中建立 `--settings`/专属 config-dir 参数；不伪造 `AGY_HOME`。v1 只在已注册 OS 用户配置中运行，overlay 必须与该 home 的已登记 settings 一致；需要另一份设置时用独立执行用户/容器文件系统，是否保留登录态与原生能力须另验收。只确认 BYOK 的 `modelProvider:"gemini"` + `GEMINI_API_KEY` + 可选 `GOOGLE_GEMINI_BASE_URL`，后者需要 Gemini-native ingress，不能把它指向只有 Messages/Responses 的 AsterGate。未完成独立 profile 准备时返回 `SETTINGS_ISOLATION_UNAVAILABLE`，不改用户现用 settings。`--dangerously-skip-permissions` 只映射明确的 always-proceed；`--mode plan|accept-edits` 保留原生含义。gateway-auth §5.4
 
 **generic-pty：**只运行登记的 executable 与 argv，分配 PTY、继承经过策略选择的 env；不存在通用 provider 配置编码器，profile 必须显式声明 `native-login` 或已注册的 env 模板。它不接受 Claude/Codex settingsOverlay，不提供 semantic resume/approval。未知 binary 不通过尝试不同旗标猜协议。
 
@@ -646,7 +659,7 @@ agy 没有在现有 help 中建立 `--settings`/专属 config-dir 参数；不�
 
 `HOME`/`USERPROFILE` 不作为临时脚本变量或普通 env override 改写；需要不同 OS profile 由 executor 显式切换用户/容器。父 Claude 的临时身份、控制 socket、审批 token 不原样传给 child；每个 child 单独发放 runtime capability，保留所选 native 配置中的工具能力。决定剔除的 native nesting env 必须写入对应版本规则，不能通过大范围删除 `CLAUDE_*`/`CODEX_*` 实现隔离。
 
-ProviderProfile v1 至少有 `id, revision, ingress, endpointCandidates[], models[], credentialRefs[], rotationOwner: gateway|runtime, selectionPolicy: pinned|weighted-healthy, nativeHomeRef, supportedDrivers[]`。endpointCandidate 包含 `id, baseUrl, priority, weight, health: healthy|cooldown|disabled|unknown, cooldownUntil`；同优先级健康候选按权重选择，unknown 默认不自动接流量。运行中固定 ProviderSelection；记录 requested/resolved model，未知 resolved 不回填 requested。AsterGate 作为账号池时 runtime 只轮换 endpoint/profile，不再自行轮换其背后的 upstream accounts。[gateway-auth](../research/gateway-auth.md)
+ProviderProfile v1 至少有 `id, revision, ingress, endpointCandidates[], models[], credentialRefs[], rotationOwner: gateway|runtime, selectionPolicy: pinned|weighted-healthy, nativeHomeRef, supportedDrivers[]`。endpointCandidate 包含 `id, baseUrl, priority, weight, health: healthy|cooldown|disabled|unknown, cooldownUntil`；同优先级健康候选按权重选择，unknown 默认不自动接流量。运行中固定 ProviderSelection；记录 requested/resolved model，未知 resolved 不回填 requested。AsterGate 作为账号池时 runtime 只轮换 endpoint/profile，不再自行轮换其背后的 upstream accounts。gateway-auth
 
 换 endpoint/key 分三类：尚未 native 派发的新命令可重选；原生支持且已验收的 credential helper 可在其原生机制内刷新；其它运行中的请求先进入 reconciliation。恢复必须获得原生 session 单 owner lease、确认旧执行已终止、绑定新 generation、显式 native resume，不重投已可能执行的 prompt。失败尝试的 observation 保留，不能通过“换 provider 再跑一次”把已产生的文件修改或 tool effects 隐去。profile 的 ingress 不兼容返回 `PROVIDER_PROTOCOL_MISMATCH`，不临时搭一个有损协议转换器。
 
@@ -757,7 +770,7 @@ open 的 revision 为 1、baseRevision 为 null；append/replace/close 的 revis
 | `workflow.phase` | `workflowId:Id, phaseId:Id, nativePhaseId:Knowledge<string>, label:Knowledge<string>, state:queued\|running\|completed\|failed\|cancelled\|unknown, revision:U64, parentPhaseId:Id\|null` | 只有真实 phase 数据才创建；member label、数组位置不能假造 phase |
 | `workflow.member` | `workflowId:Id, memberId:Id, nativeAgentId:Knowledge<string>, nativeKey:Knowledge<string>, attempt:Knowledge<U64>, phaseId:Id\|null, label:Knowledge<string>, state:queued\|running\|completed\|failed\|cancelled\|unknown, modelRequested:Knowledge<string>, modelResolved:Knowledge<string>, resultRef:Id\|null, revision:U64` | key、agentId、attempt 共同区分重试；一个 member 完成不等于 workflow 完成 |
 
-这里仅定义 Claude dynamic Workflow 的已观察树。runtime 调起另一 Instance 通过 Instance.parent/Run.parentRunId 展示；Codex collab/Grok plan 进入 native lifecycle/tool 数据。未来若引入其它真实 workflow engine，新增受版本协商的 engine variant，而不是将它们强改成 Claude Workflow。script 本身仍在原生 CLI 执行，runtime 不解释 `agent()/parallel()` 或改变它的调度。[DSH workflow 对比](../research/deepseek-harness.md#44-packagesworkflow自己的脚本运行器不是-claude-workflow-桥)、[原生 workflow 实测](../research/claude-control-plane.md#4--p--workflow-端到端)
+这里仅定义 Claude dynamic Workflow 的已观察树。runtime 调起另一 Instance 通过 Instance.parent/Run.parentRunId 展示；Codex collab/Grok plan 进入 native lifecycle/tool 数据。未来若引入其它真实 workflow engine，新增受版本协商的 engine variant，而不是将它们强改成 Claude Workflow。script 本身仍在原生 CLI 执行，runtime 不解释 `agent()/parallel()` 或改变它的调度。DSH workflow 对比、原生 workflow 实测
 
 ### 5.4 Interaction 请求与回答 schema
 
@@ -818,9 +831,9 @@ type InteractionAnswer =
 
 `ArtifactLocator` 为 `{type:"blob",objectId:Id,digest:Digest}`、`{type:"workspace-file",workspaceId:Id,relativePath:string,revision:U64,digest:Knowledge<Digest>}`、`{type:"native",nativeUri:string}` 或 `{type:"url",url:string}`。可读 workspace-file 路径由 Node 按注册根解析，拒绝 `..`、越界 symlink 和跨 host 路径；下载校验 revision/digest 防止读错版本。native URI/URL 不自动抓取或执行。HTML 预览使用独立 origin 与 sandbox；TTY 的 clipboard/URL/escape sequences 不在 Hub 或普通 DOM 执行。Artifact 工具的调用只产生 declared，文件/API 的读回证据才产生 available；普通文件产物不能声称复现了 Claude 原生 Artifact 功能。
 
-usage 每个 scope 用 metricRevision 更新；snapshot 覆盖旧 snapshot，不累加。只有原生明示 delta 才累加。Claude 多条 result 可能是累计 cost，Codex resume 会重发 thread 累计量，agy total 未必包含 cache/reasoning；保持原生统计口径，不用字段相加“修正”上游总量。没有 usage 时所有相关值 unknown，不是 0。[Claude Workflow 样例](../research/claude-control-plane.md#4--p--workflow-端到端)、[Codex usage/resume](../research/codex-appserver-driver.md#7-threadlist--threadread--threadresume已验证)、[agy sample](../research/cli-help/agy-stream-json-sample.jsonl)
+usage 每个 scope 用 metricRevision 更新；snapshot 覆盖旧 snapshot，不累加。只有原生明示 delta 才累加。Claude 多条 result 可能是累计 cost，Codex resume 会重发 thread 累计量，agy total 未必包含 cache/reasoning；保持原生统计口径，不用字段相加“修正”上游总量。没有 usage 时所有相关值 unknown，不是 0。Claude Workflow 样例、Codex usage/resume、agy sample
 
-Grok ACP `_meta.usage.inputTokens` 已知包含 cache，故 inputAccounting=total-including-cache；其 headless `end.usage.input_tokens` 是 uncached，不能直接跨表相加或相减假定等价。response_completed、turn_completed、prompt result 可能重复报告同一范围；没有稳定 response/turn ID 时保留 nativeFieldsRef 并将聚合关系标 unknown，不用邻接顺序去重。[Grok usage 对照](../research/grok-acp-driver.md#11-headless-streaming-json-对照已验证)
+Grok ACP `_meta.usage.inputTokens` 已知包含 cache，故 inputAccounting=total-including-cache；其 headless `end.usage.input_tokens` 是 uncached，不能直接跨表相加或相减假定等价。response_completed、turn_completed、prompt result 可能重复报告同一范围；没有稳定 response/turn ID 时保留 nativeFieldsRef 并将聚合关系标 unknown，不用邻接顺序去重。Grok usage 对照
 
 ### 5.6 Claude 原生事件逐项映射
 
@@ -856,7 +869,7 @@ Grok ACP `_meta.usage.inputTokens` 已知包含 cache，故 inputAccounting=tota
 | `control_request` / `control_response` / `control_cancel_request` | §6 的 broker 或 command ACK；必要的状态变化进入 lifecycle/interaction | 不显示为 assistant 文本；control ID 按 connectionEpoch 区分 |
 | 其它 system / 无法识别 record | opaque + native diagnostic | 例如未验证的新 settings/Artifact 协议；保留原始数据 |
 
-依据：[本机 init fixture](../research/cli-help/claude-p-init.json)、[control-plane §4](../research/claude-control-plane.md#4--p--workflow-端到端)、[SDK 0.3.268 类型整理与逐帧参考](../research/claude-stream-json-protocol.md)。本次另只读 `/tmp/hh-probe-ctl/logs/wf.jsonl` 的事件类型和终态元数据，确认 task_* 实际是 `type:system` 的 subtype；两条 result 都曾有 `terminal_reason=completed`、`queued_turn_count=0`，第二条 origin 为 task-notification。因此这两个字段的组合也不能单独证明整体 task 已结束。原生 Workflow 的预算 canary 还观察到父 result 后后台 task 被 budget limit 停止；它提供混合模型的调用/成员记录证据，不是“所有成员成功完成”的证明。[交互探针 §4](../research/claude-interaction-probe.md#4-workflow-跨模型-canaryrelay)
+依据：本机 init fixture、control-plane §4、SDK 0.3.268 类型整理与逐帧参考。本次另只读 `/tmp/hh-probe-ctl/logs/wf.jsonl` 的事件类型和终态元数据，确认 task_* 实际是 `type:system` 的 subtype；两条 result 都曾有 `terminal_reason=completed`、`queued_turn_count=0`，第二条 origin 为 task-notification。因此这两个字段的组合也不能单独证明整体 task 已结束。原生 Workflow 的预算 canary 还观察到父 result 后后台 task 被 budget limit 停止；它提供混合模型的调用/成员记录证据，不是“所有成员成功完成”的证明。交互探针 §4
 
 | Claude transcript JSONL type / attachment 子类 | 统一映射 | 规则 |
 | --- | --- | --- |
@@ -875,7 +888,7 @@ Grok ACP `_meta.usage.inputTokens` 已知包含 cache，故 inputAccounting=tota
 | `artifact-autoreact-ledger` / `artifact-comment-monitor` | opaque + artifact native 引用（有明确 ID 时） | 不伪造 Artifact 状态/批准/可访问 URL |
 | 未知 type / 新 attachment | opaque，完整 rawRef | 不丢行、不猜终态 |
 
-transcript 类型依据 [agent-protocols §2.4](../research/agent-protocols.md#24-transcript)。Workflow 的单独 `journal.jsonl`：`launched`→workflow.run/running；`started{key,agentId,label}`→workflow.member/running；`result{key,agentId,result}`→对应 member/completed 和 resultRef；`workflows/<wfId>.json` 的已知 `status/result`→workflow.run snapshot。其它 journal type（包括尚无 fixture 的 phase/error）先 opaque；agent-*.jsonl 可产生明确 member 下的消息。member result 不能替代 workflow 整体状态。[control-plane §4](../research/claude-control-plane.md#4--p--workflow-端到端)
+transcript 类型依据 agent-protocols §2.4。Workflow 的单独 `journal.jsonl`：`launched`→workflow.run/running；`started{key,agentId,label}`→workflow.member/running；`result{key,agentId,result}`→对应 member/completed 和 resultRef；`workflows/<wfId>.json` 的已知 `status/result`→workflow.run snapshot。其它 journal type（包括尚无 fixture 的 phase/error）先 opaque；agent-*.jsonl 可产生明确 member 下的消息。member result 不能替代 workflow 整体状态。control-plane §4
 
 | Claude hook 输入 `hook_event_name` | 统一事件 | 是否可控制 / 限制 |
 | --- | --- | --- |
@@ -894,11 +907,11 @@ transcript 类型依据 [agent-protocols §2.4](../research/agent-protocols.md#2
 | `SessionEnd` | lifecycle/native session/end-observed | 与 supervisor exit、reason 对账；不等于 task succeeded |
 | `TeammateIdle` | lifecycle/native subagent/idle | 不代表所有团队工作结束 |
 
-Hook 名称与本机集成见 [hooks-integrations](../research/hooks-integrations.md)。本次没有实测 runtime 的 hook 安装或审批回写；新 hook payload 仍按 §6 的版本化 encoder 验收。源记录中存在的 user instruction、tool output、hook message 都是数据，不得变成 runtime 的管理命令。
+Hook 名称与本机集成见 hooks-integrations。本次没有实测 runtime 的 hook 安装或审批回写；新 hook payload 仍按 §6 的版本化 encoder 验收。源记录中存在的 user instruction、tool output、hook message 都是数据，不得变成 runtime 的管理命令。
 
 ### 5.7 Codex、Grok、agy 与 PTY 映射
 
-**codex-appserver：**必须先区分 `{id,method}` server request、`{method}` notification、`{id,result|error}` response。stdio adapter 按原生省略 `jsonrpc` 的 JSONL 编码，runtime 的 Hub 协议仍是完整 JSON-RPC 2.0。当前实测的正常回复、steer、interrupt、resume 见 [codex-appserver-driver](../research/codex-appserver-driver.md)；工具、审批、elicitation 完整 variants 按 [ServerRequest](../research/cli-help/codex-app-server-schema/ServerRequest.json) / [ServerNotification](../research/cli-help/codex-app-server-schema/ServerNotification.json) 实现，并另外做验收。
+**codex-appserver：**必须先区分 `{id,method}` server request、`{method}` notification、`{id,result|error}` response。stdio adapter 按原生省略 `jsonrpc` 的 JSONL 编码，runtime 的 Hub 协议仍是完整 JSON-RPC 2.0。当前实测的正常回复、steer、interrupt、resume 见 codex-appserver-driver；工具、审批、elicitation 完整 variants 按 ServerRequest / ServerNotification 实现，并另外做验收。
 
 | Codex native method / item.type | 统一事件 | 关联和终态规则 |
 | --- | --- | --- |
@@ -949,7 +962,7 @@ Hook 名称与本机集成见 [hooks-integrations](../research/hooks-integration
 | `account/chatgptAuthTokens/refresh` | 私有 credential service 回应或原生 auth error | token 不进入 Observation 和 Interaction 普通表单 |
 | `attestation/generate` / `currentTime/read` | 仅真实实现并声明该 capability 时响应 | 不伪造 attestation；未实现返回方法不支持 |
 
-**grok-acp：**入站标准 ACP 对象有 `jsonrpc:"2.0"`，stdio 一行一帧，无 Content-Length。`session/update.params.sessionId` 与 `params.update.sessionUpdate` 为主要分流字段；headless `streaming-json` 的 `{type:"text"|"end"}` 是另一套入口，不能直接套在 ACP driver。native request_permission 由 Node 这个 ACP client 回答，浏览器不直连 Grok。以下实测范围取自 [Grok 专项报告](../research/grok-acp-driver.md)；标准中存在但探针没触发的 variant 仍要独立 fixture。
+**grok-acp：**入站标准 ACP 对象有 `jsonrpc:"2.0"`，stdio 一行一帧，无 Content-Length。`session/update.params.sessionId` 与 `params.update.sessionUpdate` 为主要分流字段；headless `streaming-json` 的 `{type:"text"|"end"}` 是另一套入口，不能直接套在 ACP driver。native request_permission 由 Node 这个 ACP client 回答，浏览器不直连 Grok。以下实测范围取自 Grok 专项报告；标准中存在但探针没触发的 variant 仍要独立 fixture。
 
 | ACP 原生方法 / `sessionUpdate` | 统一事件 | 规则 |
 | --- | --- | --- |
@@ -989,7 +1002,7 @@ Grok `session/prompt` 的 JSON-RPC response 是完成而非早期 admission。�
 | `background_tasks` | native task 快照；不把空表当 prompt 之外任务全部完成 |
 | `model_changed` | lifecycle/native configuration；保留实际字段并更新未来选择观察，不回填过去的 model |
 
-always-approve 探针只出现 pending_interaction→interaction_resolved，零条 session/request_permission；因此上述标准 permission encoder 是待验收候选，不是已完成的审批往返。[Grok 实测 §5](../research/grok-acp-driver.md#5-sessionrequest_permission-与---always-approve已验证) `_x.ai/session/prompt_complete` 也只作辅助终态观察；`_x.ai/models/update`、`settings/update`、`mcp/servers_updated`、`mcp_initialized`、`announcements/update`、`queue/changed`、`sessions/changed` 分别进入 native configuration/diagnostic 快照，未知 payload 留 opaque。两个扩展通道若同发一件事，必须有稳定原生 ID 才归并。
+always-approve 探针只出现 pending_interaction→interaction_resolved，零条 session/request_permission；因此上述标准 permission encoder 是待验收候选，不是已完成的审批往返。Grok 实测 §5 `_x.ai/session/prompt_complete` 也只作辅助终态观察；`_x.ai/models/update`、`settings/update`、`mcp/servers_updated`、`mcp_initialized`、`announcements/update`、`queue/changed`、`sessions/changed` 分别进入 native configuration/diagnostic 快照，未知 payload 留 opaque。两个扩展通道若同发一件事，必须有稳定原生 ID 才归并。
 
 **agy-print：**当前落盘 fixture 只有以下已验证记录；失败、工具、提问、input stream 更完整 schema 尚未建立，不借用 Claude 或 Gemini 的字段填空。
 
@@ -1002,7 +1015,7 @@ always-approve 探针只出现 pending_interaction→interaction_resolved，零�
 | 未知 step_type / event / status | opaque | 不把 ask_permission 工具名的存在当已接 broker；不把 agy SQLite 当 JSONL tail |
 | EOF / 非零退出 / timeout | lifecycle/process 或 diagnostic | 无匹配 result 时 unknown；非零退出可证明进程失败但不证明任务未产生效果 |
 
-具体字段依据 [agy-stream-json-sample](../research/cli-help/agy-stream-json-sample.jsonl)、[control-plane §6](../research/claude-control-plane.md#6-agy-stream-json-schema)。
+具体字段依据 agy-stream-json-sample、control-plane §6。
 
 **claude-pty / generic-pty 的 carrier：**Claude 的语义内容来自 §5.6 的 transcript/hooks/workflow journal；generic 仅有下面的 carrier observation。
 
@@ -1019,9 +1032,9 @@ always-approve 探针只出现 pending_interaction→interaction_resolved，零�
 | `agent.start` / `agent.prompt` / `agent.wait` response | carrier ACK / observation | wait 匹配 detector 状态不结算 runtime Run；没有 native receipt 的 prompt 保持接纳未知 |
 | `pane.report_agent_session` 的 session 信息 | NativeRef 候选，经 host/pane/process 核对后绑定 | 探针元数据不是操作者身份；不得覆盖不同 generation 的 session |
 
-Herdr 的 ANSI bridge 已有明确源码入口：[terminal_sessions.rs](../../../herdr/src/client/terminal_sessions.rs) 将 `terminal.frame` 输出成 JSONL，control 接受 `terminal.input`（text 或 base64 bytes 二选一）、`terminal.resize`、`terminal.scroll`、`terminal.release`。本次进一步核对 Herdr HEAD `1a7c691559bb6ea8ad366bce68f87f8c3f6db098` 的 [TerminalFrame](../../../herdr/src/protocol/wire.rs)、[render_stream.rs](../../../herdr/src/server/render_stream.rs)、[render_ansi.rs](../../../herdr/src/protocol/render_ansi.rs)：bytes 由 FrameData/BlitEncoder 生成，seq 是 per-client，full 表示重绘。因此 [PTY spike](../research/pty-driver-spike.md) 所称“原始 ANSI 流”在此精确记作 **rendered-ansi**，不宣称保留源 PTY 字节、原生滚动历史或跨 attach 的稳定 offset。
+Herdr 的 ANSI bridge 已有明确源码入口：terminal_sessions.rs 将 `terminal.frame` 输出成 JSONL，control 接受 `terminal.input`（text 或 base64 bytes 二选一）、`terminal.resize`、`terminal.scroll`、`terminal.release`。本次进一步核对 Herdr HEAD `1a7c691559bb6ea8ad366bce68f87f8c3f6db098` 的 TerminalFrame、render_stream.rs、render_ansi.rs：bytes 由 FrameData/BlitEncoder 生成，seq 是 per-client，full 表示重绘。因此 PTY spike 所称“原始 ANSI 流”在此精确记作 **rendered-ansi**，不宣称保留源 PTY 字节、原生滚动历史或跨 attach 的稳定 offset。
 
-规格决定：已装 Herdr 的 Node 优先用该 bridge 承载终端；backend 仍可替换。Node 为每次 Herdr terminal 连接创建 streamEpoch，持久保存自己收到的 rendered-ansi bytes 与 offset。Herdr 重新连接必须换 streamEpoch，并从 full frame 重建显示；Hub 断线而 Node bridge 未断则可按 Node offset 补页。`pane.read` 的普通文本仍不能替代这个 bridge。检测器只用于 activity 提示；spike 已见瞬时 idle 闪烁，禁止据此自动发送下一 prompt。[PTY spike §1、§4](../research/pty-driver-spike.md)
+规格决定：已装 Herdr 的 Node 优先用该 bridge 承载终端；backend 仍可替换。Node 为每次 Herdr terminal 连接创建 streamEpoch，持久保存自己收到的 rendered-ansi bytes 与 offset。Herdr 重新连接必须换 streamEpoch，并从 full frame 重建显示；Hub 断线而 Node bridge 未断则可按 Node offset 补页。`pane.read` 的普通文本仍不能替代这个 bridge。检测器只用于 activity 提示；spike 已见瞬时 idle 闪烁，禁止据此自动发送下一 prompt。PTY spike §1、§4
 
 ### 5.8 成功、取消与“不知道”的结算规则
 
@@ -1096,7 +1109,7 @@ hook invocation 自身可使用小型本地持久 spool，把 invocationId、启
 | `PermissionRequest` hook | 已验证 print 下阻塞 allow/deny；claude-pty 仅在 runtime 是唯一等待 responder 时启用 | 没有 tool_use_id/requestId；hook invocation 本身是 callback 身份；不覆盖所有 question、sandbox prompt 或 TUI 交互 |
 | PTY 原生 TUI | Claude 完整人机体验的默认保留通道；手机展示原生终端，持写入 lease 的人操作 | 无稳定 requestId 时 Interaction.answerable=false；不得从屏幕“Allow?”创建具有语义授权的按钮，禁止按坐标/文案自动送 y/Enter |
 
-以下是 SDK 定义与 [2.1.268 交互探针](../research/claude-interaction-probe.md) 支持的**线协议示例**，ID、工具和路径为示意，初始化 response 省略已知可选目录。adapter 必须锁定 CLI/SDK 版本并回放真实 fixture；未知 subtype 使用已知 control error 机制报告并将交互标不可答/unknown，不自动同意。`request_user_dialog` 只在 initialize 的 supportedDialogKinds 中声明已完整实现的种类；未声明种类不会因可以画表单就自动获得回写能力。[SDK 类型参考](../research/claude-stream-json-protocol.md)
+以下是 SDK 定义与 2.1.268 交互探针 支持的**线协议示例**，ID、工具和路径为示意，初始化 response 省略已知可选目录。adapter 必须锁定 CLI/SDK 版本并回放真实 fixture；未知 subtype 使用已知 control error 机制报告并将交互标不可答/unknown，不自动同意。`request_user_dialog` 只在 initialize 的 supportedDialogKinds 中声明已完整实现的种类；未声明种类不会因可以画表单就自动获得回写能力。SDK 类型参考
 
 ~~~json
 {"type":"control_request","request_id":"runtime-init-1","request":{"subtype":"initialize"}}
@@ -1120,7 +1133,7 @@ AskUserQuestion 的已验证请求同样为 `can_use_tool`，`tool_name:"AskUser
 }
 ~~~
 
-answers 的 key 是原 question 全文，值为选择的原 label；所有非 answers 的原 input 字段都保留。相同 question 文本或重复 option label 若使该 encoder 无法无歧义表达，返回 `INTERACTION_SCHEMA_UNSUPPORTED`，不靠索引写入错误答案。多选和自由输入虽能由统一 schema 表达，当前探针只验证单选；须取得相应 fixture 才开放。ExitPlanMode 必须有原生暂停请求、可见 plan 与准确 encoder；批准只按已展示选项作用，不隐式追加 setMode=bypassPermissions。单独 elicitation/request_user_dialog subtype 各自注册，不能靠 can_use_tool encoder 声称全覆盖。[AskUserQuestion 往返](../research/claude-interaction-probe.md#2-askuserquestion-回路已验证)
+answers 的 key 是原 question 全文，值为选择的原 label；所有非 answers 的原 input 字段都保留。相同 question 文本或重复 option label 若使该 encoder 无法无歧义表达，返回 `INTERACTION_SCHEMA_UNSUPPORTED`，不靠索引写入错误答案。多选和自由输入虽能由统一 schema 表达，当前探针只验证单选；须取得相应 fixture 才开放。ExitPlanMode 必须有原生暂停请求、可见 plan 与准确 encoder；批准只按已展示选项作用，不隐式追加 setMode=bypassPermissions。单独 elicitation/request_user_dialog subtype 各自注册，不能靠 can_use_tool encoder 声称全覆盖。AskUserQuestion 往返
 
 ### 6.3 Claude hook 的输入、输出与冲突
 
@@ -1142,7 +1155,7 @@ Claude `PermissionRequest` 的输出必须是该事件专属的 hook JSON，不�
 
 同一原生请求禁止同时挂 runtime blocking PermissionRequest 与 runtime host can_use_tool 两个 responder；按 driver 选择一个，另一路只做不阻塞观察。已有第三方 hook 若也会返回 allow/deny，materializer 记录 `approvalAuthority=unknown` 并禁用统一 approval 按钮；声明必须有 interactive-approval 的 print spec 返回 `CONTROL_UNAVAILABLE`，有原生 TUI 的 profile 继续提供 TUI。不能认为“有多个 hooks 就先到先得”，也不能暗中删除第三方 hook。
 
-本机 Flux PermissionRequest 配置 timeout=86400；交互探针通过空 setting-sources 排除了它，证明了新 broker 的编码，但未证明保留全部现用 hooks 时仍无竞争。因此生产必须选择已经准备好的无冲突持久 native store，或逐项登记现有 responder 的协作方式；此配置准备不在本任务中执行。缺省 native command hook timeout 文档为 600 秒，探针用 30 秒验证 allow/deny；没有实等 600 秒的超时证据。`PermissionRequest` 的输入/输出详见 [交互探针 §3](../research/claude-interaction-probe.md#3-hook-permissionrequest-阻塞决策已验证)，并保留 [hooks-integrations](../research/hooks-integrations.md) 的原配置来源。
+本机 Flux PermissionRequest 配置 timeout=86400；交互探针通过空 setting-sources 排除了它，证明了新 broker 的编码，但未证明保留全部现用 hooks 时仍无竞争。因此生产必须选择已经准备好的无冲突持久 native store，或逐项登记现有 responder 的协作方式；此配置准备不在本任务中执行。缺省 native command hook timeout 文档为 600 秒，探针用 30 秒验证 allow/deny；没有实等 600 秒的超时证据。`PermissionRequest` 的输入/输出详见 交互探针 §3，并保留 hooks-integrations 的原配置来源。
 
 ### 6.4 超时策略与权限默认值
 
@@ -1150,13 +1163,13 @@ MVP 不把 bot 等同于无人审批：默认 Claude human/bot 都采用已配�
 
 `interactionDeadlineMs`、`hookDeadlineMs`、`controlWriteTimeoutMs` 是 Node 配置，记录在 LaunchManifest；hook helper 的 deadline 必须早于原生 hook timeout，留出写出合法 deny 的时间。原生不支持外部暂停时，在超时后使用已验证的 native deny/cancel encoder，或保持 native TUI等待；不支持时记录 `CONTROL_UNAVAILABLE`，禁止把超时当 consent。由 deadline 导致的拒绝是系统策略事件，actor=system，与人类选择分开。Node→Hub 断线不延长已给出的 native deadline。
 
-Claude can_use_tool 没有可假定的 native park deadline；配置没有 runtime deadline 时保持 pending，不能编一个“CLI 已拒绝”的时间。设置 runtime deadline 时须在请求中明确其来源，并把超时决定作为 Node 的系统 answer/outbox 处理；只有 native 已取消/清理的证据才记原生 resolved。`defer + resume` 不属于 v1 已验收的交互恢复机制，不能用它保证长时间手机审批一定可恢复。[交互探针 §1、§7](../research/claude-interaction-probe.md)
+Claude can_use_tool 没有可假定的 native park deadline；配置没有 runtime deadline 时保持 pending，不能编一个“CLI 已拒绝”的时间。设置 runtime deadline 时须在请求中明确其来源，并把超时决定作为 Node 的系统 answer/outbox 处理；只有 native 已取消/清理的证据才记原生 resolved。`defer + resume` 不属于 v1 已验收的交互恢复机制，不能用它保证长时间手机审批一定可恢复。交互探针 §1、§7
 
 ## 7. Hub ↔ Node Agent 协议
 
 ### 7.1 网络、版本和身份
 
-默认 Node 主动连接 Hub `wss://<hub>/node/v1/connect`；经 SSH 隧道承载时仍使用同一应用协议。人使用 Web/PWA 的 HTTPS/WSS client endpoint，Bot 经 Hub dispatcher，不能直接访问 native app-server、ACP、Herdr socket 或模型网关管理面。长连接断开只影响控制与观察同步，不杀已托管进程。拓扑沿 [proposal §4](proposal.md#4-架构分层)；环境已有 SSH、不要求先安装 Tailscale 的依据是 [env-inventory §6](../research/env-inventory.md#六-网络端口与远程连接盘点)。
+默认 Node 主动连接 Hub `wss://<hub>/node/v1/connect`；经 SSH 隧道承载时仍使用同一应用协议。人使用 Web/PWA 的 HTTPS/WSS client endpoint，Bot 经 Hub dispatcher，不能直接访问 native app-server、ACP、Herdr socket 或模型网关管理面。长连接断开只影响控制与观察同步，不杀已托管进程。拓扑沿 [proposal §4](proposal.md#4-架构分层)；环境已有 SSH、不要求先安装 Tailscale 的依据是 env-inventory §6。
 
 Hub wire 使用 JSON-RPC 2.0；请求 `{jsonrpc:"2.0",id,method,params}`，通知不带 id，response 必须且只能有 result/error 之一。RPC id 是每个方向、每个 connectionEpoch 内唯一的 string；不能跨连接重用它来判定 Command 是否执行。第一条应用请求为 `runtime.hello`，成功前除关闭连接外不接受其它操作。
 
@@ -1200,6 +1213,7 @@ Hub 生成 ownerFence，Node 在本地 durable store 单调保存；旧 fence �
 | `worktree.remove` | Hub→Node | `{worktreeId,expectedHeadOid,expectedDirty:false}` → Command；没有 force 隐式回退 |
 | `instance.create` | Hub→Node | `{instanceId,spec,initialInput?:DriverInput}` → Command + `{instanceId,prepared:boolean,sendCommandId:Id\|null,runId:Id\|null}`；initialInput 只能 prompt；agy deferred-argv 可 prepared=true 而尚未启动 |
 | `instance.attach` | Hub→Node | `{instanceId,ref:AttachRef}` → Command；不得 wake/resume |
+| `instance.open_terminal` | Hub→Node | `{instanceId,backgroundJobId,allowWake:true,carrier:{backend:"herdr",server:HerdrServer,session}}` → Command；只允许经认证的人类显式动作，可能 wake native job。使用同一 Command wrapper、digest、expected generation/fence 与持久 dispatch intent；不创建 Run、不含 prompt |
 | `instance.resume` | Hub→Node | `{instanceId,nativeRef,providerProfileRevision,expectedPreviousGeneration}` → Command；不含 prompt，后续输入另发 |
 | `instance.send` | Hub→Node | `{instanceId,runId,input:prompt\|steer,completionScope}` → Command；input 使用 DriverInput 对应分支，model-switch 只能经 configure；steer 必须指定既有 runId，不创建新 Run |
 | `instance.configure` | Hub→Node | `{instanceId,modelId,effective:"next-turn"}` → Command；仅能力支持且无活 foreground Run 时，转 Driver.send(model-switch) |
@@ -1232,7 +1246,7 @@ object 上传授权绑定 actor、host/workspace 和用途；uploadId 使用 obj
 
 订阅输入：`{journalId,afterSeq:U64|null,snapshot:"required"|"if-needed"|"none",projectionVersion:string,batchLimit:number}`。result：`{subscriptionId,journalId,floorSeq,durableSeq,snapshot:Snapshot|null,replayFromSeq,nextCursor,connectionId}`。`Snapshot` 包含 `{projectionVersion,projectionEpoch:Id,asOfSeq,instance,runs,commands,pendingInteractions,nodes,history:{earliestRetainedSeq,complete:boolean}}`；registry snapshot 使用其对应实体集合，不能给它虚构 Instance。
 
-Node 在同一可重复读快照中取得 asOfSeq 和投影，同时先注册 follow 缓冲；返回 snapshot 后按 seq 发出所有大于 asOfSeq 的事件。数据写入、snapshot watermark 与 pending Interaction 必须来自同一已持久版本。不能先读第一页、随后才订阅，从而丢掉两者间的更新。历史旧页以 beforeSeq/cursor 读取，向前 prepend 不能改变 node 稳定 ID。[借鉴 DSH 的 snapshot/follow](../../../deepseek-harness/packages/api/session-controller/src/history.ts)
+Node 在同一可重复读快照中取得 asOfSeq 和投影，同时先注册 follow 缓冲；返回 snapshot 后按 seq 发出所有大于 asOfSeq 的事件。数据写入、snapshot watermark 与 pending Interaction 必须来自同一已持久版本。不能先读第一页、随后才订阅，从而丢掉两者间的更新。历史旧页以 beforeSeq/cursor 读取，向前 prepend 不能改变 node 稳定 ID。借鉴 DSH 的 snapshot/follow
 
 事件 notification：
 
@@ -1265,13 +1279,13 @@ cursor 是服务器签名的 opaque token，绑定 principal、journal、方向�
 
 协商 `tty-binary-v1` 后，输出二进制帧采用 32-byte header：byte 0 为 framingVersion=1；byte 1 为 channelType（1=TTY output，2=object chunk）；bytes 2–3 保留且必须为 0；bytes 4–19 为 stream UUID 的 16 bytes（不含前缀）；bytes 20–27 为大端 uint64 byte offset；bytes 28–31 为大端 uint32 payloadLength；之后恰有 payloadLength 原始 bytes。streamId 对应 tty.attach/object.read 返回的 ID；kind/type/length/offset 不合法即拒绝该流，不能把未注册 stream 当另一个 Instance 的输入。
 
-`tty.attach` 参数 `{instanceId,processGeneration,mode:read|write,previousStreamId:Id|null,afterOffset:U64|null}`；返回 `{streamId,streamEpoch,representation:pty-bytes|rendered-ansi,nextOffset,availableFrom,screenSnapshotRef:Id|null,snapshotAtOffset:Knowledge<U64>,writerLease:{leaseId:Id,expiresAt:Timestamp,inputNextSeq:U64}|null}`。streamId 与 epoch 必须同时关联，每次重建原生 terminal bridge 都分配新 streamId/streamEpoch，不复用旧 offset 空间；只有原 bridge 未断时 previousStreamId/afterOffset 可恢复。read attach 没有输入权；write lease 同一 Instance 同时只有一个，设备失联后到期释放。其他设备继续读。显式接管产生审计事件，并使旧 lease 的写入返回 `TTY_LEASE_LOST`。关闭终端面板只 detach，不 close 原生进程。
+`tty.attach` 只订阅已经存在的 bridge，不能创建 `claude attach` pane；payload 中不存在 allowWake、job ID 或 launch 参数，额外字段拒绝。刷新、重连与 reconciliation 禁止推导 open_terminal。`tty.attach` 参数 `{instanceId,processGeneration,mode:read|write,previousStreamId:Id|null,afterOffset:U64|null}`；返回 `{streamId,streamEpoch,representation:pty-bytes|rendered-ansi,nextOffset,availableFrom,screenSnapshotRef:Id|null,snapshotAtOffset:Knowledge<U64>,writerLease:{leaseId:Id,expiresAt:Timestamp,inputNextSeq:U64}|null}`。streamId 与 epoch 必须同时关联，每次重建原生 terminal bridge 都分配新 streamId/streamEpoch，不复用旧 offset 空间；只有原 bridge 未断时 previousStreamId/afterOffset 可恢复。read attach 没有输入权；write lease 同一 Instance 同时只有一个，设备失联后到期释放。其他设备继续读。显式接管产生审计事件，并使旧 lease 的写入返回 `TTY_LEASE_LOST`。关闭终端面板只 detach，不 close 原生进程。
 
 `tty.write` 参数 `{commandId,instanceId,processGeneration,streamId,streamEpoch,writerLeaseId,inputSeq:U64,dataBase64:string}`；Node 持久 intent 后写一次 PTY，返回 scope=tty-bytes，inputSeq 在该 lease 下严格单调。相同 commandId/inputSeq 的重试只查记录；已可能写入但 ACK 丢失时返回 unknown，不重复送 Enter、Ctrl+C 或粘贴。响应超时不自动重传按键。`tty.resize` 参数 `{instanceId,streamId,writerLeaseId,resizeRevision,cols,rows}` 是状态设置，较旧 revision 忽略并返回实际尺寸，新设置可安全幂等重发。
 
 输出 offset 按字节而非字符计数，UTF-8/ANSI 可以跨帧，终端客户端保留增量解析状态。断线从 afterOffset 补该 stream 实际保存的 bytes；新终端需要从有效终端状态快照的 snapshotAtOffset 开始，或从 stream 开头重放。前缀已 GC 且无可恢复终端快照时明确 `TTY_HISTORY_GAP`，不把普通屏幕截图当 xterm serialize state。
 
-representation=rendered-ansi 时，Node 把 Herdr terminal.frame 的 base64 解码后经上述 binary framing 发送，并在 raw_tty 记录 native frame seq/full/尺寸；消费者以该 stream 的字节 offset 为水位，不以 Herdr per-client seq 作为跨重连游标。新 Herdr 连接先等 full frame，建立新 stream，清空渲染器后恢复当前画面；若无法得到 full frame，返回 TTY_HISTORY_GAP。该恢复不承诺先前 scrollback/源 PTY 模式恢复。只实现 pane.read 的 backend 仍只能提供 screen-snapshot UI，不能冒充此 ANSI bridge。[Herdr terminal transport 源码](../../../herdr/src/client/terminal_sessions.rs)
+representation=rendered-ansi 时，Node 把 Herdr terminal.frame 的 base64 解码后经上述 binary framing 发送，并在 raw_tty 记录 native frame seq/full/尺寸；消费者以该 stream 的字节 offset 为水位，不以 Herdr per-client seq 作为跨重连游标。新 Herdr 连接先等 full frame，建立新 stream，清空渲染器后恢复当前画面；若无法得到 full frame，返回 TTY_HISTORY_GAP。该恢复不承诺先前 scrollback/源 PTY 模式恢复。只实现 pane.read 的 backend 仍只能提供 screen-snapshot UI，不能冒充此 ANSI bridge。Herdr terminal transport 源码
 
 TransportLimits v1 默认建议：`maxJsonFrameBytes=1048576`、`maxBinaryChunkBytes=65536`、`maxTtyInputBytes=4096`、`maxInFlightRpc=128`、`maxEventsPerBatch=256`、`maxSubscriptionBufferEvents=4096`、`heartbeatIntervalMs=15000`、`leaseTtlMs=45000`、`maxWaitMs=60000`。这些是可校验配置并在 hello 返回；客户端必须按实际值工作。大 prompt/file 先写受限 object，再在控制消息中引用；不截断成另一条有效命令。磁盘/日志不可写时停止接纳新的 native 变更，返回 `JOURNAL_UNAVAILABLE`，现有运行状态显式 unknown/受配置控制地停止；不能为了保持 UI 流畅而丢终态或授权记录。
 
@@ -1326,7 +1340,7 @@ CLI exit 0 只表示 API 请求成功返回；返回对象的 commandState/resol
 
 主 Claude 调 child 的完整顺序是 create（只证明进程/会话接纳）→ send（持久 commandId）→ wait/read（取 Run 与 Workflow 的真实状态）→ 将返回内容作为该 MCP 工具结果交回**原生 Claude**→ 显式 stop 或按已设保留策略闲置。runtime 不直接写 parent transcript，不把 child output 合成新的 assistant 消息，也不自动要求 parent 再跑一轮推理。需要父模型继续思考由原生 MCP tool 返回/原生通知机制驱动。
 
-同 native store/session 的复用不是 child isolation；需要并行编辑时默认独立 worktree。深度/并发限制在 create 接纳前执行；达到限制返回 `RESOURCE_LIMIT`，不偷偷改用父工作目录串起隐藏任务。每个主/子 Instance 可有不同 ProviderSelection，gateway model display alias、wire model、native capability 三者分别记录。[任务已确认的 Workflow/Agent 区分](../research/tasks/_context.md)、[proposal §4.2](proposal.md#42-claude-调-claude--混合模型的实现路径)
+同 native store/session 的复用不是 child isolation；需要并行编辑时默认独立 worktree。深度/并发限制在 create 接纳前执行；达到限制返回 `RESOURCE_LIMIT`，不偷偷改用父工作目录串起隐藏任务。每个主/子 Instance 可有不同 ProviderSelection，gateway model display alias、wire model、native capability 三者分别记录。任务已确认的 Workflow/Agent 区分、[proposal §4.2](proposal.md#42-claude-调-claude--混合模型的实现路径)
 
 ### 8.3 Bot dispatcher 对同一协议的使用
 
@@ -1443,35 +1457,55 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
 5. **再接 Codex/Grok/agy。** Codex 用匹配的 schema/stdio fixture，分别验收 turn+item+approval/elicitation、steer/interrupt、resume usage 去重；Grok 做 ACP 能力与 permissions/cancel/resume；agy 对未知 type 明确保留 opaque。未完成的 optional driver 不降低 Claude 主路径能力。
 6. **最后接主 agent MCP 与 Bot。** create/send/wait/read/stop 都只访问上述 API；证实主 Claude 能启动另一套已登记 settings 的 Claude并取回结果，原生 Workflow 仍可直接混合网关模型。Bot queued/accepted/settled 分开通知，重复 delivery/card callback 不产生第二份任务或答案。
 
-本文唯一产物为本规格；上述实现和运行验收均未执行。当前可据此实现协议、状态机、存储、Hub/Node 传输和有明确证据的 driver 子集；每个标 unknown 的能力按本规格返回明确错误/状态，直到对应 native 版本的验收补齐。
+上述顺序中的原生执行、存储与网络验收仍属于对应实现任务；protocol crate 当前的类型、schema、golden 与 binary 编解码实施状态见 §12。每个标 unknown 的能力继续返回明确错误/状态，直到对应 native 版本的验收补齐。
 
-## 12. 实现反馈（2026-09-12，Remuda bootstrap）
+## 12. 实现反馈与 M0-02 状态（2026-09-12）
 
-本节记录 `remuda-protocol` 的首次 Rust 类型落地。按 decisions.md D-001/D-003/D-004，项目名为 Remuda，后端为 Rust，Cargo workspace 含八个 crate；新增 `DriverKind::ClaudeBg` 的 wire 值 `claude-bg`。前文六个 driver 的候选矩阵保留其调研范围；此新增标识不证明 bg 的启动、attach、恢复或权限回填已经实现。agy 保留协议标识以读取既有数据，按 D-002 不进入 MVP 驱动实施。语言和 bg 范围以新决策为准，旧草案的 Go/延后 bg 叙述不再作为实施要求。
+[协议 crate](../../crates/remuda-protocol/src/lib.rs) 是 wire 类型的单一来源；[JSON Schema](../../crates/remuda-protocol/schema/protocol.schema.json) 与 [TypeScript](../../web/src/types/generated.ts) 由 [生成器](../../crates/remuda-protocol/examples/gen_types.rs) 同次生成。`just gen-types` 只改这两个产物；`cargo run -p remuda-protocol --example gen_types -- --check` 比较字节且不改文件。现有 CI 的 `cargo test --workspace` 会运行 generated freshness 测试，Rust 类型变化而未生成、或手改产物，均使测试失败；不新增依赖 Node 的 CI 流程。计划旧表中的 `scripts/ci/check-generated.sh` 入口由此 crate 内命令实现，避免扩大本任务文件范围。
 
-类型位于 [remuda-protocol](../../crates/remuda-protocol/src/lib.rs)：core 实体、带品牌的实体 ID、NativeRef、完整 CapabilitySet、InstanceSpec、Interaction、15 类 Observation、45 个 Hub↔Node 方法和 47 个 RuntimeError code。`PROTOCOL_VERSION={major:1,minor:0}`；SchemaVersion 只接受 1；U64 仅接受规范十进制字符串并检查溢出。serde 的相邻标签使 Observation 的 kind 与 payload 类型绑定；Native 原始 JSON/工具参数仍保留为 JSON 值。原生 Claude control_request 不是 Hub JSON-RPC，不能把它作为 RpcRequest 接收。
+生成器使用固定版本的 [schemars](https://docs.rs/schemars/1.2.2/schemars/) 派生 Serde schema，以序列化规则保留 required nullable 与可省略字段的区别；自定义 U64/ID/时间/digest/字面量 schema 与入口解析配对测试。TypeScript 从同份 schema 输出命名实体、判别 union 与已实例化的泛型定义；未知 schema 关键字使生成失败。TypeScript 不是运行时验证器：数值范围、字符串格式、对象关系、权限与状态转移仍需 schema/Node 检查。`from_json_slice` 拒绝重复 key、非法 UTF-8 与多余 JSON 文档，网络层在解码前限制 frame 大小。
 
-以下未完整指定的字段已在相邻类型以 `// TODO(protocol §x.y)` 标记；本节给出 bootstrap 的明确编码，供后续实现复核，不能改回凭空推断。
-
-| 位置 | 原规格缺口 / 实施决定 | 后续责任 |
+| 范围 | 状态 | 已落实内容 / 后续责任 |
 | --- | --- | --- |
-| §3.1 | D-004 新增 claude-bg；枚举先纳入，未实现 carrier | driver 明确 daemon job 身份、不可隐式 wake 的 attach 及独占控制，再声明 supported |
-| §7.1 | hello 的 resumeCursors 未给元素字段；使用 `{journalId,afterSeq:U64}` | Hub 按各 journal 独立对账，不能套用全局水位 |
-| §7.2 | driver.capabilities.profileRef 未给字段；使用 `{id,revision}` | 固定 registry revision 后查询能力 |
-| §7.3 | registry snapshot 没有完整结构和判别字段；Snapshot 新增 `scope:instance\|registry`，registry variant 给 `projectionVersion,projectionEpoch,asOfSeq,hosts,workspaces,commands,history` | 双端同版本采用此结构；instance variant 其余字段沿 §7.3，不用缺少 instance 的反序列化回退来猜 scope |
-| §7.4 | tty.detach 缺少参数；使用 `{instanceId,streamId,writerLeaseId?}` | 只释放订阅/对应 lease，不停止原生进程 |
-| §7.2 | object.stat/read 的结果没有逐字段定义；stat 返回 `{objectId,sizeBytes,digest,mediaType}`，read 返回 `{streamId,objectId,offset,length,digest}` | binary stream 继续使用 §7.4，不能把结果变成任意文件读取权限 |
-| §5.5 | lifecycle 的 state、entityId、revision 与 entity 重复 | 类型把 entityType 与实体绑在同一 union；Node/journal 提交前仍须核对重复字段、父子关系和状态转移，serde round-trip 不等于这些跨字段检查已执行 |
+| 核心实体、ID、Knowledge、三维 Instance 状态 | 已实现 | Rust Serde + JSON Schema + TS；U64 是十进制字符串，实体 ID 使用不同 Rust brand；未知枚举拒绝 |
+| Driver/NativeRef/carrier 增量 | 已实现 | claude-bg、独立 claudeBg.jobId、Herdr binary/server/session/pane 身份；PTY 固定 Herdr/rendered-ansi；bg first input 声明 deferred-argv 与 explicit-non-secret |
+| Command/RPC/Observation | 已实现类型 | Command 三态、15 类 Observation、46 个方法、47 个 error code；open_terminal 使用显式 allowWake:true；只读 tty.attach 拒绝 launch 字段 |
+| Wire golden | 已实现 | 本文每个 JSON 示例单独保存；NDJSON 按 frame 拆成独立 JSON；来源与类型分流记录在 golden 目录。原生 control/settings/hook 示例保持原始 JSON，不冒充 Remuda RpcRequest |
+| TTY/object 32-byte header | 已实现 | 纯函数检查版本、channel、保留位、UUIDv7、精确长度、配置上限、offset 溢出；跨帧 UTF-8/ANSI 不在 header 层解析 |
+| Schema/TS freshness | 已实现 | 生成器、只读 check 与现有 cargo CI 中的字节比较；golden 同时检验 schema 与 Serde；TS 类型编译验证属于本机检查 |
+| Native process、bg argv/attach 与 Herdr bridge | 未在本任务实现 | driver/Node 必须核对人类授权、job/store/host、binary pin 和 owner fence，再持久 intent；bg 首次输入只接受显式非敏感单个 text block，bot 禁止。Herdr 重连换 streamId/streamEpoch 并等待 full frame，不能用 pane.read 补增量 |
+| Journal、Command/Interaction CAS 与恢复 | 未在本任务实现 | Node/journal 核对 parent ID、重复 lifecycle 字段、digest、generation、租约与状态转移；serde/schema 可解析不等于可派发。ACK 丢失、崩溃或 unknown 不自动重放 |
+| 远程审批与 bot 权限 | 未在本任务实现 | D-005 的 host broker 是目标；M0 临时 dontAsk 需记录权限债。bot 永不 bypass；CLI/模型返回文本不构成授权 |
+| MaterializedLaunch 与 secrets | 非 wire 类型 | env 明文只留 Node 进程内；不加入 schema/TS。持久 recipe 只保存受控配置/credential 引用与 digest |
 
-字段旁出现的 state 等枚举均使用规格中的 wire 拼写，例如 `tool_call`、`waiting-interaction`、`acceptEdits`；不全局将它们统一改成另一种大小写。required nullable 字段使用显式反序列化函数：null 可表达“无关联”，缺字段被拒绝；原文带 `?` 的字段才允许省略。完整 CapabilitySet 不允许漏项后默认 supported 或 false。公共 JSON 入口 [from_json_slice](../../crates/remuda-protocol/src/json.rs) 在 serde 解码前拒绝任意深度重复 key、非法 UTF-8 和多余文档；传输层仍必须先执行帧大小与身份校验。EventsBatch 的 validate 检查非空、同 journal、连续 seq、唯一 eventId 及 durable 水位，ACK 前必须调用它。
+### 12.1 已收口的字段与仍需运行校验的关系
 
-这次 bootstrap 没有实现进程管理、driver trait 的执行、CAS/owner lease、持久 journal、Hub/Node 网络服务、TTY 二进制编解码或 bot 权限决策。NativeRef 的跨字段对应、Command.id/commandId 一致、Interaction kind/request/answer 配对、权限与实体状态机校验仍由后续 Node/broker 的提交入口执行，不把“serde 能解析”当“可派发”。D-005 的 bot 永不 bypass 也不能仅靠可表达权限枚举落实。MaterializedLaunch 的 env 明文不属于此 serde wire crate，后续 materializer 必须保留其进程内、不可通用序列化的要求。
+- hello.resumeCursors 使用 `{journalId,afterSeq:U64}`；driver.capabilities.profileRef 使用 `{id,revision}`，不跟随变化的 registry 默认值。
+- Snapshot 使用 `scope:instance|registry`。registry variant 包含 `projectionVersion,projectionEpoch,asOfSeq,hosts,workspaces,commands,history`；instance variant 包含 §7.3 的 instance/runs/commands/pendingInteractions/nodes/history，不以缺少 instance 猜类型。
+- tty.detach 使用 `{instanceId,streamId,writerLeaseId?}`，只释放订阅/对应 lease；object.stat 为 `{objectId,sizeBytes,digest,mediaType}`，object.read 为 `{streamId,objectId,offset,length,digest}`，不接受任意文件路径。
+- lifecycle 的 entityType 与具体 entity 在 Rust union 绑定；重复的 entityId/state/revision 与内部实体字段仍由 journal 提交入口核对。JournalEvent 的 schema 与解析均禁止带 instanceId 的坏事件退回 registry 分支。
+- `instance.open_terminal` 的 Command.operation 也为 `instance.open_terminal`。请求归属于已有 claude-bg Instance，backgroundJobId 必须匹配其 host/store/job；人类 actor、fence、generation 与权限在派发前校验。Command accepted 只证明相应 native-control 接纳，不能证明 Run 成功；重复 commandId 只查原记录。
 
-`remuda-journal` 预选 bundled rusqlite：本地 journal 由单一数据库 worker 持有，避免依赖系统 SQLite；执行实现必须离开 Tokio async executor 做阻塞数据库操作。其它服务 crate 只留职责说明，`remuda hub|node|dev` 当前只打印占位。NOTICE 尚未加入第三方源码；未来 lift Apache-2.0 代码时保留来源、许可证与 NOTICE。
+### 12.2 M0 unknown / reconciliation 与最小错误词汇
 
-下面两个规范化 wire 示例补齐 §5.4、§7.2 的字段表，与 [question-request.json](../../crates/remuda-protocol/tests/fixtures/question-request.json)、[requests.json](../../crates/remuda-protocol/tests/fixtures/requests.json) 对齐；它们不是已发送的原生命令。另有 [hello.json](../../crates/remuda-protocol/tests/fixtures/hello.json) 保留 §7.1 原示例。fixture 中标注 fixture 的进程/模型，以及占位 digest/路径，均只用于类型验证。
+| 位置 | 固定的 wire 表达 | 必须保留的语义 |
+| --- | --- | --- |
+| Command.state | queued / accepted / settled | 不增设 unknown、dispatch_unknown 或 decision_unknown 第四态 |
+| Command.resolution | clear / unknown / reconciling | 分开投递进度与是否能判定；unknown 不降成 rejected 或 completed |
+| Command.dispatch | not-dispatched / intent-durable / transport-written / native-acknowledged | intent 之后可能发生的 native 写入只能查询/对账，不能因无 ACK 重发 |
+| Instance.lifecycle、Run.state、Interaction.state | 各自保留 unknown / reconciling | 断线不表示进程已死或任务成功；已有答案的 Interaction 不回 pending |
+| Instance.connectivity | connected / disconnected / reconnecting | 与 activity/Run 结果独立；未知 activity 使用 Knowledge，而非默认 idle |
+| wait / capability / knowledge | reason:unknown / state:unknown / state:unknown | 没有足够证据时明确拒绝或返回 unknown，不提升为 supported/condition-met |
+| RuntimeError.execution / retry | possibly-dispatched / same-command-query 或 after-reconciliation | 非零 API 错误不证明 native 未收到；错误本身不授予重新执行权限 |
 
-提问请求（由 §6.2 的 Tea/coffee 原生问答投影到统一 schema）：
+[M0_REQUIRED_ERROR_CODES](../../crates/remuda-protocol/src/error.rs) 固定 24 个最低必备 code：UNAUTHENTICATED、SCOPE_DENIED、HOST_OFFLINE、OWNER_FENCED、PROTOCOL_VERSION_UNSUPPORTED、SCHEMA_VERSION_UNSUPPORTED、CAPABILITY_UNSUPPORTED、CAPABILITY_UNKNOWN、BINARY_CHANGED、INVALID_LAUNCH_SPEC、NATIVE_GENERATION_MISMATCH、ATTACH_WOULD_WAKE、CONTROL_UNAVAILABLE、COMMAND_ID_CONFLICT、COMMAND_EXPIRED、COMMAND_OUTCOME_UNKNOWN、NATIVE_RESPONSE_UNKNOWN、JOURNAL_GAP、JOURNAL_DIVERGED、JOURNAL_UNAVAILABLE、STATE_UNKNOWN、RESOURCE_LIMIT、TTY_LEASE_LOST、TTY_HISTORY_GAP。它们继续使用 §9.1 的既有数值分配，不重新编号；完整 47 个 code 仍保留。原计划的 dispatch_unknown/decision_unknown 是上述字段组合的描述，不是可接受的 wire state。
+
+### 12.3 规范化 wire 示例
+
+下面示例均为类型 fixture，不是本次运行的原生命令；fixture binary/version、路径、job ID 与 digest 为占位数据。JSON 文件须保持合法 JSON，来源注释集中在 [wire golden 说明](../../crates/remuda-protocol/tests/wire_golden/README.md) 与测试模块头；不向控制帧加入注释或额外字段。
+
+<!-- golden: question-request -->
+统一问题请求（Tea/coffee 原生问答的投影）：
 
 ~~~json
 {
@@ -1501,7 +1535,8 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
 }
 ~~~
 
-发送命令（保持 commandId 与原生输入身份分离）：
+<!-- golden: instance-send -->
+独立的 prompt Command：
 
 ~~~json
 {
@@ -1535,4 +1570,118 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
 }
 ~~~
 
-本次本机验证（macOS，Rust 1.94.1）：`cargo build --workspace`、`cargo test --workspace`（12 个 wire 测试）、`cargo clippy --workspace -- -D warnings`、`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 均通过；CLI 的 `--help` 和 `hub`、`node`、`dev` 占位命令均成功退出。Linux 的 test/clippy/fmt 已写入 CI 配置，尚未执行托管 CI。
+<!-- golden: native-bg-herdr -->
+已观测 job 与 Herdr pane；Claude session UUID 仍可未知：
+
+~~~json
+{
+  "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+  "nativeStoreId": "obj_01993ab0-0000-7000-8000-000000000002",
+  "kind": "claude",
+  "sessionId": {
+    "state": "known",
+    "value": "01993ab0-0000-7000-8000-000000000003"
+  },
+  "transcript": {
+    "state": "unknown",
+    "reason": "not-emitted",
+    "evidenceEventIds": []
+  },
+  "claude": {
+    "sessionId": "01993ab0-0000-7000-8000-000000000003"
+  },
+  "claudeBg": {
+    "jobId": "native-job-fixture-1"
+  },
+  "herdr": {
+    "binaryPath": "/opt/herdr/herdr",
+    "version": "fixture-0.9.0",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "protocolVersion": "fixture-v1",
+    "serverIdentity": "obj_01993ab0-0000-7000-8000-000000000010",
+    "serverEpoch": "epoch_01993ab0-0000-7000-8000-000000000011",
+    "representation": "rendered-ansi",
+    "session": "remuda-test",
+    "paneId": "w5:p1"
+  }
+}
+~~~
+
+<!-- golden: claude-bg-carrier -->
+bg 的首次输入策略：
+
+~~~json
+{
+  "type": "claude-bg",
+  "inputDelivery": "deferred-argv",
+  "argvInputPolicy": "explicit-non-secret"
+}
+~~~
+
+<!-- golden: herdr-carrier -->
+PTY carrier 的完整 Herdr pin：
+
+~~~json
+{
+  "type": "pty",
+  "backend": "herdr",
+  "server": {
+    "binaryPath": "/opt/herdr/herdr",
+    "version": "fixture-0.9.0",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "protocolVersion": "fixture-v1",
+    "serverIdentity": "obj_01993ab0-0000-7000-8000-000000000010",
+    "serverEpoch": "epoch_01993ab0-0000-7000-8000-000000000011",
+    "representation": "rendered-ansi"
+  },
+  "session": "remuda-test"
+}
+~~~
+
+<!-- golden: open-terminal -->
+显式创建 background attach pane：
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": "request-open-terminal",
+  "method": "instance.open_terminal",
+  "params": {
+    "commandId": "cmd_01993ab0-0000-7000-8000-000000000050",
+    "payload": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000001",
+      "backgroundJobId": "native-job-fixture-1",
+      "allowWake": true,
+      "carrier": {
+        "backend": "herdr",
+        "server": {
+          "binaryPath": "/opt/herdr/herdr",
+          "version": "fixture-0.9.0",
+          "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "protocolVersion": "fixture-v1",
+          "serverIdentity": "obj_01993ab0-0000-7000-8000-000000000010",
+          "serverEpoch": "epoch_01993ab0-0000-7000-8000-000000000011",
+          "representation": "rendered-ansi"
+        },
+        "session": "remuda-test"
+      }
+    },
+    "expected": {
+      "ownerFence": "1",
+      "processGeneration": "1"
+    }
+  }
+}
+~~~
+
+<!-- golden: binary-header -->
+32-byte header 的解码元数据（payload 为三个原始字节）：
+
+~~~json
+{
+  "channel": "tty-output",
+  "streamUuid": "01993ab0-0000-7000-8000-000000000001",
+  "offset": "9007199254740993",
+  "payloadLength": 3
+}
+~~~

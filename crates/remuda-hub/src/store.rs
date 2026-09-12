@@ -1459,30 +1459,6 @@ fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRec
     .map_err(StoreError::from)
 }
 
-fn load_journal_row(
-    conn: &Connection,
-    instance_id: &str,
-    seq: i64,
-) -> Result<Option<JournalRecord>, StoreError> {
-    conn.query_row(
-        "SELECT seq, event_id, payload_json, observed_at FROM journal
-         WHERE instance_id = ?1 AND seq = ?2",
-        params![instance_id, seq],
-        |row| {
-            let payload: String = row.get(2)?;
-            Ok(JournalRecord {
-                instance_id: instance_id.to_string(),
-                seq: row.get(0)?,
-                event_id: row.get(1)?,
-                event: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                observed_at: row.get(3)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(StoreError::from)
-}
-
 fn interaction_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InteractionRecord> {
     let payload: String = row.get(6)?;
     let blocking: i64 = row.get(5)?;

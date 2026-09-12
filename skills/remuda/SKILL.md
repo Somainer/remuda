@@ -95,7 +95,13 @@ remuda instance rm reviewer
 | `instance stop` / `rm` | `remuda_instance_stop` / `remuda_instance_rm` |
 | `fleet send --all\|--labels` | `remuda_fleet_send` |
 
-Claude Code names tools `mcp__remuda__<tool>`. Config: `docs/design/remuda-mcp.json`.
+Claude Code names tools `mcp__remuda__<tool>`. Config: `docs/design/remuda-mcp.json`
+(committed file has no Hub URL or token). `remuda mcp` resolves, in order:
+`--hub` / `REMUDA_HUB` / `$REMUDA_DATA_DIR/dev-hub/listen` / `./data/dev-hub/listen`
+/ `http://127.0.0.1:18080` when a `bootstrap-token` or `access-code` file exists
+(else `:8080`). Token: `REMUDA_TOKEN`, else `REMUDA_BOOTSTRAP_TOKEN` or the
+dev access-code / `bootstrap-token` file. After `remuda dev`, the committed
+config works without editing.
 
 ```sh
 claude --mcp-config docs/design/remuda-mcp.json --strict-mcp-config

@@ -66,19 +66,46 @@ pub fn persist_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
 
 /// Resolve the bootstrap token, generating one when the config is empty.
 pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
-    if !config.bootstrap_token.is_empty() {
-        return Ok(());
-    }
     let path = config.data_dir.join("bootstrap-token");
-    if path.is_file() {
-        config.bootstrap_token = std::fs::read_to_string(&path)
-            .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
-            .trim()
-            .to_string();
-        return Ok(());
+    if config.bootstrap_token.is_empty() {
+        if path.is_file() {
+            config.bootstrap_token = std::fs::read_to_string(&path)
+                .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
+                .trim()
+                .to_string();
+            return Ok(());
+        }
+        config.bootstrap_token = random_token();
     }
-    config.bootstrap_token = random_token();
-    persist_bootstrap(&config.data_dir, &config.bootstrap_token)
+    if !path.is_file() {
+        persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
+    }
+    Ok(())
+}
+
+/// Persist the bound Hub URL so `remuda mcp` can discover it without env edits.
+pub fn persist_listen(data_dir: &Path, addr: std::net::SocketAddr) -> Result<(), HubError> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
+    let host = if addr.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        addr.ip().to_string()
+    };
+    let url = format!("http://{host}:{}\n", addr.port());
+    let path = data_dir.join("listen");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|err| HubError::Internal(format!("listen: {err}")))?;
+    file.write_all(url.as_bytes())
+        .map_err(|err| HubError::Internal(format!("listen: {err}")))?;
+    file.sync_all()
+        .map_err(|err| HubError::Internal(format!("listen: {err}")))?;
+    Ok(())
 }
 
 /// `Set-Cookie` value for a device token.

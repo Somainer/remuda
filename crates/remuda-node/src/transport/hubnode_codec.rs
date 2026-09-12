@@ -279,6 +279,9 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             }
         }
     }
+    // Hub routed this RPC to this Node; bind create to the local Host/Workspace.
+    request.host_id = Some(node.host().meta.id.clone());
+    request.workspace_id = Some(node.workspace().meta.id.clone());
     serde_json::to_value(node.create_instance(request).await?).map_err(NodeError::from)
 }
 

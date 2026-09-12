@@ -476,7 +476,7 @@ export interface paths {
         /** List git worktrees on a host (Node remuda worktree catalog) */
         get: operations["worktreeList"];
         put?: never;
-        /** Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main) */
+        /** Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main) at the Node's fixed `../remuda-wt/<name>` location */
         post: operations["worktreeCreate"];
         delete?: never;
         options?: never;
@@ -831,8 +831,6 @@ export interface components {
             base?: string;
             hostId?: string;
             name: string;
-            path?: string;
-            repo?: string;
         };
         WorktreePage: {
             hostId?: string;

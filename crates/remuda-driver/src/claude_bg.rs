@@ -315,14 +315,12 @@ impl ClaudeBgDriver {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        apply_claude_config_dir(
+        scrub_env(
             &mut command,
-            &live.recipe.native_home,
+            &live.recipe,
+            &self.options.extra_env,
             self.options.inherit_default_config,
         );
-        for (key, value) in &self.options.extra_env {
-            command.env(key, value);
-        }
         let output = command.output().await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -421,9 +419,10 @@ impl ClaudeBgDriver {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        apply_claude_config_dir(
+        scrub_env(
             &mut command,
-            &live.recipe.native_home,
+            &live.recipe,
+            &self.options.extra_env,
             self.options.inherit_default_config,
         );
         let output = command.output().await?;
@@ -455,9 +454,10 @@ impl ClaudeBgDriver {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            apply_claude_config_dir(
+            scrub_env(
                 &mut command,
-                &live.recipe.native_home,
+                &live.recipe,
+                &self.options.extra_env,
                 self.options.inherit_default_config,
             );
             let status = command.status().await?;
@@ -733,6 +733,40 @@ fn apply_claude_config_dir(command: &mut Command, native_home: &str, inherit_def
     }
 }
 
+/// Build the child environment for a `--bg` invocation.
+///
+/// `env_clear` first, then the inheritable base, then the recipe's allowlist,
+/// then `extra_env` — so the Node's own secrets never reach the job
+/// (`security-review-2.md` S1/S2).
+fn scrub_env(
+    command: &mut Command,
+    recipe: &LaunchRecipe,
+    extra_env: &BTreeMap<String, String>,
+    inherit_default_config: bool,
+) {
+    command.env_clear();
+    for (key, value) in crate::child_env::base_env() {
+        command.env(key, value);
+    }
+    for entry in &recipe.env_allowlist {
+        if crate::child_env::is_denied(&entry.name) {
+            continue;
+        }
+        // `--bg` resolves credentials through the native home rather than the
+        // broker, so only the non-secret overlay names are applied here.
+        if entry.name == "ANTHROPIC_BASE_URL" && !recipe.provider.base_url.is_empty() {
+            command.env(&entry.name, &recipe.provider.base_url);
+        }
+    }
+    apply_claude_config_dir(command, &recipe.native_home, inherit_default_config);
+    for (key, value) in extra_env {
+        if crate::child_env::is_denied(key) {
+            continue;
+        }
+        command.env(key, value);
+    }
+}
+
 async fn lookup_session_id(
     binary: &Path,
     cwd: &str,
@@ -750,6 +784,10 @@ async fn lookup_session_id(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.env_clear();
+    for (key, value) in crate::child_env::base_env() {
+        command.env(key, value);
+    }
     apply_claude_config_dir(&mut command, native_home, false);
     let output = command.output().await.ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -2,10 +2,10 @@
 
 use super::{
     Tool,
-    args::{opt_str, required_str, send_text_from_args, string_list},
+    args::{opt_str, reject_removed_args, required_str, send_text_from_args, string_list},
 };
 use crate::cmd::instance::{CreateOpts, create, list_instances, read, send, send_keys, stop, wait};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 pub(super) fn tools() -> Vec<Tool> {
@@ -30,7 +30,6 @@ pub(super) fn tools() -> Vec<Tool> {
                     "name": { "type": "string" },
                     "title": { "type": "string" },
                     "prompt": { "type": "string" },
-                    "promptFile": { "type": "string" },
                     "commandId": { "type": "string" }
                 }
             }),
@@ -53,14 +52,13 @@ pub(super) fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "remuda_instance_send",
-            "Send a prompt to a running instance. `file` is a local path read by this MCP process.",
+            "Send a prompt to a running instance. Pass the text inline; reading a local file is CLI-only.",
             json!({
                 "type": "object",
                 "required": ["instanceId"],
                 "properties": {
                     "instanceId": { "type": "string" },
                     "text": { "type": "string" },
-                    "file": { "type": "string" },
                     "commandId": { "type": "string" },
                     "completionScope": { "type": "string" }
                 }
@@ -249,12 +247,10 @@ pub(super) fn tools() -> Vec<Tool> {
 }
 
 fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
-    let mut prompt = opt_str(args, "prompt").map(str::to_string);
-    if prompt.is_none()
-        && let Some(path) = opt_str(args, "promptFile")
-    {
-        prompt = Some(std::fs::read_to_string(path).map_err(|err| anyhow!("read {path}: {err}"))?);
-    }
+    // `promptFile` is CLI-only for the same reason as `file`; see
+    // `args::send_text_from_args` (security-review-2.md M5).
+    reject_removed_args(args, &["promptFile"])?;
+    let prompt = opt_str(args, "prompt").map(str::to_string);
     Ok(CreateOpts {
         host: opt_str(args, "host").map(str::to_string),
         labels: string_list(args, "labels"),

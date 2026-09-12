@@ -501,4 +501,100 @@ mod tests {
         assert!(text.to_ascii_lowercase().contains("content-length:"));
         assert!(text.contains("\"jsonrpc\":\"2.0\""));
     }
+
+    /// security-review-2 M4/M5: no agent-callable tool may advertise a local
+    /// file read or a caller-chosen worktree location. Sweeping the whole
+    /// registry means a newly registered group inherits this check for free.
+    #[test]
+    fn no_tool_advertises_a_local_path_or_file_read() {
+        for tool in tools_catalog() {
+            let name = tool["name"].as_str().expect("name").to_string();
+            let properties = &tool["inputSchema"]["properties"];
+            for banned in ["file", "promptFile"] {
+                assert!(
+                    properties.get(banned).is_none(),
+                    "{name} still advertises {banned}"
+                );
+            }
+            if name.starts_with("remuda_worktree_") {
+                for banned in ["path", "repo"] {
+                    assert!(
+                        properties.get(banned).is_none(),
+                        "{name} still advertises {banned}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A removed parameter must fail loudly rather than be ignored, so an
+    /// agent cannot believe it read a file that was never read.
+    #[tokio::test]
+    async fn removed_arguments_are_rejected_not_ignored() {
+        let client = dummy_client();
+        for (tool, key, value) in [
+            (
+                "remuda_worktree_create",
+                "path",
+                "/home/op/.config/systemd/user",
+            ),
+            ("remuda_worktree_create", "repo", "/some/other/repo"),
+            ("remuda_worktree_rm", "repo", "/some/other/repo"),
+        ] {
+            let call = json!({
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": { "name": "evil", key: value } }
+            });
+            let resp = handle_rpc(&call, &client).await.expect("response");
+            assert_eq!(
+                resp["result"]["isError"],
+                json!(true),
+                "{tool}/{key}: {resp}"
+            );
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(&format!("{key} is not accepted")), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn instance_send_rejects_file_argument() {
+        let mock = spawn_mock_hub().await;
+        let client = connect_for_test(format!("http://{}", mock.addr), "t".into()).expect("client");
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "remuda_instance_send",
+                "arguments": { "instanceId": "ins_test", "file": "/etc/passwd" }
+            }
+        });
+        let resp = handle_rpc(&call, &client).await.expect("response");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("file is not accepted"), "{text}");
+        // The file's contents must not appear in the reply.
+        assert!(!text.contains("root:"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn instance_create_rejects_prompt_file_argument() {
+        let mock = spawn_mock_hub().await;
+        let client = connect_for_test(format!("http://{}", mock.addr), "t".into()).expect("client");
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "remuda_instance_create",
+                "arguments": { "host": "hst_1", "promptFile": "/etc/shadow" }
+            }
+        });
+        let resp = handle_rpc(&call, &client).await.expect("response");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("promptFile is not accepted"), "{text}");
+    }
 }

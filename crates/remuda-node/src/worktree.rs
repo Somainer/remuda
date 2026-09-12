@@ -1,6 +1,7 @@
 //! Git worktree create/list used by Hub `worktree.create` / `worktree.list`.
 
 use crate::NodeError;
+use remuda_protocol::path_guard;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
@@ -68,23 +69,22 @@ fn create(repo: &Path, params: &Value) -> Result<Value, NodeError> {
         .get("path")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    let repo_override = params
-        .get("repo")
-        .and_then(Value::as_str)
-        .filter(|raw| !raw.is_empty())
-        .map(PathBuf::from);
-    let record = create_record(
-        name,
-        base,
-        path.as_deref(),
-        repo_override.as_deref().or(Some(repo)),
-    )?;
+    // `repo` is not accepted from the wire: it would let a caller operate on a
+    // different repository than the one this Node registered
+    // (`security-review-2.md` M4). The Node's own workspace root is the repo.
+    if params.get("repo").is_some() {
+        return Err(NodeError::InvalidRequest(
+            "worktree.create does not accept repo; the Node workspace root is the repository"
+                .into(),
+        ));
+    }
+    let record = create_record(name, base, path.as_deref(), Some(repo))?;
     Ok(json!({
         "name": record.name,
         "path": record.path,
         "branch": record.branch,
         "base": record.base,
-        "workspaceRoot": repo_root(repo_override.as_deref().or(Some(repo)))?.to_string_lossy(),
+        "workspaceRoot": repo_root(Some(repo))?.to_string_lossy(),
     }))
 }
 
@@ -153,18 +153,57 @@ fn create_record(
     Ok(record)
 }
 
-fn validate_name(name: &str) -> Result<(), NodeError> {
-    let valid = (1..=32).contains(&name.len())
-        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-    if !valid {
+/// Resolve a caller-supplied instance `cwd` against the registered workspace.
+///
+/// An Instance may run in the workspace root or in any worktree beside it
+/// (`<repo>/../remuda-wt/…`), and nowhere else. `None` and a path that is not
+/// a directory both fall back to the workspace root, preserving the previous
+/// behaviour for callers that omit `cwd` (`security-review-2.md` G5).
+pub fn resolve_instance_cwd(
+    workspace_root: &Path,
+    cwd: Option<&str>,
+) -> Result<PathBuf, NodeError> {
+    // The configured root may be relative (`DevServerConfig` defaults to
+    // `"."`); resolve it against the process cwd before anything else.
+    let workspace_root = if workspace_root.is_absolute() {
+        workspace_root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace_root)
+    };
+    // Always return a canonical path, whichever branch produced it. The
+    // `Some` branch gets one from `contain`, so the fallback must canonicalize
+    // too or callers see two different spellings of the same directory — on
+    // macOS the temp dir is `/var/...`, a symlink to `/private/var/...`.
+    let Some(raw) = cwd.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return path_guard::real_path(&workspace_root).map_err(|error| {
+            NodeError::InvalidRequest(format!("workspace root is unusable: {error}"))
+        });
+    };
+    let candidate = path_guard::absolutize(&workspace_root, Path::new(raw));
+    // The worktree root is advisory here: a Node whose workspace has no parent
+    // simply has no second root, rather than failing every create.
+    let worktrees = path_guard::worktree_root(&workspace_root).ok();
+    let mut roots: Vec<&Path> = vec![&workspace_root];
+    if let Some(worktrees) = worktrees.as_deref() {
+        roots.push(worktrees);
+    }
+    let resolved = path_guard::contain(&roots, &candidate).map_err(|error| {
+        NodeError::InvalidRequest(format!(
+            "cwd must resolve inside the registered workspace or a worktree beside it: {error}"
+        ))
+    })?;
+    if !resolved.is_dir() {
         return Err(NodeError::InvalidRequest(format!(
-            "worktree name must match [a-z][a-z0-9_-]{{0,31}}, got {name:?}"
+            "cwd {} is not a directory",
+            resolved.display()
         )));
     }
-    Ok(())
+    Ok(resolved)
+}
+
+fn validate_name(name: &str) -> Result<(), NodeError> {
+    path_guard::safe_segment(name)
+        .map_err(|error| NodeError::InvalidRequest(format!("worktree {error}")))
 }
 
 fn repo_root(repo: Option<&Path>) -> Result<PathBuf, NodeError> {
@@ -188,16 +227,19 @@ fn git_common_dir(repo: &Path) -> Result<PathBuf, NodeError> {
     }
 }
 
+/// Resolve the worktree directory and require it under `<repo>/../remuda-wt`.
+///
+/// Mirrors `remuda::cmd::worktree::resolve_path`; both use the shared guard so
+/// the Hub RPC path cannot be looser than the CLI (`security-review-2.md` M4).
 fn resolve_path(repo: &Path, name: &str, path: Option<&Path>) -> Result<PathBuf, NodeError> {
+    let root = path_guard::worktree_root(repo)
+        .map_err(|error| NodeError::InvalidRequest(format!("worktree {error}")))?;
     let raw = match path {
-        Some(p) => p.to_path_buf(),
-        None => PathBuf::from("..").join("remuda-wt").join(name),
+        Some(p) => path_guard::absolutize(repo, p),
+        None => root.join(name),
     };
-    Ok(if raw.is_absolute() {
-        raw
-    } else {
-        repo.join(raw)
-    })
+    path_guard::contain_strict(&[root.as_path()], &raw)
+        .map_err(|error| NodeError::InvalidRequest(format!("worktree path rejected: {error}")))
 }
 
 fn unique_branch(repo: &Path, name: &str) -> Result<String, NodeError> {
@@ -311,8 +353,13 @@ mod tests {
 
     fn init_repo() -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        git(&root, &["init", "-b", "main"]).unwrap();
+        // The worktree root is the repo's sibling; give the repo a parent
+        // inside the tempdir so that root lands in the tempdir too.
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]).unwrap();
+        // `git init -b main` needs git >= 2.28; set HEAD directly instead.
+        git(&root, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
         git(&root, &["config", "user.email", "test@example.com"]).unwrap();
         git(&root, &["config", "user.name", "test"]).unwrap();
         git(&root, &["commit", "--allow-empty", "-m", "init"]).unwrap();
@@ -325,12 +372,14 @@ mod tests {
         assert!(validate_name("1abc").is_err());
         assert!(validate_name("ok").is_ok());
         assert!(validate_name("x-web").is_ok());
+        assert!(validate_name("../escape").is_err());
+        assert!(validate_name("a/b").is_err());
     }
 
     #[test]
     fn create_and_list_round_trip() {
-        let (_keep, root) = init_repo();
-        let path = root.join("wt-agent");
+        let (keep, root) = init_repo();
+        let path = keep.path().join("remuda-wt").join("agent1");
         let created = handle_rpc(
             &root,
             "worktree.create",
@@ -363,5 +412,193 @@ mod tests {
             .expect("list");
         assert_eq!(listed["items"].as_array().unwrap().len(), 1);
         assert_eq!(listed["items"][0]["name"], "agent1");
+    }
+
+    #[test]
+    fn default_path_lands_in_the_worktree_root() {
+        let (keep, root) = init_repo();
+        let created = handle_rpc(&root, "worktree.create", &json!({ "name": "agent2" }))
+            .expect("handled")
+            .expect("create");
+        let expected = keep.path().canonicalize().unwrap().join("remuda-wt");
+        let got = created["path"].as_str().unwrap();
+        assert!(
+            Path::new(got).starts_with(&expected),
+            "{got} is not under {}",
+            expected.display()
+        );
+    }
+
+    #[test]
+    fn rejects_path_escaping_the_worktree_root() {
+        let (keep, root) = init_repo();
+        let outside = keep.path().join("evil");
+        let err = handle_rpc(
+            &root,
+            "worktree.create",
+            &json!({ "name": "agent3", "path": outside }),
+        )
+        .expect("handled")
+        .expect_err("absolute path outside the root must be rejected");
+        assert!(
+            err.to_string().contains("worktree path rejected"),
+            "unexpected error: {err}"
+        );
+        assert!(!outside.exists(), "the rejected directory must not exist");
+
+        // The review's PoC spellings.
+        for bad in [
+            json!("/home/op/.config/systemd/user"),
+            json!("../../../../tmp/evil"),
+            json!("/tmp"),
+        ] {
+            assert!(
+                handle_rpc(
+                    &root,
+                    "worktree.create",
+                    &json!({ "name": "agent4", "path": bad }),
+                )
+                .expect("handled")
+                .is_err(),
+                "path {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_repo_override() {
+        let (keep, root) = init_repo();
+        let (_other_keep, other) = init_repo();
+        let err = handle_rpc(
+            &root,
+            "worktree.create",
+            &json!({ "name": "agent5", "repo": other }),
+        )
+        .expect("handled")
+        .expect_err("repo override must be rejected");
+        assert!(
+            err.to_string().contains("does not accept repo"),
+            "unexpected error: {err}"
+        );
+        // Nothing was created in either repository.
+        assert!(!keep.path().join("remuda-wt").exists());
+    }
+
+    #[test]
+    fn instance_cwd_defaults_to_the_workspace_root() {
+        let (keep, root) = init_repo();
+        let resolved = resolve_instance_cwd(&root, None).expect("default");
+        assert_eq!(resolved, root.canonicalize().unwrap());
+        assert_eq!(resolve_instance_cwd(&root, Some("  ")).unwrap(), resolved);
+        drop(keep);
+    }
+
+    /// Every branch must return the same spelling of the same directory.
+    ///
+    /// On macOS the temp dir is `/var/folders/…`, and `/var` is a symlink to
+    /// `/private/var`, so a workspace root reached through a symlink has two
+    /// valid spellings. The `Some` branch canonicalizes via `contain`; if the
+    /// `None` fallback did not, callers would get different paths for the same
+    /// workspace depending on whether `cwd` was supplied. This test builds
+    /// that symlink shape explicitly so it fails on Linux too.
+    #[test]
+    #[cfg(unix)]
+    fn instance_cwd_is_canonical_through_a_symlinked_root() {
+        let keep = TempDir::new().expect("tempdir");
+        let real_parent = keep.path().join("private");
+        fs::create_dir_all(real_parent.join("repo")).unwrap();
+        // `link` stands in for macOS's /var -> /private/var.
+        let link = keep.path().join("var");
+        std::os::unix::fs::symlink(&real_parent, &link).unwrap();
+
+        let via_symlink = link.join("repo");
+        let canonical = via_symlink.canonicalize().unwrap();
+        assert_ne!(
+            via_symlink, canonical,
+            "the fixture must exercise a symlink"
+        );
+
+        // Default (no cwd) and explicit cwd must agree, and both must be the
+        // resolved path rather than the symlinked spelling.
+        let defaulted = resolve_instance_cwd(&via_symlink, None).expect("default cwd");
+        assert_eq!(defaulted, canonical);
+        let explicit = resolve_instance_cwd(&via_symlink, Some(&via_symlink.to_string_lossy()))
+            .expect("explicit cwd");
+        assert_eq!(explicit, defaulted);
+
+        // A real directory under the symlinked root is still accepted: this is
+        // the case that would break every launch on a macOS host if the
+        // containment check compared a canonical path against a raw root.
+        let sub = via_symlink.join("crates");
+        fs::create_dir_all(&sub).unwrap();
+        let resolved = resolve_instance_cwd(&via_symlink, Some(&sub.to_string_lossy()))
+            .expect("a directory under the symlinked root must be accepted");
+        assert_eq!(resolved, sub.canonicalize().unwrap());
+    }
+
+    /// A Node may be configured with a relative workspace root
+    /// (`DevServerConfig` defaults to `"."`), which must still resolve rather
+    /// than being rejected as "not a plain absolute path".
+    #[test]
+    fn instance_cwd_accepts_a_relative_workspace_root() {
+        let resolved = resolve_instance_cwd(Path::new("."), None).expect("relative root");
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn instance_cwd_accepts_the_workspace_and_its_worktrees() {
+        let (keep, root) = init_repo();
+        let created = handle_rpc(&root, "worktree.create", &json!({ "name": "agent1" }))
+            .expect("handled")
+            .expect("create");
+        let worktree = created["path"].as_str().unwrap();
+
+        // The workspace root itself, a subdirectory of it, and a worktree.
+        assert!(resolve_instance_cwd(&root, Some(&root.to_string_lossy())).is_ok());
+        let sub = root.join("crates");
+        fs::create_dir_all(&sub).unwrap();
+        assert!(resolve_instance_cwd(&root, Some(&sub.to_string_lossy())).is_ok());
+        let resolved = resolve_instance_cwd(&root, Some(worktree)).expect("worktree cwd");
+        assert_eq!(resolved, Path::new(worktree).canonicalize().unwrap());
+        drop(keep);
+    }
+
+    #[test]
+    fn instance_cwd_rejects_paths_outside_the_workspace() {
+        let (keep, root) = init_repo();
+        // The review's PoC values, plus traversal and a non-directory.
+        for bad in ["/", "/etc", "/home", "../..", "/etc/passwd"] {
+            let err =
+                resolve_instance_cwd(&root, Some(bad)).expect_err("cwd {bad} must be rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains("must resolve inside") || message.contains("is not a directory"),
+                "cwd {bad}: unexpected error {message}"
+            );
+        }
+        // A sibling of the workspace that is not a worktree.
+        let sibling = keep.path().join("elsewhere");
+        fs::create_dir_all(&sibling).unwrap();
+        assert!(resolve_instance_cwd(&root, Some(&sibling.to_string_lossy())).is_err());
+    }
+
+    #[test]
+    fn instance_cwd_rejects_a_symlink_escaping_the_workspace() {
+        let (keep, root) = init_repo();
+        let outside = keep.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+            let escape = root.join("escape");
+            assert!(
+                resolve_instance_cwd(&root, Some(&escape.to_string_lossy())).is_err(),
+                "a symlink out of the workspace must not be accepted"
+            );
+        }
     }
 }

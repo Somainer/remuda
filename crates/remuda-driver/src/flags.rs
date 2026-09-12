@@ -49,8 +49,10 @@ const RESERVED: &[&str] = &[
 /// Extra flags `spec.args` may append after the template.
 const EXTRA_ALLOWLIST: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-config", "name"];
 
-/// Env names that disable native features and must not be injected.
-const BANNED_ENV: &[&str] = &["CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE"];
+/// Env names that disable native features. A spec may set these to a falsy
+/// value; anything truthy is refused. The full denylist is
+/// [`crate::child_env::is_denied`].
+const NATIVE_FEATURE_ENV: &[&str] = &["CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Flag {
@@ -103,23 +105,34 @@ pub(crate) fn validate_spec_args(
 }
 
 /// Reject env bindings that would set CLAUDE_CODE_SIMPLE / SAFE_MODE.
+/// Reject an env name a spec wants injected into the agent child.
+///
+/// The denylist lives in [`crate::child_env`] so the materializer and the
+/// spawn sites cannot disagree. It covers the loader, proxy, TLS, and
+/// `REMUDA_` families, not just the two native-feature switches that were
+/// listed before (`security-review-2.md` S2).
 pub(crate) fn reject_banned_env(name: &str, literal: Option<&str>) -> DriverResult<()> {
-    if !BANNED_ENV.contains(&name) {
+    if !crate::child_env::is_denied(name) {
         return Ok(());
     }
-    if let Some(value) = literal
-        && is_truthy(value)
+    // A denied name is refused whatever its value: for the loader and proxy
+    // families the name alone is the vulnerability. The historical
+    // native-feature switches keep their "only when truthy" behaviour so a
+    // spec may still set them to a falsy value explicitly.
+    if NATIVE_FEATURE_ENV.contains(&name)
+        && let Some(value) = literal
+        && !is_truthy(value)
     {
+        return Ok(());
+    }
+    if let Some(value) = literal {
         return Err(DriverError::NativeFeatureDisabled(format!(
-            "environment {name}={value} disables native features"
+            "environment {name}={value} may not be injected"
         )));
     }
-    if literal.is_none() {
-        return Err(DriverError::NativeFeatureDisabled(format!(
-            "environment {name} may not be forwarded"
-        )));
-    }
-    Ok(())
+    Err(DriverError::NativeFeatureDisabled(format!(
+        "environment {name} may not be forwarded"
+    )))
 }
 
 pub(crate) fn is_banned_flag_token(token: &str) -> bool {

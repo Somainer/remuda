@@ -362,7 +362,7 @@
       "post": {
         "tags": ["worktrees"],
         "operationId": "worktreeCreate",
-        "summary": "Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main)",
+        "summary": "Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main) at the Node's fixed `../remuda-wt/<name>` location",
         "requestBody": {
           "required": true,
           "content": {
@@ -1165,9 +1165,7 @@
         "properties": {
           "hostId": { "type": "string" },
           "name": { "type": "string" },
-          "base": { "type": "string", "description": "Start-point (default main)." },
-          "path": { "type": "string" },
-          "repo": { "type": "string" }
+          "base": { "type": "string", "description": "Start-point (default main)." }
         }
       },
       "WorktreeRecord": {

@@ -14,7 +14,7 @@
 | `agent read <name> --lines N` | `remuda instance read <id> --lines N [--source screen\|journal]` | **完成。** generic-pty 把 bounded screen 快照写入 journal（`nativeName=screen`，screen-derived）；dogfood-2/3 `source=screen` 返回 pane 文本，无 journal-fallback。 |
 | `agent send-keys <name> enter` | `remuda instance keys <id> enter` | **部分。** Hub→Node `tty.write` 已合入 [`a4f0485`](https://github.com/Somainer/remuda/commit/a4f0485)；D0 验收未跑 keys。 |
 | `agent list` | `remuda instance list [--host]` | **完成。** CLI/MCP 存在；D0 会话未调用。 |
-| 群发暂停/恢复 | `remuda fleet send --all "PAUSE…"` | **完成。** CLI `--all` / `--labels` 与 MCP `remuda_fleet_send` 存在；D0 验收未跑。 |
+| 群发暂停/恢复 | `remuda fleet send --all "PAUSE…"` / `remuda fleet keys --all esc` | **完成。** Hub `POST /v1/fleet/broadcast` 在服务端选中运行中 Instance 并扇出 `instance.send` / `tty.write`，返回 per-instance 结果与 `accepted`/`failed`/`skipped` 汇总；`--all` 与 `--labels`/`--host`/`--kind` 可叠加（取交集），`--idempotency-key` 重放不重发。CLI `fleet send` / `fleet keys`、MCP `remuda_fleet_send` / `remuda_fleet_keys`、Web Fleet 页「群发」框同一条路径。测试：Hub 双 fake Node 扇出、CLI 单测、web 单测。D0 live 验收仍未跑。 |
 | 任务书文件 + `DONE <sha>` 约定 | `remuda instance wait --until 'line:(?m)^DONE'` 或 read 解析 | **完成。** dogfood-3 wait `reason=condition-met`（codex `matchedLine="• DONE"`；grok 跟发后命中缩进 `DONE`）。worker 文件 `dogfood-codex.txt` / `dogfood-grok.txt`。 |
 | `git worktree add ../remuda-wt/<agent> -b wt/…` | `remuda worktree create <name> [--base main]` 并可在 create 时 `--worktree` | **完成。** dogfood-1 起 MCP `remuda_worktree_create` 可用（reuse-on-repeat，catalog 在 git-common-dir）。 |
 | coordinator 验证合并（coord-verify/merge 脚本） | `remuda merge <branch> --gate` / MCP `remuda_merge` | **已实现（post-D0）**。隔离 merge、共享 gate、CAS 更新 main、push；临时 Git 仓库 + stub gate 验证，不计入历史 dogfood-3 live 验收。 |

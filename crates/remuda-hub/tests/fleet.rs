@@ -293,3 +293,245 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
     assert!(states.iter().all(|s| *s == "queued" || *s == "accepted"));
     Ok(())
 }
+
+/// Answer every Hub→Node request with a durable `accepted` so forwards settle
+/// immediately instead of burning the command-accept timeout.
+fn spawn_accepting_node(
+    mut ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws.next().await {
+            let Message::Text(text) = msg else { continue };
+            let Ok(req) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let (Some(id), Some(params)) = (req.get("id"), req.get("params")) else {
+                continue;
+            };
+            let command_id = params
+                .get("commandId")
+                .cloned()
+                .unwrap_or_else(|| json!("cmd_unknown"));
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "command": { "commandId": command_id, "state": "accepted" } }
+            });
+            if ws
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+/// `POST /v1/fleet/broadcast` across two fake Nodes: filters narrow the
+/// selection, per-instance results carry a summary, and a repeated
+/// idempotency key replays instead of queuing a second command.
+#[tokio::test]
+async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+
+    let sg = HostId::new();
+    let cn = HostId::new();
+    let sg_id = sg.as_id().as_str().to_string();
+    let cn_id = cn.as_id().as_str().to_string();
+
+    let (sg_ws, _) = connect_node(
+        hub.addr,
+        &bootstrap,
+        &sg_id,
+        "sg-node",
+        json!({ "region": "sg" }),
+        None,
+    )
+    .await?;
+    let (cn_ws, _) = connect_node(
+        hub.addr,
+        &bootstrap,
+        &cn_id,
+        "cn-node",
+        json!({ "region": "cn" }),
+        None,
+    )
+    .await?;
+    let _sg_task = spawn_accepting_node(sg_ws);
+    let _cn_task = spawn_accepting_node(cn_ws);
+
+    // Two instances on sg (claude, codex) and one on cn (claude).
+    let mut made = Vec::new();
+    for (host, kind) in [(&sg_id, "claude"), (&sg_id, "codex"), (&cn_id, "claude")] {
+        let body = json!({ "hostId": host, "kind": kind, "driver": "claude-print" }).to_string();
+        let (status, _, created) =
+            http(hub.addr, "POST", "/v1/instances", &auth, Some(&body)).await?;
+        assert_eq!(status, 200, "{created}");
+        let created: Value = serde_json::from_str(created.trim())?;
+        made.push(
+            created["instance"]["instanceId"]
+                .as_str()
+                .context("instanceId")?
+                .to_string(),
+        );
+    }
+    assert_eq!(made.len(), 3);
+
+    // Selection is required: neither `all` nor a filter is a 400.
+    let (status, _, err) = http(
+        hub.addr,
+        "POST",
+        "/v1/fleet/broadcast",
+        &auth,
+        Some(&json!({ "payload": { "text": "hi" } }).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 400, "{err}");
+
+    // Only `instance.send` / `tty.write` may be broadcast.
+    let (status, _, err) = http(
+        hub.addr,
+        "POST",
+        "/v1/fleet/broadcast",
+        &auth,
+        Some(&json!({ "all": true, "operation": "instance.close" }).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 400, "{err}");
+
+    // all=true reaches every instance on both hosts.
+    let body = json!({
+        "all": true,
+        "operation": "instance.send",
+        "payload": { "input": { "type": "prompt", "blocks": [{ "type": "text", "text": "PAUSE" }] } }
+    })
+    .to_string();
+    let (status, _, all) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{all}");
+    let all: Value = serde_json::from_str(all.trim())?;
+    assert_eq!(all["accepted"], json!(3), "{all}");
+    assert_eq!(all["failed"], json!(0));
+    assert_eq!(all["results"].as_array().map(|a| a.len()), Some(3));
+    // Every member carries its own instance id, host and command, and the
+    // responding fake Nodes drive each forward to a durable accept.
+    for result in all["results"].as_array().context("results")? {
+        assert_eq!(result["ok"], json!(true), "{result}");
+        assert!(result["commandId"].as_str().is_some(), "{result}");
+        assert_eq!(result["state"], json!("accepted"), "{result}");
+        assert_eq!(result["forwarded"], json!(true), "{result}");
+        assert!(made.contains(&result["instanceId"].as_str().unwrap().to_string()));
+    }
+
+    // A kind filter narrows to the two claude instances; codex is skipped.
+    let body = json!({ "all": true, "kinds": ["claude"], "payload": { "text": "k" } }).to_string();
+    let (status, _, kinds) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{kinds}");
+    let kinds: Value = serde_json::from_str(kinds.trim())?;
+    assert_eq!(kinds["accepted"], json!(2), "{kinds}");
+    assert_eq!(kinds["skipped"], json!(1));
+    assert!(
+        kinds["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["kind"] == json!("claude")),
+        "{kinds}"
+    );
+
+    // A host filter narrows to cn's single instance.
+    let body = json!({ "hosts": [cn_id], "payload": { "text": "h" } }).to_string();
+    let (status, _, hosts) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{hosts}");
+    let hosts: Value = serde_json::from_str(hosts.trim())?;
+    assert_eq!(hosts["accepted"], json!(1), "{hosts}");
+    assert_eq!(hosts["results"][0]["hostId"], json!(cn_id));
+
+    // A label filter resolves through host labels, not instance fields.
+    let body = json!({ "labels": ["region=sg"], "payload": { "text": "l" } }).to_string();
+    let (status, _, labels) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{labels}");
+    let labels: Value = serde_json::from_str(labels.trim())?;
+    assert_eq!(labels["accepted"], json!(2), "{labels}");
+    assert!(
+        labels["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["hostId"] == json!(sg_id)),
+        "{labels}"
+    );
+
+    // Filters intersect: sg AND codex is exactly one instance.
+    let body =
+        json!({ "hosts": [sg_id], "kinds": ["codex"], "payload": { "text": "x" } }).to_string();
+    let (status, _, both) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{both}");
+    let both: Value = serde_json::from_str(both.trim())?;
+    assert_eq!(both["accepted"], json!(1), "{both}");
+    assert_eq!(both["results"][0]["kind"], json!("codex"));
+
+    // tty.write is the keys broadcast.
+    let body = json!({
+        "all": true,
+        "operation": "tty.write",
+        "payload": { "keys": ["enter"], "dataBase64": "DQ==" }
+    })
+    .to_string();
+    let (status, _, keys) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{keys}");
+    let keys: Value = serde_json::from_str(keys.trim())?;
+    assert_eq!(keys["operation"], json!("tty.write"));
+    assert_eq!(keys["accepted"], json!(3), "{keys}");
+
+    // Same idempotency key twice: the second call replays the same commands.
+    let body = json!({
+        "all": true,
+        "idempotencyKey": "pause-round-1",
+        "payload": { "text": "once" }
+    })
+    .to_string();
+    let (status, _, first) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{first}");
+    let first: Value = serde_json::from_str(first.trim())?;
+    assert_eq!(first["accepted"], json!(3), "{first}");
+    let first_ids: Vec<&str> = first["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["commandId"].as_str())
+        .collect();
+
+    let (status, _, again) =
+        http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
+    assert_eq!(status, 200, "{again}");
+    let again: Value = serde_json::from_str(again.trim())?;
+    let again_ids: Vec<&str> = again["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["commandId"].as_str())
+        .collect();
+    assert_eq!(
+        first_ids, again_ids,
+        "replay must reuse the same commandIds"
+    );
+    assert!(
+        again["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["replayed"] == json!(true)),
+        "{again}"
+    );
+    Ok(())
+}

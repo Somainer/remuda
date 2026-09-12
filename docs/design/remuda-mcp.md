@@ -1,7 +1,8 @@
 # `--mcp-config` for Remuda
 
 Pass this file to Claude Code so the coordinator can call Remuda tools
-(`remuda_instance_*`, `remuda_worktree_create`, `remuda_fleet_send`) without a
+(`remuda_instance_*`, `remuda_worktree_create`, `remuda_fleet_send`,
+`remuda_fleet_keys`) without a
 Hub root secret. The MCP process is `remuda mcp`. Do **not** put a Hub URL or
 device token in the committed JSON: `remuda mcp` resolves them at runtime.
 
@@ -51,7 +52,7 @@ claude -p "$PROMPT" \
   --mcp-config docs/design/remuda-mcp.json \
   --strict-mcp-config \
   --permission-mode dontAsk \
-  --allowedTools mcp__remuda__remuda_worktree_create,mcp__remuda__remuda_instance_create,mcp__remuda__remuda_instance_wait,mcp__remuda__remuda_instance_read,mcp__remuda__remuda_instance_send,mcp__remuda__remuda_instance_keys,mcp__remuda__remuda_instance_list,mcp__remuda__remuda_instance_stop,mcp__remuda__remuda_instance_rm,mcp__remuda__remuda_fleet_send
+  --allowedTools mcp__remuda__remuda_worktree_create,mcp__remuda__remuda_instance_create,mcp__remuda__remuda_instance_wait,mcp__remuda__remuda_instance_read,mcp__remuda__remuda_instance_send,mcp__remuda__remuda_instance_keys,mcp__remuda__remuda_instance_list,mcp__remuda__remuda_instance_stop,mcp__remuda__remuda_instance_rm,mcp__remuda__remuda_fleet_send,mcp__remuda__remuda_fleet_keys
 ```
 
 Replace `command` in the JSON with an absolute `remuda` binary when `PATH` is

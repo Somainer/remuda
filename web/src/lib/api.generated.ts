@@ -134,6 +134,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/fleet/broadcast": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["fleetBroadcast"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/fleet/instances": {
         parameters: {
             query?: never;
@@ -496,6 +512,39 @@ export interface components {
             code: string;
             error: string;
             reasons?: string[];
+        };
+        /** @description Select running instances and fan one command out. Requires `all` or at least one of `hosts` / `labels` / `kinds`; filters intersect. */
+        FleetBroadcast: {
+            all?: boolean;
+            hosts?: string[];
+            /** @description Base key; each instance is queued under `<key>:<instanceId>` so a retry replays instead of double-sending. */
+            idempotencyKey?: string;
+            kinds?: string[];
+            labels?: string[];
+            /** @enum {string} */
+            operation?: "instance.send" | "tty.write";
+            payload?: {
+                [key: string]: unknown;
+            };
+        };
+        FleetBroadcastResult: {
+            accepted?: number;
+            failed?: number;
+            operation?: string;
+            results?: {
+                commandId?: string;
+                error?: string;
+                forwarded?: boolean;
+                hostId?: string;
+                instanceId?: string;
+                kind?: string;
+                ok?: boolean;
+                replayed?: boolean;
+                resolution?: string | null;
+                state?: string;
+            }[];
+            selected?: number;
+            skipped?: number;
         };
         FleetCreate: {
             driver?: string;
@@ -981,6 +1030,31 @@ export interface operations {
                 };
             };
             404: components["responses"]["Error"];
+        };
+    };
+    fleetBroadcast: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["FleetBroadcast"];
+            };
+        };
+        responses: {
+            /** @description Per-instance fan-out results with an accepted/failed summary */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FleetBroadcastResult"];
+                };
+            };
+            400: components["responses"]["Error"];
         };
     };
     fleetCreate: {

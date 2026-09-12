@@ -110,12 +110,28 @@ impl HubClient {
         payload: Value,
         command_id: Option<&str>,
     ) -> Result<Value, ClientError> {
+        self.post_command_keyed(instance_id, operation, payload, command_id, None)
+            .await
+    }
+
+    /// `POST /v1/instances/{id}/commands` with an explicit `idempotencyKey`.
+    pub async fn post_command_keyed(
+        &self,
+        instance_id: &str,
+        operation: &str,
+        payload: Value,
+        command_id: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<Value, ClientError> {
         let mut body = json!({
             "operation": operation,
             "payload": payload,
         });
         if let Some(id) = command_id.filter(|s| !s.is_empty()) {
             body["commandId"] = json!(id);
+        }
+        if let Some(key) = idempotency_key.filter(|s| !s.is_empty()) {
+            body["idempotencyKey"] = json!(key);
         }
         self.post(&format!("/v1/instances/{instance_id}/commands"), &body)
             .await
@@ -163,6 +179,11 @@ impl HubClient {
     /// `POST /v1/fleet/instances`.
     pub async fn create_fleet(&self, body: &Value) -> Result<Value, ClientError> {
         self.post("/v1/fleet/instances", body).await
+    }
+
+    /// `POST /v1/fleet/broadcast` — Hub-side fan-out of one command.
+    pub async fn fleet_broadcast(&self, body: &Value) -> Result<Value, ClientError> {
+        self.post("/v1/fleet/broadcast", body).await
     }
 
     /// Device follow socket (`GET /v1/follow?instanceId=`).

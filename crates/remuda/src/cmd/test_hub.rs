@@ -162,6 +162,51 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
                 ]
             }),
         ),
+        ("POST", "/v1/fleet/broadcast") => {
+            let parsed: Value = serde_json::from_str(body).unwrap_or(json!({}));
+            let operation = parsed
+                .get("operation")
+                .cloned()
+                .unwrap_or(json!("instance.send"));
+            let kinds: Vec<String> = parsed
+                .get("kinds")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The single mock instance is `ins_test` on `hst_1`, kind claude.
+            let selected = kinds.is_empty() || kinds.iter().any(|k| k == "claude");
+            let results = if selected {
+                json!([{
+                    "instanceId": "ins_test",
+                    "hostId": "hst_1",
+                    "kind": "claude",
+                    "ok": true,
+                    "commandId": "cmd_broadcast",
+                    "state": "accepted",
+                    "forwarded": true,
+                    "replayed": false
+                }])
+            } else {
+                json!([])
+            };
+            (
+                200,
+                json!({
+                    "operation": operation,
+                    "accepted": if selected { 1 } else { 0 },
+                    "failed": 0,
+                    "skipped": if selected { 0 } else { 1 },
+                    "selected": if selected { 1 } else { 0 },
+                    "results": results
+                }),
+            )
+        }
         (_, path) if path.starts_with("/v1/fleet") => {
             (404, json!({ "code": "NOT_FOUND", "error": "not found" }))
         }

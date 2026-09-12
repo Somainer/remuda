@@ -16,6 +16,7 @@ import {
   mockDb,
   mockDeviceList,
   mockDeviceRevoke,
+  mockFleetBroadcast,
   mockHostName,
   mockKeys,
   mockLogin,
@@ -314,6 +315,13 @@ export type HubProviderRow = {
   updatedAt?: string;
 };
 
+/** `POST /v1/fleet/broadcast` request body. */
+export type FleetBroadcastBody = HubBody<"/v1/fleet/broadcast", "post">;
+/** `POST /v1/fleet/broadcast` 200 body. */
+export type FleetBroadcastResult = HubJson<"/v1/fleet/broadcast", "post">;
+/** One instance's outcome inside a broadcast. */
+export type FleetBroadcastEntry = NonNullable<FleetBroadcastResult["results"]>[number];
+
 export type HubApi = {
   mock: boolean;
   login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
@@ -328,6 +336,7 @@ export type HubApi = {
   instanceCreate(spec: InstanceCreateSpec): Promise<{ command: CommandResult["command"]; instance: Instance }>;
   instanceSend(instanceId: Id, prompt: string): Promise<CommandResult>;
   instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
+  fleetBroadcast(body: FleetBroadcastBody): Promise<FleetBroadcastResult>;
   worktreeList(hostId?: string): Promise<WorktreePage>;
   worktreeCreate(spec: WorktreeCreateSpec): Promise<WorktreeRecord>;
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
@@ -530,6 +539,9 @@ function createMockApi(): HubApi {
     },
     async instanceKeys(instanceId, key) {
       return mockKeys(instanceId, key);
+    },
+    async fleetBroadcast(body) {
+      return mockFleetBroadcast(body ?? {});
     },
     async worktreeList() {
       return {
@@ -837,6 +849,12 @@ function createLiveApi(): HubApi {
     },
     async instanceKeys(instanceId, key) {
       return command(instanceId, "tty.write", { keys: [key], source: "ui" });
+    },
+    async fleetBroadcast(body) {
+      return rest<FleetBroadcastResult>("/v1/fleet/broadcast", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
     },
     async worktreeList(hostId) {
       const qs = hostId ? `?hostId=${encodeURIComponent(hostId)}` : "";

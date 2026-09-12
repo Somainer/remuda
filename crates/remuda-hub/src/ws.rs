@@ -95,9 +95,9 @@ pub async fn follow_socket(
     ws: WebSocketUpgrade,
 ) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = require_device(&state.store, &headers).await?;
     let filter = query.instance_id;
-    Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter)))
+    Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device.id)))
 }
 
 async fn node_session(state: AppState, socket: WebSocket, token: String) {
@@ -306,6 +306,7 @@ async fn handle_node_method(
                 .await
                 .map_err(map_host_store)?;
             publish_journal(&state.bus, &record);
+            crate::alerts::observe(state, &record);
             Ok(Some(json!({
                 "seq": record.seq.to_string(),
                 "eventId": record.event_id,
@@ -450,10 +451,18 @@ fn rpc_code(err: &HubError) -> i32 {
     }
 }
 
-async fn follow_session(state: AppState, socket: WebSocket, filter: Option<String>) {
+async fn follow_session(
+    state: AppState,
+    socket: WebSocket,
+    filter: Option<String>,
+    device_id: String,
+) {
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.bus.subscribe();
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
+    for id in &instance_ids {
+        state.followers.watch(device_id.clone(), id.clone()).await;
+    }
 
     if let Some(id) = instance_ids.first().cloned() {
         let _ = send_snapshot(&state, &mut sink, &id).await;
@@ -468,12 +477,14 @@ async fn follow_session(state: AppState, socket: WebSocket, filter: Option<Strin
                     && value.get("type").and_then(Value::as_str) == Some("subscribe")
                     && let Some(ids) = value.get("instanceIds").and_then(Value::as_array)
                 {
+                    state.followers.unwatch(&device_id, &instance_ids).await;
                     instance_ids = ids
                         .iter()
                         .filter_map(Value::as_str)
                         .map(str::to_string)
                         .collect();
                     for id in &instance_ids {
+                        state.followers.watch(device_id.clone(), id.clone()).await;
                         let _ = send_snapshot(&state, &mut sink, id).await;
                     }
                 }
@@ -502,6 +513,7 @@ async fn follow_session(state: AppState, socket: WebSocket, filter: Option<Strin
             }
         }
     }
+    state.followers.unwatch(&device_id, &instance_ids).await;
 }
 
 async fn send_snapshot(

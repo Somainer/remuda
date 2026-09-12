@@ -61,6 +61,12 @@ point at a built `web/dist` without rebuilding.
 | POST | `/v1/fleet/instances` | device | One Instance per selected host |
 | GET | `/v1/fleet/:id` | device | Aggregated fleet status |
 | POST | `/v1/fleet/:id/commands` | device | Broadcast send/cancel (per-instance commandId) |
+| GET | `/v1/devices` | device | Paired device list |
+| DELETE | `/v1/devices/:id` | device | Revoke a device |
+| POST | `/v1/devices/pair-code` | device | One-time phone pairing code |
+| POST | `/v1/devices/pair` | pairing code | Redeem code → device cookie |
+| GET | `/push/config` | device | VAPID public key (`remuda-push`) |
+| POST/DELETE | `/push/subscriptions` | device | Web Push subscription upsert/delete |
 
 ## Hub ↔ Node JSON-RPC (over `/v1/node`)
 
@@ -92,6 +98,12 @@ leave `state=queued`, `forwarded=true`, `resolution=unknown`.
 `ws::routes()` in `router()`. `POST /v1/instances` accepts `placement`
 (`host` / `labels` / `any`) and returns `PLACEMENT_UNSATISFIABLE` with
 `reasons` when no host fits.
+
+Web Push (`remuda-push` nested at `/push`) is device-authed. Hub notifies
+`interaction.requested`, `turn_done` with error, `lifecycle=exited`, and
+`waiting-interaction` lasting `push_block_ms` (default 30s). If any device
+is following that instance over `/v1/follow`, the push is suppressed (Paseo
+attention rule).
 
 ## SQLite (`data-dir/hub.sqlite`)
 

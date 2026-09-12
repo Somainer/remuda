@@ -21,6 +21,7 @@ argon2.workspace = true
 axum.workspace = true
 futures.workspace = true
 remuda-protocol.workspace = true
+remuda-push.workspace = true
 rusqlite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 serde.workspace = true
@@ -34,6 +35,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+base64 = "0.22"
+ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite.workspace = true

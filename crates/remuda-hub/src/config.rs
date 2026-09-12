@@ -24,6 +24,13 @@ pub struct HubConfig {
     pub allowed_origins: Vec<String>,
     /// Optional on-disk `web/dist` override used before the embedded assets.
     pub web_root: Option<PathBuf>,
+    /// How long `waiting-interaction` must last before a blocked push (ms).
+    #[serde(default = "default_push_block_ms")]
+    pub push_block_ms: u64,
+}
+
+fn default_push_block_ms() -> u64 {
+    30_000
 }
 
 impl Default for HubConfig {
@@ -35,6 +42,7 @@ impl Default for HubConfig {
             cookie_secure: true,
             allowed_origins: Vec::new(),
             web_root: None,
+            push_block_ms: default_push_block_ms(),
         }
     }
 }
@@ -49,6 +57,7 @@ impl HubConfig {
             cookie_secure: false,
             allowed_origins: Vec::new(),
             web_root: None,
+            push_block_ms: 80,
         }
     }
 }

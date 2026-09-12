@@ -884,6 +884,86 @@ impl Store {
         })
         .await
     }
+
+    /// All paired devices (no token hashes).
+    pub async fn list_devices(&self) -> Result<Vec<Device>, StoreError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare("SELECT id, name FROM devices ORDER BY created_at")?;
+            let rows = stmt.query_map([], |row| {
+                Ok(Device {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Remove a device row.
+    pub async fn delete_device(&self, device_id: String) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            let n = conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    /// Store a hashed one-time pairing code.
+    pub async fn insert_pair_code(
+        &self,
+        code_hash: String,
+        created_by: String,
+        expires_at: String,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO pair_codes (code_hash, created_by, expires_at, used)
+                 VALUES (?1, ?2, ?3, 0)",
+                params![code_hash, created_by, expires_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Consume a pairing code if it is unused and unexpired.
+    pub async fn consume_pair_code<F>(
+        &self,
+        presented: String,
+        now: String,
+        verify: F,
+    ) -> Result<bool, StoreError>
+    where
+        F: Fn(&str, &str) -> bool + Send + 'static,
+    {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT code_hash, expires_at, used FROM pair_codes")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (hash, expires_at, used) = row?;
+                if used != 0 || expires_at < now {
+                    continue;
+                }
+                if verify(&presented, &hash) {
+                    conn.execute(
+                        "UPDATE pair_codes SET used = 1 WHERE code_hash = ?1",
+                        params![hash],
+                    )?;
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+    }
 }
 
 fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
@@ -969,6 +1049,12 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             instance_id TEXT NOT NULL,
             host_id TEXT NOT NULL,
             PRIMARY KEY (fleet_id, instance_id)
+        );
+        CREATE TABLE IF NOT EXISTS pair_codes (
+            code_hash TEXT PRIMARY KEY,
+            created_by TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
         );
         ",
     )?;

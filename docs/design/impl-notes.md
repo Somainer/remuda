@@ -695,4 +695,25 @@ cargo clippy -p remuda-driver -p remuda-node --all-targets --locked -- -D warnin
   PASS
 ```
 
-The complete post-rebase workspace and web gate results are recorded in the final follow-up commit for this section.
+The branch was rebased onto `main` at `1229d53`, then the required and relevant gates were run from the worktree with the shared target directory:
+
+```text
+cargo check --workspace --all-targets --locked
+  PASS (22.24s)
+
+cargo test -p remuda-driver -p remuda-node -p remuda-hub -p remuda \
+  --locked -- --test-threads=1
+  PASS: 149 passed, 0 failed, 6 explicitly ignored live-cost tests
+
+cargo clippy --workspace --all-targets --locked -- -D warnings
+  PASS (15.70s)
+
+cd web && pnpm build
+  PASS: 394 modules; index 1.19 kB, CSS 60.79 kB, JS 992.40 kB
+cd web && pnpm test
+  PASS: 28 files, 72 tests
+cd web && pnpm lint
+  PASS (exit 0); two existing set-state-in-effect warnings in NewSessionPage.tsx
+```
+
+The reconnect teardown was also repeated against the rebuilt binary after the regression landed. Hub stopped at `11:09:26`, Node entered reconnect backoff, SIGINT reached Node at `11:09:40.207484`, and the process exited successfully in 0.901 seconds—inside the one-second carrier fallback bound.

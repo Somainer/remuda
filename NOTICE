@@ -1,42 +1,69 @@
 Remuda
 Copyright 2026 Ruming Wang
 
-This product includes code derived from the following Apache-2.0 projects.
+This product includes code derived from the following third-party projects.
 Remuda's MIT license does not replace the licenses of imported third-party
 code. Upstream LICENSE/NOTICE text must travel with source and binary
 distributions of the copied files.
 
-vibe-kanban (Apache-2.0)
+-------------------------------------------------------------------------------
+Apache-2.0 (copied)
+
+vibe-kanban
   Copyright 2025 Bloop AI Labs Ltd
+  License: Apache-2.0
   Source: https://github.com/BloopAI/vibe-kanban
   Revision: 4deb7eca8f381f7cbc1f9d15515a9ab8f8009053
   Lifted path: crates/executors/src/executors/codex/jsonrpc.rs
   Local path: crates/remuda-codex-wire/src/peer.rs
+  Header: SPDX-License-Identifier: Apache-2.0 (file start)
   Modifications: Remuda `WireError`; omit the `jsonrpc` field; classify
   inbound notifications and server→client requests onto an mpsc stream;
   NDJSON line cap; skip empty/`#` lines; no vibe-kanban executor callbacks.
 
-Future imports from vibe-kanban, herdr, or other Apache-2.0 projects must
-retain the applicable copyright notices, LICENSE, and upstream NOTICE
-contents, identify the imported revision and local modifications, and add
-the required attribution here.
+-------------------------------------------------------------------------------
+Apache-2.0 (not copied; protocol cross-check only)
 
----
+vibe-kanban Claude executor
+  crates/executors/src/executors/claude/{types.rs,protocol.rs,client.rs}
+  Revision: 4deb7eca8f381f7cbc1f9d15515a9ab8f8009053
+  Local: crates/remuda-claude-wire (new implementation)
+  No vibe-kanban source was copied. Differences (initialize handshake wait,
+  `--include-hook-events`, `--forward-subagent-text`, keep reading after the
+  first `result`) are in crates/remuda-claude-wire/README.md.
 
-`crates/remuda-claude-wire` implements the Claude Code stream-json control
-protocol from Remuda research notes (`docs/research/claude-stream-json-protocol.md`)
-and live CLI 2.1.268 fixtures. It was cross-checked against vibe-kanban
-(Apache-2.0) `crates/executors/src/executors/claude/{types.rs,protocol.rs,client.rs}`
-as a protocol subset. No vibe-kanban source was copied; differences (initialize
-handshake wait, `--include-hook-events`, `--forward-subagent-text`, not
-breaking on the first `result`) are documented in
-`crates/remuda-claude-wire/README.md`.
+vibe-kanban ACP executor
+  crates/executors/src/executors/acp/
+  Local: crates/remuda-acp-wire (new implementation on
+  `agent-client-protocol` 2.1.0)
+  Not a copy. See crates/remuda-acp-wire/README.md.
 
-herdrx (MIT)
-Copyright (c) 2026 riba2534
-Source: herdrx/web/src/lib/terminalFit.ts, herdrx/web/src/lib/terminalTouch.ts,
-herdrx/web/src/components/TerminalPane.tsx, herdrx/web/src/pages/WorkbenchPage.tsx
-Local: web/src/features/session/tty/{terminalFit.ts,terminalTouch.ts,TerminalView.tsx}
-Algorithms rewritten for Remuda Hub tty-binary-v1 and Night Corral tokens;
-not imported from herdrx. Fit/touch/IME/aux-key/viewport behaviour preserved
-in simplified form. Font family is IBM Plex Mono instead of JetBrains Mono.
+Herdr
+  Calling a local `herdr` binary over a Unix socket is not a code lift.
+  `crates/remuda-herdr` is an original client. `herdr/src/detect` is not
+  vendored.
+
+-------------------------------------------------------------------------------
+MIT (algorithms rewritten, not imported)
+
+herdrx
+  Copyright (c) 2026 riba2534
+  License: MIT
+  Source paths:
+    herdrx/web/src/lib/terminalFit.ts
+    herdrx/web/src/lib/terminalTouch.ts
+    herdrx/web/src/lib/displayPreferences.ts
+    herdrx/web/src/components/TerminalPane.tsx
+  Local paths:
+    web/src/features/session/tty/terminalFit.ts
+    web/src/features/session/tty/terminalTouch.ts
+    web/src/lib/viewport.ts
+    web/src/features/session/tty/TerminalView.tsx
+  Fit/touch/IME/aux-key/viewport behaviour preserved in simplified form for
+  Remuda tty-binary-v1 and Night Corral tokens. Font family is IBM Plex Mono
+  instead of JetBrains Mono. Not a verbatim import.
+
+-------------------------------------------------------------------------------
+Future Apache-2.0 imports (vibe-kanban, Herdr detect, Codex crates, …) must
+keep the upstream copyright/SPDX header, record revision and local
+modifications, and add a block here.

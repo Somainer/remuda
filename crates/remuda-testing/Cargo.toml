@@ -1,0 +1,22 @@
+[package]
+name = "remuda-testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "fake-claude stream-json test double and captured CLI fixtures."
+
+[[bin]]
+name = "fake-claude"
+path = "src/bin/fake-claude.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

@@ -8,6 +8,7 @@ members = [
     "crates/remuda-journal",
     "crates/remuda-node",
     "crates/remuda-hub",
+    "crates/remuda-testing",
     "crates/remuda",
 ]
 
@@ -42,6 +43,7 @@ remuda-driver = { path = "crates/remuda-driver" }
 remuda-journal = { path = "crates/remuda-journal" }
 remuda-node = { path = "crates/remuda-node" }
 remuda-hub = { path = "crates/remuda-hub" }
+remuda-testing = { path = "crates/remuda-testing" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

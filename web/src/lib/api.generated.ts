@@ -267,6 +267,26 @@ export interface paths {
         patch: operations["hostPatch"];
         trace?: never;
     };
+    "/v1/hosts/{id}/doctor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Fresh diagnostics over the registered host's active Node link
+         * @description Requires device authentication. Runs the Node inventory, data/identity, disk and listener checks without returning credentials. Login states are local-marker heuristics. RPC callers cannot choose filesystem paths.
+         */
+        get: operations["hostDoctor"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances": {
         parameters: {
             query?: never;
@@ -1316,6 +1336,43 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    hostDoctor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Host preflight, including blockers in exitCode/checks */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        checks: {
+                            details: unknown;
+                            message: string;
+                            name: string;
+                            /** @enum {string} */
+                            status: "ok" | "warning" | "blocker";
+                        }[];
+                        /** @enum {integer} */
+                        exitCode: 0 | 1;
+                        inventory: Record<string, never> | null;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            500: components["responses"]["Error"];
         };
     };
     instanceList: {

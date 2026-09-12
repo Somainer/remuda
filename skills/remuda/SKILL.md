@@ -232,7 +232,7 @@ See `docs/design/merge-affected.md` for selection and dry-run semantics.
 | `merge <branch> --gate` / `--dry-run` | `remuda_merge` (`branch`, `gate` / `dryRun`, `web`, `noPush`, `repo`, `targetDir`) |
 | `instance create` | `remuda_instance_create` |
 | `instance list` | `remuda_instance_list` |
-| `instance send` | `remuda_instance_send` (`text`) |
+| `instance send` | `remuda_instance_send` (`text` or `file`) |
 | `instance wait` | `remuda_instance_wait` (`until`, `timeoutMs`) |
 | `instance read` | `remuda_instance_read` (`lines`, `source`) |
 | `instance keys` | `remuda_instance_keys` (`keys: []`) |
@@ -240,10 +240,10 @@ See `docs/design/merge-affected.md` for selection and dry-run semantics.
 | `fleet run` / `fleet send` | `remuda_fleet_run` / `remuda_fleet_send` |
 | `fleet keys` | `remuda_fleet_keys` (`keys: []`, `all` / `labels` / `hosts` / `kinds`) |
 
-Arguments are camelCase (`timeoutMs`, `workspaceId`, `afterSeq`). Claude Code
-exposes them as `mcp__remuda__<tool>`. The MCP tools do not read local files:
-`--file` / `--prompt-file` are CLI-only, and `remuda_worktree_create` takes no
-`path` / `repo` — the worktree always lands at `../remuda-wt/<name>`.
+Arguments are camelCase (`timeoutMs`, `promptFile`, `workspaceId`,
+`afterSeq`). Claude Code exposes them as `mcp__remuda__<tool>`. Paths in
+`file` / `promptFile` are read by the `remuda mcp` process, so they must
+exist on the machine running it.
 
 `remuda mcp` resolves the Hub itself — `--hub` / `REMUDA_HUB` /
 `$REMUDA_DATA_DIR/dev-hub/listen` / `./data/dev-hub/listen` / `:18080` when a

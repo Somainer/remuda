@@ -1,3 +1,5 @@
+import { readSession } from "./session";
+
 const KEY = "runtime.access-code";
 
 export function readAccessCode(): string {
@@ -26,5 +28,7 @@ export function accessHeaders(): Record<string, string> {
     headers["X-Remuda-Access-Code"] = code;
     headers.Authorization = `Bearer ${code}`;
   }
+  const session = readSession();
+  if (session?.token) headers.Authorization = `Bearer ${session.token}`;
   return headers;
 }

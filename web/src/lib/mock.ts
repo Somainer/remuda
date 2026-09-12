@@ -13,7 +13,9 @@ import type {
 import type { Workspace } from "../types/workspace";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import { printCapabilities } from "./capabilities";
+import { HubHttpError } from "./httpError";
 import { digestPlaceholder, id, now } from "./ids";
+import { MOCK_BOOTSTRAP_TOKEN, type DeviceSession, type PairCode, type PairedDevice } from "./session";
 import { thisDeviceId } from "./interactionStatus";
 import { LONG_EVENT_COUNT, LONG_SESSION_TITLE, buildLongObservations } from "../fixtures/session/longEvents";
 
@@ -1032,3 +1034,102 @@ export function mockEventsBatch(journalId: Id, fromSeq: U64, toSeq: U64): Events
 
 export const mockHostName = hosts[0].label;
 export const mockWorkspaceLabel = workspaces[0].label;
+
+type MockDevice = PairedDevice & { token: string };
+type MockPairRow = { code: string; expiresAt: string; used: boolean };
+
+const DEVICES_KEY = "runtime.mock-devices";
+const CODES_KEY = "runtime.mock-pair-codes";
+const PAIR_ALPH = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function readJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* ignore */
+  }
+}
+
+function mockDevices(): MockDevice[] {
+  return readJson<MockDevice[]>(DEVICES_KEY, []);
+}
+
+function mockPairCodes(): MockPairRow[] {
+  return readJson<MockPairRow[]>(CODES_KEY, []);
+}
+
+export function resetMockAuth(): void {
+  try {
+    localStorage.removeItem(DEVICES_KEY);
+    localStorage.removeItem(CODES_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function requireMockDevice(token: string | undefined): MockDevice {
+  const found = token ? mockDevices().find((d) => d.token === token) : undefined;
+  if (!found) throw new HubHttpError(401, "UNAUTHENTICATED", "UNAUTHENTICATED");
+  return found;
+}
+
+function mockAuthId(prefix: string): Id {
+  const rand = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  return `${prefix}${rand}` as Id;
+}
+
+export function mockLogin(bootstrapToken: string, deviceName: string): DeviceSession {
+  if (bootstrapToken !== MOCK_BOOTSTRAP_TOKEN) {
+    throw new HubHttpError(401, "UNAUTHENTICATED", "UNAUTHENTICATED");
+  }
+  const token = mockAuthId("tok_");
+  const device: MockDevice = { id: mockAuthId("dev_"), name: deviceName.trim() || "device", token };
+  writeJson(DEVICES_KEY, [...mockDevices(), device]);
+  return { deviceId: device.id, token, name: device.name };
+}
+
+export function mockDeviceList(token: string | undefined): { items: PairedDevice[] } {
+  requireMockDevice(token);
+  return { items: mockDevices().map(({ id, name }) => ({ id, name })) };
+}
+
+export function mockPairCode(token: string | undefined): PairCode {
+  requireMockDevice(token);
+  let code = "";
+  for (let i = 0; i < 8; i++) code += PAIR_ALPH[Math.floor(Math.random() * PAIR_ALPH.length)] ?? "A";
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  writeJson(CODES_KEY, [...mockPairCodes(), { code, expiresAt, used: false }]);
+  return { code, expiresAt };
+}
+
+export function mockPairRedeem(code: string, deviceName: string): DeviceSession {
+  const normalized = code.trim().toUpperCase();
+  const rows = mockPairCodes();
+  const found = rows.find((row) => row.code === normalized && !row.used);
+  if (!found || Date.parse(found.expiresAt) < Date.now()) {
+    throw new HubHttpError(401, "UNAUTHENTICATED", "UNAUTHENTICATED");
+  }
+  found.used = true;
+  writeJson(CODES_KEY, rows);
+  const token = mockAuthId("tok_");
+  const device: MockDevice = { id: mockAuthId("dev_"), name: deviceName.trim() || "phone", token };
+  writeJson(DEVICES_KEY, [...mockDevices(), device]);
+  return { deviceId: device.id, token, name: device.name };
+}
+
+export function mockDeviceRevoke(token: string | undefined, deviceId: string): { ok: boolean } {
+  requireMockDevice(token);
+  const next = mockDevices().filter((d) => d.id !== deviceId);
+  if (next.length === mockDevices().length) throw new HubHttpError(404, "NOT_FOUND", "NOT_FOUND");
+  writeJson(DEVICES_KEY, next);
+  return { ok: true };
+}

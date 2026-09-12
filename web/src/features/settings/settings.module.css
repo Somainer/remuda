@@ -125,6 +125,46 @@
   font-size: 13px;
 }
 
+.danger {
+  border-color: var(--danger, #8f3d2c);
+  color: var(--paper);
+}
+
+.deviceRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  border-bottom: 1px solid var(--line);
+  padding: 6px 0;
+}
+
+.deviceName {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  color: var(--paper);
+}
+
+.deviceId {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.you {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dust);
+}
+
+.pairValue {
+  font-family: var(--mono);
+  font-size: 22px;
+  letter-spacing: 0.14em;
+  color: var(--paper);
+}
+
 @media (max-width: 767px) {
   .head {
     height: 52px;

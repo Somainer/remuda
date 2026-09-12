@@ -1,11 +1,13 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { iosStandaloneHint, readDeviceSettings, writeDeviceSettings, type PermissionDefault } from "../features/settings";
 import css from "../features/settings/settings.module.css";
 import { readAccessCode, writeAccessCode } from "../lib/accessCode";
+import { clipboardIo } from "../lib/clipboard";
 import { MORE_NAV } from "../lib/nav";
 import { subscribePush } from "../lib/push";
 import { hubStore, useHub } from "../lib/store";
+import { LoginPage } from "./LoginPage";
 
 const PERMS: { id: PermissionDefault; label: string }[] = [
   { id: "manual", label: "询问" },
@@ -15,9 +17,11 @@ const PERMS: { id: PermissionDefault; label: string }[] = [
 
 export function SettingsPage() {
   const hub = useHub();
+  const navigate = useNavigate();
   const [access, setAccess] = useState(() => readAccessCode());
   const [settings, setSettings] = useState(() => readDeviceSettings());
   const [push, setPush] = useState(() => (typeof Notification === "undefined" ? "unsupported" : Notification.permission));
+  const [pairBusy, setPairBusy] = useState(false);
 
   const patch = (next: Partial<typeof settings>) => setSettings(writeDeviceSettings(next));
 
@@ -55,7 +59,72 @@ export function SettingsPage() {
             <button type="button" className={css.action} onClick={() => hubStore.setCompact(!hub.compact)}>
               Compact {hub.compact ? "开" : "关"}
             </button>
+            <button
+              type="button"
+              className={css.action}
+              data-testid="settings-logout"
+              onClick={() => {
+                hubStore.logout();
+                navigate("/login", { replace: true });
+              }}
+            >
+              退出登录
+            </button>
           </div>
+        </section>
+
+        <section className={css.section} data-testid="settings-devices">
+          <div className={css.label}>已配对设备</div>
+          <p className={css.hint}>撤销会立刻作废该设备的 cookie。本设备撤销等于退出。</p>
+          {hub.devices.map((device) => {
+            const mine = device.id === hub.session?.deviceId;
+            return (
+              <div key={device.id} className={css.deviceRow} data-testid="settings-device-row">
+                <div className={css.deviceName}>
+                  {device.name}
+                  {mine ? <span className={css.you}> 本机</span> : null}
+                  <div className={css.deviceId}>{device.id.slice(0, 12)}</div>
+                </div>
+                <button
+                  type="button"
+                  className={`${css.action} ${css.danger}`}
+                  data-testid="settings-revoke"
+                  onClick={() => {
+                    void hubStore.revokeDevice(device.id).then(() => {
+                      if (mine) navigate("/login", { replace: true });
+                    });
+                  }}
+                >
+                  撤销
+                </button>
+              </div>
+            );
+          })}
+          <div className={css.row}>
+            <button
+              type="button"
+              className={css.action}
+              data-testid="settings-pair-code"
+              disabled={pairBusy}
+              onClick={() => {
+                setPairBusy(true);
+                void hubStore
+                  .issuePairCode()
+                  .then((issued) => clipboardIo.write(issued.code))
+                  .finally(() => setPairBusy(false));
+              }}
+            >
+              生成配对码
+            </button>
+          </div>
+          {hub.pairCode ? (
+            <div>
+              <div className={css.pairValue} data-testid="settings-pair-code-value">
+                {hub.pairCode.code}
+              </div>
+              <p className={css.hint}>10 分钟内有效 · 手机打开 /login 选「手机配对」</p>
+            </div>
+          ) : null}
         </section>
 
         <section className={css.section}>
@@ -141,10 +210,5 @@ export function SettingsPage() {
 }
 
 export function PairPage() {
-  return (
-    <div className={css.page} style={{ padding: 24 }}>
-      <h1 className={css.title}>设备配对</h1>
-      <p className={css.hint}>第一里程碑占位。</p>
-    </div>
-  );
+  return <LoginPage mode="pair" />;
 }

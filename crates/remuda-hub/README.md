@@ -116,7 +116,7 @@ WAL writer thread (no `rusqlite::Connection` across `.await`). Tables:
 | --- | --- |
 | `devices` | Device Argon2id hashes; cookies / bearer tokens stay valid |
 | `hosts` | Enrollment (`hostId`, token hash, inventory). Re-hello with the host token reuses the row |
-| `instances` | Cross-host index + `durable_seq` watermark |
+| `instances` | Cross-host index + `durable_seq` watermark. `lifecycle`/`activity` are derived from Node `journal.append` observations (requested→starting→running, then idle/working/blocked from herdr `agent_status`; start-failure → failed). Create default is `requested`/`unknown`, not idle. |
 | `commands` | Inbox; `forwarded` means never resend |
 | `journal` | Observation mirror. `journal.append` with an already-mirrored `seq` is idempotent |
 | `interactions` | Pending cards from `interaction.requested` events until answered/expired |

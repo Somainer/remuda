@@ -55,3 +55,7 @@ Spec: `docs/design/claude-design/Remuda UI Spec v0.2.dc.html` boards 1b / 1k / 1
 - Playwright mock: `composer-effort.spec.ts` (chromium + mobile-webkit) plus the existing session/new-session/settings suites
 
 Idle mock sessions have no usage event, so the context chip shows `—` rather than the spec’s example `74%`. Working-session journals still drive a real percent when tokens are known.
+
+## Computer-use (live demo)
+
+Screenshots above are mock (`VITE_MOCK=1`). On the live demo, keep these testids: `composer-bar`, `harness-chip`, `model-effort-chip`, `context-chip`, `permission-chip`, `effort-menu`, `effort-tier-*`, `harness-menu`, `approval-card`, `new-session-perm-row`, `new-session-yolo-hint`, `settings-effort`. Open the effort menu with an approval card visible and assert the two bounding boxes do not overlap. Check New Session permission chips at 390px and 1440px for single-line labels. Do not use ports 18080/18787.

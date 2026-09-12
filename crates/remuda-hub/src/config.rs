@@ -1,7 +1,7 @@
 //! Listen, data-dir, and cookie policy.
 
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -37,6 +37,12 @@ pub struct HubConfig {
     pub enroll_token_ttl_minutes: u64,
     /// Set the `Secure` flag on the device cookie (production HTTPS).
     pub cookie_secure: bool,
+    /// Canonical externally visible HTTP(S) origin, without a path.
+    #[serde(default)]
+    pub public_origin: Option<String>,
+    /// Exact immediate TCP peers permitted to supply forwarding headers.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
     /// Extra allowed `Origin` values. Empty means same-origin with `Host`.
     pub allowed_origins: Vec<String>,
     /// Optional on-disk `web/dist` override used before the embedded assets.
@@ -96,6 +102,8 @@ impl Default for HubConfig {
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: true,
+            public_origin: None,
+            trusted_proxies: Vec::new(),
             allowed_origins: Vec::new(),
             web_root: None,
             push_block_ms: default_push_block_ms(),
@@ -118,6 +126,8 @@ impl HubConfig {
             bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
             enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: false,
+            public_origin: None,
+            trusted_proxies: Vec::new(),
             allowed_origins: Vec::new(),
             web_root: None,
             push_block_ms: 80,

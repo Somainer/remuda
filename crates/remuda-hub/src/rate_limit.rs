@@ -1,4 +1,4 @@
-//! Bounded authentication attempt budgets, keyed by the actual TCP peer.
+//! Bounded authentication attempt budgets, keyed by the validated client IP.
 
 use crate::AppState;
 use axum::Json;
@@ -110,13 +110,12 @@ pub(crate) async fn limit_auth_attempts(
         (&Method::POST, "/v1/devices/pair") => Endpoint::Pair,
         _ => return next.run(request).await,
     };
-    // Do not trust Forwarded / X-Forwarded-For from callers. A reverse proxy
-    // shares its own peer budget unless a trusted-proxy policy is added.
     let admitted = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .is_some_and(|ConnectInfo(peer)| {
-            state.auth_limits.admit(peer.ip(), endpoint, Instant::now())
+            let client = crate::proxy::client_ip(peer.ip(), request.headers(), &state.config);
+            state.auth_limits.admit(client, endpoint, Instant::now())
         });
     if !admitted {
         return (

@@ -236,6 +236,9 @@ pub fn origin_allowed(headers: &HeaderMap, config: &HubConfig) -> bool {
     {
         return true;
     }
+    if let Some(public_origin) = &config.public_origin {
+        return origin == public_origin;
+    }
     let Some(origin_host) = origin_host(origin) else {
         return false;
     };

@@ -85,6 +85,7 @@ class HubStore {
   private listeners = new Set<Listener>();
   private journals = new Map<Id, JournalClient>();
   private subs = new Map<Id, Id>();
+  private bootGen = 0;
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -122,6 +123,7 @@ class HubStore {
   }
 
   async bootstrap() {
+    const gen = ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], connection: "offline" });
       return;
@@ -133,6 +135,11 @@ class HubStore {
     }
     try {
       await api.hello();
+      if (gen !== this.bootGen) return;
+      if (!api.mock && !api.hasDeviceSession()) {
+        this.emit({ ready: true, authed: false, error: null, connection: "live" });
+        return;
+      }
       const [instances, hosts, workspaces, interactions, devices] = await Promise.all([
         api.instanceList(),
         api.hostList(),
@@ -140,6 +147,7 @@ class HubStore {
         api.interactionList(),
         api.deviceList().catch(() => ({ items: [] as PairedDevice[] })),
       ]);
+      if (gen !== this.bootGen) return;
       this.emit({
         ready: true,
         authed: true,
@@ -153,6 +161,7 @@ class HubStore {
         interactions,
       });
     } catch (err) {
+      if (gen !== this.bootGen) return;
       const unauth = isUnauthorized(err);
       if (unauth) {
         clearSession();
@@ -246,10 +255,12 @@ class HubStore {
       }
       return api.eventsRead(args);
     };
+    const last = history.at(-1)?.seq ?? ("0" as Observation["seq"]);
     const client = new JournalClient(instance.journalId, read, {
       onEvents: (events) => {
         const current = this.state.events[instanceId] ?? [];
-        const next = current.concat(events);
+        const seen = new Set(current.map((e) => e.eventId));
+        const next = current.concat(events.filter((e) => !seen.has(e.eventId)));
         this.emit({
           events: { ...this.state.events, [instanceId]: next },
           bubbles: settleBubbles(this.state.bubbles, instanceId, next),
@@ -265,13 +276,26 @@ class HubStore {
       },
     });
     this.journals.set(instance.journalId, client);
-    const sub = await api.eventsSubscribe(instance.journalId, client.appliedSeq, (batch) => {
+    client.applySnapshot({
+      projectionVersion: "v1",
+      projectionEpoch: id("epoch_"),
+      asOfSeq: last,
+      instance: {} as Instance,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    });
+    const sub = await api.eventsSubscribe(instance.journalId, last, (batch) => {
       const result = client.applyBatch(batch);
       if (result.acked) void api.eventsAck(batch.subscriptionId, instance.journalId, result.acked);
       if (result.gap) void client.fillGap(result.gap.from, result.gap.to);
     });
     this.subs.set(instance.journalId, sub.subscriptionId);
-    client.applySnapshot(sub.snapshot);
+    if (Number(sub.snapshot.asOfSeq) >= Number(last)) {
+      client.applySnapshot(sub.snapshot);
+    }
     const tail = mockGappedTail(instance.journalId);
     if (tail) {
       setTimeout(() => {
@@ -303,7 +327,8 @@ class HubStore {
   async create(spec: InstanceCreateSpec) {
     const result = await api.instanceCreate(spec);
     this.emit({ instances: [result.instance, ...this.state.instances.filter((i) => i.id !== result.instance.id)] });
-    return result.instance;
+    await this.refresh();
+    return this.state.instances.find((i) => i.id === result.instance.id) ?? result.instance;
   }
 
   async send(instanceId: Id, prompt: string) {

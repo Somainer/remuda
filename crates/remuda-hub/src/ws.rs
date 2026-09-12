@@ -77,6 +77,8 @@ pub fn routes() -> axum::Router<crate::AppState> {
 pub struct FollowQuery {
     #[serde(rename = "instanceId")]
     instance_id: Option<String>,
+    /// Device token for browsers that cannot set WS headers.
+    token: Option<String>,
 }
 
 /// `GET /v1/node` (and `/node/v1/connect`).
@@ -98,7 +100,15 @@ pub async fn follow_socket(
     ws: WebSocketUpgrade,
 ) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
-    let device = require_device(&state.store, &headers).await?;
+    let device = if let Some(token) = query.token.as_deref().filter(|s| !s.is_empty()) {
+        state
+            .store
+            .find_device_by_token(token.to_string(), verify_secret)
+            .await?
+            .ok_or(HubError::Unauthenticated)?
+    } else {
+        require_device(&state.store, &headers).await?
+    };
     let filter = query.instance_id;
     Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device.id)))
 }

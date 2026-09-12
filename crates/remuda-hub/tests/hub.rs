@@ -492,6 +492,99 @@ async fn node_cannot_append_to_another_hosts_journal() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn get_instance_and_follow_with_query_token() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (_cookie, token) = login(hub.addr, &bootstrap).await?;
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "runtime.hello",
+            "params": { "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0", "label": "token-node" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let _ = node
+                .send(Message::Text(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+        }
+    });
+
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "prompt": "token-follow"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Authorization", &format!("Bearer {token}"))],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let body: Value = serde_json::from_str(body.trim())?;
+    let instance_id = body["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+
+    let (status, _, got) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Authorization", &format!("Bearer {token}"))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{got}");
+    let got: Value = serde_json::from_str(got.trim())?;
+    assert_eq!(got["instanceId"], json!(instance_id));
+
+    let mut follow_req = format!(
+        "ws://{}/v1/follow?instanceId={}&token={}",
+        hub.addr, instance_id, token
+    )
+    .into_client_request()?;
+    follow_req.headers_mut().remove("Authorization");
+    let (mut follow, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(follow_req))
+            .await
+            .context("follow query token")??;
+    let snapshot = recv_json(&mut follow).await?;
+    assert_eq!(snapshot["type"], json!("snapshot"));
+    assert_eq!(snapshot["instanceId"], json!(instance_id));
+    Ok(())
+}
+
 async fn recv_json<S>(ws: &mut S) -> Result<Value>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,

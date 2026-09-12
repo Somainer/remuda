@@ -80,6 +80,7 @@ pub fn routes() -> Router<crate::AppState> {
         .route("/v1/login", post(login))
         .route("/v1/hosts", get(list_hosts))
         .route("/v1/instances", get(list_instances).post(create_instance))
+        .route("/v1/instances/{id}", get(get_instance))
         .route("/v1/instances/{id}/commands", post(post_command))
         .route("/v1/instances/{id}/journal", get(get_journal))
 }
@@ -136,6 +137,23 @@ pub async fn list_instances(
     require_device(&state.store, &headers).await?;
     let items = state.store.list_instances(query.host_id).await?;
     Ok(Json(json!({ "items": items, "nextCursor": null })))
+}
+
+/// `GET /v1/instances/:id`
+pub async fn get_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    require_device(&state.store, &headers).await?;
+    let instance = state
+        .store
+        .get_instance(instance_id)
+        .await?
+        .ok_or(HubError::NotFound)?;
+    Ok(Json(
+        serde_json::to_value(instance).map_err(|err| HubError::Internal(err.to_string()))?,
+    ))
 }
 
 /// `POST /v1/instances` — index + forward `instance.create` when the Node is online.

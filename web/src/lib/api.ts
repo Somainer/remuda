@@ -27,9 +27,10 @@ import {
   mockWorkspaceLabel,
 } from "./mock";
 import { digestPlaceholder, id, now } from "./ids";
-import { accessHeaders } from "./accessCode";
+import { accessHeaders, readAccessCode, writeAccessCode } from "./accessCode";
 import { HubHttpError } from "./httpError";
 import { readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
+import { coerceObservation, coerceObservationList } from "./hubJournal";
 
 export const MOCK = import.meta.env.VITE_MOCK === "1";
 
@@ -148,6 +149,10 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
   };
 }
 
+function instanceTitle(rec: components["schemas"]["InstanceRecord"]): string | undefined {
+  return rec.title ?? undefined;
+}
+
 function mapCommand(row: components["schemas"]["CommandRecord"], instanceId: Id): Command {
   const commandId = row.commandId as Id;
   const state: Command["state"] =
@@ -204,12 +209,6 @@ export type InstanceCreateSpec = {
   name?: string;
 };
 
-export type RpcError = { code: number; message: string; data?: unknown };
-
-type JsonRpcSuccess<T> = { jsonrpc: "2.0"; id: string; result: T };
-type JsonRpcFailure = { jsonrpc: "2.0"; id: string; error: RpcError };
-type JsonRpcResponse<T> = JsonRpcSuccess<T> | JsonRpcFailure;
-
 export type HubApi = {
   mock: boolean;
   login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
@@ -217,6 +216,7 @@ export type HubApi = {
   pairCode(): Promise<PairCode>;
   deviceList(): Promise<{ items: PairedDevice[] }>;
   deviceRevoke(deviceId: string): Promise<{ ok: boolean }>;
+  hasDeviceSession(): boolean;
   hello(): Promise<HelloResult>;
   instanceList(q?: { hostId?: string; workspaceId?: string; kind?: string }): Promise<Page<Instance>>;
   instanceGet(instanceId: Id): Promise<Instance>;
@@ -255,16 +255,25 @@ export type HubApi = {
 
 /** Live remuda-node / Hub origin. Default `remuda dev` is loopback :8787. */
 function hubBase(): string {
+  if (import.meta.env.DEV && import.meta.env.VITE_HUB_URL) return "";
   const raw = import.meta.env.VITE_API_BASE ?? import.meta.env.VITE_HUB_URL ?? "";
   return raw.replace(/\/$/, "");
 }
 
-function wsUrl(): string {
+function wsUrl(path: string): string {
   const base = hubBase();
-  if (base.startsWith("https://")) return `${base.replace(/^https/, "wss")}/v1/client`;
-  if (base.startsWith("http://")) return `${base.replace(/^http/, "ws")}/v1/client`;
+  if (base.startsWith("https://")) return `${base.replace(/^https/, "wss")}${path}`;
+  if (base.startsWith("http://")) return `${base.replace(/^http/, "ws")}${path}`;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/v1/client`;
+  return `${proto}://${location.host}${path}`;
+}
+
+function followUrl(instanceId: Id): string {
+  const url = new URL(wsUrl("/v1/follow"));
+  url.searchParams.set("instanceId", instanceId);
+  const token = readSession()?.token ?? readAccessCode();
+  if (token) url.searchParams.set("token", token);
+  return url.toString();
 }
 
 async function rest<T>(path: string, init: RequestInit & { auth?: boolean } = {}): Promise<T> {
@@ -295,16 +304,6 @@ async function rest<T>(path: string, init: RequestInit & { auth?: boolean } = {}
   return (await res.json()) as T;
 }
 
-async function postRpc<T>(method: string, params: unknown): Promise<T> {
-  const rpcId = crypto.randomUUID();
-  const body = await rest<JsonRpcResponse<T>>("/v1/rpc", {
-    method: "POST",
-    body: JSON.stringify({ jsonrpc: "2.0", id: rpcId, method, params }),
-  });
-  if ("error" in body) throw new Error(body.error.message);
-  return body.result;
-}
-
 function createMockApi(): HubApi {
   const subs = new Map<Id, (batch: EventsBatch["params"]) => void>();
   return {
@@ -323,6 +322,9 @@ function createMockApi(): HubApi {
     },
     async deviceRevoke(deviceId) {
       return mockDeviceRevoke(readSession()?.token, deviceId);
+    },
+    hasDeviceSession() {
+      return true;
     },
     async hello() {
       return {
@@ -468,103 +470,55 @@ function createMockApi(): HubApi {
 }
 
 function createLiveApi(): HubApi {
-  let socket: WebSocket | null = null;
-  const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  const batchHandlers = new Map<Id, (batch: EventsBatch["params"]) => void>();
-  let rpcSeq = 0;
+  const follows = new Map<Id, WebSocket>();
+  const followSubs = new Map<Id, Id>();
   const titles = new Map<Id, string>();
   const hosts = new Map<Id, Host>();
   const workspaces = new Map<Id, Workspace>();
   const journals = new Map<Id, Id>();
 
-  function remember(instance: Instance): Instance {
+  function remember(instance: Instance, title?: string): Instance {
     journals.set(instance.journalId, instance.id);
+    journals.set(instance.id, instance.id);
+    if (title) titles.set(instance.id, title);
     return instance;
   }
 
-  function send<T>(method: string, params: unknown): Promise<T> {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      const rpcId = `c${++rpcSeq}`;
-      return new Promise<T>((resolve, reject) => {
-        pending.set(rpcId, { resolve: (v) => resolve(v as T), reject });
-        socket!.send(JSON.stringify({ jsonrpc: "2.0", id: rpcId, method, params }));
-      });
-    }
-    return postRpc<T>(method, params);
+  function instanceIdOf(journalId: Id): Id {
+    return journals.get(journalId) ?? journalId;
   }
 
-  function ensureSocket(): Promise<void> {
-    if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(wsUrl());
-      ws.binaryType = "arraybuffer";
-      socket = ws;
-      ws.addEventListener("open", () => resolve());
-      ws.addEventListener("error", () => reject(new Error("WSS_CONNECT_FAILED")));
-      ws.addEventListener("message", (ev) => {
-        if (typeof ev.data !== "string") {
-          // tty-binary-v1 / object chunks on the same /v1/client socket; tty/ owns decode.
-          return;
-        }
-        const msg = JSON.parse(ev.data) as JsonRpcResponse<unknown> & { method?: string; params?: EventsBatch["params"] };
-        if (msg.method === "events.batch" && msg.params) {
-          const handler = batchHandlers.get(msg.params.subscriptionId);
-          handler?.(msg.params);
-          return;
-        }
-        if (!("id" in msg) || msg.id == null) return;
-        const waiter = pending.get(String(msg.id));
-        if (!waiter) return;
-        pending.delete(String(msg.id));
-        if ("error" in msg) waiter.reject(new Error(msg.error.message));
-        else waiter.resolve(msg.result);
-      });
-      ws.addEventListener("close", () => {
-        for (const waiter of pending.values()) waiter.reject(new Error("WSS_CLOSED"));
-        pending.clear();
-      });
-    });
-  }
-
-  async function command(instanceId: Id, body: Record<string, unknown>): Promise<CommandResult> {
+  async function command(instanceId: Id, operation: string, payload: Record<string, unknown> = {}): Promise<CommandResult> {
     const req: HubBody<"/v1/instances/{id}/commands", "post"> = {
-      operation: String(body.operation ?? "instance.send"),
-      prompt: typeof body.prompt === "string" ? body.prompt : undefined,
-      payload: body,
+      operation,
+      payload,
     };
-    try {
-      const result = await rest<HubJson<"/v1/instances/{id}/commands", "post">>(
-        `/v1/instances/${instanceId}/commands`,
-        { method: "POST", body: JSON.stringify(req) },
-      );
-      return mapCommandResult(result, instanceId);
-    } catch {
-      // TODO(M0-11): remuda-node HTTP router may still be landing; JSON-RPC per protocol.md.
-      const operation = String(body.operation ?? "instance.send");
-      return send<CommandResult>(
-        operation === "send" ? "instance.send" : operation === "close" ? "instance.close" : "interaction.respond",
-        body,
-      );
-    }
+    const result = await rest<HubJson<"/v1/instances/{id}/commands", "post">>(
+      `/v1/instances/${instanceId}/commands`,
+      { method: "POST", body: JSON.stringify(req) },
+    );
+    return mapCommandResult(result, instanceId);
   }
 
   return {
     mock: false,
     async login(bootstrapToken, deviceName) {
-      const body: HubBody<"/v1/login", "post"> = { bootstrapToken, deviceName };
-      return rest<HubJson<"/v1/login", "post">>("/v1/login", {
+      const body = await rest<HubJson<"/v1/login", "post">>("/v1/login", {
         method: "POST",
         auth: false,
-        body: JSON.stringify(body),
+        body: JSON.stringify({ bootstrapToken, deviceName }),
       });
+      writeAccessCode(body.token);
+      return body;
     },
     async pairRedeem(code, deviceName) {
-      const body: HubBody<"/v1/devices/pair", "post"> = { code, deviceName };
-      return rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
+      const body = await rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
         method: "POST",
         auth: false,
-        body: JSON.stringify(body),
+        body: JSON.stringify({ code, deviceName }),
       });
+      writeAccessCode(body.token);
+      return body;
     },
     async pairCode() {
       return rest<HubJson<"/v1/devices/pair-code", "post">>("/v1/devices/pair-code", {
@@ -578,30 +532,29 @@ function createLiveApi(): HubApi {
     async deviceRevoke(deviceId) {
       return rest<HubJson<"/v1/devices/{id}", "delete">>(`/v1/devices/${deviceId}`, { method: "DELETE" });
     },
+    hasDeviceSession() {
+      return Boolean(readSession()?.token || readAccessCode());
+    },
     async hello() {
-      await ensureSocket();
-      return send<HelloResult>("runtime.hello", {
-        protocol: { major: 1, minMinor: 0, maxMinor: 0 },
-        observationSchemaMajors: [1],
-        features: ["snapshot-follow-v1"],
-      });
+      const health = await rest<{ ok?: boolean }>("/healthz");
+      return {
+        protocol: { major: 1, minor: 0 },
+        connectionId: id("conn_"),
+        serverEpoch: id("epoch_"),
+        observationSchemaMajor: 1 as const,
+        features: health.ok ? ["hub"] : [],
+      };
     },
     async instanceList(q) {
-      try {
-        const page = await rest<HubJson<"/v1/instances", "get">>(
-          `/v1/instances${q?.hostId ? `?hostId=${encodeURIComponent(q.hostId)}` : ""}`,
-        );
-        return { items: page.items.map((row) => remember(mapInstance(row))), nextCursor: page.nextCursor ?? null };
-      } catch {
-        return send<Page<Instance>>("instance.list", q ?? {});
-      }
+      const page = await rest<HubJson<"/v1/instances", "get">>(
+        `/v1/instances${q?.hostId ? `?hostId=${encodeURIComponent(q.hostId)}` : ""}`,
+      );
+      const items = page.items.map((row) => remember(mapInstance(row), instanceTitle(row)));
+      return { items, nextCursor: page.nextCursor ?? null };
     },
     async instanceGet(instanceId) {
-      try {
-        return remember(await rest<Instance>(`/v1/instances/${instanceId}`));
-      } catch {
-        return remember(await send<Instance>("instance.get", { instanceId }));
-      }
+      const rec = await rest<components["schemas"]["InstanceRecord"]>(`/v1/instances/${instanceId}`);
+      return remember(mapInstance(rec), instanceTitle(rec));
     },
     async instanceCreate(spec) {
       const body: HubBody<"/v1/instances", "post"> = {
@@ -617,148 +570,198 @@ function createLiveApi(): HubApi {
         name: spec.name,
         title: spec.name ?? spec.prompt.slice(0, 80),
       };
-      try {
-        const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
-          method: "POST",
-          body: JSON.stringify(body),
-        });
-        const instance = remember(mapInstance(created.instance));
-        titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
-        return { instance, command: mapCommand(created.command, instance.id) };
-      } catch {
-        // TODO(M0-11): remuda-node HTTP router may still be landing; JSON-RPC per protocol.md.
-        return send("instance.create", { spec, initialInput: { type: "prompt", text: spec.prompt } });
-      }
+      const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      const instance = remember(mapInstance(created.instance), spec.prompt.slice(0, 80) || spec.name);
+      titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
+      return { instance, command: mapCommand(created.command, instance.id) };
     },
     async instanceSend(instanceId, prompt) {
-      return command(instanceId, { operation: "send", prompt });
+      return command(instanceId, "instance.send", { prompt });
     },
     async instanceClose(instanceId) {
-      return command(instanceId, { operation: "close" });
+      return command(instanceId, "instance.close", {});
     },
     async instanceResume(instanceId) {
-      try {
-        return await command(instanceId, { operation: "resume" });
-      } catch {
-        return send<CommandResult>("instance.resume", { instanceId });
-      }
+      return command(instanceId, "instance.resume", {});
     },
     async instanceConfigure(instanceId, permissionMode) {
-      return send<CommandResult>("instance.configure", { instanceId, permissionMode, effective: "next-turn" });
+      return command(instanceId, "instance.configure", { permissionMode });
     },
     async interactionList(q) {
-      try {
-        const page = await rest<{ items?: Interaction[] } | Interaction[]>("/v1/interactions");
-        const items = Array.isArray(page) ? page : (page.items ?? []);
-        return items.filter((i) => {
-          if (q?.instanceId && i.instanceId !== q.instanceId) return false;
-          if (q?.state && i.state !== q.state) return false;
-          return true;
-        });
-      } catch {
-        const page = await send<{ items?: Interaction[] } | Interaction[]>("interaction.list", q ?? {});
-        return Array.isArray(page) ? page : (page.items ?? []);
-      }
+      const qs = new URLSearchParams();
+      if (q?.instanceId) qs.set("instanceId", q.instanceId);
+      const page = await rest<HubJson<"/v1/interactions", "get">>(`/v1/interactions${qs.size ? `?${qs}` : ""}`);
+      const items = (page.items ?? []) as Interaction[];
+      return items.filter((i) => {
+        if (q?.instanceId && i.instanceId !== q.instanceId) return false;
+        if (q?.state && i.state !== q.state) return false;
+        return true;
+      });
     },
     async interactionGet(interactionId) {
-      try {
-        return await rest<Interaction>(`/v1/interactions/${interactionId}`);
-      } catch {
-        return send<Interaction>("interaction.get", { interactionId });
-      }
+      const items = await this.interactionList();
+      const found = items.find((i) => i.id === interactionId);
+      if (!found) throw new Error("INTERACTION_NOT_FOUND");
+      return found;
     },
     async interactionRespond(interactionId, answer) {
-      const found = await (async () => {
-        try {
-          return await rest<Interaction>(`/v1/interactions/${interactionId}`);
-        } catch {
-          return send<Interaction>("interaction.get", { interactionId });
-        }
-      })();
-      return command(found.instanceId, {
-        operation: "respond_interaction",
-        interactionId,
-        answer,
-      });
+      const result = await rest<HubJson<"/v1/interactions/{id}/answer", "post">>(
+        `/v1/interactions/${interactionId}/answer`,
+        { method: "POST", body: JSON.stringify({ answer }) },
+      );
+      if (result && typeof result === "object" && "command" in result) {
+        const found = await this.interactionGet(interactionId).catch(() => null);
+        return mapCommandResult(result as HubJson<"/v1/instances/{id}/commands", "post">, found?.instanceId ?? ("" as Id));
+      }
+      return {
+        command: {
+          id: interactionId,
+          revision: "1",
+          createdAt: now(),
+          updatedAt: now(),
+          commandId: interactionId,
+          actor: { principalId: "" as Id, type: "human", deviceId: null, instanceId: null },
+          origin: "ui",
+          operation: "interaction.respond",
+          target: { hostId: "" as Id, instanceId: null, runId: null },
+          payloadDigest: digestPlaceholder(),
+          state: "accepted",
+          dispatch: "transport-written",
+          resolution: "clear",
+        },
+        relatedCommandIds: [],
+      };
     },
     async hostList() {
-      try {
-        const page = await rest<HubJson<"/v1/hosts", "get">>("/v1/hosts");
-        const items = page.items.map(mapHost);
-        for (const h of items) hosts.set(h.id, h);
-        return { items, nextCursor: page.nextCursor ?? null };
-      } catch {
-        const page = await send<Page<Host>>("host.list", {});
-        for (const h of page.items) hosts.set(h.id, h);
-        return page;
-      }
+      const page = await rest<HubJson<"/v1/hosts", "get">>("/v1/hosts");
+      const items = page.items.map(mapHost);
+      for (const h of items) hosts.set(h.id, h);
+      return { items, nextCursor: page.nextCursor ?? null };
     },
     async hostGet(hostId) {
-      try {
-        const host = mapHost(await rest<HubJson<"/v1/hosts/{id}", "get">>(`/v1/hosts/${hostId}`));
-        hosts.set(host.id, host);
-        return host;
-      } catch {
-        const host = await send<Host>("host.get", { hostId });
-        hosts.set(host.id, host);
-        return host;
-      }
+      const host = mapHost(await rest<HubJson<"/v1/hosts/{id}", "get">>(`/v1/hosts/${hostId}`));
+      hosts.set(host.id, host);
+      return host;
     },
     async workspaceList(hostId) {
-      try {
-        const page = await rest<Page<Workspace>>(hostId ? `/v1/workspaces?hostId=${hostId}` : "/v1/workspaces");
-        for (const w of page.items) workspaces.set(w.id, w);
-        return page;
-      } catch {
-        const page = await send<Page<Workspace>>("workspace.list", { hostId });
-        for (const w of page.items) workspaces.set(w.id, w);
-        return page;
-      }
+      const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;
+      const items: Workspace[] = listed.map((h) => ({
+        id: h.id,
+        revision: "1",
+        createdAt: h.createdAt,
+        updatedAt: h.updatedAt,
+        hostId: h.id,
+        label: h.label,
+        rootPath: "/",
+        writePolicy: "default",
+        canonicalRoot: unknownKnowledge("none"),
+      }));
+      for (const w of items) workspaces.set(w.id, w);
+      return { items, nextCursor: null };
     },
     eventsRead: async (args) => {
-      const instanceId = journals.get(args.journalId);
-      if (instanceId) {
-        try {
-          const qs = args.afterSeq ? `?afterSeq=${encodeURIComponent(args.afterSeq)}` : "";
-          const page = await rest<HubJson<"/v1/instances/{id}/journal", "get">>(
-            `/v1/instances/${instanceId}/journal${qs}`,
-          );
-          const events = page.events as unknown as Observation[];
-          return {
-            events: events.slice(0, args.limit),
-            durableSeq: page.durableSeq as U64,
-            floorSeq: "1" as U64,
-          };
-        } catch {
-          /* JSON-RPC fallback for node-local journals */
-        }
-      }
-      return send("events.read", args);
+      const instanceId = instanceIdOf(args.journalId);
+      const qs = args.afterSeq ? `?afterSeq=${encodeURIComponent(args.afterSeq)}` : "";
+      const page = await rest<HubJson<"/v1/instances/{id}/journal", "get">>(
+        `/v1/instances/${instanceId}/journal${qs}`,
+      );
+      const events = coerceObservationList(page.events, args.journalId, instanceId).slice(0, args.limit);
+      return {
+        events,
+        durableSeq: page.durableSeq as U64,
+        floorSeq: "1" as U64,
+      };
     },
     async eventsSubscribe(journalId, afterSeq, onBatch) {
-      await ensureSocket();
-      const result = await send<{
-        subscriptionId: Id;
-        journalId: Id;
-        snapshot: Snapshot;
-        floorSeq: U64;
-        durableSeq: U64;
-      }>("events.subscribe", {
-        journalId,
-        afterSeq,
-        snapshot: "required",
-        projectionVersion: "v1",
-        batchLimit: 128,
+      const instanceId = instanceIdOf(journalId);
+      follows.get(journalId)?.close();
+      const subscriptionId = id("sub_") as Id;
+      const ws = new WebSocket(followUrl(instanceId));
+      follows.set(journalId, ws);
+      followSubs.set(subscriptionId, journalId);
+      const asOfSeq = await new Promise<U64>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("FOLLOW_SNAPSHOT_TIMEOUT")), 10_000);
+        let settled = false;
+        const finish = (seq: U64) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(seq);
+        };
+        ws.addEventListener("error", () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error("FOLLOW_CONNECT_FAILED"));
+        });
+        ws.addEventListener("message", (ev) => {
+          if (typeof ev.data !== "string") return;
+          let msg: { type?: string; asOfSeq?: string; seq?: string; events?: unknown; event?: unknown };
+          try {
+            msg = JSON.parse(ev.data) as typeof msg;
+          } catch {
+            return;
+          }
+          if (msg.type === "snapshot") {
+            const events = coerceObservationList(msg.events, journalId, instanceId);
+            const from = afterSeq ? events.filter((e) => Number(e.seq) > Number(afterSeq)) : events;
+            if (from.length) {
+              onBatch({
+                subscriptionId,
+                journalId,
+                fromSeq: from[0].seq,
+                toSeq: from[from.length - 1].seq,
+                events: from,
+                durableSeq: (msg.asOfSeq ?? from[from.length - 1].seq) as U64,
+              });
+            }
+            finish((msg.asOfSeq ?? afterSeq ?? "0") as U64);
+            return;
+          }
+          if (msg.type === "event") {
+            const obs = coerceObservation(msg.event ?? msg, journalId, instanceId, msg.seq);
+            if (!obs) return;
+            onBatch({
+              subscriptionId,
+              journalId,
+              fromSeq: obs.seq,
+              toSeq: obs.seq,
+              events: [obs],
+              durableSeq: obs.seq,
+            });
+          }
+        });
       });
-      batchHandlers.set(result.subscriptionId, onBatch);
-      return result;
+      return {
+        subscriptionId,
+        journalId,
+        snapshot: {
+          projectionVersion: "v1",
+          projectionEpoch: id("epoch_"),
+          asOfSeq,
+          instance: {} as Instance,
+          runs: [],
+          commands: [],
+          pendingInteractions: [],
+          nodes: [],
+          history: { earliestRetainedSeq: "1", complete: true },
+        },
+        floorSeq: "1" as U64,
+        durableSeq: asOfSeq,
+      };
     },
-    async eventsAck(subscriptionId, journalId, throughSeq) {
-      return send("events.ack", { subscriptionId, journalId, throughSeq });
+    async eventsAck(_subscriptionId, _journalId, throughSeq) {
+      return { acknowledgedSeq: throughSeq };
     },
     async eventsUnsubscribe(subscriptionId) {
-      batchHandlers.delete(subscriptionId);
-      await send("events.unsubscribe", { subscriptionId });
+      const journalId = followSubs.get(subscriptionId);
+      followSubs.delete(subscriptionId);
+      if (!journalId) return;
+      follows.get(journalId)?.close();
+      follows.delete(journalId);
     },
     titleOf(instanceId) {
       return titles.get(instanceId) ?? "会话";
@@ -776,8 +779,8 @@ function createLiveApi(): HubApi {
       return workspaces.get(workspaceId)?.label ?? workspaceId.slice(0, 8);
     },
     disconnect() {
-      socket?.close();
-      socket = null;
+      for (const ws of follows.values()) ws.close();
+      follows.clear();
     },
   };
 }

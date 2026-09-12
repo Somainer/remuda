@@ -991,7 +991,7 @@ async fn stale_socket_does_not_offline_live_host() -> Result<()> {
 }
 
 #[tokio::test]
-async fn hello_reannounce_same_host_id_updates_one_row() -> Result<()> {
+async fn bootstrap_cannot_impersonate_existing_host_but_host_token_can_reconnect() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
     let (cookie, _) = login(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
@@ -1026,15 +1026,37 @@ async fn hello_reannounce_same_host_id_updates_one_row() -> Result<()> {
         .context("connect first")??;
     node.send(Message::Text(hello("1").into())).await?;
     let first = recv_json(&mut node).await?;
-    assert!(first["result"]["nodeToken"].as_str().is_some(), "{first}");
-    drop(node);
+    let node_token = first["result"]["nodeToken"]
+        .as_str()
+        .context("host token")?;
+
+    let mut attacker_req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    attacker_req
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {bootstrap}").parse()?);
+    let (mut attacker, _) = tokio_tungstenite::connect_async(attacker_req).await?;
+    attacker
+        .send(Message::Text(hello("attacker").into()))
+        .await?;
+    let rejected = recv_json(&mut attacker).await?;
+    assert!(rejected.get("error").is_some(), "{rejected}");
+    assert!(rejected.get("result").is_none(), "{rejected}");
+    // The failed collision cannot steal or disconnect the victim's route.
+    node.send(Message::Text(
+        json!({"jsonrpc":"2.0", "id":"heartbeat", "method":"runtime.heartbeat", "params":{}})
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    assert!(recv_json(&mut node).await?.get("result").is_some());
+    drop(attacker);
 
     let mut req = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("second node")?;
     req.headers_mut().insert(
         "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
+        format!("Bearer {node_token}").parse().unwrap(),
     );
     let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
         .await

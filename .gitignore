@@ -1,4 +1,6 @@
 /target/
+/target-gate/
+/data/tmp/
 node_modules/
 /web/dist/
 .env

@@ -7,7 +7,7 @@ description: "Control Remuda instances, worktrees, and fleets from a Claude Code
 
 Remuda hosts native coding agents (claude, codex, grok, agy, …) on Hub-connected Nodes. This skill is the coordinator surface: create an isolated git worktree, start an instance, send a task brief, wait, read `DONE <sha>`, then stop.
 
-Prefer the `remuda` CLI when this session can run shell. Prefer MCP tools (`remuda_instance_*`, `remuda_worktree_create`, `remuda_fleet_send`) when the session is attached with `--mcp-config docs/design/remuda-mcp.json`.
+Prefer the `remuda` CLI when this session can run shell. Prefer MCP tools (`remuda_instance_*`, `remuda_worktree_create`, `remuda_fleet_send`, `remuda_merge`) when the session is attached with `--mcp-config docs/design/remuda-mcp.json`.
 
 The installed binary is the authority for flags. Start with:
 
@@ -15,6 +15,7 @@ The installed binary is the authority for flags. Start with:
 remuda instance
 remuda worktree
 remuda fleet
+remuda merge --help
 ```
 
 Do not run bare `remuda` for discovery; it expects a subcommand.
@@ -81,11 +82,34 @@ remuda instance rm reviewer
 
 `--all` and `--labels` are mutually exclusive. Do not `rm` instances you did not create unless the user asked.
 
+## Verify and merge a completed branch
+
+After reading the worker's `DONE <sha>` and reviewing its branch, use the coordinator command:
+
+```bash
+remuda merge wt/reviewer/work --dry-run --json
+remuda merge wt/reviewer/work --gate --json
+# Add --no-push to advance only local main, or --web to force web checks.
+```
+
+The command fetches origin, rejects a source worktree with staged changes or an active merge/rebase (including detached rebase HEAD), and pins local main plus the committed source SHA. It creates a detached worktree under `<repo>/data/tmp`, merges with `--no-ff`, and runs the shared `scripts/ci/gate.sh`: secret scan, format check, workspace check, clippy, then workspace tests. Tests retry once on failure and report `retried`; other failures stop immediately. When the merge changes `web/` or `--web` is present, it runs frozen pnpm install, build, and test inside `web/`.
+
+Gate builds use `CARGO_INCREMENTAL=0` and their own `CARGO_TARGET_DIR` (default `<repo>/target-gate`; override with `--target-dir`, relative to `--repo` or absolute). Worker Cargo target settings are not inherited. Use separate target directories for simultaneous coordinators. Leave the test-only `REMUDA_MERGE_GATE_COMMAND` unset for real verification; `gateOverride: true` reports a substituted gate executable.
+
+Only a successful gate permits `git update-ref refs/heads/main <merged> <expected>`. The command then pushes exactly the verified commit to origin main without force, unless `--no-push`. It removes its temporary worktree on every returned outcome and reports cleanup errors. It never resets existing checkouts; inspect local modifications before refreshing a checkout of main after CAS.
+
+`--dry-run` checks local refs and source worktree safety and prints planned steps without fetching, merging, running gate commands, updating refs, or pushing. It is a plan, not gate/conflict acceptance. `--json` returns one stdout object with each step's status, duration in milliseconds, attempts and retry flag; progress goes to stderr.
+
+Exit codes: `0` success / dry-run, `1` gate or operational failure, `2` merge conflicts (see `conflicts`), `3` main CAS lost. Read `mainUpdated`, `pushed`, `expectedMain`, and `merged` before retrying: a failed push can leave local main advanced. A CAS loss does not push; re-inspect the newer main before another attempt. Fetch does not silently fast-forward local main.
+
+MCP: `remuda_merge` accepts `branch`, `gate: true` or `dryRun: true`, plus optional `repo`, `targetDir`, `web`, and `noPush`. It executes locally to the MCP server and returns the same JSON in text and `structuredContent`; nonzero `exitCode` sets `isError: true`.
+
 ## MCP equivalents
 
 | CLI | MCP tool |
 | --- | --- |
 | `worktree create` | `remuda_worktree_create` |
+| `merge <branch> --gate` / `--dry-run` | `remuda_merge` (`branch`, `gate` / `dryRun`, `web`, `noPush`, `repo`, `targetDir`) |
 | `instance create` | `remuda_instance_create` |
 | `instance list` | `remuda_instance_list` |
 | `instance send` / `--file` | `remuda_instance_send` (`text` or `file`) |

@@ -10,18 +10,17 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-gate
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: rustup show active-toolchain
       - name: Prebuild remuda-testing bins
         run: cargo build -p remuda-testing --bins --locked
-      - name: Test
-        run: cargo test --workspace --locked
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Shared Rust merge gate
+        run: ./scripts/ci/gate.sh
 
   m0-stub:
     runs-on: ubuntu-latest
@@ -87,18 +86,14 @@ jobs:
           node-version: "24"
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
-      - name: Install
-        run: pnpm --dir web install --frozen-lockfile
+      - name: Shared web merge gate
+        run: ./scripts/ci/gate.sh --web-only
       - name: Generated OpenAPI client is current
         run: |
           pnpm --dir web run gen:api
           git diff --exit-code -- web/src/lib/api.generated.ts
       - name: Lint
         run: pnpm --dir web lint
-      - name: Test
-        run: pnpm --dir web test
-      - name: Build
-        run: pnpm --dir web build
 
   web-hub-e2e:
     runs-on: ubuntu-latest

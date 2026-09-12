@@ -55,6 +55,12 @@ point at a built `web/dist` without rebuilding.
 | GET WS | `/v1/follow?instanceId=` | device | Snapshot (`asOfSeq`) then live `{type:event,seq}` |
 | GET WS | `/v1/node` | host/bootstrap bearer | Node control plane |
 | GET WS | `/node/v1/connect` | host/bootstrap bearer | Alias from `plan-phase0.md` §1.5 |
+| GET | `/v1/hosts/:id` | device | Single host including last inventory |
+| PATCH | `/v1/hosts/:id` | device | `labels`, `maxInstances`, `name` |
+| POST | `/v1/placement/resolve` | device | Dry-run host selection |
+| POST | `/v1/fleet/instances` | device | One Instance per selected host |
+| GET | `/v1/fleet/:id` | device | Aggregated fleet status |
+| POST | `/v1/fleet/:id/commands` | device | Broadcast send/cancel (per-instance commandId) |
 
 ## Hub ↔ Node JSON-RPC (over `/v1/node`)
 
@@ -81,10 +87,11 @@ leave `state=queued`, `forwarded=true`, `resolution=unknown`.
 
 `NodeTransport` is the Hub-side session trait. `WssTransport` serves
 `WS /v1/node` today. `StdioTransport` is the plug for
-`ssh <host> remuda node --stdio` (no Hub listen port). Placement and fleet
-HTTP are **not** in this crate yet: merge `registry::routes()`,
-`placement::routes()`, and `fleet::routes()` next to `http::routes()` /
-`ws::routes()` in `router()`.
+`ssh <host> remuda node --stdio` (no Hub listen port). `registry::routes()`,
+`placement::routes()`, and `fleet::routes()` merge next to `http::routes()` /
+`ws::routes()` in `router()`. `POST /v1/instances` accepts `placement`
+(`host` / `labels` / `any`) and returns `PLACEMENT_UNSATISFIABLE` with
+`reasons` when no host fits.
 
 ## SQLite (`data-dir/hub.sqlite`)
 

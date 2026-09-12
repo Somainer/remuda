@@ -779,6 +779,111 @@ impl Store {
         })
         .await
     }
+
+    /// Operator PATCH of labels / maxInstances / display name (does not mark online).
+    pub async fn patch_host(
+        &self,
+        host_id: String,
+        name: Option<String>,
+        labels: Option<Value>,
+        max_instances: Option<i64>,
+    ) -> Result<HostRecord, StoreError> {
+        self.run(move |conn| {
+            if load_host(conn, &host_id)?.is_none() {
+                return Err(StoreError::Id("unknown host".into()));
+            }
+            if let Some(name) = name {
+                conn.execute(
+                    "UPDATE hosts SET label = ?1 WHERE id = ?2",
+                    params![name, host_id],
+                )?;
+            }
+            if let Some(labels) = labels {
+                conn.execute(
+                    "UPDATE hosts SET labels_json = ?1 WHERE id = ?2",
+                    params![labels.to_string(), host_id],
+                )?;
+            }
+            if let Some(max_instances) = max_instances {
+                conn.execute(
+                    "UPDATE hosts SET max_instances = ?1 WHERE id = ?2",
+                    params![max_instances, host_id],
+                )?;
+            }
+            load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
+        })
+        .await
+    }
+
+    /// Instances that still occupy a concurrency slot.
+    pub async fn running_count(&self, host_id: String) -> Result<i64, StoreError> {
+        self.run(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM instances
+                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
+                params![host_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Persist a fleet and its members.
+    pub async fn insert_fleet(
+        &self,
+        spec: Value,
+        members: Vec<(String, String)>,
+    ) -> Result<String, StoreError> {
+        self.run(move |conn| {
+            let fleet_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
+            let now = now_rfc3339();
+            conn.execute(
+                "INSERT INTO fleets (id, spec_json, created_at) VALUES (?1, ?2, ?3)",
+                params![fleet_id, spec.to_string(), now],
+            )?;
+            for (instance_id, host_id) in members {
+                conn.execute(
+                    "INSERT INTO fleet_members (fleet_id, instance_id, host_id) VALUES (?1, ?2, ?3)",
+                    params![fleet_id, instance_id, host_id],
+                )?;
+            }
+            Ok(fleet_id)
+        })
+        .await
+    }
+
+    /// Fleet spec + member instance ids.
+    pub async fn get_fleet(
+        &self,
+        fleet_id: String,
+    ) -> Result<Option<(Value, Vec<(String, String)>)>, StoreError> {
+        self.run(move |conn| {
+            let spec: Option<String> = conn
+                .query_row(
+                    "SELECT spec_json FROM fleets WHERE id = ?1",
+                    params![fleet_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(spec) = spec else {
+                return Ok(None);
+            };
+            let mut stmt = conn.prepare(
+                "SELECT instance_id, host_id FROM fleet_members WHERE fleet_id = ?1 ORDER BY instance_id",
+            )?;
+            let members = stmt
+                .query_map(params![fleet_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some((
+                serde_json::from_str(&spec).unwrap_or(Value::Null),
+                members,
+            )))
+        })
+        .await
+    }
 }
 
 fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
@@ -853,6 +958,17 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             payload_json TEXT NOT NULL,
             observed_at TEXT NOT NULL,
             PRIMARY KEY (instance_id, seq)
+        );
+        CREATE TABLE IF NOT EXISTS fleets (
+            id TEXT PRIMARY KEY,
+            spec_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS fleet_members (
+            fleet_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            PRIMARY KEY (fleet_id, instance_id)
         );
         ",
     )?;

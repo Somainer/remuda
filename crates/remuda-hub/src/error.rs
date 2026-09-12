@@ -24,6 +24,12 @@ pub enum HubError {
     /// Idempotency key reused with a different payload.
     #[error("{0}")]
     Conflict(String),
+    /// No host satisfied placement constraints (D-013).
+    #[error("placement unsatisfiable")]
+    Unsatisfiable {
+        /// Human-readable rejection reasons, one per considered host or rule.
+        reasons: Vec<String>,
+    },
     /// SQLite or actor mailbox.
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
@@ -40,6 +46,7 @@ impl HubError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Unsatisfiable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -51,6 +58,7 @@ impl HubError {
             Self::NotFound => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Conflict(_) => "COMMAND_ID_CONFLICT",
+            Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
         }
     }
@@ -59,10 +67,15 @@ impl HubError {
 impl IntoResponse for HubError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let body = json!({
+        let mut body = json!({
             "error": self.to_string(),
             "code": self.code(),
         });
+        if let Self::Unsatisfiable { reasons } = &self
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("reasons".into(), json!(reasons));
+        }
         (status, Json(body)).into_response()
     }
 }

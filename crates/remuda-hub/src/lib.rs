@@ -12,8 +12,11 @@
 mod auth;
 mod config;
 mod error;
+mod fleet;
 mod http;
 mod inventory;
+mod placement;
+mod registry;
 mod store;
 mod transport;
 mod web;
@@ -112,6 +115,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(http::routes())
         .merge(ws::routes())
+        .merge(registry::routes())
+        .merge(placement::routes())
+        .merge(fleet::routes())
         .fallback(static_fallback)
         .with_state(state)
 }

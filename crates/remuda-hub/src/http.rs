@@ -35,7 +35,7 @@ pub struct InstanceListQuery {
 #[derive(Deserialize)]
 pub struct CreateInstanceBody {
     #[serde(rename = "hostId")]
-    host_id: String,
+    host_id: Option<String>,
     #[serde(rename = "workspaceId")]
     workspace_id: Option<String>,
     #[serde(default = "default_kind")]
@@ -44,6 +44,10 @@ pub struct CreateInstanceBody {
     driver: String,
     title: Option<String>,
     prompt: Option<String>,
+    #[serde(default)]
+    placement: Option<Value>,
+    #[serde(default)]
+    delegation: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -142,48 +146,47 @@ pub async fn create_instance(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     require_device(&state.store, &headers).await?;
-    let host = state
-        .store
-        .get_host(body.host_id.clone())
-        .await?
-        .ok_or(HubError::NotFound)?;
-    let spec = json!({
+    let mut spec = json!({
         "kind": body.kind,
         "driver": body.driver,
         "workspaceId": body.workspace_id,
         "prompt": body.prompt,
         "title": body.title,
     });
-    let instance = state
-        .store
-        .insert_instance(
-            body.host_id.clone(),
-            body.workspace_id.clone(),
-            body.kind.clone(),
-            body.driver.clone(),
-            body.title.clone(),
-            spec.clone(),
-        )
-        .await
-        .map_err(map_store)?;
-    let payload = json!({
-        "instanceId": instance.instance_id,
-        "spec": spec,
-        "initialInput": body.prompt.as_ref().map(|prompt| json!({ "type": "prompt", "text": prompt })),
-    });
-    let (command, _created) = state
-        .store
-        .queue_command(
-            None,
-            Some(instance.instance_id.clone()),
-            body.host_id.clone(),
-            "instance.create".into(),
-            payload.clone(),
-            None,
-        )
-        .await?;
-    let command = forward_if_online(&state, command, host.online).await?;
-    Ok(Json(json!({ "instance": instance, "command": command })))
+    if let Some(delegation) = &body.delegation
+        && let Some(obj) = spec.as_object_mut()
+    {
+        obj.insert("delegation".into(), json!(delegation));
+    }
+    let placement =
+        crate::placement::Placement::from_value(body.placement.as_ref(), body.host_id.as_deref())?;
+    let place_spec = crate::placement::PlaceSpec::from_json(&spec);
+    let host = crate::placement::pick_hosts(&state, &placement, &place_spec)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(HubError::Unsatisfiable {
+            reasons: vec!["placement returned no host".into()],
+        })?;
+    if let Some(obj) = spec.as_object_mut() {
+        obj.insert("hostId".into(), json!(host.host_id));
+    }
+    let (instance, command) = crate::placement::spawn_on_host(
+        &state,
+        &host,
+        crate::placement::SpawnRequest {
+            kind: body.kind,
+            driver: body.driver,
+            workspace_id: body.workspace_id,
+            title: body.title,
+            prompt: body.prompt,
+            spec,
+        },
+    )
+    .await?;
+    Ok(Json(
+        json!({ "instance": instance, "command": command, "hostId": host.host_id }),
+    ))
 }
 
 /// `POST /v1/instances/:id/commands`
@@ -262,7 +265,7 @@ pub async fn get_journal(
     })))
 }
 
-async fn forward_if_online(
+pub(crate) async fn forward_if_online(
     state: &AppState,
     command: CommandRecord,
     host_online: bool,
@@ -315,7 +318,7 @@ async fn forward_if_online(
     }
 }
 
-fn map_store(err: crate::store::StoreError) -> HubError {
+pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
     match &err {
         crate::store::StoreError::Id(msg) if msg.contains("unknown host") => HubError::NotFound,
         crate::store::StoreError::Id(msg)

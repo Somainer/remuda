@@ -326,9 +326,6 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
         .as_str()
         .context("nodeToken")?
         .to_string();
-    node.close(None).await.ok();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     let create = json!({
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
@@ -346,10 +343,28 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
     .await?;
     assert_eq!(status, 200, "{body}");
     let body: Value = serde_json::from_str(body.trim())?;
+    let instance_id = body["instance"]["instanceId"].as_str().unwrap().to_string();
+    node.close(None).await.ok();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let send = json!({
+        "operation": "instance.send",
+        "payload": { "text": "queued-offline" }
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/instances/{instance_id}/commands"),
+        &[("Cookie", &cookie)],
+        Some(&send),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let body: Value = serde_json::from_str(body.trim())?;
     assert_eq!(body["command"]["state"], json!("queued"));
     assert_eq!(body["command"]["forwarded"], json!(false));
     let command_id = body["command"]["commandId"].as_str().unwrap().to_string();
-    let instance_id = body["instance"]["instanceId"].as_str().unwrap().to_string();
 
     // Reconnect: Hub must not auto-resend the queued command.
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
@@ -376,7 +391,7 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
     // Same commandId + payload is idempotent (reconnect must not create a second native send).
     let replay = json!({
         "commandId": command_id,
-        "operation": "instance.create",
+        "operation": "instance.send",
         "payload": body["command"]["payload"]
     })
     .to_string();

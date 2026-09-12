@@ -87,6 +87,8 @@ pub struct ClaudePtyOptions {
     pub broker: Arc<dyn SecretBroker>,
     /// Extra env forwarded onto the Herdr workspace/pane (no secrets logged).
     pub extra_env: BTreeMap<String, String>,
+    /// Hub-issued instance context; separate from ordinary environment overlays.
+    pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// Override `--setting-sources`.
     pub setting_sources: Option<Vec<String>>,
     /// `agent.start` timeout in milliseconds.
@@ -117,6 +119,7 @@ impl ClaudePtyOptions {
             herdr_binary: None,
             broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: BTreeMap::new(),
+            agent_mcp: None,
             setting_sources: None,
             agent_start_timeout_ms: 120_000,
             inherit_default_config: false,
@@ -258,6 +261,9 @@ impl ClaudePtyDriver {
                 continue;
             }
             env.insert(key.clone(), value.clone());
+        }
+        if let Some(context) = &self.options.agent_mcp {
+            env.extend(context.environment()?);
         }
 
         let created = self

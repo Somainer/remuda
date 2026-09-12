@@ -176,6 +176,8 @@ pub struct GenericPtyOptions {
     pub broker: Arc<dyn SecretBroker>,
     /// Extra env (no secrets logged).
     pub extra_env: BTreeMap<String, String>,
+    /// Hub-issued instance context; separate from ordinary environment overlays.
+    pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// `agent.start` timeout in milliseconds.
     pub agent_start_timeout_ms: u64,
     /// How long to wait after `agent.start` for idle/working/blocked.
@@ -203,6 +205,7 @@ impl GenericPtyOptions {
             herdr_binary: None,
             broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: BTreeMap::new(),
+            agent_mcp: None,
             agent_start_timeout_ms: 120_000,
             liveness_timeout_ms: 60_000,
             line_matcher: Some("^DONE".into()),
@@ -400,6 +403,9 @@ impl GenericPtyDriver {
                 continue;
             }
             env.insert(key.clone(), value.clone());
+        }
+        if let Some(context) = &self.options.agent_mcp {
+            env.extend(context.environment()?);
         }
         let created = self
             .resources

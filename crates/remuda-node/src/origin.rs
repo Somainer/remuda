@@ -44,6 +44,20 @@ pub(crate) fn input_origin(origin: CommandOrigin) -> InputOrigin {
     }
 }
 
+pub(crate) fn instance_mcp(
+    launch: &crate::DriverLaunch,
+) -> remuda_driver::agent_mcp::AgentMcpContext {
+    let credential = launch.request.agent_credential.as_ref();
+    remuda_driver::agent_mcp::AgentMcpContext::new(
+        launch.instance.meta.id.clone(),
+        launch.instance.host_id.clone(),
+        credential
+            .map(|value| value.token.clone())
+            .unwrap_or_default(),
+        credential.and_then(|value| value.hub.clone()),
+    )
+}
+
 pub(crate) fn instance_env(
     launch: &crate::DriverLaunch,
     extra_env: &BTreeMap<String, String>,

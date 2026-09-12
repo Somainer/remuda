@@ -60,6 +60,8 @@ pub struct ClaudeBgOptions {
     pub broker: Arc<dyn SecretBroker>,
     /// Extra env for the `--bg` process (no secrets logged).
     pub extra_env: BTreeMap<String, String>,
+    /// Hub-issued instance context; separate from ordinary environment overlays.
+    pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// Override `--setting-sources`.
     pub setting_sources: Option<Vec<String>>,
     /// Let Claude resolve its default config directory instead of exporting
@@ -88,6 +90,7 @@ impl ClaudeBgOptions {
             herdr_binary: None,
             broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: BTreeMap::new(),
+            agent_mcp: None,
             setting_sources: None,
             inherit_default_config: false,
             settings_overlay_path: None,
@@ -321,6 +324,9 @@ impl ClaudeBgDriver {
             &self.options.extra_env,
             self.options.inherit_default_config,
         );
+        if let Some(context) = &self.options.agent_mcp {
+            command.envs(context.environment()?);
+        }
         let output = command.output().await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

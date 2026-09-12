@@ -231,6 +231,7 @@ impl DriverFactory for NativeClaudeFactory {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
                 options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin;
                 options.handshake_timeout = self.config.print_handshake_timeout;
                 options.inherit_default_config = inherit_default_config;
@@ -240,6 +241,7 @@ impl DriverFactory for NativeClaudeFactory {
             DriverKind::ClaudePty => {
                 let mut options = ClaudePtyOptions::new(profile, launch_dir, native_home, binary);
                 options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
@@ -251,6 +253,7 @@ impl DriverFactory for NativeClaudeFactory {
             DriverKind::ClaudeBg => {
                 let mut options = ClaudeBgOptions::new(profile, launch_dir, native_home, binary);
                 options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
@@ -262,6 +265,7 @@ impl DriverFactory for NativeClaudeFactory {
             DriverKind::GenericPty => {
                 let mut options = GenericPtyOptions::new(profile, launch_dir, native_home, binary);
                 options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();

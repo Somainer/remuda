@@ -815,7 +815,7 @@ mod tests {
             "3",
         ])
         .expect("Node command overrides");
-        let crate::Command::Node(args) = cli.command else {
+        let crate::cmd::Command::Node(args) = cli.command else {
             panic!("Node command")
         };
         args.apply(&mut config).expect("validate the final values");
@@ -875,7 +875,7 @@ token = 'file:./secrets/token'
             "https://hub.example",
         ])
         .expect("dispatcher flags");
-        let crate::Command::Dispatcher(args) = cli.command else {
+        let crate::cmd::Command::Dispatcher(args) = cli.command else {
             panic!("dispatcher")
         };
         args.apply(&mut config)

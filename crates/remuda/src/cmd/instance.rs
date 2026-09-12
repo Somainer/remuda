@@ -18,6 +18,21 @@ const MAX_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_LINES: usize = 120;
 
 /// `remuda instance` subcommands.
+#[derive(clap::Args)]
+#[command(about = "Create, list, send, wait, read, keys, stop, or rm a Hub-backed instance.")]
+pub(crate) struct Args {
+    #[command(flatten)]
+    hub: HubOpts,
+    #[command(subcommand)]
+    pub(crate) command: InstanceCommand,
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self.hub, self.command).map(|()| 0)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum InstanceCommand {
     /// Create an instance on a host (`--host`) or matching `--labels`.
@@ -60,11 +75,8 @@ pub(crate) enum InstanceCommand {
         command_id: Option<String>,
     },
     /// List instances (`name`, `kind`, `status`, `cwd`, `host`).
-    List {
-        /// Restrict to one host id.
-        #[arg(long)]
-        host: Option<String>,
-    },
+    #[command(visible_alias = "ls")]
+    List(super::agents::ListArgs),
     /// Send a prompt / steer to a running instance.
     Send {
         /// Instance id (`ins_…`) or `--name`.
@@ -210,9 +222,8 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 .await?;
                 print_json(&value)
             }
-            InstanceCommand::List { host } => {
-                let value = list_instances(&client, host.as_deref()).await?;
-                print_json(&value)
+            InstanceCommand::List(args) => {
+                super::agents::list(std::sync::Arc::new(client), args).await
             }
             InstanceCommand::Send {
                 instance_id,
@@ -683,6 +694,9 @@ pub(crate) fn project_instance(item: &Value, hosts: &[Value]) -> Value {
         "hostId": host_id,
         "lifecycle": item.get("lifecycle").cloned().unwrap_or(json!("")),
         "activity": item.get("activity").cloned().unwrap_or(json!("")),
+        "connectivity": item.get("connectivity").cloned().unwrap_or(json!("unknown")),
+        "hostOnline": host.and_then(|h| h.get("online")).cloned().unwrap_or(Value::Null),
+        "worktree": item.get("worktree").filter(|v| !v.is_null()).cloned().unwrap_or(json!(cwd)),
         "driver": item.get("driver").cloned().unwrap_or(json!("")),
         "title": item.get("title").cloned().unwrap_or(json!(name)),
         "workspaceId": item.get("workspaceId").cloned().unwrap_or(json!(cwd)),

@@ -49,6 +49,7 @@ pub(crate) struct DevNodeInner {
     workspace: Workspace,
     projection_epoch: Id,
     tty: TtyRegistry,
+    diagnostics: std::sync::RwLock<crate::DoctorContext>,
 }
 
 /// In-process Node used by the development REST/JSON-RPC/WS surface.
@@ -114,6 +115,7 @@ impl DevNode {
                 workspace,
                 projection_epoch: Id::new("epoch")?,
                 tty: TtyRegistry::new(),
+                diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
             }),
         })
     }
@@ -132,6 +134,32 @@ impl DevNode {
     #[must_use]
     pub fn tty(&self) -> &TtyRegistry {
         &self.inner.tty
+    }
+
+    /// Set diagnostics inputs from trusted process composition, never RPC params.
+    pub fn configure_doctor(&self, context: crate::DoctorContext) -> Result<(), NodeError> {
+        *self
+            .inner
+            .diagnostics
+            .write()
+            .map_err(|_| NodeError::InvalidConfig("diagnostics lock poisoned".into()))? = context;
+        Ok(())
+    }
+
+    /// Fresh local preflight for an authenticated Hub request.
+    pub async fn doctor(&self) -> Result<Value, NodeError> {
+        let context = self
+            .inner
+            .diagnostics
+            .read()
+            .map_err(|_| NodeError::InvalidConfig("diagnostics lock poisoned".into()))?
+            .clone();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::doctor_snapshot(&context, crate::ProbeEnv::from_process())
+        })
+        .await
+        .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+        serde_json::to_value(report).map_err(NodeError::from)
     }
 
     /// Persisted launch recipe for an Instance, if the driver wrote one.

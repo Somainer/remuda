@@ -4,14 +4,51 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// `remuda worktree` subcommands.
+#[derive(clap::Args)]
+#[command(about = "Manage repository worktrees.")]
+pub(crate) struct Args {
+    #[command(subcommand)]
+    pub(crate) command: WorktreeCommand,
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self.command).map(|()| 0)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorktreeCommand {
+    /// List all registered Git worktrees, including those created outside Remuda.
+    #[command(visible_alias = "list")]
+    Ls {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a named or explicitly addressed linked worktree; keep its branch.
+    Rm {
+        name: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Permit removal of dirty files; active merge/rebase and main stay protected.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Prune missing, unlocked Git registrations and stale Remuda catalog entries.
+    Prune {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Create a git worktree (`git worktree add -b wt/<name>/…`).
     Create {
         /// Worktree / agent name (`[a-z][a-z0-9_-]{0,31}`).
@@ -53,6 +90,45 @@ struct Catalog {
 /// Run a `remuda worktree` subcommand.
 pub(crate) fn run(command: WorktreeCommand) -> Result<()> {
     match command {
+        WorktreeCommand::Ls { repo, json } => {
+            let items = list(repo.as_deref())?;
+            if json {
+                return super::hub_client::print_json(&json!({"items":items}));
+            }
+            let rows: Vec<_> = items
+                .iter()
+                .map(|item| {
+                    vec![
+                        item.name.clone().unwrap_or_default(),
+                        item.branch.clone().unwrap_or_else(|| "(detached)".into()),
+                        item.path.to_string_lossy().into_owned(),
+                        if item.locked {
+                            "locked"
+                        } else if !item.exists {
+                            "missing"
+                        } else {
+                            "present"
+                        }
+                        .into(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                super::table::render(
+                    &["NAME", "BRANCH", "PATH", "STATE"],
+                    &[18, 32, 72, 10],
+                    &rows
+                )
+            );
+            Ok(())
+        }
+        WorktreeCommand::Rm { name, repo, force } => {
+            super::hub_client::print_json(&remove(&name, repo.as_deref(), force)?)
+        }
+        WorktreeCommand::Prune { repo, dry_run } => {
+            super::hub_client::print_json(&prune(repo.as_deref(), dry_run)?)
+        }
         WorktreeCommand::Create {
             name,
             base,
@@ -80,6 +156,7 @@ pub(crate) fn create(
     validate_name(name)?;
     let repo_root = repo_root(repo)?;
     let git_common = git_common_dir(&repo_root)?;
+    let _lock = catalog_lock(&git_common)?;
     let abs_path = resolve_path(&repo_root, name, path)?;
     let mut catalog = load_catalog(&git_common)?;
     if let Some(existing) = catalog
@@ -237,9 +314,7 @@ fn find_listed_worktree(repo: &Path, path: &Path) -> Result<Option<(String, Stri
     for line in out.lines().chain(std::iter::once("")) {
         if line.is_empty() {
             if !current_path.is_empty()
-                && (current_path == want
-                    || Path::new(&current_path).canonicalize().ok().as_deref()
-                        == path.canonicalize().ok().as_deref())
+                && (current_path == want || same_path(Path::new(&current_path), path))
             {
                 if current_branch.is_empty() {
                     current_branch = "HEAD".into();
@@ -276,7 +351,168 @@ fn save_catalog(git_common: &Path, catalog: &Catalog) -> Result<()> {
     fs::create_dir_all(git_common).ok();
     let path = catalog_path(git_common);
     let body = serde_json::to_string_pretty(catalog)?;
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))
+    let temporary = git_common.join(format!("remuda-worktrees-{}.tmp", std::process::id()));
+    fs::write(&temporary, body).with_context(|| format!("write {}", temporary.display()))?;
+    fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))
+}
+
+fn catalog_lock(common: &Path) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(common.join("remuda-worktrees.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ListedWorktree {
+    name: Option<String>,
+    path: PathBuf,
+    branch: Option<String>,
+    head: String,
+    locked: bool,
+    prunable: bool,
+    exists: bool,
+    primary: bool,
+}
+
+pub(crate) fn list(repo: Option<&Path>) -> Result<Vec<ListedWorktree>> {
+    let root = repo_root(repo)?;
+    let catalog = load_catalog(&git_common_dir(&root)?)?;
+    let output = Command::new("git")
+        .current_dir(&root)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()?;
+    ensure!(output.status.success(), "git worktree list failed");
+    let text = std::str::from_utf8(&output.stdout).context("non-UTF-8 worktree path")?;
+    let mut items = Vec::new();
+    let mut current = ListedWorktree::default();
+    for field in text.split('\0') {
+        if let Some(path) = field.strip_prefix("worktree ") {
+            current.path = path.into();
+        } else if let Some(branch) = field.strip_prefix("branch refs/heads/") {
+            current.branch = Some(branch.into());
+        } else if let Some(head) = field.strip_prefix("HEAD ") {
+            current.head = head.into();
+        } else if field == "locked" || field.starts_with("locked ") {
+            current.locked = true;
+        } else if field == "prunable" || field.starts_with("prunable ") {
+            current.prunable = true;
+        } else if field.is_empty() && !current.path.as_os_str().is_empty() {
+            current.exists = current.path.exists();
+            current.primary = items.is_empty();
+            current.name = catalog
+                .worktrees
+                .iter()
+                .find(|entry| same_path(Path::new(&entry.path), &current.path))
+                .map(|entry| entry.name.clone());
+            items.push(std::mem::take(&mut current));
+        }
+    }
+    Ok(items)
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || a.canonicalize()
+            .ok()
+            .zip(b.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+pub(crate) fn remove(name: &str, repo: Option<&Path>, force: bool) -> Result<serde_json::Value> {
+    let root = repo_root(repo)?;
+    let common = git_common_dir(&root)?;
+    let _lock = catalog_lock(&common)?;
+    let items = list(Some(&root))?;
+    let current = PathBuf::from(git(&root, &["rev-parse", "--show-toplevel"])?);
+    let requested = root.join(name);
+    let matches: Vec<_> = items
+        .iter()
+        .filter(|item| item.name.as_deref() == Some(name) || same_path(&requested, &item.path))
+        .collect();
+    ensure!(
+        matches.len() == 1,
+        "worktree name/path must identify exactly one registered worktree"
+    );
+    let item = matches[0];
+    ensure!(
+        !item.primary && item.branch.as_deref() != Some("main") && !same_path(&item.path, &current),
+        "refusing to remove the primary, current, or main worktree"
+    );
+    ensure!(
+        !item.locked,
+        "worktree is locked; unlock it explicitly first"
+    );
+    if item.exists {
+        let dir = PathBuf::from(git(&item.path, &["rev-parse", "--absolute-git-dir"])?);
+        ensure!(
+            !["MERGE_HEAD", "rebase-merge", "rebase-apply"]
+                .iter()
+                .any(|state| dir.join(state).exists()),
+            "worktree has a merge/rebase in progress"
+        );
+    }
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push("--");
+    let path = item.path.to_string_lossy();
+    args.push(&path);
+    git(&root, &args)?;
+    let mut catalog = load_catalog(&common)?;
+    catalog
+        .worktrees
+        .retain(|entry| !same_path(Path::new(&entry.path), &item.path));
+    save_catalog(&common, &catalog)?;
+    Ok(json!({"removed":true,"path":item.path,"branch":item.branch,"branchDeleted":false}))
+}
+
+pub(crate) fn prune(repo: Option<&Path>, dry_run: bool) -> Result<serde_json::Value> {
+    let root = repo_root(repo)?;
+    let common = git_common_dir(&root)?;
+    let _lock = catalog_lock(&common)?;
+    let before = list(Some(&root))?;
+    let mut args = vec!["worktree", "prune", "--expire", "now", "--verbose"];
+    if dry_run {
+        args.push("--dry-run");
+    }
+    let detail = git(&root, &args)?;
+    let mut catalog = load_catalog(&common)?;
+    let remaining = if dry_run {
+        before
+            .iter()
+            .filter(|item| item.exists || item.locked)
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>()
+    } else {
+        list(Some(&root))?
+            .into_iter()
+            .map(|item| item.path)
+            .collect()
+    };
+    let removed: Vec<_> = catalog
+        .worktrees
+        .iter()
+        .filter(|entry| {
+            !remaining
+                .iter()
+                .any(|path| same_path(Path::new(&entry.path), path))
+        })
+        .map(|entry| entry.name.clone())
+        .collect();
+    if !dry_run {
+        catalog
+            .worktrees
+            .retain(|entry| !removed.contains(&entry.name));
+        save_catalog(&common, &catalog)?;
+    }
+    Ok(json!({"dryRun":dry_run,"catalogRemoved":removed,"git":detail}))
 }
 
 fn upsert(catalog: &mut Catalog, record: WorktreeRecord) {

@@ -8,6 +8,7 @@ use clap::Args as ClapArgs;
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(ClapArgs)]
+#[command(about = "Run the Hub, authentication store, and embedded Web application.")]
 pub(crate) struct Args {
     /// Hub HTTP/WebSocket listener; overrides file/environment configuration.
     #[arg(long)]
@@ -76,4 +77,10 @@ pub(crate) async fn run(
     // an awaited shutdown handle so the CLI can also verify completion of its drain.
     drop(running);
     result
+}
+
+impl super::registry::Entrypoint for Args {
+    fn enter(self, context: super::registry::Context) -> anyhow::Result<i32> {
+        super::registry::service(context, |config, shutdown| run(config, self, shutdown))
+    }
 }

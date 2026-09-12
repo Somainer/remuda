@@ -87,9 +87,14 @@ async fn enroll_fake_node(
             if let Some(id) = frame.get("id").cloned()
                 && frame.get("method").is_some()
             {
+                let result = if frame["method"] == "host.doctor" {
+                    json!({"exitCode":0,"inventory":{},"checks":[{"name":"fixture.remote","status":"ok","message":"Node diagnostics reached","details":null}]})
+                } else {
+                    json!({"ok":true})
+                };
                 let _ = node
                     .send(Message::Text(
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
+                        json!({ "jsonrpc": "2.0", "id": id, "result": result })
                             .to_string()
                             .into(),
                     ))
@@ -254,5 +259,66 @@ async fn mcp_tools_list_and_instance_create_against_in_process_hub() -> Result<(
     );
 
     node.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_routes_to_the_registered_host_and_mcp_marks_offline_hosts_as_errors() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let host_id = HostId::new();
+    let node = enroll_fake_node(hub.addr, &hub.bootstrap_token, host_id.as_id().as_str()).await?;
+    let hub_url = format!("http://{}", hub.addr);
+    let config = dir.path().join("remuda.toml");
+    std::fs::write(
+        &config,
+        "[hub]\nlisten = '127.0.0.1:0'\n[node]\nlisten = '127.0.0.1:0'\n",
+    )?;
+    let output = timeout(
+        RPC,
+        Command::new(bin())
+            .args([
+                "doctor",
+                "--host",
+                host_id.as_id().as_str(),
+                "--json",
+                "--hub",
+                &hub_url,
+            ])
+            .env("REMUDA_BOOTSTRAP_TOKEN", &hub.bootstrap_token)
+            .env_remove("REMUDA_TOKEN")
+            .env("REMUDA_DATA_DIR", dir.path().join("client"))
+            .env("REMUDA_CONFIG", &config)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| String::from_utf8_lossy(&output.stderr).to_string())?;
+    assert!(output.status.success(), "{report}");
+    assert_eq!(report["mode"], "remote");
+    assert_eq!(report["checks"][0]["name"], "fixture.remote");
+    assert_eq!(report["registeredHosts"][0]["online"], true);
+    let call = |id: &str| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remuda_doctor","arguments":{"host":id}}});
+    let replies = mcp_roundtrip(
+        &hub_url,
+        &hub.bootstrap_token,
+        &[
+            call(host_id.as_id().as_str()),
+            call(HostId::new().as_id().as_str()),
+        ],
+    )
+    .await?;
+    assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
+    assert_eq!(
+        replies[0]["result"]["structuredContent"]["checks"][0]["name"],
+        "fixture.remote"
+    );
+    assert_eq!(replies[1]["result"]["isError"], true);
+    assert_eq!(replies[1]["result"]["structuredContent"]["exitCode"], 1);
+    node.abort();
+    node.await.ok();
+    hub.shutdown().await;
     Ok(())
 }

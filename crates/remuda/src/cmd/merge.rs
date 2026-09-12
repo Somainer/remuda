@@ -14,13 +14,22 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Args, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[command(about = "Verify a branch in a temporary worktree, then advance and push main.")]
 pub(crate) struct MergeArgs {
     /// Local branch to merge into main (the committed snapshot is pinned).
-    pub branch: String,
+    #[arg(required_unless_present = "list")]
+    pub branch: Option<String>,
     /// Run the gate before advancing main.
-    #[arg(long, required_unless_present = "dry_run")]
+    #[arg(long, required_unless_present_any = ["dry_run", "list"])]
     #[serde(default)]
     pub gate: bool,
+    /// Show local wt/* branches ahead of main and their mergeability.
+    #[arg(long, visible_alias = "pending", conflicts_with_all = ["branch", "gate", "dry_run", "message", "web", "no_push"])]
+    #[serde(default)]
+    pub list: bool,
+    /// Override the merge title; the gate summary is still appended to the body.
+    #[arg(long)]
+    pub message: Option<String>,
     /// Inspect local refs and print the plan; do not fetch, merge, or run checks.
     #[arg(long)]
     #[serde(default)]
@@ -125,6 +134,48 @@ enum MergeStop {
 }
 
 pub(crate) fn run(args: MergeArgs) -> Result<i32> {
+    if args.list {
+        let value = pending(args.repo.as_deref())?;
+        if args.json {
+            super::hub_client::print_json(&value)?;
+        } else {
+            let rows = value["items"]
+                .as_array()
+                .context("queue items")?
+                .iter()
+                .map(|item| {
+                    vec![
+                        item["branch"].as_str().unwrap_or("").to_owned(),
+                        item["ahead"].to_string(),
+                        item["status"].as_str().unwrap_or("unknown").to_owned(),
+                        item["worktreeStatus"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                        item["conflicts"]
+                            .as_array()
+                            .map(|paths| {
+                                paths
+                                    .iter()
+                                    .filter_map(|p| p.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print!(
+                "{}",
+                super::table::render(
+                    &["BRANCH", "AHEAD", "MERGE", "WORKTREE", "CONFLICTS"],
+                    &[40, 6, 10, 14, 60],
+                    &rows
+                )
+            );
+        }
+        return Ok(0);
+    }
     let json = args.json;
     let report = execute(args);
     if json {
@@ -165,7 +216,7 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
     let mut report = MergeReport {
         exit_code: 1,
         status: "gate_failed".into(),
-        branch: args.branch.clone(),
+        branch: args.branch.clone().unwrap_or_default(),
         dry_run: args.dry_run,
         affected: args.affected && !args.full,
         expected_main: None,
@@ -229,7 +280,13 @@ fn execute_inner(
         ensure!(args.gate || args.dry_run, "--gate or --dry-run is required");
         let cwd = args.repo.clone().unwrap_or(std::env::current_dir()?);
         let repo = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
-        let reference = branch_ref(&args.branch)?;
+        let reference = branch_ref(args.branch.as_deref().context("branch is required")?)?;
+        ensure!(
+            args.message
+                .as_ref()
+                .is_none_or(|message| !message.trim().is_empty()),
+            "--message must not be empty"
+        );
         git(&repo, &["check-ref-format", &reference])?;
         Ok((repo, reference))
     })?;
@@ -245,11 +302,19 @@ fn execute_inner(
         record(report, "fetch", || git(&repo, &["fetch", "origin"]))?;
     }
     let (expected, source) = record(report, "preflight", || {
+        let expected = resolve(&repo, "refs/heads/main")?;
+        ensure!(
+            is_ancestor(&repo, &expected, &resolve(&repo, "HEAD")?)?,
+            "checkout is behind main; update the coordinator checkout before merging"
+        );
+        if let Ok(remote) = resolve(&repo, "refs/remotes/origin/main") {
+            ensure!(
+                is_ancestor(&repo, &remote, &expected)?,
+                "local main is behind or diverged from origin/main; refresh the coordinator checkout before merging"
+            );
+        }
         check_branch_worktrees(&repo, &reference)?;
-        Ok((
-            resolve(&repo, "refs/heads/main")?,
-            resolve(&repo, &reference)?,
-        ))
+        Ok((expected, resolve(&repo, &reference)?))
     })?;
     report.expected_main = Some(expected.clone());
     report.source = Some(source.clone());
@@ -278,6 +343,7 @@ fn execute_inner(
             report.web_e2e,
         )?);
         report.steps.push(Step::planned("verify-tree"));
+        report.steps.push(Step::planned("record-gate"));
         report.steps.push(Step::planned("update-main"));
         if !args.no_push {
             report.steps.push(Step::planned("push"));
@@ -302,7 +368,13 @@ fn execute_inner(
         )?;
         Ok(path)
     })?;
-    let merged = record(report, "merge", || {
+    let message = args.message.clone().unwrap_or_else(|| {
+        format!(
+            "merge: {} into main",
+            reference.trim_start_matches("refs/heads/")
+        )
+    });
+    let mut merged = record(report, "merge", || {
         let output = git_output(
             &worktree,
             &[
@@ -311,6 +383,8 @@ fn execute_inner(
                 "merge",
                 "--no-ff",
                 "--no-edit",
+                "-m",
+                &message,
                 &source,
             ],
         )?;
@@ -343,8 +417,30 @@ fn execute_inner(
             "gate changed the merge HEAD"
         );
         git(&worktree, &["diff", "--exit-code", "HEAD", "--"])?;
+        git(
+            &worktree,
+            &["diff", "--cached", "--exit-code", "HEAD", "--"],
+        )?;
         Ok(())
     })?;
+    if merged != expected {
+        let summary = gate_summary(report);
+        merged = record(report, "record-gate", || {
+            let tree = git(&worktree, &["rev-parse", "HEAD^{tree}"])?;
+            git(
+                &worktree,
+                &[
+                    "commit", "--amend", "--only", "-m", &message, "-m", &summary,
+                ],
+            )?;
+            ensure!(
+                git(&worktree, &["rev-parse", "HEAD^{tree}"])? == tree,
+                "recording gate summary changed the verified tree"
+            );
+            resolve(&worktree, "HEAD")
+        })?;
+        report.merged = Some(merged.clone());
+    }
     record(report, "update-main", || {
         let output = git_output(
             &repo,
@@ -382,6 +478,83 @@ fn branch_ref(branch: &str) -> Result<String> {
     Ok(format!("refs/heads/{name}"))
 }
 
+fn gate_summary(report: &MergeReport) -> String {
+    let mut summary = format!("Gate: passed (override={})\n", report.gate_override);
+    for step in report.steps.iter().filter(|step| !step.command.is_empty()) {
+        summary.push_str(&format!(
+            "\n{}: {} ({} ms), attempts={}, retried={}",
+            step.name, step.status, step.duration_ms, step.attempts, step.retried
+        ));
+    }
+    summary
+}
+
+fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = git_output(repo, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            successful(&output)?;
+            Ok(false)
+        }
+    }
+}
+
+/// Inspect the local coordinator queue without changing refs or worktrees.
+pub(crate) fn pending(repo: Option<&Path>) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let cwd = repo
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir()?);
+    let root = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
+    let main = resolve(&root, "refs/heads/main")?;
+    let refs = git(
+        &root,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/wt/"],
+    )?;
+    let mut items = Vec::new();
+    for reference in refs.lines() {
+        let source = resolve(&root, reference)?;
+        let ahead: u64 = git(
+            &root,
+            &["rev-list", "--count", &format!("{main}..{source}")],
+        )?
+        .parse()?;
+        if ahead == 0 {
+            continue;
+        }
+        let merge = git_output(
+            &root,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "-z",
+                &main,
+                &source,
+            ],
+        )?;
+        let (status, conflicts) = match merge.status.code() {
+            Some(0) => ("clean", Vec::new()),
+            Some(1) => (
+                "conflict",
+                nul_strings(&merge.stdout)?.into_iter().skip(1).collect(),
+            ),
+            _ => {
+                successful(&merge)?;
+                unreachable!("failed merge-tree")
+            }
+        };
+        let safety = check_branch_worktrees(&root, reference);
+        items.push(json!({"branch":reference.trim_start_matches("refs/heads/"),"source":source,"ahead":ahead,
+            "status":status,"conflicts":conflicts,"worktreeStatus":if safety.is_ok() { "clean" } else { "blocked" },
+            "reason":safety.err().map(|error| format!("{error:#}"))}));
+    }
+    Ok(json!({"exitCode":0,"main":main,"items":items}))
+}
+
 fn web_changed(paths: &[u8]) -> bool {
     paths
         .split(|byte| *byte == 0)
@@ -412,11 +585,17 @@ fn test_range(report: &MergeReport) -> Option<(&str, &str)> {
         .filter(|_| report.affected)
 }
 
-fn gate_command(repo: &Path, web: bool, range: Option<(&str, &str)>, web_e2e: bool) -> Command {
+// Execution always uses the merge-result worktree; dry-run uses the synchronized checkout.
+fn gate_command(
+    gate_worktree: &Path,
+    web: bool,
+    range: Option<(&str, &str)>,
+    web_e2e: bool,
+) -> Command {
     let mut command = Command::new("bash");
     command
-        .arg(repo.join("scripts/ci/gate.sh"))
-        .current_dir(repo)
+        .arg(gate_worktree.join("scripts/ci/gate.sh"))
+        .current_dir(gate_worktree)
         .stdin(Stdio::null());
     if web {
         command.arg("--web");
@@ -438,6 +617,10 @@ fn gate_plan(
     range: Option<(&str, &str)>,
     web_e2e: bool,
 ) -> Result<Vec<Step>> {
+    ensure!(
+        repo.join("scripts/ci/gate.sh").is_file(),
+        "scripts/ci/gate.sh is missing from the selected tree; the checkout may be behind main"
+    );
     let output = gate_command(repo, web, range, web_e2e)
         .arg("--list")
         .output()
@@ -448,20 +631,30 @@ fn gate_plan(
 
 fn run_gate(
     report: &mut MergeReport,
-    repo: &Path,
+    merged_worktree: &Path,
     target: &Path,
     report_file: &Path,
 ) -> Result<()> {
-    let planned = gate_plan(repo, report.web, test_range(report), report.web_e2e)?;
-    let status = gate_command(repo, report.web, test_range(report), report.web_e2e)
-        .arg("--report")
-        .arg(report_file)
-        .env("CARGO_TARGET_DIR", target)
-        .env("CARGO_INCREMENTAL", "0")
-        .stdout(Stdio::from(std::io::stderr()))
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run gate")?;
+    let planned = gate_plan(
+        merged_worktree,
+        report.web,
+        test_range(report),
+        report.web_e2e,
+    )?;
+    let status = gate_command(
+        merged_worktree,
+        report.web,
+        test_range(report),
+        report.web_e2e,
+    )
+    .arg("--report")
+    .arg(report_file)
+    .env("CARGO_TARGET_DIR", target)
+    .env("CARGO_INCREMENTAL", "0")
+    .stdout(Stdio::from(std::io::stderr()))
+    .stderr(Stdio::inherit())
+    .status()
+    .context("run gate")?;
     let results = fs::read_to_string(report_file).context("read gate report")?;
     let steps: Vec<Step> = results
         .lines()
@@ -661,6 +854,12 @@ impl Drop for TemporaryWorktree {
         if let Err(error) = self.remove() {
             tracing::error!(%error, "temporary merge worktree cleanup failed");
         }
+    }
+}
+
+impl super::registry::Entrypoint for MergeArgs {
+    fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
+        run(self)
     }
 }
 

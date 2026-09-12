@@ -2881,18 +2881,22 @@ name = "remuda"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "futures",
  "remuda-hub",
+ "remuda-node",
  "remuda-protocol",
  "remuda-ssh",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

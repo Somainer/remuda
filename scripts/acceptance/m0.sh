@@ -145,11 +145,12 @@ stub_run() {
   command -v cargo >/dev/null 2>&1 || die "cargo is required"
   [[ -f "$SCAN" ]] || die "missing $SCAN"
 
-  local leftover workdir bin stub status=0 before_s after_s target
-  workdir="$(mktemp -d "${TMPDIR:-/tmp}/remuda-m0.XXXXXX")"
+  local leftover bin stub status=0 before_s after_s target
+  # Global: EXIT trap runs after `local` vars in this function are gone (`set -u`).
+  M0_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/remuda-m0.XXXXXX")"
   cleanup() {
-    if [[ -d "$workdir" ]]; then
-      rm -rf "$workdir"
+    if [[ -n "${M0_WORKDIR:-}" && -d "$M0_WORKDIR" ]]; then
+      rm -rf "$M0_WORKDIR"
     fi
   }
   trap cleanup EXIT
@@ -168,14 +169,14 @@ stub_run() {
   before_s="$(pid_set $(fake_claude_pids))"
 
   local script
-  mkdir -p "$workdir/logs"
+  mkdir -p "$M0_WORKDIR/logs"
   for script in ok approval askuser workflow; do
     log "script $script (claude-print + journal)"
-    mkdir -p "$workdir/$script"
+    mkdir -p "$M0_WORKDIR/$script"
     "$stub" \
       --script "$script" \
       --fake-claude "$bin" \
-      --workdir "$workdir/$script" \
+      --workdir "$M0_WORKDIR/$script" \
       >&2
   done
 
@@ -190,17 +191,17 @@ stub_run() {
   fi
 
   log "secret-scan artifacts"
-  if ! "$SCAN" "$workdir"; then
+  if ! "$SCAN" "$M0_WORKDIR"; then
     status=1
   fi
 
   local socket
   socket="$("$HERDR_SH" start --session "$HERDR_SESSION" --fixture-only)"
 
-  rm -rf "$workdir"
+  rm -rf "$M0_WORKDIR"
   trap - EXIT
-  if [[ -e "$workdir" ]]; then
-    log "temp dir survived cleanup: $workdir"
+  if [[ -e "$M0_WORKDIR" ]]; then
+    log "temp dir survived cleanup: $M0_WORKDIR"
     status=1
   fi
 

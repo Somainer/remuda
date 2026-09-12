@@ -250,6 +250,7 @@ async fn wss_reannounce_keeps_a_single_host_row() {
         .expect("shutdown timeout");
 
     config.token = token;
+    config.url = format!("ws://{}/node/v1/connect", hub.addr);
     let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config))
         .await
         .expect("reconnect timeout")

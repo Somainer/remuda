@@ -289,7 +289,7 @@ pub async fn restrict_agent_routes(
     let path = request.uri().path();
     if !matches!(
         path,
-        "/v1/node" | "/v1/login" | "/v1/devices/pair" | "/healthz"
+        "/v1/node" | "/node/v1/connect" | "/v1/login" | "/v1/devices/pair" | "/healthz"
     ) && auth::presented_token(request.headers()).is_some()
     {
         let device = caller(&state, request.headers()).await?;

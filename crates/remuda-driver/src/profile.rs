@@ -55,17 +55,19 @@ pub enum ProviderHealth {
 pub struct SecretRef(String);
 
 impl SecretRef {
-    /// Accept `env:NAME`, `file:PATH`, or `helper:/abs/command` only.
+    /// Accept `env:NAME`, `file:PATH`, `store:NAME`, `keychain:ACCOUNT`, or `helper:/abs/command`.
     pub fn parse(raw: impl Into<String>) -> DriverResult<Self> {
         let raw = raw.into();
         if raw.starts_with("env:") && raw.len() > 4
             || raw.starts_with("file:") && raw.len() > 5
             || raw.starts_with("helper:") && raw.len() > 7
+            || raw.starts_with("store:") && raw.len() > 6
+            || raw.starts_with("keychain:") && raw.len() > 9
         {
             Ok(Self(raw))
         } else {
             Err(DriverError::InvalidLaunchSpec(
-                "secret_ref must use env:, file:, or helper: scheme".into(),
+                "secret_ref must use env:, file:, store:, keychain:, or helper: scheme".into(),
             ))
         }
     }
@@ -88,6 +90,23 @@ impl SecretRef {
     /// Absolute `apiKeyHelper` command; secret stays out of settings/env files.
     pub fn helper_command(&self) -> Option<&str> {
         self.0.strip_prefix("helper:")
+    }
+
+    /// `store:NAME` vault key.
+    pub fn store_name(&self) -> Option<&str> {
+        self.0.strip_prefix("store:")
+    }
+
+    /// `keychain:ACCOUNT` or `keychain:SERVICE/ACCOUNT`. Default service is `remuda`.
+    pub fn keychain_spec(&self) -> Option<(&str, &str)> {
+        let rest = self.0.strip_prefix("keychain:")?;
+        match rest.split_once('/') {
+            Some((service, account)) if !service.is_empty() && !account.is_empty() => {
+                Some((service, account))
+            }
+            None if !rest.is_empty() => Some(("remuda", rest)),
+            _ => None,
+        }
     }
 }
 
@@ -156,7 +175,7 @@ impl Drop for Secret {
     }
 }
 
-/// Resolves [`SecretRef`] values. M0 reads env or files; token broker comes later.
+/// Resolves [`SecretRef`] values. M0 reads env or files; named stores use [`crate::FileSecretStore`].
 #[async_trait]
 pub trait SecretBroker: Send + Sync {
     /// Fetch the current secret. Never persist the return value.

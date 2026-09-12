@@ -14,9 +14,13 @@ workspace = true
 default = []
 # In-process FakeDriver for Node/Web loopback. Not installed in release images.
 test-stub = []
+# macOS `security` CLI keychain backend. Tests are `#[ignore]`.
+keychain = []
 
 [dependencies]
 async-trait = "0.1"
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
 remuda-claude-wire.workspace = true
 remuda-herdr.workspace = true
 remuda-protocol.workspace = true
@@ -26,6 +30,7 @@ sha2 = "0.10"
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+toml = "0.8"
 tracing.workspace = true
 uuid.workspace = true
 

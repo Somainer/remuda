@@ -17,6 +17,7 @@ mod materializer;
 mod process;
 mod profile;
 mod recipe;
+mod secrets;
 
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;
@@ -42,6 +43,11 @@ pub use recipe::{
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
 };
 pub use remuda_protocol::DriverKind;
+#[cfg(all(target_os = "macos", feature = "keychain"))]
+pub use secrets::KeychainSecretBroker;
+pub use secrets::{FileSecretStore, TokenBroker};
+#[cfg(unix)]
+pub use secrets::{request_secret, serve_token_broker};
 
 #[cfg(any(test, feature = "test-stub"))]
 pub use fake::FakeDriver;

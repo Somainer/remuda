@@ -1,8 +1,8 @@
 //! NDJSON `node --stdio` carrier: emit `node.hello`, answer `hub.hello` / `hub.ping`.
 
-use crate::error::NodeError;
 use crate::inventory::{CollectRequest, collect};
-use remuda_protocol::{HostId, Id};
+use crate::{error::NodeError, load_or_create_host_id};
+use remuda_protocol::Id;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,7 +19,10 @@ pub async fn run_stdio(
         max_instances,
         herdr_socket: None,
     });
-    let host_id = HostId::new();
+    let data_dir = std::env::var_os("REMUDA_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("data"));
+    let host_id = load_or_create_host_id(&data_dir.join("node"))?;
     let hello = json!({
         "jsonrpc": "2.0",
         "method": "node.hello",

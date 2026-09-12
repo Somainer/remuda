@@ -51,9 +51,17 @@ pub struct DevNode {
 impl DevNode {
     /// Build a Node with a bounded in-memory store and the default FakeDriver.
     pub fn new(config: &crate::DevServerConfig) -> Result<Self, NodeError> {
+        Self::with_host_id(config, HostId::new())
+    }
+
+    /// Build a Node whose Host identity matches a persisted enrollment.
+    pub fn with_host_id(
+        config: &crate::DevServerConfig,
+        host_id: HostId,
+    ) -> Result<Self, NodeError> {
         let store = Arc::new(MemoryStore::new(config.follow_buffer_capacity));
         let drivers = DriverRegistry::with_fake()?;
-        Self::with_parts(config, store, drivers)
+        Self::with_parts_on_host(config, store, drivers, host_id)
     }
 
     /// Build a Node around externally supplied store and driver trait objects.

@@ -818,6 +818,7 @@ async fn dispatch_rpc(
             serde_json::to_value(workspace).map_err(NodeError::from)
         }
         "worktree.list" => node.list_worktrees(),
+        "host.doctor" => node.doctor().await,
         "worktree.create" => node.create_worktree(&params),
         "instance.list" => {
             let mut page = node.list_instances()?;

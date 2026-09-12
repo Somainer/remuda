@@ -110,6 +110,10 @@ pub(crate) async fn run_stdio_runtime(
     hello: Option<&NodeHello>,
 ) -> Result<(), NodeError> {
     let enrollment = enroll::load_or_create(&opts.data_dir)?;
+    node.configure_doctor(crate::DoctorContext {
+        data_dir: Some(opts.data_dir.clone()),
+        listeners: Vec::new(),
+    })?;
     ensure_runtime_identity(&node, &enrollment)?;
     let token = enrollment
         .node_token
@@ -363,7 +367,9 @@ async fn handle_stdio_frame(
                 pump_instance,
             })
         }
-        _ if crate::worktree::is_worktree_method(request.method.as_str()) => {
+        _ if request.method == "host.doctor"
+            || crate::worktree::is_worktree_method(request.method.as_str()) =>
+        {
             let result =
                 hubnode_codec::dispatch_method(node, request.method.as_str(), params).await;
             Ok(FrameOutcome {

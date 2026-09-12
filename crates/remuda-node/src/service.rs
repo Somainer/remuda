@@ -116,6 +116,10 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
     };
     let host_id = crate::enroll::load_or_create(&config.data_dir)?.host_id;
     let node = DevNode::with_parts_on_host(&config.http, store, drivers, host_id)?;
+    node.configure_doctor(crate::DoctorContext {
+        data_dir: Some(config.data_dir.clone()),
+        listeners: Vec::new(),
+    })?;
     Ok(match &config.drivers {
         LocalDrivers::Native(native) => node.with_herdr_config(native.clone())?,
         LocalDrivers::Fake => node,
@@ -128,6 +132,10 @@ pub async fn serve(config: ServeConfig) -> Result<RunningNode, NodeError> {
     node.reconcile_herdr().await?;
     let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
     let addr = listener.local_addr()?;
+    node.configure_doctor(crate::DoctorContext {
+        data_dir: Some(config.data_dir.clone()),
+        listeners: vec![addr],
+    })?;
     let app = dev_router(node.clone(), &config.http);
     let (stop, stopped) = oneshot::channel();
     let task = tokio::spawn(async move {

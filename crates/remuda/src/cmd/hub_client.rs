@@ -39,6 +39,7 @@ pub(crate) struct ResolveInput {
     pub env_token: Option<String>,
     pub env_bootstrap: Option<String>,
     pub env_data_dir: Option<PathBuf>,
+    pub fallback_hub: Option<String>,
     pub cwd: PathBuf,
 }
 
@@ -59,7 +60,7 @@ impl HubOpts {
 }
 
 impl ResolveInput {
-    fn from_opts(opts: &HubOpts) -> Self {
+    pub(crate) fn from_opts(opts: &HubOpts) -> Self {
         Self {
             flag_hub: opts.hub.clone(),
             flag_token: opts.token.clone(),
@@ -68,6 +69,7 @@ impl ResolveInput {
             env_token: env_present("REMUDA_TOKEN"),
             env_bootstrap: env_present("REMUDA_BOOTSTRAP_TOKEN"),
             env_data_dir: std::env::var_os("REMUDA_DATA_DIR").map(PathBuf::from),
+            fallback_hub: None,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
@@ -86,6 +88,7 @@ pub(crate) fn resolve_hub(input: &ResolveInput) -> ResolvedHub {
     let dirs = data_dir_candidates(input);
     let url = first_present([&input.flag_hub, &input.env_hub])
         .or_else(|| first_listen_file(&dirs))
+        .or_else(|| input.fallback_hub.clone())
         .unwrap_or_else(|| default_hub_url(&dirs))
         .trim_end_matches('/')
         .to_string();

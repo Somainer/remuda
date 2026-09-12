@@ -2,6 +2,7 @@
 
 mod carrier;
 mod config;
+mod diagnostics;
 mod driver;
 mod enroll;
 mod entity;
@@ -28,6 +29,7 @@ pub use carrier::{
     OutboundWssCarrier, StdioCarrier,
 };
 pub use config::{DEFAULT_DEV_PORT, DevServerConfig};
+pub use diagnostics::{DoctorCheck, DoctorContext, DoctorReport, doctor_port, doctor_snapshot};
 pub use driver::{
     Driver, DriverEmission, DriverError, DriverFactory, DriverFuture, DriverLaunch, DriverRegistry,
     DriverRequest, DriverStartFuture, FakeDriver,

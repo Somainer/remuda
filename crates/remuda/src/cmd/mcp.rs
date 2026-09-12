@@ -68,13 +68,13 @@ pub(crate) async fn handle_rpc(msg: &Value, client: &HubClient) -> Option<Value>
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             let result = call_tool(name, args, client).await;
-            let merge_report = if name == "remuda_merge" {
+            let operation_report = if matches!(name, "remuda_merge" | "remuda_doctor") {
                 result.as_ref().ok().cloned()
             } else {
                 None
             };
             let mut content = tool_content(result);
-            if let Some(report) = merge_report {
+            if let Some(report) = operation_report {
                 content["isError"] = json!(report["exitCode"] != 0);
                 content["structuredContent"] = report;
             }
@@ -266,6 +266,20 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
             }),
         ),
         tool(
+            "remuda_doctor",
+            "Preflight the local machine (default/local=true) or an active Hub host. Reports binary versions and login-marker states, data/identity, disk, ports, Hub reachability and registered host links. Nonzero exitCode means blockers. No credential values are returned.",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "host":{"type":"string"},"local":{"type":"boolean"},"dataDir":{"type":"string"}
+            }}),
+        ),
+        tool(
+            "remuda_worktree_rm",
+            "Remove a registered linked Git worktree by Remuda name or explicit path on this MCP server. Keeps the branch. Refuses primary/current/main, locks, or active merge/rebase; dirty files require explicit force=true.",
+            json!({"type":"object","additionalProperties":false,"required":["name"],"properties":{
+                "name":{"type":"string"},"repo":{"type":"string"},"force":{"type":"boolean"}
+            }}),
+        ),
+        tool(
             "remuda_merge",
             "Merge a local branch into main in a disposable worktree, run the shared gate, compare-and-swap main and push origin. Requires gate=true or dryRun=true. dryRun only inspects local refs. Reports exitCode 0 ok / 1 gate failed / 2 conflict / 3 CAS lost with step timings. Runs on the MCP server's machine.",
             json!({
@@ -281,7 +295,8 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
                     "web": { "type": "boolean" },
                     "noPush": { "type": "boolean" },
                     "repo": { "type": "string" },
-                    "targetDir": { "type": "string" }
+                    "targetDir": { "type": "string" },
+                    "message": { "type": "string" }
                 }
             }),
         ),
@@ -438,6 +453,33 @@ async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value>
             let options: merge::MergeArgs = serde_json::from_value(args)?;
             let report = tokio::task::spawn_blocking(move || merge::execute(options)).await?;
             Ok(serde_json::to_value(report)?)
+        }
+        "remuda_doctor" => {
+            let mut config = crate::config::Config::load(None)?;
+            let mut args = args;
+            if let Some(path) = args.as_object_mut().and_then(|map| map.remove("dataDir")) {
+                config.data_dir = std::path::PathBuf::from(
+                    path.as_str()
+                        .ok_or_else(|| anyhow!("dataDir must be a string"))?,
+                );
+            }
+            let options = serde_json::from_value(args)?;
+            super::doctor::inspect(&config, &options, client).await
+        }
+        "remuda_worktree_rm" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct RemoveArgs {
+                name: String,
+                repo: Option<std::path::PathBuf>,
+                #[serde(default)]
+                force: bool,
+            }
+            let options: RemoveArgs = serde_json::from_value(args)?;
+            tokio::task::spawn_blocking(move || {
+                worktree::remove(&options.name, options.repo.as_deref(), options.force)
+            })
+            .await?
         }
         "remuda_fleet_send" => {
             let text = send_text_from_args(&args)?;
@@ -736,6 +778,8 @@ mod tests {
             "remuda_fleet_send",
             "remuda_fleet_keys",
             "remuda_merge",
+            "remuda_doctor",
+            "remuda_worktree_rm",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }

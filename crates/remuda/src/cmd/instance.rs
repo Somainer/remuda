@@ -60,11 +60,8 @@ pub(crate) enum InstanceCommand {
         command_id: Option<String>,
     },
     /// List instances (`name`, `kind`, `status`, `cwd`, `host`).
-    List {
-        /// Restrict to one host id.
-        #[arg(long)]
-        host: Option<String>,
-    },
+    #[command(visible_alias = "ls")]
+    List(super::agents::ListArgs),
     /// Send a prompt / steer to a running instance.
     Send {
         /// Instance id (`ins_…`) or `--name`.
@@ -210,9 +207,8 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 .await?;
                 print_json(&value)
             }
-            InstanceCommand::List { host } => {
-                let value = list_instances(&client, host.as_deref()).await?;
-                print_json(&value)
+            InstanceCommand::List(args) => {
+                super::agents::list(std::sync::Arc::new(client), args).await
             }
             InstanceCommand::Send {
                 instance_id,
@@ -683,6 +679,9 @@ pub(crate) fn project_instance(item: &Value, hosts: &[Value]) -> Value {
         "hostId": host_id,
         "lifecycle": item.get("lifecycle").cloned().unwrap_or(json!("")),
         "activity": item.get("activity").cloned().unwrap_or(json!("")),
+        "connectivity": item.get("connectivity").cloned().unwrap_or(json!("unknown")),
+        "hostOnline": host.and_then(|h| h.get("online")).cloned().unwrap_or(Value::Null),
+        "worktree": item.get("worktree").filter(|v| !v.is_null()).cloned().unwrap_or(json!(cwd)),
         "driver": item.get("driver").cloned().unwrap_or(json!("")),
         "title": item.get("title").cloned().unwrap_or(json!(name)),
         "workspaceId": item.get("workspaceId").cloned().unwrap_or(json!(cwd)),

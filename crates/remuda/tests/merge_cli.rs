@@ -652,3 +652,169 @@ fn mcp_merge_returns_the_same_structured_result_and_marks_failures() {
         repo.assert_cleaned();
     }
 }
+
+#[test]
+fn gate_script_is_loaded_from_the_merge_result_even_with_stale_caller_files() {
+    let repo = Repo::new();
+    commit_file(
+        &repo.source,
+        "scripts/ci/gate.sh",
+        &GATE.replace("cargo-check", "branch-check"),
+    );
+    // The coordinator's files can lag after update-ref advances its main ref.
+    fs::write(repo.root.join("scripts/ci/gate.sh"), "#!/bin/sh\nexit 99\n").unwrap();
+    let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(step(&report, "branch-check")["status"], "ok");
+    assert!(
+        repo.trace()
+            .iter()
+            .any(|entry| entry["step"] == "branch-check")
+    );
+    assert!(git(&repo.root, &["show", "main:scripts/ci/gate.sh"]).contains("branch-check"));
+    repo.assert_cleaned();
+}
+
+#[test]
+fn merge_history_names_the_branch_and_records_verified_gate_timings_and_retries() {
+    for title in [None, Some("merge: custom coordinator title")] {
+        let repo = Repo::new();
+        let mut flags = vec!["--gate", "--no-push"];
+        if let Some(title) = title {
+            flags.extend(["--message", title]);
+        }
+        let (output, report) = repo.merge(&flags, &[("REMUDA_TEST_GATE_RETRY", "cargo-test")]);
+        assert_exit(&output, &report, 0);
+        let message = git(&repo.root, &["show", "-s", "--format=%B", "main"]);
+        assert_eq!(
+            message.lines().next(),
+            Some(title.unwrap_or("merge: topic into main"))
+        );
+        assert!(
+            message.contains("Gate: passed (override=true)"),
+            "{message}"
+        );
+        for result in report["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s.get("command").is_some())
+        {
+            let line = format!(
+                "{}: {} ({} ms), attempts={}, retried={}",
+                result["name"].as_str().unwrap(),
+                result["status"].as_str().unwrap(),
+                result["durationMs"],
+                result["attempts"],
+                result["retried"]
+            );
+            assert!(message.contains(&line), "{message} missing {line}");
+        }
+        assert_eq!(git(&repo.root, &["show", "main:shared file.txt"]), "branch");
+        assert_eq!(report["merged"], repo.main());
+        assert!(!message.contains(repo.root.to_str().unwrap()));
+        repo.assert_cleaned();
+    }
+}
+
+#[test]
+fn checkout_behind_main_and_main_behind_origin_fail_clearly_before_the_gate() {
+    let repo = Repo::new();
+    commit_file(&repo.root, "main-only.txt", "main advanced\n");
+    let output = repo
+        .command()
+        .current_dir(&repo.source)
+        .args(["merge", "topic", "--gate", "--no-push", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_exit(&output, &report, 1);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("checkout is behind main")
+    );
+    assert!(repo.trace().is_empty());
+    git(&repo.root, &["push", "origin", "main"]);
+    git(&repo.root, &["reset", "--hard", &repo.base]);
+    let (output, report) = repo.merge(&["--gate"], &[]);
+    assert_exit(&output, &report, 1);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("local main is behind or diverged from origin/main")
+    );
+    assert!(repo.trace().is_empty());
+    repo.assert_cleaned();
+}
+
+#[test]
+fn missing_gate_in_merged_tree_is_reported_and_cleaned_up() {
+    let repo = Repo::new();
+    git(&repo.source, &["rm", "scripts/ci/gate.sh"]);
+    git(
+        &repo.source,
+        &["commit", "-m", "remove gate", "--", "scripts/ci/gate.sh"],
+    );
+    let (output, report) = repo.merge(&["--gate"], &[]);
+    assert_exit(&output, &report, 1);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("scripts/ci/gate.sh is missing from the selected tree")
+    );
+    assert_eq!(repo.main(), repo.base);
+    repo.assert_cleaned();
+}
+
+#[test]
+fn pending_lists_only_ahead_local_worker_branches_and_reports_conflicts_and_staging() {
+    let repo = Repo::new();
+    git(&repo.source, &["branch", "-m", "wt/conflict/work"]);
+    let main = commit_file(&repo.root, "shared file.txt", "main conflict\n");
+    let tree = git(&repo.root, &["rev-parse", "main^{tree}"]);
+    let clean = git(
+        &repo.root,
+        &["commit-tree", &tree, "-p", &main, "-m", "clean queue"],
+    );
+    git(&repo.root, &["branch", "wt/clean/work", &clean]);
+    git(&repo.root, &["branch", "wt/already/work", "main"]);
+    git(&repo.root, &["branch", "ordinary-topic", &clean]);
+    fs::write(repo.source.join("staged.txt"), "unfinished\n").unwrap();
+    git(&repo.source, &["add", "--", "staged.txt"]);
+    let before = git(&repo.root, &["show-ref"]);
+    for flag in ["--list", "--pending"] {
+        let output = repo
+            .command()
+            .args(["merge", flag, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let items = report["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{report}");
+        assert_eq!(items[0]["branch"], "wt/clean/work");
+        assert_eq!(items[0]["status"], "clean");
+        assert_eq!(items[1]["branch"], "wt/conflict/work");
+        assert_eq!(items[1]["status"], "conflict");
+        assert_eq!(items[1]["conflicts"], json!(["shared file.txt"]));
+        assert_eq!(items[1]["worktreeStatus"], "blocked");
+        assert!(
+            items[1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("staged changes")
+        );
+        assert!(items.iter().all(|item| item["ahead"] == 1));
+    }
+    assert_eq!(git(&repo.root, &["show-ref"]), before);
+    assert!(repo.trace().is_empty());
+    repo.assert_cleaned();
+}

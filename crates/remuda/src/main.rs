@@ -61,13 +61,27 @@ enum Command {
         #[command(subcommand)]
         command: cmd::fleet::FleetCommand,
     },
-    /// Create a git worktree (`git worktree add -b wt/<name>/…`).
+    /// Create, list, safely remove, or prune local Git worktrees.
     Worktree {
         #[command(subcommand)]
         command: cmd::worktree::WorktreeCommand,
     },
     /// Verify a branch in a temporary worktree, then advance and push main.
     Merge(cmd::merge::MergeArgs),
+    /// Preflight local or registered remote host capabilities and connectivity.
+    Doctor {
+        #[command(flatten)]
+        hub: cmd::hub_client::HubOpts,
+        #[command(flatten)]
+        args: cmd::doctor::DoctorArgs,
+    },
+    /// List instances across hosts (alias for instance ls).
+    Agents {
+        #[command(flatten)]
+        hub: cmd::hub_client::HubOpts,
+        #[command(flatten)]
+        args: cmd::agents::ListArgs,
+    },
     /// stdio MCP server (JSON-RPC 2.0) for the same instance/fleet/worktree tools.
     Mcp {
         #[command(flatten)]
@@ -92,6 +106,13 @@ fn main() -> anyhow::Result<()> {
         return build_info::write(json, &mut std::io::stdout().lock());
     }
     init_tracing()?;
+    if let Command::Doctor { hub, args } = &cli.command {
+        let code = cmd::doctor::run(cli.load_config()?, hub.clone(), args.clone())?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     if matches!(
         &cli.command,
         Command::Hub(_) | Command::Node(_) | Command::Dev(_) | Command::Dispatcher(_)
@@ -127,6 +148,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Ssh(args) => cmd::ssh::run_blocking(args),
+        Command::Agents { hub, args } => cmd::agents::run(hub, args),
         Command::Instance { hub, command } => cmd::instance::run(hub, command),
         Command::Fleet { hub, command } => cmd::fleet::run(hub, command),
         Command::Worktree { command } => cmd::worktree::run(command),
@@ -290,7 +312,7 @@ mod tests {
             let Command::Merge(args) = cli.command else {
                 panic!("merge")
             };
-            assert_eq!(args.branch, "topic");
+            assert_eq!(args.branch.as_deref(), Some("topic"));
             assert_eq!(args.gate, mode == "--gate");
             assert_eq!(args.dry_run, mode == "--dry-run");
             assert!(args.web && args.no_push && args.json);
@@ -299,6 +321,40 @@ mod tests {
                 Some(std::path::Path::new("target-coordinator"))
             );
         }
+    }
+
+    #[test]
+    fn diagnostics_watch_and_merge_queue_arguments_are_wired() {
+        assert!(
+            Cli::try_parse_from(["remuda", "doctor", "--host", "hst_test", "--local"]).is_err()
+        );
+        for command in [
+            vec!["remuda", "agents", "--watch", "--json"],
+            vec!["remuda", "instance", "ls", "--watch", "--json"],
+        ] {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+        for flag in ["--list", "--pending"] {
+            let cli = Cli::try_parse_from(["remuda", "merge", flag, "--json"]).unwrap();
+            let Command::Merge(args) = cli.command else {
+                panic!("merge");
+            };
+            assert!(args.list && args.branch.is_none());
+            assert!(Cli::try_parse_from(["remuda", "merge", "topic", flag, "--gate"]).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "remuda",
+            "merge",
+            "topic",
+            "--gate",
+            "--message",
+            "custom title",
+        ])
+        .unwrap();
+        let Command::Merge(args) = cli.command else {
+            panic!("merge");
+        };
+        assert_eq!(args.message.as_deref(), Some("custom title"));
     }
 
     #[test]

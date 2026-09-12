@@ -188,11 +188,25 @@ impl HubClient {
 
     /// Device follow socket (`GET /v1/follow?instanceId=`).
     pub async fn follow_ws(&self, instance_id: &str) -> Result<FollowSocket, ClientError> {
+        self.open_follow(Some(instance_id)).await
+    }
+
+    /// Follow events across all instances, including instances created later.
+    pub async fn follow_all_ws(&self) -> Result<FollowSocket, ClientError> {
+        self.open_follow(None).await
+    }
+
+    async fn open_follow(&self, instance_id: Option<&str>) -> Result<FollowSocket, ClientError> {
         self.ensure_auth().await?;
         let token = self.current_token()?.ok_or(ClientError::NoCredentials)?;
         let ws_base = http_to_ws(&self.base);
-        let url = format!("{ws_base}/v1/follow?instanceId={instance_id}");
+        let mut url = reqwest::Url::parse(&format!("{ws_base}/v1/follow"))
+            .map_err(|error| ClientError::Websocket(error.to_string()))?;
+        if let Some(instance_id) = instance_id {
+            url.query_pairs_mut().append_pair("instanceId", instance_id);
+        }
         let mut req = url
+            .as_str()
             .into_client_request()
             .map_err(|err| ClientError::Websocket(err.to_string()))?;
         req.headers_mut().insert(

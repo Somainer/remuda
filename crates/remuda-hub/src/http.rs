@@ -400,7 +400,7 @@ async fn pick_worktree_host(
         })
 }
 
-async fn call_node(
+pub(crate) async fn call_node(
     state: &AppState,
     host_id: &str,
     method: &str,

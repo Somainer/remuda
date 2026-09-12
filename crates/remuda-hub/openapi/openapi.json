@@ -188,6 +188,49 @@
         }
       }
     },
+    "/v1/hosts/{id}/doctor": {
+      "get": {
+        "tags": ["hosts"],
+        "operationId": "hostDoctor",
+        "summary": "Fresh diagnostics over the registered host's active Node link",
+        "description": "Requires device authentication. Runs the Node inventory, data/identity, disk and listener checks without returning credentials. Login states are local-marker heuristics. RPC callers cannot choose filesystem paths.",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Host preflight, including blockers in exitCode/checks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["exitCode", "inventory", "checks"],
+                  "properties": {
+                    "exitCode": { "type": "integer", "enum": [0, 1] },
+                    "inventory": { "type": ["object", "null"] },
+                    "checks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["name", "status", "message", "details"],
+                        "properties": {
+                          "name": { "type": "string" },
+                          "status": { "type": "string", "enum": ["ok", "warning", "blocker"] },
+                          "message": { "type": "string" },
+                          "details": {}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/instances": {
       "get": {
         "tags": ["instances"],

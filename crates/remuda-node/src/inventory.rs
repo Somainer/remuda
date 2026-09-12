@@ -413,7 +413,7 @@ fn hostname(env: &ProbeEnv) -> String {
     run_system("uname", &["-n"]).unwrap_or_else(|| "unknown".to_owned())
 }
 
-fn find_executable(name: &str, path_var: &OsString) -> Option<PathBuf> {
+pub(crate) fn find_executable(name: &str, path_var: &OsString) -> Option<PathBuf> {
     std::env::split_paths(path_var)
         .map(|directory| directory.join(name))
         .find(|candidate| is_executable(candidate))
@@ -449,7 +449,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn binary_version(path: &Path) -> Option<String> {
+pub(crate) fn binary_version(path: &Path) -> Option<String> {
     let output = spawn_version(path)?;
     if !output.status.success() {
         return None;

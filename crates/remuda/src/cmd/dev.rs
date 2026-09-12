@@ -153,6 +153,10 @@ pub(crate) async fn run(
     let node = DevNode::with_parts_on_host(&node_config, store, drivers, host_id.clone())?
         .with_herdr_config(native)?;
     node.reconcile_herdr().await?;
+    node.configure_doctor(remuda_node::DoctorContext {
+        data_dir: Some(identity_dir.clone()),
+        listeners: Vec::new(),
+    })?;
     let mut wss = WssConfig::loopback(running_hub.addr, node_token, host_id.as_id().to_string())
         .with_collected_inventory_from(&remuda_node::CollectRequest {
             labels: config.node.labels.clone(),
@@ -177,6 +181,10 @@ pub(crate) async fn run(
     );
     let listener = tokio::net::TcpListener::bind(node_config.bind_addr).await?;
     let address = listener.local_addr()?;
+    node.configure_doctor(remuda_node::DoctorContext {
+        data_dir: Some(identity_dir),
+        listeners: vec![address],
+    })?;
     let accepting = Arc::new(AtomicBool::new(true));
     let policy = accepting.clone();
     let app = dev_router(node.clone(), &node_config).layer(axum::middleware::from_fn(

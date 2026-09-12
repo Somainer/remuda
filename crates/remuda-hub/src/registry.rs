@@ -15,7 +15,22 @@ use serde_json::{Value, json};
 
 /// Registry routes composed by the host feature router.
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/v1/hosts/{id}", get(get_host).patch(patch_host))
+    Router::new()
+        .route("/v1/hosts/{id}", get(get_host).patch(patch_host))
+        .route("/v1/hosts/{id}/doctor", get(doctor_host))
+}
+
+async fn doctor_host(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    require_device(&state.store, &headers).await?;
+    if state.store.get_host(id.clone()).await?.is_none() {
+        return Err(HubError::NotFound);
+    }
+    let report = crate::http::call_node(&state, &id, "host.doctor", json!({})).await?;
+    Ok(Json(report))
 }
 
 #[derive(Deserialize)]

@@ -180,6 +180,9 @@ pub async fn dispatch_method(
     method: &str,
     params: Value,
 ) -> Result<Value, NodeError> {
+    if method == "host.doctor" {
+        return node.doctor().await;
+    }
     if crate::worktree::is_worktree_method(method) {
         return crate::worktree::handle_rpc(
             std::path::Path::new(&node.workspace().root_path),

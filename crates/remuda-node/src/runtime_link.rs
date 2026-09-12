@@ -27,6 +27,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
         return node.dispatch_interaction(method, params).await;
     }
     match method {
+        "host.doctor" => node.doctor().await,
         "instance.create" => {
             let created = node
                 .create_instance(create_from_params(node, &params)?)

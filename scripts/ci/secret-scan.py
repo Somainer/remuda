@@ -20,6 +20,13 @@ P_SK = "sk" + "-"
 P_BEARER = "Bearer" + " "
 P_TOKEN = "ANTHROPIC_AUTH_TOKEN" + "="
 P_API = "api" + "_" + "key"
+P_BOOT = "REMUDA_BOOTSTRAP_TOKEN" + "="
+P_OPENAI = "OPENAI_API_KEY" + "="
+P_XAI = "xai" + "-"
+P_GHP = "ghp" + "_"
+P_GPAT = "github" + "_pat_"
+P_APPSEC = "app" + "_secret"
+P_PEM = "BEGIN" + " " + "PRIVATE" + " " + "KEY"
 
 SKIP_DIR_NAMES = {
     ".git",
@@ -84,6 +91,36 @@ RULES = [
             r"\b" + re.escape(P_API) + r"\b\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{8,})"
         ),
     ),
+    (
+        "REMUDA_BOOTSTRAP_TOKEN=",
+        re.compile(re.escape(P_BOOT) + r"['\"]?([A-Za-z0-9_\-]{8,})"),
+    ),
+    (
+        "OPENAI_API_KEY=",
+        re.compile(re.escape(P_OPENAI) + r"['\"]?([A-Za-z0-9_\-]{8,})"),
+    ),
+    (
+        "xai-",
+        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_XAI) + r"[A-Za-z0-9_\-]{8,}"),
+    ),
+    (
+        "ghp_",
+        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_GHP) + r"[A-Za-z0-9]{8,}"),
+    ),
+    (
+        "github_pat_",
+        re.compile(r"(?<![A-Za-z0-9_])" + re.escape(P_GPAT) + r"[A-Za-z0-9_]{8,}"),
+    ),
+    (
+        "app_secret",
+        re.compile(
+            r"\b" + re.escape(P_APPSEC) + r"\b\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{8,})"
+        ),
+    ),
+    (
+        "BEGIN PRIVATE KEY",
+        re.compile(r"-----" + re.escape(P_PEM) + r"-----"),
+    ),
 ]
 
 
@@ -107,13 +144,26 @@ def is_redacted(match: str, payload: str) -> bool:
 
 
 def payload_for(name: str, m: re.Match[str]) -> str:
-    if name in {"Bearer ", "ANTHROPIC_AUTH_TOKEN=", "api_key"} and m.lastindex:
+    if name in {
+        "Bearer ",
+        "ANTHROPIC_AUTH_TOKEN=",
+        "api_key",
+        "REMUDA_BOOTSTRAP_TOKEN=",
+        "OPENAI_API_KEY=",
+        "app_secret",
+    } and m.lastindex:
         return m.group(1)
     text = m.group(0)
     if name == "agk_":
         return text[len(P_AGK) :]
     if name == "sk-":
         return text[len(P_SK) :]
+    if name == "xai-":
+        return text[len(P_XAI) :]
+    if name == "ghp_":
+        return text[len(P_GHP) :]
+    if name == "github_pat_":
+        return text[len(P_GPAT) :]
     return text
 
 

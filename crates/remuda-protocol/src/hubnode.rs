@@ -42,6 +42,10 @@ pub const METHOD_INTERACTION_RESPOND: &str = "interaction.respond";
 pub const METHOD_JOURNAL_APPEND: &str = "journal.append";
 /// TTY JSON control frame; binary envelopes use [`TTY_BINARY_HEADER_LEN`].
 pub const METHOD_TTY_FRAME: &str = "tty.frame";
+/// Write logical keys to an instance PTY (Hub `POST .../commands` `tty.write`).
+pub const METHOD_TTY_WRITE: &str = "tty.write";
+/// Alias accepted for [`METHOD_TTY_WRITE`].
+pub const METHOD_INSTANCE_KEYS: &str = "instance.keys";
 /// HTTP Authorization scheme for `GET /v1/node`.
 pub const WS_AUTHORIZATION_SCHEME: &str = "Bearer";
 /// `params.scheme` on [`METHOD_NODE_AUTH`].
@@ -124,6 +128,10 @@ pub enum HubNodeMethod {
     JournalAppend,
     /// [`METHOD_TTY_FRAME`].
     TtyFrame,
+    /// [`METHOD_TTY_WRITE`].
+    TtyWrite,
+    /// [`METHOD_INSTANCE_KEYS`].
+    InstanceKeys,
 }
 
 /// `node.auth` params (stdio first frame).
@@ -339,6 +347,53 @@ pub struct InstanceRespondParams {
     pub answer: Option<Value>,
 }
 
+/// `tty.write` / `instance.keys` params (Hub command payload).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtyWriteParams {
+    /// Target Instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Command identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Logical key names (`enter`, `esc`, `ctrl+c`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// Optional PTY bytes (CLI also sends names in `keys`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    /// Caller (`cli`, `mcp`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl TtyWriteParams {
+    /// Non-empty key names, or a single `raw` token when only `dataBase64` is set.
+    #[must_use]
+    pub fn key_names(&self) -> Vec<String> {
+        let names: Vec<String> = self
+            .keys
+            .iter()
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !names.is_empty() {
+            return names;
+        }
+        if self
+            .data_base64
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            vec!["raw".to_owned()]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 /// Batched `journal.append` with an optional sequence watermark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -454,6 +509,8 @@ impl HubNodeMethod {
             Self::InteractionRespond => METHOD_INTERACTION_RESPOND,
             Self::JournalAppend => METHOD_JOURNAL_APPEND,
             Self::TtyFrame => METHOD_TTY_FRAME,
+            Self::TtyWrite => METHOD_TTY_WRITE,
+            Self::InstanceKeys => METHOD_INSTANCE_KEYS,
         }
     }
 
@@ -473,6 +530,8 @@ impl HubNodeMethod {
             METHOD_INTERACTION_RESPOND => Self::InteractionRespond,
             METHOD_JOURNAL_APPEND => Self::JournalAppend,
             METHOD_TTY_FRAME => Self::TtyFrame,
+            METHOD_TTY_WRITE => Self::TtyWrite,
+            METHOD_INSTANCE_KEYS => Self::InstanceKeys,
             _ => return None,
         })
     }
@@ -499,6 +558,8 @@ impl HubNodeMethod {
                 | Self::InstanceCancel
                 | Self::InstanceRespond
                 | Self::InteractionRespond
+                | Self::TtyWrite
+                | Self::InstanceKeys
         )
     }
 }

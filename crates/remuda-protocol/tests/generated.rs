@@ -88,6 +88,7 @@ fn public_wire_types_are_registered_for_generation() {
         "JournalAppendParams",
         "JournalSeqWatermark",
         "TtyFrameParams",
+        "TtyWriteParams",
         "TtyBinaryEnvelopeSpec",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {

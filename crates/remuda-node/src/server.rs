@@ -868,9 +868,40 @@ async fn dispatch_rpc(
             "cols": params.get("cols").cloned().unwrap_or_else(|| json!(80)),
             "rows": params.get("rows").cloned().unwrap_or_else(|| json!(24)),
         })),
-        "tty.write" => Err(NodeError::InvalidRequest(
-            "the M0 local TTY fixture is read-only".to_owned(),
-        )),
+        "tty.write" | "instance.keys" => {
+            let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
+            let keys: Vec<String> = params
+                .get("keys")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .filter(|item| !item.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if keys.is_empty() {
+                return Err(NodeError::InvalidRequest(
+                    "tty.write requires keys".to_owned(),
+                ));
+            }
+            let result = node
+                .submit_command(
+                    &instance_id,
+                    InstanceCommandRequest {
+                        command_id: optional_id_field(&params, "commandId")?,
+                        operation: CommandAction::WriteTty,
+                        prompt: None,
+                        run_id: None,
+                        interaction_id: None,
+                        answer: None,
+                        keys: Some(keys),
+                    },
+                )
+                .await?;
+            serde_json::to_value(result).map_err(NodeError::from)
+        }
         _ => Err(NodeError::InvalidRequest(format!(
             "JSON-RPC method is not implemented by remuda dev: {method}"
         ))),
@@ -926,6 +957,7 @@ async fn submit_rpc_command(
                 run_id: optional_id_field(params, "runId")?,
                 interaction_id: None,
                 answer: None,
+                keys: None,
             },
         )
         .await?;

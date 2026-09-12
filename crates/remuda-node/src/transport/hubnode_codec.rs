@@ -4,7 +4,7 @@ use crate::{CommandAction, CreateInstanceRequest, DevNode, InstanceCommandReques
 use remuda_protocol::hubnode::{
     self, HubNodeMethod, HubNodeRequest, InstanceCancelParams, InstanceCreateParams,
     InstanceRespondParams, InstanceSendParams, JournalAppendParams, METHOD_NODE_AUTH,
-    METHOD_NODE_HELLO, NodeAuthParams, NodeHelloParams,
+    METHOD_NODE_HELLO, NodeAuthParams, NodeHelloParams, TtyWriteParams,
 };
 use remuda_protocol::{
     AgentKind, DriverKind, HeartbeatParams, HelloParams, HostId, Id, InstanceId, PROTOCOL_VERSION,
@@ -187,6 +187,9 @@ pub async fn dispatch_method(
         Some(HubNodeMethod::InstanceRespond | HubNodeMethod::InteractionRespond) => {
             dispatch_respond(node, params).await
         }
+        Some(HubNodeMethod::TtyWrite | HubNodeMethod::InstanceKeys) => {
+            dispatch_keys(node, params).await
+        }
         Some(HubNodeMethod::JournalAppend) => {
             let parsed: JournalAppendParams = serde_json::from_value(params)?;
             Ok(json!({
@@ -328,6 +331,7 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
         parsed.run_id.as_deref(),
         None,
         None,
+        None,
     )
     .await
 }
@@ -344,6 +348,33 @@ async fn dispatch_cancel(node: &DevNode, params: Value) -> Result<Value, NodeErr
         parsed.run_id.as_deref(),
         None,
         None,
+        None,
+    )
+    .await
+}
+
+async fn dispatch_keys(node: &DevNode, params: Value) -> Result<Value, NodeError> {
+    let parsed: TtyWriteParams = serde_json::from_value(params.clone()).unwrap_or_default();
+    let instance_id = parsed
+        .instance_id
+        .as_deref()
+        .or_else(|| params.get("instanceId").and_then(Value::as_str))
+        .ok_or_else(|| NodeError::InvalidRequest("tty.write requires instanceId".into()))?;
+    let instance_id = InstanceId::from_str(instance_id)?;
+    let keys = parsed.key_names();
+    if keys.is_empty() {
+        return Err(NodeError::InvalidRequest("tty.write requires keys".into()));
+    }
+    submit(
+        node,
+        &instance_id,
+        CommandAction::WriteTty,
+        None,
+        parsed.command_id.as_deref(),
+        None,
+        None,
+        None,
+        Some(keys),
     )
     .await
 }
@@ -365,6 +396,7 @@ async fn dispatch_respond(node: &DevNode, params: Value) -> Result<Value, NodeEr
         None,
         parsed.interaction_id.as_deref(),
         parsed.answer.clone(),
+        None,
     )
     .await
 }
@@ -379,6 +411,7 @@ async fn submit(
     run_id: Option<&str>,
     interaction_id: Option<&str>,
     answer: Option<Value>,
+    keys: Option<Vec<String>>,
 ) -> Result<Value, NodeError> {
     let result = node
         .submit_command(
@@ -390,6 +423,7 @@ async fn submit(
                 run_id: run_id.map(str::parse).transpose()?,
                 interaction_id: interaction_id.map(str::parse).transpose()?,
                 answer,
+                keys,
             },
         )
         .await?;

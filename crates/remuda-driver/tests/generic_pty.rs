@@ -125,7 +125,15 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
         screen.contains("OK") || !screen.is_empty(),
         "screen was empty"
     );
-    let _ = driver.send_keys(vec!["enter".into()]).await;
+    driver
+        .send_keys(vec!["enter".into()])
+        .await
+        .expect("send_keys enter");
+    let after_keys = driver.read_screen(40).await.expect("read after keys");
+    assert!(
+        after_keys.contains("KEYS enter") || after_keys.contains("enter"),
+        "fake-herdr should record send_keys; screen={after_keys:?}"
+    );
     let mut saw_status = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {

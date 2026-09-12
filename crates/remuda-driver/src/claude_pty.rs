@@ -481,17 +481,21 @@ impl Driver for ClaudePtyDriver {
         Ok(ack)
     }
 
-    async fn cancel(&self) -> DriverResult<DriverAck> {
+    async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
         if live.closed {
             return Err(DriverError::ControlUnavailable);
         }
         live.client
-            .agent_send_keys(live.agent_name.clone(), vec!["esc".into()])
+            .agent_send_keys(live.agent_name.clone(), keys)
             .await
             .map_err(map_herdr)?;
         Ok(DriverAck::transport_written())
+    }
+
+    async fn cancel(&self) -> DriverResult<DriverAck> {
+        self.send_keys(vec!["esc".into()]).await
     }
 
     async fn respond_interaction(

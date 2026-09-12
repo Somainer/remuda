@@ -45,6 +45,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         run_id: None,
                         interaction_id: None,
                         answer: None,
+                        keys: None,
                     },
                 )
                 .await?;
@@ -62,6 +63,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         run_id: None,
                         interaction_id: None,
                         answer: None,
+                        keys: None,
                     },
                 )
                 .await?;
@@ -83,10 +85,14 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         run_id: None,
                         interaction_id,
                         answer: Some(params.get("answer").cloned().unwrap_or(Value::Null)),
+                        keys: None,
                     },
                 )
                 .await?;
             serde_json::to_value(&result).map_err(NodeError::from)
+        }
+        "tty.write" | "instance.keys" => {
+            crate::transport::hubnode::dispatch_method(node, method, params).await
         }
         _ => Ok(json!({ "ok": true })),
     }

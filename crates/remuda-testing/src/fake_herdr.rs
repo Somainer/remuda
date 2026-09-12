@@ -989,6 +989,27 @@ fn agent_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static st
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
     let name = resolve_agent(st, target)?;
+    let keys: Vec<String> = params
+        .get("keys")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(agent) = st.agents.get(&name) {
+        let pane = agent.pane_id.clone();
+        let line = format!("KEYS {}", keys.join(" "));
+        st.screens
+            .entry(pane)
+            .and_modify(|screen| {
+                screen.push('\n');
+                screen.push_str(&line);
+            })
+            .or_insert(line);
+    }
     unblock_if_needed(st, &name);
     ok()
 }

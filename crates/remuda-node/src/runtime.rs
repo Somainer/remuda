@@ -62,12 +62,21 @@ impl DevNode {
         store: Arc<dyn LocalStore>,
         drivers: DriverRegistry,
     ) -> Result<Self, NodeError> {
+        Self::with_parts_on_host(config, store, drivers, HostId::new())
+    }
+
+    /// Build a Node around supplied parts and a persisted Host identity.
+    pub fn with_parts_on_host(
+        config: &crate::DevServerConfig,
+        store: Arc<dyn LocalStore>,
+        drivers: DriverRegistry,
+        host_id: HostId,
+    ) -> Result<Self, NodeError> {
         if config.instance_queue_capacity == 0 {
             return Err(NodeError::InvalidConfig(
                 "instance queue capacity must be positive".to_owned(),
             ));
         }
-        let host_id = HostId::new();
         let workspace_id = WorkspaceId::new();
         let host = fixture_host(host_id.clone())?;
         let workspace = fixture_workspace(workspace_id, host_id, &config.workspace_root)?;

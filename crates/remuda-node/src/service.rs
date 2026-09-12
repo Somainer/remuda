@@ -2,7 +2,7 @@
 
 use crate::{
     DevNode, DevServerConfig, DriverRegistry, MemoryStore, NativeDriverConfig, NodeError,
-    dev_router, native_driver_registry,
+    dev_router, load_or_create_host_id, native_driver_registry,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -113,7 +113,8 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
         LocalDrivers::Fake => DriverRegistry::with_fake()?,
         LocalDrivers::Native(native) => native_driver_registry(native.clone())?,
     };
-    DevNode::with_parts(&config.http, store, drivers)
+    let host_id = load_or_create_host_id(&config.data_dir.join("node"))?;
+    DevNode::with_parts_on_host(&config.http, store, drivers, host_id)
 }
 
 /// Bind and spawn a durable local Node service.
@@ -165,5 +166,14 @@ mod tests {
             0
         );
         running.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn compose_reuses_the_persisted_host_identity() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let config = ServeConfig::fake(DevServerConfig::loopback(0), data_dir.path().to_path_buf());
+        let first = compose(&config).expect("first Node").host().meta.id;
+        let second = compose(&config).expect("second Node").host().meta.id;
+        assert_eq!(first, second);
     }
 }

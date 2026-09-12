@@ -105,7 +105,7 @@ pub(super) fn mcp_requires_approval(
             || !string_list(args, "labels").is_empty()),
         "remuda_fleet_run" => Ok(true),
         // These local mutations have no instance-scoped execution sink.
-        "remuda_merge" | "remuda_worktree_create" => {
+        "remuda_merge" | "remuda_worktree_create" | "remuda_worktree_rm" => {
             bail!("{name} requires a Human/Bot coordinator device")
         }
         "remuda_instance_respond" => bail!("an Agent instance cannot answer approval Interactions"),
@@ -240,5 +240,20 @@ mod scope_tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn agent_cannot_mutate_local_worktrees_even_with_confirmation() {
+        let args = json!({"name":"other", "force":true, "approvalId":"forged"});
+        for tool in ["remuda_worktree_create", "remuda_worktree_rm"] {
+            assert!(mcp_requires_approval(&agent(), tool, &args).is_err());
+            for origin in [CallerOrigin::Human, CallerOrigin::Bot] {
+                let caller = CallerContext {
+                    origin,
+                    ..CallerContext::default()
+                };
+                assert!(!mcp_requires_approval(&caller, tool, &args).unwrap());
+            }
+        }
     }
 }

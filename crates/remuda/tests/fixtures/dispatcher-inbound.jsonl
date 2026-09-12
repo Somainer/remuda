@@ -1,0 +1,6 @@
+# Offline consume recording in lark-cli's flattened NDJSON format; schema-derived, not a live-app capture.
+# Adapted from remuda-feishu/tests/fixtures/im-message-p2p.jsonl and im-message-commands.jsonl.
+# Original schema query: lark-cli 1.0.76 event schema im.message.receive_v1 --json, 2026-09-12.
+{"type":"im.message.receive_v1","chat_id":"oc_dispatcher_fixture","chat_type":"p2p","message_id":"om_dispatcher_status","event_id":"ev_dispatcher_status","sender_id":"ou_dispatcher_owner","sender_type":"user","mentions":[],"message_type":"text","content":"/status","create_time":"1760000000000","timestamp":"1760000000000"}
+{"type":"im.message.receive_v1","chat_id":"oc_dispatcher_fixture","chat_type":"p2p","message_id":"om_dispatcher_prompt","event_id":"ev_dispatcher_prompt","sender_id":"ou_dispatcher_owner","sender_type":"user","mentions":[],"message_type":"text","content":"please read the README","create_time":"1760000000001","timestamp":"1760000000001"}
+{"type":"im.message.receive_v1","chat_id":"oc_dispatcher_fixture","chat_type":"p2p","message_id":"om_dispatcher_next","event_id":"ev_dispatcher_next","sender_id":"ou_dispatcher_owner","sender_type":"user","mentions":[],"message_type":"text","content":"continue","create_time":"1760000000002","timestamp":"1760000000002"}

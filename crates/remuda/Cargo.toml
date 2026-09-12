@@ -16,6 +16,7 @@ anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 remuda-hub = { workspace = true, features = ["embed-web"] }
+remuda-feishu.workspace = true
 remuda-node.workspace = true
 remuda-protocol.workspace = true
 remuda-ssh.workspace = true
@@ -45,5 +46,5 @@ remuda-hub.workspace = true
 remuda-protocol.workspace = true
 serde_json.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process", "test-util"] }
 tokio-tungstenite.workspace = true

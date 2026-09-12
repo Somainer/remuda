@@ -3,7 +3,7 @@
 //! The remuda-hub dependency enables `embed-web`; its build script embeds
 //! web/dist when present and otherwise uses the crate's fallback page.
 
-use crate::{Shutdown, config::Config};
+use crate::{Shutdown, config::Config, dispatcher};
 use clap::Args as ClapArgs;
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -15,6 +15,9 @@ pub(crate) struct Args {
     /// Serve assets from this directory before trying the embedded application.
     #[arg(long)]
     web_root: Option<PathBuf>,
+    /// Run the configured Feishu dispatcher against this Hub in the same process.
+    #[arg(long)]
+    with_dispatcher: bool,
 }
 
 impl Args {
@@ -53,11 +56,19 @@ pub(crate) async fn run(
     args: Args,
     mut shutdown: Shutdown,
 ) -> anyhow::Result<()> {
+    let with_dispatcher = args.with_dispatcher;
     args.apply(&mut config);
     config.validate()?;
+    if with_dispatcher && config.dispatcher.is_none() {
+        anyhow::bail!("--with-dispatcher requires a [dispatcher] configuration section");
+    }
     let running = start(&config).await?;
     tracing::info!(address = %running.addr, "remuda hub listening");
-    let result = shutdown.wait().await;
+    let result = if with_dispatcher {
+        dispatcher::run_configured(&config, Some(&running), shutdown.wait()).await
+    } else {
+        shutdown.wait().await
+    };
     // RunningHub::drop requests Axum graceful shutdown. TODO(remuda-hub): expose
     // an awaited shutdown handle so the CLI can also verify completion of its drain.
     drop(running);

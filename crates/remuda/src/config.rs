@@ -45,6 +45,7 @@ pub(crate) struct Config {
     pub data_dir: PathBuf,
     pub hub: Hub,
     pub node: Node,
+    pub dispatcher: Option<Dispatcher>,
     #[serde(alias = "providerProfiles")]
     pub provider_profiles: BTreeMap<String, ProviderProfile>,
     #[serde(alias = "shutdownTimeoutSecs")]
@@ -81,6 +82,157 @@ pub(crate) struct Node {
     pub workspace: PathBuf,
     #[serde(alias = "webOrigins")]
     pub web_origins: Vec<String>,
+}
+
+/// Dedicated Feishu app, Hub credentials, and persistent topic routing.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Dispatcher {
+    pub hub_url: String,
+    pub token: Option<SecretRef>,
+    pub bootstrap_token: Option<SecretRef>,
+    pub lark_cli: PathBuf,
+    pub profile: Option<String>,
+    pub session_db: Option<PathBuf>,
+    pub owner_open_ids: Vec<String>,
+    pub chat_allowlist: Vec<String>,
+    pub bot_open_id: Option<String>,
+    pub bot_name: Option<String>,
+    pub allow_unaddressed: bool,
+    pub outbound: DispatcherOutbound,
+    pub host: String,
+    pub agent: remuda_protocol::AgentKind,
+    pub model: Option<String>,
+    pub startup_timeout_secs: u64,
+    pub outbound_timeout_secs: u64,
+    pub follow_interval_ms: u64,
+    pub restart_initial_ms: u64,
+    pub restart_max_ms: u64,
+    pub line_max_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, clap::ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DispatcherOutbound {
+    #[default]
+    DryRun,
+    Live,
+}
+
+impl Default for Dispatcher {
+    fn default() -> Self {
+        Self {
+            hub_url: "http://127.0.0.1:8080".into(),
+            token: None,
+            bootstrap_token: None,
+            lark_cli: "lark-cli".into(),
+            profile: None,
+            session_db: None,
+            owner_open_ids: Vec::new(),
+            chat_allowlist: Vec::new(),
+            bot_open_id: None,
+            bot_name: None,
+            allow_unaddressed: false,
+            outbound: DispatcherOutbound::DryRun,
+            host: String::new(),
+            agent: remuda_protocol::AgentKind::Claude,
+            model: None,
+            startup_timeout_secs: 30,
+            outbound_timeout_secs: 30,
+            follow_interval_ms: 1000,
+            restart_initial_ms: 1000,
+            restart_max_ms: 30_000,
+            line_max_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl Dispatcher {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_url(&self.hub_url, false)?;
+        let uri: axum::http::Uri = self.hub_url.parse()?;
+        ensure!(
+            matches!(uri.path(), "" | "/"),
+            "dispatcher.hub_url must be a Hub base URL without a path"
+        );
+        ensure!(
+            self.profile.as_ref().is_some_and(|s| !s.trim().is_empty()
+                && s.trim() == s
+                && !s.chars().any(char::is_control)),
+            "dispatcher.profile must select a dedicated lark-cli app profile"
+        );
+        ensure!(
+            !self.owner_open_ids.is_empty(),
+            "dispatcher.owner_open_ids must contain at least one owner"
+        );
+        for values in [&self.owner_open_ids, &self.chat_allowlist] {
+            ensure!(
+                values.iter().all(|s| !s.trim().is_empty() && s.trim() == s),
+                "dispatcher owner/chat IDs must be non-empty without surrounding whitespace"
+            );
+        }
+        for value in [&self.bot_open_id, &self.bot_name, &self.model]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                !value.trim().is_empty(),
+                "dispatcher bot/model values must not be empty"
+            );
+        }
+        ensure!(
+            !self.lark_cli.as_os_str().is_empty(),
+            "dispatcher.lark_cli must not be empty"
+        );
+        ensure!(
+            self.session_db
+                .as_ref()
+                .is_none_or(|p| !p.as_os_str().is_empty()),
+            "dispatcher.session_db must not be empty"
+        );
+        ensure!(
+            self.startup_timeout_secs > 0,
+            "dispatcher.startup_timeout_secs must be positive"
+        );
+        ensure!(
+            self.outbound_timeout_secs > 0,
+            "dispatcher.outbound_timeout_secs must be positive"
+        );
+        ensure!(
+            self.follow_interval_ms > 0,
+            "dispatcher.follow_interval_ms must be positive"
+        );
+        ensure!(
+            self.restart_initial_ms > 0 && self.restart_initial_ms <= self.restart_max_ms,
+            "dispatcher restart delays require 0 < restart_initial_ms <= restart_max_ms"
+        );
+        ensure!(
+            self.line_max_bytes > 0,
+            "dispatcher.line_max_bytes must be positive"
+        );
+        Ok(())
+    }
+
+    fn absolutize(&mut self, base: &Path) -> anyhow::Result<()> {
+        if let Some(path) = &mut self.session_db {
+            ensure!(
+                !path.as_os_str().is_empty(),
+                "dispatcher.session_db must not be empty"
+            );
+            *path = absolute(base, path);
+        }
+        // A bare executable name uses PATH; paths are relative to the config file.
+        if self.lark_cli.components().count() > 1 {
+            self.lark_cli = absolute(base, &self.lark_cli);
+        }
+        for reference in [&mut self.token, &mut self.bootstrap_token]
+            .into_iter()
+            .flatten()
+        {
+            reference.absolutize(base);
+        }
+        Ok(())
+    }
 }
 
 /// A native-login profile may omit both endpoint and credentials.
@@ -170,6 +322,7 @@ impl Default for Config {
             data_dir: "./data".into(),
             hub: Hub::default(),
             node: Node::default(),
+            dispatcher: None,
             provider_profiles: BTreeMap::new(),
             shutdown_timeout_secs: 10,
         }
@@ -272,6 +425,9 @@ impl Config {
                 reference.absolutize(base);
             }
         }
+        if let Some(dispatcher) = &mut self.dispatcher {
+            dispatcher.absolutize(base)?;
+        }
         Ok(())
     }
 
@@ -346,10 +502,101 @@ impl Config {
         if env("REMUDA_BOOTSTRAP_TOKEN").is_some() {
             self.hub.bootstrap_token = Some(SecretRef::Env("REMUDA_BOOTSTRAP_TOKEN".into()));
         }
+        self.apply_dispatcher_environment(cwd, env)?;
+        Ok(())
+    }
+
+    fn apply_dispatcher_environment(
+        &mut self,
+        cwd: &Path,
+        env: &impl Fn(&str) -> Option<OsString>,
+    ) -> anyhow::Result<()> {
+        for key in [
+            "REMUDA_DISPATCHER_HUB_URL",
+            "REMUDA_DISPATCHER_PROFILE",
+            "REMUDA_DISPATCHER_LARK_CLI",
+            "REMUDA_DISPATCHER_SESSION_DB",
+            "REMUDA_DISPATCHER_OWNER_OPEN_IDS",
+            "REMUDA_DISPATCHER_CHAT_ALLOWLIST",
+            "REMUDA_DISPATCHER_BOT_OPEN_ID",
+            "REMUDA_DISPATCHER_BOT_NAME",
+            "REMUDA_DISPATCHER_ALLOW_UNADDRESSED",
+            "REMUDA_DISPATCHER_OUTBOUND",
+            "REMUDA_DISPATCHER_TOKEN_FILE",
+            "REMUDA_DISPATCHER_BOOTSTRAP_TOKEN_FILE",
+            "REMUDA_DISPATCHER_TOKEN",
+            "REMUDA_DISPATCHER_BOOTSTRAP_TOKEN",
+        ] {
+            let Some(raw) = env(key) else { continue };
+            let dispatcher = self.dispatcher.get_or_insert_with(Dispatcher::default);
+            if matches!(
+                key,
+                "REMUDA_DISPATCHER_TOKEN" | "REMUDA_DISPATCHER_BOOTSTRAP_TOKEN"
+            ) {
+                let reference = Some(SecretRef::Env(key.into()));
+                if key == "REMUDA_DISPATCHER_TOKEN" {
+                    dispatcher.token = reference;
+                } else {
+                    dispatcher.bootstrap_token = reference;
+                }
+                continue;
+            }
+            let value = raw
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("{key} is not valid UTF-8"))?;
+            match key {
+                "REMUDA_DISPATCHER_HUB_URL" => dispatcher.hub_url = value,
+                "REMUDA_DISPATCHER_PROFILE" => dispatcher.profile = Some(value),
+                "REMUDA_DISPATCHER_LARK_CLI" => {
+                    ensure!(!value.is_empty(), "{key} must not be empty");
+                    let path = PathBuf::from(value);
+                    dispatcher.lark_cli = if path.components().count() > 1 {
+                        absolute(cwd, &path)
+                    } else {
+                        path
+                    };
+                }
+                "REMUDA_DISPATCHER_SESSION_DB"
+                | "REMUDA_DISPATCHER_TOKEN_FILE"
+                | "REMUDA_DISPATCHER_BOOTSTRAP_TOKEN_FILE" => {
+                    ensure!(!value.is_empty(), "{key} must not be empty");
+                    let path = absolute(cwd, Path::new(&value));
+                    match key {
+                        "REMUDA_DISPATCHER_SESSION_DB" => dispatcher.session_db = Some(path),
+                        "REMUDA_DISPATCHER_TOKEN_FILE" => {
+                            dispatcher.token = Some(SecretRef::File(path))
+                        }
+                        _ => dispatcher.bootstrap_token = Some(SecretRef::File(path)),
+                    }
+                }
+                "REMUDA_DISPATCHER_OWNER_OPEN_IDS" => {
+                    dispatcher.owner_open_ids = parse_json_env(&value, key)?
+                }
+                "REMUDA_DISPATCHER_CHAT_ALLOWLIST" => {
+                    dispatcher.chat_allowlist = parse_json_env(&value, key)?
+                }
+                "REMUDA_DISPATCHER_BOT_OPEN_ID" => dispatcher.bot_open_id = Some(value),
+                "REMUDA_DISPATCHER_BOT_NAME" => dispatcher.bot_name = Some(value),
+                "REMUDA_DISPATCHER_ALLOW_UNADDRESSED" => {
+                    dispatcher.allow_unaddressed = parse_env(&value, key)?
+                }
+                "REMUDA_DISPATCHER_OUTBOUND" => {
+                    dispatcher.outbound = match value.as_str() {
+                        "dry-run" => DispatcherOutbound::DryRun,
+                        "live" => DispatcherOutbound::Live,
+                        _ => bail!("{key} must be dry-run or live"),
+                    };
+                }
+                _ => unreachable!("dispatcher environment keys are enumerated above"),
+            }
+        }
         Ok(())
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.validate()?;
+        }
         ensure!(
             !self.data_dir.as_os_str().is_empty(),
             "data_dir must not be empty"
@@ -529,6 +776,111 @@ mod tests {
             Some("wss://cli.example/v1/node")
         );
         assert_eq!(config.node.max_instances, 3);
+    }
+
+    #[test]
+    fn dispatcher_file_environment_and_cli_precedence_preserves_secret_references() {
+        use clap::Parser;
+        let fixture = Fixture::new(
+            r#"
+[dispatcher]
+profile = 'file-app'
+owner_open_ids = ['ou_file']
+lark_cli = './tools/lark-cli'
+session_db = './state/sessions.sqlite'
+token = 'file:./secrets/token'
+"#,
+        );
+        let mut config = fixture
+            .load(&[
+                ("REMUDA_DISPATCHER_PROFILE", "env-app"),
+                ("REMUDA_DISPATCHER_OWNER_OPEN_IDS", r#"["ou_env"]"#),
+                ("REMUDA_DISPATCHER_TOKEN_FILE", "ignored-file"),
+                ("REMUDA_DISPATCHER_TOKEN", "private-test-token"),
+                ("REMUDA_DISPATCHER_OUTBOUND", "live"),
+            ])
+            .expect("dispatcher env overlay");
+        let settings = config.dispatcher.as_ref().expect("dispatcher section");
+        assert_eq!(settings.profile.as_deref(), Some("env-app"));
+        assert_eq!(settings.owner_open_ids, ["ou_env"]);
+        assert_eq!(settings.lark_cli, fixture.0.join("tools/lark-cli"));
+        assert_eq!(
+            settings.session_db,
+            Some(fixture.0.join("state/sessions.sqlite"))
+        );
+        assert_eq!(
+            settings.token,
+            Some(SecretRef::Env("REMUDA_DISPATCHER_TOKEN".into()))
+        );
+        assert_eq!(settings.outbound, DispatcherOutbound::Live);
+        assert!(!format!("{settings:?}").contains("private-test-token"));
+        let cli = crate::Cli::try_parse_from([
+            "remuda",
+            "dispatcher",
+            "--profile",
+            "cli-app",
+            "--outbound",
+            "dry-run",
+            "--owner-open-id",
+            "ou_cli",
+            "--hub-url",
+            "https://hub.example",
+        ])
+        .expect("dispatcher flags");
+        let crate::Command::Dispatcher(args) = cli.command else {
+            panic!("dispatcher")
+        };
+        args.apply(&mut config)
+            .expect("validate final dispatcher config");
+        let settings = config.dispatcher.expect("dispatcher");
+        assert_eq!(settings.profile.as_deref(), Some("cli-app"));
+        assert_eq!(settings.owner_open_ids, ["ou_cli"]);
+        assert_eq!(settings.hub_url, "https://hub.example");
+        assert_eq!(settings.outbound, DispatcherOutbound::DryRun);
+    }
+
+    #[test]
+    fn dispatcher_rejects_missing_policy_bad_endpoints_and_invalid_timeouts() {
+        assert!(Config::default().dispatcher.is_none());
+        let valid = "[dispatcher]\nprofile = 'dedicated'\nowner_open_ids = ['ou_owner']\n";
+        assert_eq!(
+            Fixture::new(valid)
+                .load(&[])
+                .expect("valid")
+                .dispatcher
+                .expect("section")
+                .outbound,
+            DispatcherOutbound::DryRun
+        );
+        for setting in [
+            "hub_url = 'wss://hub.example'",
+            "hub_url = 'https://hub.example/path'",
+            "hub_url = 'https://user:credential@hub.example'",
+            "lark_cli = ''",
+            "session_db = ''",
+            "startup_timeout_secs = 0",
+            "outbound_timeout_secs = 0",
+            "follow_interval_ms = 0",
+            "restart_initial_ms = 31000",
+            "line_max_bytes = 0",
+            "outbound = 'automatic'",
+            "token = 'private-test-token'",
+        ] {
+            let error = Fixture::new(&format!("{valid}{setting}\n"))
+                .load(&[])
+                .expect_err("invalid dispatcher config");
+            assert!(!format!("{error:#}").contains("private-test-token"));
+        }
+        assert!(
+            Fixture::new("[dispatcher]\nprofile = 'dedicated'\n")
+                .load(&[])
+                .is_err()
+        );
+        assert!(
+            Fixture::new("[dispatcher]\nowner_open_ids = ['ou_owner']\n")
+                .load(&[])
+                .is_err()
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ mod inventory;
 mod placement;
 mod providers;
 mod push_http;
+mod rate_limit;
 mod registry;
 mod store;
 mod transport;
@@ -62,6 +63,7 @@ pub struct AppState {
     push: Option<PushService>,
     followers: Followers,
     blocked: BlockedWatch,
+    auth_limits: rate_limit::AuthRateLimits,
 }
 
 /// A bound Hub that shuts down when dropped.
@@ -166,6 +168,7 @@ async fn spawn_inner(
         push,
         followers: Followers::default(),
         blocked: BlockedWatch::default(),
+        auth_limits: rate_limit::AuthRateLimits::default(),
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     let reaper_store = store.clone();
@@ -178,9 +181,12 @@ async fn spawn_inner(
         let shutdown = async {
             let _ = rx.await;
         };
-        let server = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .into_future();
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .into_future();
         tokio::pin!(server);
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -221,6 +227,10 @@ pub fn router(state: AppState) -> Router {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }
     app.fallback(static_fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::limit_auth_attempts,
+        ))
         .layer(axum::middleware::map_response(web::security_headers))
         .with_state(state)
 }

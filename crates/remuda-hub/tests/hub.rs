@@ -214,6 +214,58 @@ async fn auth_reject_http_and_origin() -> Result<()> {
 }
 
 #[tokio::test]
+async fn login_and_pair_attempts_are_limited_by_peer_not_forwarded_headers() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    for (path, body) in [
+        ("/v1/login", json!({"bootstrapToken":"wrong"})),
+        ("/v1/devices/pair", json!({"code":"ZZZZZZZZ"})),
+    ] {
+        for i in 0..10 {
+            let forwarded = format!("192.0.2.{i}");
+            let (status, _, _) = http(
+                hub.addr,
+                "POST",
+                path,
+                &[("X-Forwarded-For", &forwarded)],
+                Some(&body.to_string()),
+            )
+            .await?;
+            assert_eq!(status, 401, "{path} attempt {i}");
+        }
+        let (status, headers, body) = http(
+            hub.addr,
+            "POST",
+            path,
+            &[("Forwarded", "for=198.51.100.1")],
+            Some(&body.to_string()),
+        )
+        .await?;
+        assert_eq!(status, 429, "{path}: {body}");
+        assert!(headers.to_ascii_lowercase().contains("retry-after: 10"));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("x-frame-options: deny")
+        );
+    }
+    let (status, _, _) = http(
+        hub.addr,
+        "POST",
+        "/v1/login",
+        &[],
+        Some(&json!({"bootstrapToken":bootstrap}).to_string()),
+    )
+    .await?;
+    assert_eq!(
+        status, 429,
+        "rate limit must precede credential verification"
+    );
+    let (status, _, _) = http(hub.addr, "GET", "/healthz", &[], None).await?;
+    assert_eq!(status, 200);
+    Ok(())
+}
+
+#[tokio::test]
 async fn node_ws_rejects_missing_token() -> Result<()> {
     let (hub, _, _dir) = boot().await?;
     let url = format!("ws://{}/v1/node", hub.addr);
@@ -683,9 +735,9 @@ async fn node_cannot_append_to_another_hosts_journal() -> Result<()> {
 }
 
 #[tokio::test]
-async fn get_instance_and_follow_with_query_token() -> Result<()> {
+async fn follow_uses_cookie_or_header_and_never_query_token() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (_cookie, token) = login(hub.addr, &bootstrap).await?;
+    let (cookie, token) = login(hub.addr, &bootstrap).await?;
 
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
     req.headers_mut().insert(
@@ -759,19 +811,61 @@ async fn get_instance_and_follow_with_query_token() -> Result<()> {
     let got: Value = serde_json::from_str(got.trim())?;
     assert_eq!(got["instanceId"], json!(instance_id));
 
-    let mut follow_req = format!(
+    let query_req = format!(
         "ws://{}/v1/follow?instanceId={}&token={}",
         hub.addr, instance_id, token
+    );
+    let rejected = tokio_tungstenite::connect_async(query_req)
+        .await
+        .err()
+        .context("query token must fail")?;
+    assert!(
+        matches!(rejected, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 401)
+    );
+    for (header, value) in [
+        ("Cookie", cookie),
+        ("Authorization", format!("Bearer {token}")),
+    ] {
+        let mut follow_req = format!("ws://{}/v1/follow?instanceId={instance_id}", hub.addr)
+            .into_client_request()?;
+        follow_req.headers_mut().insert(header, value.parse()?);
+        let (mut follow, response) =
+            tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(follow_req)).await??;
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        let snapshot = recv_json(&mut follow).await?;
+        assert_eq!(snapshot["type"], json!("snapshot"));
+        assert_eq!(snapshot["instanceId"], json!(instance_id));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoking_current_device_expires_httponly_cookie() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, token) = login(hub.addr, &bootstrap).await?;
+    let (_, _, body) = http(hub.addr, "GET", "/v1/devices", &[("Cookie", &cookie)], None).await?;
+    let devices: Value = serde_json::from_str(body.trim())?;
+    let device_id = devices["items"][0]["id"].as_str().context("device id")?;
+    let (status, headers, _) = http(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/devices/{device_id}"),
+        &[("Cookie", &cookie)],
+        None,
     )
-    .into_client_request()?;
-    follow_req.headers_mut().remove("Authorization");
-    let (mut follow, _) =
-        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(follow_req))
-            .await
-            .context("follow query token")??;
-    let snapshot = recv_json(&mut follow).await?;
-    assert_eq!(snapshot["type"], json!("snapshot"));
-    assert_eq!(snapshot["instanceId"], json!(instance_id));
+    .await?;
+    assert_eq!(status, 200);
+    assert!(headers.contains("HttpOnly; SameSite=Strict; Max-Age=0"));
+    assert_eq!(cookie_from(&headers).as_deref(), Some("remuda_device="));
+    let (status, _, _) = http(
+        hub.addr,
+        "GET",
+        "/v1/hosts",
+        &[("Authorization", &format!("Bearer {token}"))],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 401);
     Ok(())
 }
 

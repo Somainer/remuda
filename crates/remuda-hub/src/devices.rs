@@ -1,9 +1,13 @@
 //! Device list, revoke, and phone pairing-code flow.
 
 use crate::AppState;
-use crate::auth::{device_cookie, hash_secret, require_device, require_origin, verify_secret};
+use crate::auth::{
+    PAIR_CODE_ALPHABET, device_cookie, expired_device_cookie, hash_secret, require_device,
+    require_origin, verify_secret,
+};
 use crate::config::now_rfc3339;
 use crate::error::HubError;
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
@@ -12,7 +16,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 /// Device management routes.
 pub fn routes() -> Router<AppState> {
@@ -48,14 +51,24 @@ async fn revoke_device(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<Value>, HubError> {
+) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = require_device(&state.store, &headers).await?;
+    let revoking_self = device.id == id;
     let ok = state.store.delete_device(id).await?;
     if !ok {
         return Err(HubError::NotFound);
     }
-    Ok(Json(json!({ "ok": true })))
+    let mut response = Json(json!({ "ok": true })).into_response();
+    if revoking_self {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            expired_device_cookie(state.config.cookie_secure)
+                .parse()
+                .map_err(|_| HubError::Internal("invalid expiry cookie".into()))?,
+        );
+    }
+    Ok(response)
 }
 
 async fn issue_pair_code(
@@ -64,17 +77,26 @@ async fn issue_pair_code(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = require_device(&state.store, &headers).await?;
-    let code = pairing_code();
-    let hash = hash_secret(&code)?;
     let expires = expires_rfc3339(600);
-    state
-        .store
-        .insert_pair_code(hash, device.id, expires.clone())
-        .await?;
-    Ok(Json(json!({
-        "code": code,
-        "expiresAt": expires,
-    })))
+    for _ in 0..8 {
+        let code = pairing_code()?;
+        let hash = hash_secret(&code)?;
+        if state
+            .store
+            .insert_pair_code(
+                hash,
+                code[..4].to_owned(),
+                device.id.clone(),
+                expires.clone(),
+            )
+            .await?
+        {
+            return Ok(Json(json!({"code": code, "expiresAt": expires})));
+        }
+    }
+    Err(HubError::Internal(
+        "pairing selector allocation failed".into(),
+    ))
 }
 
 async fn redeem_pair_code(
@@ -94,7 +116,10 @@ async fn redeem_pair_code(
     }
     let token = crate::config::random_token();
     let hash = hash_secret(&token)?;
-    let device = state.store.insert_device(body.device_name, hash).await?;
+    let device = state
+        .store
+        .insert_device(body.device_name, hash, token[..16].to_owned())
+        .await?;
     let cookie = device_cookie(&token, state.config.cookie_secure);
     let body = json!({
         "deviceId": device.id,
@@ -104,15 +129,17 @@ async fn redeem_pair_code(
     Ok((StatusCode::OK, [(header::SET_COOKIE, cookie)], Json(body)).into_response())
 }
 
-fn pairing_code() -> String {
-    const ALPH: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let raw = Uuid::new_v4();
-    let bytes = raw.as_bytes();
+fn pairing_code() -> Result<String, HubError> {
+    let mut bytes = [0; 8];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| HubError::Internal("pairing entropy unavailable".into()))?;
     let mut out = String::with_capacity(8);
-    for b in bytes.iter().take(8) {
-        out.push(ALPH[(*b as usize) % ALPH.len()] as char);
+    for b in bytes {
+        // The 32-symbol alphabet divides 256 exactly, so this is unbiased.
+        out.push(PAIR_CODE_ALPHABET[b as usize % PAIR_CODE_ALPHABET.len()] as char);
     }
-    out
+    Ok(out)
 }
 
 fn expires_rfc3339(secs: i64) -> String {

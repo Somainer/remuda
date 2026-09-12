@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
+#[cfg(test)]
+#[path = "store_auth_tests.rs"]
+mod auth_tests;
+
 /// SQLite or actor failures.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -469,51 +473,58 @@ impl Store {
         &self,
         name: String,
         token_hash: String,
+        token_prefix: String,
     ) -> Result<Device, StoreError> {
         self.run(move |conn| {
             let id = new_id("dev").map_err(|e| StoreError::Id(e.to_string()))?;
             let now = now_rfc3339();
             conn.execute(
-                "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
-                params![id, name, token_hash, now],
+                "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, token_prefix)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params![id, name, token_hash, now, token_prefix],
             )?;
             Ok(Device { id, name })
         })
         .await
     }
 
-    /// Lookup a device by verifying `token` against stored hashes.
+    /// Indexed lookup, followed by one full-token verification. Legacy cookies
+    /// may migrate using an explicit device id, never a scan of salted hashes.
     pub async fn find_device_by_token<F>(
         &self,
         token: String,
+        legacy_device_id: Option<String>,
         verify: F,
     ) -> Result<Option<Device>, StoreError>
     where
         F: Fn(&str, &str) -> bool + Send + 'static,
     {
         self.run(move |conn| {
-            let mut stmt =
-                conn.prepare("SELECT id, name, token_hash FROM devices ORDER BY created_at")?;
-            let rows = stmt.query_map([], |row| {
+            let Some(prefix) = crate::auth::token_prefix(&token) else { return Ok(None); };
+            let read_row = |row: &rusqlite::Row<'_>| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                 ))
-            })?;
-            for row in rows {
-                let (id, name, hash) = row?;
-                if verify(&token, &hash) {
-                    let now = now_rfc3339();
-                    conn.execute(
-                        "UPDATE devices SET last_seen_at = ?1 WHERE id = ?2",
-                        params![now, id],
-                    )?;
-                    return Ok(Some(Device { id, name }));
-                }
+            };
+            let mut candidate = conn.query_row(
+                "SELECT id, name, token_hash FROM devices WHERE token_prefix = ?1",
+                params![prefix], read_row,
+            ).optional()?;
+            if candidate.is_none() && let Some(id) = legacy_device_id {
+                candidate = conn.query_row(
+                    "SELECT id, name, token_hash FROM devices WHERE id = ?1 AND token_prefix IS NULL",
+                    params![id], read_row,
+                ).optional()?;
             }
-            Ok(None)
+            let Some((id, name, hash)) = candidate else { return Ok(None); };
+            if !verify(&token, &hash) { return Ok(None); }
+            conn.execute(
+                "UPDATE devices SET last_seen_at = ?1, token_prefix = ?2 WHERE id = ?3",
+                params![now_rfc3339(), prefix, id],
+            )?;
+            Ok(Some(Device { id, name }))
         })
         .await
     }
@@ -529,19 +540,28 @@ impl Store {
         F: Fn(&str, &str) -> bool + Send + 'static,
     {
         self.run(move |conn| {
-            let mut stmt = conn.prepare("SELECT id, token_hash FROM hosts")?;
-            let rows = stmt.query_map([], |row| {
+            let prefix = crate::auth::token_prefix(&request.presented);
+            let read_row = |row: &rusqlite::Row<'_>| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                let (id, hash) = row?;
-                if verify(&request.presented, &hash) {
+            };
+            let mut candidate = conn.query_row(
+                "SELECT id, token_hash FROM hosts WHERE token_prefix = ?1",
+                params![prefix], read_row,
+            ).optional()?;
+            if candidate.is_none() && prefix.is_some() && let Some(id) = &request.hello_host_id {
+                candidate = conn.query_row(
+                    "SELECT id, token_hash FROM hosts WHERE id = ?1 AND token_prefix IS NULL",
+                    params![id], read_row,
+                ).optional()?;
+            }
+            if let Some((id, hash)) = candidate
+                && verify(&request.presented, &hash) {
+                    conn.execute("UPDATE hosts SET token_prefix = ?1 WHERE id = ?2", params![prefix, id])?;
                     let host = touch_host_online(conn, &id, &request.node_version)?;
                     return Ok(HostAuthOutcome::Authenticated {
                         host: Box::new(host),
                         node_token: None,
                     });
-                }
             }
             if !crate::config::secret_eq(&request.presented, &request.bootstrap) {
                 return Ok(HostAuthOutcome::Rejected);
@@ -562,9 +582,9 @@ impl Store {
             conn.execute(
                 "INSERT INTO hosts
                     (id, label, token_hash, state, last_seen_at, node_version, cli_json, capabilities_json,
-                     created_at, transport, labels_json, herdr_json, resources_json, max_instances, hostname)
-                 VALUES (?1, ?2, ?3, 'online', ?4, ?5, '[]', '{}', ?4, 'outbound-wss', '[]', NULL, NULL, 8, NULL)",
-                params![host_id, label, token_hash, now, request.node_version],
+                     created_at, transport, labels_json, herdr_json, resources_json, max_instances, hostname, token_prefix)
+                 VALUES (?1, ?2, ?3, 'online', ?4, ?5, '[]', '{}', ?4, 'outbound-wss', '[]', NULL, NULL, 8, NULL, ?6)",
+                params![host_id, label, token_hash, now, request.node_version, crate::auth::token_prefix(&node_token)],
             )?;
             let host = load_host(conn, &host_id)?
                 .ok_or_else(|| StoreError::Id("host insert missing".into()))?;
@@ -1330,16 +1350,19 @@ impl Store {
     pub async fn insert_pair_code(
         &self,
         code_hash: String,
+        code_prefix: String,
         created_by: String,
         expires_at: String,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         self.run(move |conn| {
-            conn.execute(
-                "INSERT INTO pair_codes (code_hash, created_by, expires_at, used)
-                 VALUES (?1, ?2, ?3, 0)",
-                params![code_hash, created_by, expires_at],
+            conn.execute("DELETE FROM pair_codes WHERE used != 0 OR expires_at <= ?1 OR failed_attempts >= ?2",
+                params![now_rfc3339(), crate::auth::MAX_PAIR_FAILURES])?;
+            let inserted = conn.execute(
+                "INSERT INTO pair_codes (code_hash, created_by, expires_at, used, code_prefix)
+                 VALUES (?1, ?2, ?3, 0, ?4) ON CONFLICT DO NOTHING",
+                params![code_hash, created_by, expires_at, code_prefix],
             )?;
-            Ok(())
+            Ok(inserted != 0)
         })
         .await
     }
@@ -1355,28 +1378,19 @@ impl Store {
         F: Fn(&str, &str) -> bool + Send + 'static,
     {
         self.run(move |conn| {
-            let mut stmt = conn.prepare("SELECT code_hash, expires_at, used FROM pair_codes")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (hash, expires_at, used) = row?;
-                if used != 0 || expires_at < now {
-                    continue;
-                }
-                if verify(&presented, &hash) {
-                    conn.execute(
-                        "UPDATE pair_codes SET used = 1 WHERE code_hash = ?1",
-                        params![hash],
-                    )?;
-                    return Ok(true);
-                }
+            let Some(prefix) = crate::auth::pair_prefix(&presented) else { return Ok(false); };
+            let hash = conn.query_row(
+                "SELECT code_hash FROM pair_codes WHERE code_prefix = ?1 AND used = 0 AND expires_at > ?2 AND failed_attempts < ?3",
+                params![prefix, now, crate::auth::MAX_PAIR_FAILURES], |row| row.get::<_, String>(0),
+            ).optional()?;
+            let Some(hash) = hash else { return Ok(false); };
+            let accepted = verify(&presented, &hash);
+            if accepted {
+                conn.execute("UPDATE pair_codes SET used = 1 WHERE code_hash = ?1", params![hash])?;
+            } else {
+                conn.execute("UPDATE pair_codes SET failed_attempts = failed_attempts + 1 WHERE code_hash = ?1", params![hash])?;
             }
-            Ok(false)
+            Ok(accepted)
         })
         .await
     }
@@ -1797,6 +1811,18 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "hosts", "hostname", "TEXT")?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
+    ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
+    ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
+    ensure_column(&conn, "pair_codes", "code_prefix", "TEXT")?;
+    ensure_column(
+        &conn,
+        "pair_codes",
+        "failed_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS devices_token_prefix ON devices(token_prefix) WHERE token_prefix IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
     dedup_duplicate_hosts(&conn)?;
     Ok(conn)
 }

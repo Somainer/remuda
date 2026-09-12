@@ -33,7 +33,6 @@ import {
 } from "./mock";
 import { digestPlaceholder, id, now } from "./ids";
 import { parseScreenBody, type ScreenRead } from "./screen";
-import { accessHeaders, readAccessCode, writeAccessCode } from "./accessCode";
 import { HubHttpError } from "./httpError";
 import { readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
 import { coerceObservation, coerceObservationList } from "./hubJournal";
@@ -395,15 +394,15 @@ function wsUrl(path: string): string {
 function followUrl(instanceId: Id): string {
   const url = new URL(wsUrl("/v1/follow"));
   url.searchParams.set("instanceId", instanceId);
-  const token = readSession()?.token ?? readAccessCode();
-  if (token) url.searchParams.set("token", token);
   return url.toString();
 }
 
-async function rest<T>(path: string, init: RequestInit & { auth?: boolean } = {}): Promise<T> {
-  const { auth = true, ...req } = init;
+async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
+  const session = readSession();
   const headers = {
-    ...(auth ? accessHeaders() : { "content-type": "application/json" }),
+    "content-type": "application/json",
+    // Allows a single-row migration of cookies issued before token indexing.
+    ...(session ? { "X-Remuda-Device-Id": session.deviceId } : {}),
     ...(req.headers as Record<string, string> | undefined),
   };
   const res = await fetch(`${hubBase()}${path}`, {
@@ -765,19 +764,15 @@ function createLiveApi(): HubApi {
     async login(bootstrapToken, deviceName) {
       const body = await rest<HubJson<"/v1/login", "post">>("/v1/login", {
         method: "POST",
-        auth: false,
         body: JSON.stringify({ bootstrapToken, deviceName }),
       });
-      writeAccessCode(body.token);
       return body;
     },
     async pairRedeem(code, deviceName) {
       const body = await rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
         method: "POST",
-        auth: false,
         body: JSON.stringify({ code, deviceName }),
       });
-      writeAccessCode(body.token);
       return body;
     },
     async pairCode() {
@@ -793,7 +788,8 @@ function createLiveApi(): HubApi {
       return rest<HubJson<"/v1/devices/{id}", "delete">>(`/v1/devices/${deviceId}`, { method: "DELETE" });
     },
     hasDeviceSession() {
-      return Boolean(readSession()?.token || readAccessCode());
+      // Persisted metadata is only a UI hint; the Hub validates the cookie.
+      return Boolean(readSession());
     },
     async hello() {
       const health = await rest<{ ok?: boolean }>("/healthz");

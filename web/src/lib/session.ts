@@ -18,24 +18,32 @@ export type PairCode = {
 
 const SESSION_KEY = "runtime.device-session";
 const LOGGED_OUT_KEY = "runtime.logged-out";
+const LEGACY_ACCESS_KEY = "runtime.access-code";
+let memorySession: DeviceSession | null = null;
 
 export const MOCK_BOOTSTRAP_TOKEN = "dev-bootstrap";
 
 export function readSession(): DeviceSession | null {
   try {
+    // Previous builds persisted the same bearer secret under two keys.
+    localStorage.removeItem(LEGACY_ACCESS_KEY);
     const raw = localStorage.getItem(SESSION_KEY);
-    if (!raw) return null;
+    if (!raw) return memorySession;
     const parsed = JSON.parse(raw) as Partial<DeviceSession>;
-    if (!parsed.deviceId || !parsed.token || !parsed.name) return null;
-    return { deviceId: parsed.deviceId, token: parsed.token, name: parsed.name };
+    if (typeof parsed.deviceId !== "string" || !parsed.deviceId || typeof parsed.name !== "string" || !parsed.name) return null;
+    const metadata = { deviceId: parsed.deviceId, name: parsed.name };
+    if ("token" in parsed) localStorage.setItem(SESSION_KEY, JSON.stringify(metadata));
+    return { ...metadata, token: memorySession?.deviceId === parsed.deviceId ? memorySession.token : "" };
   } catch {
-    return null;
+    return memorySession;
   }
 }
 
 export function writeSession(session: DeviceSession): void {
+  memorySession = { ...session };
   try {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    localStorage.removeItem(LEGACY_ACCESS_KEY);
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ deviceId: session.deviceId, name: session.name }));
     localStorage.removeItem(LOGGED_OUT_KEY);
     localStorage.setItem(DEVICE_KEY, session.deviceId);
   } catch {
@@ -44,7 +52,9 @@ export function writeSession(session: DeviceSession): void {
 }
 
 export function clearSession(): void {
+  memorySession = null;
   try {
+    localStorage.removeItem(LEGACY_ACCESS_KEY);
     localStorage.removeItem(SESSION_KEY);
     localStorage.setItem(LOGGED_OUT_KEY, "1");
   } catch {
@@ -69,9 +79,6 @@ export function rememberDeviceId(deviceId: string): void {
 }
 
 export function dropDeviceCookie(): void {
-  try {
-    document.cookie = "remuda_device=; Path=/; Max-Age=0; SameSite=Strict";
-  } catch {
-    /* ignore */
-  }
+  // The Hub clears the HttpOnly cookie on device revocation. JavaScript cannot
+  // read or delete it; clearSession separately drops the in-memory credential.
 }

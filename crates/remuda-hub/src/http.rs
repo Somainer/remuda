@@ -74,6 +74,9 @@ pub struct CreateInstanceBody {
     claude_config_dir: Option<String>,
     #[serde(default, rename = "maxBudgetUsd")]
     max_budget_usd: Option<serde_json::Value>,
+    /// Native effort selection persisted on the instance spec.
+    #[serde(default)]
+    effort: Option<Value>,
 }
 
 fn default_kind() -> String {
@@ -243,6 +246,9 @@ pub async fn create_instance(
         if let Some(budget) = &body.max_budget_usd {
             obj.insert("maxBudgetUsd".into(), budget.clone());
         }
+        if let Some(effort) = &body.effort {
+            obj.insert("effort".into(), effort.clone());
+        }
     }
     crate::providers::attach_provider_to_spec(&state, &mut spec).await?;
     let placement =
@@ -302,7 +308,7 @@ pub async fn post_command(
         .store
         .queue_command(
             body.command_id,
-            Some(instance_id),
+            Some(instance_id.clone()),
             instance.host_id.clone(),
             body.operation,
             payload,
@@ -310,6 +316,13 @@ pub async fn post_command(
         )
         .await
         .map_err(map_store)?;
+    if command.operation == "instance.configure" {
+        state
+            .store
+            .patch_instance_configure(instance_id, command.payload.clone())
+            .await
+            .map_err(map_store)?;
+    }
     if !created {
         return Ok(Json(json!({ "command": command, "replayed": true })));
     }

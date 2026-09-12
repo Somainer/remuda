@@ -34,6 +34,28 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .await?;
             serde_json::to_value(&created).map_err(NodeError::from)
         }
+        "instance.configure" => {
+            let instance_id = instance_id_of(&params)?;
+            let result = node
+                .submit_command(
+                    &instance_id,
+                    InstanceCommandRequest {
+                        command_id: command_id_of(&params),
+                        operation: CommandAction::Configure,
+                        prompt: None,
+                        run_id: None,
+                        interaction_id: None,
+                        answer: None,
+                        keys: None,
+                        model: None,
+                        effort_name: None,
+                        effort_index: None,
+                    }
+                    .with_configure(&params),
+                )
+                .await?;
+            serde_json::to_value(&result).map_err(NodeError::from)
+        }
         "instance.send" => {
             let instance_id = instance_id_of(&params)?;
             let result = node
@@ -47,6 +69,9 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         interaction_id: None,
                         answer: None,
                         keys: None,
+                        model: None,
+                        effort_name: None,
+                        effort_index: None,
                     },
                 )
                 .await?;
@@ -65,6 +90,9 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         interaction_id: None,
                         answer: None,
                         keys: None,
+                        model: None,
+                        effort_name: None,
+                        effort_index: None,
                     },
                 )
                 .await?;
@@ -87,6 +115,9 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         interaction_id,
                         answer: Some(params.get("answer").cloned().unwrap_or(Value::Null)),
                         keys: None,
+                        model: None,
+                        effort_name: None,
+                        effort_index: None,
                     },
                 )
                 .await?;

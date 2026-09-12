@@ -39,25 +39,26 @@ export function HostsPage() {
 
   return (
     <div className={css.board} data-testid="hosts-page">
-      <header className={css.head}>
+      <header className={css.head} data-testid="hosts-head">
         <h1 className={css.title}>主机</h1>
-        <div className={css.count}>
-          {visible.length} 台 · {online} 在线
+        <div className={css.headMeta}>
+          <div className={css.count}>
+            {visible.length} 台 · {online} 在线
+          </div>
+          <Link to="/fleet" className={css.count}>
+            Fleet
+          </Link>
+          {stale.length > 0 ? (
+            <button
+              type="button"
+              className={`${css.toggle} ${showStale ? css.toggleOn : ""}`}
+              data-testid="hosts-show-stale"
+              onClick={() => setShowStale((on) => !on)}
+            >
+              {showStale ? "隐藏过期" : `显示过期 (${stale.length})`}
+            </button>
+          ) : null}
         </div>
-        <Link to="/fleet" className={css.count}>
-          Fleet
-        </Link>
-        <div style={{ flex: 1 }} />
-        {stale.length > 0 ? (
-          <button
-            type="button"
-            className={`${css.toggle} ${showStale ? css.toggleOn : ""}`}
-            data-testid="hosts-show-stale"
-            onClick={() => setShowStale((on) => !on)}
-          >
-            {showStale ? "隐藏过期" : `显示过期 (${stale.length})`}
-          </button>
-        ) : null}
         <button type="button" className={css.add} data-testid="hosts-add" onClick={() => setAdding(true)}>
           添加主机
         </button>

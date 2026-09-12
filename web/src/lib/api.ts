@@ -175,6 +175,9 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     name?: string | null;
     delegation?: string | null;
     providerProfileId?: string | null;
+    model?: string | null;
+    effortName?: string | null;
+    effortIndex?: number | null;
   };
   return {
     id,
@@ -219,6 +222,9 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     delegation: typeof rec.delegation === "string" ? rec.delegation : extra.delegation ?? null,
     providerProfileId:
       typeof rec.providerProfileId === "string" ? rec.providerProfileId : extra.providerProfileId ?? null,
+    model: typeof extra.model === "string" ? extra.model : null,
+    effortName: typeof extra.effortName === "string" ? extra.effortName : null,
+    effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
   };
 }
 
@@ -536,6 +542,11 @@ function createMockApi(): HubApi {
       instance.cwd = spec.cwd ?? null;
       instance.delegation = spec.delegation ?? "none";
       instance.providerProfileId = spec.providerProfileId;
+      instance.model = spec.model;
+      if (spec.effortName != null) {
+        instance.effortName = spec.effortName;
+        instance.effortIndex = spec.effortIndex ?? 0;
+      }
       return {
         instance,
         command: {
@@ -596,7 +607,7 @@ function createMockApi(): HubApi {
       return mockResume(instanceId);
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
-      return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode);
+      return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode, extras);
     },
     async interactionList(q) {
       return mockDb.interactions.filter((i) => {
@@ -863,7 +874,12 @@ function createLiveApi(): HubApi {
       };
       const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
         method: "POST",
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          ...body,
+          ...(spec.effortName != null
+            ? { effort: { name: spec.effortName, index: spec.effortIndex ?? 0, kind: spec.kind } }
+            : {}),
+        }),
       });
       const instance = remember(mapInstance(created.instance), spec.prompt.slice(0, 80) || spec.name);
       titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");

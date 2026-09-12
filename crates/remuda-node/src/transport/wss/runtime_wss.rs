@@ -138,6 +138,20 @@ async fn dispatch_hub(
             catch_up(runtime, &instance_id).await?;
             Ok(result)
         }
+        Some(HubNodeMethod::InstanceConfigure) => {
+            let instance_id = params
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    NodeError::InvalidRequest("instance.configure requires instanceId".into())
+                })?;
+            let instance_id = InstanceId::try_from(instance_id.to_owned())
+                .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
+            let result =
+                crate::transport::hubnode::dispatch_method(&runtime.node, method, params).await?;
+            catch_up(runtime, &instance_id).await?;
+            Ok(result)
+        }
         Some(HubNodeMethod::InstanceCancel) => {
             let (instance_id, result) = cancel_from_params(&runtime.node, params).await?;
             catch_up(runtime, &instance_id).await?;
@@ -298,6 +312,9 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 interaction_id: None,
                 answer: None,
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -334,6 +351,9 @@ async fn cancel_from_params(
                 interaction_id: None,
                 answer: None,
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -366,6 +386,9 @@ async fn close_from_params(
                 interaction_id: None,
                 answer: None,
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -423,6 +446,9 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 interaction_id: None,
                 answer: None,
                 keys: Some(keys),
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -467,6 +493,9 @@ async fn respond_from_params(
                 interaction_id,
                 answer: Some(answer),
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;

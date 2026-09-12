@@ -868,6 +868,9 @@ async fn dispatch_rpc(
             }
             serde_json::to_value(node.create_instance(request).await?).map_err(NodeError::from)
         }
+        "instance.configure" => {
+            crate::transport::hubnode::dispatch_method(node, method, params).await
+        }
         "instance.send" => {
             let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
             let prompt = prompt_from_params(&params).ok_or_else(|| {
@@ -961,6 +964,9 @@ async fn dispatch_rpc(
                         interaction_id: None,
                         answer: None,
                         keys: Some(keys),
+                        model: None,
+                        effort_name: None,
+                        effort_index: None,
                     },
                 )
                 .await?;
@@ -1022,6 +1028,9 @@ async fn submit_rpc_command(
                 interaction_id: None,
                 answer: None,
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;

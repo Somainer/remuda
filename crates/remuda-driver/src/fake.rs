@@ -39,6 +39,8 @@ struct State {
     instance_id: Option<InstanceId>,
     host: Option<remuda_protocol::HostId>,
     seq: u64,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 impl Default for FakeDriver {
@@ -59,6 +61,8 @@ impl FakeDriver {
                 instance_id: None,
                 host: None,
                 seq: 0,
+                model: None,
+                effort: None,
             }),
         }
     }
@@ -268,8 +272,50 @@ impl Driver for FakeDriver {
         match &input {
             DriverInput::Prompt(_) => {}
             DriverInput::Steer(_) => return Err(DriverError::CapabilityUnknown("steer".into())),
-            DriverInput::ModelSwitch(_) => {
-                return Err(DriverError::CapabilityUnknown("model-switch".into()));
+            DriverInput::ModelSwitch(switch) => {
+                {
+                    let mut state = self.state.lock().await;
+                    if !state.started || state.closed {
+                        return Err(DriverError::ControlUnavailable);
+                    }
+                    if !switch.model_id.is_empty() {
+                        state.model = Some(switch.model_id.clone());
+                    }
+                    if let Some(effort) = &switch.effort {
+                        state.effort = Some(effort.clone());
+                    }
+                }
+                let mut related = BTreeMap::new();
+                if !switch.model_id.is_empty() {
+                    related.insert("model".into(), switch.model_id.clone());
+                }
+                if let Some(effort) = &switch.effort {
+                    related.insert("effort".into(), effort.clone());
+                }
+                self.emit(ObservationPayload::Lifecycle(Box::new(
+                    LifecyclePayload::Native(Box::new(NativeLifecycle {
+                        topic: LifecycleTopic::Session,
+                        native_name: "model-switch".into(),
+                        native_id: Knowledge::NotApplicable,
+                        status: Knowledge::Known {
+                            value: format!(
+                                "applied model={} effort={}",
+                                if switch.model_id.is_empty() {
+                                    "-"
+                                } else {
+                                    switch.model_id.as_str()
+                                },
+                                switch.effort.as_deref().unwrap_or("-"),
+                            ),
+                        },
+                        related_ids: related,
+                        data_ref: None,
+                        severity: Severity::Info,
+                        affects_completion: false,
+                    })),
+                )))
+                .await?;
+                return Ok(DriverAck::transport_written());
             }
         }
         self.emit(ObservationPayload::Message(Box::new(MessagePayload {
@@ -417,5 +463,42 @@ mod tests {
         let json = serde_json::to_string(handle.recipe()).unwrap();
         assert!(!json.contains("sk-"));
         driver.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_claude_applies_model_switch_with_effort() {
+        let driver = FakeDriver::new();
+        let spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        let mut handle = driver.start(spec).await.unwrap();
+        let _ = handle.recv().await.expect("session lifecycle");
+        let _ = handle.recv().await.expect("fixture message");
+        driver
+            .send(DriverInput::ModelSwitch(Box::new(
+                remuda_protocol::ModelSwitchInput {
+                    model_id: "opus".into(),
+                    effective: remuda_protocol::ModelEffective::NextTurn,
+                    effort: Some("ultracode".into()),
+                },
+            )))
+            .await
+            .unwrap();
+        let applied = handle.recv().await.expect("model-switch observation");
+        let ObservationPayload::Lifecycle(payload) = applied.body else {
+            panic!("expected lifecycle, got {:?}", applied.body);
+        };
+        let LifecyclePayload::Native(native) = payload.as_ref() else {
+            panic!("expected native lifecycle");
+        };
+        assert_eq!(native.native_name, "model-switch");
+        assert_eq!(
+            native.status,
+            Knowledge::Known {
+                value: "applied model=opus effort=ultracode".into(),
+            }
+        );
+        let state = driver.state.lock().await;
+        assert_eq!(state.model.as_deref(), Some("opus"));
+        assert_eq!(state.effort.as_deref(), Some("ultracode"));
     }
 }

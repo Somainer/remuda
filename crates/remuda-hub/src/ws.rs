@@ -566,6 +566,7 @@ pub(crate) async fn handle_node_method(
         }
         "instance.create"
         | "instance.send"
+        | "instance.configure"
         | "instance.cancel"
         | "instance.respond"
         | "interaction.respond" => {

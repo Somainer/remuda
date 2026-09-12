@@ -458,13 +458,18 @@ mod tests {
         let stopped_dir = dir.path().to_owned();
         let stop = async move {
             entered.notified().await;
-            // Both subscriptions have restarted before requesting shutdown.
+            // Both subscriptions have restarted *and* finished replaying before
+            // requesting shutdown. `.starts` is bumped before the replay begins,
+            // so waiting on it alone races the replayed `continue` line into the
+            // channel against `events.close()` — under load the accepted prompt
+            // could then never be dispatched. `.replayed` is written only after
+            // every line has been flushed, so the events are already queued.
             for key in [
                 remuda_feishu::EVENT_IM_RECEIVE,
                 remuda_feishu::EVENT_CARD_ACTION,
             ] {
-                let path = stopped_dir.join(format!("{key}.starts"));
-                tokio::time::timeout(Duration::from_secs(5), async {
+                let path = stopped_dir.join(format!("{key}.replayed"));
+                tokio::time::timeout(Duration::from_secs(30), async {
                     loop {
                         if std::fs::read_to_string(&path).ok().as_deref() == Some("2") {
                             break;
@@ -473,7 +478,7 @@ mod tests {
                     }
                 })
                 .await
-                .expect("consume restarted");
+                .expect("consume restarted and replayed");
             }
             tokio::spawn(async move {
                 wait_for(&stopped_dir.join("im.message.receive_v1.stopped")).await;

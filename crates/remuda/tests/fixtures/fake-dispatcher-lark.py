@@ -43,6 +43,10 @@ if not os.environ.get("REMUDA_TEST_LARK_UNREADY"):
             if os.environ.get("REMUDA_TEST_LARK_STATUS_ONLY") and json.loads(line)["content"] != "/status":
                 continue
             print(line, flush=True)
+    # Written only after every replayed line has been flushed, so a test can
+    # wait for delivery rather than for the restart counter, which is bumped
+    # before the replay begins.
+    (directory / (key + ".replayed")).write_text(str(attempt))
 
 # EOF is distinct from SIGTERM so tests can prove the root retained stdin.
 for _line in sys.stdin:

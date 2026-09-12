@@ -1068,6 +1068,8 @@ impl IntoResponse for ApiError {
             NodeError::InvalidRequest(_) | NodeError::Wire(_) | NodeError::Json(_) => {
                 StatusCode::BAD_REQUEST
             }
+            NodeError::InteractionExpired => StatusCode::GONE,
+            NodeError::InteractionSuperseded { .. } => StatusCode::CONFLICT,
             NodeError::QueueFull => StatusCode::TOO_MANY_REQUESTS,
             NodeError::InvalidConfig(_) => StatusCode::INTERNAL_SERVER_ERROR,
             NodeError::DriverUnavailable | NodeError::Driver(_) => StatusCode::SERVICE_UNAVAILABLE,

@@ -2,8 +2,8 @@
 
 use crate::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, Driver, DriverEmission,
-    DriverLaunch, DriverRegistry, DriverRequest, InstanceCommandRequest, LocalStore, MemoryStore,
-    NodeError,
+    DriverLaunch, DriverRegistry, DriverRequest, InstanceCommandRequest, InteractionRuntime,
+    LocalStore, MemoryStore, NodeError,
     store::{timestamp_now, unknown},
 };
 use remuda_protocol::{
@@ -34,6 +34,7 @@ struct QueuedCommand {
 struct DevNodeInner {
     store: Arc<dyn LocalStore>,
     drivers: DriverRegistry,
+    interactions: Arc<InteractionRuntime>,
     senders: RwLock<BTreeMap<InstanceId, mpsc::Sender<QueuedCommand>>>,
     queue_capacity: usize,
     host: Host,
@@ -70,10 +71,12 @@ impl DevNode {
         let workspace_id = WorkspaceId::new();
         let host = fixture_host(host_id.clone())?;
         let workspace = fixture_workspace(workspace_id, host_id, &config.workspace_root)?;
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store))?;
         Ok(Self {
             inner: Arc::new(DevNodeInner {
                 store,
                 drivers,
+                interactions,
                 senders: RwLock::new(BTreeMap::new()),
                 queue_capacity: config.instance_queue_capacity,
                 host,
@@ -150,6 +153,10 @@ impl DevNode {
             },
         )?;
         self.inner.store.insert_instance(instance)?;
+        self.inner
+            .interactions
+            .register_driver(instance_id.clone(), Arc::clone(&driver))
+            .await;
         let observations = match driver.start().await {
             Ok(observations) => observations,
             Err(error) => {
@@ -301,22 +308,39 @@ impl DevNode {
         self.inner.projection_epoch.clone()
     }
 
+    /// Hub→Node `interaction.list` / `interaction.answer`.
+    pub async fn dispatch_interaction(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, NodeError> {
+        self.inner.interactions.dispatch_rpc(method, params).await
+    }
+
     fn spawn_observation_pump(
         &self,
         instance_id: InstanceId,
         mut observations: mpsc::Receiver<remuda_protocol::Observation>,
     ) {
         let store = self.inner.store.clone();
+        let interactions = Arc::clone(&self.inner.interactions);
         tokio::spawn(async move {
             while let Some(observation) = observations.recv().await {
-                if let Err(error) = store.append_driver_observation(&instance_id, observation) {
-                    tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
-                    record_task_exit(
-                        store.as_ref(),
-                        &instance_id,
-                        "native-observation-commit-failed",
-                    );
-                    break;
+                match store.append_driver_observation(&instance_id, observation) {
+                    Ok(committed) => {
+                        if let Err(error) = interactions.ingest(&committed).await {
+                            tracing::debug!(%error, "interaction ingest failed");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
+                        record_task_exit(
+                            store.as_ref(),
+                            &instance_id,
+                            "native-observation-commit-failed",
+                        );
+                        break;
+                    }
                 }
             }
         });
@@ -330,11 +354,11 @@ impl DevNode {
             .await
             .insert(instance_id.clone(), sender);
         let store = self.inner.store.clone();
+        let interactions = Arc::clone(&self.inner.interactions);
         let worker_instance = instance_id.clone();
-        let worker =
-            tokio::spawn(
-                async move { instance_worker(store, worker_instance, driver, receiver).await },
-            );
+        let worker = tokio::spawn(async move {
+            instance_worker(store, worker_instance, driver, receiver, interactions).await
+        });
         let store = self.inner.store.clone();
         tokio::spawn(async move {
             match worker.await {
@@ -393,6 +417,7 @@ async fn instance_worker(
     instance_id: InstanceId,
     driver: Arc<dyn Driver>,
     mut receiver: mpsc::Receiver<QueuedCommand>,
+    interactions: Arc<InteractionRuntime>,
 ) -> Result<(), NodeError> {
     while let Some(queued) = receiver.recv().await {
         let mut command = store.get_command(&queued.command_id)?;
@@ -425,12 +450,13 @@ async fn instance_worker(
         match result {
             Ok(emissions) => {
                 for emission in emissions {
-                    store.append_observation(
+                    let observation = store.append_observation(
                         &instance_id,
                         None,
                         Completeness::Structured,
                         emission.into_payload()?,
                     )?;
+                    interactions.ingest(&observation).await?;
                 }
                 finish_instance_operation(store.as_ref(), &instance_id, &queued.request)?;
                 settle_command(

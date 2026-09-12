@@ -78,6 +78,11 @@ pub enum DriverEmission {
         /// Diagnostic severity.
         severity: Severity,
     },
+    /// Fake/native `can_use_tool` (or equivalent) waiting on the host.
+    InteractionRequested {
+        /// Full Interaction entity for journal + broker ingest.
+        interaction: Box<remuda_protocol::Interaction>,
+    },
 }
 
 impl DriverEmission {
@@ -100,6 +105,13 @@ impl DriverEmission {
                     affects_completion: false,
                 })),
             ))),
+            Self::InteractionRequested { interaction } => {
+                Ok(ObservationPayload::InteractionRequested(Box::new(
+                    remuda_protocol::InteractionRequestedPayload {
+                        interaction: *interaction,
+                    },
+                )))
+            }
         }
     }
 }
@@ -140,6 +152,7 @@ pub trait DriverFactory: Send + Sync {
 pub struct FakeDriver {
     kind: DriverKind,
     panic_prompts: BTreeSet<String>,
+    instance: Option<Instance>,
 }
 
 impl FakeDriver {
@@ -148,6 +161,7 @@ impl FakeDriver {
         Self {
             kind,
             panic_prompts: BTreeSet::new(),
+            instance: None,
         }
     }
 
@@ -178,11 +192,22 @@ impl Driver for FakeDriver {
                         !self.panic_prompts.contains(&prompt),
                         "intentional fake-driver panic"
                     );
-                    Ok(vec![DriverEmission::Message {
+                    let mut emissions = Vec::new();
+                    if prompt.contains("can_use_tool")
+                        && let Some(instance) = &self.instance
+                    {
+                        let interaction = crate::interactions::fake_can_use_tool(instance)
+                            .map_err(|error| DriverError::Failed(error.to_string()))?;
+                        emissions.push(DriverEmission::InteractionRequested {
+                            interaction: Box::new(interaction),
+                        });
+                    }
+                    emissions.push(DriverEmission::Message {
                         role: MessageRole::Assistant,
                         phase: MessagePhase::Final,
                         text: format!("fake: {prompt}"),
-                    }])
+                    });
+                    Ok(emissions)
                 }
                 DriverRequest::Cancel => Ok(vec![DriverEmission::NativeLifecycle {
                     name: "fake-driver".to_owned(),
@@ -267,8 +292,24 @@ impl DriverRegistry {
     /// Registry containing the default Claude print fake driver.
     pub fn with_fake() -> Result<Self, NodeError> {
         let registry = Self::default();
-        registry.register(Arc::new(FakeDriver::default()))?;
+        registry.register_factory(Arc::new(FakeDriverFactory))?;
         Ok(registry)
+    }
+}
+
+struct FakeDriverFactory;
+
+impl DriverFactory for FakeDriverFactory {
+    fn kind(&self) -> DriverKind {
+        DriverKind::ClaudePrint
+    }
+
+    fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
+        Ok(Arc::new(FakeDriver {
+            kind: DriverKind::ClaudePrint,
+            panic_prompts: BTreeSet::new(),
+            instance: Some(launch.instance),
+        }))
     }
 }
 

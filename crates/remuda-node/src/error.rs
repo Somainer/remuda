@@ -31,6 +31,15 @@ pub enum NodeError {
     /// A driver rejected or failed an operation.
     #[error("driver error: {0}")]
     Driver(String),
+    /// Interaction deadline already passed.
+    #[error("interaction expired")]
+    InteractionExpired,
+    /// A different commandId already committed the unique answer.
+    #[error("interaction already answered by {winner}")]
+    InteractionSuperseded {
+        /// Winning command identity.
+        winner: String,
+    },
     /// Shared in-memory state was poisoned by a panic.
     #[error("local store lock poisoned")]
     StorePoisoned,

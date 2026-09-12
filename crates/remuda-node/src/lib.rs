@@ -5,9 +5,11 @@ mod config;
 mod driver;
 mod error;
 mod identity;
+mod interactions;
 mod inventory;
 mod model;
 mod runtime;
+mod runtime_link;
 mod server;
 mod stdio;
 mod store;
@@ -26,6 +28,7 @@ pub use driver::{
 };
 pub use error::NodeError;
 pub use identity::load_or_create_host_id;
+pub use interactions::{InteractionRuntime, PendingInteraction};
 pub use inventory::{
     CLI_KINDS, CliAuth, CliEntry, CollectRequest, Collector, DEFAULT_TTL, HerdrReport,
     HostSnapshot, ProbeEnv, ResourceReport, collect, collect_fresh,
@@ -34,6 +37,7 @@ pub use model::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, InstanceCommandRequest,
 };
 pub use runtime::DevNode;
+pub use runtime_link::attach_runtime;
 pub use server::{DevServer, dev_router};
 pub use stdio::run_stdio;
 pub use store::{LocalStore, MemoryStore};

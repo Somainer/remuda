@@ -180,4 +180,9 @@ impl ConnectedNodes {
     pub async fn kind_of(&self, host_id: &str) -> Option<TransportKind> {
         self.inner.lock().await.get(host_id).map(|link| link.kind())
     }
+
+    /// Host ids with a live Node session.
+    pub async fn host_ids(&self) -> Vec<String> {
+        self.inner.lock().await.keys().cloned().collect()
+    }
 }

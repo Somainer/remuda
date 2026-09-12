@@ -16,6 +16,7 @@ mod devices;
 mod error;
 mod fleet;
 mod http;
+mod interactions;
 mod inventory;
 mod placement;
 mod push_http;
@@ -149,6 +150,7 @@ async fn spawn_inner(
 pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .merge(http::routes())
+        .merge(interactions::routes())
         .merge(ws::routes())
         .merge(registry::routes())
         .merge(placement::routes())

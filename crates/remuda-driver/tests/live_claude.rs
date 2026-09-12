@@ -183,6 +183,8 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
         extra_env: Default::default(),
         setting_sources: None,
         agent_start_timeout_ms: 180_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
 
     let t0 = Instant::now();
@@ -353,6 +355,8 @@ async fn live_claude_bg_start_prompt_idle_read_close() {
         broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
         extra_env: Default::default(),
         setting_sources: None,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
 
     let t0 = Instant::now();

@@ -92,6 +92,11 @@ pub struct ClaudePtyOptions {
     pub setting_sources: Option<Vec<String>>,
     /// `agent.start` timeout in milliseconds.
     pub agent_start_timeout_ms: u64,
+    /// Let Claude resolve its default config directory instead of exporting
+    /// `CLAUDE_CONFIG_DIR`.
+    pub inherit_default_config: bool,
+    /// Host-validated `--settings` overlay. Contents are never logged.
+    pub settings_overlay_path: Option<PathBuf>,
 }
 
 impl ClaudePtyOptions {
@@ -115,6 +120,8 @@ impl ClaudePtyOptions {
             extra_env: BTreeMap::new(),
             setting_sources: None,
             agent_start_timeout_ms: 120_000,
+            inherit_default_config: false,
+            settings_overlay_path: None,
         }
     }
 }
@@ -216,6 +223,7 @@ impl ClaudePtyDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin,
+            settings_overlay_path: self.options.settings_overlay_path.clone(),
         };
         let mut recipe = materialize(&request)?;
         apply_tty_bypass_flag(&mut recipe);
@@ -240,7 +248,9 @@ impl ClaudePtyDriver {
         let herdr_pin = herdr_pin(&client, &pong.version, pong.protocol)?;
 
         let mut env = HashMap::new();
-        env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        if !self.options.inherit_default_config {
+            env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        }
         for (key, value) in &self.options.extra_env {
             env.insert(key.clone(), value.clone());
         }
@@ -1130,7 +1140,13 @@ pub(crate) fn inject_session_start_hook(
         shell_single_quote(&meta_path.to_string_lossy())
     );
     let settings_path = launch_dir.join("settings.json");
-    let mut settings = if settings_path.exists() {
+    let overlay_src = recipe
+        .argv
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--settings").then(|| PathBuf::from(&pair[1])));
+    let mut settings = if let Some(src) = overlay_src.filter(|path| path.exists()) {
+        serde_json::from_slice(&std::fs::read(src)?)?
+    } else if settings_path.exists() {
         serde_json::from_slice(&std::fs::read(&settings_path)?)?
     } else {
         json!({})

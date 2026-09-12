@@ -716,6 +716,140 @@ async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
     fake_herdr.shutdown().expect("fake herdr shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
+    use remuda_node::{DevServerConfig, LocalDrivers, NativeDriverConfig, ServeConfig, compose};
+    use remuda_protocol::InstanceId;
+    use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let overlay = dir.path().join("settings.relay.json");
+    std::fs::write(&overlay, r#"{"model":"passthrough/example-model"}"#).expect("overlay");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
+        .await
+        .expect("hub");
+    let mut node_http = DevServerConfig::loopback(0);
+    node_http.workspace_root = workspace;
+    let mut native = NativeDriverConfig::new(dir.path().join("node"))
+        .with_claude_binary(ensure_workspace_bin("fake-claude"));
+    native.extra_env.insert(
+        "FAKE_CLAUDE_SCRIPT".to_owned(),
+        script_path(ScriptKind::Ok).to_string_lossy().into_owned(),
+    );
+    let node = compose(&ServeConfig {
+        http: node_http,
+        data_dir: dir.path().join("node"),
+        drivers: LocalDrivers::Native(native),
+    })
+    .expect("compose");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let mut config = WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host_id.clone());
+    config.host = Some(json!({
+        "hostname": "local-development",
+        "labels": { "egress": "gateway" },
+        "maxInstances": 8
+    }));
+    let query = node.clone();
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(config, node))
+        .await
+        .expect("connect timeout")
+        .expect("wss runtime connect");
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+
+    let request = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "claude-print",
+        "model": "fake",
+        "providerProfileId": "gateway",
+        "permissionMode": "bypassPermissions",
+        "delegation": "gateway",
+        "settingsOverlayPath": overlay.to_string_lossy(),
+        "maxBudgetUsd": "0.3",
+        "prompt": "hello"
+    })
+    .to_string();
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(8),
+        http(
+            hub.addr,
+            "POST",
+            "/v1/instances",
+            &[("Cookie", cookie.as_str())],
+            Some(&request),
+        ),
+    )
+    .await
+    .expect("create timeout");
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim()).expect("create json");
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .expect("instanceId");
+    assert_eq!(created["instance"]["delegation"], json!("gateway"));
+    assert_eq!(created["instance"]["providerProfileId"], json!("gateway"));
+
+    let instance_id = InstanceId::try_from(instance_id.to_owned()).expect("instance id");
+    let recipe = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(Some(recipe)) = query.launch_recipe(&instance_id) {
+                break recipe;
+            }
+            if let Ok(instance) = query.get_instance(&instance_id)
+                && instance.lifecycle == remuda_protocol::InstanceLifecycle::Failed
+            {
+                panic!("native start failed last_error={:?}", instance.last_error);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let listed = query.list_instances().expect("list");
+        let instance = query.get_instance(&instance_id).ok();
+        panic!(
+            "recipe timeout listed={:?} instance={:?} last_error={:?}",
+            listed
+                .items
+                .iter()
+                .map(|row| (
+                    row.meta.id.as_id().to_string(),
+                    row.lifecycle,
+                    row.last_error.clone()
+                ))
+                .collect::<Vec<_>>(),
+            instance.as_ref().map(|row| row.lifecycle),
+            instance.and_then(|row| row.last_error)
+        );
+    });
+    assert_eq!(
+        recipe.provider.delegation,
+        remuda_driver::Delegation::Gateway
+    );
+    assert!(
+        recipe
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--settings" && pair[1] == overlay.to_string_lossy()),
+        "WSS launch must keep the overlay: {:?}",
+        recipe.argv
+    );
+    assert!(
+        recipe
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--max-budget-usd" && pair[1] == "0.3"),
+        "WSS launch must keep the budget: {:?}",
+        recipe.argv
+    );
+
+    link.shutdown().await;
+}
+
 fn journal_has_command_state(journal: &Value, command_id: &str, state: &str) -> bool {
     journal["events"].as_array().is_some_and(|events| {
         events.iter().any(|record| {

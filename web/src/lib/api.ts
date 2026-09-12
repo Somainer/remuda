@@ -159,7 +159,12 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
   const hostId = rec.hostId as Id;
   const kind = mapKind(rec.kind);
   const driver = mapDriver(rec.driver);
-  const extra = rec as components["schemas"]["InstanceRecord"] & { cwd?: string | null; name?: string | null };
+  const extra = rec as components["schemas"]["InstanceRecord"] & {
+    cwd?: string | null;
+    name?: string | null;
+    delegation?: string | null;
+    providerProfileId?: string | null;
+  };
   return {
     id,
     revision: "1",
@@ -200,6 +205,9 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     exit: { state: "not-applicable" },
     cwd: extra.cwd ?? rec.workspaceId ?? null,
     name: extra.name ?? rec.title ?? null,
+    delegation: typeof rec.delegation === "string" ? rec.delegation : extra.delegation ?? null,
+    providerProfileId:
+      typeof rec.providerProfileId === "string" ? rec.providerProfileId : extra.providerProfileId ?? null,
   };
 }
 
@@ -398,14 +406,21 @@ async function rest<T>(path: string, init: RequestInit & { auth?: boolean } = {}
     const text = await res.text();
     let code = `HTTP_${res.status}`;
     let message = text || `HTTP ${res.status}`;
+    let reasons: string[] = [];
     try {
-      const body = JSON.parse(text) as { code?: string; error?: string };
+      const body = JSON.parse(text) as { code?: string; error?: string; reasons?: unknown };
       if (body.code) code = body.code;
       if (body.error) message = body.error;
+      if (Array.isArray(body.reasons)) {
+        reasons = body.reasons.filter((reason): reason is string => typeof reason === "string" && reason.length > 0);
+        if (reasons.length > 0) {
+          message = [message, ...reasons].join(" · ");
+        }
+      }
     } catch {
       /* raw */
     }
-    throw new HubHttpError(res.status, code, message);
+    throw new HubHttpError(res.status, code, message, reasons);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -489,6 +504,8 @@ function createMockApi(): HubApi {
       instance.hostId = spec.hostId;
       instance.workspaceId = workspaceId;
       instance.cwd = spec.cwd ?? null;
+      instance.delegation = spec.delegation ?? "none";
+      instance.providerProfileId = spec.providerProfileId;
       return {
         instance,
         command: {
@@ -803,6 +820,9 @@ function createLiveApi(): HubApi {
         title: spec.name ?? spec.prompt.slice(0, 80),
         cwd: spec.cwd,
         worktree: worktreeName,
+        settingsOverlayPath: spec.settingsOverlayPath,
+        claudeConfigDir: spec.claudeConfigDir,
+        maxBudgetUsd: spec.maxBudgetUsd,
       };
       const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
         method: "POST",

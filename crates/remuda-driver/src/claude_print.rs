@@ -80,6 +80,8 @@ pub struct ClaudePrintOptions {
     pub setting_sources: Option<Vec<String>>,
     /// Initialize handshake timeout.
     pub handshake_timeout: Duration,
+    /// Host-validated `--settings` overlay. Contents are never logged.
+    pub settings_overlay_path: Option<PathBuf>,
 }
 
 impl ClaudePrintOptions {
@@ -101,6 +103,7 @@ impl ClaudePrintOptions {
             extra_env: std::collections::BTreeMap::new(),
             setting_sources: None,
             handshake_timeout: Duration::from_secs(30),
+            settings_overlay_path: None,
         }
     }
 }
@@ -261,6 +264,7 @@ impl ClaudePrintDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin.into(),
+            settings_overlay_path: self.options.settings_overlay_path.clone(),
         };
         let mut recipe = materialize(&request)?;
         apply_bypass_flag(&mut recipe);

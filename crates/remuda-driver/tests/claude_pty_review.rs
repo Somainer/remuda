@@ -253,6 +253,7 @@ fn inject_hook_writes_launch_dir_not_native_home_and_keeps_sources() {
         binary: BinarySource::Pinned(pin_binary(stub_claude(tmp.path())).unwrap()),
         setting_sources: None,
         origin: LaunchOrigin::Human,
+        settings_overlay_path: None,
     })
     .unwrap();
     let injected = review::inject_hook(&mut recipe, &launch).unwrap();
@@ -328,6 +329,7 @@ fn tty_bypass_strips_print_flag() {
         binary: BinarySource::Pinned(pin_binary(stub_claude(tmp.path())).unwrap()),
         setting_sources: None,
         origin: LaunchOrigin::Human,
+        settings_overlay_path: None,
     })
     .unwrap();
     recipe
@@ -431,6 +433,8 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
         extra_env: Default::default(),
         setting_sources: None,
         agent_start_timeout_ms: 5_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
 
     let mut spec = pty_spec(&cwd, "opus-review");
@@ -517,6 +521,8 @@ async fn bg_resume_keeps_settings_attach_after_stop_does_not_wake() {
         broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
         extra_env: Default::default(),
         setting_sources: None,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
 
     let spec = bg_spec(&cwd, "opus-review");
@@ -628,6 +634,8 @@ async fn bg_attach_before_dispatch_would_wake() {
         broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
         extra_env: Default::default(),
         setting_sources: None,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
     let spec = bg_spec(&cwd, "opus-review");
     let _handle = driver.start(spec.clone()).await.expect("prepare");

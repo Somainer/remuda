@@ -76,6 +76,8 @@ pub struct MaterializeRequest<'a> {
     pub setting_sources: Option<Vec<String>>,
     /// Who originated this launch. Bot/dispatcher specs cannot request bypass/yolo.
     pub origin: LaunchOrigin,
+    /// Host-validated `--settings` overlay. Contents are never logged.
+    pub settings_overlay_path: Option<PathBuf>,
 }
 
 /// Node token-broker bind baked into a Claude `apiKeyHelper` script.
@@ -183,7 +185,22 @@ fn materialize_inner(
 
     match request.spec.driver {
         DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => {
-            let settings_path = if inject_provider {
+            let user_overlay = match request.settings_overlay_path.as_ref() {
+                Some(path) => Some(validate_settings_overlay(path)?),
+                None => None,
+            };
+            let settings_path = if let Some(path) = user_overlay.clone() {
+                let bytes = fs::read(&path)?;
+                let digest = crate::binary::hash_bytes(&bytes)?;
+                files.push(MaterializedFile {
+                    path: path.to_string_lossy().into_owned(),
+                    role: FileRole::Settings,
+                    mode: "0600".into(),
+                    content_digest: digest,
+                    lifetime: FileLifetime::NativeStore,
+                });
+                Some(path)
+            } else if inject_provider {
                 if let Some(bind) = broker {
                     api_key_helper_path = maybe_write_api_key_helper(request, bind, &mut files)?;
                 }
@@ -230,12 +247,14 @@ fn materialize_inner(
                 None,
             );
             if inject_provider {
-                push_env(
-                    &mut env_allowlist,
-                    "ANTHROPIC_BASE_URL",
-                    EnvAllowlistSource::ProviderOverlay,
-                    None,
-                );
+                if !request.profile.base_url.trim().is_empty() {
+                    push_env(
+                        &mut env_allowlist,
+                        "ANTHROPIC_BASE_URL",
+                        EnvAllowlistSource::ProviderOverlay,
+                        None,
+                    );
+                }
                 match request.profile.secret_ref.as_ref() {
                     Some(secret)
                         if secret.helper_command().is_some() || api_key_helper_path.is_some() => {}
@@ -245,9 +264,10 @@ fn materialize_inner(
                         EnvAllowlistSource::Credential,
                         Some(secret.as_str().to_string()),
                     ),
+                    None if user_overlay.is_some() => {}
                     None => {
                         return Err(DriverError::InvalidLaunchSpec(
-                            "gateway delegation requires a secret_ref".into(),
+                            "gateway delegation requires a settings overlay or secret_ref".into(),
                         ));
                     }
                 }
@@ -912,6 +932,23 @@ fn redact_argv(argv: &[String], files: &[MaterializedFile]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn validate_settings_overlay(path: &Path) -> DriverResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "settings overlay path must be absolute".into(),
+        ));
+    }
+    match path.metadata() {
+        Ok(meta) if meta.is_file() => Ok(path.to_path_buf()),
+        Ok(_) => Err(DriverError::InvalidLaunchSpec(
+            "settings overlay path is not a file".into(),
+        )),
+        Err(_) => Err(DriverError::InvalidLaunchSpec(
+            "settings overlay path does not exist".into(),
+        )),
+    }
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> DriverResult<()> {

@@ -80,8 +80,17 @@ impl WssConfig {
 
     /// Replace `cli` / `host` with a live PATH probe (installed CLIs only).
     #[must_use]
-    pub fn with_collected_inventory(mut self) -> Self {
-        let mut snap = crate::inventory::collect(&crate::inventory::CollectRequest::default());
+    pub fn with_collected_inventory(self) -> Self {
+        self.with_collected_inventory_from(&crate::inventory::CollectRequest::default())
+    }
+
+    /// PATH probe plus operator labels / maxInstances / herdr socket.
+    #[must_use]
+    pub fn with_collected_inventory_from(
+        mut self,
+        request: &crate::inventory::CollectRequest,
+    ) -> Self {
+        let mut snap = crate::inventory::collect(request);
         snap.cli.retain(|entry| entry.path.is_some());
         self.cli = snap.cli_hub_json();
         let mut host = snap.to_hub_host();

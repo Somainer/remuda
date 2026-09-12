@@ -62,6 +62,11 @@ pub struct ClaudeBgOptions {
     pub extra_env: BTreeMap<String, String>,
     /// Override `--setting-sources`.
     pub setting_sources: Option<Vec<String>>,
+    /// Let Claude resolve its default config directory instead of exporting
+    /// `CLAUDE_CONFIG_DIR`.
+    pub inherit_default_config: bool,
+    /// Host-validated `--settings` overlay. Contents are never logged.
+    pub settings_overlay_path: Option<PathBuf>,
 }
 
 impl ClaudeBgOptions {
@@ -84,6 +89,8 @@ impl ClaudeBgOptions {
             broker: Arc::new(EnvFileSecretBroker),
             extra_env: BTreeMap::new(),
             setting_sources: None,
+            inherit_default_config: false,
+            settings_overlay_path: None,
         }
     }
 }
@@ -237,6 +244,7 @@ impl ClaudeBgDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin,
+            settings_overlay_path: self.options.settings_overlay_path.clone(),
         };
         let mut recipe = materialize(&request)?;
         recipe.argv = strip_named_flags(&recipe.argv, &["--session-id", "--cwd", "--continue"]);
@@ -305,8 +313,12 @@ impl ClaudeBgDriver {
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("CLAUDE_CONFIG_DIR", &live.recipe.native_home);
+            .stderr(Stdio::piped());
+        apply_claude_config_dir(
+            &mut command,
+            &live.recipe.native_home,
+            self.options.inherit_default_config,
+        );
         for (key, value) in &self.options.extra_env {
             command.env(key, value);
         }
@@ -407,8 +419,12 @@ impl ClaudeBgDriver {
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("CLAUDE_CONFIG_DIR", &live.recipe.native_home);
+            .stderr(Stdio::piped());
+        apply_claude_config_dir(
+            &mut command,
+            &live.recipe.native_home,
+            self.options.inherit_default_config,
+        );
         let output = command.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -437,8 +453,12 @@ impl ClaudeBgDriver {
                 .kill_on_drop(true)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .env("CLAUDE_CONFIG_DIR", &live.recipe.native_home);
+                .stderr(Stdio::null());
+            apply_claude_config_dir(
+                &mut command,
+                &live.recipe.native_home,
+                self.options.inherit_default_config,
+            );
             let status = command.status().await?;
             if !status.success() {
                 warn!(job = %live.short_id, %status, "claude stop returned non-zero");
@@ -693,6 +713,14 @@ fn spawn_job_observer(
     })
 }
 
+fn apply_claude_config_dir(command: &mut Command, native_home: &str, inherit_default: bool) {
+    if inherit_default {
+        command.env_remove("CLAUDE_CONFIG_DIR");
+    } else {
+        command.env("CLAUDE_CONFIG_DIR", native_home);
+    }
+}
+
 async fn lookup_session_id(
     binary: &Path,
     cwd: &str,
@@ -709,8 +737,8 @@ async fn lookup_session_id(
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("CLAUDE_CONFIG_DIR", native_home);
+        .stderr(Stdio::piped());
+    apply_claude_config_dir(&mut command, native_home, false);
     let output = command.output().await.ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: Value = serde_json::from_str(stdout.trim()).ok()?;

@@ -52,6 +52,9 @@ pub(crate) struct Args {
     /// Serve Hub web assets from this directory (typically `web/dist`).
     #[arg(long)]
     web_root: Option<PathBuf>,
+    /// Placement label `KEY=VALUE`; repeatable. Defaults include `egress=gateway`.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<String>,
 }
 
 impl Args {
@@ -80,6 +83,13 @@ impl Args {
         }
         if !self.web_origins.is_empty() {
             config.node.web_origins = self.web_origins.clone();
+        }
+        config
+            .node
+            .labels
+            .extend(crate::config::parse_labels(&self.labels)?);
+        if !config.node.labels.contains_key("egress") {
+            config.node.labels.insert("egress".into(), "gateway".into());
         }
         if self.dev_bind_lan {
             if config.node.listen.ip().is_loopback() {
@@ -144,7 +154,11 @@ pub(crate) async fn run(
         .with_herdr_config(native)?;
     node.reconcile_herdr().await?;
     let mut wss = WssConfig::loopback(running_hub.addr, node_token, host_id.as_id().to_string())
-        .with_collected_inventory();
+        .with_collected_inventory_from(&remuda_node::CollectRequest {
+            labels: config.node.labels.clone(),
+            max_instances: config.node.max_instances,
+            herdr_socket: config.node.herdr_socket.clone(),
+        });
     wss.label = "local-development".into();
     let link = WssLink::connect_runtime(wss, node.clone())
         .await
@@ -318,6 +332,7 @@ mod tests {
             web_origins: Vec::new(),
             workspace: None,
             web_root: None,
+            labels: Vec::new(),
         };
         let mut config = Config::default();
         config.hub.listen = "0.0.0.0:8080".parse().expect("fixture address");
@@ -330,6 +345,10 @@ mod tests {
         args().apply(&mut config).expect("loopback defaults");
         assert!(!config.hub.cookie_secure);
         assert!(config.data_dir.ends_with("dev-hub"));
+        assert_eq!(
+            config.node.labels.get("egress").map(String::as_str),
+            Some("gateway")
+        );
 
         let mut config = Config::default();
         let mut flags = args();

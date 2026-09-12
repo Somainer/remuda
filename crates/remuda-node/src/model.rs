@@ -80,6 +80,75 @@ pub struct CreateInstanceRequest {
     /// Working directory for the native driver (git worktree path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Provider delegation (`none` / `gateway`). Omitted means native none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
+    /// Host-local `--settings` overlay path. `~` is expanded on the Node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_overlay_path: Option<String>,
+    /// Explicit `CLAUDE_CONFIG_DIR`. Wins over inherited default login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<String>,
+    /// `--max-budget-usd` cap forwarded onto Claude argv.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_opt_stringish"
+    )]
+    pub max_budget_usd: Option<String>,
+}
+
+impl CreateInstanceRequest {
+    /// Copy launch fields that Hub stores on `spec` onto the Node request.
+    pub fn apply_spec_launch_fields(&mut self, spec: &serde_json::Value) {
+        if let Some(value) = spec
+            .get("delegation")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            self.delegation = Some(value.to_owned());
+        }
+        if let Some(value) = spec
+            .get("providerProfileId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            self.provider_profile_id = value.to_owned();
+        }
+        if let Some(value) = spec
+            .get("settingsOverlayPath")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            self.settings_overlay_path = Some(value.to_owned());
+        }
+        if let Some(value) = spec
+            .get("claudeConfigDir")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            self.claude_config_dir = Some(value.to_owned());
+        }
+        if self.max_budget_usd.is_none() {
+            self.max_budget_usd = stringish(spec.get("maxBudgetUsd"));
+        }
+    }
+}
+
+fn stringish(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn deserialize_opt_stringish<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(stringish(
+        Option::<serde_json::Value>::deserialize(deserializer)?.as_ref(),
+    ))
 }
 
 /// Result returned after an Instance and its create command are represented in the local store.

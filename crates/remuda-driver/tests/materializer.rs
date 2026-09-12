@@ -66,6 +66,7 @@ fn request<'a>(
         binary,
         setting_sources: None,
         origin: LaunchOrigin::Human,
+        settings_overlay_path: None,
     }
 }
 
@@ -540,4 +541,125 @@ fn token_broker_helper_script_in_settings_omits_auth_token_and_secret() {
             .unwrap()
             .content_digest
     );
+}
+
+#[test]
+fn gateway_overlay_config_dir_and_budget_are_emitted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let overlay = tmp.path().join("settings.relay.json");
+    fs::write(
+        &overlay,
+        r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"secret-token-must-not-appear"}}"#,
+    )
+    .unwrap();
+    let mut spec = load_spec();
+    spec.args = vec!["--max-budget-usd".into(), "0.3".into()];
+    spec.driver = DriverKind::ClaudePrint;
+    let mut profile = profile();
+    profile.secret_ref = None;
+    profile.base_url.clear();
+    let mut req = request(&spec, &profile, &launch, &home, pin_source(&binary));
+    req.settings_overlay_path = Some(overlay.clone());
+    let recipe = materialize(&req).unwrap();
+    assert_eq!(recipe.native_home, home.to_string_lossy());
+    assert!(
+        recipe
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--settings" && pair[1] == overlay.to_string_lossy()),
+        "overlay path must be passed as --settings: {:?}",
+        recipe.argv
+    );
+    assert!(
+        recipe
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--max-budget-usd" && pair[1] == "0.3"),
+        "budget must be forwarded: {:?}",
+        recipe.argv
+    );
+    assert!(
+        recipe
+            .env_allowlist
+            .iter()
+            .any(|entry| entry.name == "CLAUDE_CONFIG_DIR"),
+        "native home must stay on the allowlist"
+    );
+    let encoded = serde_json::to_string(&recipe).unwrap();
+    assert!(
+        !encoded.contains("secret-token-must-not-appear"),
+        "overlay contents must not be serialized"
+    );
+    assert!(
+        recipe
+            .audit
+            .redacted_argv
+            .iter()
+            .any(|token| token == "<settings>")
+    );
+}
+
+#[test]
+fn missing_overlay_fails_closed_without_logging_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let missing = tmp.path().join("missing-overlay.json");
+    let spec = load_spec();
+    let profile = profile();
+    let mut req = request(&spec, &profile, &launch, &home, pin_source(&binary));
+    req.settings_overlay_path = Some(missing);
+    let error = materialize(&req).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("settings overlay path does not exist"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("ANTHROPIC_AUTH_TOKEN"),
+        "error must not include overlay contents: {message}"
+    );
+}
+
+#[test]
+fn pty_and_bg_recipes_accept_user_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let overlay = tmp.path().join("settings.relay.json");
+    fs::write(&overlay, r#"{"model":"passthrough/example-model"}"#).unwrap();
+    for driver in [DriverKind::ClaudePty, DriverKind::ClaudeBg] {
+        let mut spec = load_spec();
+        spec.driver = driver;
+        spec.args = vec!["--max-budget-usd".into(), "0.3".into()];
+        let mut profile = profile();
+        profile.secret_ref = None;
+        profile.base_url.clear();
+        let mut req = request(&spec, &profile, &launch, &home, pin_source(&binary));
+        req.settings_overlay_path = Some(overlay.clone());
+        let recipe = materialize(&req).unwrap();
+        assert_eq!(recipe.driver, driver);
+        assert!(
+            recipe
+                .argv
+                .windows(2)
+                .any(|pair| pair[0] == "--settings" && pair[1] == overlay.to_string_lossy()),
+            "{driver:?} argv={:?}",
+            recipe.argv
+        );
+        assert!(
+            recipe
+                .argv
+                .windows(2)
+                .any(|pair| pair[0] == "--max-budget-usd" && pair[1] == "0.3")
+        );
+    }
 }

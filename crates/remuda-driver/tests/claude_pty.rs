@@ -85,6 +85,8 @@ async fn fake_herdr_start_prompt_idle_close() {
         extra_env: Default::default(),
         setting_sources: None,
         agent_start_timeout_ms: 5_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
 
     let mut handle = driver.start(spec(&cwd)).await.expect("start");
@@ -196,6 +198,8 @@ async fn live_claude_pty_haiku_once() {
         extra_env: Default::default(),
         setting_sources: Some(vec!["project".into(), "local".into()]),
         agent_start_timeout_ms: 180_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
     });
     let mut spec = spec(&cwd);
     spec.model_id = Some("haiku".into());

@@ -173,7 +173,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
                 .filter(|raw| !raw.is_empty() && !raw.starts_with("ws_"))
         })
         .map(str::to_string);
-    Ok(CreateInstanceRequest {
+    let mut request = CreateInstanceRequest {
         command_id: command_id_of(params),
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
@@ -199,7 +199,13 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .to_owned(),
         prompt: prompt_of(params).unwrap_or_default(),
         cwd,
-    })
+        delegation: None,
+        settings_overlay_path: None,
+        claude_config_dir: None,
+        max_budget_usd: None,
+    };
+    request.apply_spec_launch_fields(spec);
+    Ok(request)
 }
 
 fn instance_id_of(params: &Value) -> Result<InstanceId, NodeError> {

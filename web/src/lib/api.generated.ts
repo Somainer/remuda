@@ -559,12 +559,14 @@ export interface components {
             [key: string]: unknown;
         };
         InstanceCreate: {
+            claudeConfigDir?: string;
             /** @description Working directory on the host. */
             cwd?: string;
             delegation?: string;
             driver?: string;
             hostId?: string;
             kind?: string;
+            maxBudgetUsd?: string | number;
             model?: string;
             name?: string;
             permissionMode?: string;
@@ -573,6 +575,7 @@ export interface components {
             };
             prompt?: string;
             providerProfileId?: string;
+            settingsOverlayPath?: string;
             title?: string;
             workspaceId?: string;
             /** @description Worktree name created by remuda worktree create. */
@@ -596,6 +599,7 @@ export interface components {
             connectivity: string;
             createdAt?: string;
             cwd?: string | null;
+            delegation?: string | null;
             driver: string;
             durableSeq: string;
             hostId: string;
@@ -608,6 +612,7 @@ export interface components {
              */
             lifecycle: "requested" | "starting" | "running" | "closing" | "exited" | "failed";
             name?: string | null;
+            providerProfileId?: string | null;
             title?: string | null;
             updatedAt?: string;
             workspaceId?: string | null;

@@ -9,6 +9,26 @@ use std::path::{Path, PathBuf};
 #[folder = "$OUT_DIR/web-dist"]
 struct WebAssets;
 
+/// Apply to the entire router, including API errors and WebSocket upgrades.
+pub async fn security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    // React layouts and xterm generate inline styles; executable scripts remain
+    // restricted to same-origin assets (no inline scripts or eval).
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'",
+    ));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
 /// Serve an embedded or on-disk asset; unknown paths fall back to `index.html`.
 pub async fn static_handler(uri: Uri, web_root: Option<PathBuf>) -> Response {
     let raw = uri.path().strip_prefix('/').unwrap_or(uri.path());
@@ -73,6 +93,8 @@ fn mime_of(path: &str) -> &'static str {
         "css" => "text/css; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
         "webmanifest" => "application/manifest+json",
         "json" => "application/json",
         "txt" => "text/plain; charset=utf-8",

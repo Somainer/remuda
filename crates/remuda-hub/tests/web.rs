@@ -93,3 +93,56 @@ async fn static_symlinks_cannot_escape_even_via_spa_fallback() -> Result<()> {
     hub.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn security_headers_cover_assets_api_errors_and_upgrade_rejections() -> Result<()> {
+    for disk_assets in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let mut config = HubConfig::for_test(dir.path().join("data"));
+        if disk_assets {
+            let root = dir.path().join("web");
+            std::fs::create_dir(&root)?;
+            std::fs::write(root.join("index.html"), "index")?;
+            std::fs::write(root.join("font.woff2"), b"font fixture")?;
+            config.web_root = Some(root);
+        }
+        let hub = spawn(config).await?;
+        for path in [
+            "/",
+            "/font.woff2",
+            "/healthz",
+            "/v1/hosts",
+            "/v1/login",
+            "/v1/follow",
+            "/push/subscriptions",
+            "/../secret",
+        ] {
+            let (_, response) = get(hub.addr, path).await?;
+            let headers = response
+                .split_once("\r\n\r\n")
+                .unwrap()
+                .0
+                .to_ascii_lowercase();
+            assert!(
+                headers.contains("content-security-policy: default-src 'self';"),
+                "{path}: {headers}"
+            );
+            assert!(
+                headers.contains("frame-ancestors 'none'"),
+                "{path}: {headers}"
+            );
+            for header in [
+                "x-content-type-options: nosniff",
+                "x-frame-options: deny",
+                "referrer-policy: no-referrer",
+            ] {
+                assert!(headers.contains(header), "{path}: {headers}");
+            }
+            if disk_assets && path == "/font.woff2" {
+                assert!(headers.contains("content-type: font/woff2"));
+            }
+        }
+        hub.shutdown().await;
+    }
+    Ok(())
+}

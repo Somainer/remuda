@@ -195,7 +195,9 @@ pub fn router(state: AppState) -> Router {
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }
-    app.fallback(static_fallback).with_state(state)
+    app.fallback(static_fallback)
+        .layer(axum::middleware::map_response(web::security_headers))
+        .with_state(state)
 }
 
 async fn static_fallback(State(state): State<AppState>, uri: Uri) -> Response {

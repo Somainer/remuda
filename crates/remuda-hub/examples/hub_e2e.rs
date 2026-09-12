@@ -31,7 +31,11 @@ async fn main() -> Result<()> {
         "http://127.0.0.1:4179,http://localhost:4179,http://127.0.0.1:4177".into()
     });
     let mut config = HubConfig::for_test(dir.path().join("data"));
-    config.listen = LISTEN.parse::<SocketAddr>().context("listen addr")?;
+    config.listen = std::env::var("HUB_E2E_LISTEN")
+        .unwrap_or_else(|_| LISTEN.into())
+        .parse::<SocketAddr>()
+        .context("listen addr")?;
+    config.web_root = std::env::var_os("REMUDA_WEB_ROOT").map(Into::into);
     config.bootstrap_token = BOOTSTRAP.into();
     config.cookie_secure = false;
     config.allowed_origins = origins

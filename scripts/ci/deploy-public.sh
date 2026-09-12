@@ -27,7 +27,12 @@ import json, sys
 prod, ci = (json.load(open(path)) for path in sys.argv[1:])
 assert not prod['services']['remuda-hub'].get('ports'), 'Hub must not publish ports'
 assert {p['published'] for p in prod['services']['caddy']['ports']} == {'80', '443'}
-assert all(p['host_ip'] == '127.0.0.1' for p in ci['services']['caddy']['ports'])
+ports = ci['services']['caddy']['ports']
+assert len(ports) == 1 and ports[0]['target'] == 443
+assert ports[0]['host_ip'] == '127.0.0.1' and not ports[0].get('published'), 'CI requires an ephemeral loopback port'
+hub_ip = ci['services']['remuda-hub']['networks']['hub_proxy']['ipv4_address']
+proxy_ip = ci['services']['caddy']['networks']['hub_proxy']['ipv4_address']
+assert hub_ip != proxy_ip, 'Hub and Caddy must have distinct CI addresses'
 assert not ci['volumes']['hub_data'].get('driver_opts'), 'CI must use disposable data'
 PY
 # Check the production config grammar without starting it or requesting ACME.
@@ -37,9 +42,13 @@ docker run --rm --entrypoint caddy \
   validate --config /etc/caddy/Caddyfile
 "${compose[@]}" up -d --wait --wait-timeout 120
 "${compose[@]}" cp caddy:/data/caddy/pki/authorities/local/root.crt "$scratch/root.crt"
-port=${CI_HTTPS_PORT:-18443}
-url="https://localhost:$port"
-curl_args=(--silent --show-error --fail --noproxy '*' --cacert "$scratch/root.crt" --resolve "localhost:$port:127.0.0.1")
+binding=$("${compose[@]}" port caddy 443)
+[[ $binding =~ ^127\.0\.0\.1:([0-9]+)$ ]] || { echo 'Expected an ephemeral loopback HTTPS binding' >&2; exit 1; }
+port=${BASH_REMATCH[1]}
+(( port > 1023 )) || { echo 'Expected a high HTTPS port' >&2; exit 1; }
+# Preserve the configured HTTPS origin and TLS hostname while using Docker's port.
+url=https://localhost
+curl_args=(--silent --show-error --fail --noproxy '*' --cacert "$scratch/root.crt" --connect-to "localhost:443:127.0.0.1:$port")
 curl "${curl_args[@]}" -D "$scratch/headers" "$url/healthz" > "$scratch/health.json"
 python3 - "$scratch/health.json" "$scratch/headers" <<'PY'
 import json, sys

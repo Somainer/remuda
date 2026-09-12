@@ -2,13 +2,13 @@
 
 use crate::DevNode;
 use crate::NodeError;
-use crate::transport::hubnode::{self as hubnode_codec, SeqWatermark};
 use crate::transport::{Backoff, NodeTransport};
 use futures::{SinkExt, StreamExt};
-use remuda_protocol::Id;
 use remuda_protocol::hubnode::{
-    self, METHOD_JOURNAL_APPEND, METHOD_NODE_HEARTBEAT, METHOD_NODE_HELLO, WS_AUTHORIZATION_SCHEME,
+    self, JournalAppendParams, JournalSeqWatermark, METHOD_JOURNAL_APPEND, METHOD_NODE_HEARTBEAT,
+    METHOD_NODE_HELLO, NodeHeartbeatParams, NodeHelloParams, WS_AUTHORIZATION_SCHEME,
 };
+use remuda_protocol::{Id, PROTOCOL_VERSION, U64};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 mod runtime_wss;
+use runtime_wss::SeqWatermark;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -352,11 +353,11 @@ async fn recv_ws(stream: &mut WsStream) -> Result<Option<Value>, NodeError> {
 }
 
 fn rpc_request(id: &str, method: &str, params: Value) -> Value {
-    hubnode_codec::rpc_request(id, method, params)
+    hubnode::rpc_request(id, method, params)
 }
 
 fn rpc_ok(id: Value, result: Value) -> Value {
-    hubnode_codec::rpc_ok(id, result)
+    hubnode::rpc_ok(id, result)
 }
 
 fn take_rpc_error(frame: &Value) -> Option<NodeError> {
@@ -633,7 +634,7 @@ fn rpc_node_error(id: Value, error: &NodeError) -> Value {
 }
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    hubnode_codec::rpc_error(id, code, message)
+    hubnode::rpc_error(id, code, message)
 }
 
 fn encode_hello_params(
@@ -641,14 +642,31 @@ fn encode_hello_params(
     node_epoch: &Id,
     watermarks: &HashMap<String, SeqWatermark>,
 ) -> Value {
-    hubnode_codec::encode_hello(
-        &config.host_id,
-        &config.node_version,
-        &config.label,
-        &config.cli,
-        node_epoch,
-        watermarks,
-    )
+    let mut params = json!(NodeHelloParams {
+        host_id: Some(config.host_id.clone()),
+        label: Some(config.label.clone()),
+        node_version: Some(config.node_version.clone()),
+        node_epoch: Some(node_epoch.to_string()),
+        enrollment_token: None,
+        transport: Some("outbound-wss".into()),
+        version: Some(PROTOCOL_VERSION),
+        protocol: Some(json!({
+            "major": PROTOCOL_VERSION.major,
+            "minor": PROTOCOL_VERSION.minor,
+            "framing": "websocket-message",
+        })),
+        host: None,
+        capabilities: None,
+        cli: Some(config.cli.clone()),
+    });
+    if let Some(object) = params.as_object_mut() {
+        object.insert("resumeCursors".into(), json!(resume_cursors(watermarks)));
+        object.insert(
+            "instanceWatermarks".into(),
+            json!(journal_watermarks(watermarks)),
+        );
+    }
+    params
 }
 
 fn encode_heartbeat_params(
@@ -657,17 +675,62 @@ fn encode_heartbeat_params(
     lease_id: Option<&str>,
     watermarks: &HashMap<String, SeqWatermark>,
 ) -> Value {
-    hubnode_codec::encode_heartbeat(
-        &config.node_version,
-        &config.cli,
-        connection_id,
-        lease_id,
-        watermarks,
-    )
+    json!(NodeHeartbeatParams {
+        connection_id: connection_id.map(str::to_owned),
+        lease_id: lease_id.map(str::to_owned),
+        node_version: Some(config.node_version.clone()),
+        transport: Some("outbound-wss".into()),
+        host: None,
+        cli: Some(config.cli.clone()),
+        capabilities: None,
+        instance_watermarks: journal_watermarks(watermarks),
+    })
 }
 
 fn encode_append_params(instance_id: &str, seq: Option<i64>, event: Value) -> Value {
-    hubnode_codec::encode_append(instance_id, seq, event)
+    json!(JournalAppendParams {
+        instance_id: instance_id.to_owned(),
+        event: Some(event.clone()),
+        events: vec![event],
+        seq: seq.map(|seq| json!(seq.to_string())),
+        watermark: seq.map(|seq| JournalSeqWatermark {
+            journal_id: None,
+            instance_id: Some(instance_id.to_owned()),
+            durable_seq: Some(json!(seq.to_string())),
+            after_seq: None,
+            seq: u64_seq(seq),
+        }),
+    })
+}
+
+fn journal_watermarks(watermarks: &HashMap<String, SeqWatermark>) -> Vec<JournalSeqWatermark> {
+    watermarks
+        .values()
+        .map(|mark| JournalSeqWatermark {
+            journal_id: mark.journal_id.clone(),
+            instance_id: Some(mark.instance_id.clone()),
+            durable_seq: Some(json!(mark.seq.to_string())),
+            after_seq: Some(json!(mark.seq.to_string())),
+            seq: u64_seq(mark.seq),
+        })
+        .collect()
+}
+
+fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
+    watermarks
+        .values()
+        .map(|mark| {
+            json!({
+                "journalId": mark.journal_id.as_deref().unwrap_or(mark.instance_id.as_str()),
+                "afterSeq": mark.seq.to_string(),
+                "instanceId": mark.instance_id,
+            })
+        })
+        .collect()
+}
+
+fn u64_seq(seq: i64) -> Option<U64> {
+    u64::try_from(seq.max(0)).ok().map(U64)
 }
 
 fn fail_pending(pending: &mut HashMap<String, PendingAppend>, error: NodeError) {
@@ -756,7 +819,6 @@ pub(crate) fn already_durable(error: &NodeError, seq: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remuda_protocol::hubnode::{JournalAppendParams, NodeHelloParams};
     use serde_json::json;
 
     #[tokio::test]
@@ -798,7 +860,7 @@ mod tests {
             parsed
                 .watermark
                 .as_ref()
-                .and_then(|mark| mark.durable_i64()),
+                .and_then(|mark: &JournalSeqWatermark| mark.durable_i64()),
             Some(4)
         );
     }

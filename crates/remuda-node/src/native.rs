@@ -7,7 +7,8 @@ use crate::{
 use remuda_driver::claude_print::{ClaudePrintDriver, ClaudePrintOptions};
 use remuda_driver::{
     BinarySource, ClaudeBgDriver, ClaudeBgOptions, ClaudePtyDriver, ClaudePtyOptions, Delegation,
-    Driver as NativeDriver, ProviderHealth, ProviderKind, ProviderProfile,
+    Driver as NativeDriver, GenericPtyDriver, GenericPtyOptions, ProviderHealth, ProviderKind,
+    ProviderProfile, preset_by_id,
 };
 use remuda_protocol::{
     ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode, ClaudePermission,
@@ -72,6 +73,7 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
         DriverKind::ClaudePrint,
         DriverKind::ClaudePty,
         DriverKind::ClaudeBg,
+        DriverKind::GenericPty,
     ] {
         registry.register_factory(Arc::new(NativeClaudeFactory {
             kind,
@@ -109,7 +111,21 @@ impl DriverFactory for NativeClaudeFactory {
             .claude_binary
             .clone()
             .map(BinarySource::Path)
-            .unwrap_or_else(|| BinarySource::Command("claude".to_owned()));
+            .unwrap_or_else(|| {
+                let name = match self.kind {
+                    DriverKind::GenericPty => preset_by_id(match launch.request.kind {
+                        remuda_protocol::AgentKind::Codex => "codex",
+                        remuda_protocol::AgentKind::Grok => "grok",
+                        remuda_protocol::AgentKind::Agy => "agy",
+                        remuda_protocol::AgentKind::Generic => "gemini",
+                        remuda_protocol::AgentKind::Claude => "claude",
+                    })
+                    .map(|preset| preset.binary)
+                    .unwrap_or("claude"),
+                    _ => "claude",
+                };
+                BinarySource::Command(name.to_owned())
+            });
         let native: Arc<dyn NativeDriver> = match self.kind {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
@@ -132,6 +148,14 @@ impl DriverFactory for NativeClaudeFactory {
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
                 Arc::new(ClaudeBgDriver::new(options))
+            }
+            DriverKind::GenericPty => {
+                let mut options = GenericPtyOptions::new(profile, launch_dir, native_home, binary);
+                options.extra_env = self.config.extra_env.clone();
+                options.session_name = self.config.herdr_session.clone();
+                options.socket_dir = self.config.herdr_socket_dir.clone();
+                options.herdr_binary = self.config.herdr_binary.clone();
+                Arc::new(GenericPtyDriver::new(options))
             }
             other => {
                 return Err(DriverError::Unsupported(format!(
@@ -247,13 +271,16 @@ fn instance_spec(
         "bypassPermissions" | "bypass-permissions" => ClaudePermissionMode::BypassPermissions,
         _ => ClaudePermissionMode::Manual,
     };
-    let interaction = if launch.request.driver == DriverKind::ClaudePty {
+    let interaction = if matches!(
+        launch.request.driver,
+        DriverKind::ClaudePty | DriverKind::GenericPty
+    ) {
         ClaudeInteractionMode::NativeTty
     } else {
         ClaudeInteractionMode::Host
     };
     let carrier = match launch.request.driver {
-        DriverKind::ClaudePty => CarrierSpec::Pty(Box::new(PtyCarrier {
+        DriverKind::ClaudePty | DriverKind::GenericPty => CarrierSpec::Pty(Box::new(PtyCarrier {
             backend: PtyBackend::Herdr,
             server: HerdrServer {
                 binary_path: config
@@ -332,10 +359,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
             .expect("registry");
-        for kind in [
-            DriverKind::ClaudePrint,
-            DriverKind::ClaudePty,
-            DriverKind::ClaudeBg,
+        for (agent, kind) in [
+            (AgentKind::Claude, DriverKind::ClaudePrint),
+            (AgentKind::Claude, DriverKind::ClaudePty),
+            (AgentKind::Claude, DriverKind::ClaudeBg),
+            (AgentKind::Codex, DriverKind::GenericPty),
         ] {
             let instance =
                 fixture_instance(InstanceId::new(), HostId::new(), WorkspaceId::new(), kind)
@@ -344,7 +372,7 @@ mod tests {
                 instance_id: Some(instance.meta.id.clone()),
                 host_id: Some(instance.host_id.clone()),
                 workspace_id: Some(instance.workspace_id.clone()),
-                kind: AgentKind::Claude,
+                kind: agent,
                 driver: kind,
                 model: "haiku".to_owned(),
                 provider_profile_id: "native".to_owned(),

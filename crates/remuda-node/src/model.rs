@@ -14,6 +14,17 @@ fn default_driver_kind() -> DriverKind {
     DriverKind::ClaudePrint
 }
 
+fn deserialize_driver_kind<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<DriverKind, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    match raw.as_str() {
+        "pty" => Ok(DriverKind::GenericPty),
+        other => serde_json::from_value(serde_json::Value::String(other.to_owned()))
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 fn default_model() -> String {
     "fake".to_owned()
 }
@@ -42,8 +53,11 @@ pub struct CreateInstanceRequest {
     /// Native product kind.
     #[serde(default = "default_agent_kind")]
     pub kind: AgentKind,
-    /// Driver selected from the local registry.
-    #[serde(default = "default_driver_kind")]
+    /// Driver selected from the local registry (`pty` is an alias of `generic-pty`).
+    #[serde(
+        default = "default_driver_kind",
+        deserialize_with = "deserialize_driver_kind"
+    )]
     pub driver: DriverKind,
     /// Requested model label retained only as fake-driver input metadata.
     #[serde(default = "default_model")]

@@ -413,7 +413,13 @@ fn materialize_inner(
 }
 
 fn validate_spec_profile(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult<()> {
-    if spec.kind != agent_kind(spec.driver) {
+    if spec.driver == DriverKind::GenericPty {
+        if crate::generic_pty::preset_for_spec(spec).is_err() {
+            return Err(DriverError::InvalidLaunchSpec(
+                "generic-pty has no preset for this agent kind".into(),
+            ));
+        }
+    } else if spec.kind != agent_kind(spec.driver) {
         return Err(DriverError::InvalidLaunchSpec(format!(
             "driver {:?} is incompatible with agent kind",
             spec.driver

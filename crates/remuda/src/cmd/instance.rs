@@ -136,7 +136,7 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                         host,
                         labels,
                         kind,
-                        driver,
+                        driver: normalize_driver(&driver),
                         workspace_id,
                         title,
                         prompt,
@@ -207,6 +207,13 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
             }
         }
     })
+}
+
+fn normalize_driver(driver: &str) -> String {
+    match driver {
+        "pty" => "generic-pty".to_owned(),
+        other => other.to_owned(),
+    }
 }
 
 pub(crate) async fn create(client: &HubClient, opts: CreateOpts) -> Result<Value> {

@@ -36,3 +36,23 @@ docs/                      # design/ research/
 | D-014 | 2026-09-12 | **Dogfooding 目标（D0）**：Remuda 要能用来迭代 Remuda 自身，打平当前「coordinator 用 herdr 派多 agent」的工作流。为此提前实现：(a) `generic-pty` driver（herdr 承载，任意 kind：claude/codex/grok/agy…，每种 kind 的 yolo 参数预设与命名），(b) worktree 集成（`remuda instance create --worktree <name>` 自动 `git worktree add -b`），(c) MCP/CLI 控制面补齐 `list/wait(until)/read(lines)/send-keys/broadcast`，(d) coordinator 用的 Claude Code skill（等价于现在的 herdr skill），(e) 用一次真实的 `claude -p --mcp-config remuda` 会话派一个 codex + 一个 grok 任务并回收结果作为验收。结构化 codex/grok 驱动仍留在 M4 | 用户 | 用户 2026-09-12 设定 |
 | D-015 | 2026-09-13 | **D0 herdr 对标达成**（main `30e4abe` / dogfood-3）：一次真实 haiku coordinator 会话对 codex+grok `generic-pty` 得到 `codexDone=true`、`grokDone=true`（wait `line:(?m)^DONE` `condition-met`）。Fable 级模型（Claude Fable 及同级 coordinator）**只做统领**，不执行仓库改动；执行面是 **codex / grok / opus**（用户规则）。结构化次级驱动仍留 M4（D-014）。已知缺口不挡 D0：grok 有时要跟发一次 send；`instance stop` 不回收 herdr workspace；Node shutdown 可能打 `driver shutdown did not settle` | 用户 | [dogfood.md](./dogfood.md) D0 验收结果；[dogfood-3-report.md](./dogfood-3-report.md) |
 | D-016 | 2026-09-13 | **Remote terminal**：Web 合同见 [remote-terminal.md](./remote-terminal.md)（文首）。输出 = `tty.frame` binary channel `1`；输入 = binary channel `3` 原字节（键盘+鼠标，不过滤）；resize = JSON `tty.resize {cols,rows}`；attach = `GET /v1/follow?tty=1` 先重放 ≤256 KiB / 全屏 ANSI snapshot。`generic-pty` / `claude-pty` 仍经 herdr `terminal session observe/control`（D-010）；新 kind `terminal` + driver `shell-pty` 用 `portable-pty` 跑 login `$SHELL`，并作为无法识别的 agent CLI 的 fallback。写权限 = 能发 instance commands 的设备；`maxTtyInputBytes` 限长。 | 用户 | [remote-terminal.md](./remote-terminal.md)；herdr-herdrx §7.2；protocol.md §7.4 |
+| D-020 | 2026-09-13 | **公开部署改为公网 VPS 上的 Hub + Caddy**，取代 D-006 的内网 Hub + Cloudflare Tunnel。SG 宿主机没有公网 IP，现有 Caddy/网关域名解析到内网地址；企业风控禁止 cloudflared、frp、ngrok、长期 `ssh -R` 等隧道/内网穿透。所有 Node（SG、devbox、笔记本）按 D-019 主模式以常驻 daemon + 出站 WSS/HTTPS 连接公网 Hub，首次接入用 D-018 一次性 enroll token；手机 HTTPS 直达公网 Hub。内网 provider 网关只由对应 Node 直接访问，配置和凭证按主机保存，Hub 不访问内网 provider。`deploy/public/` 是支持的部署包；旧 M1 Tunnel 操作步骤不再适用。仅记录、未实现的替代方案：内网 Hub 与客户端都主动连接薄公网自定义 WSS relay（Tailcat 风格，无第三方隧道软件），以保留内网 Hub 持久化，代价是额外组件、协议和延迟。 | 用户 | [deploy-public.md](./deploy-public.md)、[deploy/public](../../deploy/public/README.md)；本次为部署包、runbook 和测试，不执行部署或 SSH |
+
+### D-020 优先级调整（同日，用户后续指示）
+
+当前先在 SG 内网运行 Hub，复用现有 Caddy 的 DNS-01，为 `remuda.<zone>`
+配置内网 A 记录，只追加独立站点 include 和必要的 import，不修改既有网关站点。
+`deploy/intranet/` 与 [deploy-runbook.md](./deploy-runbook.md) 为当前操作入口；
+`deploy/public/` 保留为后续公网 VPS 变体。此调整授权了内网实施，取代上表
+本轮仅准备包的执行范围；实际执行结果以 [内网实施证据](./evidence/intranet-hub-1.md)
+为准。禁止隧道的约束保持不变；DNS-01 证书不产生公网可达性，内网 Hub
+只承诺具备内网路由的客户端可达，普通蜂窝网络访问需后续公网方案。
+
+### D-020 执行边界调整（同日，最新用户指示）
+
+当前仅准备内网变更，状态为 `awaiting-caddy-restart-approval`。准备一次性
+apply/rollback 脚本：apply 添加 Remuda import，并将全局 admin 改为
+`localhost:2019`，验证后重启现有 Caddy，再检查网关与 Hub；rollback 恢复
+原 import/admin 设置，验证后重启并检查网关。两个路径中的重启均须等待明确
+批准，当前不执行，也不继续 Node 验收。之前的临时 reload/恢复结果只记入
+实施证据，不代表对最新执行边界的继续授权。

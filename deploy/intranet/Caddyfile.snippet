@@ -1,0 +1,39 @@
+# Replace remuda.<zone> with the dedicated intranet Hub hostname.
+# Import this as a new site; the existing gateway site's /v1 stays untouched.
+# Existing Caddy must already have the Cloudflare DNS module and CF_API_TOKEN.
+# The placeholder expands at runtime: this file contains no DNS credentials.
+# Keep the operator copy in Caddyfile.d and stage this inactive include in the
+# existing persistent /config volume at /config/remuda/Caddyfile.d/remuda.caddy.
+# caddy-change.py prepare validates without modifying the active Caddyfile.
+# Import/admin changes and the apply/rollback restarts require explicit approval;
+# see README.md. Do not change the existing gateway site.
+
+remuda.<zone> {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+	# Includes REST /v1 and /node/v1, /healthz and the embedded Web UI.
+	# Caddy automatically upgrades /v1/follow, /node/v1/connect and /v1/node.
+	reverse_proxy remuda-intranet-hub:8080 {
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto {http.request.scheme}
+		header_up X-Forwarded-Host {http.request.host}
+		header_up -Forwarded
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 3m
+		}
+		stream_timeout 24h
+		stream_close_delay 5m
+		flush_interval -1
+	}
+}

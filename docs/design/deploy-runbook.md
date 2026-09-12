@@ -1,225 +1,134 @@
-# Remuda deploy runbook (zero → phone HTTPS)
+# Remuda deploy runbook：SG 内网 Hub + 现有 Caddy
 
-This is the M1-pre edge path: build Linux artifacts, put Hub behind the
-existing Caddy on `devbox-sg-host`, publish that hostname through a
-Cloudflare Tunnel, and run Node on `devbox-sg`. `remuda hub` / `remuda
-node` are still bootstrap placeholders; this document is the wiring, not a
-claim that the PWA already talks to a live Hub.
+当前交付状态：**prepared only — awaiting-caddy-restart-approval**。按用户最新
+指示，准备变更与回滚脚本，等待明确的 Caddy 重启批准；不得因脚本已准备好就
+执行重启或继续 Node 接入验收。此前操作和基线恢复以
+[实施证据](./evidence/intranet-hub-1.md) 为准，不把临时探测当作最终启用结果。
 
-Do not install services or edit remote Caddy/compose while only running the
-binary smoke in `/tmp/remuda-smoke/`.
+当前支持入口是 [deploy/intranet](../../deploy/intranet/README.md)。按 D-020
+后续优先级调整，先把 Hub 放到 `<sg-host>`，复用现有 Caddy 的 DNS-01，使用
+独立域名 `remuda.<zone>`。未来公网 VPS 方案保留在
+[deploy/public](../../deploy/public/README.md)，本轮不部署公网 VPS。
 
-## 0. Inventory (verified 2026-09-12)
+SG 没有公网 IP；域名 A 记录指向内网地址。DNS-01 可签发 HTTPS 证书，但不会
+让该地址变成公网可达。浏览器、手机和 Node 必须有获准的内网路由。普通蜂窝
+网络访问不属于此次内网验收。cloudflared、frp、ngrok、长期 `ssh -R` 等隧道/
+内网穿透均不适用；旧 [cloudflared 文档](../../deploy/cloudflared.md) 仅作历史记录。
 
-| Role | SSH alias | OS | Kernel | libc | Notes |
-| --- | --- | --- | --- | --- | --- |
-| Hub host | `devbox-sg-host` | Debian 10 | 5.4.143.bsk.8-amd64 | glibc 2.28 | Docker 26.x, Caddy v2 on `:80`/`:443`, compose project `deploy` |
-| First Node | `devbox-sg` | Ubuntu 20.04.5 | same kernel | glibc 2.31 | Container; systemd as PID 1; has docker of its own (not the host daemon) |
-| CN canary | `devbox-small` | Debian 10 | same kernel | glibc 2.28 | glibc floor; GitHub egress is poor; Cloudflare 443 works |
+## 前置证据与构建
 
-Docker network on the Hub host (read-only `docker network ls`):
+操作员先核验 `<sg-host>` 的 OS/架构、Docker/Compose、现有 Caddy 容器、
+`deploy_default` 网络、Caddyfile 挂载及 import 方式、DNS 模块和既有凭证变量名。
+查看配置时不输出凭证。记录相关状态和已有网关健康响应作为回滚/验收基线；
+执行结果集中写入 [intranet-hub-1.md](./evidence/intranet-hub-1.md)，不能由旧 M1
+预检记录推定当前可用。
 
-```
-NAME             DRIVER    SCOPE
-deploy_default   bridge    local
-```
+本轮现场检查识别的宿主机是 Debian 10 x86_64；以检查结果为准，不套用公网
+包的 Ubuntu 24.04 安装器。现有 Caddy 已把 `/config` 和 `/data` 挂载为命名卷，
+主 Caddyfile 是独立 bind mount；拟复用 `/config` 保存持久 include。远端 PATH
+检查未发现原生 agent CLI 或 Herdr；未来 Node 注册可以报告缺失工具，但当前
+不执行 Node 接入验收，也不据此宣称具备会话执行能力。
 
-That is the compose project `deploy` default network. Remuda Hub joins it as
-an **external** network. Do not create a second `deploy_default`. Do not
-publish Hub ports on the host.
+从已验证的同一提交先构建 web，再构建 Linux musl 二进制与
+`deploy/m1/Dockerfile` 镜像。详细构建顺序见
+[镜像构建](../../deploy/public/README.md#build-the-image)。确认镜像架构匹配
+SG x86_64，并用明确 tag 或摘要标识实际部署构建。
 
-AsterGate already occupies `/v1` on the existing HTTPS hostname. Remuda uses
-a **new hostname** (`remuda.example.com` below — replace with a name in the
-same DNS zone). Cookie domain and path stay isolated.
+## 批准前：准备材料
 
-## 1. Cross-compile
+1. 核验 `remuda.<zone>` 的 A 记录为目标内网地址；复用 Caddy 已有的 Cloudflare
+   DNS-01 凭证。DNS token 仅供 Caddy 使用，Hub 不获取它。
+2. 准备 [intranet Compose](../../deploy/intranet/compose.hub.yml) 的环境值：
+   `HUB_IMAGE`、`HUB_DOMAIN=remuda.<zone>`、`DATA_DIR`、实际数据目录 owner 的
+   `HUB_UID/HUB_GID`，以及只包含 Caddy 实际网络 IP 的 `REMUDA_TRUSTED_PROXIES` JSON。
+   数据目录 `/data00/remuda/hub` 模式为 0700，由实际 Compose 运行用户拥有；
+   已有数据和 bootstrap 文件必须保留。Hub 不发布端口。
+3. 核验独立 `remuda-intranet` Compose 项目的准备状态和既有外部网络
+   `deploy_default`。用 `docker compose config` 检查镜像、数据目录和只读设置；
+   已启动服务及内部健康检查的实际情况以证据为准，不改动 Caddy/网关项目。
+   拟使用 Caddy 上游专用别名 `remuda-intranet-hub`，避免共享网络中的服务名冲突。
+4. 将 [Caddy 片段](../../deploy/intranet/Caddyfile.snippet) 实例化为单独的 Remuda
+   include，使用已验证的 DNS-01 配置。保留操作员源文件
+   `~/astergate/deploy/Caddyfile.d/remuda.caddy`。批准前只准备未激活的片段与
+   脚本，不在活动 Caddyfile 添加 import。准备阶段可复制到现有容器内
+   `/config/remuda/Caddyfile.d/remuda.caddy`，位于已挂载的 `/config` 命名卷；
+   保留此卷即可跨容器重建保留 include。
+5. 准备并审阅 [caddy-change.py](../../deploy/intranet/caddy-change.py) 的
+   `prepare`、`apply` 与 `rollback` 路径，
+   包括原配置备份、仅限 Remuda 的 diff、验证、重启及健康检查；等待批准。
+   首次登录 access code 保存于 `/data00/remuda/secrets/access-code`，模式 0600，
+   不进入 argv、URL、日志或证据文档。
 
-On macOS, use Zig 0.13.x plus `cargo-zigbuild` (reproducible, no QEMU):
-
-```bash
-# zig 0.13 from https://ziglang.org/download/ on PATH
-cargo install cargo-zigbuild
-rustup target add x86_64-unknown-linux-musl x86_64-unknown-linux-gnu
-just linux-musl    # static; smoke default
-just linux-gnu     # cargo-zigbuild target x86_64-unknown-linux-gnu.2.28
-```
-
-Outputs:
-
-- `target/x86_64-unknown-linux-musl/release/remuda` — statically linked
-- `target/x86_64-unknown-linux-gnu/release/remuda` — dynamic glibc, max
-  `GLIBC_2.28`
-
-### glibc 2.28
-
-Debian 10 is the Node floor (`plan-phase0.md` §13.6). Compatibility is not
-the target triple; it is “the binary runs on that host”.
-
-1. Prefer musl static. Promotion requires `file` = statically linked, `ldd`
-   = not a dynamic executable, and a real `./remuda version` on the host.
-2. Fallback: `cargo zigbuild --target x86_64-unknown-linux-gnu.2.28`. Check
-   `readelf --dyn-syms` for no `GLIBC_2.29` or newer, then run the binary on
-   Debian 10.
-3. Hub images use bookworm/distroless and are **not** the Node glibc story.
-
-This session: musl static ran on Ubuntu 20.04 (glibc 2.31) and Debian 10
-(glibc 2.28). The gnu.2.28 artifact ran on Debian 10; dyn-syms were
-`GLIBC_2.2.5` … `GLIBC_2.28` (highest 2.28). No OpenSSL/libgcc on the
-current clap-only binary; later `rusqlite` bundled SQLite must re-run this
-gate.
-
-## 2. Hub image
-
-From the repo root (after pinning `FROM` digests — see `deploy/Dockerfile`):
+主机上的脚本名为 `~/astergate/deploy/remuda-caddy-change.py`。私有设置文件
+`.remuda-caddy-change.json` 使用 0600，包含 `gateway_health_url`、`hub_health_url`、
+`baseline_caddy_sha256`、`baseline_started_at`、`include_sha256` 和
+`gateway_health_sha256`，均由本轮已审阅基线产生；不包含 DNS token。
 
 ```bash
-docker build -f deploy/Dockerfile \
-  --build-arg REMUDA_GIT_SHA="$(git rev-parse HEAD)" \
-  -t ghcr.io/somainer/remuda:0.1.0 .
+cd "$HOME/astergate/deploy"
+python3 remuda-caddy-change.py prepare --settings .remuda-caddy-change.json
 ```
 
-Stages: pnpm `web/` → `cargo build --locked --release --bin remuda` →
-`gcr.io/distroless/cc-debian12:nonroot`. Runs as UID 65532. Distroless has
-no shell; do not add `HEALTHCHECK CMD-SHELL`. Probe HTTP/`remuda doctor`
-once those exist.
+`prepare` 检查配置哈希、容器启动时间、片段哈希与网关健康响应；生成
+`Caddyfile.remuda-prepared`，把候选配置和未激活片段复制到已有 `/config` 卷，
+执行 Caddy validate，再复查网关健康与活动文件未改变。它不改活动 Caddyfile、
+不发 reload 信号、不重启。准备成功也不解除审批等待状态。
 
-Tag-triggered CI draft: `.github/workflows/release.yml` (musl artifact +
-push to `ghcr.io/somainer/remuda`). No extra registry secret; GHCR uses
-`GITHUB_TOKEN`. This workflow has not been executed here.
+## 获得明确批准后：一次性 Caddy 变更
 
-## 3. Secrets (create before compose up)
+以下是待批准脚本的行为约定，当前不得执行。`apply` 应备份原 Caddyfile，
+核验准备好的 include 哈希，写入专用 Remuda include，在主文件只添加缺少的
+`import /config/remuda/Caddyfile.d/*.caddy`，并把全局 `admin off` 改为
+`admin localhost:2019`。管理端点仅在 Caddy 容器内回环地址监听，不发布宿主机
+2019 端口。保留既有网关站点及其 `/v1` 路由。
 
-All files mode `0400`, directory `0700`, owner root or the compose operator.
-Never put values in git, image layers, Caddy env that Hub can read, or
-argv.
+完成配置验证后，脚本才运行用户待批准的 `docker restart deploy-caddy-1`，
+随后检查原网关健康响应哈希以及 Remuda HTTPS `/healthz` 的 `{"ok": true}`，
+HTTPS 请求保持证书验证。完整登录页面另列为后续验收。重启可能暂时
+中断该 Caddy 承载的连接，正是本次需要等待明确批准的动作。原 API reload 失败
+与 SIGUSR1 探测经过只保存在实施证据中，不作为本次绕过批准的替代执行入口。
 
-| Secret | Path on Hub host | Consumer | How to inject |
-| --- | --- | --- | --- |
-| Hub master key | `/data00/remuda/secrets/master-key` | Hub, migrate | `umask 077; openssl rand -out … 32` |
-| Web password | `/data00/remuda/secrets/web-password` | Hub auth | operator-chosen; Hub stores a KDF, not this file’s echo in logs |
-| Lark app secret | `/data00/remuda/secrets/lark-app-secret` | Hub dispatcher (M2) | from the Feishu app; optional until M2 |
-| Node token | `/etc/remuda/secrets/node-token` on the Node | that Node only | Hub enroll returns it once; 256-bit |
-| Cloudflare DNS token | existing Caddy env `CF_API_TOKEN` | Caddy only | already present; **do not** copy into Remuda |
-| Tunnel credential | `/etc/cloudflared/<uuid>.json` | cloudflared only | `cloudflared tunnel create remuda` |
-
-Compose maps the first three as Docker secrets (`*_FILE` env). Data dir
-`/data00/remuda/hub` must be writable by UID 65532, mode `0700`:
+只在批准后，从同一主机目录执行：
 
 ```bash
-sudo mkdir -p /data00/remuda/hub /data00/remuda/secrets
-sudo chown 65532:65532 /data00/remuda/hub
-sudo chmod 0700 /data00/remuda/hub /data00/remuda/secrets
+python3 remuda-caddy-change.py apply --settings .remuda-caddy-change.json
 ```
 
-Rotate: write a new file, `compose up -d` (or restart the migrate+hub pair),
-keep the previous master key readable until dual-key read is implemented.
-Tunnel JSON leak → rotate the tunnel; it is independent of the Hub master
-key.
+`apply` 会重复基线检查，保存 `Caddyfile.pre-remuda-approved` 和恢复状态，再
+修改活动文件。若变更后的重启或健康检查失败，脚本自动恢复原文件并再次重启
+Caddy 以恢复网关。批准 `apply` 包含这次失败恢复重启，不在故障时额外等待批准。
 
-## 4. Compose + Caddy + Tunnel
+## 配套回滚（同样包含重启）
 
-On `devbox-sg-host`, from a checkout of `deploy/`:
+`rollback` 恢复备份中的原全局 admin 设置（本轮基线为 `admin off`）和原 import
+状态，通过恢复 import 停用新增 Remuda 片段；保留未激活的准备文件供审阅。
+验证恢复后的配置，再
+`docker restart deploy-caddy-1`，复核原网关健康。回滚脚本当前也只准备，不能在
+未获批准时执行其中的重启。保留 Hub 数据、Caddy `/config` 与证书卷、
+`deploy_default` 网络，不重建网关项目。
+
+以下命令留作批准后的显式恢复使用，当前不执行：
 
 ```bash
-# 1. Placeholder hub.toml until remuda hub reads config (create empty ok).
-install -m 0644 /dev/null ./hub.toml
-
-# 2. Join existing network; no ports.
-docker compose -f compose.hub.yml config
-docker compose -f compose.hub.yml up -d
+python3 remuda-caddy-change.py rollback --settings .remuda-caddy-change.json
 ```
 
-Append `deploy/Caddyfile.snippet` to `~/astergate/deploy/Caddyfile` as a
-**new site block**. Reload Caddy only (`docker exec deploy-caddy-1 caddy
-reload --config /etc/caddy/Caddyfile`). Do not change the AsterGate site.
+## 批准并启用后的验收（当前未执行）
 
-Follow `deploy/cloudflared.md`: named tunnel, origin `https://127.0.0.1:443`
-with `originServerName remuda.example.com`, catch-all `http_status:404`.
-CNAME the hostname to `<tunnel-id>.cfargotunnel.com`. Do not publish a
-public A record for the private Hub IP. Do not open extra inbound ports.
+从具备内网路由的客户端验证 `https://remuda.<zone>/login`，私下读取 access
+code 首次登录；已登录设备在 Settings 生成手机配对码，手机使用 `/login?pair`。
+按 [Node onboarding](../../deploy/public/NODES.md) 接入 Node，再核验
+`/v1/follow`、`/node/v1/connect`、主机清单与断线重连。当前 carrier 参数为
+`--hub-url` / `--host-token-file`；c-daemon 与 D-018 合入后使用安装器及一次性
+enroll token。内网 provider 由各 Node 直接访问，凭证和 profile 按主机配置。
+这些步骤是后续验收清单，不是当前完成声明。
 
-Phone check: cellular network (not corp VPN) loads `https://remuda.example.com`,
-WebSocket upgrade works, SSE does not buffer. Cloudflare 200 is not Hub
-health.
+## 后续维护
 
-## 5. Node
+升级前对 SQLite 做一致性备份，并保留匹配的 bootstrap、master key 与其他
+secret envelope；数据库迁移失败时保持 Hub 停止。旧镜像必须兼容当前 schema
+才可直接回滚；否则在新目录恢复备份和对应配置，保留故障目录并验证后切换。
+公网包的安装/升级脚本面向独立 VPS 栈，不直接作用于已有 SG Caddy 项目。
 
-Same UID as Herdr (`remuda-agent`). Binary from the musl artifact unless
-musl fails that host.
-
-- systemd host: `deploy/node.service` (requires a matching Herdr unit from
-  `plan-phase0.md` §13.4). `ProtectHome=read-only`; workspace whitelist
-  replaces `/workspaces`.
-- No systemd (or a canary in a container): `deploy/node-nohup.sh start`.
-  One PID file; `stop` to clean. Not a production supervisor.
-
-Node only dials outbound WSS to the Hub hostname. Production Node has no
-listener.
-
-## 6. Smoke results (redacted)
-
-Cross-compile host: macOS `aarch64-apple-darwin`, rustc 1.94.1,
-zig 0.13.0, cargo-zigbuild 0.23.4. Artifact SHA-256 is of the file copied
-to `/tmp/remuda-smoke/remuda`. Remote files deleted after the run.
-
-| Host | OS / kernel / libc | Artifact | `./remuda version` | `./remuda dev --help` | Cleanup |
-| --- | --- | --- | --- | --- | --- |
-| `devbox-sg` | Ubuntu 20.04.5 / 5.4.143.bsk.8-amd64 / glibc 2.31 | musl static, ELF x86-64, `ldd`: not a dynamic executable, sha256 `86a4781998a0e12551d3c09a78d2a4b3431d9f2e143187733f755d2912151fd3` | `remuda 0.1.0` `target=x86_64-unknown-linux-musl` `wire=1` `schema=0` | clap help for `dev` | `/tmp/remuda-smoke` removed |
-| `devbox-small` | Debian 10 / 5.4.143.bsk.8-amd64 / glibc 2.28 | same musl binary / same digest | same | same | removed |
-| `devbox-small` (gnu gate) | Debian 10 / glibc 2.28 | `x86_64-unknown-linux-gnu.2.28` PIE, `ldd`: libpthread/libc/libdl, dyn-syms highest `GLIBC_2.28`, sha256 `29c911261197c90109743f24b168f24f974db529d7c6a78c43c56a0e46d3692d` | `target=x86_64-unknown-linux-gnu` | same | removed |
-
-`devbox-sg-host` was used only for `docker network ls` (confirmed
-`deploy_default`). No binary was left there. No compose/Caddy/cloudflared
-process was started in this smoke.
-
-Commit in the version line was `b5f8c97…-dirty` because the tree had
-unrelated in-progress crates at build time; release builds must pass
-`REMUDA_GIT_SHA` from a clean tag.
-
-## 7. Rollback
-
-1. Stop taking new Hub work; Nodes keep local journals.
-2. `docker compose -f compose.hub.yml down` (Remuda services only).
-3. Revert the Remuda Caddy site block; reload Caddy. Leave AsterGate as-is.
-4. Point the Tunnel hostname away or delete only the Remuda ingress rule.
-5. Restore `/data00/remuda/hub` from backup into a **new** directory; never
-   overlay a live DB.
-
-## 8. M1 preflight (2026-09-12, read-only)
-
-`./deploy/m1/preflight.sh` against SSH aliases `devbox-sg-host` and
-`devbox-sg`. No compose up, no unit start, no Caddy reload. Output
-redacted (no host IPs, no usernames).
-
-| Check | Result | Detail |
-| --- | --- | --- |
-| ssh devbox-sg-host | GO | BatchMode ok |
-| hub os | GO | Linux 5.4.143.bsk.8-amd64 x86_64; Debian GNU/Linux 10 (buster) |
-| hub docker | GO | 26.1.4 |
-| hub compose | GO | Docker Compose version v2.27.1 |
-| network deploy_default | GO | deploy_default bridge local |
-| caddy container | GO | deploy-caddy-1 |
-| caddy import | GO | `import routes` already (add `import Caddyfile.d/*.caddy` for Remuda) |
-| hub :443 | GO | listener present (do not bind another) |
-| hub :8080 host | GO | host already has :8080; Hub must stay unpublished (compose has no ports:) |
-| hub disk | GO | /data00 1007G, 55% used |
-| hub cloudflared bin | GO | not installed yet (token-based install is in deploy/m1/README.md) |
-| hub remuda containers | GO | none |
-| ssh devbox-sg | GO | BatchMode ok |
-| node os | GO | Linux 5.4.143.bsk.8-amd64 x86_64; Ubuntu 20.04.5 LTS |
-| node pid1 | GO | systemd |
-| node /tmp | GO | 504G, 46% used |
-| node /opt/remuda | GO | empty; scp is operator-run |
-
-**PREFLIGHT: GO**
-
-Copy-paste operator steps: `deploy/m1/README.md`. Hub tarball and musl
-binary live in `deploy/out/` (gitignored).
-
-## 9. Still out of scope for this wiring
-
-- Real `remuda hub` listen / auth / migrate (M1).
-- Node enrollment and outbound WSS (M1).
-- CN as a production Node (egress and Cloudflare reachability differ by
-  host; `devbox` CN cannot reach Cloudflare).
-- Pinning container `FROM` digests (M3-05 / `scripts/ci/container.sh`).
+公开 VPS CI smoke 只验证包的内部证书容器路径。此次内网部署、DNS-01 和
+真实客户端结果以 [实施证据](./evidence/intranet-hub-1.md) 为准。

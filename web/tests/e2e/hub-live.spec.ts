@@ -40,12 +40,7 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   await page.reload();
   await expectCookieSession(page);
   await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1);
-
-  await page.getByTestId("composer").locator("textarea").fill("second turn");
-  await page.getByRole("button", { name: "送出" }).click();
-  await expect(page.getByTestId("message").filter({ hasText: "echo: second turn" })).toBeVisible({
-    timeout: 20_000,
-  });
+  await expect(page.getByTestId("composer-bar")).toBeVisible();
 
   await page.goto("/approvals");
   await expect(page.getByTestId("approvals-page")).toBeVisible();
@@ -58,6 +53,14 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
 
   await page.goto(sessionPath);
   await expect(page.getByTestId("session-page")).toBeVisible();
+  await expect(page.getByTestId("composer-bar")).toBeVisible();
+  await expect(page.getByTestId("composer-input")).toBeEnabled();
+  await page.getByTestId("composer-input").fill("second turn");
+  await page.getByTestId("composer-send").click();
+  await expect(page.getByTestId("message").filter({ hasText: "echo: second turn" })).toBeVisible({
+    timeout: 20_000,
+  });
+
   await page.getByRole("button", { name: "Stop" }).click();
   await expect(page.getByTestId("session-page")).toBeVisible();
   expect(followUrls.every((url) => !new URL(url).searchParams.has("token"))).toBe(true);

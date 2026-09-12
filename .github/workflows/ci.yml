@@ -14,6 +14,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: rustup show active-toolchain
+      - name: Prebuild remuda-testing bins
+        run: cargo build -p remuda-testing --bins --locked
       - name: Test
         run: cargo test --workspace --locked
       - name: Clippy

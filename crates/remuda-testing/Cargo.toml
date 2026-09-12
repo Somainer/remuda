@@ -25,6 +25,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+fs2 = "0.4"
 remuda-driver.workspace = true
 remuda-herdr.workspace = true
 remuda-journal.workspace = true

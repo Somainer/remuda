@@ -18,10 +18,9 @@ use remuda_protocol::{
     LifecyclePayload, LifecycleTopic, NativeRequestKey, Observation, ObservationPayload,
     PromptInput, PromptMode, QuestionAnswer, QuestionFieldAnswer, TextBlock, U64,
 };
-use remuda_testing::{ScriptKind, fake_claude_bin, script_path};
+use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -29,18 +28,8 @@ use tokio::sync::Mutex;
 
 fn ensure_fake_claude() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        if let Ok(path) = std::env::var("CARGO_BIN_EXE_fake-claude") {
-            return PathBuf::from(path);
-        }
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "remuda-testing", "--bin", "fake-claude"])
-            .status()
-            .expect("build fake-claude");
-        assert!(status.success());
-        fake_claude_bin()
-    })
-    .clone()
+    BIN.get_or_init(|| ensure_workspace_bin("fake-claude"))
+        .clone()
 }
 
 fn dummy_digest() -> Digest {

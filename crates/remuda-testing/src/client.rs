@@ -159,8 +159,7 @@ impl Drop for FakeClaudeProcess {
 
 /// Path to the `fake-claude` binary built for this package.
 pub fn fake_claude_bin() -> PathBuf {
-    crate::locate_workspace_bin("fake-claude")
-        .unwrap_or_else(|| crate::fallback_bin_path("fake-claude"))
+    crate::ensure_workspace_bin("fake-claude")
 }
 
 /// Spawn `fake-claude` with stream-json flags a real host would pass.

@@ -127,7 +127,7 @@ pub enum HubNodeMethod {
 }
 
 /// `node.auth` params (stdio first frame).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeAuthParams {
     /// Bootstrap or persisted host token.
@@ -135,6 +135,15 @@ pub struct NodeAuthParams {
     /// Auth scheme; `bearer` when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
+}
+
+impl std::fmt::Debug for NodeAuthParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeAuthParams")
+            .field("token", &"<redacted>")
+            .field("scheme", &self.scheme)
+            .finish()
+    }
 }
 
 /// `node.hello` params: persisted host id, inventory, enrollment token.
@@ -753,5 +762,16 @@ mod tests {
     fn bearer_strips_scheme() {
         assert_eq!(bearer_from_authorization("Bearer abc"), Some("abc"));
         assert_eq!(bearer_from_authorization("Bearer "), None);
+    }
+
+    #[test]
+    fn node_auth_params_debug_redacts_token() {
+        let params = NodeAuthParams {
+            token: "host-secret".into(),
+            scheme: Some("bearer".into()),
+        };
+        let rendered = format!("{params:?}");
+        assert!(!rendered.contains("host-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }

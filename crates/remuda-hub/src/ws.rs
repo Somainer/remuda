@@ -120,6 +120,7 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
         Arc::new(Mutex::new(HashMap::new()));
     let mut host_id: Option<String> = None;
     let mut hello_done = false;
+    let mut session_generation: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -138,6 +139,9 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                     continue;
                 }
                 let Message::Text(text) = msg else { continue; };
+                if text.len() > default_limits().max_json_frame_bytes as usize {
+                    break;
+                }
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue; };
                 if frame.get("method").is_none() {
                     if let Some(id) = frame.get("id").and_then(Value::as_str)
@@ -161,7 +165,7 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                     }
                     break;
                 }
-                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, method, params, &out_tx, &pending).await {
+                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, method, params, &out_tx, &pending).await {
                     Ok(Some(result)) => {
                         if !id.is_null() {
                             let _ = sink.send(Message::Text(rpc_ok(id, result).to_string().into())).await;
@@ -184,8 +188,16 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     }
 
     if let Some(host_id) = host_id {
-        state.nodes.remove(&host_id).await;
-        let _ = state.store.mark_host_offline(host_id).await;
+        let stale = match session_generation {
+            Some(generation) => state.nodes.remove_generation(&host_id, generation).await,
+            None => {
+                state.nodes.remove(&host_id).await;
+                true
+            }
+        };
+        if stale {
+            let _ = state.store.mark_host_offline(host_id).await;
+        }
     }
 }
 
@@ -195,17 +207,27 @@ async fn handle_node_method(
     token: &str,
     host_id: &mut Option<String>,
     hello_done: &mut bool,
+    session_generation: &mut Option<u64>,
     method: &str,
     params: Value,
     out_tx: &mpsc::Sender<Value>,
     pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
 ) -> Result<Option<Value>, HubError> {
     match method {
-        "node.auth" => Ok(Some(json!({
-            "ok": true,
-            "scheme": hubnode::AUTH_SCHEME_BEARER,
-        }))),
+        "node.auth" => {
+            let presented = params.get("token").and_then(Value::as_str).unwrap_or("");
+            if !crate::config::secret_eq(presented, token) {
+                return Err(HubError::Unauthenticated);
+            }
+            Ok(Some(json!({
+                "ok": true,
+                "scheme": hubnode::AUTH_SCHEME_BEARER,
+            })))
+        }
         "runtime.hello" | "node.hello" => {
+            if *hello_done {
+                return Err(HubError::BadRequest("hello already completed".into()));
+            }
             let typed: Option<NodeHelloParams> = serde_json::from_value(params.clone()).ok();
             let hello_host = typed
                 .as_ref()
@@ -265,13 +287,14 @@ async fn handle_node_method(
                     params.get("capabilities").cloned(),
                 )
                 .await?;
-            state
+            let generation = state
                 .nodes
                 .insert(
                     host.host_id.clone(),
                     Arc::new(WssTransport::new(out_tx.clone(), pending.clone())),
                 )
                 .await;
+            *session_generation = Some(generation);
             Ok(Some(hello_result(&host, node_token)?))
         }
         "runtime.heartbeat" | "node.heartbeat" => {
@@ -358,14 +381,18 @@ async fn handle_node_method(
                 .await
                 .map_err(map_host_store)?;
             let mut last = None;
+            let mut seq = seq;
             for event in events {
-                let record = state
+                let (record, inserted) = state
                     .store
                     .append_journal(host_id.clone(), instance_id.clone(), seq, event)
                     .await
                     .map_err(map_host_store)?;
-                publish_journal(&state.bus, &record);
-                crate::alerts::observe(state, &record);
+                if inserted {
+                    publish_journal(&state.bus, &record);
+                    crate::alerts::observe(state, &record);
+                }
+                seq = Some(record.seq.saturating_add(1));
                 last = Some(record);
             }
             let record = last.ok_or_else(|| {

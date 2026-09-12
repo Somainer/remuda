@@ -80,6 +80,7 @@ impl RunningNode {
 
     /// Stop accepting new connections and wait for upgraded connections to drain.
     pub async fn shutdown(mut self) -> Result<(), NodeError> {
+        self.node.shutdown().await?;
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -114,12 +115,17 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
         LocalDrivers::Native(native) => native_driver_registry(native.clone())?,
     };
     let host_id = crate::enroll::load_or_create(&config.data_dir)?.host_id;
-    DevNode::with_parts_on_host(&config.http, store, drivers, host_id)
+    let node = DevNode::with_parts_on_host(&config.http, store, drivers, host_id)?;
+    Ok(match &config.drivers {
+        LocalDrivers::Native(native) => node.with_herdr_config(native.clone())?,
+        LocalDrivers::Fake => node,
+    })
 }
 
 /// Bind and spawn a durable local Node service.
 pub async fn serve(config: ServeConfig) -> Result<RunningNode, NodeError> {
     let node = compose(&config)?;
+    node.reconcile_herdr().await?;
     let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
     let addr = listener.local_addr()?;
     let app = dev_router(node.clone(), &config.http);

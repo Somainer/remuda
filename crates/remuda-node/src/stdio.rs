@@ -70,7 +70,32 @@ pub async fn run_stdio_opts(opts: StdioOptions) -> Result<(), NodeError> {
 
 /// Serve an already-composed Node runtime over NDJSON stdin/stdout.
 pub async fn run_stdio_runtime_opts(node: DevNode, opts: StdioOptions) -> Result<(), NodeError> {
-    run_stdio_runtime(node, opts, None, None).await
+    node.reconcile_herdr().await?;
+    let result = tokio::select! {
+        result = run_stdio_runtime(node.clone(), opts, None, None) => result,
+        result = shutdown_signal() => result,
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown())
+        .await
+        .map_err(|_| {
+            NodeError::Driver("Node shutdown deadline exceeded; ownership retained".into())
+        })??;
+    result
+}
+
+async fn shutdown_signal() -> Result<(), NodeError> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }
 
 /// Alias of [`run_stdio_runtime_opts`] for the musl `remuda-node-stdio` bin.

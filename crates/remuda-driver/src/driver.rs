@@ -107,6 +107,14 @@ impl RunHandle {
 /// `start` / `attach` / `resume` only establish the connection; they do not send a prompt.
 #[async_trait]
 pub trait Driver: Send + Sync {
+    /// Bind durable ownership before starting a Node-owned PTY.
+    fn track_pty_resources(
+        &self,
+        _id: InstanceId,
+        _store: std::sync::Arc<dyn crate::PtyResourceStore>,
+    ) {
+    }
+
     /// Capability snapshot for this driver and binary generation.
     async fn capabilities(&self) -> DriverResult<remuda_protocol::CapabilitySnapshot>;
 

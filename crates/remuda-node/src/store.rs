@@ -31,11 +31,19 @@ struct InstanceRecord {
 struct MemoryState {
     instances: BTreeMap<InstanceId, InstanceRecord>,
     commands: BTreeMap<CommandId, Command>,
+    pty_resources: BTreeMap<String, remuda_driver::PtyResource>,
     journal_instances: BTreeMap<remuda_protocol::Id, InstanceId>,
 }
 
 /// Storage contract used by `DevNode`; the durable SQLite adapter can implement this seam later.
 pub trait LocalStore: Send + Sync {
+    /// Persist a Node-owned Herdr resource before agent launch.
+    fn put_pty_resource(&self, resource: &remuda_driver::PtyResource) -> Result<(), NodeError>;
+    /// List resources, including partial launches from a previous Node process.
+    fn pty_resources(&self) -> Result<Vec<remuda_driver::PtyResource>, NodeError>;
+    /// Remove a resource after confirmed cleanup.
+    fn remove_pty_resource(&self, key: &str) -> Result<(), NodeError>;
+
     /// Insert a newly materialized Instance.
     fn insert_instance(&self, instance: Instance) -> Result<(), NodeError>;
     /// Return all Instances in stable identity order.
@@ -305,6 +313,9 @@ impl MemoryStore {
         let entities = EntityDb::open(data_dir)?;
         let durable = DurableJournal::open(data_dir, follow_buffer_capacity, fsync)?;
         let mut state = MemoryState::default();
+        for resource in entities.pty_resources()? {
+            state.pty_resources.insert(resource.key(), resource);
+        }
         for mut instance in entities.list_instances()? {
             let seq = durable.durable_seq(&instance.meta.id)?;
             instance.durable_seq = seq;
@@ -353,6 +364,41 @@ impl MemoryStore {
 }
 
 impl LocalStore for MemoryStore {
+    fn put_pty_resource(&self, resource: &remuda_driver::PtyResource) -> Result<(), NodeError> {
+        if let Some(db) = &self.entities {
+            db.put_pty_resource(resource)?;
+        }
+        self.state
+            .write()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .pty_resources
+            .insert(resource.key(), resource.clone());
+        Ok(())
+    }
+
+    fn pty_resources(&self) -> Result<Vec<remuda_driver::PtyResource>, NodeError> {
+        Ok(self
+            .state
+            .read()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .pty_resources
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn remove_pty_resource(&self, key: &str) -> Result<(), NodeError> {
+        if let Some(db) = &self.entities {
+            db.remove_pty_resource(key)?;
+        }
+        self.state
+            .write()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .pty_resources
+            .remove(key);
+        Ok(())
+    }
+
     fn insert_instance(&self, instance: Instance) -> Result<(), NodeError> {
         let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
         if state.instances.contains_key(&instance.meta.id) {
@@ -420,6 +466,17 @@ impl LocalStore for MemoryStore {
             .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
         if let Some(lifecycle) = lifecycle {
             record.instance.lifecycle = lifecycle;
+            if lifecycle == InstanceLifecycle::Exited
+                && !matches!(record.instance.exit, Knowledge::Known { .. })
+            {
+                record.instance.exit = Knowledge::Known {
+                    value: remuda_protocol::ProcessExit {
+                        code: None,
+                        signal: None,
+                        observed_at: now.clone(),
+                    },
+                };
+            }
         }
         if let Some(activity) = activity {
             record.instance.activity = activity;

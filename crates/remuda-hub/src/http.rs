@@ -30,6 +30,8 @@ fn default_device_name() -> String {
 pub struct InstanceListQuery {
     #[serde(rename = "hostId")]
     host_id: Option<String>,
+    #[serde(default, rename = "includeHistory")]
+    include_history: bool,
 }
 
 #[derive(Deserialize)]
@@ -179,7 +181,10 @@ pub async fn list_instances(
     Query(query): Query<InstanceListQuery>,
 ) -> Result<Json<Value>, HubError> {
     require_device(&state.store, &headers).await?;
-    let items = state.store.list_instances(query.host_id).await?;
+    let mut items = state.store.list_instances(query.host_id).await?;
+    if !query.include_history {
+        items.retain(|instance| instance.last_error.as_deref() != Some("host-lost"));
+    }
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 

@@ -25,6 +25,9 @@ use std::{
 
 #[derive(ClapArgs)]
 pub(crate) struct Args {
+    /// Preserve unknown Herdr panes at startup for manual recovery.
+    #[arg(long)]
+    no_herdr_orphan_sweep: bool,
     /// Local Node HTTP/WebSocket listener (loopback unless --dev-bind-lan).
     #[arg(long, conflicts_with = "port")]
     listen: Option<SocketAddr>,
@@ -117,12 +120,16 @@ pub(crate) async fn run(
         .with_access_code(running_hub.bootstrap_token.clone())?;
     node_config.bind_addr = config.node.listen;
     let mut native = NativeDriverConfig::new(config.data_dir.join("node"));
+    native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
     if let Some(binary) = resolve_claude_binary() {
         tracing::info!(path = %binary.display(), "using Claude binary from PATH");
         native = native.with_claude_binary(binary);
     }
-    let drivers = native_driver_registry(native)?;
-    let store = Arc::new(MemoryStore::new(node_config.follow_buffer_capacity));
+    let drivers = native_driver_registry(native.clone())?;
+    let store = Arc::new(MemoryStore::open_journaled(
+        config.data_dir.join("node"),
+        node_config.follow_buffer_capacity,
+    )?);
     let (host_id, node_token) = load_dev_enrollment(
         &identity_dir,
         &config.data_dir,
@@ -133,7 +140,9 @@ pub(crate) async fn run(
         host_id = %host_id.as_id(),
         "loaded node identity"
     );
-    let node = DevNode::with_parts_on_host(&node_config, store, drivers, host_id.clone())?;
+    let node = DevNode::with_parts_on_host(&node_config, store, drivers, host_id.clone())?
+        .with_herdr_config(native)?;
+    node.reconcile_herdr().await?;
     let mut wss = WssConfig::loopback(running_hub.addr, node_token, host_id.as_id().to_string())
         .with_collected_inventory();
     wss.label = "local-development".into();
@@ -300,6 +309,7 @@ mod tests {
     #[test]
     fn development_mode_rejects_non_loopback_config_and_flag_overrides() {
         let args = || Args {
+            no_herdr_orphan_sweep: false,
             listen: None,
             port: None,
             hub_listen: None,

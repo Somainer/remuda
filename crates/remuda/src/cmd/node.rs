@@ -4,7 +4,7 @@ use crate::{
     Shutdown,
     config::{Config, SecretRef, parse_labels},
 };
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 use remuda_node::{
     Backoff, CarrierKind, DevNode, DevServerConfig, HostInventoryConfig, HubCarrier, NodeHello,
@@ -14,6 +14,9 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(ClapArgs)]
 pub(crate) struct Args {
+    /// Preserve unknown Herdr panes at startup for manual recovery.
+    #[arg(long)]
+    no_herdr_orphan_sweep: bool,
     /// Carry Node NDJSON over stdin/stdout; logs always use stderr.
     #[arg(long, conflicts_with = "hub_url")]
     stdio: bool,
@@ -106,7 +109,12 @@ pub(crate) async fn run(
         .context("node requires a host token or bootstrap secret reference")?
         .into_string();
     let http = DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone());
-    let runtime = compose(&ServeConfig::native(http, config.data_dir.clone()))?;
+    let mut service = ServeConfig::native(http, config.data_dir.clone());
+    if let remuda_node::LocalDrivers::Native(native) = &mut service.drivers {
+        native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
+    }
+    let runtime = compose(&service)?;
+    runtime.reconcile_herdr().await?;
     ensure!(
         runtime.host().meta.id == hello.params.host.host_id,
         "persisted Node runtime and enrollment host identities diverged"
@@ -251,59 +259,11 @@ fn persist_host_token(path: &std::path::Path, token: &str) -> anyhow::Result<()>
     result.context("cannot persist enrolled host token")
 }
 
-/// Close every local driver through its command queue, then observe its settled lifecycle.
+/// Reclaim drivers independently of whether their command worker is still alive.
 pub(crate) async fn shutdown_drivers(node: &DevNode, deadline: Duration) -> anyhow::Result<()> {
-    use remuda_node::{CommandAction, InstanceCommandRequest};
-    use remuda_protocol::{CommandState, InstanceLifecycle, Knowledge, SettlementOutcome};
-
-    let mut tasks = tokio::task::JoinSet::new();
-    for instance in node.list_instances()?.items {
-        if instance.lifecycle == InstanceLifecycle::Exited {
-            continue;
-        }
-        let node = node.clone();
-        tasks.spawn(async move {
-            let id = instance.meta.id;
-            let mut changes = node.subscribe(&id)?;
-            let result = node.submit_command(&id, InstanceCommandRequest {
-                command_id: None,
-                operation: CommandAction::Close,
-                prompt: None,
-                run_id: None,
-                interaction_id: None,
-                answer: None,
-                keys: None,
-            }).await?;
-            loop {
-                let command = node.get_command(&result.command.meta.id)?;
-                if command.state == CommandState::Settled {
-                    ensure!(matches!(command.settlement, Knowledge::Known { value: ref settlement } if settlement.outcome == SettlementOutcome::Completed), "driver close did not complete; command is retained for reconciliation");
-                    return Ok::<_, anyhow::Error>(());
-                }
-                match changes.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => bail!("driver journal closed before close settlement"),
-                }
-            }
-        });
-    }
-    let drain = async {
-        let mut failed = false;
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result
-                .context("driver shutdown task failed")
-                .and_then(|result| result)
-            {
-                tracing::error!(%error, "driver shutdown did not settle");
-                failed = true;
-            }
-        }
-        ensure!(!failed, "one or more drivers did not complete shutdown");
-        Ok::<_, anyhow::Error>(())
-    };
-    tokio::time::timeout(deadline, drain)
+    tokio::time::timeout(deadline, node.shutdown())
         .await
-        .context("driver shutdown deadline exceeded; unresolved commands must be reconciled")??;
+        .context("driver shutdown deadline exceeded; resources retained for reconciliation")??;
     Ok(())
 }
 
@@ -416,6 +376,7 @@ mod tests {
         config.node.labels.insert("region".into(), "file".into());
         config.node.labels.insert("gpu".into(), "none".into());
         let args = Args {
+            no_herdr_orphan_sweep: false,
             stdio: true,
             hub_url: None,
             host_token_file: None,

@@ -11,6 +11,7 @@ mod interactions;
 mod inventory;
 mod model;
 mod native;
+mod reclaim;
 mod runtime;
 mod runtime_link;
 mod server;

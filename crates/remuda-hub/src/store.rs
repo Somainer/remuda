@@ -468,7 +468,7 @@ impl Store {
     pub async fn mark_all_hosts_offline(&self) -> Result<(), StoreError> {
         self.run(|conn| {
             conn.execute(
-                "UPDATE hosts SET state = 'offline' WHERE state = 'online'",
+                "UPDATE hosts SET state = 'offline', offline_since = COALESCE(offline_since, last_seen_at, created_at) WHERE state = 'online'",
                 [],
             )?;
             conn.execute(
@@ -497,8 +497,8 @@ impl Store {
     pub async fn mark_host_offline(&self, host_id: String) -> Result<(), StoreError> {
         self.run(move |conn| {
             conn.execute(
-                "UPDATE hosts SET state = 'offline' WHERE id = ?1 AND state = 'online'",
-                params![&host_id],
+                "UPDATE hosts SET state = 'offline', offline_since = ?2 WHERE id = ?1 AND state = 'online'",
+                params![&host_id, now_rfc3339()],
             )?;
             conn.execute(
                 "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
@@ -508,6 +508,22 @@ impl Store {
             Ok(())
         })
         .await
+    }
+
+    /// Hub-owned projection only: never forge a Node journal cursor or native completion.
+    pub async fn expire_lost_hosts(&self, grace_ms: u64) -> Result<usize, StoreError> {
+        self.run(move |conn| {
+            let changed = conn.execute(
+                "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
+                    connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
+                 WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
+                    SELECT id FROM hosts WHERE state != 'online' AND
+                    (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
+                 )",
+                params![now_rfc3339(), grace_ms.min(i64::MAX as u64) as i64],
+            )?;
+            Ok(changed)
+        }).await
     }
 
     /// Heartbeat / hello: lastSeen + optional inventory (D-013).
@@ -520,7 +536,7 @@ impl Store {
         self.run(move |conn| {
             let now = now_rfc3339();
             conn.execute(
-                "UPDATE hosts SET last_seen_at = ?1, state = 'online' WHERE id = ?2",
+                "UPDATE hosts SET last_seen_at = ?1, state = 'online', offline_since = NULL WHERE id = ?2",
                 params![&now, &host_id],
             )?;
             conn.execute(
@@ -1401,6 +1417,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     )?;
     ensure_column(&conn, "hosts", "hostname", "TEXT")?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
+    ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
     dedup_duplicate_hosts(&conn)?;
     Ok(conn)
 }
@@ -1563,6 +1580,77 @@ fn ensure_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_lost_obeys_offline_grace_and_reconnect_and_preserves_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: "bootstrap".into(),
+                    bootstrap: "bootstrap".into(),
+                    hello_host_id: Some(host.clone()),
+                    label: Some("reclaim-test".into()),
+                    node_version: None,
+                },
+                |_, _| false,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "claude".into(),
+                "generic-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.expire_lost_hosts(0).await.unwrap(),
+            0,
+            "online hosts never expire"
+        );
+        store.mark_host_offline(host.clone()).await.unwrap();
+        assert_eq!(
+            store.expire_lost_hosts(600_000).await.unwrap(),
+            0,
+            "ten minute grace"
+        );
+        store
+            .apply_inventory(host.clone(), Default::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.expire_lost_hosts(0).await.unwrap(),
+            0,
+            "reconnect clears offline timer"
+        );
+        store.mark_host_offline(host).await.unwrap();
+        assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 1);
+        assert_eq!(
+            store.expire_lost_hosts(0).await.unwrap(),
+            0,
+            "idempotent sweep"
+        );
+        let exited = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exited.lifecycle, "exited");
+        assert_eq!(exited.last_error.as_deref(), Some("host-lost"));
+        assert_eq!(
+            store.list_instances(None).await.unwrap().len(),
+            1,
+            "history is retained"
+        );
+    }
 
     #[tokio::test]
     async fn journal_settles_commands_while_connectivity_follows_the_host_link() {
@@ -1812,7 +1900,7 @@ fn touch_host_online(
 ) -> Result<HostRecord, StoreError> {
     let now = now_rfc3339();
     conn.execute(
-        "UPDATE hosts SET state = 'online', last_seen_at = ?1, node_version = COALESCE(?2, node_version)
+        "UPDATE hosts SET state = 'online', offline_since = NULL, last_seen_at = ?1, node_version = COALESCE(?2, node_version)
          WHERE id = ?3",
         params![now, node_version, host_id],
     )?;

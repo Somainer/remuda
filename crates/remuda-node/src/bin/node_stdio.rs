@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(async move {
+            let result = runtime.block_on(async move {
                 let node = compose(&ServeConfig {
                     http: DevServerConfig::loopback(0)
                         .with_workspace_root(data_dir.join("workspace")),
@@ -108,7 +108,11 @@ fn main() -> anyhow::Result<()> {
                 )
                 .await
                 .map_err(|err| anyhow::anyhow!("{err}"))
-            })
+            });
+            // Tokio stdin uses a blocking read which cannot be cancelled while
+            // SSH keeps the pipe open. Carrier/driver cleanup has already finished.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+            result
         }
     }
 }

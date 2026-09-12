@@ -120,6 +120,7 @@ impl ClaudePtyOptions {
 }
 
 struct PtyLive {
+    ctx: crate::claude_pty::ObsCtx,
     client: Client,
     pane_id: String,
     agent_name: String,
@@ -142,6 +143,7 @@ struct PtyLive {
 
 /// Native Claude TUI hosted in a Herdr pane.
 pub struct ClaudePtyDriver {
+    resources: crate::pty_resource::PtyResources,
     options: ClaudePtyOptions,
     inner: Mutex<Option<PtyLive>>,
     last_recipe: Mutex<Option<LaunchRecipe>>,
@@ -155,6 +157,7 @@ impl ClaudePtyDriver {
     /// Build a driver from explicit options.
     pub fn new(options: ClaudePtyOptions) -> Self {
         Self {
+            resources: Default::default(),
             options,
             inner: Mutex::new(None),
             last_recipe: Mutex::new(None),
@@ -242,16 +245,20 @@ impl ClaudePtyDriver {
             env.insert(key.clone(), value.clone());
         }
 
-        let created = client
-            .workspace_create(WorkspaceCreateParams {
-                cwd: Some(recipe.cwd.clone()),
-                env: env.clone(),
-                focus: false,
-                label: Some("remuda".into()),
-                source_workspace_id: None,
-            })
-            .await
-            .map_err(map_herdr)?;
+        let created = self
+            .resources
+            .create_workspace(
+                &client,
+                &session_name,
+                WorkspaceCreateParams {
+                    cwd: Some(recipe.cwd.clone()),
+                    env: env.clone(),
+                    focus: false,
+                    label: Some(format!("remuda-{}", uuid::Uuid::now_v7())),
+                    source_workspace_id: None,
+                },
+            )
+            .await?;
         let split = client
             .pane_split(PaneSplitParams {
                 direction: SplitDirection::Right,
@@ -265,6 +272,9 @@ impl ClaudePtyDriver {
             .await
             .map_err(map_herdr)?;
         let pane_id = split.pane.pane_id.clone();
+        self.resources
+            .record(&client, &session_name, &created, &pane_id)
+            .await?;
         let agent_name = agent_name_for(&spec);
 
         let started = client
@@ -357,6 +367,7 @@ impl ClaudePtyDriver {
         );
 
         *self.inner.lock().await = Some(PtyLive {
+            ctx,
             client,
             pane_id,
             agent_name,
@@ -392,6 +403,10 @@ impl ClaudePtyDriver {
 
 #[async_trait]
 impl Driver for ClaudePtyDriver {
+    fn track_pty_resources(&self, id: InstanceId, store: Arc<dyn crate::PtyResourceStore>) {
+        self.resources.configure(id, store);
+    }
+
     async fn capabilities(&self) -> DriverResult<remuda_protocol::CapabilitySnapshot> {
         let pin = pin_source(&self.options.binary)?;
         Ok(capability_snapshot(
@@ -404,7 +419,15 @@ impl Driver for ClaudePtyDriver {
 
     async fn start(&self, spec: InstanceSpec) -> DriverResult<RunHandle> {
         let session_id = uuid::Uuid::now_v7().to_string();
-        self.launch(spec, SessionAction::New { session_id }).await
+        match self.launch(spec, SessionAction::New { session_id }).await {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if let Err(cleanup) = self.resources.close().await {
+                    tracing::error!(%cleanup, "failed launch resource cleanup");
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn attach(&self, native_ref: NativeRef) -> DriverResult<DriverAck> {
@@ -512,8 +535,15 @@ impl Driver for ClaudePtyDriver {
         self.closed.store(true, Ordering::SeqCst);
         let mut inner = self.inner.lock().await;
         let Some(live) = inner.as_mut() else {
+            drop(inner);
+            self.resources.close().await?;
             return Ok(DriverAck::not_dispatched());
         };
+        if live.closed {
+            drop(inner);
+            self.resources.close().await?;
+            return Ok(DriverAck::not_dispatched());
+        }
         live.closed = true;
         if let Some(task) = live.status_task.take() {
             task.abort();
@@ -524,10 +554,12 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.tty_task.take() {
             task.abort();
         }
-        let pane_id = live.pane_id.clone();
-        let client = live.client.clone();
+        let events = live.events.clone();
+        let ctx = live.ctx.clone();
         drop(inner);
-        let _ = client.pane_close(pane_id).await;
+        self.resources.close().await?;
+        crate::claude_pty::emit_pty_closed(&events, &self.seq, &ctx).await?;
+        self.inner.lock().await.take();
         Ok(DriverAck::not_dispatched())
     }
 
@@ -1390,6 +1422,40 @@ pub(crate) fn obs_ctx(
         run_id,
         session_id,
         pin_version,
+    }
+}
+
+pub(crate) async fn emit_pty_closed(
+    tx: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &ObsCtx,
+) -> DriverResult<()> {
+    let emission = emit_on(
+        tx,
+        seq,
+        ctx,
+        SourceChannel::Runtime,
+        Completeness::Structured,
+        ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+            NativeLifecycle {
+                topic: LifecycleTopic::Session,
+                native_name: "carrier_closed".into(),
+                native_id: Knowledge::NotApplicable,
+                status: Knowledge::Known {
+                    value: "exited".into(),
+                },
+                related_ids: BTreeMap::from([("reason".into(), "owner-forced-stop".into())]),
+                data_ref: None,
+                severity: Severity::Info,
+                affects_completion: false,
+            },
+        )))),
+    );
+    // The Node emits its durable exited entity after close returns. A detached or
+    // stalled optional observer must not hold successful resource cleanup open.
+    match tokio::time::timeout(Duration::from_millis(250), emission).await {
+        Ok(result) if !tx.is_closed() => result,
+        _ => Ok(()),
     }
 }
 

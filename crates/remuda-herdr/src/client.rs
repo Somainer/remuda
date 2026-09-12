@@ -143,6 +143,16 @@ impl Client {
             .await
     }
 
+    /// `workspace.close` (without closing linked worktree groups).
+    pub async fn workspace_close(&self, workspace_id: &str) -> Result<OkResult, Error> {
+        self.typed(
+            "workspace.close",
+            json!({"workspace_id": workspace_id}),
+            "ok",
+        )
+        .await
+    }
+
     /// `tab.create`.
     pub async fn tab_create(&self, params: TabCreateParams) -> Result<TabCreated, Error> {
         self.typed("tab.create", serde_json::to_value(params)?, "tab_created")

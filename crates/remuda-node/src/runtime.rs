@@ -6,6 +6,7 @@ use crate::{
     LocalStore, MemoryStore, NodeError,
     store::{timestamp_now, unknown},
 };
+use futures::FutureExt;
 use remuda_protocol::{
     Acceptance, AcceptanceScope, Activity, ActorRef, ActorType, AgentKind, Capability,
     CapabilitySet, CapabilitySnapshot, CapabilityState, ClaudeRef, Command, CommandAuthority,
@@ -33,11 +34,16 @@ struct QueuedCommand {
     close_after: bool,
 }
 
-struct DevNodeInner {
-    store: Arc<dyn LocalStore>,
+pub(crate) struct DevNodeInner {
+    pub(crate) store: Arc<dyn LocalStore>,
     drivers: DriverRegistry,
     interactions: Arc<InteractionRuntime>,
     senders: RwLock<BTreeMap<InstanceId, mpsc::Sender<QueuedCommand>>>,
+    pub(crate) workers: tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>,
+    pub(crate) instance_drivers: RwLock<BTreeMap<InstanceId, Arc<dyn Driver>>>,
+    pub(crate) stopping: std::sync::atomic::AtomicBool,
+    pub(crate) mutations: RwLock<()>,
+    pub(crate) herdr_config: Option<crate::NativeDriverConfig>,
     queue_capacity: usize,
     host: Host,
     workspace: Workspace,
@@ -47,7 +53,7 @@ struct DevNodeInner {
 /// In-process Node used by the development REST/JSON-RPC/WS surface.
 #[derive(Clone)]
 pub struct DevNode {
-    inner: Arc<DevNodeInner>,
+    pub(crate) inner: Arc<DevNodeInner>,
 }
 
 impl DevNode {
@@ -97,6 +103,11 @@ impl DevNode {
                 drivers,
                 interactions,
                 senders: RwLock::new(BTreeMap::new()),
+                workers: Default::default(),
+                instance_drivers: Default::default(),
+                stopping: Default::default(),
+                mutations: Default::default(),
+                herdr_config: None,
                 queue_capacity: config.instance_queue_capacity,
                 host,
                 workspace,
@@ -161,6 +172,14 @@ impl DevNode {
         &self,
         request: CreateInstanceRequest,
     ) -> Result<CreateInstanceResponse, NodeError> {
+        let _mutation = self.inner.mutations.read().await;
+        if self
+            .inner
+            .stopping
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(NodeError::InvalidRequest("Node is shutting down".into()));
+        }
         let payload_digest = digest_json(&request)?;
         validate_kind_driver(request.kind, request.driver)?;
         validate_text(&request.prompt, "prompt")?;
@@ -206,6 +225,10 @@ impl DevNode {
             },
         )?;
         self.inner.store.insert_instance(instance)?;
+        driver.track_pty_resources(
+            instance_id.clone(),
+            Arc::new(crate::reclaim::ResourceStore(self.inner.store.clone())),
+        );
         self.inner
             .interactions
             .register_driver(instance_id.clone(), Arc::clone(&driver))
@@ -251,6 +274,14 @@ impl DevNode {
         instance_id: &InstanceId,
         request: InstanceCommandRequest,
     ) -> Result<CommandResult, NodeError> {
+        let _mutation = self.inner.mutations.read().await;
+        if self
+            .inner
+            .stopping
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(NodeError::InvalidRequest("Node is shutting down".into()));
+        }
         let instance = self.inner.store.get_instance(instance_id)?;
         let (operation, driver_request, close_after) = command_parts(&request)?;
         let command_id = request.command_id.clone().unwrap_or_default();
@@ -288,6 +319,38 @@ impl DevNode {
                     instance_id,
                     command,
                     "instance-queue-full",
+                )?;
+                Ok(CommandResult {
+                    command,
+                    related_command_ids: Vec::new(),
+                })
+            }
+            Err(NodeError::DriverUnavailable)
+                if close_after
+                    && self
+                        .inner
+                        .workers
+                        .lock()
+                        .await
+                        .get(instance_id)
+                        .is_none_or(|worker| worker.is_finished()) =>
+            {
+                self.close_ended_instance(instance_id, "explicit-close")
+                    .await?;
+                let mut command = command;
+                accept_command(&mut command)?;
+                settle_command(
+                    &mut command,
+                    SettlementOutcome::Completed,
+                    None,
+                    remuda_protocol::ExecutionState::PossiblyDispatched,
+                )?;
+                self.inner.store.save_command(command.clone())?;
+                append_command_lifecycle(
+                    self.inner.store.as_ref(),
+                    instance_id,
+                    &command,
+                    "settled",
                 )?;
                 Ok(CommandResult {
                     command,
@@ -375,35 +438,68 @@ impl DevNode {
             .write()
             .await
             .insert(instance_id.clone(), sender);
+        self.inner
+            .instance_drivers
+            .write()
+            .await
+            .insert(instance_id.clone(), driver.clone());
         let store = self.inner.store.clone();
         let interactions = Arc::clone(&self.inner.interactions);
         let worker_instance = instance_id.clone();
         let worker = tokio::spawn(async move {
-            materialize_instance(
-                store,
-                worker_instance,
+            let result = std::panic::AssertUnwindSafe(materialize_instance(
+                store.clone(),
+                worker_instance.clone(),
                 driver,
                 receiver,
                 interactions,
                 create_command,
                 initial_prompt,
-            )
-            .await
-        });
-        let store = self.inner.store.clone();
-        tokio::spawn(async move {
-            match worker.await {
+            ))
+            .catch_unwind()
+            .await;
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::error!(%error, instance_id = %instance_id.as_id(), "instance task exited");
-                    record_task_exit(store.as_ref(), &instance_id, "driver-task-exited");
+                    tracing::error!(%error, "instance task exited");
+                    record_task_exit(store.as_ref(), &worker_instance, "driver-task-exited");
                 }
-                Err(error) => {
-                    tracing::error!(%error, instance_id = %instance_id.as_id(), "instance task panicked");
-                    record_task_exit(store.as_ref(), &instance_id, "driver-task-panicked");
+                Err(_) => {
+                    record_task_exit(store.as_ref(), &worker_instance, "driver-task-panicked")
                 }
             }
         });
+        self.inner.workers.lock().await.insert(instance_id, worker);
+    }
+
+    pub(crate) async fn adopt_worker(&self, instance_id: InstanceId, driver: Arc<dyn Driver>) {
+        let (sender, receiver) = mpsc::channel(self.inner.queue_capacity);
+        self.inner
+            .senders
+            .write()
+            .await
+            .insert(instance_id.clone(), sender);
+        self.inner
+            .instance_drivers
+            .write()
+            .await
+            .insert(instance_id.clone(), driver.clone());
+        self.inner
+            .interactions
+            .register_driver(instance_id.clone(), driver.clone())
+            .await;
+        let store = self.inner.store.clone();
+        let interactions = Arc::clone(&self.inner.interactions);
+        let id = instance_id.clone();
+        let worker = tokio::spawn(async move {
+            if let Err(error) =
+                instance_worker(store.clone(), id.clone(), driver, receiver, interactions).await
+            {
+                tracing::error!(%error, "adopted instance task exited");
+                record_task_exit(store.as_ref(), &id, "driver-task-exited");
+            }
+        });
+        self.inner.workers.lock().await.insert(instance_id, worker);
     }
 
     async fn enqueue_existing(
@@ -496,6 +592,9 @@ async fn materialize_instance(
         }
     };
     if let Some(error) = driver.startup_error() {
+        if let Err(cleanup) = driver.execute(DriverRequest::Close).await {
+            tracing::error!(%cleanup, "startup cleanup failed");
+        }
         if let Some(mut pending) = observations {
             while let Ok(observation) = pending.try_recv() {
                 let _ = store.append_driver_observation(&instance_id, observation);
@@ -735,6 +834,12 @@ fn finish_instance_operation(
 }
 
 fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &str) {
+    if store
+        .get_instance(instance_id)
+        .is_ok_and(|i| i.lifecycle == InstanceLifecycle::Exited)
+    {
+        return;
+    }
     if let Err(error) = store.mark_unsettled_unknown(instance_id) {
         tracing::error!(%error, "failed to mark commands unknown after task exit");
     }
@@ -1055,7 +1160,7 @@ fn append_command_lifecycle(
     Ok(())
 }
 
-fn append_instance_lifecycle(
+pub(crate) fn append_instance_lifecycle(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
     previous_state: Option<&str>,
@@ -1346,6 +1451,12 @@ mod tests {
                 LifecyclePayload::Entity(entity) if entity.state == "failed"
             )
         }));
+        node.shutdown()
+            .await
+            .expect("already-ended worker is settled");
+        let exited = node.get_instance(&instance.meta.id).unwrap();
+        assert_eq!(exited.lifecycle, InstanceLifecycle::Exited);
+        assert!(matches!(exited.exit, Knowledge::Known { .. }));
     }
 
     #[tokio::test]

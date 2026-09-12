@@ -39,6 +39,7 @@ function kindClass(kind: Kind): string {
   if (kind === "codex") return css.kindCodex;
   if (kind === "grok") return css.kindGrok;
   if (kind === "agy") return css.kindAgy;
+  if (kind === "terminal") return css.kindClaude;
   return css.kindClaude;
 }
 

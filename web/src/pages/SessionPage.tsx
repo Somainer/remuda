@@ -10,7 +10,7 @@ import { Transcript } from "../features/session/Transcript";
 import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
-import { canShowTtyLab, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
+import { canShowTerminal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
 import { nativeShort, isGenericPty, projectStatus, uiMode } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
@@ -18,7 +18,11 @@ import { useWorkbenchViewport } from "../lib/viewport";
 import ui from "../styles/ui.module.css";
 import session from "../features/session/session.module.css";
 
-export function SessionPage({ view = "structured" }: { view?: "structured" | "tty" | "files" | "events" }) {
+export function SessionPage({
+  view = "auto",
+}: {
+  view?: "auto" | "structured" | "tty" | "files" | "events";
+}) {
   const { instanceId = "" } = useParams();
   const hub = useHub();
   const navigate = useNavigate();
@@ -34,7 +38,8 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   const events = hub.events[instanceId] ?? [];
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
   const status = instance ? projectStatus(instance) : "unknown";
-  const showTtyLab = instance ? canShowTtyLab(instance) : false;
+  const showTerminal = instance ? canShowTerminal(instance) : false;
+  const resolvedView = view === "auto" ? (showTerminal ? "tty" : "structured") : view;
   const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
   const usageEvent = events.findLast((e) => e.kind === "usage");
@@ -47,9 +52,9 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   }
   if (!instance) return <p style={{ padding: 16 }}>加载 snapshot…</p>;
 
-  if (view === "tty" && !showTtyLab) {
-    hubStore.toast("终端实验页仅在 VITE_DEV_TTY=1 且 capabilities.ttyAttach 时可用");
-    return <Navigate to={`/s/${instanceId}`} replace />;
+  if (resolvedView === "tty" && !showTerminal) {
+    hubStore.toast("该会话没有可 attach 的终端");
+    return <Navigate to={`/s/${instanceId}/structured`} replace />;
   }
 
   const cost = usage && usage.cost.state === "known" ? `$${usage.cost.value.amount}` : "—";
@@ -69,6 +74,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
       data-lifecycle={instance.lifecycle}
       data-activity={activity}
       data-driver={instance.driver}
+      data-view={resolvedView}
       data-journal={journalStatus}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
@@ -85,11 +91,16 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
             {status}
           </span>
           <span className={session.spacer} />
-          {showTtyLab ? (
+          {showTerminal ? (
             <span className={ui.row}>
-              <Link to={`/s/${instance.id}`}>结构</Link>
-              <Link to={`/s/${instance.id}/tty`} aria-current={view === "tty" ? "page" : undefined}>
+              <Link to={`/s/${instance.id}/tty`} aria-current={resolvedView === "tty" ? "page" : undefined}>
                 终端
+              </Link>
+              <Link
+                to={`/s/${instance.id}/structured`}
+                aria-current={resolvedView === "structured" ? "page" : undefined}
+              >
+                结构
               </Link>
             </span>
           ) : null}
@@ -102,7 +113,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           >
             {hub.compact ? "Compact" : "Full"}
           </button>
-          {view === "structured" ? (
+          {resolvedView === "structured" ? (
             <>
               <button type="button" className={`${session.headBtn} ${session.deskOnly}`} onClick={() => navigate(`/s/${instance.id}/files`)}>
                 文件
@@ -150,7 +161,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           <span>{instance.connectivity}</span>
           <span className={session.dotSep}>·</span>
           <span>{cost}</span>
-          {structuredOnly && !mobile ? (
+          {structuredOnly && !showTerminal && !mobile ? (
             <>
               <span className={session.dotSep}>·</span>
               <span>structured-only — 无终端 tab</span>
@@ -169,23 +180,23 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
         </div>
       </header>
       <div
-        className={view === "tty" || view === "structured" ? session.pane : undefined}
+        className={resolvedView === "tty" || resolvedView === "structured" ? session.pane : undefined}
         style={
-          view === "tty" || view === "structured"
+          resolvedView === "tty" || resolvedView === "structured"
             ? undefined
             : { flex: 1, overflow: "auto", minHeight: 0 }
         }
       >
-        {view === "events" ? (
+        {resolvedView === "events" ? (
           <RawEvents events={events} />
-        ) : view === "files" ? (
+        ) : resolvedView === "files" ? (
           <p style={{ padding: 16, color: "var(--mute)" }}>文件 / diff 栏占位。空间不够时走这条全屏路由。</p>
-        ) : view === "tty" ? (
+        ) : resolvedView === "tty" ? (
           <TerminalView
             instance={instance}
             onAttachFailed={(reason) => {
               hubStore.toast(reason);
-              navigate(`/s/${instance.id}`, { replace: true });
+              navigate(`/s/${instance.id}/structured`, { replace: true });
             }}
           />
         ) : snapshotLoading ? (
@@ -206,7 +217,7 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           />
         )}
       </div>
-      {view === "tty" || view === "events" ? null : <div className={session.dock}>
+      {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock}>
         <TaskTrack tasks={tasks} />
         {pending.map((item) =>
           item.kind === "question" ? (

@@ -1,7 +1,7 @@
 import type { CapabilitySnapshot, DriverKind, NativeRef, ProcessRef } from "./nativeRef";
 import type { EntityMeta, Id, Knowledge, Timestamp, U64 } from "./wire";
 
-export type Kind = "claude" | "codex" | "grok" | "agy" | "generic";
+export type Kind = "claude" | "codex" | "grok" | "agy" | "generic" | "terminal";
 
 export type Lifecycle =
   | "requested"

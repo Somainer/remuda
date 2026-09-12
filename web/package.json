@@ -9,15 +9,18 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:hub": "playwright test -c playwright.hub.config.ts",
+    "test:e2e:terminal": "playwright test -c playwright.terminal.config.ts",
     "lint": "oxlint src --ignore-pattern src/lib/api.generated.ts",
     "preview": "vite preview",
     "gen:api": "node ./scripts/gen-api.mjs"
   },
   "dependencies": {
+    "@xterm/addon-canvas": "^0.7.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-search": "^0.16.0",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.44.0",
     "react": "^19.2.8",

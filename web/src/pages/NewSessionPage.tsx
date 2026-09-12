@@ -27,6 +27,7 @@ const KINDS: { id: CreateKind; label: string }[] = [
   { id: "codex", label: "Codex" },
   { id: "grok", label: "Grok" },
   { id: "agy", label: "agy" },
+  { id: "terminal", label: "Terminal" },
 ];
 
 export function NewSessionPage() {
@@ -93,12 +94,19 @@ export function NewSessionPage() {
   const workspaces = sortRecent(hostWorkspaces, prefs.recentWorkspaceIds);
   const hostCli = cliSummary(host?.cli);
   const supportedKinds = installedCli(host?.cli).map((entry) => entry.kind);
-  const kindEnabled = (id: CreateKind) => (supportedKinds.length ? supportedKinds.includes(id) : id === "claude");
+  const kindEnabled = (id: CreateKind) =>
+    id === "terminal" ? true : supportedKinds.length ? supportedKinds.includes(id) : id === "claude";
   const activeKind: CreateKind = kindEnabled(kind)
     ? kind
     : (KINDS.find((item) => kindEnabled(item.id))?.id ?? "claude");
-  const driver: DriverKind =
-    activeKind === "claude" ? (mobile || !wantTty ? "claude-print" : "claude-pty") : "generic-pty";
+  const plainTerminal = activeKind === "terminal";
+  const driver: DriverKind = plainTerminal
+    ? "shell-pty"
+    : activeKind === "claude"
+      ? mobile || !wantTty
+        ? "claude-print"
+        : "claude-pty"
+      : "generic-pty";
   const close = () => navigate("/sessions");
 
   return (
@@ -139,7 +147,7 @@ export function NewSessionPage() {
               settingsOverlayPath: settingsOverlayPath || undefined,
               claudeConfigDir: claudeConfigDir || undefined,
               maxBudgetUsd: maxBudgetUsd || undefined,
-              name: name || worktree || undefined,
+              name: name || worktree || (plainTerminal ? "terminal" : undefined),
             });
             rememberNewSessionSuccess({
               hostId,
@@ -166,12 +174,13 @@ export function NewSessionPage() {
         </header>
         <div className={css.body}>
           <label className={css.field}>
-            <span className={css.label}>提示词 · 第一焦点</span>
+            <span className={css.label}>{plainTerminal ? "启动命令（可空，默认 shell）" : "提示词 · 第一焦点"}</span>
             <textarea
               ref={promptRef}
               className={css.prompt}
               data-testid="new-session-prompt"
               autoFocus
+              placeholder={plainTerminal ? "empty = login shell in cwd/worktree" : undefined}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onKeyDown={(e) => {
@@ -292,17 +301,26 @@ export function NewSessionPage() {
                 ))}
               </div>
             </fieldset>
-            <label className={css.field}>
-              <span className={css.label}>模型</span>
-              <div className={css.selectWrap}>
-                <input
-                  className={css.select}
-                  data-testid="new-session-model"
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                />
-              </div>
-            </label>
+            {plainTerminal ? (
+              <label className={css.field}>
+                <span className={css.label}>driver</span>
+                <span className={css.hint} data-testid="new-session-terminal-driver">
+                  shell-pty · cwd/worktree 上的真实 PTY
+                </span>
+              </label>
+            ) : (
+              <label className={css.field}>
+                <span className={css.label}>模型</span>
+                <div className={css.selectWrap}>
+                  <input
+                    className={css.select}
+                    data-testid="new-session-model"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                  />
+                </div>
+              </label>
+            )}
           </div>
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
             <legend className={css.label}>权限</legend>
@@ -329,7 +347,15 @@ export function NewSessionPage() {
                 <div className={css.yoloBody}>{YOLO_HINT}</div>
               </div>
             ) : null}
-            {activeKind !== "claude" ? (
+            {plainTerminal ? (
+              <div className={css.yolo} data-testid="new-session-terminal-hint">
+                <div className={css.yoloHead}>
+                  <span className={css.yoloDot} />
+                  <span className={css.yoloTitle}>driver shell-pty</span>
+                </div>
+                <div className={css.yoloBody}>plain terminal · 默认打开终端 tab · 键鼠走 raw PTY</div>
+              </div>
+            ) : activeKind === "codex" || activeKind === "grok" || activeKind === "agy" ? (
               <div className={css.yolo} data-testid="new-session-pty-hint">
                 <div className={css.yoloHead}>
                   <span className={css.yoloDot} />
@@ -361,11 +387,15 @@ export function NewSessionPage() {
             <button type="button" className={css.advancedToggle} onClick={() => setAdvanced(!advanced)}>
               <span>{advanced ? "▾" : "▸"}</span>
               <span>高级 · 驱动</span>
-              <span className={css.m3}>{activeKind === "claude" ? "claude-print / claude-pty" : "generic-pty"}</span>
+              <span className={css.m3}>
+                {plainTerminal ? "shell-pty" : activeKind === "claude" ? "claude-print / claude-pty" : "generic-pty"}
+              </span>
             </button>
             {advanced ? (
               <div className={css.driverList}>
-                {mobile ? (
+                {plainTerminal ? (
+                  <p className={css.hint}>kind terminal · driver shell-pty · 空 prompt 打开 login shell。</p>
+                ) : mobile ? (
                   <p className={css.hint}>手机固定 structured print。</p>
                 ) : (
                   <>

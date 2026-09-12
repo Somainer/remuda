@@ -63,6 +63,14 @@ impl WssConfig {
             journal_queue: DEFAULT_JOURNAL_QUEUE,
         }
     }
+
+    /// Replace `cli` with a live PATH probe in Hub `{kind,version,path,auth}` shape.
+    #[must_use]
+    pub fn with_collected_inventory(mut self) -> Self {
+        self.cli =
+            crate::inventory::collect(&crate::inventory::CollectRequest::default()).cli_hub_json();
+        self
+    }
 }
 
 /// Hub→Node JSON-RPC request. Not stored across reconnects.

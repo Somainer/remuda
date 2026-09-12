@@ -395,6 +395,104 @@ Same ETXTBSY class as `claude_pty_review` (writing a stub binary while it is sti
 acks, duplicate journal-gap acks, reconnects, hello rejects, clock skew,
 pending drops). Chaos suite and `remuda node --self-test` are not in this
 slice.
+## dogfood on SG
+
+Date: 2026-09-12. After `078683f` (`wt/x-grokdrv/generic-pty` into main).
+Worktree `wt/x-ssh/dogfood-sg`. Remote writes only under `/tmp/remuda-dogfood/`
+(removed afterwards). User herdr `0.8.2` was not upgraded.
+
+### Code needed for the run
+
+`remuda-node-stdio` previously composed FakeDriver, so Hub `instance.create`
+could not start `generic-pty`. The stdio bin now `compose`s
+`LocalDrivers::Native` with `herdr_socket_dir=<data-dir>/herdr` and
+`run_stdio_with_node`. `HerdrServer::ensure` with an explicit socket dir sets
+the child `XDG_CONFIG_HOME` to that dir so logs/sessions stay off the user
+herdr config. `generic-pty` only sets `CLAUDE_CONFIG_DIR` when the native home
+already contains `.claude.json` (an empty isolated dir makes Claude 2.1 on this
+host print `Not logged in`).
+
+### herdr 0.8.2 vs remuda-herdr (protocol 22)
+
+SG `herdr --version` is `0.8.2`, socket protocol **20**. The subset used by
+`generic-pty` exists: `ping` (string ids; integer ids rejected),
+`workspace.create`, `pane.split`, `agent.start` / `prompt` / `wait` / `read` /
+`send_keys`, `events.subscribe` (`subscriptions[].type`, not `event`). Isolated
+`HERDR_SOCKET_PATH` + `XDG_CONFIG_HOME` under `/tmp/remuda-*` starts a headless
+server without touching the user default session. **Did not install 0.9.0.**
+The running 0.8.2 log noted an update at
+`https://github.com/herdrdev/herdr/releases/download/v0.9.0/herdr-linux-x86_64`
+and waited for explicit install; user binary left at 0.8.2.
+
+Probe mistake: one `workspace.create` on the **user** default socket (label
+`probe-readonly`) was closed immediately; snapshot afterwards `focused=w2`,
+3 panes, same as before.
+
+### Commands (Mac)
+
+Hub: `127.0.0.1:18090`, data dir `/tmp/remuda-dogfood-hub`.
+
+```
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+PATH="$HOME/.local/bin:$PATH" cargo zigbuild --locked --release -p remuda-node \
+  --bin remuda-node-stdio --target x86_64-unknown-linux-musl
+cargo build -p remuda --locked
+target/debug/remuda ssh bootstrap devbox-sg \
+  --local $CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/remuda-node-stdio \
+  --remote /tmp/remuda-dogfood/remuda
+target/debug/remuda --data-dir /tmp/remuda-dogfood-hub hub --listen 127.0.0.1:18090
+target/debug/remuda ssh node devbox-sg \
+  --remote /tmp/remuda-dogfood/remuda \
+  --hub http://127.0.0.1:18090 \
+  --bootstrap-token-file /tmp/remuda-dogfood-hub/bootstrap-token \
+  --label devbox-sg --node-label region=sg \
+  --node-data-dir /tmp/remuda-dogfood/data
+```
+
+`GET /v1/hosts`: `online=true`, `label=devbox-sg`, `hostname=devbox`,
+`transport=ssh-stdio`, `labels=["region=sg"]`. Inventory: Claude logged in
+(`2.1.221`), Codex **logged_out** (`codex-cli 0.147.0`) so kind=`claude` not
+`codex`. herdr inventory still advertises the user default socket; the driver
+used an isolated socket under the node data dir.
+
+```
+target/debug/remuda instance create --hub http://127.0.0.1:18090 \
+  --bootstrap-token "$(cat /tmp/remuda-dogfood-hub/bootstrap-token)" \
+  --host hst_… --kind claude --driver generic-pty --title sg-dogfood \
+  --prompt 'Reply with exactly one line starting with DONE and then sg-dogfood, then stop.'
+```
+
+Create `state=accepted`, `forwarded=true`, `driver=generic-pty`. Isolated herdr
+`agent.start` kind=claude, pane at `/tmp/remuda-dogfood/data/workspace`. First
+create blocked on Claude folder-trust then bypass-permissions (default
+selection is `No, exit`). Trust can be skipped by seeding
+`projects[<cwd>].hasTrustDialogAccepted` in an isolated login file; bypass
+still needed `agent.send_keys down` then `enter` (batched `down,enter` selected
+exit). `instance.send` while `launch_pending` / blocked returns node
+`control unavailable`; send after `interactive_ready` is `accepted`.
+
+### Output / DONE
+
+`instance wait --condition run-terminal` does not treat generic-pty
+line-matcher lifecycle as run-terminal. Screen read after a successful
+`agent.prompt` (Hub send or isolated `agent.prompt`):
+
+```
+❯ Reply with exactly one line starting with
+  DONE and then sg-dogfood, then stop.
+  ⎿  Not logged in · Please run /login
+```
+
+Isolated copies of `~/.claude.json` plus `CLAUDE_CONFIG_DIR`/`HOME` under
+`/tmp/remuda-*` still yield `Not logged in` on this host (API Usage Billing /
+Opus 5). Did not point Claude at the user config dir (would write sessions
+outside `/tmp/remuda-*`). No `DONE sg-dogfood` line. Codex was not attempted
+(logged_out). After `herdr server stop` on the isolated socket, later creates
+did not respawn herdr (empty launch dir, no journal) until a new node process.
+
+Stop: `remuda instance stop <id> --scope instance`. Isolated herdr stopped.
+`/tmp/remuda-dogfood` removed. User herdr 0.8.2 still running; snapshot
+`focused=w2`, 3 panes.
 
 ## M1 local end-to-end (2026-09-12)
 

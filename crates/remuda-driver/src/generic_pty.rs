@@ -325,7 +325,13 @@ impl GenericPtyDriver {
             .map_err(map_herdr)?;
         let client = bind_client(&server, &self.options)?;
         let mut env = HashMap::new();
-        env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        // Only pin CLAUDE_CONFIG_DIR when the native home already has a login
+        // file. An empty isolated dir makes Claude 2.1 report "Not logged in"
+        // even when the host user is authenticated.
+        let login = std::path::Path::new(&recipe.native_home).join(".claude.json");
+        if login.is_file() {
+            env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        }
         for (key, value) in &self.options.extra_env {
             env.insert(key.clone(), value.clone());
         }

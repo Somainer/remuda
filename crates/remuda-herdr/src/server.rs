@@ -81,6 +81,10 @@ impl HerdrServer {
             command.env("HERDR_SESSION", &session_name);
         } else {
             command.env("HERDR_SOCKET_PATH", &socket_path);
+            // Keep named-socket servers off the user XDG herdr dir (logs, sessions).
+            if let Some(parent) = socket_path.parent() {
+                command.env("XDG_CONFIG_HOME", parent);
+            }
             if session_name != "default" {
                 command.env("HERDR_SESSION", &session_name);
             }

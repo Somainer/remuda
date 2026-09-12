@@ -73,6 +73,11 @@ pub async fn run_stdio_runtime_opts(node: DevNode, opts: StdioOptions) -> Result
     run_stdio_runtime(node, opts, None, None).await
 }
 
+/// Alias of [`run_stdio_runtime_opts`] for the musl `remuda-node-stdio` bin.
+pub async fn run_stdio_with_node(node: DevNode, opts: StdioOptions) -> Result<(), NodeError> {
+    run_stdio_runtime_opts(node, opts).await
+}
+
 pub(crate) async fn run_stdio_runtime(
     node: DevNode,
     opts: StdioOptions,

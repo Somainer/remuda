@@ -92,6 +92,7 @@ async fn wss_hello_heartbeat_append_reconnect_against_hub() {
     config.backoff = Backoff {
         initial: Duration::from_millis(5),
         max: Duration::from_millis(20),
+        jitter_ppt: 0,
     };
     config.journal_queue = 2;
 
@@ -225,6 +226,7 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
     config.backoff = Backoff {
         initial: Duration::from_millis(5),
         max: Duration::from_millis(20),
+        jitter_ppt: 0,
     };
 
     let mut link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(config, node.clone()))

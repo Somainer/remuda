@@ -48,6 +48,7 @@ pub use service::{LocalDrivers, RunningNode, ServeConfig, compose, serve};
 pub use stdio::{StdioOptions, run_stdio, run_stdio_opts};
 pub use store::{LocalStore, MemoryStore};
 pub use transport::{
-    Backoff, HubRequest, JournalSender, NodeTransport, WssCarrier, WssConfig, WssLink,
+    Backoff, HubRequest, JournalSender, NodeTransport, TransportMetrics, TransportMetricsSnapshot,
+    WssCarrier, WssConfig, WssLink,
 };
 pub use tty::{TTY_CHANNEL_OUTPUT, TTY_FRAME_HEADER_BYTES, encode_tty_frame};

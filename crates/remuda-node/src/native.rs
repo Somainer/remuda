@@ -157,26 +157,34 @@ impl DriverFactory for NativeClaudeFactory {
         }
         let profile = provider_profile(&launch)?;
         let spec = instance_spec(&launch, &self.config, &profile)?;
-        let binary = self
-            .config
-            .claude_binary
-            .clone()
-            .map(BinarySource::Path)
-            .unwrap_or_else(|| {
-                let name = match self.kind {
-                    DriverKind::GenericPty => preset_by_id(match launch.request.kind {
-                        remuda_protocol::AgentKind::Codex => "codex",
-                        remuda_protocol::AgentKind::Grok => "grok",
-                        remuda_protocol::AgentKind::Agy => "agy",
-                        remuda_protocol::AgentKind::Generic => "gemini",
-                        remuda_protocol::AgentKind::Claude => "claude",
-                    })
-                    .map(|preset| preset.binary)
-                    .unwrap_or("claude"),
-                    _ => "claude",
-                };
-                BinarySource::Command(name.to_owned())
-            });
+        let binary = match self.kind {
+            DriverKind::GenericPty => {
+                let name = preset_by_id(match launch.request.kind {
+                    remuda_protocol::AgentKind::Codex => "codex",
+                    remuda_protocol::AgentKind::Grok => "grok",
+                    remuda_protocol::AgentKind::Agy => "agy",
+                    remuda_protocol::AgentKind::Generic => "gemini",
+                    remuda_protocol::AgentKind::Claude => "claude",
+                })
+                .map(|preset| preset.binary)
+                .unwrap_or("claude");
+                if name == "claude" {
+                    self.config
+                        .claude_binary
+                        .clone()
+                        .map(BinarySource::Path)
+                        .unwrap_or_else(|| BinarySource::Command(name.to_owned()))
+                } else {
+                    BinarySource::Command(name.to_owned())
+                }
+            }
+            _ => self
+                .config
+                .claude_binary
+                .clone()
+                .map(BinarySource::Path)
+                .unwrap_or_else(|| BinarySource::Command("claude".to_owned())),
+        };
         let native: Arc<dyn NativeDriver> = match self.kind {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
@@ -453,6 +461,7 @@ mod tests {
                 provider_profile_id: "native".to_owned(),
                 permission_mode: "manual".to_owned(),
                 prompt: String::new(),
+                cwd: None,
             };
             let driver = registry
                 .build(

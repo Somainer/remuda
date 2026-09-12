@@ -19,8 +19,8 @@ use crate::recipe::LaunchRecipe;
 use async_trait::async_trait;
 use remuda_herdr::{
     AgentPromptParams, AgentReadParams, AgentStartParams, AgentStatus, AgentWaitParams, Client,
-    EventKind, EventStream, HerdrServer, PaneSplitParams, ReadFormat, ReadSource, SplitDirection,
-    Subscription, WorkspaceCreateParams,
+    EventKind, EventStream, HerdrServer, PaneReadParams, PaneSplitParams, ReadFormat, ReadSource,
+    SplitDirection, Subscription, WorkspaceCreateParams,
 };
 use remuda_protocol::{
     AgentKind, Completeness, DriverInput, DriverKind, HerdrRepresentation, HerdrServer as HerdrPin,
@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -81,7 +81,7 @@ pub const PRESETS: &[KindPreset] = &[
         binary: "grok",
         herdr_kind: "grok",
         yolo_argv: &["--always-approve"],
-        name_flag: Some("--name"),
+        name_flag: None,
         journals: false,
         done_means_idle: true,
     },
@@ -191,7 +191,7 @@ impl GenericPtyOptions {
             broker: Arc::new(EnvFileSecretBroker),
             extra_env: BTreeMap::new(),
             agent_start_timeout_ms: 120_000,
-            line_matcher: Some("^DONE ".into()),
+            line_matcher: Some("^DONE".into()),
         }
     }
 }
@@ -226,12 +226,17 @@ impl GenericPtyDriver {
         }
     }
 
-    /// Send named keys (`enter`, `esc`, `ctrl+c`, …).
-    pub async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
+    async fn live_client(&self) -> DriverResult<(Client, String)> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        live.client
-            .agent_send_keys(&live.agent_name, keys)
+        Ok((live.client.clone(), live.agent_name.clone()))
+    }
+
+    /// Send named keys (`enter`, `esc`, `ctrl+c`, …).
+    pub async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
+        let (client, agent_name) = self.live_client().await?;
+        client
+            .agent_send_keys(&agent_name, keys)
             .await
             .map_err(map_herdr)?;
         Ok(DriverAck::transport_written())
@@ -239,8 +244,7 @@ impl GenericPtyDriver {
 
     /// Wait until herdr reports idle, done, or blocked.
     pub async fn wait(&self, until: WaitUntil, timeout_ms: u64) -> DriverResult<DriverAck> {
-        let inner = self.inner.lock().await;
-        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        let (client, agent_name) = self.live_client().await?;
         let mut statuses = match until {
             WaitUntil::Idle => vec![AgentStatus::Idle],
             WaitUntil::Done => vec![AgentStatus::Done],
@@ -249,9 +253,9 @@ impl GenericPtyDriver {
         if matches!(until, WaitUntil::Idle) {
             statuses.push(AgentStatus::Done);
         }
-        live.client
+        client
             .agent_wait(AgentWaitParams {
-                target: live.agent_name.clone(),
+                target: agent_name,
                 until: statuses,
                 timeout_ms: Some(timeout_ms),
             })
@@ -262,12 +266,10 @@ impl GenericPtyDriver {
 
     /// Read recent screen lines via `agent.read` (not the journal).
     pub async fn read_screen(&self, lines: u32) -> DriverResult<String> {
-        let inner = self.inner.lock().await;
-        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        let read = live
-            .client
+        let (client, agent_name) = self.live_client().await?;
+        let read = client
             .agent_read(AgentReadParams {
-                target: live.agent_name.clone(),
+                target: agent_name,
                 source: ReadSource::RecentUnwrapped,
                 lines: Some(lines),
                 format: ReadFormat::Text,
@@ -306,8 +308,9 @@ impl GenericPtyDriver {
         };
         let mut recipe = materialize(&request)?;
         merge_yolo_argv(&mut recipe.argv, preset);
+        let agent_name = agent_name_for(&spec);
         if let Some(flag) = preset.name_flag {
-            ensure_name_flag(&mut recipe.argv, flag, &agent_name_for(&spec));
+            ensure_name_flag(&mut recipe.argv, flag, &agent_name);
         }
         refuse_bare(&recipe.argv)?;
         if preset.journals {
@@ -352,7 +355,7 @@ impl GenericPtyDriver {
             .await
             .map_err(map_herdr)?;
         let pane_id = split.pane.pane_id.clone();
-        let agent_name = agent_name_for(&spec);
+        wait_shell_prompt(&client, &pane_id).await;
         let started = client
             .agent_start(AgentStartParams {
                 name: agent_name.clone(),
@@ -362,8 +365,12 @@ impl GenericPtyDriver {
                 timeout_ms: Some(self.options.agent_start_timeout_ms),
             })
             .await
-            .map_err(map_herdr)?;
+            .map_err(|err| {
+                tracing::error!(error = %err, kind = preset.id, "generic-pty agent.start failed");
+                map_herdr(err)
+            })?;
         refuse_bare(&started.argv)?;
+        dismiss_startup_prompt(&client, &agent_name).await;
 
         let stream = client
             .subscribe(vec![Subscription::pane_agent_status_changed(&pane_id)])
@@ -469,16 +476,17 @@ impl Driver for GenericPtyDriver {
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
         let text = prompt_text(&input)?;
-        let inner = self.inner.lock().await;
-        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        live.client
+        let (client, agent_name) = self.live_client().await?;
+        client
             .agent_prompt(AgentPromptParams {
-                target: live.agent_name.clone(),
+                target: agent_name.clone(),
                 text: text.clone(),
                 wait: None,
             })
             .await
             .map_err(map_herdr)?;
+        let inner = self.inner.lock().await;
+        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
         let ctx = obs_ctx(
             DriverKind::GenericPty,
             InstanceId::new(),
@@ -702,6 +710,54 @@ pub fn line_matches(screen: &str, pattern: &str) -> bool {
     })
 }
 
+async fn wait_shell_prompt(client: &Client, pane_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if let Ok(read) = client
+            .pane_read(PaneReadParams {
+                pane_id: pane_id.to_owned(),
+                source: ReadSource::RecentUnwrapped,
+                lines: Some(20),
+                format: ReadFormat::Text,
+                strip_ansi: true,
+            })
+            .await
+        {
+            let text = read.text();
+            if text.contains('➜') || text.contains('$') || text.contains('%') || text.contains('>')
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+async fn dismiss_startup_prompt(client: &Client, agent_name: &str) {
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let Ok(read) = client
+        .agent_read(AgentReadParams {
+            target: agent_name.to_owned(),
+            source: ReadSource::RecentUnwrapped,
+            lines: Some(40),
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        })
+        .await
+    else {
+        return;
+    };
+    let text = read.text();
+    if text.contains("Do you trust")
+        || text.contains("Yes, continue")
+        || text.contains("Trust this")
+    {
+        let _ = client
+            .agent_send_keys(agent_name, vec!["enter".into()])
+            .await;
+    }
+}
+
 fn merge_yolo_argv(argv: &mut Vec<String>, preset: &KindPreset) {
     for flag in preset.yolo_argv {
         if !argv.iter().any(|token| token == flag) {
@@ -719,9 +775,20 @@ fn ensure_name_flag(argv: &mut Vec<String>, flag: &str, name: &str) {
 }
 
 fn agent_name_for(spec: &InstanceSpec) -> String {
-    let raw = spec.host.as_id().as_str();
-    let suffix = raw.rsplit('_').next().unwrap_or("pty").chars().take(8);
-    format!("remuda-{}", suffix.collect::<String>())
+    let kind = match spec.kind {
+        AgentKind::Claude => "claude",
+        AgentKind::Codex => "codex",
+        AgentKind::Grok => "grok",
+        AgentKind::Agy => "agy",
+        AgentKind::Generic => "pty",
+    };
+    let uniq: String = uuid::Uuid::now_v7()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect();
+    format!("rmd-{kind}-{uniq}")
 }
 
 fn bind_client(server: &HerdrServer, options: &GenericPtyOptions) -> DriverResult<Client> {
@@ -763,7 +830,7 @@ mod tests {
             assert!(preset_by_id(id).is_some(), "{id}");
         }
         assert!(preset_by_id("codex").unwrap().yolo_argv[0].contains("bypass"));
-        assert!(preset_by_id("grok").unwrap().name_flag.is_some());
+        assert!(preset_by_id("grok").unwrap().name_flag.is_none());
         assert!(preset_by_id("claude").unwrap().journals);
         assert!(!preset_by_id("codex").unwrap().journals);
     }
@@ -773,5 +840,7 @@ mod tests {
         assert!(line_matches("hello\nDONE abc\n", "^DONE "));
         assert!(!line_matches("not yet\n", "^DONE "));
         assert!(line_matches("DONE sha", "^DONE "));
+        assert!(line_matches("DONE\n", "^DONE"));
+        assert!(line_matches("hello\nDONE\n", "^DONE"));
     }
 }

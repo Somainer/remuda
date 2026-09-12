@@ -128,7 +128,12 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         .unwrap_or(AgentKind::Claude);
     let driver = spec
         .get("driver")
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .and_then(|value| match value.as_str() {
+            Some("pty" | "generic-pty" | "generic_pty" | "genericPty") => {
+                Some(DriverKind::GenericPty)
+            }
+            _ => serde_json::from_value(value.clone()).ok(),
+        })
         .unwrap_or(DriverKind::ClaudePrint);
     let args = match spec.get("args") {
         None => Vec::new(),
@@ -146,6 +151,16 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             ));
         }
     };
+    let cwd = spec
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|raw| !raw.is_empty())
+        .or_else(|| {
+            spec.get("workspaceId")
+                .and_then(Value::as_str)
+                .filter(|raw| !raw.is_empty() && !raw.starts_with("ws_"))
+        })
+        .map(str::to_string);
     Ok(CreateInstanceRequest {
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
@@ -170,6 +185,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .unwrap_or("dontAsk")
             .to_owned(),
         prompt: prompt_of(params).unwrap_or_default(),
+        cwd,
     })
 }
 

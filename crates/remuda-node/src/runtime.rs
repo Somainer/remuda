@@ -19,7 +19,12 @@ use remuda_protocol::{
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 const COMMAND_ACK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -169,12 +174,18 @@ impl DevNode {
             workspace_id,
             request.driver,
         )?;
+        let workspace_root = request
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| self.inner.workspace.root_path.clone().into());
         let driver = self.inner.drivers.build(
             request.driver,
             DriverLaunch {
                 instance: instance.clone(),
                 request: request.clone(),
-                workspace_root: self.inner.workspace.root_path.clone().into(),
+                workspace_root,
             },
         )?;
         self.inner.store.insert_instance(instance)?;

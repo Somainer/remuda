@@ -234,7 +234,20 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             workspace_id: None,
         });
     let spec = parsed.spec.clone().unwrap_or_else(|| params.clone());
-    let mut request: CreateInstanceRequest = match serde_json::from_value(spec) {
+    let mut spec_for_request = spec.clone();
+    if let Some(obj) = spec_for_request.as_object_mut() {
+        if obj
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .is_some_and(|raw| !raw.starts_with("ws_"))
+        {
+            obj.remove("workspaceId");
+        }
+        if obj.get("driver").and_then(Value::as_str) == Some("pty") {
+            obj.insert("driver".into(), json!("generic-pty"));
+        }
+    }
+    let mut request: CreateInstanceRequest = match serde_json::from_value(spec_for_request) {
         Ok(request) => request,
         Err(_) => CreateInstanceRequest {
             instance_id: None,
@@ -247,8 +260,21 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             provider_profile_id: "dev-fake".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),
+            cwd: None,
         },
     };
+    if request.cwd.is_none() {
+        request.cwd = spec
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|raw| !raw.is_empty())
+            .or_else(|| {
+                spec.get("workspaceId")
+                    .and_then(Value::as_str)
+                    .filter(|raw| !raw.is_empty() && !raw.starts_with("ws_"))
+            })
+            .map(str::to_string);
+    }
     if request.instance_id.is_none()
         && let Some(id) = parsed
             .instance_id

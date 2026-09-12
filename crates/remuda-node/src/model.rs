@@ -74,6 +74,9 @@ pub struct CreateInstanceRequest {
     /// Optional initial prompt delivered through the bounded instance task.
     #[serde(default)]
     pub prompt: String,
+    /// Working directory for the native driver (git worktree path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Result returned after an Instance and its create command are represented in the local store.

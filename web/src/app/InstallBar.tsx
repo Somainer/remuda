@@ -1,28 +1,34 @@
-import { useInstallPrompt } from "../lib/pwa";
-import { Button } from "../components/Button";
-import ui from "../styles/ui.module.css";
 import { useState } from "react";
+import { useInstallPrompt } from "../lib/pwa";
+import ui from "../styles/ui.module.css";
 
 export function InstallBar() {
-  const event = useInstallPrompt();
+  const offer = useInstallPrompt();
   const [hidden, setHidden] = useState(false);
-  if (!event || hidden) return null;
+  if (!offer || hidden) return null;
+
+  const ios = offer.kind === "ios";
+  const copy = ios ? "添加到主屏幕 · 分享 → 加到主屏幕" : "添加到主屏幕";
+
   return (
-    <div className={ui.install}>
-      <span>添加到主屏幕</span>
-      <span>
-        <Button
-          variant="primary"
-          onClick={() => {
-            void event.prompt();
-            setHidden(true);
-          }}
-        >
-          安装
-        </Button>
-        <Button variant="ghost" onClick={() => setHidden(true)}>
-          稍后
-        </Button>
+    <div className={ui.install} data-testid="install-bar" role="region" aria-label="安装应用">
+      <span>{copy}</span>
+      <span className={ui.installActions}>
+        {offer.kind === "prompt" || offer.kind === "demo" ? (
+          <button
+            type="button"
+            className={`${ui.btnPrimary} ${ui.installBtn}`}
+            onClick={() => {
+              if (offer.kind === "prompt") void offer.prompt();
+              setHidden(true);
+            }}
+          >
+            安装
+          </button>
+        ) : null}
+        <button type="button" className={`${ui.btnGhost} ${ui.installBtn}`} onClick={() => setHidden(true)}>
+          {ios ? "知道了" : "稍后"}
+        </button>
       </span>
     </div>
   );

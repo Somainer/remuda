@@ -82,20 +82,6 @@ export function Shell() {
           >
             ⋯
           </button>
-          {moreOpen ? (
-            <div className={css.moreMenu} role="menu">
-              {MORE_NAV.map((item) => (
-                <Link
-                  key={item.id}
-                  role="menuitem"
-                  className={`${css.moreItem} ${location.pathname.startsWith(item.to) ? css.moreItemActive : ""}`}
-                  to={item.to}
-                >
-                  {item.label}
-                </Link>
-              ))}
-            </div>
-          ) : null}
         </div>
         <Link className={css.me} to="/settings" title="设置">
           <span className={css.meDot}>me</span>
@@ -123,11 +109,31 @@ export function Shell() {
         <button type="button" onClick={() => navigate("/sessions/new")} aria-label="新建">
           <span className={css.barPlus}>＋</span>
         </button>
-        <button type="button" className={moreActive ? css.barActive : ""} onClick={() => setMoreOpen((v) => !v)}>
+        <button
+          type="button"
+          className={moreActive ? css.barActive : ""}
+          aria-expanded={moreOpen}
+          aria-haspopup="menu"
+          onClick={() => setMoreOpen((v) => !v)}
+        >
           <span className={css.barGlyph}>⋯</span>
           更多
         </button>
       </nav>
+      {moreOpen ? (
+        <div className={css.moreMenu} role="menu">
+          {MORE_NAV.map((item) => (
+            <Link
+              key={item.id}
+              role="menuitem"
+              className={`${css.moreItem} ${location.pathname.startsWith(item.to) ? css.moreItemActive : ""}`}
+              to={item.to}
+            >
+              {item.label}
+            </Link>
+          ))}
+        </div>
+      ) : null}
       {hub.toast ? <div className={css.toast}>{hub.toast.text}</div> : null}
     </div>
   );

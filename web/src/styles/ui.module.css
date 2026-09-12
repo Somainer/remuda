@@ -190,7 +190,7 @@
   border: 1px solid var(--line);
   border-radius: var(--radius);
   width: min(520px, calc(100% - 24px));
-  margin-bottom: 24px;
+  margin-bottom: calc(24px + var(--safe-bottom));
   padding: 16px;
 }
 
@@ -328,10 +328,37 @@
   z-index: 20;
   display: flex;
   justify-content: space-between;
-  gap: 8px;
+  align-items: center;
+  gap: 10px;
   padding: 8px 12px;
   background: var(--ink-2);
   border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.installActions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+.installBtn {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
+@media (max-width: 767px) {
+  .btnPrimary,
+  .btnDanger {
+    min-height: 44px;
+  }
+
+  .modal {
+    padding-bottom: var(--safe-bottom);
+  }
 }
 
 .approval {

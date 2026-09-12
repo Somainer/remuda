@@ -1,7 +1,9 @@
 .page {
   display: flex;
   flex-direction: column;
-  min-height: 100%;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
   color: var(--paper);
 }
 
@@ -696,7 +698,6 @@
 
   .dock {
     padding: 10px 14px;
-    padding-bottom: calc(10px + var(--safe-bottom));
     gap: 10px;
   }
 

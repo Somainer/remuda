@@ -16,8 +16,8 @@ mod paths;
 mod script;
 
 pub use bin_locator::{
-    cargo_bin_exe, cargo_target_dir, ensure_workspace_bin, fallback_bin_path, locate_bin_in,
-    locate_workspace_bin, workspace_root,
+    cargo_bin_exe, cargo_target_dir, ensure_workspace_bin, env_bin_override, fallback_bin_path,
+    locate_bin_in, locate_workspace_bin, workspace_root,
 };
 pub use client::{
     FakeClaudeProcess, SpawnOptions, fake_claude_bin, is_control_subtype, is_system_subtype,

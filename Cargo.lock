@@ -3013,6 +3013,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "remuda-testing",
  "serde",
  "serde_json",
  "tempfile",

@@ -4,7 +4,9 @@
 //! build into the pointed-at target dir. Lookup must not assume `./target`.
 //!
 //! On-demand `cargo build` of `fake-claude` / `fake-herdr` is serialized with
-//! an exclusive flock on `<target>/remuda-bin-locator.lock`. After a build (or
+//! an exclusive flock on `<target>/remuda-bin-locator.lock`. It is skipped when
+//! the binary is already on disk or `REMUDA_<NAME>_BIN` is set, and it never
+//! builds into a target dir owned by a parent `cargo test`. After a build (or
 //! when another process may still be writing the file), the locator waits until
 //! the binary can be exec'd, retrying `ETXTBSY` / [`std::io::ErrorKind::ExecutableFileBusy`].
 
@@ -83,9 +85,22 @@ pub fn locate_bin_in(target_dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Locate a remuda-testing binary, honoring cargo bin-exe env and target dir.
+/// Env override for a stub binary (`REMUDA_FAKE_HERDR_BIN`, `REMUDA_FAKE_CLAUDE_BIN`, …).
+pub fn env_bin_override(name: &str) -> Option<PathBuf> {
+    let key = env_bin_key(name);
+    let path = PathBuf::from(std::env::var_os(key)?);
+    path.is_file().then_some(path)
+}
+
+fn env_bin_key(name: &str) -> String {
+    format!("REMUDA_{}_BIN", name.replace('-', "_").to_ascii_uppercase())
+}
+
+/// Locate a remuda-testing binary, honoring env override, cargo bin-exe, and target dir.
 pub fn locate_workspace_bin(name: &str) -> Option<PathBuf> {
-    cargo_bin_exe(name).or_else(|| locate_bin_in(&cargo_target_dir(), name))
+    env_bin_override(name)
+        .or_else(|| cargo_bin_exe(name))
+        .or_else(|| locate_bin_in(&cargo_target_dir(), name))
 }
 
 /// Conventional fallback path used in error messages when the binary is not on disk yet.
@@ -94,27 +109,84 @@ pub fn fallback_bin_path(name: &str) -> PathBuf {
     cargo_target_dir().join(profile).join(name)
 }
 
-/// Build `-p remuda-testing --bin <name>` into [`cargo_target_dir`] and return the path.
+/// Return `{name}` built for this workspace, without racing a parent `cargo test`.
 ///
-/// Concurrent callers share an exclusive flock so only one `cargo build` runs
-/// at a time. If the binary is already present it is not rebuilt (CI prebuilds
-/// with `cargo build -p remuda-testing --bins` for this reason).
+/// Lookup order: `REMUDA_<NAME>_BIN` (hyphens → underscores), `CARGO_BIN_EXE_*`,
+/// then `{debug,release}/<name>` under [`cargo_target_dir`]. If the binary is
+/// missing, a nested `cargo build -p remuda-testing --bin <name>` runs **only**
+/// when this process is not already inside a parent cargo that owns the same
+/// target dir. Under `cargo test` the fallback uses a sidecar target
+/// (`<target>/remuda-test-bins`) so it never takes the parent `.cargo-lock`.
+///
+/// Concurrent callers share an exclusive flock on `<target>/remuda-bin-locator.lock`.
 ///
 /// # Panics
 ///
 /// Panics if `cargo build` fails or the binary is still missing / not exec-able
 /// afterwards.
 pub fn ensure_workspace_bin(name: &str) -> PathBuf {
-    if let Some(path) = cargo_bin_exe(name) {
+    if let Some(path) = env_bin_override(name).or_else(|| cargo_bin_exe(name)) {
         wait_until_runnable(&path);
         return path;
     }
     let target_dir = cargo_target_dir();
+    let sidecar = target_dir.join("remuda-test-bins");
     let _lock = lock_bin_locator(&target_dir);
-    if let Some(path) = locate_bin_in(&target_dir, name) {
+    if let Some(path) = locate_bin_in(&target_dir, name).or_else(|| locate_bin_in(&sidecar, name)) {
         wait_until_runnable(&path);
         return path;
     }
+    let build_dir = if parent_cargo_owns_target(&target_dir) {
+        sidecar
+    } else {
+        target_dir.clone()
+    };
+    cargo_build_testing_bin(name, &build_dir);
+    let path = locate_bin_in(&build_dir, name).unwrap_or_else(|| {
+        panic!(
+            "{name} binary not found under {}/{{debug,release}}",
+            build_dir.display()
+        )
+    });
+    wait_until_runnable(&path);
+    path
+}
+
+/// `CARGO` is set for `cargo test` / `cargo build` children. Nested cargo into
+/// the same `--target-dir` then fights the parent's `.cargo-lock`.
+fn parent_cargo_owns_target(target_dir: &Path) -> bool {
+    let Some(cargo) = std::env::var_os("CARGO") else {
+        return false;
+    };
+    if cargo.is_empty() {
+        return false;
+    }
+    let parent_target = std::env::var_os("CARGO_TARGET_DIR")
+        .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
+        .map(PathBuf::from);
+    match parent_target {
+        Some(parent) => {
+            let parent = if parent.is_absolute() {
+                parent
+            } else {
+                workspace_root().join(parent)
+            };
+            paths_match(&parent, target_dir)
+        }
+        None => true,
+    }
+}
+
+fn paths_match(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn cargo_build_testing_bin(name: &str, target_dir: &Path) {
+    std::fs::create_dir_all(target_dir)
+        .unwrap_or_else(|err| panic!("create cargo target dir {}: {err}", target_dir.display()));
     let status = Command::new(env!("CARGO"))
         .current_dir(workspace_root())
         .args([
@@ -126,23 +198,15 @@ pub fn ensure_workspace_bin(name: &str) -> PathBuf {
             "--quiet",
             "--target-dir",
         ])
-        .arg(&target_dir)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .env("CARGO_BUILD_TARGET_DIR", &target_dir)
+        .arg(target_dir)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_BUILD_TARGET_DIR", target_dir)
         .status()
         .unwrap_or_else(|err| panic!("cargo build -p remuda-testing --bin {name}: {err}"));
     assert!(
         status.success(),
         "cargo build -p remuda-testing --bin {name} failed with {status}"
     );
-    let path = locate_bin_in(&target_dir, name).unwrap_or_else(|| {
-        panic!(
-            "{name} binary not found under {}/{{debug,release}}",
-            target_dir.display()
-        )
-    });
-    wait_until_runnable(&path);
-    path
 }
 
 struct BinLocatorLock {
@@ -230,5 +294,11 @@ mod tests {
         let path = ensure_workspace_bin("fake-herdr");
         assert!(path.is_file(), "{}", path.display());
         assert!(is_executable(&path), "{}", path.display());
+    }
+
+    #[test]
+    fn fake_herdr_env_override_key() {
+        assert_eq!(env_bin_key("fake-herdr"), "REMUDA_FAKE_HERDR_BIN");
+        assert_eq!(env_bin_key("fake-claude"), "REMUDA_FAKE_CLAUDE_BIN");
     }
 }

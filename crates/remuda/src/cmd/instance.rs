@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use serde_json::{Value, json};
 
-use super::hub_client::{HubClient, HubOpts, block_on, labels_to_map, pick_host, print_json};
+use super::hub_client::{HubClient, HubOpts, block_on, pick_host, print_json};
 
 /// Default `wait` budget; protocol.md §8.1.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -230,22 +230,26 @@ pub(crate) async fn create(client: &HubClient, opts: CreateOpts) -> Result<Value
         body["commandId"] = json!(command_id);
     }
 
-    // TODO: Hub placement (proposal.md §4.6) should honour `placement` and
-    // select the host. POST /v1/instances currently requires `hostId`, so the
-    // CLI resolves labels/any from GET /v1/hosts and still sends hostId.
+    // Hub placement (proposal.md §4.6) accepts hostId, labels[], or any.
+    // Still send hostId when the CLI can resolve it so older Hubs that require
+    // the field keep working; otherwise Hub pick_hosts runs.
     if let Some(host) = &opts.host {
         body["hostId"] = json!(host);
         body["placement"] = json!({ "host": host });
     } else if !opts.labels.is_empty() {
-        let hosts = client.list_hosts().await?;
-        let host_id = pick_host(&hosts, &opts.labels)?;
-        body["hostId"] = json!(host_id);
-        body["placement"] = json!({ "labels": labels_to_map(&opts.labels) });
+        body["placement"] = json!({ "labels": opts.labels });
+        if let Ok(hosts) = client.list_hosts().await
+            && let Ok(host_id) = pick_host(&hosts, &opts.labels)
+        {
+            body["hostId"] = json!(host_id);
+        }
     } else {
-        let hosts = client.list_hosts().await?;
-        let host_id = pick_host(&hosts, &[])?;
-        body["hostId"] = json!(host_id);
-        body["placement"] = json!({ "any": true });
+        body["placement"] = json!({ "kind": "any" });
+        if let Ok(hosts) = client.list_hosts().await
+            && let Ok(host_id) = pick_host(&hosts, &[])
+        {
+            body["hostId"] = json!(host_id);
+        }
     }
 
     Ok(client.create_instance(&body).await?)

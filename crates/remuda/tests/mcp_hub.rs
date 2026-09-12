@@ -1,0 +1,246 @@
+//! `remuda mcp` tools/list + tools/call instance.create against an in-process Hub
+//! and a fake Node WebSocket client. No remuda-node process and no native CLI.
+
+use anyhow::{Context, Result, anyhow};
+use futures::{SinkExt, StreamExt};
+use remuda_hub::{HubConfig, spawn};
+use remuda_protocol::HostId;
+use serde_json::{Value, json};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command;
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+const RPC: Duration = Duration::from_secs(8);
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_remuda")
+}
+
+async fn recv_json<S>(ws: &mut S) -> Result<Value>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    loop {
+        let msg = timeout(RPC, ws.next())
+            .await
+            .map_err(|_| anyhow!("ws timeout"))?
+            .ok_or_else(|| anyhow!("ws closed"))??;
+        match msg {
+            Message::Text(text) => return Ok(serde_json::from_str(&text)?),
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => return Err(anyhow!("unexpected ws frame {other:?}")),
+        }
+    }
+}
+
+async fn enroll_fake_node(
+    addr: std::net::SocketAddr,
+    bootstrap: &str,
+    host_id: &str,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hello",
+            "method": "runtime.hello",
+            "params": {
+                "hostId": host_id,
+                "nodeVersion": "0.1.0-test",
+                "label": "fake-node",
+                "host": {
+                    "hostname": "fake-node.local",
+                    "labels": { "region": "sg" },
+                    "maxInstances": 4,
+                    "cli": [{
+                        "kind": "claude",
+                        "version": "0.0.0",
+                        "absolutePath": "/usr/bin/claude",
+                        "authState": "unknown"
+                    }]
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    anyhow::ensure!(
+        hello["result"]["nodeToken"].as_str().is_some(),
+        "hello {hello}"
+    );
+    Ok(tokio::spawn(async move {
+        loop {
+            let Ok(frame) = recv_json(&mut node).await else {
+                break;
+            };
+            if let Some(id) = frame.get("id").cloned()
+                && frame.get("method").is_some()
+            {
+                let _ = node
+                    .send(Message::Text(
+                        json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+            }
+        }
+    }))
+}
+
+async fn mcp_roundtrip(hub: &str, bootstrap: &str, requests: &[Value]) -> Result<Vec<Value>> {
+    let mut child = Command::new(bin())
+        .arg("mcp")
+        .env("REMUDA_HUB", hub)
+        .env("REMUDA_BOOTSTRAP_TOKEN", bootstrap)
+        .env_remove("REMUDA_TOKEN")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn remuda mcp")?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let mut stdout = child.stdout.take().context("stdout")?;
+    for req in requests {
+        stdin
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .context("write mcp")?;
+    }
+    drop(stdin);
+
+    let mut buf = Vec::new();
+    let read = timeout(Duration::from_secs(10), async {
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = stdout.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            if text.lines().filter(|l| !l.is_empty()).count() >= requests.len() {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await;
+    let mut err = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = timeout(Duration::from_millis(200), stderr.read_to_end(&mut err)).await;
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    read.map_err(|_| {
+        anyhow!(
+            "mcp stdout timeout stderr={}",
+            String::from_utf8_lossy(&err)
+        )
+    })??;
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    anyhow::ensure!(
+        lines.len() >= requests.len(),
+        "mcp frames {} want {} stdout={text:?} stderr={}",
+        lines.len(),
+        requests.len(),
+        String::from_utf8_lossy(&err)
+    );
+    lines
+        .iter()
+        .take(requests.len())
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_tools_list_and_instance_create_against_in_process_hub() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let bootstrap = hub.bootstrap_token.clone();
+    let host_id = HostId::new();
+    let node = enroll_fake_node(hub.addr, &bootstrap, host_id.as_id().as_str()).await?;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let hub_url = format!("http://{}", hub.addr);
+    let replies = mcp_roundtrip(
+        &hub_url,
+        &bootstrap,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "mcp-hub-test", "version": "0" }
+                }
+            }),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "remuda_instance_create",
+                    "arguments": {
+                        "host": host_id.as_id().as_str(),
+                        "kind": "claude",
+                        "driver": "claude-print",
+                        "prompt": "ok"
+                    }
+                }
+            }),
+        ],
+    )
+    .await?;
+
+    assert_eq!(replies[0]["result"]["serverInfo"]["name"], json!("remuda"));
+    let names: Vec<String> = replies[1]["result"]["tools"]
+        .as_array()
+        .context("tools")?
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.contains(&"remuda_instance_create".into()),
+        "tools {names:?}"
+    );
+
+    let call = &replies[2];
+    assert_eq!(call["result"]["isError"], json!(false), "{call}");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .context("tool text")?;
+    let created: Value = serde_json::from_str(text).context("create json")?;
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?;
+    assert!(instance_id.starts_with("ins_"), "instanceId {instance_id}");
+    assert_eq!(
+        created["instance"]["hostId"].as_str(),
+        Some(host_id.as_id().as_str())
+    );
+
+    node.abort();
+    Ok(())
+}

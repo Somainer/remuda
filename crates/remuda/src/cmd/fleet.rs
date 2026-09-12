@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use serde_json::{Value, json};
 
-use super::hub_client::{HubClient, HubOpts, block_on, labels_to_map, print_json};
+use super::hub_client::{HubClient, HubOpts, block_on, print_json};
 
 /// `remuda fleet` subcommands.
 #[derive(Debug, Subcommand)]
@@ -106,9 +106,9 @@ pub(crate) async fn fleet_run(client: &HubClient, opts: FleetRunOpts) -> Result<
     if opts.hosts.len() == 1 {
         spec["placement"] = json!({ "host": opts.hosts[0] });
     } else if !opts.labels.is_empty() {
-        spec["placement"] = json!({ "labels": labels_to_map(&opts.labels) });
+        spec["placement"] = json!({ "labels": opts.labels });
     } else if opts.hosts.is_empty() {
-        spec["placement"] = json!({ "any": true });
+        spec["placement"] = json!({ "kind": "any" });
     }
 
     let mut body = json!({ "spec": spec });
@@ -125,8 +125,5 @@ pub(crate) async fn fleet_run(client: &HubClient, opts: FleetRunOpts) -> Result<
         body["max"] = json!(max);
     }
 
-    // TODO: Hub fleet routes (POST /v1/fleet/instances, GET /v1/fleet/:id,
-    // POST /v1/fleet/:id/commands) are specified in proposal.md §4.6 and are
-    // owned by the remuda-hub agent. A 404 is mapped to FleetUnavailable.
     Ok(client.create_fleet(&body).await?)
 }

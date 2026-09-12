@@ -102,10 +102,13 @@ impl HubClient {
         token: Option<String>,
         bootstrap: Option<String>,
     ) -> Result<Self, ClientError> {
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .user_agent(format!("remuda/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(30))
-            .build()?;
+            .timeout(Duration::from_secs(30));
+        if loopback_hub(&base) {
+            http = http.no_proxy();
+        }
+        let http = http.build()?;
         Ok(Self {
             base,
             token: Mutex::new(token),
@@ -267,6 +270,13 @@ impl HubClient {
     }
 }
 
+fn loopback_hub(base: &str) -> bool {
+    let rest = base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    rest.starts_with("127.0.0.1") || rest.starts_with("localhost") || rest.starts_with("[::1]")
+}
+
 fn is_fleet_path(path: &str) -> bool {
     path.split('?')
         .next()
@@ -352,6 +362,7 @@ fn push_label_values(value: Option<&Value>, out: &mut Vec<String>) {
 }
 
 /// Convert `key=value` / bare-key CLI labels into a placement map.
+#[cfg(test)]
 pub(crate) fn labels_to_map(labels: &[String]) -> Value {
     let mut map = serde_json::Map::new();
     for label in labels {

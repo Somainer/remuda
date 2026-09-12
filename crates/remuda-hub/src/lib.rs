@@ -25,6 +25,7 @@ mod providers;
 mod push_http;
 mod rate_limit;
 mod registry;
+pub mod ssh_hosts;
 mod store;
 mod transport;
 mod tty;
@@ -220,6 +221,7 @@ pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .merge(http::routes())
         .merge(hosts::routes())
+        .merge(ssh_hosts::routes(state.clone()))
         .merge(instances::routes())
         .merge(interactions::routes())
         .merge(tty::routes())

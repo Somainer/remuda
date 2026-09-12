@@ -263,7 +263,7 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_node_method(
+pub(crate) async fn handle_node_method(
     state: &AppState,
     token: &str,
     host_id: &mut Option<String>,
@@ -352,7 +352,12 @@ async fn handle_node_method(
                 .nodes
                 .insert(
                     host.host_id.clone(),
-                    Arc::new(WssTransport::new(out_tx.clone(), pending.clone())),
+                    Arc::new(
+                        WssTransport::new(out_tx.clone(), pending.clone()).with_kind(
+                            TransportKind::parse(&host.transport)
+                                .unwrap_or(TransportKind::OutboundWss),
+                        ),
+                    ),
                 )
                 .await;
             *session_generation = Some(generation);

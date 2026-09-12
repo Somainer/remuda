@@ -48,6 +48,8 @@ pub(crate) fn host_view(host: &HostRecord) -> Value {
         "resources": host.resources,
         "maxInstances": host.max_instances,
         "hostname": host.hostname,
+        "ssh": host.ssh,
+        "lastError": host.last_error,
     })
 }
 

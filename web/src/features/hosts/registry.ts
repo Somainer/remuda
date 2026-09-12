@@ -87,6 +87,8 @@ class HostRegistry {
       const count = instances.filter((i) => i.hostId === host.id).length;
       out.push({
         ...base,
+        ssh: host.ssh,
+        lastError: host.lastError,
         ...this.patches.get(host.id),
         id: host.id,
         instanceCount: count || host.instanceCount || base.instanceCount,

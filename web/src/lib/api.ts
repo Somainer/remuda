@@ -82,7 +82,7 @@ const LIFECYCLES: Instance["lifecycle"][] = [
   "reconciling",
 ];
 const ACTIVITIES = ["idle", "working", "waiting-interaction", "draining"] as const;
-const HOST_STATES: Host["state"][] = ["enrolled", "online", "offline", "reconciling", "retired"];
+const HOST_STATES: Host["state"][] = ["enrolled", "connecting", "online", "offline", "reconciling", "retired"];
 
 function mapKind(raw: string): Instance["kind"] {
   return KINDS.find((k) => k === raw) ?? "generic";
@@ -151,6 +151,8 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
     nodeVersion: "nodeVersion" in h && typeof h.nodeVersion === "string" ? h.nodeVersion : undefined,
     instanceCount: h.instanceCount ?? 0,
     online: h.online,
+    ssh: h.ssh ?? undefined,
+    lastError: h.lastError ?? undefined,
   };
 }
 
@@ -345,6 +347,8 @@ export type HubApi = {
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
   interactionRespond(interactionId: Id, answer: InteractionAnswer): Promise<CommandResult>;
+  hostSshAdd(body: components["schemas"]["SshHostCreate"]): Promise<Host>;
+  hostRemove(hostId: Id): Promise<void>;
   hostList(): Promise<Page<Host>>;
   hostGet(hostId: Id): Promise<Host>;
   workspaceList(hostId?: Id): Promise<Page<Workspace>>;
@@ -591,6 +595,8 @@ function createMockApi(): HubApi {
     async interactionRespond(interactionId, answer) {
       return mockRespond(interactionId, answer);
     },
+    async hostSshAdd() { throw new Error("演示模式无法连接真实 SSH 主机"); },
+    async hostRemove() { throw new Error("演示模式无法移除真实 SSH 主机"); },
     async hostList() {
       return mockPage(mockDb.hosts);
     },
@@ -921,6 +927,13 @@ function createLiveApi(): HubApi {
         relatedCommandIds: [],
       };
     },
+    async hostSshAdd(body) {
+      return mapHost(await rest<components["schemas"]["HostView"]>("/v1/hosts/ssh", { method: "POST", body: JSON.stringify(body) }));
+    },
+    async hostRemove(hostId) {
+      await rest<void>(`/v1/hosts/${encodeURIComponent(hostId)}`, { method: "DELETE" });
+      hosts.delete(hostId);
+    },
     async hostList() {
       const page = await rest<HubJson<"/v1/hosts", "get">>("/v1/hosts");
       const items = page.items.map(mapHost);
@@ -960,9 +973,9 @@ function createLiveApi(): HubApi {
         updatedAt: h.updatedAt,
         hostId: h.id,
         label: h.label,
-        rootPath: trees.workspaceRoot || "/",
+        rootPath: h.ssh?.workspaceRoot || trees.workspaceRoot || "/",
         writePolicy: "default",
-        canonicalRoot: trees.workspaceRoot ? known(trees.workspaceRoot) : unknownKnowledge("none"),
+        canonicalRoot: h.ssh?.workspaceRoot ? known(h.ssh.workspaceRoot) : trees.workspaceRoot ? known(trees.workspaceRoot) : unknownKnowledge("none"),
       }));
       const fromTrees: Workspace[] = trees.items.map((row) => ({
         id: row.path as Id,

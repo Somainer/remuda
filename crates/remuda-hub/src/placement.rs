@@ -210,6 +210,12 @@ fn consider(
             host.host_id, host.max_instances
         ));
     }
+    if host.ssh.is_some() && spec.driver == "generic-pty" && !has_herdr(host) {
+        return Err(format!(
+            "{}: remote generic-pty requires herdr; no shell-pty driver is advertised by this Node. Use a host with herdr or a supported no-herdr driver",
+            host.host_id
+        ));
+    }
     if spec.driver == "claude-pty" && !has_herdr(host) {
         return Err(format!(
             "{}: driver claude-pty requires herdr",
@@ -240,6 +246,12 @@ fn has_herdr(host: &HostRecord) -> bool {
     };
     if herdr.is_null() {
         return false;
+    }
+    if host.ssh.is_some() {
+        return herdr
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.is_empty());
     }
     ["version", "socket", "path"].iter().any(|key| {
         herdr
@@ -399,6 +411,8 @@ mod tests {
 
     fn host(id: &str, online: bool, labels: &[&str], herdr: bool, max: i64) -> HostRecord {
         HostRecord {
+            ssh: None,
+            last_error: None,
             host_id: id.into(),
             label: id.into(),
             state: if online {
@@ -482,5 +496,39 @@ mod tests {
             }
             other => panic!("{other}"),
         }
+    }
+
+    #[test]
+    fn managed_ssh_requires_ready_link_and_real_herdr_executable() {
+        let mut remote = host("hst_remote", true, &[], true, 8);
+        remote.ssh = Some(json!({"target": "test-node"}));
+        remote.state = "connecting".into();
+        assert!(!crate::store::Store::with_live_link(remote.clone(), true).online);
+        remote.state = "retired".into();
+        assert!(!crate::store::Store::with_live_link(remote.clone(), true).online);
+        remote.state = "online".into();
+        assert!(!crate::store::Store::with_live_link(remote.clone(), false).online);
+        assert!(crate::store::Store::with_live_link(remote.clone(), true).online);
+        let spec = PlaceSpec {
+            driver: "generic-pty".into(),
+            delegation: None,
+        };
+        let error = consider(&remote, &[], &Placement::Any, &spec).unwrap_err();
+        assert!(error.contains("requires herdr") && error.contains("shell-pty"));
+        remote.herdr = Some(json!({"path": "/usr/bin/herdr", "version": "0.9.0"}));
+        assert!(consider(&remote, &[], &Placement::Any, &spec).is_ok());
+        remote.herdr = None;
+        assert!(
+            consider(
+                &remote,
+                &[],
+                &Placement::Any,
+                &PlaceSpec {
+                    driver: "claude-print".into(),
+                    delegation: None
+                },
+            )
+            .is_ok()
+        );
     }
 }

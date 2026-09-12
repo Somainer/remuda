@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AddHostForm,
   cliSummary,
@@ -9,11 +9,26 @@ import {
   useHostViews,
   type HostView,
 } from "../features/hosts";
-import { useHub } from "../lib/store";
+import { hubStore, useHub } from "../lib/store";
+import { api } from "../lib/api";
 import ui from "../styles/ui.module.css";
 import css from "../features/hosts/hosts.module.css";
 
+function useHostPolling() {
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try { await hubStore.refreshHosts(); } catch { /* preserve last snapshot */ }
+      if (!stopped) timer = setTimeout(() => void refresh(), 2500);
+    };
+    void refresh();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, []);
+}
+
 export function HostsPage() {
+  useHostPolling();
   const hub = useHub();
   const hosts = useHostViews(hub.hosts, hub.instances);
   const [adding, setAdding] = useState(false);
@@ -44,7 +59,7 @@ export function HostsPage() {
           </button>
         ) : null}
         <button type="button" className={css.add} data-testid="hosts-add" onClick={() => setAdding(true)}>
-          添加
+          添加主机
         </button>
       </header>
       {visible.map((host) => (
@@ -61,8 +76,9 @@ export function HostsPage() {
           <span className={`${css.dot} ${host.online ? css.dotOn : css.dotOff}`} aria-label={host.online ? "在线" : "离线"} />
           <span className={css.identity}>
             <span className={`${css.name} ${host.online ? "" : css.nameOff}`}>{host.label}</span>
+            {host.lastError ? <span role="status" className={css.sshError}>{host.lastError}</span> : null}
             <span className={css.mobileMeta}>
-              {host.online
+              {host.state === "connecting" ? "连接中…" : host.online
                 ? `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}`
                 : `离线${host.lastSeenAt ? ` · 最后心跳 ${host.lastSeenAt.slice(11, 16)}` : ""}`}
               {cliSummary(host.cli) ? ` · ${cliSummary(host.cli)}` : ""}
@@ -70,7 +86,7 @@ export function HostsPage() {
             </span>
           </span>
           <span className={`${css.cell} ${css.cellRtt}`}>
-            {host.online ? `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}` : "离线 —"}
+            {host.state === "connecting" ? "连接中…" : host.online ? `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}` : "离线 —"}
           </span>
           <span className={`${css.cell} ${css.cellCli}`}>{cliSummary(host.cli) || "—"}</span>
           <span className={`${css.cell} ${css.cellTransport}`}>
@@ -89,6 +105,7 @@ export function HostsPage() {
 }
 
 export function HostDetailPage() {
+  useHostPolling();
   const { hostId = "" } = useParams();
   const hub = useHub();
   const hosts = useHostViews(hub.hosts, hub.instances);
@@ -99,6 +116,9 @@ export function HostDetailPage() {
 }
 
 function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label: string; path: string }[] }) {
+  const navigate = useNavigate();
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const [label, setLabel] = useState(host.label);
   const [labelDraft, setLabelDraft] = useState(host.labels.join(", "));
   const [maxInstances, setMaxInstances] = useState(String(host.maxInstances));
@@ -124,6 +144,17 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label:
             </button>
           )}
         </div>
+        {host.ssh ? <div className={css.sshPanel}>
+          <span>SSH · {host.ssh.target} · {host.state === "connecting" ? "连接中…" : host.online ? "在线" : "离线，自动重连中"}</span>
+          <button type="button" className={css.add} disabled={removing} onClick={() => {
+            setRemoving(true); setRemoveError(null);
+            void api.hostRemove(host.id).then(async () => { await hubStore.refreshHosts(); navigate("/hosts"); })
+              .catch((error: unknown) => setRemoveError(error instanceof Error ? error.message : "移除失败"))
+              .finally(() => setRemoving(false));
+          }} data-testid="host-remove">{removing ? "移除中…" : "移除主机"}</button>
+          {host.lastError ? <p role="status" className={css.sshError}>{host.lastError}</p> : null}
+          {removeError ? <p role="alert" className={css.sshError}>{removeError}</p> : null}
+        </div> : null}
         <div className={css.metrics}>
           <div className={css.metric}>
             <div className={css.metricLabel}>传输</div>

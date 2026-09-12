@@ -500,3 +500,11 @@
     order: 3;
   }
 }
+
+.sshError { color: var(--dust); font-size: 12px; overflow-wrap: anywhere; white-space: normal; display: block; }
+.sshPanel { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.sshPanel p { flex-basis: 100%; margin: 0; }
+@media (max-width: 640px) {
+  .fields input, .fields select { min-height: 44px; font-size: 16px; }
+  .sshPanel button { min-height: 44px; }
+}

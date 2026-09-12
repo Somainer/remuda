@@ -16,6 +16,9 @@ pub const MIN_CREATE_SETTLE_TIMEOUT_MS: u64 = 120_000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HubConfig {
+    /// Hub-supervised SSH executable and optional upload artifact.
+    #[serde(default)]
+    pub ssh_hosts: crate::ssh_hosts::SshHostOptions,
     /// SQLite, bootstrap-token file, and blob cache root.
     pub data_dir: PathBuf,
     /// HTTP/WS bind address.
@@ -68,6 +71,7 @@ fn default_create_settle_timeout_ms() -> u64 {
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
+            ssh_hosts: crate::ssh_hosts::SshHostOptions::default(),
             data_dir: PathBuf::from("./data"),
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             bootstrap_token: String::new(),
@@ -87,6 +91,7 @@ impl HubConfig {
     /// Test helper: insecure cookie, generated bootstrap, caller-supplied data dir.
     pub fn for_test(data_dir: PathBuf) -> Self {
         Self {
+            ssh_hosts: crate::ssh_hosts::SshHostOptions::default(),
             data_dir,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             bootstrap_token: format!("boot-{}", Uuid::new_v4().simple()),

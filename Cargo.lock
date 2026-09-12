@@ -3094,6 +3094,7 @@ dependencies = [
  "remuda-driver",
  "remuda-protocol",
  "remuda-push",
+ "remuda-ssh",
  "reqwest",
  "rusqlite",
  "rust-embed",

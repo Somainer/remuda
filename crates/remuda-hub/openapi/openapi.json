@@ -19,6 +19,49 @@
     { "name": "realtime" }
   ],
   "paths": {
+    "/v1/hosts/ssh": {
+      "post": {
+        "tags": [
+          "hosts"
+        ],
+        "operationId": "hostSshAdd",
+        "summary": "Persist a Hub-supervised SSH host and start preflight/reconnect",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SshHostCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Host registered; inspect state and lastError while connecting",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/healthz": {
       "get": {
         "tags": ["health"],
@@ -79,6 +122,35 @@
       }
     },
     "/v1/hosts/{id}": {
+      "delete": {
+        "tags": [
+          "hosts"
+        ],
+        "operationId": "hostRemove",
+        "summary": "Remove a supervised SSH host after stopping its instances; keep journal history",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Supervisor cancelled, connection closed, registration removed; remote files retained"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
       "get": {
         "tags": ["hosts"],
         "operationId": "hostGet",
@@ -707,6 +779,44 @@
       }
     },
     "schemas": {
+      "SshHostCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "target",
+          "label"
+        ],
+        "properties": {
+          "target": {
+            "type": "string",
+            "maxLength": 255,
+            "description": "SSH config alias or user@host, resolved by the Hub system SSH client."
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "labels": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "description": "Placement labels such as egress:gateway or region=sg."
+          },
+          "remuda_binary_policy": {
+            "type": "string",
+            "enum": [
+              "require_installed",
+              "upload_if_missing"
+            ],
+            "default": "require_installed"
+          }
+        }
+      },
       "ErrorBody": {
         "type": "object",
         "required": ["error", "code"],
@@ -869,6 +979,36 @@
         "additionalProperties": true,
         "required": ["hostId", "label", "state", "online"],
         "properties": {
+          "ssh": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "required": [
+              "target",
+              "remudaBinaryPolicy"
+            ],
+            "properties": {
+              "workspaceRoot": { "type": "string" },
+              "target": {
+                "type": "string"
+              },
+              "remudaBinaryPolicy": {
+                "type": "string",
+                "enum": [
+                  "require_installed",
+                  "upload_if_missing"
+                ],
+                "default": "require_installed"
+              }
+            }
+          },
+          "lastError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "hostId": { "type": "string", "description": "Stable Node identity (`hst_…`)." },
           "id": { "type": "string" },
           "name": { "type": "string" },

@@ -132,7 +132,7 @@ struct PtyLive {
     native_store_id: Id,
     herdr_pin: HerdrPin,
     herdr_session: String,
-    transcript_path: Option<String>,
+    transcript_path: Arc<std::sync::Mutex<Option<String>>>,
     events: mpsc::Sender<Observation>,
     status_task: Option<JoinHandle<()>>,
     hook_task: Option<JoinHandle<()>>,
@@ -167,6 +167,17 @@ impl ClaudePtyDriver {
     /// Last persisted recipe, if any. Contains no secrets or prompts.
     pub async fn persisted_recipe(&self) -> Option<LaunchRecipe> {
         self.last_recipe.lock().await.clone()
+    }
+
+    /// Transcript path recorded by the SessionStart hook, if it has fired.
+    pub async fn session_transcript(&self) -> Option<String> {
+        let inner = self.inner.lock().await;
+        inner.as_ref().and_then(|live| {
+            live.transcript_path
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+        })
     }
 
     /// Open a read-only Herdr terminal observer for the live pane.
@@ -335,7 +346,14 @@ impl ClaudePtyDriver {
 
         let status_task = spawn_status_pump(stream, tx.clone(), ctx.clone(), Arc::clone(&self.seq));
         let hook_path = self.options.launch_dir.join("session-meta.json");
-        let hook_task = spawn_hook_watch(hook_path, tx.clone(), ctx.clone(), Arc::clone(&self.seq));
+        let transcript_path = Arc::new(std::sync::Mutex::new(None));
+        let hook_task = spawn_hook_watch(
+            hook_path,
+            tx.clone(),
+            ctx.clone(),
+            Arc::clone(&self.seq),
+            Arc::clone(&transcript_path),
+        );
 
         *self.inner.lock().await = Some(PtyLive {
             client,
@@ -350,7 +368,7 @@ impl ClaudePtyDriver {
             native_store_id: spec.native_home.store_id.clone(),
             herdr_pin,
             herdr_session: session_name,
-            transcript_path: None,
+            transcript_path,
             events: tx,
             status_task: Some(status_task),
             hook_task: Some(hook_task),
@@ -589,9 +607,11 @@ fn spawn_hook_watch(
     tx: mpsc::Sender<Observation>,
     ctx: ObsCtx,
     seq: Arc<AtomicU64>,
+    transcript_slot: Arc<std::sync::Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        for _ in 0..50 {
+        // Live Claude startup (trust UI + SessionStart) can exceed 10s.
+        for _ in 0..900 {
             if let Ok(body) = tokio::fs::read_to_string(&path).await
                 && let Ok(value) = serde_json::from_str::<Value>(&body)
             {
@@ -603,6 +623,11 @@ fn spawn_hook_watch(
                     .get("transcript_path")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                if !transcript.is_empty()
+                    && let Ok(mut slot) = transcript_slot.lock()
+                {
+                    *slot = Some(transcript.to_string());
+                }
                 let mut related = BTreeMap::new();
                 if !transcript.is_empty() {
                     related.insert("transcriptPath".into(), transcript.to_string());
@@ -1271,12 +1296,17 @@ fn reject_bot_bypass(spec: &InstanceSpec) -> DriverResult<()> {
 }
 
 fn native_ref_for(live: &PtyLive) -> NativeRef {
-    let transcript = match &live.transcript_path {
+    let recorded = live
+        .transcript_path
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let transcript = match recorded {
         Some(path) => match Id::new("obj") {
             Ok(object_id) => Knowledge::Known {
                 value: TranscriptRef {
                     object_id,
-                    source_path: path.clone(),
+                    source_path: path,
                 },
             },
             Err(_) => Knowledge::Unknown {

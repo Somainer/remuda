@@ -27,7 +27,7 @@ mod web;
 mod ws;
 
 use crate::alerts::{BlockedWatch, Followers};
-use crate::auth::resolve_bootstrap;
+use crate::auth::{persist_listen, resolve_bootstrap};
 use crate::store::Store;
 use crate::ws::Bus;
 use axum::Router;
@@ -127,6 +127,7 @@ async fn spawn_inner(
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
+    persist_listen(&config.data_dir, addr)?;
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let shutdown = async {

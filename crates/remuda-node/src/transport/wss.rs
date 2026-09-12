@@ -29,6 +29,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const DEFAULT_JOURNAL_QUEUE: usize = 32;
 const DEFAULT_HUB_QUEUE: usize = 32;
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// Dial settings for [`WssLink`].
 #[derive(Debug, Clone)]
@@ -305,8 +306,17 @@ impl WssLink {
 
     /// Stop the session loop.
     pub async fn shutdown(self) {
-        let _ = self.control.send(Control::Shutdown).await;
-        let _ = self.task.await;
+        let Self {
+            control, mut task, ..
+        } = self;
+        let _ = control.send(Control::Shutdown).await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -937,6 +947,27 @@ mod tests {
         let _ = job.reply.send(Ok(json!({"seq":"2"})));
         second.await.expect("join").expect("second seq");
         assert_eq!(metrics.snapshot().journal_enqueued, 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_an_unresponsive_session_task() {
+        let (journal, _journal_rx) = journal_channel(1);
+        let (control, _control_rx) = mpsc::channel(1);
+        let (_hub_tx, hub_rx) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending());
+        let link = WssLink {
+            host_id: "hst_test".into(),
+            node_token: None,
+            hello: json!({}),
+            journal,
+            control,
+            hub_rx,
+            task,
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), link.shutdown())
+            .await
+            .expect("shutdown must remain bounded");
     }
 
     #[test]

@@ -1,0 +1,20 @@
+{"type":"keep_alive"}
+{"type":"control_cancel_request","request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}},"parent_tool_use_id":null,"session_id":"s","uuid":"u"}
+{"type":"system","subtype":"hook_progress","hook_id":"h1","hook_name":"PreToolUse","hook_event":"PreToolUse","stdout":"chunk","session_id":"s","uuid":"u"}
+{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"s"}
+{"type":"system","subtype":"status","status":"compacting","session_id":"s"}
+{"type":"tool_progress","tool_use_id":"toolu_1","elapsed_seconds":1}
+{"type":"prompt_suggestion","text":"try this"}
+{"type":"control_request","request_id":"mcp-1","request":{"subtype":"mcp_message","server_name":"demo","message":{"jsonrpc":"2.0","id":1,"method":"ping"}}}
+{"type":"control_request","request_id":"hook-1","request":{"subtype":"hook_callback","callback_id":"tool_approval","tool_use_id":"toolu_1","input":{"hook_event_name":"PreToolUse","tool_name":"Bash"}}}
+{"type":"control_request","request_id":"perm-paths","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"true"},"blocked_paths":["/tmp/a","/tmp/b"],"tool_use_id":"toolu_2"}}
+{"type":"result","subtype":"error_max_budget_usd","is_error":true,"errors":["budget"],"result":null,"session_id":"s"}
+{"_dir":"in","type":"control_request","request_id":"host-init","request":{"subtype":"initialize","hooks":{"PreToolUse":[{"matcher":"^Bash$","hookCallbackIds":["tool_approval"]}]},"perTaskStopAffordance":true}}
+{"_dir":"in","type":"control_request","request_id":"host-int","request":{"subtype":"interrupt","cancel_queued":true}}
+{"_dir":"in","type":"control_request","request_id":"host-mode","request":{"subtype":"set_permission_mode","mode":"acceptEdits"}}
+{"_dir":"in","type":"control_request","request_id":"host-model","request":{"subtype":"set_model","model":"haiku"}}
+{"_dir":"in","type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]},"uuid":"11111111-1111-4111-8111-111111111111"}
+{"type":"future_frame","hello":true}
+{"type":"system","subtype":"brand_new_subtype","x":1}
+{"type":"control_request","request_id":"x","request":{"subtype":"not_a_real_subtype","foo":1}}

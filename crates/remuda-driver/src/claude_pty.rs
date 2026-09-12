@@ -952,9 +952,11 @@ pub(crate) fn prompt_text(input: &DriverInput) -> DriverResult<String> {
         DriverInput::Steer(_) => Err(DriverError::CapabilityUnsupported(
             "claude-pty does not accept structured steer".into(),
         )),
-        DriverInput::ModelSwitch(_) => Err(DriverError::CapabilityUnknown(
-            "claude-pty model-switch is native TUI only".into(),
-        )),
+        DriverInput::ModelSwitch(switch) => Err(DriverError::CapabilityUnsupported(format!(
+            "claude-pty has no runtime model/effort command; requested model={} effort={}",
+            switch.model_id,
+            switch.effort.as_deref().unwrap_or("-"),
+        ))),
     }
 }
 

@@ -32,6 +32,8 @@ pub const METHOD_RUNTIME_HEARTBEAT: &str = "runtime.heartbeat";
 pub const METHOD_INSTANCE_CREATE: &str = "instance.create";
 /// Submit a prompt to an Instance.
 pub const METHOD_INSTANCE_SEND: &str = "instance.send";
+/// Switch model / effort on a live Instance.
+pub const METHOD_INSTANCE_CONFIGURE: &str = "instance.configure";
 /// Cancel the current run.
 pub const METHOD_INSTANCE_CANCEL: &str = "instance.cancel";
 /// Answer a pending interaction (`instance.respond`).
@@ -122,6 +124,8 @@ pub enum HubNodeMethod {
     InstanceCreate,
     /// [`METHOD_INSTANCE_SEND`].
     InstanceSend,
+    /// [`METHOD_INSTANCE_CONFIGURE`].
+    InstanceConfigure,
     /// [`METHOD_INSTANCE_CANCEL`].
     InstanceCancel,
     /// [`METHOD_INSTANCE_RESPOND`].
@@ -554,6 +558,7 @@ impl HubNodeMethod {
             Self::RuntimeHeartbeat => METHOD_RUNTIME_HEARTBEAT,
             Self::InstanceCreate => METHOD_INSTANCE_CREATE,
             Self::InstanceSend => METHOD_INSTANCE_SEND,
+            Self::InstanceConfigure => METHOD_INSTANCE_CONFIGURE,
             Self::InstanceCancel => METHOD_INSTANCE_CANCEL,
             Self::InstanceRespond => METHOD_INSTANCE_RESPOND,
             Self::InteractionRespond => METHOD_INTERACTION_RESPOND,
@@ -577,6 +582,7 @@ impl HubNodeMethod {
             METHOD_RUNTIME_HEARTBEAT => Self::RuntimeHeartbeat,
             METHOD_INSTANCE_CREATE => Self::InstanceCreate,
             METHOD_INSTANCE_SEND => Self::InstanceSend,
+            METHOD_INSTANCE_CONFIGURE => Self::InstanceConfigure,
             METHOD_INSTANCE_CANCEL => Self::InstanceCancel,
             METHOD_INSTANCE_RESPOND => Self::InstanceRespond,
             METHOD_INTERACTION_RESPOND => Self::InteractionRespond,
@@ -609,6 +615,7 @@ impl HubNodeMethod {
             self,
             Self::InstanceCreate
                 | Self::InstanceSend
+                | Self::InstanceConfigure
                 | Self::InstanceCancel
                 | Self::InstanceRespond
                 | Self::InteractionRespond

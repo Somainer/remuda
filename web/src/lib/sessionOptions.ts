@@ -33,6 +33,14 @@ export function ptyYoloHint(kind: keyof typeof PTY_YOLO_FLAGS): string {
   return `generic-pty · Node applies ${PTY_YOLO_FLAGS[kind]} (server-side yolo preset)`;
 }
 
+/** Short chip label for the read-only pty permission control. */
+export function ptyYoloChipLabel(kind: string): string {
+  if (kind === "grok") return "always-approve";
+  if (kind === "codex") return "bypass";
+  if (kind === "agy") return "bypass";
+  return "skip-permissions";
+}
+
 export function normalizePermissionMode(value: string | undefined): PermissionModeId {
   if (value === "bypassPermissions") return "bypassPermissions";
   if (value === "dontAsk") return "dontAsk";

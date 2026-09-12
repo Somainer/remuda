@@ -7,6 +7,7 @@ import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { contextPercent } from "../features/session/effort";
+import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import { useHostViews } from "../features/hosts";
 import { Transcript } from "../features/session/Transcript";
 import { TaskTrack } from "../features/session/TaskTrack";
@@ -273,7 +274,9 @@ export function SessionPage({
           mobile={mobile}
           sending={sending}
           disabled={status === "exited" || pending.length > 0}
-          permissionMode={hubStore.permissionModeOf(instance.id)}
+          permissionMode={
+            genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
+          }
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
           effort={hubStore.effortOf(instance.id, instance.kind)}

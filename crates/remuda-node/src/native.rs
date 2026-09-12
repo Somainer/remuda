@@ -397,6 +397,45 @@ impl Driver for NativeAdapter {
                         .await
                         .map_err(map_driver_error)?;
                 }
+                DriverRequest::Configure {
+                    model,
+                    effort,
+                    effort_index,
+                } => {
+                    let switch = remuda_protocol::ModelSwitchInput {
+                        model_id: model.clone().unwrap_or_default(),
+                        effective: remuda_protocol::ModelEffective::NextTurn,
+                        effort: effort.clone(),
+                    };
+                    let applied = format!(
+                        "model={} effort={} index={}",
+                        model.as_deref().unwrap_or("-"),
+                        effort.as_deref().unwrap_or("-"),
+                        effort_index
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    );
+                    match self
+                        .native
+                        .send(remuda_protocol::DriverInput::ModelSwitch(Box::new(switch)))
+                        .await
+                    {
+                        Ok(_) => {
+                            return Ok(vec![crate::driver::DriverEmission::NativeLifecycle {
+                                name: "instance.configure".into(),
+                                status: format!("applied {applied}"),
+                                severity: remuda_protocol::Severity::Info,
+                            }]);
+                        }
+                        Err(error) => {
+                            return Ok(vec![crate::driver::DriverEmission::NativeLifecycle {
+                                name: "instance.configure".into(),
+                                status: format!("accepted-noop: {error}"),
+                                severity: remuda_protocol::Severity::Info,
+                            }]);
+                        }
+                    }
+                }
             }
             Ok(Vec::new())
         })

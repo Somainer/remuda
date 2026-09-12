@@ -17,6 +17,16 @@
   gap: 12px;
   padding: 0 20px;
   border-bottom: 1px solid var(--line);
+  flex-wrap: nowrap;
+}
+
+.headMeta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  overflow: hidden;
 }
 
 .title {
@@ -24,6 +34,10 @@
   font-weight: 600;
   margin: 0;
   color: var(--paper);
+  flex: none;
+  flex-shrink: 0;
+  white-space: nowrap;
+  word-break: keep-all;
 }
 
 .count {
@@ -41,6 +55,8 @@
   color: var(--paper);
   font-size: 13px;
   padding: 0 13px;
+  flex: none;
+  white-space: nowrap;
 }
 
 .toggle {
@@ -391,6 +407,11 @@
   .head {
     height: 52px;
     padding: 0 16px;
+    flex-wrap: nowrap;
+  }
+
+  .headMeta {
+    min-width: 0;
   }
 
   .title {

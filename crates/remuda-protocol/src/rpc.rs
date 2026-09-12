@@ -363,6 +363,16 @@ pub struct InstanceSendParams {
     pub completion_scope: CompletionScope,
 }
 
+/// Native effort tier stored on `instance.configure`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EffortSelection {
+    /// Index into the harness-native table.
+    pub index: u32,
+    /// Native tier name (`think`, `high`, `max`, …).
+    pub name: String,
+}
+
 /// InstanceConfigureParams; `protocol.md` §7.2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -370,9 +380,21 @@ pub struct InstanceConfigureParams {
     /// `instance_id`; protocol §7.2.
     pub instance_id: InstanceId,
     /// `model_id`; protocol §7.2.
+    #[serde(default)]
     pub model_id: String,
     /// `effective`; protocol §7.2.
+    #[serde(default = "default_model_effective")]
     pub effective: ModelEffective,
+    /// Native effort tier (index + name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortSelection>,
+    /// Optional permission mode for print drivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+}
+
+fn default_model_effective() -> ModelEffective {
+    ModelEffective::NextTurn
 }
 
 /// ForkBoundary; `protocol.md` §7.2.

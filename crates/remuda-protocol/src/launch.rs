@@ -209,6 +209,9 @@ pub struct ModelSwitchInput {
     pub model_id: String,
     /// `effective`; protocol §3.1.
     pub effective: ModelEffective,
+    /// Native effort tier name when the driver supports a runtime switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// DriverInput; `protocol.md` §3.1.

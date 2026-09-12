@@ -660,6 +660,13 @@ export type DriverInput = (PromptInput & ({
 /** DriverKind wire values; `protocol.md` §3.1. */
 export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
 
+/** Native effort tier stored on `instance.configure`. */
+export type EffortSelection = ({
+  "index": (number);
+  "name": (string);
+  [key: string]: unknown;
+});
+
 /** ElicitationAction wire values; `protocol.md` §5.4. */
 export type ElicitationAction = ("accept" | "decline" | "cancel");
 
@@ -1135,8 +1142,10 @@ export type InstanceCloseParams = ({
 /** InstanceConfigureParams; `protocol.md` §7.2. */
 export type InstanceConfigureParams = ({
   "effective": ModelEffective;
+  "effort"?: (EffortSelection | (null));
   "instanceId": InstanceId;
   "modelId": (string);
+  "permissionMode"?: (string | null);
   [key: string]: unknown;
 });
 
@@ -2080,6 +2089,7 @@ export type ModelEffective = ("next-turn");
 /** ModelSwitchInput; `protocol.md` §3.1. */
 export type ModelSwitchInput = ({
   "effective": ModelEffective;
+  "effort"?: (string | null);
   "modelId": (string);
   [key: string]: unknown;
 });

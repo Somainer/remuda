@@ -58,4 +58,24 @@ describe("Composer shortcuts", () => {
     await user.click(screen.getByTestId("effort-tier-ultracode"));
     expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "ultracode", kind: "claude" });
   });
+
+  it("shows a read-only yolo permission chip for grok pty", () => {
+    render(
+      <Composer
+        instanceId="ins_grok"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="grok"
+        model="grok-4"
+        effort={effortAt("grok", 1)}
+        permissionMode="always-approve"
+      />,
+    );
+    const chip = screen.getByTestId("permission-chip");
+    expect(chip).toHaveAttribute("data-readonly", "1");
+    expect(chip).toHaveTextContent("always-approve");
+    expect(screen.getByTestId("harness-chip")).toHaveTextContent(/Grok/i);
+    expect(screen.getByTestId("model-effort-chip")).toBeVisible();
+    expect(screen.getByTestId("context-chip")).toBeVisible();
+  });
 });

@@ -5,6 +5,7 @@ import {
   YOLO_HINT,
   PTY_YOLO_FLAGS,
   ptyYoloHint,
+  ptyYoloChipLabel,
   claudeHostAuth,
   claudeProviderHint,
   normalizeDelegation,
@@ -51,5 +52,8 @@ describe("sessionOptions", () => {
     expect(PTY_YOLO_FLAGS.grok).toBe("--always-approve");
     expect(ptyYoloHint("grok")).toContain("--always-approve");
     expect(ptyYoloHint("codex")).toContain("generic-pty");
+    expect(ptyYoloChipLabel("grok")).toBe("always-approve");
+    expect(ptyYoloChipLabel("codex")).toBe("bypass");
+    expect(ptyYoloChipLabel("agy")).toBe("bypass");
   });
 });

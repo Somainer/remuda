@@ -185,4 +185,30 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("new-session-effort-max")).toHaveAttribute("data-selected", "1");
     await expect(page.getByTestId("new-session-effort-max")).toHaveAttribute("data-ember", "1");
   });
+
+  test("effort selection persists after reload", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    await page.getByTestId("model-effort-chip").click();
+    await page.getByTestId("effort-tier-ultracode").click();
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+    await page.reload();
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+    await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
+  });
+
+  test("grok pty shows four chips including a read-only yolo permission", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "Grok 会话").click();
+    await expect(page.getByTestId("session-page")).toBeVisible();
+    const structured = page.getByRole("link", { name: "结构" });
+    await expect(structured).toBeVisible();
+    await structured.click();
+    await expect(page.getByTestId("composer-bar")).toBeVisible();
+    await expect(page.getByTestId("harness-chip")).toBeVisible();
+    await expect(page.getByTestId("model-effort-chip")).toBeVisible();
+    await expect(page.getByTestId("context-chip")).toBeVisible();
+    await expect(page.getByTestId("permission-chip")).toHaveAttribute("data-readonly", "1");
+    await expect(page.getByTestId("permission-chip")).toContainText(/always-approve/);
+  });
 });

@@ -888,7 +888,10 @@ fn finish_instance_operation(
                 "explicit-close",
             )?;
         }
-        DriverRequest::Send { .. } | DriverRequest::Cancel | DriverRequest::SendKeys { .. } => {
+        DriverRequest::Send { .. }
+        | DriverRequest::Cancel
+        | DriverRequest::SendKeys { .. }
+        | DriverRequest::Configure { .. } => {
             store.set_instance_state(
                 instance_id,
                 None,
@@ -1006,6 +1009,15 @@ fn command_parts(
                 false,
             ))
         }
+        CommandAction::Configure => Ok((
+            CommandOperation::InstanceConfigure,
+            DriverRequest::Configure {
+                model: request.model.clone(),
+                effort: request.effort_name.clone(),
+                effort_index: request.effort_index,
+            },
+            false,
+        )),
     }
 }
 
@@ -1641,6 +1653,100 @@ mod tests {
         })
         .await
         .expect("fake-driver-keys lifecycle");
+    }
+
+    #[tokio::test]
+    async fn instance_configure_is_forwarded_and_applied_on_fake_claude() {
+        let node = DevNode::new(&crate::DevServerConfig::loopback(0)).expect("node");
+        let created = node
+            .create_instance(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "prompt": ""
+                }))
+                .expect("request"),
+            )
+            .await
+            .expect("create");
+        let result = crate::transport::hubnode::dispatch_method(
+            &node,
+            remuda_protocol::hubnode::METHOD_INSTANCE_CONFIGURE,
+            serde_json::json!({
+                "instanceId": created.instance.meta.id,
+                "model": "opus",
+                "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
+            }),
+        )
+        .await
+        .expect("instance.configure");
+        assert!(result.get("error").is_none(), "{result}");
+        let command_id = result["command"]["commandId"]
+            .as_str()
+            .expect("commandId")
+            .to_owned();
+        let command_id = CommandId::try_from(command_id).expect("command id");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let command = node.get_command(&command_id).expect("command");
+                if command.operation == CommandOperation::InstanceConfigure
+                    && command.state == CommandState::Settled
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("configure command settled");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let instance = node
+                    .get_instance(&created.instance.meta.id)
+                    .expect("instance");
+                let page = node
+                    .read_journal(&instance.journal_id, None, 64)
+                    .expect("journal");
+                let has_command = page.events.iter().any(|event| {
+                    let JournalEvent::Instance(observation) = event else {
+                        return false;
+                    };
+                    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+                        return false;
+                    };
+                    let LifecyclePayload::Entity(entity) = payload.as_ref() else {
+                        return false;
+                    };
+                    matches!(
+                        entity.entity_value,
+                        LifecycleEntity::Command(ref command)
+                            if command.operation == CommandOperation::InstanceConfigure
+                    )
+                });
+                let has_apply = page.events.iter().any(|event| {
+                    let JournalEvent::Instance(observation) = event else {
+                        return false;
+                    };
+                    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+                        return false;
+                    };
+                    let LifecyclePayload::Native(native) = payload.as_ref() else {
+                        return false;
+                    };
+                    native.native_name == "instance.configure"
+                        && native.status
+                            == Knowledge::Known {
+                                value: "applied model=opus effort=ultracode index=3".into(),
+                            }
+                });
+                if has_command && has_apply {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("configure command entity and driver apply");
     }
 
     #[test]

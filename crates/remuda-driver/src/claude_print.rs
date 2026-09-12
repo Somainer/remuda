@@ -508,10 +508,12 @@ impl Driver for ClaudePrintDriver {
             }
             DriverInput::Steer(_) => Err(DriverError::CapabilityUnknown("steer".into())),
             DriverInput::ModelSwitch(switch) => {
-                live.process
-                    .set_model(Some(switch.model_id.clone()))
-                    .await
-                    .map_err(map_wire)?;
+                if !switch.model_id.is_empty() {
+                    live.process
+                        .set_model(Some(switch.model_id.clone()))
+                        .await
+                        .map_err(map_wire)?;
+                }
                 Ok(DriverAck::transport_written())
             }
         }

@@ -663,6 +663,7 @@ impl Store {
                     connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
                  WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
                     SELECT id FROM hosts WHERE state != 'online' AND
+                    (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                     (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
                  )",
                 params![now_rfc3339(), grace_ms.min(i64::MAX as u64) as i64],

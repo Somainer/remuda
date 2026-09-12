@@ -18,7 +18,15 @@ async fn assert_bootstrap_cannot_claim_ssh_host(hub: &RunningHub, id: &str) {
         "Authorization",
         format!("Bearer {}", hub.bootstrap_token).parse().unwrap(),
     );
-    let (mut node, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let mut node = match tokio_tungstenite::connect_async(request).await {
+        Ok((node, _)) => node,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+            if matches!(response.status().as_u16(), 401 | 403) =>
+        {
+            return;
+        }
+        Err(error) => panic!("unexpected Node upgrade failure: {error}"),
+    };
     node.send(Message::Text(
         json!({"jsonrpc":"2.0","id":"claim","method":"node.hello","params":{"hostId":id}})
             .to_string()
@@ -329,4 +337,113 @@ async fn invalid_and_missing_binary_report_actionable_errors() {
     );
     hub.shutdown().await;
     let _ = std::fs::remove_dir_all(format!("/tmp/remuda-ssh-{id}"));
+}
+
+#[tokio::test]
+async fn bridge_loss_preserves_instance_then_replays_from_hub_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("node");
+    executable(&fixture, include_str!("fixtures/ssh/fake-node.py"));
+    let mut config = HubConfig::for_test(dir.path().join("hub"));
+    config.ssh_hosts.ssh_binary = fake_ssh(dir.path(), &fixture);
+    config.host_lost_grace_ms = 25;
+    let hub = remuda_hub::spawn(config).await.unwrap();
+    let token = login(&hub).await;
+    let (status, added) = request(
+        hub.addr,
+        "POST",
+        "/v1/hosts/ssh",
+        &token,
+        json!({"target":"resume-node","label":"durable bridge test"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{added}");
+    let id = added["id"].as_str().unwrap();
+    let remote = PathBuf::from(format!("/tmp/remuda-ssh-{id}"));
+    wait_host(&hub, &token, id, |host| host["online"] == true).await;
+    let (status, created) = request(hub.addr, "POST", "/v1/instances", &token,
+        json!({"hostId":id,"kind":"codex","driver":"codex-appserver","prompt":"fixture completion"})).await;
+    assert_eq!(status, 200, "{created}");
+    let instance_id = created["instance"]["instanceId"].as_str().unwrap();
+    let journal_path = format!("/v1/instances/{instance_id}/journal");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, journal) = request(hub.addr, "GET", &journal_path, &token, Value::Null).await;
+            if journal["durableSeq"] == "1" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(remote.join("fixture-pause-bridge"), "").unwrap();
+    let pid = fixture_pid(id);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_host(&hub, &token, id, |host| host["state"] == "offline-alive").await;
+    // This spans the Hub's one-second reaper tick and far exceeds lost grace.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        std::fs::read_to_string(remote.join("fixture-DONE")).unwrap(),
+        "DONE\n"
+    );
+    let (_, disconnected) = request(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &token,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(disconnected["lifecycle"], "running", "{disconnected}");
+    assert_eq!(disconnected["connectivity"], "disconnected");
+    assert_ne!(disconnected["lastError"], "host-lost");
+    std::fs::remove_file(remote.join("fixture-pause-bridge")).unwrap();
+    wait_host(&hub, &token, id, |host| {
+        host["online"] == true && host["lastError"].is_null()
+    })
+    .await;
+    let journal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, journal) = request(hub.addr, "GET", &journal_path, &token, Value::Null).await;
+            if journal["durableSeq"] == "2" {
+                break journal;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(journal["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        journal["events"][1]["event"]["payload"]["reasonCode"],
+        "fixture-completed"
+    );
+    let watermarks: Value = serde_json::from_str(
+        &std::fs::read_to_string(remote.join("fixture-watermarks.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(watermarks[0]["instanceId"], instance_id);
+    assert_eq!(
+        watermarks[0]["durableSeq"], "1",
+        "hello snapshot must not advance Hub's acked seq"
+    );
+    let (_, complete) = request(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &token,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(complete["lifecycle"], "exited");
+    assert_eq!(complete["durableSeq"], "2");
+    hub.shutdown().await;
+    std::fs::remove_dir_all(remote).unwrap();
 }

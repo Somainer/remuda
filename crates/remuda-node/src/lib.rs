@@ -2,6 +2,8 @@
 
 mod carrier;
 mod config;
+#[cfg(unix)]
+mod daemon;
 mod diagnostics;
 mod driver;
 mod enroll;
@@ -29,6 +31,12 @@ pub use carrier::{
     OutboundWssCarrier, StdioCarrier,
 };
 pub use config::{DEFAULT_DEV_PORT, DevServerConfig};
+#[cfg(unix)]
+pub use daemon::{
+    DaemonControl, DaemonListener, DaemonWssLease, bind_daemon, connect_daemon_bridge,
+    daemon_is_running, daemon_socket_path, run_daemon_runtime_controlled,
+    run_daemon_runtime_listener, run_daemon_runtime_opts,
+};
 pub use diagnostics::{DoctorCheck, DoctorContext, DoctorReport, doctor_port, doctor_snapshot};
 pub use driver::{
     Driver, DriverEmission, DriverError, DriverFactory, DriverFuture, DriverLaunch, DriverRegistry,

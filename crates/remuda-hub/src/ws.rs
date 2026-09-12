@@ -348,6 +348,15 @@ pub(crate) async fn handle_node_method(
                     params.get("capabilities").cloned(),
                 )
                 .await?;
+            if params["daemon"] == true {
+                state
+                    .store
+                    .reconcile_daemon_instances(
+                        host.host_id.clone(),
+                        params["instances"].as_array().cloned().unwrap_or_default(),
+                    )
+                    .await?;
+            }
             let generation = state
                 .nodes
                 .insert(

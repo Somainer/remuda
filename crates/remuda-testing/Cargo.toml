@@ -15,17 +15,27 @@ path = "src/bin/fake-claude.rs"
 name = "fake-herdr"
 path = "src/bin/fake-herdr.rs"
 
+[[bin]]
+name = "m0-print-stub"
+path = "src/bin/m0-print-stub.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+remuda-driver.workspace = true
 remuda-herdr.workspace = true
+remuda-journal.workspace = true
+remuda-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

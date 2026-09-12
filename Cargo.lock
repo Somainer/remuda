@@ -3116,16 +3116,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "clap",
  "remuda-driver",
  "remuda-herdr",
  "remuda-journal",
  "remuda-protocol",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

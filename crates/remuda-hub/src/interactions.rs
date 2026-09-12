@@ -150,7 +150,10 @@ pub async fn answer_interaction(
     Json(body): Json<AnswerBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    let device = require_device(&state.store, &headers).await?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
+    if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human {
+        return Err(HubError::Forbidden);
+    }
     let interaction_id =
         InteractionId::try_from(id).map_err(|err| HubError::BadRequest(err.to_string()))?;
     let command_id = match body.command_id {

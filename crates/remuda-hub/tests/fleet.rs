@@ -404,6 +404,31 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
     }
     assert_eq!(made.len(), 3);
 
+    // All-target broadcasts require operator confirmation and are never an
+    // instance-origin operation, even when confirmation is supplied.
+    for (agent, confirm) in [(false, false), (true, false), (true, true)] {
+        let mut caller = auth.to_vec();
+        if agent {
+            caller.push(("x-remuda-instance-id", made[0].as_str()));
+        }
+        let (status, _, error) = http(
+            hub.addr,
+            "POST",
+            "/v1/fleet/broadcast",
+            &caller,
+            Some(
+                &json!({"all":true, "confirm":confirm, "payload":{"text":"forbidden"}}).to_string(),
+            ),
+        )
+        .await?;
+        assert_eq!(status, 400, "{error}");
+        assert!(error.contains(if agent {
+            "forbidden from Agent origin"
+        } else {
+            "confirm=true"
+        }));
+    }
+
     // Selection is required: neither `all` nor a filter is a 400.
     let (status, _, err) = http(
         hub.addr,
@@ -421,14 +446,14 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
         "POST",
         "/v1/fleet/broadcast",
         &auth,
-        Some(&json!({ "all": true, "operation": "instance.close" }).to_string()),
+        Some(&json!({ "all": true, "confirm": true, "operation": "instance.close" }).to_string()),
     )
     .await?;
     assert_eq!(status, 400, "{err}");
 
     // all=true reaches every instance on both hosts.
     let body = json!({
-        "all": true,
+        "all": true, "confirm": true,
         "operation": "instance.send",
         "payload": { "input": { "type": "prompt", "blocks": [{ "type": "text", "text": "PAUSE" }] } }
     })
@@ -451,7 +476,9 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
     }
 
     // A kind filter narrows to the two claude instances; codex is skipped.
-    let body = json!({ "all": true, "kinds": ["claude"], "payload": { "text": "k" } }).to_string();
+    let body =
+        json!({ "all": true, "confirm": true, "kinds": ["claude"], "payload": { "text": "k" } })
+            .to_string();
     let (status, _, kinds) =
         http(hub.addr, "POST", "/v1/fleet/broadcast", &auth, Some(&body)).await?;
     assert_eq!(status, 200, "{kinds}");
@@ -504,7 +531,7 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
 
     // tty.write is the keys broadcast.
     let body = json!({
-        "all": true,
+        "all": true, "confirm": true,
         "operation": "tty.write",
         "payload": { "keys": ["enter"], "dataBase64": "DQ==" }
     })
@@ -518,7 +545,7 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
 
     // Same idempotency key twice: the second call replays the same commands.
     let body = json!({
-        "all": true,
+        "all": true, "confirm": true,
         "idempotencyKey": "pause-round-1",
         "payload": { "text": "once" }
     })

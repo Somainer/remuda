@@ -10,6 +10,7 @@
 #![allow(missing_docs)] // handler types; public API is documented below.
 
 pub mod agent_approvals;
+mod agent_scope;
 mod alerts;
 mod auth;
 mod config;
@@ -299,11 +300,16 @@ pub fn router(state: AppState) -> Router {
         .merge(placement::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
-        .merge(providers::routes());
+        .merge(providers::routes())
+        .merge(agent_scope::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }
     app.fallback(static_fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            agent_scope::restrict_agent_routes,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             rate_limit::limit_auth_attempts,

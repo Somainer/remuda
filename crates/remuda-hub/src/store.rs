@@ -102,6 +102,10 @@ pub struct Device {
     pub id: String,
     /// Caller-supplied label.
     pub name: String,
+    /// Authenticated device kind: human, bot, or agent. Unknown fails closed.
+    pub kind: String,
+    /// Agent credentials are bound to one instance.
+    pub instance_id: Option<String>,
 }
 
 /// Host index row (Hub projection).
@@ -166,6 +170,8 @@ fn default_provider_scope() -> String {
 pub struct InstanceRecord {
     /// `ins_…`.
     pub instance_id: String,
+    /// Immutable creator instance, recorded by the Hub at create time.
+    pub parent_instance_id: Option<String>,
     /// Owning host.
     pub host_id: String,
     /// Optional workspace.
@@ -526,15 +532,28 @@ impl Store {
         token_hash: String,
         token_prefix: String,
     ) -> Result<Device, StoreError> {
+        self.insert_device_as(name, token_hash, token_prefix, "human".into(), None)
+            .await
+    }
+
+    /// Mint a credential with server-selected scope (never from request payload origin).
+    pub async fn insert_device_as(
+        &self,
+        name: String,
+        token_hash: String,
+        token_prefix: String,
+        kind: String,
+        instance_id: Option<String>,
+    ) -> Result<Device, StoreError> {
         self.run(move |conn| {
             let id = new_id("dev").map_err(|e| StoreError::Id(e.to_string()))?;
             let now = now_rfc3339();
             conn.execute(
-                "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, token_prefix)
-                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
-                params![id, name, token_hash, now, token_prefix],
+                "INSERT INTO devices (id, name, token_hash, created_at, last_seen_at, token_prefix, kind, instance_id)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7)",
+                params![id, name, token_hash, now, token_prefix, kind, instance_id],
             )?;
-            Ok(Device { id, name })
+            Ok(Device { id, name, kind, instance_id })
         })
         .await
     }
@@ -557,25 +576,27 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             };
             let mut candidate = conn.query_row(
-                "SELECT id, name, token_hash FROM devices WHERE token_prefix = ?1",
+                "SELECT id, name, token_hash, kind, instance_id FROM devices WHERE token_prefix = ?1",
                 params![prefix], read_row,
             ).optional()?;
             if candidate.is_none() && let Some(id) = legacy_device_id {
                 candidate = conn.query_row(
-                    "SELECT id, name, token_hash FROM devices WHERE id = ?1 AND token_prefix IS NULL",
+                    "SELECT id, name, token_hash, kind, instance_id FROM devices WHERE id = ?1 AND token_prefix IS NULL",
                     params![id], read_row,
                 ).optional()?;
             }
-            let Some((id, name, hash)) = candidate else { return Ok(None); };
+            let Some((id, name, hash, kind, instance_id)) = candidate else { return Ok(None); };
             if !verify(&token, &hash) { return Ok(None); }
             conn.execute(
                 "UPDATE devices SET last_seen_at = ?1, token_prefix = ?2 WHERE id = ?3",
                 params![now_rfc3339(), prefix, id],
             )?;
-            Ok(Some(Device { id, name }))
+            Ok(Some(Device { id, name, kind, instance_id }))
         })
         .await
     }
@@ -1509,11 +1530,14 @@ impl Store {
     /// All paired devices (no token hashes).
     pub async fn list_devices(&self) -> Result<Vec<Device>, StoreError> {
         self.run(|conn| {
-            let mut stmt = conn.prepare("SELECT id, name FROM devices ORDER BY created_at")?;
+            let mut stmt = conn
+                .prepare("SELECT id, name, kind, instance_id FROM devices ORDER BY created_at")?;
             let rows = stmt.query_map([], |row| {
                 Ok(Device {
                     id: row.get(0)?,
                     name: row.get(1)?,
+                    kind: row.get(2)?,
+                    instance_id: row.get(3)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -2039,6 +2063,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         ",
     )?;
+    ensure_column(&conn, "devices", "kind", "TEXT NOT NULL DEFAULT 'human'")?;
+    ensure_column(&conn, "devices", "instance_id", "TEXT")?;
     ensure_column(&conn, "hosts", "labels_json", "TEXT NOT NULL DEFAULT '[]'")?;
     ensure_column(&conn, "hosts", "herdr_json", "TEXT")?;
     ensure_column(&conn, "hosts", "resources_json", "TEXT")?;
@@ -3048,6 +3074,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 });
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
+                parent_instance_id: spec
+                    .get("parentInstanceId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 host_id: row.get(1)?,
                 workspace_id,
                 kind: row.get(3)?,

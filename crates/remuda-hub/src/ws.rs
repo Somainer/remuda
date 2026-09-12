@@ -173,6 +173,9 @@ pub async fn follow_socket(
     // Browsers send the HttpOnly device cookie with the same-origin handshake.
     // Native clients may use Authorization; URL parameters never authenticate.
     let device = require_device(&state.store, &headers).await?;
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        return Err(HubError::Forbidden);
+    }
     let filter = query.instance_id;
     let tty = query.tty == Some(1);
     Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device.id, tty)))

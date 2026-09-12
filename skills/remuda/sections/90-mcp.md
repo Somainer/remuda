@@ -12,6 +12,7 @@
 | `instance keys` | `remuda_instance_keys` (`keys: []`) |
 | `instance stop` / `rm` | `remuda_instance_stop` (`scope`) / `remuda_instance_rm` |
 | `fleet run` / `fleet send` | `remuda_fleet_run` / `remuda_fleet_send` |
+| `fleet keys` | `remuda_fleet_keys` (`keys: []`, `all` / `labels` / `hosts` / `kinds`) |
 
 Arguments are camelCase (`timeoutMs`, `promptFile`, `workspaceId`,
 `afterSeq`). Claude Code exposes them as `mcp__remuda__<tool>`. Paths in

@@ -14,7 +14,7 @@ use std::sync::Arc;
 async fn file_store_round_trip_json_and_hides_debug() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileSecretStore::open(dir.path()).unwrap();
-    let value = "sk-file-store-secret-value";
+    let value = "sk-fake-file-store-value";
     store.put("anthropic", value.as_bytes()).unwrap();
     let secret = store
         .resolve(&SecretRef::parse("store:anthropic").unwrap())
@@ -72,7 +72,7 @@ async fn tampered_ciphertext_fails_closed() {
 async fn token_broker_allowlist_and_audit_omit_secret() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileSecretStore::open(dir.path()).unwrap();
-    let value = "sk-broker-secret-value";
+    let value = "sk-fake-broker-value";
     store.put("gateway", value.as_bytes()).unwrap();
     let audit = dir.path().join("audit.jsonl");
     let broker = TokenBroker::new(Arc::new(store), audit.clone());

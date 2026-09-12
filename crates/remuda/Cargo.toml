@@ -46,5 +46,5 @@ remuda-hub.workspace = true
 remuda-protocol.workspace = true
 serde_json.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process", "test-util"] }
 tokio-tungstenite.workspace = true

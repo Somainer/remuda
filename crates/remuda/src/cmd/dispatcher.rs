@@ -535,17 +535,35 @@ mod tests {
             .push(("REMUDA_TEST_LARK_UNREADY".into(), "1".into()));
         let dispatcher =
             open_dispatcher(&settings, dir.path(), FakeInstanceApi::default()).expect("dispatcher");
-        let error = supervise(
+        let startup_timeout = Duration::from_secs(60);
+        let task = tokio::spawn(supervise(
             dispatcher,
             consume,
-            Duration::from_secs(3),
+            startup_timeout,
             Duration::from_secs(5),
             Duration::from_secs(1),
             std::future::pending(),
-        )
-        .await
-        .err()
-        .expect("startup failure");
+        ));
+        // Process startup uses wall time; expire the deadline only after both
+        // fixtures have installed their signal handlers, without sending ready.
+        for key in [
+            remuda_feishu::EVENT_IM_RECEIVE,
+            remuda_feishu::EVENT_CARD_ACTION,
+        ] {
+            wait_for(&dir.path().join(format!("{key}.starts"))).await;
+        }
+        assert!(
+            !task.is_finished(),
+            "consume must still be waiting for ready"
+        );
+        tokio::time::pause();
+        tokio::time::advance(startup_timeout).await;
+        tokio::time::resume();
+        let error = task
+            .await
+            .expect("supervisor task")
+            .err()
+            .expect("startup failure");
         assert!(error.to_string().contains("startup timed out"));
         assert_terminated(dir.path());
     }

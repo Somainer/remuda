@@ -6,6 +6,7 @@ import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
 import type { Workspace } from "../types/workspace";
 import { api, observationText, type InstanceCreateSpec } from "./api";
+import { doneFromLines, lastLines } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
@@ -55,6 +56,7 @@ export type HubState = {
   permissionMode: Record<string, string>;
   compact: boolean;
   answering: Record<string, true>;
+  screens: Record<string, { lines: string[]; done: boolean }>;
 };
 
 const initial: HubState = {
@@ -76,6 +78,7 @@ const initial: HubState = {
   permissionMode: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
+  screens: {},
 };
 
 type Listener = () => void;
@@ -352,6 +355,7 @@ class HubStore {
       await this.catchup(instanceId);
       const events = this.state.events[instanceId] ?? [];
       this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
+      await this.refreshScreen(instanceId).catch(() => undefined);
     } catch {
       this.emit({
         bubbles: this.state.bubbles.map((b) => (b.id === localId ? { ...b, state: "unknown" } : b)),
@@ -368,6 +372,33 @@ class HubStore {
   async close(instanceId: Id) {
     await api.instanceClose(instanceId);
     await this.refresh();
+  }
+
+  async sendKeys(instanceId: Id, key: "enter" | "esc") {
+    await api.instanceKeys(instanceId, key);
+    await this.refreshScreen(instanceId);
+  }
+
+  async broadcast(instanceIds: Id[], prompt: string) {
+    const text = prompt.trim();
+    if (!text || !instanceIds.length) return;
+    await Promise.all(instanceIds.map((id) => this.send(id, text)));
+    this.toast(`已群发 ${instanceIds.length} 个实例`);
+  }
+
+  async refreshScreen(instanceId: Id) {
+    const read = await api.screenRead(instanceId, 3);
+    const lines = lastLines(read.lines, 3);
+    this.emit({
+      screens: {
+        ...this.state.screens,
+        [instanceId]: { lines, done: doneFromLines(read.lines) },
+      },
+    });
+  }
+
+  async refreshScreens(instanceIds: Id[]) {
+    await Promise.all(instanceIds.map((id) => this.refreshScreen(id)));
   }
 
   async resume(instanceId: Id) {

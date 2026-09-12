@@ -24,6 +24,14 @@ function cap(state: Capability["state"], reason: string): Capability {
   return { state, scope: [], reasonCode: reason, prerequisites: [], evidence: [] };
 }
 
+export function ptyCapabilities(driverKind: DriverKind = "generic-pty"): CapabilitySnapshot {
+  const snapshot = printCapabilities();
+  snapshot.driverKind = driverKind;
+  snapshot.capabilities["tty-attach"] = cap("supported", "herdr-pty");
+  snapshot.capabilities.artifact = cap("supported", "pty-scrollback");
+  return snapshot;
+}
+
 export function printCapabilities(): CapabilitySnapshot {
   const capabilities = {} as Record<CapabilityName, Capability>;
   for (const name of NAMES) capabilities[name] = cap("unknown", "unverified");

@@ -207,6 +207,7 @@ impl Default for Node {
 }
 
 impl Config {
+    /// Load file/environment values; commands validate semantics after CLI overrides.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         Self::load_with(path, &std::env::current_dir()?, &|key| {
             std::env::var_os(key)
@@ -240,7 +241,6 @@ impl Config {
         };
         config.absolutize(base)?;
         config.apply_environment(cwd, environment)?;
-        config.validate()?;
         Ok(config)
     }
 
@@ -484,18 +484,51 @@ mod tests {
             Self(path)
         }
         fn load(&self, values: &[(&str, &str)]) -> anyhow::Result<Config> {
-            Config::load_with(None, &self.0, &|key| {
+            let config = Config::load_with(None, &self.0, &|key| {
                 values
                     .iter()
                     .find(|(name, _)| *name == key)
                     .map(|(_, value)| OsString::from(value))
-            })
+            })?;
+            config.validate()?;
+            Ok(config)
         }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn command_line_can_replace_semantically_invalid_file_values() {
+        use clap::Parser;
+        let fixture =
+            Fixture::new("[node]\nhub_url = 'ws://old.example/v1/node'\nmaxInstances = 0\n");
+        let mut config = Config::load_with(None, &fixture.0, &|_| None)
+            .expect("file values are available for command overrides");
+        assert!(
+            config.validate().is_err(),
+            "unchanged invalid settings must fail"
+        );
+        let cli = crate::Cli::try_parse_from([
+            "remuda",
+            "node",
+            "--hub-url",
+            "wss://cli.example/v1/node",
+            "--max-instances",
+            "3",
+        ])
+        .expect("Node command overrides");
+        let crate::Command::Node(args) = cli.command else {
+            panic!("Node command")
+        };
+        args.apply(&mut config).expect("validate the final values");
+        assert_eq!(
+            config.node.hub_url.as_deref(),
+            Some("wss://cli.example/v1/node")
+        );
+        assert_eq!(config.node.max_instances, 3);
     }
 
     #[test]

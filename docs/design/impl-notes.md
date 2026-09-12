@@ -231,7 +231,11 @@ Validation used an isolated archive of `63d6cf4801c46f3c8b46d2661eeefc8b740189e3
 
 The Clippy workaround is `cargo clippy --offline -p remuda --no-deps -- -D warnings -A unused-imports`. The unowned `cmd/ssh.rs` re-exports an unused `run_cli as run`; the earlier full dependency lint also found `remuda-node::transport::session_task` exceeding Clippy's argument count (subsequently addressed by its owner). This exception changes the validation command, not lint policy in source. Other command modules are unchanged by this task.
 
-The composition source landed in `3f5a8952396d32a5d2bcdfeba4b4f9fd8a48eaad`. The coordinator synchronized its `Cargo.lock` dependencies in `dc9c5f2`; the committed Remuda lock entry matches the dependencies used by the isolated validation.
+The composition source landed in `8bd73c5c7b7a80bc10c8e271ae90ee31c48348e2` after the history rewrite. The coordinator synchronized its `Cargo.lock` dependencies in `ccec0b9`; the committed Remuda lock entry matches the dependencies used by the isolated validation.
+
+The configuration follow-up defers semantic validation until the command has applied CLI overrides. A valid `--hub-url` or `--max-instances` can therefore replace an invalid value from `remuda.toml`; unchanged invalid settings still fail before carrier startup. The regression uses the real Node argument parser and override method.
+
+Follow-up validation started from committed `b39c12e` in `/tmp/v-remuda-config`, with `CARGO_TARGET_DIR` set to the shared repository `target/`. Its initial `cargo build --offline --locked -p remuda` failed because the committed Node declares an absent `interactions` module and does not handle its two new interaction errors. Only in the verification worktree, `crates/remuda-node/src/lib.rs` and `src/error.rs` were restored from `74248ec`. With those two dependency files restored, build and tests passed (27 unit tests and 5 integration tests). Binary smokes confirmed rejection of an unchanged zero capacity, successful stdio startup with `--max-instances 3`, and one-object `remuda version --json` output even with invalid config/tracing settings. Full Clippy reached the unchanged SSH re-export warning; `cargo clippy --offline --locked -p remuda --no-deps -- -D warnings -A unused-imports` passed. The verification-only Node substitutions are excluded from this task's commit; the Node owner must land its missing implementation.
 
 Remaining steps:
 

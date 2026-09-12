@@ -35,7 +35,7 @@ pub(crate) struct Args {
 }
 
 impl Args {
-    fn apply(&self, config: &mut Config) -> anyhow::Result<()> {
+    pub(crate) fn apply(&self, config: &mut Config) -> anyhow::Result<()> {
         if let Some(url) = &self.hub_url {
             config.node.hub_url = Some(url.clone());
         }

@@ -252,6 +252,9 @@ pub struct Instance {
     pub durable_seq: U64,
     /// `exit`; protocol §2.3.
     pub exit: Knowledge<ProcessExit>,
+    /// Driver or native diagnostic when [`InstanceLifecycle::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// RunCause; `protocol.md` §2.4.

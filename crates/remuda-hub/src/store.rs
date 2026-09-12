@@ -146,6 +146,9 @@ pub struct InstanceRecord {
     pub created_at: String,
     /// Update-time.
     pub updated_at: String,
+    /// Last native/driver error when lifecycle is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Command ledger row (three-state).
@@ -783,11 +786,7 @@ impl Store {
             if inst.host_id != host_id {
                 return Err(StoreError::Id("instance belongs to another host".into()));
             }
-            let next = inst
-                .durable_seq
-                .parse::<i64>()
-                .unwrap_or(0)
-                + 1;
+            let next = inst.durable_seq.parse::<i64>().unwrap_or(0) + 1;
             let seq = seq.unwrap_or(next);
             let durable = inst.durable_seq.parse::<i64>().unwrap_or(0);
             if let Some(existing) = load_journal_row(conn, &instance_id, seq)? {
@@ -807,9 +806,7 @@ impl Store {
                 .get("eventId")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .unwrap_or_else(|| {
-                    new_id("evt").unwrap_or_else(|_| "evt_missing".into())
-                });
+                .unwrap_or_else(|| new_id("evt").unwrap_or_else(|_| "evt_missing".into()));
             if let Some(obj) = event.as_object_mut() {
                 obj.entry("eventId".to_string())
                     .or_insert_with(|| json!(event_id.clone()));
@@ -824,10 +821,7 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![instance_id, seq, event_id, event.to_string(), now],
             )?;
-            conn.execute(
-                "UPDATE instances SET durable_seq = ?1, connectivity = 'connected', updated_at = ?2 WHERE id = ?3",
-                params![seq, now, instance_id],
-            )?;
+            apply_instance_projection(conn, &instance_id, &event, seq, &now)?;
             apply_interaction_event(conn, &host_id, &instance_id, &event)?;
             Ok(JournalAppend {
                 record: JournalRecord {
@@ -1211,7 +1205,8 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             durable_seq INTEGER NOT NULL DEFAULT 0,
             spec_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            last_error TEXT
         );
         CREATE TABLE IF NOT EXISTS commands (
             id TEXT PRIMARY KEY,
@@ -1276,7 +1271,86 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "INTEGER NOT NULL DEFAULT 8",
     )?;
     ensure_column(&conn, "hosts", "hostname", "TEXT")?;
+    ensure_column(&conn, "instances", "last_error", "TEXT")?;
     Ok(conn)
+}
+
+fn apply_instance_projection(
+    conn: &Connection,
+    instance_id: &str,
+    event: &Value,
+    seq: i64,
+    now: &str,
+) -> Result<(), StoreError> {
+    let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+    let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+    let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut lifecycle: Option<&str> = None;
+    let mut last_error: Option<String> = None;
+    let mut connectivity = "connected";
+    if kind == "lifecycle" && payload_type == "entity" {
+        if payload.get("state").and_then(Value::as_str) == Some("failed") {
+            lifecycle = Some("failed");
+            connectivity = "disconnected";
+            last_error = payload
+                .get("reasonCode")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        } else if payload.get("state").and_then(Value::as_str) == Some("ready") {
+            lifecycle = Some("ready");
+        } else if payload.get("state").and_then(Value::as_str) == Some("exited") {
+            lifecycle = Some("exited");
+            connectivity = "disconnected";
+        }
+        if let Some(entity_error) = payload.pointer("/entity/lastError").and_then(Value::as_str) {
+            last_error = Some(entity_error.to_string());
+        }
+    }
+    if kind == "lifecycle" && payload_type == "native" {
+        let native_name = payload
+            .get("nativeName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let severity = payload
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let failed = severity == "error"
+            || native_name.contains("error")
+            || native_name == "exit"
+            || native_name.contains("gone")
+            || native_name.contains("agent_not_ready")
+            || native_name.contains("shell");
+        if failed {
+            lifecycle = Some("failed");
+            connectivity = "disconnected";
+            last_error = payload
+                .pointer("/relatedIds/lastError")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    payload
+                        .pointer("/status/value")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+        }
+    }
+    if let Some(lifecycle) = lifecycle {
+        conn.execute(
+            "UPDATE instances SET durable_seq = ?1, connectivity = ?2, lifecycle = ?3,
+                    last_error = COALESCE(?4, last_error), updated_at = ?5
+             WHERE id = ?6",
+            params![seq, connectivity, lifecycle, last_error, now, instance_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE instances SET durable_seq = ?1, connectivity = 'connected', updated_at = ?2 WHERE id = ?3",
+            params![seq, now, instance_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_column(
@@ -1368,7 +1442,7 @@ fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreErr
 fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, StoreError> {
     conn.query_row(
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
-                title, journal_id, durable_seq, created_at, updated_at, spec_json
+                title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -1403,6 +1477,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 durable_seq: durable.to_string(),
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
+                last_error: row.get(14)?,
             })
         },
     )

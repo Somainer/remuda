@@ -4982,6 +4982,13 @@
           "$ref": "#/$defs/AgentKind",
           "description": "`kind`; protocol §2.3."
         },
+        "lastError": {
+          "description": "Driver or native diagnostic when [`InstanceLifecycle::Failed`].",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "launchId": {
           "$ref": "#/$defs/Knowledge15",
           "description": "`launch_id`; protocol §2.3."

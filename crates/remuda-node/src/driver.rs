@@ -141,6 +141,10 @@ pub trait Driver: Send + Sync {
     fn launch_recipe(&self) -> Option<remuda_driver::LaunchRecipe> {
         None
     }
+    /// Native start reported a failed agent (process gone / shell prompt / not ready).
+    fn startup_error(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Creates one stateful driver object for each Instance.

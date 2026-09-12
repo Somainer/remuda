@@ -205,6 +205,7 @@ struct PtyLive {
     status_task: Option<JoinHandle<()>>,
     matcher_task: Option<JoinHandle<()>>,
     closed: bool,
+    failed: Arc<AtomicBool>,
 }
 
 /// Herdr-hosted generic TUI for any registered kind.
@@ -379,7 +380,10 @@ impl GenericPtyDriver {
         dismiss_startup_prompt(&client, &agent_name).await;
 
         let stream = client
-            .subscribe(vec![Subscription::pane_agent_status_changed(&pane_id)])
+            .subscribe(vec![
+                Subscription::pane_agent_status_changed(&pane_id),
+                Subscription::pane_exited(),
+            ])
             .await
             .map_err(map_herdr)?;
         let (tx, rx) = mpsc::channel(64);
@@ -394,6 +398,30 @@ impl GenericPtyDriver {
             agent_name.clone(),
             recipe.binary.version.clone(),
         );
+        let failed = Arc::new(AtomicBool::new(false));
+        if let Some(reason) =
+            confirm_agent_alive(&client, &agent_name, &pane_id, preset.binary, &recipe.argv).await
+        {
+            failed.store(true, Ordering::SeqCst);
+            emit_startup_failure(
+                &tx,
+                &self.seq,
+                &ctx,
+                &agent_name,
+                &pane_id,
+                preset.id,
+                &reason,
+            )
+            .await?;
+            let mut ack = DriverAck::transport_written();
+            ack.native_ids.insert("paneId".into(), pane_id);
+            ack.native_ids.insert("agentName".into(), agent_name);
+            ack.native_ids
+                .insert("herdrKind".into(), preset.herdr_kind.into());
+            ack.native_ids.insert("lastError".into(), reason);
+            info!(kind = preset.id, "generic-pty agent.start failed liveness");
+            return Ok(RunHandle::new(recipe, ack, rx));
+        }
         emit_on(
             &tx,
             &self.seq,
@@ -421,7 +449,14 @@ impl GenericPtyDriver {
             )))),
         )
         .await?;
-        let status_task = spawn_status_pump(stream, tx.clone(), ctx.clone(), Arc::clone(&self.seq));
+        let status_task = spawn_status_pump(
+            stream,
+            tx.clone(),
+            ctx.clone(),
+            Arc::clone(&self.seq),
+            pane_id.clone(),
+            Arc::clone(&failed),
+        );
         let matcher_task = self.options.line_matcher.as_ref().map(|pattern| {
             spawn_line_matcher(
                 client.clone(),
@@ -447,6 +482,7 @@ impl GenericPtyDriver {
             status_task: Some(status_task),
             matcher_task,
             closed: false,
+            failed,
         });
         info!(kind = preset.id, "generic-pty agent.start dispatched");
         Ok(RunHandle::new(recipe, ack, rx))
@@ -482,17 +518,19 @@ impl Driver for GenericPtyDriver {
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
         let text = prompt_text(&input)?;
-        let (client, agent_name) = self.live_client().await?;
-        client
+        let inner = self.inner.lock().await;
+        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        if live.failed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        live.client
             .agent_prompt(AgentPromptParams {
-                target: agent_name.clone(),
+                target: live.agent_name.clone(),
                 text: text.clone(),
                 wait: None,
             })
             .await
-            .map_err(map_herdr)?;
-        let inner = self.inner.lock().await;
-        let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+            .map_err(map_prompt_herdr)?;
         let ctx = obs_ctx(
             DriverKind::GenericPty,
             InstanceId::new(),
@@ -573,12 +611,40 @@ fn spawn_status_pump(
     tx: mpsc::Sender<Observation>,
     ctx: crate::claude_pty::ObsCtx,
     seq: Arc<AtomicU64>,
+    pane_id: String,
+    failed: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(item) = stream.next_event().await {
             let Ok(event) = item else {
                 break;
             };
+            if event.kind == EventKind::PaneExited {
+                if event.pane_id() != Some(pane_id.as_str()) {
+                    continue;
+                }
+                failed.store(true, Ordering::SeqCst);
+                let payload = failure_lifecycle(
+                    "exit",
+                    &ctx.session_id,
+                    &pane_id,
+                    "pane exited; agent process is gone",
+                );
+                if emit_on(
+                    &tx,
+                    &seq,
+                    &ctx,
+                    SourceChannel::Herdr,
+                    Completeness::ScreenDerived,
+                    payload,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             if event.kind != EventKind::PaneAgentStatusChanged {
                 continue;
             }
@@ -764,6 +830,239 @@ async fn dismiss_startup_prompt(client: &Client, agent_name: &str) {
     }
 }
 
+async fn emit_startup_failure(
+    tx: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &crate::claude_pty::ObsCtx,
+    agent_name: &str,
+    pane_id: &str,
+    kind: &str,
+    reason: &str,
+) -> DriverResult<()> {
+    let mut payload = failure_lifecycle("error", agent_name, pane_id, reason);
+    if let ObservationPayload::Lifecycle(body) = &mut payload
+        && let LifecyclePayload::Native(native) = body.as_mut()
+    {
+        native.related_ids.insert("kind".into(), kind.to_string());
+    }
+    emit_on(
+        tx,
+        seq,
+        ctx,
+        SourceChannel::Herdr,
+        Completeness::Structured,
+        payload,
+    )
+    .await
+}
+
+fn failure_lifecycle(
+    native_name: &str,
+    agent_name: &str,
+    pane_id: &str,
+    reason: &str,
+) -> ObservationPayload {
+    ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+        NativeLifecycle {
+            topic: LifecycleTopic::Session,
+            native_name: native_name.into(),
+            native_id: Knowledge::Known {
+                value: agent_name.into(),
+            },
+            status: Knowledge::Known {
+                value: reason.into(),
+            },
+            related_ids: BTreeMap::from([
+                ("paneId".into(), pane_id.into()),
+                ("lastError".into(), reason.into()),
+            ]),
+            data_ref: None,
+            severity: Severity::Error,
+            affects_completion: true,
+        },
+    ))))
+}
+
+async fn confirm_agent_alive(
+    client: &Client,
+    agent_name: &str,
+    pane_id: &str,
+    binary: &str,
+    argv: &[String],
+) -> Option<String> {
+    let mut last_reason = None;
+    for attempt in 0..10 {
+        match probe_startup_failure(client, agent_name, pane_id, binary, argv).await {
+            None => return None,
+            Some(reason) => {
+                last_reason = Some(reason);
+                if attempt + 1 < 10 {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            }
+        }
+    }
+    last_reason
+}
+
+async fn probe_startup_failure(
+    client: &Client,
+    agent_name: &str,
+    pane_id: &str,
+    binary: &str,
+    argv: &[String],
+) -> Option<String> {
+    match client.agent_get(agent_name).await {
+        Ok(info) => {
+            if !info.agent.interactive_ready && info.agent.launch_pending {
+                return Some(format!(
+                    "herdr reports agent {agent_name} is not ready (launch still pending)"
+                ));
+            }
+        }
+        Err(remuda_herdr::Error::Api { code, message, .. })
+            if code == "agent_not_ready" || message.contains("unknown agent") =>
+        {
+            return Some(format!("agent gone / {code}: {message}"));
+        }
+        Err(_) => {}
+    }
+
+    if let Ok(info) = client.pane_process_info(Some(pane_id.to_string())).await
+        && let Some(process) = info.process_info
+        && process_is_shell_only(&process, binary, argv)
+    {
+        return Some(format!(
+            "agent process exited during startup; pane {pane_id} returned to a shell"
+        ));
+    }
+
+    match client
+        .agent_read(AgentReadParams {
+            target: agent_name.to_string(),
+            source: ReadSource::RecentUnwrapped,
+            lines: Some(40),
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        })
+        .await
+    {
+        Ok(read) => {
+            let text = read.text();
+            if looks_like_cli_crash(text) {
+                return Some(cli_crash_reason(text));
+            }
+            if looks_like_shell_prompt(text) {
+                return Some(format!(
+                    "pane {pane_id} returned to a shell prompt after agent.start"
+                ));
+            }
+        }
+        Err(remuda_herdr::Error::Api { code, message, .. }) if code == "agent_not_ready" => {
+            return Some(format!("agent_not_ready: {message}"));
+        }
+        Err(_) => {}
+    }
+    None
+}
+
+fn process_is_shell_only(
+    process: &remuda_herdr::PaneProcessInfo,
+    binary: &str,
+    argv: &[String],
+) -> bool {
+    if process
+        .foreground_processes
+        .iter()
+        .any(|proc| process_looks_like_agent(proc, binary, argv))
+    {
+        return false;
+    }
+    process.foreground_processes.is_empty()
+        || process.foreground_processes.iter().all(|proc| {
+            is_shell_name(&proc.name) || proc.argv0.as_deref().is_some_and(is_shell_name)
+        })
+}
+
+fn process_looks_like_agent(
+    proc: &remuda_herdr::PaneProcessInfoProcess,
+    binary: &str,
+    argv: &[String],
+) -> bool {
+    let names = [proc.name.as_str(), proc.argv0.as_deref().unwrap_or("")];
+    if names
+        .iter()
+        .any(|name| !name.is_empty() && name.rsplit('/').next() == Some(binary))
+    {
+        return true;
+    }
+    argv.iter().any(|token| {
+        PathBuf::from(token).is_file()
+            && proc
+                .argv
+                .as_ref()
+                .is_some_and(|cmd| cmd.iter().any(|part| part == token))
+    })
+}
+
+fn is_shell_name(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let base = base.trim_start_matches('-');
+    matches!(
+        base,
+        "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh" | "tcsh" | "nu"
+    )
+}
+
+/// Last non-empty line is a typical login-shell prompt (`%`, `$`, `#`).
+pub fn looks_like_shell_prompt(screen: &str) -> bool {
+    let last = screen
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    last == "%"
+        || last == "$"
+        || last == "#"
+        || last.ends_with(" %")
+        || last.ends_with(" $")
+        || last.ends_with(" #")
+}
+
+fn looks_like_cli_crash(screen: &str) -> bool {
+    let lower = screen.to_ascii_lowercase();
+    lower.contains("unexpected argument")
+        || lower.contains("unknown option")
+        || lower.contains("unrecognized option")
+        || (lower.contains("error:") && looks_like_shell_prompt(screen))
+}
+
+fn cli_crash_reason(screen: &str) -> String {
+    screen
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("unexpected argument")
+                || lower.contains("unknown option")
+                || lower.contains("error:")
+        })
+        .unwrap_or("agent process exited during startup")
+        .to_string()
+}
+
+fn map_prompt_herdr(error: remuda_herdr::Error) -> DriverError {
+    match &error {
+        remuda_herdr::Error::Api { code, message, .. }
+            if code == "agent_not_ready" || message.contains("unknown agent") =>
+        {
+            DriverError::ControlUnavailable
+        }
+        _ => map_herdr(error),
+    }
+}
+
 fn merge_yolo_argv(argv: &mut Vec<String>, preset: &KindPreset) {
     for flag in preset.yolo_argv {
         if !argv.iter().any(|token| token == flag) {
@@ -837,6 +1136,8 @@ mod tests {
         }
         assert!(preset_by_id("codex").unwrap().yolo_argv[0].contains("bypass"));
         assert!(preset_by_id("grok").unwrap().name_flag.is_none());
+        assert!(preset_by_id("codex").unwrap().name_flag.is_none());
+        assert!(preset_by_id("agy").unwrap().name_flag.is_none());
         assert!(preset_by_id("claude").unwrap().journals);
         assert!(!preset_by_id("codex").unwrap().journals);
     }
@@ -848,5 +1149,14 @@ mod tests {
         assert!(line_matches("DONE sha", "^DONE "));
         assert!(line_matches("DONE\n", "^DONE"));
         assert!(line_matches("hello\nDONE\n", "^DONE"));
+    }
+
+    #[test]
+    fn shell_prompt_detects_zsh_percent_not_fake_herdr_idle() {
+        assert!(looks_like_shell_prompt(
+            "error: unexpected argument '--name' found\n%\n"
+        ));
+        assert!(!looks_like_shell_prompt("❯ \n"));
+        assert!(!looks_like_shell_prompt("OK\n❯ \n"));
     }
 }

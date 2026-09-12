@@ -1093,6 +1093,7 @@ export type Instance = ({
   "id": InstanceId;
   "journalId": Id;
   "kind": AgentKind;
+  "lastError"?: (string | null);
   "launchId": Knowledge15;
   "lifecycle": InstanceLifecycle;
   "nativeRef": NativeRef;

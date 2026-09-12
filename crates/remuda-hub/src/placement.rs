@@ -269,12 +269,32 @@ pub struct SpawnRequest {
     pub spec: Value,
 }
 
+/// Hosts with `online` derived from a live Hub<->Node session, not SQLite state.
+pub async fn hosts_with_live_links(state: &AppState) -> Result<Vec<HostRecord>, HubError> {
+    let live = state.nodes.host_ids().await;
+    Ok(state
+        .store
+        .list_hosts()
+        .await?
+        .into_iter()
+        .map(|host| {
+            let connected = live.iter().any(|id| id == &host.host_id);
+            crate::store::Store::with_live_link(host, connected)
+        })
+        .collect())
+}
+
 /// Create an instance on an already-chosen host (fleet and HTTP create).
 pub async fn spawn_on_host(
     state: &AppState,
     host: &HostRecord,
     request: SpawnRequest,
 ) -> Result<(InstanceRecord, CommandRecord), HubError> {
+    if state.nodes.kind_of(&host.host_id).await.is_none() {
+        return Err(HubError::HostOffline {
+            host_id: host.host_id.clone(),
+        });
+    }
     let instance = state
         .store
         .insert_instance(
@@ -303,7 +323,7 @@ pub async fn spawn_on_host(
             None,
         )
         .await?;
-    let command = crate::http::forward_if_online(state, command, host.online).await?;
+    let command = crate::http::forward_if_online(state, command, true).await?;
     Ok((instance, command))
 }
 
@@ -313,7 +333,15 @@ pub async fn pick_hosts(
     placement: &Placement,
     spec: &PlaceSpec,
 ) -> Result<Vec<HostRecord>, HubError> {
-    let hosts = state.store.list_hosts().await?;
+    if let Placement::Host { host_id } = placement {
+        let exists = state.store.get_host(host_id.clone()).await?.is_some();
+        if exists && state.nodes.kind_of(host_id).await.is_none() {
+            return Err(HubError::HostOffline {
+                host_id: host_id.clone(),
+            });
+        }
+    }
+    let hosts = hosts_with_live_links(state).await?;
     let mut running = Vec::new();
     for host in &hosts {
         let n = state.store.running_count(host.host_id.clone()).await?;

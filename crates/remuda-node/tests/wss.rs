@@ -1,7 +1,7 @@
 //! Integration test: outbound WSS carrier against in-process `remuda-hub`.
 
 use remuda_hub::HubConfig;
-use remuda_node::{Backoff, WssConfig, WssLink};
+use remuda_node::{Backoff, WssConfig, WssLink, apply_hello_result, load_or_create_enrollment};
 use remuda_protocol::{HostId, InstanceId};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -269,6 +269,80 @@ async fn wss_reannounce_keeps_a_single_host_row() {
         .filter_map(|row| row["kind"].as_str())
         .collect();
     assert_eq!(kinds, ["claude", "codex", "grok", "agy"], "{items:?}");
+
+    tokio::time::timeout(TIMEOUT, link.shutdown())
+        .await
+        .expect("second shutdown");
+}
+
+#[tokio::test]
+async fn enrollment_file_keeps_the_same_host_id_across_hello() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let identity = dir.path().join("identity");
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
+        .await
+        .expect("hub");
+    let first = load_or_create_enrollment(&identity).expect("first identity");
+    let mut config = WssConfig::loopback(
+        hub.addr,
+        hub.bootstrap_token.clone(),
+        first.host_id.as_id().as_str().to_owned(),
+    );
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config.clone()))
+        .await
+        .expect("connect timeout")
+        .expect("first hello");
+    apply_hello_result(
+        &identity,
+        &json!({
+            "hostId": first.host_id,
+            "nodeToken": link.node_token,
+        }),
+    )
+    .expect("persist");
+    tokio::time::timeout(TIMEOUT, link.shutdown())
+        .await
+        .expect("shutdown");
+
+    let bootstrap = hub.bootstrap_token.clone();
+    hub.shutdown().await;
+    let hub = remuda_hub::spawn({
+        let mut config = HubConfig::for_test(dir.path().join("hub"));
+        config.bootstrap_token = bootstrap.clone();
+        config
+    })
+    .await
+    .expect("hub restart");
+
+    let second = load_or_create_enrollment(&identity).expect("reload identity");
+    assert_eq!(second.host_id, first.host_id);
+    let token = second
+        .node_token
+        .clone()
+        .unwrap_or_else(|| hub.bootstrap_token.clone());
+    config.token = token;
+    config.url = format!("ws://{}/v1/node", hub.addr);
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config))
+        .await
+        .expect("reconnect timeout")
+        .expect("second hello");
+    assert_eq!(link.host_id, first.host_id.as_id().as_str());
+
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+    let (status, hosts) = http(
+        hub.addr,
+        "GET",
+        "/v1/hosts",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{hosts}");
+    let hosts: Value = serde_json::from_str(hosts.trim()).expect("hosts json");
+    let items = hosts["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 1, "{hosts}");
+    assert_eq!(items[0]["hostId"], json!(first.host_id.as_id().as_str()));
+    assert_eq!(items[0]["online"], json!(true));
 
     tokio::time::timeout(TIMEOUT, link.shutdown())
         .await

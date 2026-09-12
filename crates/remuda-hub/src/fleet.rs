@@ -216,14 +216,9 @@ async fn fleet_commands(
             )
             .await
             .map_err(crate::http::map_store)?;
-        let online = state
-            .store
-            .get_host(host_id)
-            .await?
-            .map(|h| h.online)
-            .unwrap_or(false);
+        let live = state.nodes.kind_of(&host_id).await.is_some();
         let command = if created {
-            crate::http::forward_if_online(&state, command, online).await?
+            crate::http::forward_if_online(&state, command, live).await?
         } else {
             command
         };

@@ -216,6 +216,31 @@ async fn hub_restart_keeps_host_journal_interactions_and_device() -> Result<()> 
         hosts["items"][0]["hostId"].as_str(),
         Some(host_id.as_id().as_str())
     );
+    assert_eq!(
+        hosts["items"][0]["online"],
+        json!(false),
+        "Hub restart must mark hosts offline until they re-announce: {hosts}"
+    );
+    assert_eq!(hosts["items"][0]["state"], json!("offline"));
+
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "prompt": "should-reject"
+    })
+    .to_string();
+    let (status, _, rejected) = http(
+        addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 409, "{rejected}");
+    let rejected: Value = serde_json::from_str(rejected.trim())?;
+    assert_eq!(rejected["code"], json!("HOST_OFFLINE"));
 
     let (status, _, pending) = http(
         addr,

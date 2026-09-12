@@ -464,6 +464,35 @@ impl Store {
         .await
     }
 
+    /// Mark every host offline. Hub restart has no live Node links until hello.
+    pub async fn mark_all_hosts_offline(&self) -> Result<(), StoreError> {
+        self.run(|conn| {
+            conn.execute(
+                "UPDATE hosts SET state = 'offline' WHERE state = 'online'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
+                 WHERE connectivity != 'disconnected'",
+                params![now_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Overlay Hub<->Node liveness onto a stored host row.
+    #[must_use]
+    pub fn with_live_link(mut host: HostRecord, connected: bool) -> HostRecord {
+        host.online = connected;
+        if connected {
+            host.state = "online".into();
+        } else if host.state == "online" {
+            host.state = "offline".into();
+        }
+        host
+    }
+
     /// Mark a host offline when its WS drops.
     pub async fn mark_host_offline(&self, host_id: String) -> Result<(), StoreError> {
         self.run(move |conn| {

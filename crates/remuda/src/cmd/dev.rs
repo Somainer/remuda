@@ -10,6 +10,7 @@ use clap::Args as ClapArgs;
 use remuda_node::{
     DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, WssConfig, WssLink,
     apply_hello_result, dev_router, load_or_create_enrollment, native_driver_registry,
+    save_enrollment,
 };
 use remuda_protocol::HostId;
 use serde_json::json;
@@ -101,6 +102,7 @@ pub(crate) async fn run(
     args: Args,
     mut shutdown: Shutdown,
 ) -> anyhow::Result<()> {
+    let identity_dir = config.data_dir.clone();
     args.apply(&mut config)?;
     if let Some(path) = &args.access_code_file {
         validate_private_access_code_file(path)?;
@@ -121,8 +123,16 @@ pub(crate) async fn run(
     }
     let drivers = native_driver_registry(native)?;
     let store = Arc::new(MemoryStore::new(node_config.follow_buffer_capacity));
-    let (host_id, node_token) =
-        load_dev_enrollment(&config.data_dir, &running_hub.bootstrap_token)?;
+    let (host_id, node_token) = load_dev_enrollment(
+        &identity_dir,
+        &config.data_dir,
+        &running_hub.bootstrap_token,
+    )?;
+    tracing::info!(
+        path = %identity_dir.join("enrollment.json").display(),
+        host_id = %host_id.as_id(),
+        "loaded node identity"
+    );
     let node = DevNode::with_parts_on_host(&node_config, store, drivers, host_id.clone())?;
     let mut wss = WssConfig::loopback(running_hub.addr, node_token, host_id.as_id().to_string())
         .with_collected_inventory();
@@ -130,7 +140,18 @@ pub(crate) async fn run(
     let link = WssLink::connect_runtime(wss, node.clone())
         .await
         .context("local Node could not enroll with the development Hub")?;
-    persist_dev_enrollment(&config.data_dir, &host_id, link.node_token.as_deref())?;
+    let announced = link
+        .hello
+        .get("hostId")
+        .and_then(|value| value.as_str())
+        .and_then(|raw| raw.parse::<HostId>().ok())
+        .unwrap_or(host_id);
+    persist_dev_enrollment(&identity_dir, &announced, link.node_token.as_deref())?;
+    tracing::info!(
+        path = %identity_dir.join("enrollment.json").display(),
+        host_id = %announced.as_id(),
+        "persisted node identity"
+    );
     let listener = tokio::net::TcpListener::bind(node_config.bind_addr).await?;
     let address = listener.local_addr()?;
     let accepting = Arc::new(AtomicBool::new(true));
@@ -200,8 +221,19 @@ pub(crate) async fn run(
     reason
 }
 
-fn load_dev_enrollment(data_dir: &Path, bootstrap: &str) -> anyhow::Result<(HostId, String)> {
-    let enrollment = load_or_create_enrollment(data_dir).context("node enrollment")?;
+fn load_dev_enrollment(
+    identity_dir: &Path,
+    hub_dir: &Path,
+    bootstrap: &str,
+) -> anyhow::Result<(HostId, String)> {
+    if identity_dir != hub_dir
+        && !identity_dir.join("enrollment.json").is_file()
+        && hub_dir.join("enrollment.json").is_file()
+    {
+        let migrated = load_or_create_enrollment(hub_dir).context("migrate node enrollment")?;
+        save_enrollment(identity_dir, &migrated).context("write node enrollment")?;
+    }
+    let enrollment = load_or_create_enrollment(identity_dir).context("node enrollment")?;
     let token = enrollment
         .node_token
         .filter(|token| !token.is_empty())
@@ -306,13 +338,31 @@ mod tests {
     #[test]
     fn development_enrollment_reuses_the_same_host_id() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let identity = dir.path().join("data");
+        let hub = identity.join("dev-hub");
         let (first, token) =
-            load_dev_enrollment(dir.path(), "bootstrap-secret").expect("first enroll");
+            load_dev_enrollment(&identity, &hub, "bootstrap-secret").expect("first enroll");
         assert_eq!(token, "bootstrap-secret");
-        persist_dev_enrollment(dir.path(), &first, Some("host-secret")).expect("persist token");
+        persist_dev_enrollment(&identity, &first, Some("host-secret")).expect("persist token");
+        assert!(identity.join("enrollment.json").is_file());
         let (second, token) =
-            load_dev_enrollment(dir.path(), "bootstrap-secret").expect("second enroll");
+            load_dev_enrollment(&identity, &hub, "bootstrap-secret").expect("second enroll");
         assert_eq!(first, second);
         assert_eq!(token, "host-secret");
+    }
+
+    #[test]
+    fn development_enrollment_migrates_out_of_dev_hub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = dir.path().join("data");
+        let hub = identity.join("dev-hub");
+        let (legacy, _) =
+            load_dev_enrollment(&hub, &hub, "bootstrap-secret").expect("legacy enroll");
+        persist_dev_enrollment(&hub, &legacy, Some("legacy-token")).expect("legacy persist");
+        let (migrated, token) =
+            load_dev_enrollment(&identity, &hub, "bootstrap-secret").expect("migrate");
+        assert_eq!(migrated, legacy);
+        assert_eq!(token, "legacy-token");
+        assert!(identity.join("enrollment.json").is_file());
     }
 }

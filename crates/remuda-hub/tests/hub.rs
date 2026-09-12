@@ -347,6 +347,12 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
     node.close(None).await.ok();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    let (status, _, hosts) =
+        http(hub.addr, "GET", "/v1/hosts", &[("Cookie", &cookie)], None).await?;
+    assert_eq!(status, 200, "{hosts}");
+    let hosts: Value = serde_json::from_str(hosts.trim())?;
+    assert_eq!(hosts["items"][0]["online"], json!(false), "{hosts}");
+
     let send = json!({
         "operation": "instance.send",
         "payload": { "text": "queued-offline" }
@@ -364,6 +370,25 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
     let body: Value = serde_json::from_str(body.trim())?;
     assert_eq!(body["command"]["state"], json!("queued"));
     assert_eq!(body["command"]["forwarded"], json!(false));
+
+    let create_offline = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "prompt": "offline-create"
+    })
+    .to_string();
+    let (status, _, rejected) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create_offline),
+    )
+    .await?;
+    assert_eq!(status, 409, "{rejected}");
+    let rejected: Value = serde_json::from_str(rejected.trim())?;
+    assert_eq!(rejected["code"], json!("HOST_OFFLINE"));
     let command_id = body["command"]["commandId"].as_str().unwrap().to_string();
 
     // Reconnect: Hub must not auto-resend the queued command.
@@ -407,6 +432,81 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
     assert_eq!(status, 200, "{body}");
     let body: Value = serde_json::from_str(body.trim())?;
     assert_eq!(body["replayed"], json!(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_marks_hosts_offline_and_rejects_create() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+    let config = HubConfig::for_test(data_dir.clone());
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let (node, _) = {
+        let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+        req.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {bootstrap}").parse().unwrap(),
+        );
+        let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+            .await
+            .context("connect")??;
+        node.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "h",
+                "method": "node.hello",
+                "params": { "hostId": host_id.as_id().as_str(), "label": "stale-check" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        let hello = recv_json(&mut node).await?;
+        anyhow::ensure!(hello.get("result").is_some(), "{hello}");
+        (node, hello)
+    };
+    drop(node);
+    hub.shutdown().await;
+
+    let mut config = HubConfig::for_test(data_dir);
+    config.bootstrap_token = bootstrap;
+    let hub = spawn(config).await?;
+    let (status, _, hosts) = http(
+        hub.addr,
+        "GET",
+        "/v1/hosts",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{hosts}");
+    let hosts: Value = serde_json::from_str(hosts.trim())?;
+    assert_eq!(hosts["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(hosts["items"][0]["online"], json!(false), "{hosts}");
+    assert_eq!(hosts["items"][0]["state"], json!("offline"));
+
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "prompt": "no-link"
+    })
+    .to_string();
+    let (status, _, rejected) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 409, "{rejected}");
+    let rejected: Value = serde_json::from_str(rejected.trim())?;
+    assert_eq!(rejected["code"], json!("HOST_OFFLINE"));
+    assert_eq!(rejected["hostId"].as_str(), Some(host_id.as_id().as_str()));
     Ok(())
 }
 

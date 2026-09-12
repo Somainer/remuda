@@ -84,7 +84,11 @@ impl WssConfig {
         let mut snap = crate::inventory::collect(&crate::inventory::CollectRequest::default());
         snap.cli.retain(|entry| entry.path.is_some());
         self.cli = snap.cli_hub_json();
-        self.host = Some(snap.to_hub_host());
+        let mut host = snap.to_hub_host();
+        if let Some(obj) = host.as_object_mut() {
+            obj.insert("hostId".into(), json!(self.host_id.clone()));
+        }
+        self.host = Some(host);
         self
     }
 }

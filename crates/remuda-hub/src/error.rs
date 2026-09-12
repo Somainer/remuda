@@ -39,6 +39,12 @@ pub enum HubError {
         /// Human-readable rejection reasons, one per considered host or rule.
         reasons: Vec<String>,
     },
+    /// Targeted host has no live Hub<->Node session.
+    #[error("host {host_id} is offline")]
+    HostOffline {
+        /// `hst_…` that has no connected Node.
+        host_id: String,
+    },
     /// SQLite or actor mailbox.
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
@@ -58,6 +64,7 @@ impl HubError {
             Self::Expired => StatusCode::GONE,
             Self::Superseded { .. } => StatusCode::CONFLICT,
             Self::Unsatisfiable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::HostOffline { .. } => StatusCode::CONFLICT,
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -72,6 +79,7 @@ impl HubError {
             Self::Expired => "INTERACTION_EXPIRED",
             Self::Superseded { .. } => "INTERACTION_SUPERSEDED",
             Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",
+            Self::HostOffline { .. } => "HOST_OFFLINE",
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
         }
     }
@@ -94,6 +102,11 @@ impl IntoResponse for HubError {
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert("winner".into(), json!(winner));
+        }
+        if let Self::HostOffline { host_id } = &self
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("hostId".into(), json!(host_id));
         }
         (status, Json(body)).into_response()
     }

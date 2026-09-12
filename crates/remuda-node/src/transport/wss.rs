@@ -29,6 +29,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const DEFAULT_JOURNAL_QUEUE: usize = 32;
 const DEFAULT_HUB_QUEUE: usize = 32;
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// Dial settings for [`WssLink`].
 #[derive(Debug, Clone)]
@@ -45,6 +46,8 @@ pub struct WssConfig {
     pub node_version: String,
     /// CLI inventory included in hello/heartbeat (`cli` array).
     pub cli: Value,
+    /// Full nested host inventory included in hello/heartbeat.
+    pub host: Option<Value>,
     /// Heartbeat period. Hub lease TTL is 60s; 15s matches Hub limits.
     pub heartbeat_interval: Duration,
     /// Reconnect delay policy. Commands are never replayed.
@@ -68,6 +71,7 @@ impl WssConfig {
                 "path": "/usr/bin/claude",
                 "auth": "unknown"
             }]),
+            host: None,
             heartbeat_interval: Duration::from_secs(15),
             backoff: Backoff::default(),
             journal_queue: DEFAULT_JOURNAL_QUEUE,
@@ -302,8 +306,17 @@ impl WssLink {
 
     /// Stop the session loop.
     pub async fn shutdown(self) {
-        let _ = self.control.send(Control::Shutdown).await;
-        let _ = self.task.await;
+        let Self {
+            control, mut task, ..
+        } = self;
+        let _ = control.send(Control::Shutdown).await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -694,7 +707,10 @@ fn encode_hello_params(
             "minor": PROTOCOL_VERSION.minor,
             "framing": "websocket-message",
         })),
-        host: None,
+        host: config
+            .host
+            .clone()
+            .and_then(|host| serde_json::from_value(host).ok()),
         capabilities: None,
         cli: Some(config.cli.clone()),
     });
@@ -719,7 +735,10 @@ fn encode_heartbeat_params(
         lease_id: lease_id.map(str::to_owned),
         node_version: Some(config.node_version.clone()),
         transport: Some("outbound-wss".into()),
-        host: None,
+        host: config
+            .host
+            .clone()
+            .and_then(|host| serde_json::from_value(host).ok()),
         cli: Some(config.cli.clone()),
         capabilities: None,
         instance_watermarks: journal_watermarks(watermarks),
@@ -928,6 +947,28 @@ mod tests {
         let _ = job.reply.send(Ok(json!({"seq":"2"})));
         second.await.expect("join").expect("second seq");
         assert_eq!(metrics.snapshot().journal_enqueued, 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_an_unresponsive_session_task() {
+        let (journal, _journal_rx, metrics) = journal_channel(1);
+        let (control, _control_rx) = mpsc::channel(1);
+        let (_hub_tx, hub_rx) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending());
+        let link = WssLink {
+            host_id: "hst_test".into(),
+            node_token: None,
+            hello: json!({}),
+            journal,
+            metrics,
+            control,
+            hub_rx,
+            task,
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), link.shutdown())
+            .await
+            .expect("shutdown must remain bounded");
     }
 
     #[test]

@@ -130,15 +130,45 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         .get("driver")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
         .unwrap_or(DriverKind::ClaudePrint);
+    let args = match spec.get("args") {
+        None => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    NodeError::InvalidRequest("instance.create args must be strings".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(NodeError::InvalidRequest(
+                "instance.create args must be an array".into(),
+            ));
+        }
+    };
     Ok(CreateInstanceRequest {
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
         workspace_id: None,
         kind,
         driver,
-        model: "fake".to_owned(),
-        provider_profile_id: "dev-fake".to_owned(),
-        permission_mode: "dontAsk".to_owned(),
+        model: spec
+            .get("model")
+            .or_else(|| spec.get("modelId"))
+            .and_then(Value::as_str)
+            .unwrap_or("fake")
+            .to_owned(),
+        args,
+        provider_profile_id: spec
+            .get("providerProfileId")
+            .and_then(Value::as_str)
+            .unwrap_or("native")
+            .to_owned(),
+        permission_mode: spec
+            .get("permissionMode")
+            .and_then(Value::as_str)
+            .unwrap_or("dontAsk")
+            .to_owned(),
         prompt: prompt_of(params).unwrap_or_default(),
     })
 }

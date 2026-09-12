@@ -675,7 +675,14 @@ fn validate_url(text: &str, websocket: bool) -> anyhow::Result<()> {
         "endpoint credentials must use secret references, not URL userinfo, query or fragment"
     );
     if websocket {
-        ensure!(uri.scheme_str() == Some("wss"), "hub_url must use wss://");
+        let loopback = matches!(
+            authority.host(),
+            "127.0.0.1" | "localhost" | "::1" | "[::1]"
+        );
+        ensure!(
+            uri.scheme_str() == Some("wss") || (uri.scheme_str() == Some("ws") && loopback),
+            "hub_url must use wss:// (ws:// is allowed only for loopback)"
+        );
     } else {
         ensure!(
             matches!(uri.scheme_str(), Some("http" | "https")),
@@ -881,6 +888,15 @@ token = 'file:./secrets/token'
                 .load(&[])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn node_hub_url_allows_plain_websocket_only_on_loopback() {
+        assert!(validate_url("ws://127.0.0.1:8080/v1/node", true).is_ok());
+        assert!(validate_url("ws://localhost:8080/v1/node", true).is_ok());
+        assert!(validate_url("ws://[::1]:8080/v1/node", true).is_ok());
+        assert!(validate_url("ws://example.test/v1/node", true).is_err());
+        assert!(validate_url("wss://example.test/v1/node", true).is_ok());
     }
 
     #[test]

@@ -25,6 +25,7 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         kind: AgentKind::Claude,
         driver: DriverKind::ClaudePrint,
         model: "fake".to_owned(),
+        args: Vec::new(),
         provider_profile_id: "dev-fake".to_owned(),
         permission_mode: "dontAsk".to_owned(),
         prompt: prompt.to_owned(),

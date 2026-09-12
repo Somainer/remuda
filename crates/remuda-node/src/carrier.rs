@@ -94,6 +94,7 @@ impl HubCarrier for OutboundWssCarrier {
                 label: hello.params.host.hostname.clone(),
                 node_version: env!("CARGO_PKG_VERSION").into(),
                 cli: serde_json::to_value(&hello.params.host.cli).unwrap_or_else(|_| json!([])),
+                host: serde_json::to_value(&hello.params.host).ok(),
                 heartbeat_interval: std::time::Duration::from_secs(15),
                 backoff: crate::Backoff::default(),
                 journal_queue: 32,

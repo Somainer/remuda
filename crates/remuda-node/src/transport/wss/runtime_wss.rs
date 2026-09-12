@@ -142,15 +142,46 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
                 .and_then(|value| serde_json::from_value(value.clone()).ok())
         })
         .unwrap_or(DriverKind::ClaudePrint);
+    let model = spec
+        .get("model")
+        .or_else(|| spec.get("modelId"))
+        .and_then(Value::as_str)
+        .unwrap_or("fake")
+        .to_owned();
+    let args = match spec.get("args") {
+        None => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    NodeError::InvalidRequest("instance.create args must be strings".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(NodeError::InvalidRequest(
+                "instance.create args must be an array".into(),
+            ));
+        }
+    };
     Ok(CreateInstanceRequest {
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
         workspace_id: None,
         kind,
         driver,
-        model: "fake".to_owned(),
-        provider_profile_id: "dev-fake".to_owned(),
-        permission_mode: "dontAsk".to_owned(),
+        model,
+        args,
+        provider_profile_id: spec
+            .get("providerProfileId")
+            .and_then(Value::as_str)
+            .unwrap_or("native")
+            .to_owned(),
+        permission_mode: spec
+            .get("permissionMode")
+            .and_then(Value::as_str)
+            .unwrap_or("dontAsk")
+            .to_owned(),
         prompt: parsed
             .prompt
             .clone()
@@ -456,5 +487,48 @@ fn lock_set(set: &Arc<Mutex<HashSet<String>>>) -> std::sync::MutexGuard<'_, Hash
     match set.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DevServerConfig;
+
+    #[tokio::test]
+    async fn create_params_preserve_native_model_permission_and_allowlisted_args() {
+        let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+        let request = create_from_params(
+            &node,
+            &json!({
+                "instanceId": InstanceId::new(),
+                "spec": {
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "model": "haiku",
+                    "args": ["--max-budget-usd", "0.3"],
+                    "providerProfileId": "native-login",
+                    "permissionMode": "dontAsk"
+                },
+                "initialInput": { "text": "one bounded turn" }
+            }),
+        )
+        .expect("create params");
+        assert_eq!(request.model, "haiku");
+        assert_eq!(request.args, ["--max-budget-usd", "0.3"]);
+        assert_eq!(request.provider_profile_id, "native-login");
+        assert_eq!(request.permission_mode, "dontAsk");
+        assert_eq!(request.prompt, "one bounded turn");
+    }
+
+    #[tokio::test]
+    async fn create_params_reject_non_string_native_args() {
+        let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+        let error = create_from_params(
+            &node,
+            &json!({ "spec": { "args": ["--max-budget-usd", 0.3] } }),
+        )
+        .expect_err("numeric argv must fail closed");
+        assert!(error.to_string().contains("args must be strings"));
     }
 }

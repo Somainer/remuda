@@ -7,8 +7,8 @@ use crate::{
 use anyhow::{Context, bail, ensure};
 use clap::Args as ClapArgs;
 use remuda_node::{
-    CarrierKind, DevNode, HostInventoryConfig, HubCarrier, NodeHello, NodeTransport, StdioCarrier,
-    WssCarrier, load_or_create_host_id,
+    Backoff, CarrierKind, DevNode, DevServerConfig, HostInventoryConfig, HubCarrier, NodeHello,
+    ServeConfig, StdioCarrier, WssConfig, WssLink, compose, load_or_create_host_id,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -105,28 +105,38 @@ pub(crate) async fn run(
         .resolve()
         .context("node requires a host token or bootstrap secret reference")?
         .into_string();
-    let params = serde_json::json!({
-        "hostId": hello.params.host.host_id,
-        "label": hello.params.host.hostname,
-        "labels": hello.params.host.labels,
-        "maxInstances": hello.params.host.max_instances,
-        "nodeVersion": env!("CARGO_PKG_VERSION"),
-        "cli": hello.params.host.cli,
-        "protocol": hello.params.protocol,
-    });
-    outbound_session(
-        config.node.hub_url.as_deref().context("missing Hub URL")?,
+    let http = DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone());
+    let runtime = compose(&ServeConfig::native(http, config.data_dir.clone()))?;
+    ensure!(
+        runtime.host().meta.id == hello.params.host.host_id,
+        "persisted Node runtime and enrollment host identities diverged"
+    );
+    let wss = WssConfig {
+        url: config.node.hub_url.clone().context("missing Hub URL")?,
         token,
-        params,
-        Some(token_file),
-        config.shutdown_timeout(),
-        shutdown.wait(),
-    )
-    .await
+        host_id: hello.params.host.host_id.as_id().as_str().to_owned(),
+        label: hello.params.host.hostname.clone(),
+        node_version: env!("CARGO_PKG_VERSION").to_owned(),
+        cli: serde_json::to_value(&hello.params.host.cli)?,
+        host: Some(serde_json::to_value(&hello.params.host)?),
+        heartbeat_interval: Duration::from_secs(15),
+        backoff: Backoff::default(),
+        journal_queue: 32,
+    };
+    let link = WssLink::connect_runtime(wss, runtime.clone()).await?;
+    if let Some(token) = link.node_token.as_deref() {
+        persist_host_token(&token_file, token)?;
+    }
+    tracing::info!(host_id = %link.host_id, "Node enrolled with Hub and runtime dispatch is active");
+    let result = shutdown.wait().await;
+    shutdown_drivers(&runtime, config.shutdown_timeout()).await?;
+    link.shutdown().await;
+    result
 }
 
 /// Enroll with configured inventory and cancellable I/O. Unsupported instance
 /// dispatch receives an explicit JSON-RPC error.
+#[cfg(test)]
 pub(crate) async fn outbound_session(
     url: &str,
     token: String,
@@ -135,6 +145,7 @@ pub(crate) async fn outbound_session(
     shutdown_timeout: Duration,
     stop: impl std::future::Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
+    use remuda_node::{NodeTransport, WssCarrier};
     use serde_json::json;
     tokio::pin!(stop);
     let mut carrier = tokio::select! {

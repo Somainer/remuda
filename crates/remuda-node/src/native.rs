@@ -26,6 +26,10 @@ pub struct NativeDriverConfig {
     pub data_dir: PathBuf,
     /// Explicit Claude executable; `None` resolves `claude` through `PATH` at launch.
     pub claude_binary: Option<PathBuf>,
+    /// Explicit registered Claude config directory; otherwise each Instance gets an empty one.
+    pub claude_native_home: Option<PathBuf>,
+    /// Let claude-print inherit the host user's default Claude login/config.
+    pub claude_print_inherit_default_config: bool,
     /// Explicit Herdr socket directory for PTY/background attach support.
     pub herdr_socket_dir: Option<PathBuf>,
     /// Explicit Herdr executable for PTY operations.
@@ -50,6 +54,13 @@ impl NativeDriverConfig {
             claude_binary: std::env::var_os("REMUDA_CLAUDE_BIN")
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
+            claude_native_home: std::env::var_os("REMUDA_CLAUDE_CONFIG_DIR")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+            claude_print_inherit_default_config: std::env::var(
+                "REMUDA_CLAUDE_INHERIT_DEFAULT_CONFIG",
+            )
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true")),
             herdr_socket_dir: None,
             herdr_binary: None,
             herdr_session: "remuda-node".to_owned(),
@@ -64,10 +75,38 @@ impl NativeDriverConfig {
         self.claude_binary = Some(binary);
         self
     }
+
+    /// Use an explicitly registered persistent Claude config directory.
+    #[must_use]
+    pub fn with_claude_native_home(mut self, native_home: PathBuf) -> Self {
+        self.claude_native_home = Some(native_home);
+        self
+    }
+
+    /// Explicitly allow claude-print to use the host user's default login/config.
+    #[must_use]
+    pub fn with_inherited_default_claude_config(mut self) -> Self {
+        self.claude_print_inherit_default_config = true;
+        self
+    }
 }
 
 /// Register `claude-print`, `claude-pty`, and `claude-bg` as per-instance factories.
 pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegistry, NodeError> {
+    if config
+        .claude_native_home
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(NodeError::InvalidConfig(
+            "REMUDA_CLAUDE_CONFIG_DIR must be an absolute path".into(),
+        ));
+    }
+    if config.claude_print_inherit_default_config && config.claude_native_home.is_some() {
+        return Err(NodeError::InvalidConfig(
+            "REMUDA_CLAUDE_INHERIT_DEFAULT_CONFIG conflicts with REMUDA_CLAUDE_CONFIG_DIR".into(),
+        ));
+    }
     let registry = DriverRegistry::default();
     for kind in [
         DriverKind::ClaudePrint,
@@ -100,10 +139,22 @@ impl DriverFactory for NativeClaudeFactory {
             .join("instances")
             .join(launch.instance.meta.id.as_id().as_str());
         let launch_dir = instance_dir.join("launch");
-        let native_home = instance_dir.join("native-home");
+        let inherit_default_config =
+            self.kind == DriverKind::ClaudePrint && self.config.claude_print_inherit_default_config;
+        let native_home = if inherit_default_config {
+            default_claude_home()?
+        } else {
+            self.config
+                .claude_native_home
+                .clone()
+                .unwrap_or_else(|| instance_dir.join("native-home"))
+        };
         std::fs::create_dir_all(&launch_dir)
-            .and_then(|()| std::fs::create_dir_all(&native_home))
             .map_err(|error| DriverError::Failed(error.to_string()))?;
+        if !inherit_default_config {
+            std::fs::create_dir_all(&native_home)
+                .map_err(|error| DriverError::Failed(error.to_string()))?;
+        }
         let profile = provider_profile(&launch)?;
         let spec = instance_spec(&launch, &self.config, &profile)?;
         let binary = self
@@ -131,6 +182,7 @@ impl DriverFactory for NativeClaudeFactory {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
                 options.extra_env = self.config.extra_env.clone();
                 options.handshake_timeout = self.config.print_handshake_timeout;
+                options.inherit_default_config = inherit_default_config;
                 Arc::new(ClaudePrintDriver::new(options))
             }
             DriverKind::ClaudePty => {
@@ -170,6 +222,19 @@ impl DriverFactory for NativeClaudeFactory {
             recipe: std::sync::Mutex::new(None),
         }))
     }
+}
+
+fn default_claude_home() -> Result<PathBuf, DriverError> {
+    let home = std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| DriverError::Failed("HOME is required for default Claude config".into()))?;
+    if !home.is_absolute() {
+        return Err(DriverError::Failed(
+            "HOME must be absolute for default Claude config".into(),
+        ));
+    }
+    Ok(home.join(".claude"))
 }
 
 struct NativeAdapter {
@@ -336,7 +401,7 @@ fn instance_spec(
         model_id,
         permission_mode: PermissionMode::Claude(Box::new(ClaudePermission { mode, interaction })),
         env: BTreeMap::new(),
-        args: Vec::new(),
+        args: launch.request.args.clone(),
         settings_overlay: SettingsOverlay {
             format: SettingsFormat::None,
             object_ref: None,
@@ -384,6 +449,7 @@ mod tests {
                 kind: agent,
                 driver: kind,
                 model: "haiku".to_owned(),
+                args: vec!["--max-budget-usd".to_owned(), "0.3".to_owned()],
                 provider_profile_id: "native".to_owned(),
                 permission_mode: "manual".to_owned(),
                 prompt: String::new(),
@@ -400,5 +466,28 @@ mod tests {
                 .expect("build driver");
             assert_eq!(driver.kind(), kind);
         }
+    }
+
+    #[test]
+    fn registered_claude_home_must_be_absolute() {
+        let config = NativeDriverConfig::new(PathBuf::from("/tmp/remuda-node-test"))
+            .with_claude_native_home(PathBuf::from("relative-home"));
+        let error = match native_driver_registry(config) {
+            Ok(_) => panic!("relative native home must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn inherited_and_explicit_claude_homes_conflict() {
+        let config = NativeDriverConfig::new(PathBuf::from("/tmp/remuda-node-test"))
+            .with_claude_native_home(PathBuf::from("/tmp/claude-home"))
+            .with_inherited_default_claude_config();
+        let error = match native_driver_registry(config) {
+            Ok(_) => panic!("conflicting native home modes must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("conflicts"));
     }
 }

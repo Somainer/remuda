@@ -199,10 +199,48 @@
   gap: 7px;
 }
 
+.permRow,
+.effortRow {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.permChoice,
+.effortChoice {
+  flex: none;
+  white-space: nowrap;
+  min-width: max-content;
+}
+
+.choiceEmber {
+  color: var(--dust);
+  border-color: var(--dust);
+}
+
 .yoloHead {
   display: flex;
   align-items: center;
   gap: 9px;
+  flex-wrap: wrap;
+}
+
+.yoloAck {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  white-space: nowrap;
+}
+
+.yoloAck input {
+  width: 16px;
+  height: 16px;
+  flex: none;
 }
 
 .yoloDot {
@@ -468,6 +506,26 @@
     height: 44px;
     justify-content: center;
     padding: 0 8px;
+  }
+
+  .permChoice,
+  .effortChoice {
+    flex: none;
+    white-space: nowrap;
+    min-width: max-content;
+    padding: 0 13px;
+  }
+
+  .yoloHead {
+    flex-wrap: wrap;
+  }
+
+  .yoloTitle {
+    white-space: nowrap;
+  }
+
+  .yoloAck {
+    margin-left: 16px;
   }
 
   .choiceId {

@@ -7,6 +7,8 @@ export type NewSessionPrefs = {
   permissionMode: string;
   driver: string;
   delegation: string;
+  effortIndex: number;
+  effortName: string;
   recentHostIds: string[];
   recentWorkspaceIds: string[];
 };
@@ -18,6 +20,8 @@ const empty: NewSessionPrefs = {
   permissionMode: "manual",
   driver: "claude-print",
   delegation: "none",
+  effortIndex: 1,
+  effortName: "think",
   recentHostIds: [],
   recentWorkspaceIds: [],
 };
@@ -38,7 +42,10 @@ function touch(list: string[], value: string): string[] {
 }
 
 export function rememberNewSessionSuccess(
-  patch: Pick<NewSessionPrefs, "hostId" | "workspaceId" | "model" | "permissionMode" | "driver" | "delegation">,
+  patch: Pick<
+    NewSessionPrefs,
+    "hostId" | "workspaceId" | "model" | "permissionMode" | "driver" | "delegation" | "effortIndex" | "effortName"
+  >,
 ): void {
   const prev = readNewSessionPrefs();
   const next: NewSessionPrefs = {

@@ -91,6 +91,11 @@
   color: var(--paper);
 }
 
+.chipEmber {
+  color: var(--dust);
+  border-color: var(--dust);
+}
+
 .check {
   display: flex;
   align-items: center;

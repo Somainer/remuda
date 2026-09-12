@@ -7,6 +7,7 @@ import { StateDot } from "../../components/StateDot";
 import { formatListTime, shortId } from "../../lib/format";
 import { nativeShort, projectStatus, uiMode } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
+import { isEmberName } from "./effort";
 import css from "./SessionList.module.css";
 
 const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] = [
@@ -331,6 +332,22 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
                       <span>/ {worktree}</span>
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
+                      {(() => {
+                        const effort = hubStore.effortOf(instance.id, instance.kind);
+                        const ember = isEmberName(instance.kind, effort.name);
+                        return (
+                          <>
+                            <span className={css.sep}>·</span>
+                            <span
+                              className={ember ? css.effortEmber : undefined}
+                              data-testid="session-effort"
+                              data-ember={ember ? "1" : "0"}
+                            >
+                              {effort.name}
+                            </span>
+                          </>
+                        );
+                      })()}
                       <span className={css.sep}>|</span>
                       <span>{shortId(instance.id, 8)}</span>
                     </div>

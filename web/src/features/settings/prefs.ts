@@ -1,10 +1,12 @@
-export type PermissionDefault = "manual" | "acceptEdits" | "bypassPermissions";
+export type PermissionDefault = "manual" | "acceptEdits" | "dontAsk" | "bypassPermissions";
 
 export type DeviceSettings = {
   deviceName: string;
   autoRevealTty: boolean;
   permissionDefault: PermissionDefault;
   theme: "night-corral";
+  /** Index into the claude native table; remapped by nearest index when the harness changes. */
+  defaultEffortIndex: number;
 };
 
 const KEY = "runtime.device-settings.v1";
@@ -14,6 +16,7 @@ export const DEFAULT_SETTINGS: DeviceSettings = {
   autoRevealTty: false,
   permissionDefault: "manual",
   theme: "night-corral",
+  defaultEffortIndex: 1,
 };
 
 export function readDeviceSettings(): DeviceSettings {
@@ -21,14 +24,19 @@ export function readDeviceSettings(): DeviceSettings {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<DeviceSettings>;
+    const permissionDefault: PermissionDefault =
+      parsed.permissionDefault === "acceptEdits" ||
+      parsed.permissionDefault === "dontAsk" ||
+      parsed.permissionDefault === "bypassPermissions"
+        ? parsed.permissionDefault
+        : "manual";
+    const effortRaw = Number(parsed.defaultEffortIndex);
     return {
       deviceName: parsed.deviceName?.trim() || DEFAULT_SETTINGS.deviceName,
       autoRevealTty: parsed.autoRevealTty === true,
-      permissionDefault:
-        parsed.permissionDefault === "acceptEdits" || parsed.permissionDefault === "bypassPermissions"
-          ? parsed.permissionDefault
-          : "manual",
+      permissionDefault,
       theme: "night-corral",
+      defaultEffortIndex: Number.isFinite(effortRaw) ? Math.max(0, Math.min(3, Math.round(effortRaw))) : 1,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };

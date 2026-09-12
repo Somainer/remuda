@@ -7,6 +7,7 @@ import {
   DELEGATION_OPTIONS,
   PERMISSION_OPTIONS,
   PTY_YOLO_FLAGS,
+  YOLO_ACK,
   YOLO_HINT,
   normalizeDelegation,
   normalizePermissionMode,
@@ -14,9 +15,19 @@ import {
   ptyYoloHint,
   type DelegationId,
 } from "../lib/sessionOptions";
+import { readDeviceSettings } from "../features/settings";
+import {
+  effortAt,
+  effortCaps,
+  effortTable,
+  isEmberTier,
+  mapEffort,
+  type EffortKind,
+  type EffortSelection,
+} from "../features/session/effort";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
-import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst } from "../features/hosts";
+import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
 import { defaultGatewayProfile, fromHub, type ProviderProfile } from "../features/providers";
 import { api } from "../lib/api";
 import css from "./NewSessionPage.module.css";
@@ -34,16 +45,22 @@ const KINDS: { id: CreateKind; label: string }[] = [
 
 export function NewSessionPage() {
   const hub = useHub();
+  const hostViews = useHostViews(hub.hosts, hub.instances);
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const { mobile } = useWorkbenchViewport();
   const prefs = readNewSessionPrefs();
+  const device = readDeviceSettings();
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const [prompt, setPrompt] = useState("");
   const [hostId, setHostId] = useState(params.get("host") ?? prefs.hostId);
   const [workspaceId, setWorkspaceId] = useState(params.get("workspace") ?? prefs.workspaceId);
   const [model, setModel] = useState(prefs.model || "passthrough/auto");
-  const [permissionMode, setPermissionMode] = useState(normalizePermissionMode(prefs.permissionMode));
+  const [permissionMode, setPermissionMode] = useState(
+    normalizePermissionMode(prefs.permissionMode || device.permissionDefault),
+  );
+  const [yoloAck, setYoloAck] = useState(false);
+  const [effort, setEffort] = useState<EffortSelection>(() => effortAt("claude", device.defaultEffortIndex));
   const [delegation, setDelegation] = useState<DelegationId>(normalizeDelegation(prefs.delegation));
   const [kind, setKind] = useState<CreateKind>("claude");
   const [wantTty, setWantTty] = useState(false);
@@ -104,8 +121,9 @@ export function NewSessionPage() {
   );
   const hosts = pickerHosts;
   const workspaces = sortRecent(hostWorkspaces, prefs.recentWorkspaceIds);
-  const hostCli = cliSummary(host?.cli);
-  const supportedKinds = installedCli(host?.cli).map((entry) => entry.kind);
+  const hostView = hostViews.find((h) => h.id === hostId);
+  const hostCli = cliSummary(hostView?.cli ?? host?.cli);
+  const supportedKinds = installedCli(hostView?.cli ?? host?.cli).map((entry) => entry.kind);
   const kindEnabled = (id: CreateKind) =>
     id === "terminal" ? true : supportedKinds.length ? supportedKinds.includes(id) : id === "claude";
   const activeKind: CreateKind = kindEnabled(kind)
@@ -119,6 +137,7 @@ export function NewSessionPage() {
         ? "claude-print"
         : "claude-pty"
       : "generic-pty";
+  const sessionEffort = effort.kind === activeKind ? effort : mapEffort(effort, activeKind as EffortKind);
   const close = () => navigate("/sessions");
 
   return (
@@ -160,6 +179,8 @@ export function NewSessionPage() {
               claudeConfigDir: claudeConfigDir || undefined,
               maxBudgetUsd: maxBudgetUsd || undefined,
               name: name || worktree || (plainTerminal ? "terminal" : undefined),
+              effortIndex: sessionEffort.index,
+              effortName: sessionEffort.name,
             });
             rememberNewSessionSuccess({
               hostId,
@@ -168,6 +189,8 @@ export function NewSessionPage() {
               permissionMode,
               driver,
               delegation,
+              effortIndex: sessionEffort.index,
+              effortName: sessionEffort.name,
             });
             navigate(`/s/${instance.id}`);
           })()
@@ -306,7 +329,11 @@ export function NewSessionPage() {
                     className={`${css.choice} ${activeKind === k.id ? css.choiceOn : ""} ${kindEnabled(k.id) ? "" : css.choiceDisabled}`}
                     data-testid={`new-session-kind-${k.id}`}
                     disabled={!kindEnabled(k.id)}
-                    onClick={() => kindEnabled(k.id) && setKind(k.id)}
+                    onClick={() => {
+                      if (!kindEnabled(k.id)) return;
+                      setKind(k.id);
+                      setEffort((prev) => mapEffort(prev, k.id as EffortKind));
+                    }}
                   >
                     {k.label}
                   </button>
@@ -336,17 +363,17 @@ export function NewSessionPage() {
           </div>
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
             <legend className={css.label}>权限</legend>
-            <div className={css.seg}>
+            <div className={`${css.seg} ${css.permRow}`} data-testid="new-session-perm-row">
               {PERMISSION_OPTIONS.map((opt) => (
                 <button
                   key={opt.id}
                   type="button"
-                  className={`${css.choice} ${permissionMode === opt.id ? (opt.id === "bypassPermissions" ? css.choiceDust : css.choiceOn) : ""}`}
+                  className={`${css.choice} ${css.permChoice} ${permissionMode === opt.id ? (opt.id === "bypassPermissions" ? css.choiceDust : css.choiceOn) : ""}`}
                   data-testid={`new-session-perm-${opt.id}`}
                   onClick={() => setPermissionMode(opt.id)}
                 >
                   {opt.label}
-                  <span className={css.choiceId}>{opt.id === "bypassPermissions" ? "bypassPermissions" : opt.id}</span>
+                  <span className={css.choiceId}>{opt.id}</span>
                 </button>
               ))}
             </div>
@@ -355,6 +382,15 @@ export function NewSessionPage() {
                 <div className={css.yoloHead}>
                   <span className={css.yoloDot} />
                   <span className={css.yoloTitle}>yolo · 该会话不再产生任何审批</span>
+                  <label className={css.yoloAck}>
+                    <input
+                      type="checkbox"
+                      data-testid="new-session-yolo-ack"
+                      checked={yoloAck}
+                      onChange={(e) => setYoloAck(e.target.checked)}
+                    />
+                    {YOLO_ACK}
+                  </label>
                 </div>
                 <div className={css.yoloBody}>{YOLO_HINT}</div>
               </div>
@@ -379,6 +415,31 @@ export function NewSessionPage() {
               </div>
             ) : null}
           </fieldset>
+          {effortCaps(activeKind).effort ? (
+            <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }} data-testid="new-session-effort">
+              <legend className={css.label}>effort</legend>
+              <div className={`${css.seg} ${css.effortRow}`}>
+                {effortTable(activeKind).map((tier, index) => {
+                  const on = sessionEffort.index === index;
+                  const top = isEmberTier(activeKind, index);
+                  return (
+                    <button
+                      key={tier.name}
+                      type="button"
+                      className={`${css.choice} ${css.effortChoice} ${on ? css.choiceOn : ""} ${top ? css.choiceEmber : ""}`}
+                      data-testid={`new-session-effort-${tier.name}`}
+                      data-ember={top ? "1" : "0"}
+                      data-selected={on ? "1" : "0"}
+                      onClick={() => setEffort(effortAt(activeKind as EffortKind, index))}
+                    >
+                      {tier.name}
+                    </button>
+                  );
+                })}
+                <span className={css.hint}>写进 InstanceSpec，会话内可再改</span>
+              </div>
+            </fieldset>
+          ) : null}
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
             <legend className={css.label}>Provider / 鉴权</legend>
             <div className={css.seg}>

@@ -49,6 +49,9 @@ pub enum NodeError {
     /// JSON encoding or decoding failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// Node entity SQLite failed.
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     /// Socket, file, or listener I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

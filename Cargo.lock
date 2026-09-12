@@ -3091,6 +3091,8 @@ dependencies = [
  "remuda-hub",
  "remuda-journal",
  "remuda-protocol",
+ "remuda-testing",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

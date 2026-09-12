@@ -137,6 +137,10 @@ pub trait Driver: Send + Sync {
     }
     /// Execute one request inside the caller-owned bounded instance task.
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_>;
+    /// Durable launch recipe after [`Driver::start`], if the adapter produced one.
+    fn launch_recipe(&self) -> Option<remuda_driver::LaunchRecipe> {
+        None
+    }
 }
 
 /// Creates one stateful driver object for each Instance.

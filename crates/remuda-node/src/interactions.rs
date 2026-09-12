@@ -12,7 +12,7 @@ use remuda_protocol::{
     InteractionKind, InteractionRequest, InteractionRequestKey, InteractionState, NativeRequestKey,
     NativeRequestValueType, Observation, ObservationPayload, U64,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One pending Interaction as listed to Hub.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingInteraction {
     /// Public interaction identity (driver/journal id).
@@ -109,14 +109,20 @@ impl InteractionRuntime {
     pub fn spawn(store: Arc<dyn LocalStore>) -> Result<Arc<Self>, NodeError> {
         let (broker, mut broker_rx) = InteractionBroker::new(BrokerConfig::default())
             .map_err(|err| NodeError::Driver(err.to_string()))?;
+        let mut pending = HashMap::new();
+        let mut seen_native = HashSet::new();
+        for row in store.pending_interactions()? {
+            seen_native.insert(row.interaction_id.clone());
+            pending.insert(row.interaction_id.clone(), row);
+        }
         let runtime = Arc::new(Self {
             broker: Arc::clone(&broker),
             store,
             glue: Arc::new(Mutex::new(Glue {
-                pending: HashMap::new(),
+                pending,
                 native_to_broker: HashMap::new(),
                 broker_to_native: HashMap::new(),
-                seen_native: HashSet::new(),
+                seen_native,
             })),
         });
         let pump = Arc::clone(&runtime);
@@ -173,13 +179,18 @@ impl InteractionRuntime {
         glue.pending.insert(
             native.clone(),
             PendingInteraction {
-                interaction_id: native,
+                interaction_id: native.clone(),
                 instance_id: interaction.instance_id.clone(),
                 host_id: interaction.host_id.clone(),
                 kind: interaction.kind,
                 interaction,
             },
         );
+        let pending = glue.pending.get(&native).cloned();
+        drop(glue);
+        if let Some(pending) = pending {
+            self.store.put_pending_interaction(&pending)?;
+        }
         Ok(())
     }
 

@@ -29,6 +29,7 @@ futures.workspace = true
 remuda-driver.workspace = true
 remuda-journal.workspace = true
 remuda-protocol.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -41,5 +42,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 remuda-hub.workspace = true
+remuda-testing.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true

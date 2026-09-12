@@ -1,7 +1,7 @@
 //! Dispatch Hub `instance.*` RPCs into [`crate::DevNode`] and stream journals.
 
 use super::JournalSender;
-use crate::transport::hubnode::SeqWatermark;
+pub(crate) use crate::transport::hubnode::SeqWatermark;
 use crate::{CommandAction, CreateInstanceRequest, DevNode, InstanceCommandRequest, NodeError};
 use remuda_protocol::hubnode::{
     HubNodeMethod, InstanceCancelParams, InstanceCreateParams, InstanceRespondParams,

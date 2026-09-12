@@ -57,6 +57,12 @@ pub trait LocalStore: Send + Sync {
         completeness: Completeness,
         body: ObservationPayload,
     ) -> Result<Observation, NodeError>;
+    /// Commit an observation emitted by a native driver under Node-owned identities and sequence.
+    fn append_driver_observation(
+        &self,
+        instance_id: &InstanceId,
+        observation: Observation,
+    ) -> Result<Observation, NodeError>;
     /// Read a bounded page after an exclusive sequence.
     fn read_events(
         &self,
@@ -287,6 +293,34 @@ impl LocalStore for MemoryStore {
             let journal_event = JournalEvent::Instance(Box::new(event.clone()));
             record.events.push(journal_event.clone());
             (event, (record.events_tx.clone(), journal_event))
+        };
+        let _ = sender.0.send(sender.1);
+        Ok(event)
+    }
+
+    fn append_driver_observation(
+        &self,
+        instance_id: &InstanceId,
+        mut observation: Observation,
+    ) -> Result<Observation, NodeError> {
+        let (event, sender) = {
+            let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+            let record = state
+                .instances
+                .get_mut(instance_id)
+                .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+            let seq = U64(record.instance.durable_seq.0.saturating_add(1));
+            observation.event_id = EventId::new();
+            observation.journal_id = record.instance.journal_id.clone();
+            observation.instance_id = instance_id.clone();
+            observation.host_id = record.instance.host_id.clone();
+            observation.process_generation = record.instance.process_ref.process_generation;
+            observation.seq = seq;
+            record.instance.durable_seq = seq;
+            record.instance.meta.updated_at = observation.observed_at.clone();
+            let journal_event = JournalEvent::Instance(Box::new(observation.clone()));
+            record.events.push(journal_event.clone());
+            (observation, (record.events_tx.clone(), journal_event))
         };
         let _ = sender.0.send(sender.1);
         Ok(event)

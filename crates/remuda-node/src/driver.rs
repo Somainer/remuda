@@ -4,19 +4,37 @@ use crate::{NodeError, store::unknown};
 use remuda_protocol::{
     ContentBlock, ContentStatus, DriverKind, Id, Instance, Knowledge, LifecyclePayload,
     LifecycleTopic, MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
-    NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource, Severity, SourceChannel,
-    SourceCursor, SourceDelivery, TextBlock, U64,
+    NativeRequestKey, NodeMutation, Observation, ObservationPayload, ObservationSource, Severity,
+    SourceChannel, SourceCursor, SourceDelivery, TextBlock, U64,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
 };
+use tokio::sync::mpsc;
 
 /// Future returned by a driver operation without requiring an async-trait macro.
 pub type DriverFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<DriverEmission>, DriverError>> + Send + 'a>>;
+
+/// Future returned while establishing an instance-local native driver.
+pub type DriverStartFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<mpsc::Receiver<Observation>>, DriverError>> + Send + 'a>,
+>;
+
+/// Stable inputs supplied to a per-instance [`DriverFactory`].
+#[derive(Debug, Clone)]
+pub struct DriverLaunch {
+    /// Canonical Instance allocated by the Node.
+    pub instance: Instance,
+    /// User/Hub request retained for model, profile, and permission selection.
+    pub request: crate::CreateInstanceRequest,
+    /// Absolute workspace root selected by the local registry.
+    pub workspace_root: PathBuf,
+}
 
 /// One operation delivered to an instance-local driver task.
 #[derive(Debug, Clone)]
@@ -101,8 +119,20 @@ pub enum DriverError {
 pub trait Driver: Send + Sync {
     /// Driver kind registered by this implementation.
     fn kind(&self) -> DriverKind;
+    /// Establish the native process and return its unsolicited observation stream.
+    fn start(&self) -> DriverStartFuture<'_> {
+        Box::pin(async { Ok(None) })
+    }
     /// Execute one request inside the caller-owned bounded instance task.
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_>;
+}
+
+/// Creates one stateful driver object for each Instance.
+pub trait DriverFactory: Send + Sync {
+    /// Driver kind constructed by this factory.
+    fn kind(&self) -> DriverKind;
+    /// Build an unstarted instance-local driver.
+    fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError>;
 }
 
 /// Deterministic no-network driver for local API and Web integration.
@@ -180,10 +210,16 @@ impl Driver for FakeDriver {
     }
 }
 
-/// Thread-safe registry of local driver trait objects.
+#[derive(Clone)]
+enum Registration {
+    Shared(Arc<dyn Driver>),
+    Factory(Arc<dyn DriverFactory>),
+}
+
+/// Thread-safe registry of local driver implementations.
 #[derive(Clone, Default)]
 pub struct DriverRegistry {
-    drivers: Arc<RwLock<BTreeMap<DriverKind, Arc<dyn Driver>>>>,
+    drivers: Arc<RwLock<BTreeMap<DriverKind, Registration>>>,
 }
 
 impl DriverRegistry {
@@ -192,18 +228,40 @@ impl DriverRegistry {
         self.drivers
             .write()
             .map_err(|_| NodeError::StorePoisoned)?
-            .insert(driver.kind(), driver);
+            .insert(driver.kind(), Registration::Shared(driver));
         Ok(())
     }
 
-    /// Resolve one driver or fail closed when no adapter is registered.
-    pub fn get(&self, kind: DriverKind) -> Result<Arc<dyn Driver>, NodeError> {
+    /// Register or replace a per-instance driver factory.
+    pub fn register_factory(&self, factory: Arc<dyn DriverFactory>) -> Result<(), NodeError> {
         self.drivers
+            .write()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .insert(factory.kind(), Registration::Factory(factory));
+        Ok(())
+    }
+
+    /// Construct one driver or fail closed when no adapter is registered.
+    pub fn build(
+        &self,
+        kind: DriverKind,
+        launch: DriverLaunch,
+    ) -> Result<Arc<dyn Driver>, NodeError> {
+        let registration = self
+            .drivers
             .read()
             .map_err(|_| NodeError::StorePoisoned)?
             .get(&kind)
             .cloned()
-            .ok_or_else(|| NodeError::InvalidRequest(format!("driver {kind:?} is not registered")))
+            .ok_or_else(|| {
+                NodeError::InvalidRequest(format!("driver {kind:?} is not registered"))
+            })?;
+        match registration {
+            Registration::Shared(driver) => Ok(driver),
+            Registration::Factory(factory) => factory
+                .build(launch)
+                .map_err(|error| NodeError::Driver(error.to_string())),
+        }
     }
 
     /// Registry containing the default Claude print fake driver.

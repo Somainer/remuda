@@ -2,7 +2,8 @@
 
 use crate::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, Driver, DriverEmission,
-    DriverRegistry, DriverRequest, InstanceCommandRequest, LocalStore, MemoryStore, NodeError,
+    DriverLaunch, DriverRegistry, DriverRequest, InstanceCommandRequest, LocalStore, MemoryStore,
+    NodeError,
     store::{timestamp_now, unknown},
 };
 use remuda_protocol::{
@@ -111,7 +112,6 @@ impl DevNode {
         request: CreateInstanceRequest,
     ) -> Result<CreateInstanceResponse, NodeError> {
         let payload_digest = digest_json(&request)?;
-        let driver = self.inner.drivers.get(request.driver)?;
         validate_kind_driver(request.kind, request.driver)?;
         validate_text(&request.prompt, "prompt")?;
 
@@ -141,7 +141,29 @@ impl DevNode {
             workspace_id,
             request.driver,
         )?;
+        let driver = self.inner.drivers.build(
+            request.driver,
+            DriverLaunch {
+                instance: instance.clone(),
+                request: request.clone(),
+                workspace_root: self.inner.workspace.root_path.clone().into(),
+            },
+        )?;
         self.inner.store.insert_instance(instance)?;
+        let observations = match driver.start().await {
+            Ok(observations) => observations,
+            Err(error) => {
+                record_task_exit(
+                    self.inner.store.as_ref(),
+                    &instance_id,
+                    "native-driver-start-failed",
+                );
+                return Err(NodeError::Driver(error.to_string()));
+            }
+        };
+        if let Some(observations) = observations {
+            self.spawn_observation_pump(instance_id.clone(), observations);
+        }
         self.spawn_instance_worker(instance_id.clone(), driver)
             .await;
 
@@ -163,7 +185,7 @@ impl DevNode {
             &instance_id,
             None,
             "ready",
-            "fake-driver-started",
+            "driver-started",
         )?;
 
         let command = if request.prompt.is_empty() {
@@ -277,6 +299,27 @@ impl DevNode {
     /// Projection epoch shared by snapshots from this local Node process.
     pub fn projection_epoch(&self) -> Id {
         self.inner.projection_epoch.clone()
+    }
+
+    fn spawn_observation_pump(
+        &self,
+        instance_id: InstanceId,
+        mut observations: mpsc::Receiver<remuda_protocol::Observation>,
+    ) {
+        let store = self.inner.store.clone();
+        tokio::spawn(async move {
+            while let Some(observation) = observations.recv().await {
+                if let Err(error) = store.append_driver_observation(&instance_id, observation) {
+                    tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
+                    record_task_exit(
+                        store.as_ref(),
+                        &instance_id,
+                        "native-observation-commit-failed",
+                    );
+                    break;
+                }
+            }
+        });
     }
 
     async fn spawn_instance_worker(&self, instance_id: InstanceId, driver: Arc<dyn Driver>) {

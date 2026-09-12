@@ -21,7 +21,8 @@ pub use carrier::{
 };
 pub use config::{DEFAULT_DEV_PORT, DevServerConfig};
 pub use driver::{
-    Driver, DriverEmission, DriverError, DriverFuture, DriverRegistry, DriverRequest, FakeDriver,
+    Driver, DriverEmission, DriverError, DriverFactory, DriverFuture, DriverLaunch, DriverRegistry,
+    DriverRequest, DriverStartFuture, FakeDriver,
 };
 pub use error::NodeError;
 pub use identity::load_or_create_host_id;

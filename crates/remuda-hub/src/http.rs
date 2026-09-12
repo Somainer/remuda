@@ -104,11 +104,6 @@ pub fn routes() -> Router<crate::AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/login", post(login))
-        .route("/v1/hosts", get(list_hosts))
-        .route("/v1/instances", get(list_instances).post(create_instance))
-        .route("/v1/instances/{id}", get(get_instance))
-        .route("/v1/instances/{id}/commands", post(post_command))
-        .route("/v1/instances/{id}/journal", get(get_journal))
         .route("/v1/worktrees", get(list_worktrees).post(create_worktree))
 }
 

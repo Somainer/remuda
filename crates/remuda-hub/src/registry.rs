@@ -13,7 +13,7 @@ use axum::routing::get;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Host registry routes. `GET /v1/hosts` stays on `http::routes`.
+/// Registry routes composed by the host feature router.
 pub fn routes() -> Router<AppState> {
     Router::new().route("/v1/hosts/{id}", get(get_host).patch(patch_host))
 }

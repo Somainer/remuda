@@ -4,11 +4,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use remuda_codex_wire::{
-    AskForApproval, AskForApprovalMode, CodexAppServer, CommandExecutionApprovalDecision,
-    CommandExecutionApprovalNamed, CommandExecutionRequestApprovalResponse, Inbound,
-    ModelListParams, SandboxMode, ServerNotification, ServerRequest, SpawnSpec, ThreadListParams,
-    ThreadReadParams, ThreadResumeParams, ThreadStartParams, TurnStartParams,
-    TypedServerNotification, TypedServerRequest, UserInput, WireError,
+    AskForApproval, AskForApprovalMode, CodexAppServer, Inbound, SandboxMode, ServerNotification,
+    SpawnSpec, ThreadStartParams, TurnInterruptParams, TurnStartParams, TypedServerNotification,
+    UserInput,
 };
 use tokio::time::timeout;
 
@@ -33,60 +31,13 @@ fn spec() -> SpawnSpec {
     spec
 }
 
-async fn next_typed(
-    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
-) -> ServerNotification {
-    loop {
-        match timeout(Duration::from_secs(5), inbound.recv())
-            .await
-            .expect("inbound timeout")
-            .expect("inbound closed")
-        {
-            Inbound::Notification(notification) => return notification,
-            Inbound::NonJson(_) | Inbound::UnknownFrame(_) => continue,
-            Inbound::ServerRequest(request) => {
-                panic!("unexpected server request while waiting for notification: {request:?}")
-            }
-        }
-    }
-}
-
 #[tokio::test]
-async fn not_initialized_before_handshake() {
-    let (client, _inbound) = CodexAppServer::spawn_uninitialized(spec())
-        .await
-        .expect("spawn stub");
-    let error = client
-        .peer()
-        .request::<_, serde_json::Value>("thread/list", serde_json::json!({"limit":1}))
-        .await
-        .expect_err("must fail");
-    match error {
-        WireError::Rpc { code, message, .. } => {
-            assert_eq!(code, -32600);
-            assert!(message.contains("Not initialized"));
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn handshake_thread_turn_and_model_list() {
+async fn spawn_handshake_thread_turn_interrupt() {
     let (mut client, mut inbound) = CodexAppServer::spawn(spec())
         .await
         .expect("spawn+handshake");
     let init = client.initialize_result().expect("initialize");
     assert_eq!(init.codex_home, "/tmp/fake-codex-home");
-
-    let models = client
-        .model_list(ModelListParams {
-            limit: Some(10),
-            cursor: None,
-            include_hidden: Some(false),
-        })
-        .await
-        .expect("model/list");
-    assert_eq!(models.data[0].id, "gpt-5.6-sol");
 
     let started = client
         .thread_start(ThreadStartParams {
@@ -94,7 +45,6 @@ async fn handshake_thread_turn_and_model_list() {
             cwd: Some("/tmp".into()),
             approval_policy: Some(AskForApproval::Named(AskForApprovalMode::Never)),
             sandbox: Some(SandboxMode::WorkspaceWrite),
-            personality: None,
             service_name: Some("remuda".into()),
             ..ThreadStartParams::default()
         })
@@ -103,75 +53,9 @@ async fn handshake_thread_turn_and_model_list() {
     let thread_id = started.thread.id.clone();
 
     let turn = client
-        .turn_start(TurnStartParams::text(&thread_id, "Reply with exactly OK"))
-        .await
-        .expect("turn/start");
-    assert_eq!(turn.turn.status, remuda_codex_wire::TurnStatus::InProgress);
-
-    let mut completed = false;
-    for _ in 0..20 {
-        if let ServerNotification::Typed(TypedServerNotification::TurnCompleted(done)) =
-            next_typed(&mut inbound).await
-        {
-            assert_eq!(done.turn.status, remuda_codex_wire::TurnStatus::Completed);
-            completed = true;
-            break;
-        }
-    }
-    assert!(completed, "expected turn/completed");
-
-    let listed = client
-        .thread_list(ThreadListParams {
-            limit: Some(10),
-            cwd: Some(remuda_codex_wire::ThreadListCwdFilter::One("/tmp".into())),
-            source_kinds: Some(vec![
-                remuda_codex_wire::ThreadSourceKind::AppServer,
-                remuda_codex_wire::ThreadSourceKind::Cli,
-                remuda_codex_wire::ThreadSourceKind::Vscode,
-                remuda_codex_wire::ThreadSourceKind::Exec,
-            ]),
-            ..ThreadListParams::default()
-        })
-        .await
-        .expect("thread/list");
-    assert_eq!(listed.data[0].id, thread_id);
-
-    let read = client
-        .thread_read(ThreadReadParams {
-            thread_id: thread_id.clone(),
-            include_turns: false,
-        })
-        .await
-        .expect("thread/read");
-    assert_eq!(read.thread.id, thread_id);
-
-    let resumed = client
-        .thread_resume(ThreadResumeParams {
-            thread_id: thread_id.clone(),
-            exclude_turns: true,
-            model: Some("gpt-5.6-sol".into()),
-            cwd: Some("/tmp".into()),
-            approval_policy: None,
-            sandbox: None,
-        })
-        .await
-        .expect("thread/resume");
-    assert_eq!(resumed.thread.id, thread_id);
-
-    client.kill().await.expect("kill");
-}
-
-#[tokio::test]
-async fn server_request_reply_is_id_result_only() {
-    let (client, mut inbound) = CodexAppServer::spawn(spec()).await.expect("spawn");
-    let started = client
-        .thread_start(ThreadStartParams::default())
-        .await
-        .expect("thread/start");
-    client
         .turn_start(TurnStartParams {
-            thread_id: started.thread.id.clone(),
-            input: vec![UserInput::text("NEED_APPROVAL")],
+            thread_id: thread_id.clone(),
+            input: vec![UserInput::text("SLOW")],
             model: None,
             effort: None,
             summary: None,
@@ -180,65 +64,36 @@ async fn server_request_reply_is_id_result_only() {
         })
         .await
         .expect("turn/start");
+    assert_eq!(turn.turn.status, remuda_codex_wire::TurnStatus::InProgress);
 
-    let request = loop {
-        match timeout(Duration::from_secs(5), inbound.recv())
-            .await
-            .expect("timeout")
-            .expect("closed")
-        {
-            Inbound::ServerRequest(request) => break request,
-            Inbound::Notification(_) | Inbound::NonJson(_) | Inbound::UnknownFrame(_) => {}
-        }
-    };
-    let ServerRequest::Typed(TypedServerRequest::CommandExecutionApproval { id, params }) = request
-    else {
-        panic!("expected command approval, got {request:?}");
-    };
-    assert_eq!(params.command.as_deref(), Some("echo hi"));
     client
-        .reply_result(
-            id,
-            CommandExecutionRequestApprovalResponse {
-                decision: CommandExecutionApprovalDecision::Named(
-                    CommandExecutionApprovalNamed::Accept,
-                ),
-            },
-        )
-        .await
-        .expect("reply");
-
-    let mut completed = false;
-    for _ in 0..20 {
-        if let ServerNotification::Typed(TypedServerNotification::TurnCompleted(_)) =
-            next_typed(&mut inbound).await
-        {
-            completed = true;
-            break;
-        }
-    }
-    assert!(completed);
-}
-
-#[tokio::test]
-async fn steer_without_active_turn_is_rpc_error() {
-    let (client, _inbound) = CodexAppServer::spawn(spec()).await.expect("spawn");
-    let started = client
-        .thread_start(ThreadStartParams::default())
-        .await
-        .expect("thread/start");
-    let error = client
-        .turn_steer(remuda_codex_wire::TurnSteerParams {
-            thread_id: started.thread.id,
-            expected_turn_id: "missing".into(),
-            input: vec![UserInput::text("ignore")],
+        .turn_interrupt(TurnInterruptParams {
+            thread_id,
+            turn_id: turn.turn.id,
         })
         .await
-        .expect_err("steer");
-    match error {
-        WireError::Rpc { message, .. } => {
-            assert!(message.contains("no active turn to steer"));
+        .expect("turn/interrupt");
+
+    let mut interrupted = false;
+    for _ in 0..20 {
+        match timeout(Duration::from_secs(5), inbound.recv())
+            .await
+            .expect("inbound timeout")
+            .expect("inbound closed")
+        {
+            Inbound::Notification(ServerNotification::Typed(
+                TypedServerNotification::TurnCompleted(done),
+            )) => {
+                assert_eq!(done.turn.status, remuda_codex_wire::TurnStatus::Interrupted);
+                interrupted = true;
+                break;
+            }
+            Inbound::Notification(_)
+            | Inbound::NonJson(_)
+            | Inbound::UnknownFrame(_)
+            | Inbound::ServerRequest(_) => {}
         }
-        other => panic!("{other:?}"),
     }
+    assert!(interrupted, "expected turn/completed interrupted");
+    client.kill().await.expect("kill");
 }

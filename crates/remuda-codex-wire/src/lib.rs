@@ -1,12 +1,9 @@
 //! Codex app-server JSON-RPC client over stdin/stdout NDJSON.
 //!
-//! Native frames omit `"jsonrpc":"2.0"`. The default spawn is
-//! `codex app-server --listen stdio://` with an absolute binary path.
-//! `unix://` is **WebSocket over UDS**, not JSONL; this crate rejects it.
-//!
-//! `codex-app-server-protocol` is not a dependency: that crate pulls `rmcp`,
-//! `zstd`, and several `codex-*` workspace packages. Types here are the subset
-//! Remuda uses, taken from the 0.154.0 schema and stdio probe.
+//! D-013 freeze: spawn, `initialize`/`initialized`, `thread/start`,
+//! `turn/start`, typed notifications, and `turn/interrupt`. Native frames omit
+//! `"jsonrpc":"2.0"`. `thread/resume`, `model/list`, daemon, and `unix://`/`ws://`
+//! are out of scope.
 
 #![allow(clippy::large_enum_variant)]
 
@@ -29,7 +26,7 @@ pub use notification::{
     TypedServerNotification, WarningNotification,
 };
 pub use peer::JsonRpcPeer;
-pub use process::{CodexAppServer, Listen, SpawnSpec};
+pub use process::{CodexAppServer, SpawnSpec};
 pub use rpc::{
     DEFAULT_MAX_LINE_BYTES, Inbound, JsonRpcError, JsonRpcErrorBody, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, RequestId, WireFrame, encode_line,
@@ -42,12 +39,9 @@ pub use server_request::{
 };
 pub use types::{
     ActivePermissionProfile, ApprovalsReviewer, AskForApproval, AskForApprovalMode, ClientInfo,
-    InitializeCapabilities, InitializeParams, InitializeResponse, MessagePhase, Model,
-    ModelListParams, ModelListResponse, Personality, ReasoningEffortOption, ReasoningSummary,
-    SandboxMode, SandboxPolicy, Thread, ThreadEnvironment, ThreadItem, ThreadListCwdFilter,
-    ThreadListParams, ThreadListResponse, ThreadReadParams, ThreadReadResponse, ThreadResumeParams,
-    ThreadResumeResponse, ThreadSourceKind, ThreadStartParams, ThreadStartResponse, ThreadStatus,
-    ThreadTokenUsage, TokenUsageBreakdown, Turn, TurnInterruptParams, TurnInterruptResponse,
-    TurnItemsView, TurnStartParams, TurnStartResponse, TurnStatus, TurnSteerParams,
-    TurnSteerResponse, TypedThreadItem, UserInput,
+    InitializeCapabilities, InitializeParams, InitializeResponse, MessagePhase, Personality,
+    ReasoningSummary, SandboxMode, SandboxPolicy, Thread, ThreadEnvironment, ThreadItem,
+    ThreadStartParams, ThreadStartResponse, ThreadStatus, ThreadTokenUsage, TokenUsageBreakdown,
+    Turn, TurnInterruptParams, TurnInterruptResponse, TurnItemsView, TurnStartParams,
+    TurnStartResponse, TurnStatus, TypedThreadItem, UserInput,
 };

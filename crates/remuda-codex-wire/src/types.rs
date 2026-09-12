@@ -1,9 +1,7 @@
-//! Hand-written Codex app-server types for the methods Remuda actually calls.
+//! Hand-written Codex app-server types for the D-013 frozen surface.
 //!
-//! `codex-app-server-protocol` was evaluated as a git dependency and rejected:
-//! it pulls `rmcp`, `zstd`, and a cluster of `codex-*` workspace crates. These
-//! structs cover initialize, thread/turn/model RPCs, and the item shapes seen
-//! in the 0.154.0 stdio probe.
+//! Covered RPCs: `initialize`, `thread/start`, `turn/start`, `turn/interrupt`.
+//! `thread/resume`, `model/list`, and unix/ws listens are out of scope.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -701,26 +699,6 @@ pub struct TurnStartResponse {
     pub turn: Turn,
 }
 
-/// `turn/steer` params. `expected_turn_id` is required and must be the active turn.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnSteerParams {
-    /// Thread id.
-    pub thread_id: String,
-    /// Active turn precondition.
-    pub expected_turn_id: String,
-    /// Additional input.
-    pub input: Vec<UserInput>,
-}
-
-/// `turn/steer` result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnSteerResponse {
-    /// Turn id that was steered.
-    pub turn_id: String,
-}
-
 /// `turn/interrupt` params.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -734,232 +712,6 @@ pub struct TurnInterruptParams {
 /// `turn/interrupt` result is an empty object. RPC success is not turn completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TurnInterruptResponse {}
-
-/// `thread/list` cwd filter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ThreadListCwdFilter {
-    /// Single path.
-    One(String),
-    /// Any of these paths.
-    Many(Vec<String>),
-}
-
-/// Source kinds. Default list is interactive (`cli`, `vscode`); app-server threads
-/// are `vscode` unless `--session-source` is changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThreadSourceKind {
-    /// CLI.
-    #[serde(rename = "cli")]
-    Cli,
-    /// VS Code / default app-server source.
-    #[serde(rename = "vscode")]
-    Vscode,
-    /// `codex exec`.
-    #[serde(rename = "exec")]
-    Exec,
-    /// Explicit app-server source.
-    #[serde(rename = "appServer")]
-    AppServer,
-    /// Sub-agent.
-    #[serde(rename = "subAgent")]
-    SubAgent,
-    /// Other documented kinds pass through as [`ThreadSourceKind::Unknown`].
-    #[serde(other)]
-    Unknown,
-}
-
-/// `thread/list` params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadListParams {
-    /// Page size.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    /// Pagination cursor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-    /// Cwd filter.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<ThreadListCwdFilter>,
-    /// Source filter. Include `vscode` to see default app-server threads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_kinds: Option<Vec<ThreadSourceKind>>,
-}
-
-/// `thread/list` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadListResponse {
-    /// Page of threads.
-    #[serde(default)]
-    pub data: Vec<Thread>,
-    /// Next cursor.
-    #[serde(default)]
-    pub next_cursor: Option<String>,
-    /// Backwards cursor.
-    #[serde(default)]
-    pub backwards_cursor: Option<String>,
-}
-
-/// `thread/read` params.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadReadParams {
-    /// Thread id.
-    pub thread_id: String,
-    /// Full-history hydration. Deprecated for paginated threads.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub include_turns: bool,
-}
-
-/// `thread/read` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadReadResponse {
-    /// Thread snapshot.
-    pub thread: Thread,
-}
-
-/// `thread/resume` params.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadResumeParams {
-    /// Thread id to load.
-    pub thread_id: String,
-    /// Skip populating `thread.turns`. Preferred for paginated threads.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exclude_turns: bool,
-    /// Model override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Cwd override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    /// Approval policy override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<AskForApproval>,
-    /// Request sandbox override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<SandboxMode>,
-}
-
-/// `thread/resume` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadResumeResponse {
-    /// Loaded thread.
-    pub thread: Thread,
-    /// Resolved model.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Provider.
-    #[serde(default)]
-    pub model_provider: Option<String>,
-    /// Service tier.
-    #[serde(default)]
-    pub service_tier: Option<String>,
-    /// Cwd.
-    #[serde(default)]
-    pub cwd: Option<String>,
-    /// Workspace roots.
-    #[serde(default)]
-    pub runtime_workspace_roots: Vec<String>,
-    /// Approval policy.
-    #[serde(default)]
-    pub approval_policy: Option<AskForApproval>,
-    /// Reviewer.
-    #[serde(default)]
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
-    /// Sandbox object.
-    #[serde(default)]
-    pub sandbox: Option<SandboxPolicy>,
-    /// Active profile.
-    #[serde(default)]
-    pub active_permission_profile: Option<ActivePermissionProfile>,
-    /// Effort.
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-    /// Cursor for `thread/turns/list` descending.
-    #[serde(default)]
-    pub turns_backwards_cursor: Option<String>,
-    /// Cursor for `thread/items/list` descending.
-    #[serde(default)]
-    pub items_backwards_cursor: Option<String>,
-}
-
-/// `model/list` params.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelListParams {
-    /// Page size.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u32>,
-    /// Pagination cursor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-    /// Include hidden catalog entries.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub include_hidden: Option<bool>,
-}
-
-/// One advertised reasoning effort.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReasoningEffortOption {
-    /// Effort id (`low`, `medium`, …). Preserve catalog order; do not resorted.
-    pub reasoning_effort: String,
-    /// Human description.
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-/// Catalog model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Model {
-    /// Model id.
-    pub id: String,
-    /// Underlying model slug.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Display name.
-    #[serde(default)]
-    pub display_name: Option<String>,
-    /// Description.
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Hidden from the default picker.
-    #[serde(default)]
-    pub hidden: bool,
-    /// User/config default.
-    #[serde(default)]
-    pub is_default: bool,
-    /// Advertised efforts in catalog order.
-    #[serde(default)]
-    pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
-    /// Default effort.
-    #[serde(default)]
-    pub default_reasoning_effort: Option<String>,
-    /// Input modalities.
-    #[serde(default)]
-    pub input_modalities: Vec<String>,
-    /// Multi-agent version (`v1` / `v2`).
-    #[serde(default)]
-    pub multi_agent_version: Option<String>,
-}
-
-/// `model/list` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelListResponse {
-    /// Page of models.
-    #[serde(default)]
-    pub data: Vec<Model>,
-    /// Next cursor.
-    #[serde(default)]
-    pub next_cursor: Option<String>,
-}
 
 /// Token usage breakdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -985,7 +737,7 @@ pub struct TokenUsageBreakdown {
     pub reasoning_output_tokens: i64,
 }
 
-/// Thread usage snapshot. Resume replays the same cumulative totals.
+/// Thread usage snapshot from `thread/tokenUsage/updated`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadTokenUsage {

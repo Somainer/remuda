@@ -239,6 +239,8 @@ for raw in sys.stdin:
                 "completedAtMs": 1,
             },
         )
+        if prompt == "SLOW":
+            continue
         if prompt == "NEED_APPROVAL":
             approval_id += 1
             send(

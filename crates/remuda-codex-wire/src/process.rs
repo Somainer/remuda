@@ -12,26 +12,12 @@ use crate::error::WireError;
 use crate::peer::{JsonRpcPeer, spawn_buf_reader};
 use crate::rpc::{DEFAULT_MAX_LINE_BYTES, Inbound, RequestId};
 use crate::types::{
-    ClientInfo, InitializeCapabilities, InitializeParams, InitializeResponse, ModelListParams,
-    ModelListResponse, ThreadListParams, ThreadListResponse, ThreadReadParams, ThreadReadResponse,
-    ThreadResumeParams, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse,
-    TurnInterruptParams, TurnInterruptResponse, TurnStartParams, TurnStartResponse,
-    TurnSteerParams, TurnSteerResponse,
+    ClientInfo, InitializeCapabilities, InitializeParams, InitializeResponse, ThreadStartParams,
+    ThreadStartResponse, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
+    TurnStartResponse,
 };
 
-/// How the child should listen. Only stdio JSONL is implemented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Listen {
-    /// `codex app-server --listen stdio://` — NDJSON on stdin/stdout.
-    #[default]
-    Stdio,
-    /// `unix://` is WebSocket-over-UDS, not JSONL. Rejected at spawn.
-    Unix,
-    /// Experimental `ws://` TCP. Rejected at spawn.
-    Ws,
-}
-
-/// Launch recipe for one app-server child.
+/// Launch recipe for one app-server child. Always `--listen stdio://`.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
     /// Absolute path of the `codex` binary. Relative paths are rejected.
@@ -54,8 +40,6 @@ pub struct SpawnSpec {
     pub extra_env: Vec<(String, String)>,
     /// Extra argv after the standard app-server flags.
     pub extra_args: Vec<String>,
-    /// Listen transport. Only [`Listen::Stdio`] is supported.
-    pub listen: Listen,
     /// `initialize` clientInfo. Defaults to product name `remuda`.
     pub client_info: ClientInfo,
     /// `initialize` capabilities.
@@ -81,7 +65,6 @@ impl SpawnSpec {
             disable_hooks: false,
             extra_env: Vec::new(),
             extra_args: Vec::new(),
-            listen: Listen::Stdio,
             client_info: ClientInfo::default(),
             capabilities: InitializeCapabilities::default(),
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
@@ -110,9 +93,6 @@ impl SpawnSpec {
     }
 
     fn argv(&self) -> Result<Vec<String>, WireError> {
-        if self.listen != Listen::Stdio {
-            return Err(WireError::UnsupportedListen);
-        }
         let mut argv = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
         if self.disable_hooks {
             argv.push("--disable".into());
@@ -273,15 +253,6 @@ impl CodexAppServer {
         self.peer.request("turn/start", params).await
     }
 
-    /// Typed `turn/steer`. Fails with native `-32600` when no turn is active.
-    pub async fn turn_steer(
-        &self,
-        params: TurnSteerParams,
-    ) -> Result<TurnSteerResponse, WireError> {
-        self.require_init()?;
-        self.peer.request("turn/steer", params).await
-    }
-
     /// Typed `turn/interrupt`. Success means the interrupt was accepted, not that
     /// the turn has ended.
     pub async fn turn_interrupt(
@@ -290,42 +261,6 @@ impl CodexAppServer {
     ) -> Result<TurnInterruptResponse, WireError> {
         self.require_init()?;
         self.peer.request("turn/interrupt", params).await
-    }
-
-    /// Typed `thread/list`.
-    pub async fn thread_list(
-        &self,
-        params: ThreadListParams,
-    ) -> Result<ThreadListResponse, WireError> {
-        self.require_init()?;
-        self.peer.request("thread/list", params).await
-    }
-
-    /// Typed `thread/read`.
-    pub async fn thread_read(
-        &self,
-        params: ThreadReadParams,
-    ) -> Result<ThreadReadResponse, WireError> {
-        self.require_init()?;
-        self.peer.request("thread/read", params).await
-    }
-
-    /// Typed `thread/resume`. Prefer `exclude_turns: true` for paginated threads.
-    pub async fn thread_resume(
-        &self,
-        params: ThreadResumeParams,
-    ) -> Result<ThreadResumeResponse, WireError> {
-        self.require_init()?;
-        self.peer.request("thread/resume", params).await
-    }
-
-    /// Typed `model/list`.
-    pub async fn model_list(
-        &self,
-        params: ModelListParams,
-    ) -> Result<ModelListResponse, WireError> {
-        self.require_init()?;
-        self.peer.request("model/list", params).await
     }
 
     /// Reply to a server→client request with `{id, result}` and no `method`.
@@ -408,12 +343,5 @@ mod tests {
                 "approval_policy=\"never\"",
             ]
         );
-    }
-
-    #[test]
-    fn unix_listen_is_rejected() {
-        let mut spec = SpawnSpec::new("/usr/bin/codex".into(), "/tmp".into()).expect("abs");
-        spec.listen = Listen::Unix;
-        assert!(matches!(spec.argv(), Err(WireError::UnsupportedListen)));
     }
 }

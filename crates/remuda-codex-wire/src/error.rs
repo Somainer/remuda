@@ -10,11 +10,6 @@ pub enum WireError {
     /// `SpawnSpec.binary` was relative; the path must be pinned absolutely.
     #[error("codex binary path must be absolute: {}", .0.display())]
     RelativeBinary(PathBuf),
-    /// `unix://` / `ws://` were requested. Those transports are WebSocket, not JSONL.
-    #[error(
-        "only --listen stdio:// is supported; unix:// is WebSocket-over-UDS (not JSONL) and ws:// is experimental TCP"
-    )]
-    UnsupportedListen,
     /// A `-c` override contained a double quote and would break TOML-on-argv quoting.
     #[error("config override must not contain double quotes: {0}")]
     InvalidConfigOverride(String),

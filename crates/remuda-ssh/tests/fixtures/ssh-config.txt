@@ -1,0 +1,22 @@
+# Synthetic ~/.ssh/config derived from docs/research/remote-topology.md §A.1 (2026-09-12).
+Include ssh-config.d/extra
+
+Host 10.*
+  User nobody
+
+Host devbox devbox-sg
+  User devuser
+  Port 36041
+
+Host jump-proxy-*
+  User jump
+
+Host forge-doloris
+  User root
+  ProxyJump jump-proxy-us.tiktok-row.org
+
+Host devbox-sg-host
+  HostName 10.199.x.x
+
+Host *
+  IdentitiesOnly yes

@@ -1,0 +1,7 @@
+# Source: ssh -G forge-doloris, 2026-09-12 (docs/research/remote-topology.md).
+# HostName redacted. proxyjump is present; user line originally included a trailing comment.
+user root              # 开发机卡片 SSH 命令对应的 User
+hostname 10.102.x.x
+port 22
+proxyjump jump-proxy-us.tiktok-row.org
+identityfile ~/.ssh/id_ed25519

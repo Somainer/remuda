@@ -2,6 +2,8 @@
 
 use clap::{Parser, Subcommand};
 
+mod cmd;
+
 /// Hub–Node wire protocol major; matches `remuda_protocol::PROTOCOL_VERSION.major`.
 const WIRE_MAJOR: u16 = 1;
 /// SQLite schema major. `0` until the first Hub/Node migration ships.
@@ -26,6 +28,8 @@ enum Command {
     Dev,
     /// Print semver, commit, rustc, target, and wire/schema majors.
     Version,
+    /// SSH remote hosts: list, probe, bootstrap, and stdio node.
+    Ssh(cmd::ssh::SshArgs),
 }
 
 fn version_text() -> String {
@@ -54,6 +58,12 @@ fn main() {
         Command::Version => {
             print!("{}", version_text());
         }
+        Command::Ssh(args) => {
+            if let Err(error) = cmd::ssh::run_blocking(args) {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -72,6 +82,7 @@ mod tests {
         assert!(names.contains(&"dev".to_string()));
         assert!(names.contains(&"hub".to_string()));
         assert!(names.contains(&"node".to_string()));
+        assert!(names.contains(&"ssh".to_string()));
     }
 
     #[test]

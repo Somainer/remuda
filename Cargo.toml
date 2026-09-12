@@ -10,6 +10,7 @@ members = [
     "crates/remuda-journal",
     "crates/remuda-push",
     "crates/remuda-node",
+    "crates/remuda-ssh",
     "crates/remuda-hub",
     "crates/remuda-feishu",
     "crates/remuda-testing",
@@ -55,10 +56,10 @@ remuda-driver = { path = "crates/remuda-driver" }
 remuda-journal = { path = "crates/remuda-journal" }
 remuda-push = { path = "crates/remuda-push" }
 remuda-node = { path = "crates/remuda-node" }
+remuda-ssh = { path = "crates/remuda-ssh" }
 remuda-hub = { path = "crates/remuda-hub" }
 remuda-feishu = { path = "crates/remuda-feishu" }
 remuda-testing = { path = "crates/remuda-testing" }
-remuda-ssh = { path = "crates/remuda-ssh" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

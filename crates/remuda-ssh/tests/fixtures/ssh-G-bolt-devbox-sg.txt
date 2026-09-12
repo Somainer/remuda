@@ -1,0 +1,9 @@
+# Source: ssh -G devbox-sg, 2026-09-12 (docs/research/remote-topology.md).
+# HostName redacted to 10.199.x.x. Unused OpenSSH keywords omitted.
+user devuser
+hostname 10.199.x.x
+port 34387
+identityfile ~/.ssh/id_rsa
+identityfile ~/.ssh/id_ecdsa
+identityfile ~/.ssh/id_ed25519
+controlmaster false

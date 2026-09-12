@@ -1,0 +1,29 @@
+[package]
+name = "remuda-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "SSH remote transport: OpenSSH stdio carrier, bootstrap, and host probe."
+
+[lints]
+workspace = true
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio-tungstenite.workspace = true

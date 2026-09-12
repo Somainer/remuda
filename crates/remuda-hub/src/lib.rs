@@ -9,6 +9,7 @@
 
 #![allow(missing_docs)] // handler types; public API is documented below.
 
+pub mod agent_approvals;
 mod alerts;
 mod auth;
 mod config;
@@ -76,6 +77,7 @@ pub struct AppState {
     followers: Followers,
     blocked: BlockedWatch,
     auth_limits: rate_limit::AuthRateLimits,
+    agent_approvals: agent_approvals::AgentApprovals,
 }
 
 /// A bound Hub that shuts down when dropped.
@@ -240,6 +242,7 @@ async fn spawn_inner(
         followers: Followers::default(),
         blocked: BlockedWatch::default(),
         auth_limits: rate_limit::AuthRateLimits::default(),
+        agent_approvals: agent_approvals::AgentApprovals::new()?,
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     let reaper_store = store.clone();

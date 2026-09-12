@@ -61,6 +61,24 @@ pub async fn list_interactions(
         .into_iter()
         .map(|row| row.to_list_item())
         .collect();
+    items.extend(
+        state
+            .agent_approvals
+            .list()
+            .await
+            .into_iter()
+            .filter(|item| {
+                query
+                    .host_id
+                    .as_deref()
+                    .is_none_or(|host| item["hostId"] == host)
+                    && query
+                        .instance_id
+                        .as_deref()
+                        .is_none_or(|id| item["instanceId"] == id)
+                    && query.kind.as_deref().is_none_or(|kind| kind == "approval")
+            }),
+    );
     let mut seen: HashSet<String> = items
         .iter()
         .filter_map(|item| {
@@ -142,6 +160,18 @@ pub async fn answer_interaction(
         None => CommandId::new(),
     };
     let by_device = Id::try_from(device.id).map_err(|err| HubError::Internal(err.to_string()))?;
+    if let Some(result) = state
+        .agent_approvals
+        .answer(
+            &interaction_id,
+            body.answer.clone(),
+            by_device.clone(),
+            command_id.clone(),
+        )
+        .await?
+    {
+        return Ok(Json(result));
+    }
     let stored = state
         .store
         .get_interaction(interaction_id.as_id().as_str().to_string())

@@ -15,6 +15,11 @@ pub enum HubError {
     /// Origin/Host mismatch or insufficient scope.
     #[error("forbidden")]
     Forbidden,
+    /// Agent operation is held until a human approves this exact action.
+    #[error(
+        "human approval required; answer interaction {interaction_id}, then retry with approvalId"
+    )]
+    ApprovalRequired { interaction_id: String },
     /// Target does not exist.
     #[error("not found")]
     NotFound,
@@ -64,6 +69,7 @@ impl HubError {
         match self {
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::ApprovalRequired { .. } => StatusCode::CONFLICT,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -81,6 +87,7 @@ impl HubError {
         match self {
             Self::Unauthenticated => "UNAUTHENTICATED",
             Self::Forbidden => "FORBIDDEN",
+            Self::ApprovalRequired { .. } => "HUMAN_APPROVAL_REQUIRED",
             Self::NotFound => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Conflict(_) => "COMMAND_ID_CONFLICT",
@@ -101,6 +108,9 @@ impl IntoResponse for HubError {
             "error": self.to_string(),
             "code": self.code(),
         });
+        if let Self::ApprovalRequired { interaction_id } = &self {
+            body["interactionId"] = json!(interaction_id);
+        }
         if let Self::Unsatisfiable { reasons } | Self::ProviderNotConfigured { reasons } = &self
             && let Some(obj) = body.as_object_mut()
         {

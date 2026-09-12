@@ -56,4 +56,5 @@ claude -p "$PROMPT" \
 
 Replace `command` in the JSON with an absolute `remuda` binary when `PATH` is
 empty (Claude `--print` often is). Do not put the bootstrap token in the prompt.
-Coordinator workflow: `skills/remuda/SKILL.md`.
+Coordinator workflow: `skills/remuda/SKILL.md`. Merging agent branches with
+gates: [`coordinator-guide.md`](./coordinator-guide.md).

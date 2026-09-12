@@ -1,108 +1,217 @@
 ---
 name: remuda
-description: "Control Remuda instances, worktrees, and fleets from a Claude Code coordinator. Use when dispatching coding agents through remuda CLI or MCP (create/worktree/send/wait/read/keys/fleet), not for ordinary local shell work."
+description: "Dispatch and drive coding agents (claude, codex, grok, agy, gemini) on Remuda Hub/Node hosts from a coordinator session. Use when the task is to run work in isolated git worktrees on other agents — create worktree, create pty instances, deliver task briefs, wait for DONE, read screens, stop — via the remuda CLI or the remuda_* MCP tools. Not for ordinary local shell work."
 ---
 
 # Remuda
 
-Remuda hosts native coding agents (claude, codex, grok, agy, …) on Hub-connected Nodes. This skill is the coordinator surface: create an isolated git worktree, start an instance, send a task brief, wait, read `DONE <sha>`, then stop.
+Remuda runs native coding-agent CLIs on Hub-connected Nodes. One worktree per
+agent, one PTY instance per worktree, a task brief in, a `DONE <sha>` line out.
 
-Prefer the `remuda` CLI when this session can run shell. Prefer MCP tools (`remuda_instance_*`, `remuda_worktree_create`, `remuda_fleet_send`, `remuda_merge`) when the session is attached with `--mcp-config docs/design/remuda-mcp.json`.
+Two interchangeable surfaces. Use whichever this session has:
 
-The installed binary is the authority for flags. Start with:
+- **CLI** `remuda instance|worktree|fleet|merge …` when you can run shell.
+- **MCP** `mcp__remuda__remuda_*` when launched with
+  `--mcp-config docs/design/remuda-mcp.json --strict-mcp-config`.
+
+The installed binary is the authority for flags — `remuda instance --help`,
+`remuda merge --help`. Bare `remuda` has no default subcommand; don't run it
+for discovery.
+
+## Coordinator loop
+
+The whole job, per agent. Steps 3–6 repeat until the agent reports.
 
 ```bash
-remuda instance
-remuda worktree
-remuda fleet
-remuda merge --help
+# 1. Isolate. One worktree per agent, never the coordinator checkout.
+remuda worktree create reviewer --base main
+# → {"name":"reviewer","path":"…/remuda-wt/reviewer","branch":"wt/reviewer/work"}
+
+# 2. Write the brief to a file, then start the agent with it.
+remuda instance create --name reviewer --kind codex --driver pty \
+  --worktree reviewer --prompt-file /tmp/brief-reviewer.md
+# → {"instanceId":"ins_…", …}   later commands take ins_… or --name
+
+# 3. Wait for the agreed completion line.
+remuda instance wait reviewer --until 'line:(?m)^DONE' --timeout 300000
+
+# 4. On timeout: look before you steer.
+remuda instance read reviewer --lines 120 --source screen
+
+# 5. Steer — a nudge, an answer, or a key.
+remuda instance send reviewer --text "Print DONE <sha> as its own line now."
+remuda instance keys reviewer enter
+
+# 6. Collect the sha from matchedLine, then tear down.
+remuda instance stop reviewer --scope instance
+
+# 7. Verify and land the branch (see "Verify and merge" below).
+remuda merge wt/reviewer/work --gate --json
 ```
 
-Do not run bare `remuda` for discovery; it expects a subcommand.
+`wait` returns JSON with `reason` (`condition-met` | `timeout`),
+`matchedLine` (the **raw** journal line), `lifecycle`, `activity`, `asOfSeq`.
+Exit 0 only means the Hub answered — always read `reason`.
 
-## Worktree, then instance
+Fan out by running steps 1–2 for each agent, then waiting on each. Waits are
+independent; nothing is shared but the Hub.
 
-Default topology is one git worktree per agent and one instance in that worktree. Do not share the coordinator checkout.
+## Task briefs
+
+Write a file, not a one-line prompt, for anything longer than a sentence.
+`--prompt-file` (create) and `--file` (send) read it locally. A brief that
+omits these produces an agent that pushes, edits `main`, or never terminates:
+
+- work **only** inside its own worktree; the path is its cwd
+- per-agent build dir: `export CARGO_TARGET_DIR=/tmp/<proj>-target-<name>`
+  (a shared `target/` serializes every agent behind one lock)
+- commit on `wt/<name>/…` with explicit pathspecs, never `git add -A`
+- run the gates for the crates touched (fmt, test, clippy `-D warnings`) and
+  the repo secret scan
+- **never push**, never touch `main` — the coordinator fetches the branch
+- finish with a single line: `DONE <sha>`, or `BLOCKED <reason>`
+
+Tell the agent the literal completion line. The `DONE <sha>` convention is
+what makes `wait --until 'line:…'` work, and the sha is what you merge.
+
+## wait conditions
+
+| `--until` | Met when |
+| --- | --- |
+| `line:<regex>` | A journal/screen line matches (see matcher below) |
+| `idle` | Ready for input — **not** Hub lifecycle `requested` |
+| `blocked` | Approval prompt, question, or interaction event |
+| `done` | Run terminal, or lifecycle `closed`/`failed`/`terminated` |
+
+`--timeout` is **milliseconds**: default 30000, hard max 300000 (5 min). A
+longer job needs a wait loop, not a bigger number.
+
+**The matcher is bullet-tolerant.** TUIs render output as `• DONE`, so before
+applying your regex the matcher strips leading whitespace and *one* list
+marker (`•`, `●`, `◆`, `▸`, `▪`, `-`, `*`, `>`). `line:(?m)^DONE` therefore
+matches `• DONE` and indented `DONE`. `matchedLine` reports the raw line.
+It also ignores the brief's own echo (lines containing `for example`,
+`further input`, `tui bullet`) so your instructions can't satisfy the wait.
+
+## read
 
 ```bash
-remuda worktree create reviewer --base main --path ../remuda-wt/reviewer
-# git worktree add -b wt/reviewer/work ../remuda-wt/reviewer main
-# records path in <git-common-dir>/remuda-worktrees.json
-
-remuda instance create \
-  --name reviewer \
-  --kind codex \
-  --driver generic-pty \
-  --worktree reviewer \
-  --prompt-file /tmp/remuda-brief-reviewer.md
+remuda instance read reviewer --lines 120 --source screen   # pane text
+remuda instance read reviewer --lines 200 --source journal  # lifecycle events
 ```
 
-`--worktree <name>` calls `git worktree add -b wt/<name>/…` when the name is new and stores the absolute path as the instance workspace `cwd`. `pty` is an alias for `generic-pty` (tty-attach / live-attach; see driver capabilities). Print drivers (`claude-print`) do not attach a PTY: `keys` and `read --source screen` still hit Hub, but screen data only exists on a tty-attach driver.
+`screen` selects tty observations (generic-pty journals a bounded 80-line
+snapshot, `completeness=screen-derived`). With no tty observations the
+response comes back with `source` = `journal-fallback` — check that field
+rather than assuming you saw the pane. `journal` is the right source for
+lifecycle, command state, and errors. Both accept `--after-seq` for
+incremental reads.
 
-Create responses include `instanceId` (`ins_…`). Later commands accept that id or `--name`.
+## Drivers and kinds
 
-## Dispatch, wait, read
+`--driver pty` (alias of `generic-pty`) attaches a real terminal: screen
+reads, `keys`, and interactive TUIs all work. `--driver claude-print` (the
+default) is headless — no PTY, so no screen and no keys. **For coordinator
+work you almost always want `--driver pty`.**
 
-Write a task brief file (not a one-line prompt) when the work is more than a sentence. The brief must tell the worker:
+Each kind launches with its yolo preset appended when absent:
 
-- work only in its worktree
-- `export CARGO_TARGET_DIR=$PWD/target` when building this repo (shared checkout `target/`; see `docs/research/tasks/_impl-rules.md`)
-- commit on `wt/<name>/…`
-- finish with `git rebase main`, then `cargo check --workspace --all-targets --locked` and relevant tests
-- reply with a single line `DONE <sha>`
-- never push and never touch `main`
+| `--kind` | binary | yolo argv |
+| --- | --- | --- |
+| `claude` | `claude` | `--dangerously-skip-permissions` |
+| `codex` | `codex` | `--dangerously-bypass-approvals-and-sandbox` |
+| `grok` | `grok` | `--always-approve` |
+| `agy` | `agy` | `--dangerously-skip-permissions` |
+| `gemini` | `gemini` | `--yolo` |
+
+Placement: `--host hst_…` **or** `--labels region=sg` (mutually exclusive);
+neither means "any online host". Check `remuda instance list` for what exists.
+
+## keys
 
 ```bash
-remuda instance send reviewer --file /tmp/remuda-brief-reviewer.md
-remuda instance wait reviewer --until idle --timeout 120000
-remuda instance wait reviewer --until 'line:DONE ' --timeout 120000
-remuda instance read reviewer --lines 120 --source journal
-```
-
-`--until` values: `idle` (ready for input; not `requested`), `done` (run terminal / closed), `blocked` (approval or question), `line:<regex>` (journal text). `--timeout` is milliseconds (default 30000, max 300000). `read --source screen` uses tty/raw_tty observations and falls back to the journal when none exist.
-
-Inspect before answering a blocked agent:
-
-```bash
-remuda instance list
-remuda instance read reviewer --lines 80 --source screen
 remuda instance keys reviewer esc
+remuda instance keys reviewer down enter
 ```
 
-`keys` validates every name (`enter`, `esc`, `ctrl+c`, arrows, or a single character) before Hub `tty.write`.
+Names are validated before any byte is written: `enter`/`return`, `tab`,
+`esc`, `space`, `backspace`, `delete`, `up`/`down`/`left`/`right`, `home`,
+`end`, `ctrl+<letter>`, or a single character. An unknown name fails the
+whole call. Requires a tty-attach driver.
 
 ## Fleet and teardown
 
 ```bash
-remuda fleet send --all "PAUSE git commits ~5 minutes for coordinator history rewrite"
+remuda fleet send --all "PAUSE commits ~5 min for a history rewrite"
 remuda fleet send --labels region=sg --file /tmp/resume.md
-remuda instance stop reviewer --scope run
-remuda instance rm reviewer
+remuda instance stop reviewer --scope run       # cancel the run, keep the agent
+remuda instance stop reviewer --scope instance  # close it
+remuda instance rm reviewer                     # same as --scope instance
 ```
 
-`--all` and `--labels` are mutually exclusive. Do not `rm` instances you did not create unless the user asked.
+`--all` and `--labels` are mutually exclusive and one is required. `fleet
+send` broadcasts to every matching **running** instance — use it for pauses
+and fleet-wide notices, not per-agent steering. Don't `rm` instances you
+didn't create unless asked.
 
 ## Verify and merge a completed branch
 
-After reading the worker's `DONE <sha>` and reviewing its branch, use the coordinator command:
+A worker's `DONE <sha>` is a claim, not a gate. After reviewing the branch,
+verify and land it with one command — never merge on the report alone:
 
 ```bash
-remuda merge wt/reviewer/work --dry-run --json
-remuda merge wt/reviewer/work --gate --json
-# Add --no-push to advance only local main, or --web to force web checks.
+remuda merge wt/reviewer/work --dry-run --json   # plan only
+remuda merge wt/reviewer/work --gate --json      # verify, then advance main
+# --no-push advances only local main; --web forces web checks.
 ```
 
-The command fetches origin, rejects a source worktree with staged changes or an active merge/rebase (including detached rebase HEAD), and pins local main plus the committed source SHA. It creates a detached worktree under `<repo>/data/tmp`, merges with `--no-ff`, and runs the shared `scripts/ci/gate.sh`: secret scan, format check, workspace check, clippy, then workspace tests. Tests retry once on failure and report `retried`; other failures stop immediately. When the merge changes `web/` or `--web` is present, it runs frozen pnpm install, build, and test inside `web/`.
+`--gate` or `--dry-run` is required. What `--gate` does, in order:
 
-Gate builds use `CARGO_INCREMENTAL=0` and their own `CARGO_TARGET_DIR` (default `<repo>/target-gate`; override with `--target-dir`, relative to `--repo` or absolute). Worker Cargo target settings are not inherited. Use separate target directories for simultaneous coordinators. Leave the test-only `REMUDA_MERGE_GATE_COMMAND` unset for real verification; `gateOverride: true` reports a substituted gate executable.
+1. Fetches origin. Rejects a source worktree with staged changes or an active
+   merge/rebase (including a detached rebase HEAD). Unstaged and untracked
+   worker files do not participate in the merge.
+2. Pins local main's SHA and the committed source SHA, then merges `--no-ff`
+   in a detached worktree under `<repo>/data/tmp` — your checkouts are never
+   touched.
+3. Runs `scripts/ci/gate.sh`, the single definition of gate order: secret
+   scan → `cargo fmt --all --check` → `cargo check --workspace --all-targets
+   --locked` → `cargo clippy … -D warnings` → `cargo test --workspace
+   --locked`. **Only tests retry** (once, reported as `retried` /
+   `attempts: 2`); any other failure stops immediately and later steps report
+   `skipped`.
+4. When the merge touches `web/` — or with `--web` — adds `pnpm install
+   --frozen-lockfile` → `pnpm build` → `pnpm test` inside `web/`.
+5. Only on a green gate: `git update-ref refs/heads/main <merged> <expected>`
+   (compare-and-swap), then pushes exactly that verified commit to origin
+   main, no force, unless `--no-push`.
+6. Removes the temporary worktree on every outcome and reports cleanup
+   errors. The build cache is kept for the next gate.
 
-Only a successful gate permits `git update-ref refs/heads/main <merged> <expected>`. The command then pushes exactly the verified commit to origin main without force, unless `--no-push`. It removes its temporary worktree on every returned outcome and reports cleanup errors. It never resets existing checkouts; inspect local modifications before refreshing a checkout of main after CAS.
+Gate builds set `CARGO_INCREMENTAL=0` and their own `CARGO_TARGET_DIR`
+(default `<repo>/target-gate`, override `--target-dir`, absolute or relative
+to `--repo`); worker Cargo settings are not inherited. Concurrent
+coordinators each need their own. Leave the test-only
+`REMUDA_MERGE_GATE_COMMAND` unset for real verification — `gateOverride:
+true` in the report means a substituted gate ran and the result proves
+nothing.
 
-`--dry-run` checks local refs and source worktree safety and prints planned steps without fetching, merging, running gate commands, updating refs, or pushing. It is a plan, not gate/conflict acceptance. `--json` returns one stdout object with each step's status, duration in milliseconds, attempts and retry flag; progress goes to stderr.
+Exit codes: `0` success or dry-run, `1` gate/operational failure, `2` merge
+conflicts (listed in `conflicts`), `3` main CAS lost. **Read `mainUpdated`
+and `pushed` before retrying** — a failed push can leave local main already
+advanced. A CAS loss means someone else moved main: re-inspect it, don't
+retry blind. Fetch never silently fast-forwards local main.
 
-Exit codes: `0` success / dry-run, `1` gate or operational failure, `2` merge conflicts (see `conflicts`), `3` main CAS lost. Read `mainUpdated`, `pushed`, `expectedMain`, and `merged` before retrying: a failed push can leave local main advanced. A CAS loss does not push; re-inspect the newer main before another attempt. Fetch does not silently fast-forward local main.
+`--dry-run` inspects local refs and worktree safety and prints the plan. It
+does not fetch, merge, run the gate, update refs, or push — so it proves
+neither that the merge is conflict-free nor that the gate would pass.
+`--json` puts one object on stdout (progress to stderr) with `status`,
+`exitCode`, `expectedMain`, `source`, `merged`, `mainUpdated`, `pushed`,
+`conflicts`, and per-step `name`/`status`/`durationMs`/`attempts`/`retried`.
 
-MCP: `remuda_merge` accepts `branch`, `gate: true` or `dryRun: true`, plus optional `repo`, `targetDir`, `web`, and `noPush`. It executes locally to the MCP server and returns the same JSON in text and `structuredContent`; nonzero `exitCode` sets `isError: true`.
+MCP `remuda_merge` takes `branch`, `gate: true` or `dryRun: true`, plus
+optional `repo`, `targetDir`, `web`, `noPush`. It runs git **on the MCP
+server's machine**, not through Hub, and returns the same JSON as text and
+`structuredContent`; a nonzero `exitCode` sets `isError: true`.
 
 ## MCP equivalents
 
@@ -112,21 +221,63 @@ MCP: `remuda_merge` accepts `branch`, `gate: true` or `dryRun: true`, plus optio
 | `merge <branch> --gate` / `--dry-run` | `remuda_merge` (`branch`, `gate` / `dryRun`, `web`, `noPush`, `repo`, `targetDir`) |
 | `instance create` | `remuda_instance_create` |
 | `instance list` | `remuda_instance_list` |
-| `instance send` / `--file` | `remuda_instance_send` (`text` or `file`) |
-| `instance wait --until` | `remuda_instance_wait` (`until`, `timeoutMs`) |
-| `instance read --lines --source` | `remuda_instance_read` |
-| `instance keys` | `remuda_instance_keys` |
-| `instance stop` / `rm` | `remuda_instance_stop` / `remuda_instance_rm` |
-| `fleet send --all\|--labels` | `remuda_fleet_send` |
+| `instance send` | `remuda_instance_send` (`text` or `file`) |
+| `instance wait` | `remuda_instance_wait` (`until`, `timeoutMs`) |
+| `instance read` | `remuda_instance_read` (`lines`, `source`) |
+| `instance keys` | `remuda_instance_keys` (`keys: []`) |
+| `instance stop` / `rm` | `remuda_instance_stop` (`scope`) / `remuda_instance_rm` |
+| `fleet run` / `fleet send` | `remuda_fleet_run` / `remuda_fleet_send` |
 
-Claude Code names tools `mcp__remuda__<tool>`. Config: `docs/design/remuda-mcp.json`
-(committed file has no Hub URL or token). `remuda mcp` resolves, in order:
-`--hub` / `REMUDA_HUB` / `$REMUDA_DATA_DIR/dev-hub/listen` / `./data/dev-hub/listen`
-/ `http://127.0.0.1:18080` when a `bootstrap-token` or `access-code` file exists
-(else `:8080`). Token: `REMUDA_TOKEN`, else `REMUDA_BOOTSTRAP_TOKEN` or the
-dev access-code / `bootstrap-token` file. After `remuda dev`, the committed
-config works without editing.
+Arguments are camelCase (`timeoutMs`, `promptFile`, `workspaceId`,
+`afterSeq`). Claude Code exposes them as `mcp__remuda__<tool>`. Paths in
+`file` / `promptFile` are read by the `remuda mcp` process, so they must
+exist on the machine running it.
 
-```sh
-claude --mcp-config docs/design/remuda-mcp.json --strict-mcp-config
-```
+`remuda mcp` resolves the Hub itself — `--hub` / `REMUDA_HUB` /
+`$REMUDA_DATA_DIR/dev-hub/listen` / `./data/dev-hub/listen` / `:18080` when a
+`bootstrap-token` or `access-code` file exists, else `:8080`. Token:
+`REMUDA_TOKEN`, else `REMUDA_BOOTSTRAP_TOKEN` or the dev access-code file.
+After `remuda dev` the committed config works unedited; it holds no URL or
+secret. Never put a token in a prompt. See `docs/design/remuda-mcp.md`.
+
+## Pitfalls
+
+Learned from the dogfood-1..3 acceptance runs
+(`docs/design/dogfood-{1,2,3}-report.md`):
+
+- **`^DONE` alone misses TUI output.** dogfood-2 wrote both DONE files and
+  still timed out: the pane said `• DONE`. Fixed by the bullet-stripping
+  matcher — but only with `(?m)`, so `^` anchors per line.
+- **Agents bury the completion line in prose.** In dogfood-3 grok's first
+  wait timed out; one `send` of "Print DONE as its own line now" made the
+  retry match immediately. Budget one nudge per agent rather than a longer
+  timeout. Codex matched on the first wait.
+- **Confirm work, don't infer it from a timeout.** dogfood-2's workers had
+  finished; only the regex failed. On timeout, `read --source screen` and
+  check the worktree before concluding anything failed.
+- **Creation is not readiness.** The brief is queued until the pane is live
+  (dogfood-1 lost it to `control unavailable` before that was fixed). Hub
+  lifecycle can sit at `requested` while the Node is running, so treat
+  `requested` and snapshot `activity=idle` as unproven — prefer `wait
+  --until line:` or `blocked` over trusting a status field.
+- **First launch can block on a dialog.** Folder-trust and
+  bypass-permissions prompts stop the agent before it reads the brief.
+  `read --source screen`, then answer with `keys` (`down`, `enter` — note
+  the default button is often the refusing one).
+- **`stop` doesn't reclaim the herdr workspace.** Panes and tabs accumulate
+  across runs; expect leftovers and `driver shutdown did not settle` on Node
+  exit.
+- **Give each agent its own `CARGO_TARGET_DIR`.** Parallel agents sharing
+  one target dir block on the same lock.
+- **Screen is bounded.** Last ~80 lines per snapshot. Ask agents to print
+  conclusions, not to scroll; use the journal for history.
+- **A green `DONE` is not a green gate.** Workers run crate-scoped checks;
+  `remuda merge --gate` runs the workspace gate on the *merged* tree. Land
+  through it rather than trusting the worker's own test run.
+
+## See also
+
+- `docs/design/coordinator-guide.md` — merging with gates, per-agent target
+  dirs, secret scan, evidence files
+- `docs/design/remuda-mcp.md` — `--mcp-config` and runtime resolution
+- `docs/design/dogfood.md` — herdr-parity checklist and D0 status

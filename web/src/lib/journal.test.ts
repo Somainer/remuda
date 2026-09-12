@@ -34,8 +34,8 @@ function obs(seq: number, eventId = `evt_${seq}`): Observation {
     completeness: "opaque",
     rawRef: null,
     evidenceEventIds: [],
-    payload: { nativeType: "x", reason: "fixture", rawRef: { objectId: "obj_x" as Id, offset: "0", length: "0", digest: "sha256:00", mediaType: "application/json", redaction: "none" }, affects: [], summary: `seq ${seq}` },
-  };
+    payload: { nativeType: "x", reason: "unmapped-fields", rawRef: { objectId: "obj_x" as Id, offset: "0", length: "0", digest: "sha256:00", mediaType: "application/json", redaction: "none" }, affects: [], summary: `seq ${seq}` },
+  } as Observation;
 }
 
 function snapshot(asOf: number): Snapshot {

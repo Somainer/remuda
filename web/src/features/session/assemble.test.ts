@@ -3,7 +3,7 @@ import type { Observation, ToolCallPayload } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { assembleTranscript, compactTranscript, diffState } from "./assemble";
 
-function obs(seq: number, kind: Observation["kind"], payload: Observation["payload"]): Observation {
+function obs(seq: number, kind: Observation["kind"], payload: unknown): Observation {
   return {
     schemaVersion: 1,
     eventId: `evt_${seq}` as Id,
@@ -35,7 +35,7 @@ function obs(seq: number, kind: Observation["kind"], payload: Observation["paylo
     rawRef: null,
     evidenceEventIds: [],
     payload,
-  };
+  } as Observation;
 }
 
 function call(name: string, toolCallId: string): ToolCallPayload {

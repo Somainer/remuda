@@ -158,7 +158,7 @@ function obs(
   journalId: Id,
   seq: number,
   kind: Observation["kind"],
-  payload: Observation["payload"],
+  payload: unknown,
 ): Observation {
   return {
     schemaVersion: 1,

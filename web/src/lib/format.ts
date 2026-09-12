@@ -1,15 +1,21 @@
 import type { Knowledge, U64 } from "../types/wire";
 
-export function knownText(k: Knowledge<string> | undefined, fallback = "—"): string {
-  return k?.state === "known" ? k.value : fallback;
+type KnowledgeLike = { state: string; value?: unknown };
+
+export function knownText(k: Knowledge<string> | KnowledgeLike | undefined, fallback = "—"): string {
+  return k?.state === "known" && typeof k.value === "string" ? k.value : fallback;
 }
 
-export function formatTokens(k: Knowledge<U64>): string | null {
+export function formatTokens(k: Knowledge<U64> | KnowledgeLike): string | null {
   if (k.state !== "known") return null;
   const n = Number(k.value);
   if (!Number.isFinite(n)) return null;
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+export function knowledgeString(k: KnowledgeLike | undefined): string | undefined {
+  return k?.state === "known" && typeof k.value === "string" ? k.value : undefined;
 }
 
 export function shortId(value: string, n = 8): string {

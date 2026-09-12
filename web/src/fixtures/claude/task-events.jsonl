@@ -1,0 +1,5 @@
+{"type":"background_tasks_changed"}
+{"type":"task_started","task_type":"local_workflow","task_id":"w3upf3n8p"}
+{"type":"task_progress","workflow_progress":[{"state":"start","agentId":"aec0114f3e327c255","model":"claude-haiku-4-5-20251001"}]}
+{"type":"task_updated","status":"completed"}
+{"type":"task_notification","output_file":"/private/tmp/claude-501/tasks/w3upf3n8p.output"}

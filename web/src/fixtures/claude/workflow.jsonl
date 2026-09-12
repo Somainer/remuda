@@ -1,0 +1,3 @@
+{"type":"launched"}
+{"type":"started","key":"v2:a7d83bf1","agentId":"aec0114f3e327c255","label":"Reply with exactly the word OK. Do not use any tools."}
+{"type":"result","key":"v2:a7d83bf1","agentId":"aec0114f3e327c255","result":"OK"}

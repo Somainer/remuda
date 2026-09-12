@@ -26,6 +26,7 @@ export function AppRouter() {
           <Route path="/s/:instanceId" element={<SessionPage />} />
           <Route path="/s/:instanceId/tty" element={<SessionPage view="tty" />} />
           <Route path="/s/:instanceId/files" element={<SessionPage view="files" />} />
+          <Route path="/s/:instanceId/events" element={<SessionPage view="events" />} />
           <Route path="/approvals" element={<ApprovalsPage />} />
           <Route path="/hosts" element={<HostsPage />} />
           <Route path="/hosts/:hostId" element={<HostDetailPage />} />

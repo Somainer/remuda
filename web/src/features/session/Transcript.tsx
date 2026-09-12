@@ -1,13 +1,14 @@
 import { useState, type ReactNode } from "react";
 import type { Observation } from "../../types/observation";
-import { knowledgeValue } from "../../types/command";
 import { MarkdownText } from "../../components/MarkdownText";
-import { formatTokens, jsonPreview } from "../../lib/format";
 import type { LocalBubble } from "../../lib/store";
 import { hubStore } from "../../lib/store";
 import ui from "../../styles/ui.module.css";
 import { assembleTranscript, compactTranscript } from "./assemble";
 import { ToolCard } from "./ToolCard";
+import { WorkflowTree } from "./WorkflowTree";
+import { UsageFooter } from "./UsageFooter";
+import { OpaqueRow } from "./OpaqueRow";
 
 export function Transcript({
   events,
@@ -64,52 +65,10 @@ export function Transcript({
           );
         }
         if (node.type === "workflow") {
-          const open = node.run.state === "running" || node.run.state === "failed" || node.run.state === "unknown";
-          return (
-            <details key={node.id} className={ui.card} open={open}>
-              <summary className={ui.cardHead}>
-                <strong>Workflow</strong>
-                <span>{knowledgeValue(node.run.nativeRunId) ?? node.run.workflowId}</span>
-                <span>{knowledgeValue(node.run.title) ?? node.run.state}</span>
-              </summary>
-              {node.phases.map((p) => (
-                <div key={p.phaseId} style={{ marginLeft: 12 }}>
-                  ▾ {knowledgeValue(p.label) ?? p.phaseId} · {p.state}
-                  <ul>
-                    {node.members
-                      .filter((m) => !m.phaseId || m.phaseId === p.phaseId)
-                      .map((m) => (
-                        <li key={m.memberId}>
-                          {knowledgeValue(m.label) ?? m.memberId} · {m.state}
-                          {knowledgeValue(m.modelResolved) ? ` · ${knowledgeValue(m.modelResolved)}` : ""}
-                        </li>
-                      ))}
-                  </ul>
-                </div>
-              ))}
-              {node.phases.length === 0 ? (
-                <ul>
-                  {node.members.map((m) => (
-                    <li key={m.memberId}>
-                      {knowledgeValue(m.label) ?? m.memberId} · {m.state}
-                    </li>
-                  ))}
-                </ul>
-              ) : null}
-            </details>
-          );
+          return <WorkflowTree key={node.id} run={node.run} phases={node.phases} members={node.members} />;
         }
         if (node.type === "usage") {
-          const input = formatTokens(node.payload.inputTokens);
-          const output = formatTokens(node.payload.outputTokens);
-          if (!input || !output) return null;
-          const cost = node.payload.cost.state === "known" ? ` · $${node.payload.cost.value.amount}` : "";
-          return (
-            <div key={node.id} className={ui.usage} data-testid="usage-row">
-              usage in {input} / out {output}
-              {cost}
-            </div>
-          );
+          return <UsageFooter key={node.id} payload={node.payload} />;
         }
         if (node.type === "compact") {
           return (
@@ -145,12 +104,7 @@ export function Transcript({
           );
         }
         if (node.type === "opaque") {
-          return (
-            <details key={node.id} className={ui.listMeta}>
-              <summary>未识别事件 · {node.kind}</summary>
-              <pre className={ui.pre}>{jsonPreview(node.raw)}</pre>
-            </details>
-          );
+          return <OpaqueRow key={node.id} kind={node.kind} summary={node.summary} raw={node.raw} />;
         }
         return null;
       })}

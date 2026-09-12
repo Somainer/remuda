@@ -1,14 +1,13 @@
 import type {
   Observation,
-  ThoughtPayload,
   ToolCallPayload,
   ToolResultPayload,
   UsagePayload,
   WorkflowMemberPayload,
   WorkflowPhasePayload,
   WorkflowRunPayload,
-} from "../../types/observation";
-import type { Interaction } from "../../types/interaction";
+} from "../../types/generated";
+import type { Interaction } from "../../types/generated";
 import { knowledgeValue } from "../../types/command";
 import { familyFor, type ToolFamily } from "./toolRegistry";
 import { observationText } from "../../lib/api";
@@ -72,19 +71,19 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   for (const ev of events) {
     if (ev.kind === "message") {
       const text = observationText(ev);
-      const role = (ev.payload as { role: "user" | "assistant" | "system" }).role;
+      const role = ev.payload.role;
       if (role === "user") seenUser.add(text);
       nodes.push({
         type: "message",
         id: ev.eventId,
         role,
         text,
-        status: (ev.payload as { status: string }).status,
+        status: ev.payload.status,
       });
       continue;
     }
     if (ev.kind === "thought") {
-      const payload = ev.payload as ThoughtPayload;
+      const payload = ev.payload;
       nodes.push({
         type: "thought",
         id: ev.eventId,
@@ -94,7 +93,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       continue;
     }
     if (ev.kind === "tool_call") {
-      const call = ev.payload as ToolCallPayload;
+      const call = ev.payload;
       const name = knowledgeValue(call.toolName) ?? "tool";
       const existing = tools.get(call.toolCallId);
       const node: ToolNode = {
@@ -120,7 +119,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       continue;
     }
     if (ev.kind === "tool_result") {
-      const result = ev.payload as ToolResultPayload;
+      const result = ev.payload;
       const existing = tools.get(result.toolCallId);
       if (existing) {
         existing.result = result;
@@ -130,7 +129,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       continue;
     }
     if (ev.kind === "workflow.run") {
-      const run = ev.payload as WorkflowRunPayload;
+      const run = ev.payload;
       const current = workflows.get(run.workflowId) ?? {
         type: "workflow" as const,
         id: run.workflowId,
@@ -144,13 +143,13 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       continue;
     }
     if (ev.kind === "workflow.phase") {
-      const phase = ev.payload as WorkflowPhasePayload;
+      const phase = ev.payload;
       const current = workflows.get(phase.workflowId);
       if (current) current.phases = current.phases.filter((p) => p.phaseId !== phase.phaseId).concat(phase);
       continue;
     }
     if (ev.kind === "workflow.member") {
-      const member = ev.payload as WorkflowMemberPayload;
+      const member = ev.payload;
       const current = workflows.get(member.workflowId);
       if (current) {
         current.members = current.members.filter((m) => m.memberId !== member.memberId).concat(member);
@@ -158,11 +157,11 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       continue;
     }
     if (ev.kind === "usage") {
-      nodes.push({ type: "usage", id: ev.eventId, payload: ev.payload as UsagePayload });
+      nodes.push({ type: "usage", id: ev.eventId, payload: ev.payload });
       continue;
     }
     if (ev.kind === "interaction.requested") {
-      const interaction = (ev.payload as { interaction: Interaction }).interaction;
+      const interaction = ev.payload.interaction;
       nodes.push({
         type: "interaction",
         id: ev.eventId,
@@ -174,7 +173,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     if (ev.kind === "lifecycle") continue;
     if (ev.kind === "interaction.answered" || ev.kind === "interaction.expired") continue;
     if (ev.kind === "opaque") {
-      const payload = ev.payload as { nativeType?: string; reason?: string; summary?: string | null };
+      const payload = ev.payload;
       nodes.push({
         type: "opaque",
         id: ev.eventId,
@@ -252,5 +251,18 @@ export function compactTranscript(nodes: TranscriptNode[], enabled: boolean): Tr
     pending.push(node);
   }
   out.push(...pending);
+  return out;
+}
+
+export function collectTasks(nodes: TranscriptNode[]): ToolNode[] {
+  const out: ToolNode[] = [];
+  for (const node of nodes) {
+    if (node.type === "tool" && node.family === "Task") out.push(node);
+    if (node.type === "compact") {
+      for (const child of node.children) {
+        if (child.type === "tool" && child.family === "Task") out.push(child);
+      }
+    }
+  }
   return out;
 }

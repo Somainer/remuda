@@ -7,15 +7,16 @@ import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { Transcript } from "../features/session/Transcript";
+import { TaskTrack } from "../features/session/TaskTrack";
+import { RawEvents } from "../features/session/RawEvents";
+import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { canShowTtyLab, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { nativeShort, projectStatus } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
-import { formatTokens } from "../lib/format";
 import ui from "../styles/ui.module.css";
-import type { UsagePayload } from "../types/observation";
 
-export function SessionPage({ view = "structured" }: { view?: "structured" | "tty" | "files" }) {
+export function SessionPage({ view = "structured" }: { view?: "structured" | "tty" | "files" | "events" }) {
   const { instanceId = "" } = useParams();
   const hub = useHub();
   const navigate = useNavigate();
@@ -35,7 +36,8 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
   const usageEvent = events.findLast((e) => e.kind === "usage");
-  const usage = usageEvent?.payload as UsagePayload | undefined;
+  const usage = usageEvent?.kind === "usage" ? usageEvent.payload : undefined;
+  const tasks = collectTasks(compactTranscript(assembleTranscript(events, bubbles), hub.compact));
   const snapshotLoading = Boolean(instance) && hub.events[instanceId] === undefined && !isTtyLabFixtureId(instanceId);
 
   if (!instance && hub.ready) {
@@ -49,8 +51,6 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
   }
 
   const cost = usage && usage.cost.state === "known" ? `$${usage.cost.value.amount}` : "—";
-  const inTok = usage ? formatTokens(usage.inputTokens) : null;
-  const outTok = usage ? formatTokens(usage.outputTokens) : null;
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
 
@@ -112,13 +112,15 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
       </header>
       <div className={ui.listMeta} style={{ padding: "4px 12px" }} data-testid="session-meta">
         seq {events.at(-1)?.seq ?? instance.durableSeq} · connectivity={instance.connectivity} · {cost}
-        {inTok && outTok ? ` · in ${inTok} / out ${outTok}` : ""} · native {nativeShort(instance)}
+        · native {nativeShort(instance)}
         {journalStatus === "gap-backfill" ? " · 正在补事件" : ""}
         {journalStatus === "readonly-stale" ? " · 只读" : ""}
         {status === "idle" ? " · 回合结束、进程仍在" : ""}
       </div>
       <div style={{ flex: 1, overflow: view === "tty" ? "hidden" : "auto", minHeight: 0, display: view === "tty" ? "flex" : undefined }}>
-        {view === "files" ? (
+        {view === "events" ? (
+          <RawEvents events={events} />
+        ) : view === "files" ? (
           <p style={{ padding: 16, color: "var(--mute)" }}>文件 / diff 栏占位。空间不够时走这条全屏路由。</p>
         ) : view === "tty" ? (
           <TerminalView
@@ -136,7 +138,8 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
           <Transcript events={events} bubbles={bubbles} compact={hub.compact} />
         )}
       </div>
-      {view === "tty" ? null : <div style={{ padding: 12, borderTop: "1px solid var(--line)" }}>
+      {view === "tty" || view === "events" ? null : <div style={{ padding: 12, borderTop: "1px solid var(--line)" }}>
+        <TaskTrack tasks={tasks} />
         {pending.map((item) =>
           item.kind === "question" ? (
             <QuestionForm
@@ -183,9 +186,12 @@ export function SessionPage({ view = "structured" }: { view?: "structured" | "tt
         )}
       </div>}
       {view === "structured" ? (
-        <div style={{ padding: "0 12px 12px" }}>
+        <div style={{ padding: "0 12px 12px" }} className={ui.row}>
           <Button variant="ghost" onClick={() => navigate(`/s/${instance.id}/files`)}>
             文件
+          </Button>
+          <Button variant="ghost" onClick={() => navigate(`/s/${instance.id}/events`)}>
+            原始事件
           </Button>
         </div>
       ) : null}

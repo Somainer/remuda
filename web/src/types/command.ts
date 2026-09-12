@@ -17,6 +17,6 @@ export type CommandResult = { command: Command; relatedCommandIds: Id[] };
 
 export type Page<T> = { items: T[]; nextCursor: string | null };
 
-export function knowledgeValue<T>(k: Knowledge<T>): T | undefined {
-  return k.state === "known" ? k.value : undefined;
+export function knowledgeValue<T>(k: Knowledge<T> | { state: string; value?: T }): T | undefined {
+  return k.state === "known" ? (k.value as T) : undefined;
 }

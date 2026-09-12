@@ -140,6 +140,10 @@ pub trait Driver: Send + Sync {
     fn start(&self) -> DriverStartFuture<'_> {
         Box::pin(async { Ok(None) })
     }
+    /// Wait until [`Driver::execute`] can deliver [`DriverRequest::Send`].
+    fn wait_control(&self) -> DriverFuture<'_> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Execute one request inside the caller-owned bounded instance task.
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_>;
     /// Durable launch recipe after [`Driver::start`], if the adapter produced one.

@@ -649,7 +649,7 @@ fn workspace_create(st: &mut State, params: &Value) -> Result<Value, (&'static s
         "pane_created",
         json!({"type":"pane_created","pane": pane}),
     );
-    st.screens.insert(pane_id.clone(), String::new());
+    st.screens.insert(pane_id.clone(), "$ \n".to_string());
     st.panes.insert(pane_id.clone(), pane.clone());
     st.tabs.insert(tab_id, tab.clone());
     st.workspaces.insert(ws_id, workspace.clone());
@@ -690,7 +690,7 @@ fn tab_create(st: &mut State, params: &Value) -> Result<Value, (&'static str, St
         pane_count: 1,
         agent_status: AgentStatus::Unknown,
     };
-    st.screens.insert(pane_id.clone(), String::new());
+    st.screens.insert(pane_id.clone(), "$ \n".to_string());
     st.panes.insert(pane_id, pane.clone());
     st.tabs.insert(tab_id, tab.clone());
     if let Some(ws) = st.workspaces.get_mut(&ws_id) {
@@ -761,7 +761,7 @@ fn pane_split(st: &mut State, params: &Value) -> Result<Value, (&'static str, St
         "pane_created",
         json!({"type":"pane_created","pane": pane}),
     );
-    st.screens.insert(pane_id.clone(), String::new());
+    st.screens.insert(pane_id.clone(), "$ \n".to_string());
     st.panes.insert(pane_id, pane.clone());
     if let Some(tab) = st.tabs.get_mut(&parent.tab_id) {
         tab.pane_count = st

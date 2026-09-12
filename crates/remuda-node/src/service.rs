@@ -103,17 +103,22 @@ impl Drop for RunningNode {
     }
 }
 
-/// Bind and spawn a durable local Node service.
-pub async fn serve(config: ServeConfig) -> Result<RunningNode, NodeError> {
+/// Compose the durable Node runtime without binding an HTTP listener.
+pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
     let store = Arc::new(MemoryStore::open_journaled(
         &config.data_dir,
         config.http.follow_buffer_capacity,
     )?);
-    let drivers = match config.drivers {
+    let drivers = match &config.drivers {
         LocalDrivers::Fake => DriverRegistry::with_fake()?,
-        LocalDrivers::Native(native) => native_driver_registry(native)?,
+        LocalDrivers::Native(native) => native_driver_registry(native.clone())?,
     };
-    let node = DevNode::with_parts(&config.http, store, drivers)?;
+    DevNode::with_parts(&config.http, store, drivers)
+}
+
+/// Bind and spawn a durable local Node service.
+pub async fn serve(config: ServeConfig) -> Result<RunningNode, NodeError> {
+    let node = compose(&config)?;
     let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
     let addr = listener.local_addr()?;
     let app = dev_router(node.clone(), &config.http);

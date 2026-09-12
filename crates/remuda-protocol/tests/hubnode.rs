@@ -1,0 +1,88 @@
+//! Hub↔Node operational wire fixtures (`hubnode` module).
+
+use remuda_protocol::hubnode::{
+    self, HubNodeMethod, HubNodeRequest, InstanceCreateParams, JournalAppendParams,
+    METHOD_INSTANCE_CREATE, METHOD_JOURNAL_APPEND, METHOD_NODE_AUTH, METHOD_NODE_HELLO,
+    METHOD_TTY_FRAME, NodeAuthParams, NodeHelloParams, TTY_BINARY_HEADER_LEN,
+    TtyBinaryEnvelopeSpec, TtyFrameParams,
+};
+use remuda_protocol::{BINARY_HEADER_LEN, PROTOCOL_VERSION, from_json_slice};
+use serde_json::Value;
+use std::path::Path;
+
+fn fixture(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    from_json_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn auth_hello_journal_tty_fixtures_round_trip() {
+    let auth = HubNodeRequest::from_value(&fixture("hubnode-auth.json")).unwrap();
+    assert_eq!(auth.method, METHOD_NODE_AUTH);
+    assert_eq!(auth.version, Some(PROTOCOL_VERSION));
+    let auth_params: NodeAuthParams = serde_json::from_value(auth.params.clone().unwrap()).unwrap();
+    assert_eq!(auth_params.token, "bootstrap-token");
+    assert_eq!(auth_params.scheme.as_deref(), Some("bearer"));
+
+    let hello = HubNodeRequest::from_value(&fixture("hubnode-hello.json")).unwrap();
+    assert_eq!(hello.method_kind(), Some(HubNodeMethod::NodeHello));
+    assert_eq!(hello.method, METHOD_NODE_HELLO);
+    let hello_params: NodeHelloParams =
+        serde_json::from_value(hello.params.clone().unwrap()).unwrap();
+    assert_eq!(
+        hello_params.persisted_host_id(),
+        Some("hst_01993ab0-0000-7000-8000-000000000004")
+    );
+    assert_eq!(hello_params.transport.as_deref(), Some("ssh-stdio"));
+    assert_eq!(hello_params.enrollment_token.as_deref(), Some("host-token"));
+
+    let journal = HubNodeRequest::from_value(&fixture("hubnode-journal-batch.json")).unwrap();
+    assert_eq!(journal.method, METHOD_JOURNAL_APPEND);
+    let append: JournalAppendParams =
+        serde_json::from_value(journal.params.clone().unwrap()).unwrap();
+    assert_eq!(append.events_to_append().len(), 2);
+    assert_eq!(append.seq_i64(), Some(2));
+
+    let tty = HubNodeRequest::from_value(&fixture("hubnode-tty-frame.json")).unwrap();
+    assert_eq!(tty.method, METHOD_TTY_FRAME);
+    let tty_params: TtyFrameParams = serde_json::from_value(tty.params.clone().unwrap()).unwrap();
+    assert_eq!(tty_params.channel, Some(1));
+}
+
+#[test]
+fn instance_create_accepts_hub_forward_shape() {
+    let value = serde_json::json!({
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "spec": { "kind": "claude", "driver": "claude-print", "prompt": "hi" },
+        "initialInput": { "type": "prompt", "text": "hi" }
+    });
+    let params: InstanceCreateParams = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        params.instance_id.as_deref(),
+        Some("ins_01993ab0-0000-7000-8000-000000000006")
+    );
+    assert!(
+        HubNodeMethod::parse(METHOD_INSTANCE_CREATE)
+            .unwrap()
+            .is_instance()
+    );
+}
+
+#[test]
+fn tty_binary_envelope_is_32_bytes() {
+    let spec = TtyBinaryEnvelopeSpec::v1();
+    assert_eq!(spec.header_len as usize, BINARY_HEADER_LEN);
+    assert_eq!(TTY_BINARY_HEADER_LEN, 32);
+}
+
+#[test]
+fn ws_bearer_and_stdio_auth_are_documented() {
+    assert_eq!(hubnode::WS_AUTHORIZATION_SCHEME, "Bearer");
+    assert_eq!(hubnode::METHOD_NODE_AUTH, "node.auth");
+    assert_eq!(
+        hubnode::bearer_from_authorization("Bearer secret"),
+        Some("secret")
+    );
+}

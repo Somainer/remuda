@@ -56,12 +56,66 @@ impl HubCarrier for OutboundWssCarrier {
         CarrierKind::OutboundWss
     }
 
-    fn run<'a>(&'a mut self, _hello: &'a NodeHello) -> CarrierFuture<'a> {
+    fn run<'a>(&'a mut self, hello: &'a NodeHello) -> CarrierFuture<'a> {
         Box::pin(async move {
-            Err(NodeError::InvalidConfig(format!(
-                "outbound WSS carrier for {} is planned for M1 enrollment",
-                self.endpoint
-            )))
+            let data_dir = crate::enroll::default_data_dir();
+            let enrollment = crate::enroll::load_or_create(&data_dir)?;
+            let token = enrollment
+                .node_token
+                .clone()
+                .or_else(|| {
+                    std::env::var("REMUDA_BOOTSTRAP_TOKEN")
+                        .ok()
+                        .map(|token| token.trim().to_owned())
+                        .filter(|token| !token.is_empty())
+                })
+                .ok_or_else(|| {
+                    NodeError::InvalidConfig(format!(
+                        "outbound WSS {} requires REMUDA_BOOTSTRAP_TOKEN or enrollment.json",
+                        self.endpoint
+                    ))
+                })?;
+            let url = if self.endpoint.contains("/v1/node") || self.endpoint.starts_with("ws") {
+                self.endpoint.clone()
+            } else {
+                let trimmed = self.endpoint.trim_end_matches('/');
+                if let Some(rest) = trimmed.strip_prefix("https://") {
+                    format!("wss://{rest}/v1/node")
+                } else if let Some(rest) = trimmed.strip_prefix("http://") {
+                    format!("ws://{rest}/v1/node")
+                } else {
+                    format!("ws://{trimmed}/v1/node")
+                }
+            };
+            let config = crate::WssConfig {
+                url,
+                token,
+                host_id: hello.params.host.host_id.as_id().as_str().to_owned(),
+                label: hello.params.host.hostname.clone(),
+                node_version: env!("CARGO_PKG_VERSION").into(),
+                cli: serde_json::to_value(&hello.params.host.cli).unwrap_or_else(|_| json!([])),
+                heartbeat_interval: std::time::Duration::from_secs(15),
+                backoff: crate::Backoff::default(),
+                journal_queue: 32,
+            };
+            let mut link = crate::WssLink::connect(config).await?;
+            if let Some(token) = &link.node_token {
+                let _ = crate::enroll::apply_hello_result(
+                    &data_dir,
+                    &json!({ "hostId": link.host_id, "nodeToken": token }),
+                );
+            }
+            let node = crate::DevNode::new(&crate::DevServerConfig::loopback(0))?;
+            while let Some(request) = link.next_hub_request().await {
+                let result = crate::transport::hubnode::dispatch_method(
+                    &node,
+                    &request.method,
+                    request.params.clone(),
+                )
+                .await;
+                let _ = request.respond(result).await;
+            }
+            Ok(())
         })
     }
 }
@@ -84,62 +138,118 @@ impl HubCarrier for StdioCarrier {
 
     fn run<'a>(&'a mut self, hello: &'a NodeHello) -> CarrierFuture<'a> {
         Box::pin(async move {
+            let data_dir = crate::enroll::default_data_dir();
+            let enrollment = crate::enroll::load_or_create(&data_dir)?;
             let mut input = BufReader::new(tokio::io::stdin()).lines();
             let mut output = tokio::io::stdout();
-            write_ndjson(&mut output, hello).await?;
+            let token = enrollment.node_token.clone().or_else(|| {
+                std::env::var("REMUDA_BOOTSTRAP_TOKEN")
+                    .ok()
+                    .map(|token| token.trim().to_owned())
+                    .filter(|token| !token.is_empty())
+            });
+            if let Some(token) = token.as_deref() {
+                write_ndjson(
+                    &mut output,
+                    &crate::transport::hubnode::encode_auth("auth-1", token),
+                )
+                .await?;
+            }
+            let host = serde_json::to_value(&hello.params.host)?;
+            let params = crate::transport::hubnode::stdio_hello_params(
+                &enrollment.host_id,
+                &hello.params.host.hostname,
+                "ssh-stdio",
+                env!("CARGO_PKG_VERSION"),
+                &hello.params.node_epoch,
+                host,
+                token.as_deref(),
+            );
+            write_ndjson(
+                &mut output,
+                &crate::transport::hubnode::encode_hello_request("hello-1", params),
+            )
+            .await?;
 
+            let node = crate::DevNode::new(&crate::DevServerConfig::loopback(0))?;
             while let Some(line) = input.next_line().await? {
                 if line.len() > MAX_STDIO_FRAME_BYTES {
                     write_ndjson(
                         &mut output,
-                        &json!({
-                            "type": "node.error",
-                            "code": "frame_too_large",
-                            "message": "NDJSON frame exceeds 1048576 bytes"
-                        }),
+                        &crate::transport::hubnode::rpc_error(
+                            Value::Null,
+                            -32600,
+                            "NDJSON frame exceeds 1048576 bytes",
+                        ),
                     )
                     .await?;
                     return Err(NodeError::InvalidRequest(
                         "stdio NDJSON frame exceeds local limit".to_owned(),
                     ));
                 }
+                if line.trim().is_empty() {
+                    continue;
+                }
                 let frame: Value = match serde_json::from_str(&line) {
                     Ok(value) => value,
                     Err(error) => {
                         write_ndjson(
                             &mut output,
-                            &json!({
-                                "type": "node.error",
-                                "code": "invalid_json",
-                                "message": error.to_string()
-                            }),
+                            &crate::transport::hubnode::rpc_error(
+                                Value::Null,
+                                -32700,
+                                &error.to_string(),
+                            ),
                         )
                         .await?;
                         continue;
                     }
                 };
-                let response = match frame.get("type").and_then(Value::as_str) {
-                    Some("hub.hello") => json!({
-                        "type": "node.ready",
-                        "nodeEpoch": hello.params.node_epoch,
-                        "carrier": CarrierKind::StdioNdjson,
-                    }),
-                    Some("hub.ping") => json!({
-                        "type": "node.pong",
-                        "id": frame.get("id").cloned().unwrap_or(Value::Null),
-                    }),
-                    Some(frame_type) => json!({
-                        "type": "node.error",
-                        "code": "unsupported_frame",
-                        "message": format!("M0 stdio carrier does not handle {frame_type}")
-                    }),
-                    None => json!({
-                        "type": "node.error",
-                        "code": "missing_frame_type",
-                        "message": "NDJSON application frame requires type"
-                    }),
-                };
-                write_ndjson(&mut output, &response).await?;
+                if frame.get("method").is_none() {
+                    let _ = crate::transport::hubnode::persist_hello_result(&data_dir, &frame);
+                    continue;
+                }
+                let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                let params = frame.get("params").cloned().unwrap_or(json!({}));
+                match crate::transport::hubnode::dispatch_method(&node, method, params).await {
+                    Ok(result) => {
+                        write_ndjson(&mut output, &crate::transport::hubnode::rpc_ok(id, result))
+                            .await?;
+                    }
+                    Err(error) => {
+                        let code = match error {
+                            NodeError::InvalidRequest(_) | NodeError::NotFound { .. } => -32602,
+                            _ => -32601,
+                        };
+                        if matches!(method, "hub.hello" | "hub.ping") || frame.get("type").is_some()
+                        {
+                            let response = match frame.get("type").and_then(Value::as_str) {
+                                Some("hub.hello") => json!({
+                                    "type": "node.ready",
+                                    "nodeEpoch": hello.params.node_epoch,
+                                    "carrier": CarrierKind::StdioNdjson,
+                                }),
+                                Some("hub.ping") => json!({
+                                    "type": "node.pong",
+                                    "id": id,
+                                }),
+                                _ => crate::transport::hubnode::rpc_error(
+                                    id,
+                                    code,
+                                    &error.to_string(),
+                                ),
+                            };
+                            write_ndjson(&mut output, &response).await?;
+                        } else {
+                            write_ndjson(
+                                &mut output,
+                                &crate::transport::hubnode::rpc_error(id, code, &error.to_string()),
+                            )
+                            .await?;
+                        }
+                    }
+                }
             }
             Ok(())
         })

@@ -9,6 +9,8 @@ use serde_json::Value;
 use std::future::Future;
 use std::time::Duration;
 
+pub(crate) mod hubnode;
+mod hubnode_codec;
 mod wss;
 
 pub use wss::{HubRequest, JournalSender, WssCarrier, WssConfig, WssLink};

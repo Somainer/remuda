@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": "j-1",
+  "method": "journal.append",
+  "version": { "major": 1, "minor": 0 },
+  "params": {
+    "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+    "events": [
+      { "kind": "message", "payload": { "text": "a" } },
+      { "kind": "message", "payload": { "text": "b" } }
+    ],
+    "seq": "2",
+    "watermark": {
+      "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+      "durableSeq": "2"
+    }
+  }
+}

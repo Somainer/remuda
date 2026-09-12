@@ -1,11 +1,10 @@
-//! Bridge `remuda node --stdio` NDJSON onto Hub `GET /v1/node` JSON-RPC.
+//! Bridge `remuda node --stdio` NDJSON onto Hub `GET /v1/node`.
 //!
-//! Node stdio emits an unsolicited `node.hello` and then waits for
-//! `{type: hub.hello}`. Hub `/v1/node` expects JSON-RPC with an `id` and a
-//! Bearer bootstrap/host token. This module is the M1 translator; it does not
-//! live in remuda-hub (stdio spawn stays with OpenSSH).
+//! Both sides speak the same JSON-RPC 2.0 Hub↔Node frames. Stdio may send
+//! `node.auth` first (used as WS Bearer and not forwarded). Remaining frames
+//! are copied as-is.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::error::Error;
 use crate::transport::{NodeTransport, StdioTransport, WssTransport};
@@ -17,14 +16,14 @@ pub struct HubEnroll {
     pub hub_ws_url: String,
     /// Bootstrap or host token presented as `Authorization: Bearer`.
     pub bootstrap_token: String,
-    /// Registry display name (`hosts[].label`).
+    /// Registry display name (`hosts[].label`); Node should already send this.
     pub display_label: String,
 }
 
 /// Outcome of the first hello exchange.
 #[derive(Debug, Clone)]
 pub struct EnrollResult {
-    /// Adapted hello that was sent to Hub.
+    /// Hello frame forwarded to Hub.
     pub hello: Value,
     /// Host id Hub stored (from hello or Hub-assigned).
     pub host_id: String,
@@ -52,60 +51,71 @@ pub fn node_socket_url(hub: &str) -> String {
     }
 }
 
-/// Lift nested inventory and mark the carrier as `ssh-stdio` for Hub registry.
-#[must_use]
-pub fn adapt_hello_for_hub(mut hello: Value, label: &str) -> Value {
-    if hello.get("jsonrpc").is_none() {
-        hello["jsonrpc"] = json!("2.0");
-    }
-    if hello.get("method").and_then(Value::as_str) != Some("node.hello")
-        && hello.get("method").and_then(Value::as_str) != Some("runtime.hello")
-    {
-        hello["method"] = json!("node.hello");
-    }
-    hello["id"] = json!("hello-1");
-    let params = hello
-        .as_object_mut()
-        .and_then(|obj| obj.get_mut("params"))
-        .and_then(Value::as_object_mut);
-    if let Some(params) = params {
-        if !params.contains_key("hostId")
-            && let Some(id) = params
-                .get("host")
-                .and_then(|host| host.get("hostId"))
-                .cloned()
-        {
-            params.insert("hostId".into(), id);
-        }
-        params.insert("label".into(), json!(label));
-        params.insert("transport".into(), json!("ssh-stdio"));
-        if !params.contains_key("nodeVersion") {
-            params.insert("nodeVersion".into(), json!("0.1.0"));
-        }
-    }
-    hello
+fn is_auth_frame(frame: &Value) -> bool {
+    frame.get("method").and_then(Value::as_str) == Some("node.auth")
 }
 
-/// Read stdio `node.hello`, enroll on Hub `/v1/node`, ack the Node with `hub.hello`.
-pub async fn enroll_stdio(
-    stdio: &mut StdioTransport,
-    hub: &HubEnroll,
-) -> Result<(EnrollResult, WssTransport), Error> {
-    let raw = stdio
-        .recv_json()
-        .await?
-        .ok_or_else(|| Error::Enroll("stdio closed before node.hello".into()))?;
-    let hello = adapt_hello_for_hub(raw, &hub.display_label);
-    let host_id = hello
+fn is_hello_frame(frame: &Value) -> bool {
+    matches!(
+        frame.get("method").and_then(Value::as_str),
+        Some("node.hello") | Some("runtime.hello")
+    )
+}
+
+fn token_from_auth(frame: &Value) -> Option<String> {
+    frame
+        .pointer("/params/token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
+fn host_id_from_hello(hello: &Value) -> String {
+    hello
         .pointer("/params/hostId")
         .and_then(Value::as_str)
         .or_else(|| hello.pointer("/params/host/hostId").and_then(Value::as_str))
         .unwrap_or("unknown")
-        .to_string();
+        .to_string()
+}
 
-    let mut ws =
-        WssTransport::connect_with_bearer(&hub.hub_ws_url, Some(hub.bootstrap_token.as_str()))
-            .await?;
+/// Read stdio frames, enroll on Hub `/v1/node`, forward Hub's JSON-RPC reply.
+pub async fn enroll_stdio(
+    stdio: &mut StdioTransport,
+    hub: &HubEnroll,
+) -> Result<(EnrollResult, WssTransport), Error> {
+    let mut token = hub.bootstrap_token.clone();
+    let hello = loop {
+        let frame = stdio
+            .recv_json()
+            .await?
+            .ok_or_else(|| Error::Enroll("stdio closed before node.hello".into()))?;
+        if is_auth_frame(&frame) {
+            if let Some(auth_token) = token_from_auth(&frame) {
+                token = auth_token;
+            }
+            continue;
+        }
+        break frame;
+    };
+    if !is_hello_frame(&hello) {
+        return Err(Error::Enroll(format!(
+            "expected node.hello, got {}",
+            hello
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+        )));
+    }
+    if hello.get("id").is_none() {
+        return Err(Error::Enroll(
+            "node.hello is missing jsonrpc id; Node and Hub must speak the same codec".into(),
+        ));
+    }
+    let host_id = host_id_from_hello(&hello);
+
+    let mut ws = WssTransport::connect_with_bearer(&hub.hub_ws_url, Some(token.as_str())).await?;
     ws.send_json(&hello).await?;
     let hub_result =
         match tokio::time::timeout(std::time::Duration::from_secs(8), ws.recv_json()).await {
@@ -123,12 +133,9 @@ pub async fn enroll_stdio(
         .unwrap_or(host_id.as_str())
         .to_string();
 
-    let ack = json!({
-        "type": "hub.hello",
-        "hostId": host_id,
-        "carrier": "ssh-stdio",
-    });
-    let _ = stdio.send_json(&ack).await;
+    if let Some(result) = &hub_result {
+        let _ = stdio.send_json(result).await;
+    }
 
     Ok((
         EnrollResult {
@@ -150,14 +157,19 @@ pub async fn bridge_until_close(
             from_node = stdio.recv_json() => {
                 match from_node? {
                     None => return Ok(()),
-                    Some(frame) => hub.send_json(&frame).await?,
+                    Some(frame) => {
+                        if is_auth_frame(&frame) {
+                            continue;
+                        }
+                        hub.send_json(&frame).await?;
+                    }
                 }
             }
             from_hub = hub.recv_json() => {
                 match from_hub? {
                     None => return Ok(()),
                     Some(frame) => {
-                        let _ = stdio.send_json(&to_stdio_frame(frame)).await;
+                        let _ = stdio.send_json(&frame).await;
                     }
                 }
             }
@@ -165,25 +177,10 @@ pub async fn bridge_until_close(
     }
 }
 
-fn to_stdio_frame(frame: Value) -> Value {
-    if frame.get("type").is_some() {
-        return frame;
-    }
-    if frame.get("method").and_then(Value::as_str) == Some("hub.ping")
-        || frame.get("result").is_some()
-    {
-        json!({
-            "type": "hub.ping",
-            "id": frame.get("id").cloned().unwrap_or(Value::Null),
-        })
-    } else {
-        frame
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn node_socket_url_from_http_base() {
@@ -198,26 +195,25 @@ mod tests {
     }
 
     #[test]
-    fn adapt_hello_lifts_host_id_and_marks_stdio() {
-        let raw = json!({
+    fn hello_host_id_reads_nested_or_flat() {
+        let nested = json!({
             "jsonrpc": "2.0",
+            "id": "hello-1",
             "method": "node.hello",
             "params": {
-                "nodeEpoch": "epoch_1",
-                "host": {
-                    "hostId": "hst_01993ab0-0000-7000-8000-000000000004",
-                    "hostname": "devbox",
-                    "labels": { "region": "sg" }
-                }
+                "host": { "hostId": "hst_01993ab0-0000-7000-8000-000000000004" }
             }
         });
-        let adapted = adapt_hello_for_hub(raw, "devbox-sg");
-        assert_eq!(adapted["id"], "hello-1");
         assert_eq!(
-            adapted["params"]["hostId"],
+            host_id_from_hello(&nested),
             "hst_01993ab0-0000-7000-8000-000000000004"
         );
-        assert_eq!(adapted["params"]["label"], "devbox-sg");
-        assert_eq!(adapted["params"]["transport"], "ssh-stdio");
+        assert!(is_hello_frame(&nested));
+        assert!(is_auth_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": "auth-1",
+            "method": "node.auth",
+            "params": { "token": "t" }
+        })));
     }
 }

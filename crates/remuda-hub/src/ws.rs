@@ -12,6 +12,9 @@ use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
+use remuda_protocol::hubnode::{
+    self, HubNodeMethod, JournalAppendParams, NodeHelloParams, TtyFrameParams,
+};
 use remuda_protocol::{
     ConnectionLease, HeartbeatResult, HelloResult, PROTOCOL_VERSION, TransportLimits, U64,
 };
@@ -118,6 +121,12 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             }
             incoming = stream.next() => {
                 let Some(Ok(msg)) = incoming else { break; };
+                if let Message::Binary(bytes) = &msg {
+                    if hello_done {
+                        handle_tty_binary(&state, host_id.as_deref(), bytes);
+                    }
+                    continue;
+                }
                 let Message::Text(text) = msg else { continue; };
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue; };
                 if frame.get("method").is_none() {
@@ -131,8 +140,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                 let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
                 let id = frame.get("id").cloned().unwrap_or(Value::Null);
                 let params = frame.get("params").cloned().unwrap_or(json!({}));
-                let is_hello = matches!(method, "runtime.hello" | "node.hello");
-                if !hello_done && !is_hello {
+                let kind = HubNodeMethod::parse(method);
+                let is_hello = kind.is_some_and(HubNodeMethod::is_hello);
+                let is_auth = kind.is_some_and(HubNodeMethod::is_auth);
+                if !hello_done && !is_hello && !is_auth {
                     if !id.is_null() {
                         let _ = sink.send(Message::Text(
                             rpc_err(id, -32000, "runtime.hello required").to_string().into(),
@@ -180,19 +191,36 @@ async fn handle_node_method(
     pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
 ) -> Result<Option<Value>, HubError> {
     match method {
+        "node.auth" => Ok(Some(json!({
+            "ok": true,
+            "scheme": hubnode::AUTH_SCHEME_BEARER,
+        }))),
         "runtime.hello" | "node.hello" => {
-            let hello_host = params
-                .get("hostId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let label = params
-                .get("label")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let node_version = params
-                .get("nodeVersion")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            let typed: Option<NodeHelloParams> = serde_json::from_value(params.clone()).ok();
+            let hello_host = typed
+                .as_ref()
+                .and_then(|p| p.persisted_host_id().map(str::to_string))
+                .or_else(|| {
+                    params
+                        .get("hostId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            let label = typed.as_ref().and_then(|p| p.label.clone()).or_else(|| {
+                params
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let node_version = typed
+                .as_ref()
+                .and_then(|p| p.node_version.clone())
+                .or_else(|| {
+                    params
+                        .get("nodeVersion")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
             let outcome = state
                 .store
                 .authenticate_host(
@@ -282,44 +310,77 @@ async fn handle_node_method(
         }
         "journal.append" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            let instance_id = params
-                .get("instanceId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| HubError::BadRequest("journal.append requires instanceId".into()))?
-                .to_string();
-            let seq = params.get("seq").and_then(|v| {
-                v.as_i64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            });
-            let event = params
-                .get("event")
-                .cloned()
-                .unwrap_or_else(|| params.clone());
+            let parsed: Option<JournalAppendParams> = serde_json::from_value(params.clone()).ok();
+            let instance_id = parsed
+                .as_ref()
+                .map(|p| p.instance_id.clone())
+                .or_else(|| {
+                    params
+                        .get("instanceId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| HubError::BadRequest("journal.append requires instanceId".into()))?;
+            let seq = parsed
+                .as_ref()
+                .and_then(JournalAppendParams::seq_i64)
+                .or_else(|| {
+                    params.get("seq").and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                });
+            let events = parsed
+                .as_ref()
+                .map(JournalAppendParams::events_to_append)
+                .filter(|events| !events.is_empty())
+                .unwrap_or_else(|| {
+                    vec![
+                        params
+                            .get("event")
+                            .cloned()
+                            .unwrap_or_else(|| params.clone()),
+                    ]
+                });
             state
                 .store
                 .ensure_instance(host_id.clone(), instance_id.clone())
                 .await
                 .map_err(map_host_store)?;
-            let record = state
-                .store
-                .append_journal(host_id.clone(), instance_id.clone(), seq, event)
-                .await
-                .map_err(map_host_store)?;
-            publish_journal(&state.bus, &record);
-            crate::alerts::observe(state, &record);
+            let mut last = None;
+            for event in events {
+                let record = state
+                    .store
+                    .append_journal(host_id.clone(), instance_id.clone(), seq, event)
+                    .await
+                    .map_err(map_host_store)?;
+                publish_journal(&state.bus, &record);
+                crate::alerts::observe(state, &record);
+                last = Some(record);
+            }
+            let record = last.ok_or_else(|| {
+                HubError::BadRequest("journal.append requires event or events".into())
+            })?;
             Ok(Some(json!({
                 "seq": record.seq.to_string(),
                 "eventId": record.event_id,
                 "durableSeq": record.seq.to_string(),
+                "watermark": { "durableSeq": record.seq.to_string() },
             })))
         }
         "tty.frame" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            let instance_id = params
-                .get("instanceId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let typed: Option<TtyFrameParams> = serde_json::from_value(params.clone()).ok();
+            let instance_id = typed
+                .as_ref()
+                .and_then(|p| p.instance_id.clone())
+                .or_else(|| {
+                    params
+                        .get("instanceId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
             if !instance_id.is_empty() {
                 let instance = state
                     .store
@@ -354,6 +415,28 @@ async fn handle_node_method(
         }
         other => Err(HubError::BadRequest(format!("unknown method {other}"))),
     }
+}
+
+fn handle_tty_binary(state: &AppState, host_id: Option<&str>, bytes: &[u8]) {
+    let max = default_limits().max_binary_chunk_bytes;
+    let Ok((header, payload)) = hubnode::decode_tty_binary_frame(bytes, max) else {
+        return;
+    };
+    let Some(host_id) = host_id else {
+        return;
+    };
+    state.bus.publish(FollowEvent {
+        instance_id: host_id.to_owned(),
+        seq: 0,
+        event: json!({
+            "type": "tty.frame",
+            "binary": true,
+            "channel": header.channel as u8,
+            "offset": header.offset,
+            "payloadLength": payload.len(),
+            "envelope": hubnode::TtyBinaryEnvelopeSpec::v1(),
+        }),
+    });
 }
 
 fn map_host_store(err: crate::store::StoreError) -> HubError {

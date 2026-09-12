@@ -67,6 +67,9 @@ enum SshCommand {
         /// Extra `KEY=VALUE` labels forwarded to `remuda node --stdio --label`.
         #[arg(long = "node-label", value_name = "KEY=VALUE")]
         node_labels: Vec<String>,
+        /// Remote Node data dir forwarded as `--data-dir`.
+        #[arg(long)]
+        node_data_dir: Option<String>,
         /// Exit after hello instead of bridging until disconnect (default: hold).
         #[arg(long)]
         no_hold: bool,
@@ -131,21 +134,31 @@ pub async fn run(args: SshArgs) -> Result<()> {
             bootstrap_token_file,
             label,
             node_labels,
+            node_data_dir,
             no_hold,
         } => {
             let client = client(&alias, !no_control_master);
             let target = SshTarget::resolve(&alias)?;
+            let display = label.clone().unwrap_or_else(|| alias.clone());
             let mut argv = node_stdio_argv(std::path::Path::new(&remote));
             for pair in &node_labels {
                 argv.push("--label".into());
                 argv.push(pair.clone());
+            }
+            argv.push("--display-label".into());
+            argv.push(display.clone());
+            argv.push("--transport".into());
+            argv.push("ssh-stdio".into());
+            if let Some(dir) = node_data_dir {
+                argv.push("--data-dir".into());
+                argv.push(dir);
             }
             if let Some(hub) = hub {
                 run_hub_enroll(
                     client,
                     argv,
                     &alias,
-                    label.unwrap_or_else(|| alias.clone()),
+                    display,
                     &hub,
                     bootstrap_token_file,
                     !no_hold,

@@ -22,17 +22,38 @@ def write_frame(obj):
 
 HELLO = {
     "jsonrpc": "2.0",
+    "id": "hello-1",
     "method": "node.hello",
+    "version": {"major": 1, "minor": 0},
     "params": {
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000004",
         "nodeVersion": "0.1.0",
+        "label": "devbox-sg",
+        "transport": "ssh-stdio",
         "protocol": {"major": 1, "minor": 0, "framing": "ndjson"},
+        "host": {
+            "hostId": "hst_01993ab0-0000-7000-8000-000000000004",
+            "hostname": "devbox",
+        },
     },
+}
+
+AUTH = {
+    "jsonrpc": "2.0",
+    "id": "auth-1",
+    "method": "node.auth",
+    "version": {"major": 1, "minor": 0},
+    "params": {"token": "from-node", "scheme": "bearer"},
 }
 
 
 def main() -> int:
     mode = os.environ.get("REMUDA_FAKE_NODE", "hello-exit")
     if mode == "hello-exit":
+        write_frame(HELLO)
+        return 0
+    if mode == "auth-hello-exit":
+        write_frame(AUTH)
         write_frame(HELLO)
         return 0
     if mode == "echo":

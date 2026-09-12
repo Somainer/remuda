@@ -1,18 +1,13 @@
 //! Outbound Hub WebSocket JSON-RPC client (`GET /v1/node`).
 
-use crate::DevNode;
 use crate::NodeError;
+use crate::transport::hubnode::{self, SeqWatermark};
 use crate::transport::{Backoff, NodeTransport};
 use futures::{SinkExt, StreamExt};
-use remuda_protocol::hubnode::{
-    self, JournalAppendParams, JournalSeqWatermark, METHOD_JOURNAL_APPEND, METHOD_NODE_HEARTBEAT,
-    METHOD_NODE_HELLO, NodeHeartbeatParams, NodeHelloParams, WS_AUTHORIZATION_SCHEME,
-};
-use remuda_protocol::{Id, PROTOCOL_VERSION, U64};
+use remuda_protocol::Id;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -21,9 +16,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-
-mod runtime_wss;
-use runtime_wss::SeqWatermark;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -112,15 +104,14 @@ impl HubRequest {
 }
 
 #[derive(Debug)]
-pub(crate) struct HubReply {
-    pub id: Value,
-    pub result: Result<Value, NodeError>,
+struct HubReply {
+    id: Value,
+    result: Result<Value, NodeError>,
 }
 
 struct JournalJob {
     instance_id: String,
     event: Value,
-    seq: Option<i64>,
     reply: oneshot::Sender<Result<Value, NodeError>>,
 }
 
@@ -133,31 +124,11 @@ pub struct JournalSender {
 impl JournalSender {
     /// Enqueue an observation. Waits when the session is applying backpressure.
     pub async fn append(&self, instance_id: String, event: Value) -> Result<Value, NodeError> {
-        self.push(instance_id, event, None).await
-    }
-
-    /// Enqueue an observation at a known local sequence (Hub watermark).
-    pub async fn append_seq(
-        &self,
-        instance_id: String,
-        seq: i64,
-        event: Value,
-    ) -> Result<Value, NodeError> {
-        self.push(instance_id, event, Some(seq)).await
-    }
-
-    async fn push(
-        &self,
-        instance_id: String,
-        event: Value,
-        seq: Option<i64>,
-    ) -> Result<Value, NodeError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(JournalJob {
                 instance_id,
                 event,
-                seq,
                 reply,
             })
             .await
@@ -177,12 +148,6 @@ enum Control {
     Shutdown,
 }
 
-struct PendingAppend {
-    reply: oneshot::Sender<Result<Value, NodeError>>,
-    instance_id: String,
-    seq: Option<i64>,
-}
-
 /// Live outbound WSS session: hello, heartbeat, journal pump, reconnect.
 pub struct WssLink {
     /// Host id used in hello.
@@ -200,15 +165,6 @@ pub struct WssLink {
 impl WssLink {
     /// Dial Hub, complete `node.hello`, and spawn the session loop.
     pub async fn connect(config: WssConfig) -> Result<Self, NodeError> {
-        Self::connect_inner(config, None).await
-    }
-
-    /// Dial Hub and dispatch `instance.*` into a local [`DevNode`], streaming its journal.
-    pub async fn connect_runtime(config: WssConfig, node: DevNode) -> Result<Self, NodeError> {
-        Self::connect_inner(config, Some(node)).await
-    }
-
-    async fn connect_inner(config: WssConfig, runtime: Option<DevNode>) -> Result<Self, NodeError> {
         let token = config.token.clone();
         let host_id = config.host_id.clone();
         let (journal_tx, journal_rx) = mpsc::channel(config.journal_queue.max(1));
@@ -216,12 +172,9 @@ impl WssLink {
         let (hub_reply_tx, hub_reply_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
         let (control_tx, control_rx) = mpsc::channel(4);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let journal = JournalSender { tx: journal_tx };
         let task = tokio::spawn(session_task(
             config,
             token,
-            runtime,
-            journal.clone(),
             journal_rx,
             hub_tx,
             hub_reply_tx,
@@ -238,7 +191,7 @@ impl WssLink {
             host_id,
             node_token,
             hello,
-            journal,
+            journal: JournalSender { tx: journal_tx },
             control: control_tx,
             hub_rx,
             task,
@@ -314,7 +267,7 @@ async fn dial(url: &str, token: &str) -> Result<WsStream, NodeError> {
     let mut request = url
         .into_client_request()
         .map_err(|err| NodeError::Transport(err.to_string()))?;
-    let value = format!("{WS_AUTHORIZATION_SCHEME} {token}")
+    let value = format!("Bearer {token}")
         .parse()
         .map_err(|err| NodeError::Transport(format!("authorization header: {err}")))?;
     request.headers_mut().insert(AUTHORIZATION, value);
@@ -357,7 +310,42 @@ fn rpc_request(id: &str, method: &str, params: Value) -> Value {
 }
 
 fn rpc_ok(id: Value, result: Value) -> Value {
-    hubnode::rpc_ok(id, result)
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn hello_params(config: &WssConfig) -> Value {
+    let Ok(epoch) = Id::new("epoch") else {
+        return json!({
+            "hostId": config.host_id,
+            "nodeVersion": config.node_version,
+            "label": config.label,
+            "cli": config.cli.clone(),
+            "transport": "outbound-wss",
+            "version": remuda_protocol::PROTOCOL_VERSION,
+        });
+    };
+    hubnode::encode_hello(
+        &config.host_id,
+        &config.node_version,
+        &config.label,
+        &config.cli,
+        &epoch,
+        &HashMap::<String, SeqWatermark>::new(),
+    )
+}
+
+fn heartbeat_params(config: &WssConfig) -> Value {
+    hubnode::encode_heartbeat(
+        &config.node_version,
+        &config.cli,
+        None,
+        None,
+        &HashMap::<String, SeqWatermark>::new(),
+    )
 }
 
 fn take_rpc_error(frame: &Value) -> Option<NodeError> {
@@ -375,18 +363,12 @@ fn take_rpc_error(frame: &Value) -> Option<NodeError> {
 async fn perform_hello(
     stream: &mut WsStream,
     config: &WssConfig,
-    node_epoch: &Id,
-    watermarks: &HashMap<String, SeqWatermark>,
     ids: &AtomicU64,
 ) -> Result<Value, NodeError> {
     let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
     send_ws(
         stream,
-        &rpc_request(
-            &id,
-            METHOD_NODE_HELLO,
-            encode_hello_params(config, node_epoch, watermarks),
-        ),
+        &rpc_request(&id, "node.hello", hello_params(config)),
     )
     .await?;
     let Some(frame) = recv_ws(stream).await? else {
@@ -404,8 +386,6 @@ async fn perform_hello(
 async fn session_task(
     mut config: WssConfig,
     mut token: String,
-    runtime: Option<DevNode>,
-    journal: JournalSender,
     mut journal_rx: mpsc::Receiver<JournalJob>,
     hub_tx: mpsc::Sender<HubRequest>,
     hub_reply_tx: mpsc::Sender<HubReply>,
@@ -414,24 +394,8 @@ async fn session_task(
     ready: Option<oneshot::Sender<Result<Value, NodeError>>>,
 ) {
     let ids = AtomicU64::new(1);
-    let mut pending: HashMap<String, PendingAppend> = HashMap::new();
+    let mut pending: HashMap<String, oneshot::Sender<Result<Value, NodeError>>> = HashMap::new();
     let mut attempt = 0_u32;
-    let watermarks = Arc::new(Mutex::new(HashMap::new()));
-    let pumps = Arc::new(Mutex::new(HashSet::new()));
-    let Ok(node_epoch) = Id::new("epoch") else {
-        if let Some(ready) = ready {
-            let _ = ready.send(Err(NodeError::InvalidConfig(
-                "could not allocate node epoch".into(),
-            )));
-        }
-        return;
-    };
-    let runtime = runtime.map(|node| runtime_wss::RuntimeLink {
-        node,
-        journal,
-        watermarks: watermarks.clone(),
-        pumps,
-    });
     let mut stream = match dial(&config.url, &token).await {
         Ok(stream) => stream,
         Err(err) => {
@@ -441,8 +405,7 @@ async fn session_task(
             return;
         }
     };
-    let snapshot = runtime_wss::snapshot_watermarks(&watermarks);
-    let hello = match perform_hello(&mut stream, &config, &node_epoch, &snapshot, &ids).await {
+    let hello = match perform_hello(&mut stream, &config, &ids).await {
         Ok(hello) => hello,
         Err(err) => {
             if let Some(ready) = ready {
@@ -455,14 +418,6 @@ async fn session_task(
         token = new_token.to_owned();
         config.token = token.clone();
     }
-    let mut connection_id = hello
-        .get("connectionId")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let mut lease_id = hello
-        .pointer("/lease/leaseId")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     if let Some(ready) = ready {
         let _ = ready.send(Ok(hello.clone()));
     }
@@ -477,26 +432,28 @@ async fn session_task(
                 match control {
                     None | Some(Control::Shutdown) => break,
                     Some(Control::Reconnect(done)) => {
+                        fail_pending(&mut pending, NodeError::Disconnected);
                         let result = reconnect(
-                            &mut stream, &mut config, &mut token, &node_epoch,
-                            &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id,
-                            &mut pending, runtime.as_ref(),
-                        ).await;
+                            &mut stream,
+                            &mut config,
+                            &mut token,
+                            &ids,
+                            &mut attempt,
+                        )
+                        .await;
                         let _ = done.send(result);
                     }
                 }
             }
             _ = heartbeat.tick() => {
                 let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
-                let snapshot = runtime_wss::snapshot_watermarks(&watermarks);
-                let frame = rpc_request(
-                    &id,
-                    METHOD_NODE_HEARTBEAT,
-                    encode_heartbeat_params(&config, connection_id.as_deref(), lease_id.as_deref(), &snapshot),
-                );
+                let frame = rpc_request(&id, "node.heartbeat", heartbeat_params(&config));
                 if send_ws(&mut stream, &frame).await.is_err()
-                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &ids, &mut attempt)
+                        .await
+                        .is_err()
                 {
+                    fail_pending(&mut pending, NodeError::Disconnected);
                     break;
                 }
             }
@@ -505,16 +462,20 @@ async fn session_task(
                 let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
                 let frame = rpc_request(
                     &id,
-                    METHOD_JOURNAL_APPEND,
-                    encode_append_params(&job.instance_id, job.seq, job.event),
+                    "journal.append",
+                    hubnode::encode_append(&job.instance_id, None, job.event),
                 );
                 match send_ws(&mut stream, &frame).await {
                     Ok(()) => {
-                        pending.insert(id, PendingAppend { reply: job.reply, instance_id: job.instance_id, seq: job.seq });
+                        pending.insert(id, job.reply);
                     }
                     Err(_) => {
                         let _ = job.reply.send(Err(NodeError::Disconnected));
-                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err() {
+                        if reconnect(&mut stream, &mut config, &mut token, &ids, &mut attempt)
+                            .await
+                            .is_err()
+                        {
+                            fail_pending(&mut pending, NodeError::Disconnected);
                             break;
                         }
                     }
@@ -527,18 +488,32 @@ async fn session_task(
                     Err(error) => rpc_node_error(reply.id, &error),
                 };
                 if send_ws(&mut stream, &frame).await.is_err()
-                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &ids, &mut attempt)
+                        .await
+                        .is_err()
                 {
+                    fail_pending(&mut pending, NodeError::Disconnected);
                     break;
                 }
             }
             incoming = recv_ws(&mut stream) => {
                 match incoming {
                     Ok(Some(frame)) => {
-                        handle_incoming(frame, &mut pending, &hub_tx, &hub_reply_tx, runtime.as_ref(), &watermarks, &mut stream).await;
+                        handle_incoming(
+                            frame,
+                            &mut pending,
+                            &hub_tx,
+                            &hub_reply_tx,
+                            &mut stream,
+                        )
+                        .await;
                     }
                     Ok(None) | Err(_) => {
-                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err() {
+                        fail_pending(&mut pending, NodeError::Disconnected);
+                        if reconnect(&mut stream, &mut config, &mut token, &ids, &mut attempt)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -551,27 +526,15 @@ async fn session_task(
 
 async fn handle_incoming(
     frame: Value,
-    pending: &mut HashMap<String, PendingAppend>,
+    pending: &mut HashMap<String, oneshot::Sender<Result<Value, NodeError>>>,
     hub_tx: &mpsc::Sender<HubRequest>,
     hub_reply_tx: &mpsc::Sender<HubReply>,
-    runtime: Option<&runtime_wss::RuntimeLink>,
-    watermarks: &Arc<Mutex<HashMap<String, SeqWatermark>>>,
     stream: &mut WsStream,
 ) {
     let method = frame.get("method").and_then(Value::as_str);
     if let Some(method) = method {
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
         let params = frame.get("params").cloned().unwrap_or(json!({}));
-        if let Some(runtime) = runtime {
-            runtime_wss::dispatch_in_background(
-                runtime,
-                method.to_owned(),
-                params,
-                id,
-                hub_reply_tx.clone(),
-            );
-            return;
-        }
         let request = HubRequest {
             id: id.clone(),
             method: method.to_owned(),
@@ -598,24 +561,11 @@ async fn handle_incoming(
         return;
     };
     if let Some(err) = take_rpc_error(&frame) {
-        if let Some(seq) = waiter.seq.filter(|seq| already_durable(&err, *seq)) {
-            runtime_wss::record_watermark(watermarks, &waiter.instance_id, None, seq);
-            let _ = waiter.reply.send(Ok(json!({ "seq": seq })));
-        } else {
-            let _ = waiter.reply.send(Err(err));
-        }
+        let _ = waiter.send(Err(err));
     } else if let Some(result) = frame.get("result").cloned() {
-        let seq = result
-            .get("durableSeq")
-            .or_else(|| result.get("seq"))
-            .and_then(value_i64)
-            .or(waiter.seq);
-        if let Some(seq) = seq {
-            runtime_wss::record_watermark(watermarks, &waiter.instance_id, None, seq);
-        }
-        let _ = waiter.reply.send(Ok(result));
+        let _ = waiter.send(Ok(result));
     } else {
-        let _ = waiter.reply.send(Err(NodeError::Transport(
+        let _ = waiter.send(Err(NodeError::Transport(
             "rpc response missing result".into(),
         )));
     }
@@ -626,116 +576,25 @@ fn rpc_node_error(id: Value, error: &NodeError) -> Value {
         NodeError::InvalidRequest(_) | NodeError::NotFound { .. } => -32602,
         NodeError::QueueFull => -32001,
         NodeError::DriverUnavailable => -32002,
-        NodeError::InteractionExpired => -32005,
-        NodeError::InteractionSuperseded { .. } => -32004,
         _ => -32603,
     };
     rpc_error(id, code, &error.to_string())
 }
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    hubnode::rpc_error(id, code, message)
-}
-
-fn encode_hello_params(
-    config: &WssConfig,
-    node_epoch: &Id,
-    watermarks: &HashMap<String, SeqWatermark>,
-) -> Value {
-    let mut params = json!(NodeHelloParams {
-        host_id: Some(config.host_id.clone()),
-        label: Some(config.label.clone()),
-        node_version: Some(config.node_version.clone()),
-        node_epoch: Some(node_epoch.to_string()),
-        enrollment_token: None,
-        transport: Some("outbound-wss".into()),
-        version: Some(PROTOCOL_VERSION),
-        protocol: Some(json!({
-            "major": PROTOCOL_VERSION.major,
-            "minor": PROTOCOL_VERSION.minor,
-            "framing": "websocket-message",
-        })),
-        host: None,
-        capabilities: None,
-        cli: Some(config.cli.clone()),
-    });
-    if let Some(object) = params.as_object_mut() {
-        object.insert("resumeCursors".into(), json!(resume_cursors(watermarks)));
-        object.insert(
-            "instanceWatermarks".into(),
-            json!(journal_watermarks(watermarks)),
-        );
-    }
-    params
-}
-
-fn encode_heartbeat_params(
-    config: &WssConfig,
-    connection_id: Option<&str>,
-    lease_id: Option<&str>,
-    watermarks: &HashMap<String, SeqWatermark>,
-) -> Value {
-    json!(NodeHeartbeatParams {
-        connection_id: connection_id.map(str::to_owned),
-        lease_id: lease_id.map(str::to_owned),
-        node_version: Some(config.node_version.clone()),
-        transport: Some("outbound-wss".into()),
-        host: None,
-        cli: Some(config.cli.clone()),
-        capabilities: None,
-        instance_watermarks: journal_watermarks(watermarks),
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message },
     })
 }
 
-fn encode_append_params(instance_id: &str, seq: Option<i64>, event: Value) -> Value {
-    json!(JournalAppendParams {
-        instance_id: instance_id.to_owned(),
-        event: Some(event.clone()),
-        events: vec![event],
-        seq: seq.map(|seq| json!(seq.to_string())),
-        watermark: seq.map(|seq| JournalSeqWatermark {
-            journal_id: None,
-            instance_id: Some(instance_id.to_owned()),
-            durable_seq: Some(json!(seq.to_string())),
-            after_seq: None,
-            seq: u64_seq(seq),
-        }),
-    })
-}
-
-fn journal_watermarks(watermarks: &HashMap<String, SeqWatermark>) -> Vec<JournalSeqWatermark> {
-    watermarks
-        .values()
-        .map(|mark| JournalSeqWatermark {
-            journal_id: mark.journal_id.clone(),
-            instance_id: Some(mark.instance_id.clone()),
-            durable_seq: Some(json!(mark.seq.to_string())),
-            after_seq: Some(json!(mark.seq.to_string())),
-            seq: u64_seq(mark.seq),
-        })
-        .collect()
-}
-
-fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
-    watermarks
-        .values()
-        .map(|mark| {
-            json!({
-                "journalId": mark.journal_id.as_deref().unwrap_or(mark.instance_id.as_str()),
-                "afterSeq": mark.seq.to_string(),
-                "instanceId": mark.instance_id,
-            })
-        })
-        .collect()
-}
-
-fn u64_seq(seq: i64) -> Option<U64> {
-    u64::try_from(seq.max(0)).ok().map(U64)
-}
-
-fn fail_pending(pending: &mut HashMap<String, PendingAppend>, error: NodeError) {
+fn fail_pending(
+    pending: &mut HashMap<String, oneshot::Sender<Result<Value, NodeError>>>,
+    error: NodeError,
+) {
     for (_, waiter) in pending.drain() {
-        let _ = waiter.reply.send(Err(match &error {
+        let _ = waiter.send(Err(match &error {
             NodeError::Disconnected => NodeError::Disconnected,
             other => NodeError::Transport(other.to_string()),
         }));
@@ -746,16 +605,9 @@ async fn reconnect(
     stream: &mut WsStream,
     config: &mut WssConfig,
     token: &mut String,
-    node_epoch: &Id,
-    watermarks: &Arc<Mutex<HashMap<String, SeqWatermark>>>,
     ids: &AtomicU64,
     attempt: &mut u32,
-    connection_id: &mut Option<String>,
-    lease_id: &mut Option<String>,
-    pending: &mut HashMap<String, PendingAppend>,
-    runtime: Option<&runtime_wss::RuntimeLink>,
 ) -> Result<(), NodeError> {
-    fail_pending(pending, NodeError::Disconnected);
     let _ = stream.close(None).await;
     loop {
         let delay = config.backoff.delay(*attempt);
@@ -765,54 +617,27 @@ async fn reconnect(
             "hub wss reconnecting; commands are not replayed"
         );
         sleep(delay).await;
-        let snapshot = runtime_wss::snapshot_watermarks(watermarks);
         match dial(&config.url, token).await {
-            Ok(mut next) => {
-                match perform_hello(&mut next, config, node_epoch, &snapshot, ids).await {
-                    Ok(hello) => {
-                        if let Some(new_token) = hello.get("nodeToken").and_then(Value::as_str) {
-                            *token = new_token.to_owned();
-                            config.token = token.clone();
-                        }
-                        *connection_id = hello
-                            .get("connectionId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        *lease_id = hello
-                            .pointer("/lease/leaseId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        *stream = next;
-                        *attempt = 0;
-                        if let Some(runtime) = runtime {
-                            runtime_wss::resume_runtime_journals(runtime);
-                        }
-                        return Ok(());
+            Ok(mut next) => match perform_hello(&mut next, config, ids).await {
+                Ok(hello) => {
+                    if let Some(new_token) = hello.get("nodeToken").and_then(Value::as_str) {
+                        *token = new_token.to_owned();
+                        config.token = token.clone();
                     }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "hello after reconnect failed");
-                        *attempt = attempt.saturating_add(1);
-                    }
+                    *stream = next;
+                    *attempt = 0;
+                    return Ok(());
                 }
-            }
+                Err(err) => {
+                    tracing::warn!(error = %err, "hello after reconnect failed");
+                    *attempt = attempt.saturating_add(1);
+                }
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "dial after disconnect failed");
                 *attempt = attempt.saturating_add(1);
             }
         }
-    }
-}
-
-pub(crate) fn value_i64(value: &Value) -> Option<i64> {
-    hubnode::value_as_i64(value)
-}
-
-pub(crate) fn already_durable(error: &NodeError, seq: i64) -> bool {
-    match error {
-        NodeError::HubRpc { message, .. } => {
-            message.contains("journal gap") && message.contains(&format!("got {seq}"))
-        }
-        _ => false,
     }
 }
 
@@ -848,46 +673,5 @@ mod tests {
         assert_eq!(job.instance_id, "ins_b");
         let _ = job.reply.send(Ok(json!({"seq":"2"})));
         second.await.expect("join").expect("second seq");
-    }
-
-    #[test]
-    fn append_params_use_hubnode_batch_and_watermark() {
-        let value = encode_append_params("ins_x", Some(4), json!({"kind": "message"}));
-        let parsed: JournalAppendParams = serde_json::from_value(value).expect("params");
-        assert_eq!(parsed.events_to_append().len(), 1);
-        assert_eq!(parsed.seq_i64(), Some(4));
-        assert_eq!(
-            parsed
-                .watermark
-                .as_ref()
-                .and_then(|mark: &JournalSeqWatermark| mark.durable_i64()),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn hello_params_include_resume_cursors() {
-        let epoch = Id::new("epoch").expect("epoch");
-        let host = remuda_protocol::HostId::new();
-        let config = WssConfig::loopback(
-            "127.0.0.1:1".parse().expect("addr"),
-            "tok",
-            host.as_id().as_str().to_owned(),
-        );
-        let mut marks = HashMap::new();
-        marks.insert(
-            "ins_a".into(),
-            SeqWatermark {
-                instance_id: "ins_a".into(),
-                journal_id: None,
-                seq: 3,
-            },
-        );
-        let value = encode_hello_params(&config, &epoch, &marks);
-        assert_eq!(value["transport"], json!("outbound-wss"));
-        assert_eq!(value["cli"][0]["kind"], json!("claude"));
-        assert_eq!(value["resumeCursors"][0]["afterSeq"], json!("3"));
-        let parsed: NodeHelloParams = serde_json::from_value(value).expect("hello");
-        assert_eq!(parsed.persisted_host_id(), Some(config.host_id.as_str()));
     }
 }

@@ -1,0 +1,27 @@
+{
+  "jsonrpc": "2.0",
+  "id": "hello-1",
+  "method": "node.hello",
+  "version": { "major": 1, "minor": 0 },
+  "params": {
+    "hostId": "hst_01993ab0-0000-7000-8000-000000000004",
+    "label": "devbox-sg",
+    "nodeVersion": "0.1.0",
+    "nodeEpoch": "epoch_01993ab0-0000-7000-8000-000000000005",
+    "enrollmentToken": "host-token",
+    "transport": "ssh-stdio",
+    "version": { "major": 1, "minor": 0 },
+    "protocol": {
+      "major": 1,
+      "minor": 0,
+      "framing": "ndjson",
+      "maxFrameBytes": 1048576
+    },
+    "host": {
+      "hostId": "hst_01993ab0-0000-7000-8000-000000000004",
+      "hostname": "devbox",
+      "labels": { "region": "sg" },
+      "maxInstances": 8
+    }
+  }
+}

@@ -4,7 +4,9 @@
 //! split Node crate. This bin is uploaded as `remuda` on the remote host.
 
 use clap::{Parser, Subcommand};
+use remuda_node::StdioOptions;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "remuda", version, about = "Remuda Node stdio carrier")]
@@ -26,6 +28,15 @@ enum Command {
         /// Advertised instance ceiling.
         #[arg(long, default_value_t = 8)]
         max_instances: usize,
+        /// Registry display name (`hosts[].label`).
+        #[arg(long)]
+        display_label: Option<String>,
+        /// Carrier reported to Hub.
+        #[arg(long, default_value = "ssh-stdio")]
+        transport: String,
+        /// Data directory for `enrollment.json`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
     /// Print crate version.
     Version,
@@ -56,6 +67,9 @@ fn main() -> anyhow::Result<()> {
             stdio,
             labels,
             max_instances,
+            display_label,
+            transport,
+            data_dir,
         } => {
             anyhow::ensure!(stdio, "remuda node requires --stdio on this binary");
             let labels = parse_labels(&labels)?;
@@ -63,9 +77,15 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             runtime.block_on(async move {
-                remuda_node::run_stdio(labels, max_instances)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("{err}"))
+                remuda_node::run_stdio_opts(StdioOptions {
+                    labels,
+                    max_instances,
+                    display_label,
+                    transport,
+                    data_dir: data_dir.unwrap_or_else(|| StdioOptions::default().data_dir),
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))
             })
         }
     }

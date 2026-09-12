@@ -3,14 +3,17 @@
 mod carrier;
 mod config;
 mod driver;
+mod enroll;
 mod error;
 mod identity;
 mod interactions;
 mod inventory;
 mod model;
+mod native;
 mod runtime;
 mod runtime_link;
 mod server;
+mod service;
 mod stdio;
 mod store;
 mod transport;
@@ -36,10 +39,12 @@ pub use inventory::{
 pub use model::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, InstanceCommandRequest,
 };
+pub use native::{NativeDriverConfig, native_driver_registry};
 pub use runtime::DevNode;
 pub use runtime_link::attach_runtime;
 pub use server::{DevServer, dev_router};
-pub use stdio::run_stdio;
+pub use service::{LocalDrivers, RunningNode, ServeConfig, compose, serve};
+pub use stdio::{StdioOptions, run_stdio, run_stdio_opts};
 pub use store::{LocalStore, MemoryStore};
 pub use transport::{
     Backoff, HubRequest, JournalSender, NodeTransport, WssCarrier, WssConfig, WssLink,

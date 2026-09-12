@@ -9,8 +9,8 @@
 //!   NDJSON frames (same as `remuda-node` `StdioCarrier`)
 //! - [`WssTransport`]: one WebSocket message per JSON value
 //!
-//! [`enroll_stdio`] translates Node NDJSON `node.hello` onto Hub `GET /v1/node`
-//! JSON-RPC so an SSH stdio Node can appear in `GET /v1/hosts`.
+//! [`enroll_stdio`] forwards Node JSON-RPC onto Hub `GET /v1/node`
+//! (`node.auth` sets WS Bearer and is not forwarded).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
@@ -33,9 +33,7 @@ pub use client::{
     CONTROL_PERSIST_SECS, ExecOutput, SERVER_ALIVE_COUNT_MAX, SERVER_ALIVE_INTERVAL, SshClient,
     SshOptions, default_runtime_dir, sh_single_quote,
 };
-pub use enroll::{
-    EnrollResult, HubEnroll, adapt_hello_for_hub, bridge_until_close, enroll_stdio, node_socket_url,
-};
+pub use enroll::{EnrollResult, HubEnroll, bridge_until_close, enroll_stdio, node_socket_url};
 pub use error::Error;
 pub use frame::{MAX_JSON_FRAME_BYTES, encode_json_frame, read_json_frame, write_json_frame};
 pub use probe::{BinStatus, ProbeReport, probe};

@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": "tty-1",
+  "method": "tty.frame",
+  "version": { "major": 1, "minor": 0 },
+  "params": {
+    "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+    "streamId": "tty_01993ab0-0000-7000-8000-000000000007",
+    "channel": 1,
+    "offset": "0"
+  }
+}

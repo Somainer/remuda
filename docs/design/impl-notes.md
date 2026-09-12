@@ -38,6 +38,53 @@ No remuda-hub / remuda-node files were rewritten.
 `transport=ssh-stdio`, plus CLI/herdr inventory from the SG node. Remote
 files were only under `/tmp/remuda-m1/` and were removed afterwards.
 
+
+## M1 Hub↔Node wire (2026-09-12)
+
+Shared JSON-RPC 2.0 frames live in `remuda_protocol::hubnode` (new module +
+one `lib.rs` line). Hub `/v1/node` parses those types and still accepts
+`runtime.hello` plus single-event `journal.append`. Auth is Bearer on WS;
+stdio may send `node.auth` first. `journal.append` accepts a batched
+`events` array and returns a seq watermark. Binary `tty.frame` uses the
+32-byte envelope in `hubnode::TtyBinaryEnvelopeSpec`.
+
+Node: `src/enroll.rs` persists `hostId` + `nodeToken` under the data dir;
+`src/transport/hubnode_codec.rs` encodes/decodes the same frames and
+dispatches `instance.*` to `DevNode`. `run_stdio` / `StdioCarrier` emit
+`node.auth` (when a token exists) then `node.hello` with `id`, `hostId`,
+`transport`, `label`, and `version`. `OutboundWssCarrier` dials `/v1/node`
+with Bearer and dispatches Hub requests. `remuda-ssh` `enroll_stdio` no
+longer translates: `node.auth` sets WS Bearer and is not forwarded; other
+JSON-RPC frames pass through.
+
+### Remaining for remuda-node (codex-sol)
+
+- Bind stdio `DevNode` to the persisted enrollment `hostId` (today
+  `DevNode::new` mints a second host). `crates/remuda/src/cmd/node.rs`
+  should pass `config.data_dir` into `StdioCarrier` / `run_stdio_opts`.
+- After Hub hello, write `nodeToken` from the JSON-RPC result on both
+  stdio and `WssLink` so the next enroll presents `node.auth` instead of
+  bootstrap (bootstrap + a persisted `hostId` is rejected).
+- Share one `DevNode` between stdio/`WssLink::connect_runtime` and
+  `attach_runtime` so journal pumps and `instance.*` hit the same store.
+- Stdio does not yet `journal.append` observations back to Hub; that
+  still rides `WssLink`. Binary tty on stdio is unspecified.
+- `cargo test -p remuda-node` needed `CARGO_INCREMENTAL=0` once after
+  adding `pub mod hubnode` (stale protocol rlibs omitted the module).
+
+### Verified (local + SG)
+
+`cargo test` + `clippy -D warnings` green for remuda-protocol, remuda-hub,
+remuda-node, remuda-ssh. SSH enroll tests forward `node.hello` as-is and
+use `node.auth` for Bearer.
+
+SG e2e (musl `remuda-node-stdio` at `/tmp/remuda-m1/remuda`, local Hub
+`127.0.0.1:18080`): `node.hello` JSON-RPC with `id`, `version`,
+`transport=ssh-stdio`, persisted `hostId`, nested inventory. `GET /v1/hosts`
+showed `online=true`, `label=devbox-sg`, `hostname=devbox`,
+`labels=["region=sg"]`, `transport=ssh-stdio`. Remote files only under
+`/tmp/remuda-m1/` (cleaned after).
+
 ## M0 demo gaps
 
 <!-- m0-demo-gaps:start -->

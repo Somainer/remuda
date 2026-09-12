@@ -2,7 +2,7 @@
 
 use crate::DevNode;
 use crate::NodeError;
-use crate::transport::{Backoff, NodeTransport};
+use crate::transport::{Backoff, NodeTransport, TransportMetrics, TransportMetricsSnapshot};
 use futures::{SinkExt, StreamExt};
 use remuda_protocol::hubnode::{
     self, JournalAppendParams, JournalSeqWatermark, METHOD_JOURNAL_APPEND, METHOD_NODE_HEARTBEAT,
@@ -128,6 +128,7 @@ struct JournalJob {
 #[derive(Clone)]
 pub struct JournalSender {
     tx: mpsc::Sender<JournalJob>,
+    metrics: TransportMetrics,
 }
 
 impl JournalSender {
@@ -153,6 +154,7 @@ impl JournalSender {
         seq: Option<i64>,
     ) -> Result<Value, NodeError> {
         let (reply, rx) = oneshot::channel();
+        self.metrics.enqueue(self.tx.capacity() == 0);
         self.tx
             .send(JournalJob {
                 instance_id,
@@ -167,9 +169,19 @@ impl JournalSender {
 }
 
 #[cfg(test)]
-fn journal_channel(capacity: usize) -> (JournalSender, mpsc::Receiver<JournalJob>) {
+fn journal_channel(
+    capacity: usize,
+) -> (JournalSender, mpsc::Receiver<JournalJob>, TransportMetrics) {
+    let metrics = TransportMetrics::new();
     let (tx, rx) = mpsc::channel(capacity.max(1));
-    (JournalSender { tx }, rx)
+    (
+        JournalSender {
+            tx,
+            metrics: metrics.clone(),
+        },
+        rx,
+        metrics,
+    )
 }
 
 enum Control {
@@ -192,6 +204,7 @@ pub struct WssLink {
     /// Raw `node.hello` result.
     pub hello: Value,
     journal: JournalSender,
+    metrics: TransportMetrics,
     control: mpsc::Sender<Control>,
     hub_rx: mpsc::Receiver<HubRequest>,
     task: JoinHandle<()>,
@@ -216,7 +229,11 @@ impl WssLink {
         let (hub_reply_tx, hub_reply_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
         let (control_tx, control_rx) = mpsc::channel(4);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let journal = JournalSender { tx: journal_tx };
+        let metrics = TransportMetrics::new();
+        let journal = JournalSender {
+            tx: journal_tx,
+            metrics: metrics.clone(),
+        };
         let task = tokio::spawn(session_task(
             config,
             token,
@@ -228,6 +245,7 @@ impl WssLink {
             hub_reply_rx,
             control_rx,
             Some(ready_tx),
+            metrics.clone(),
         ));
         let hello = ready_rx.await.map_err(|_| NodeError::Disconnected)??;
         let node_token = hello
@@ -239,10 +257,17 @@ impl WssLink {
             node_token,
             hello,
             journal,
+            metrics,
             control: control_tx,
             hub_rx,
             task,
         })
+    }
+
+    /// Queue and reconnect counters for this session.
+    #[must_use]
+    pub fn metrics(&self) -> TransportMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Clone the bounded `journal.append` sender used by this session.
@@ -418,6 +443,7 @@ async fn session_task(
     mut hub_reply_rx: mpsc::Receiver<HubReply>,
     mut control_rx: mpsc::Receiver<Control>,
     ready: Option<oneshot::Sender<Result<Value, NodeError>>>,
+    metrics: TransportMetrics,
 ) {
     let ids = AtomicU64::new(1);
     let mut pending: HashMap<String, PendingAppend> = HashMap::new();
@@ -449,8 +475,12 @@ async fn session_task(
     };
     let snapshot = runtime_wss::snapshot_watermarks(&watermarks);
     let hello = match perform_hello(&mut stream, &config, &node_epoch, &snapshot, &ids).await {
-        Ok(hello) => hello,
+        Ok(hello) => {
+            observe_clock_skew(&hello, &metrics);
+            hello
+        }
         Err(err) => {
+            metrics.hello_rejected();
             if let Some(ready) = ready {
                 let _ = ready.send(Err(err));
             }
@@ -486,7 +516,7 @@ async fn session_task(
                         let result = reconnect(
                             &mut stream, &mut config, &mut token, &node_epoch,
                             &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id,
-                            &mut pending, runtime.as_ref(),
+                            &mut pending, runtime.as_ref(), &metrics,
                         ).await;
                         let _ = done.send(result);
                     }
@@ -501,7 +531,7 @@ async fn session_task(
                     encode_heartbeat_params(&config, connection_id.as_deref(), lease_id.as_deref(), &snapshot),
                 );
                 if send_ws(&mut stream, &frame).await.is_err()
-                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err()
                 {
                     break;
                 }
@@ -520,7 +550,7 @@ async fn session_task(
                     }
                     Err(_) => {
                         let _ = job.reply.send(Err(NodeError::Disconnected));
-                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err() {
+                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err() {
                             break;
                         }
                     }
@@ -533,7 +563,7 @@ async fn session_task(
                     Err(error) => rpc_node_error(reply.id, &error),
                 };
                 if send_ws(&mut stream, &frame).await.is_err()
-                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err()
                 {
                     break;
                 }
@@ -541,10 +571,10 @@ async fn session_task(
             incoming = recv_ws(&mut stream) => {
                 match incoming {
                     Ok(Some(frame)) => {
-                        handle_incoming(frame, &mut pending, &hub_tx, &hub_reply_tx, runtime.as_ref(), &watermarks, &mut stream).await;
+                        handle_incoming(frame, &mut pending, &hub_tx, &hub_reply_tx, runtime.as_ref(), &watermarks, &mut stream, &metrics).await;
                     }
                     Ok(None) | Err(_) => {
-                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref()).await.is_err() {
+                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err() {
                             break;
                         }
                     }
@@ -552,7 +582,7 @@ async fn session_task(
             }
         }
     }
-    fail_pending(&mut pending, NodeError::Disconnected);
+    fail_pending(&mut pending, NodeError::Disconnected, &metrics);
 }
 
 async fn handle_incoming(
@@ -563,6 +593,7 @@ async fn handle_incoming(
     runtime: Option<&runtime_wss::RuntimeLink>,
     watermarks: &Arc<Mutex<HashMap<String, SeqWatermark>>>,
     stream: &mut WsStream,
+    metrics: &TransportMetrics,
 ) {
     let method = frame.get("method").and_then(Value::as_str);
     if let Some(method) = method {
@@ -606,6 +637,7 @@ async fn handle_incoming(
     if let Some(err) = take_rpc_error(&frame) {
         if let Some(seq) = waiter.seq.filter(|seq| already_durable(&err, *seq)) {
             runtime_wss::record_watermark(watermarks, &waiter.instance_id, None, seq);
+            metrics.duplicate_ack();
             let _ = waiter.reply.send(Ok(json!({ "seq": seq })));
         } else {
             let _ = waiter.reply.send(Err(err));
@@ -619,6 +651,7 @@ async fn handle_incoming(
         if let Some(seq) = seq {
             runtime_wss::record_watermark(watermarks, &waiter.instance_id, None, seq);
         }
+        metrics.acked();
         let _ = waiter.reply.send(Ok(result));
     } else {
         let _ = waiter.reply.send(Err(NodeError::Transport(
@@ -739,7 +772,12 @@ fn u64_seq(seq: i64) -> Option<U64> {
     u64::try_from(seq.max(0)).ok().map(U64)
 }
 
-fn fail_pending(pending: &mut HashMap<String, PendingAppend>, error: NodeError) {
+fn fail_pending(
+    pending: &mut HashMap<String, PendingAppend>,
+    error: NodeError,
+    metrics: &TransportMetrics,
+) {
+    metrics.drop_pending(pending.len() as u64);
     for (_, waiter) in pending.drain() {
         let _ = waiter.reply.send(Err(match &error {
             NodeError::Disconnected => NodeError::Disconnected,
@@ -760,11 +798,15 @@ async fn reconnect(
     lease_id: &mut Option<String>,
     pending: &mut HashMap<String, PendingAppend>,
     runtime: Option<&runtime_wss::RuntimeLink>,
+    metrics: &TransportMetrics,
 ) -> Result<(), NodeError> {
-    fail_pending(pending, NodeError::Disconnected);
+    metrics.reconnect();
+    fail_pending(pending, NodeError::Disconnected, metrics);
     let _ = stream.close(None).await;
     loop {
-        let delay = config.backoff.delay(*attempt);
+        let delay = config
+            .backoff
+            .jittered_delay(*attempt, ids.load(Ordering::Relaxed));
         tracing::warn!(
             attempt = *attempt,
             ?delay,
@@ -790,6 +832,7 @@ async fn reconnect(
                             .map(str::to_owned);
                         *stream = next;
                         *attempt = 0;
+                        observe_clock_skew(&hello, metrics);
                         if let Some(runtime) = runtime {
                             runtime_wss::resume_runtime_journals(runtime);
                         }
@@ -797,6 +840,7 @@ async fn reconnect(
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "hello after reconnect failed");
+                        metrics.hello_rejected();
                         *attempt = attempt.saturating_add(1);
                     }
                 }
@@ -811,6 +855,23 @@ async fn reconnect(
 
 pub(crate) fn value_i64(value: &Value) -> Option<i64> {
     hubnode::value_as_i64(value)
+}
+
+fn observe_clock_skew(hello: &Value, metrics: &TransportMetrics) {
+    let Some(raw) = hello.get("serverTime").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(parsed) =
+        time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+    else {
+        return;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let delta = (now - parsed).unsigned_abs();
+    if delta > Duration::from_secs(60) {
+        metrics.clock_skew();
+        tracing::warn!(%raw, ?delta, "hub serverTime clock skew");
+    }
 }
 
 pub(crate) fn already_durable(error: &NodeError, seq: i64) -> bool {
@@ -837,14 +898,12 @@ mod tests {
 
     #[tokio::test]
     async fn journal_queue_applies_backpressure() {
-        let (sender, mut rx) = journal_channel(1);
+        let (sender, mut rx, metrics) = journal_channel(1);
         let first = tokio::spawn({
             let sender = sender.clone();
             async move { sender.append("ins_a".into(), json!({"n":1})).await }
         });
-        let job = rx.recv().await.expect("queued");
-        assert_eq!(job.instance_id, "ins_a");
-
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let second = tokio::spawn({
             let sender = sender.clone();
             async move { sender.append("ins_b".into(), json!({"n":2})).await }
@@ -854,7 +913,13 @@ mod tests {
             !second.is_finished(),
             "second append must wait on a full queue"
         );
+        assert!(
+            metrics.snapshot().journal_backpressure_waits >= 1,
+            "sender must record a wait while the bounded queue is full"
+        );
 
+        let job = rx.recv().await.expect("queued");
+        assert_eq!(job.instance_id, "ins_a");
         let _ = job.reply.send(Ok(json!({"seq":"1"})));
         first.await.expect("join").expect("first seq");
 
@@ -862,6 +927,7 @@ mod tests {
         assert_eq!(job.instance_id, "ins_b");
         let _ = job.reply.send(Ok(json!({"seq":"2"})));
         second.await.expect("join").expect("second seq");
+        assert_eq!(metrics.snapshot().journal_enqueued, 2);
     }
 
     #[test]

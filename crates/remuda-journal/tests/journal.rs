@@ -345,11 +345,7 @@ async fn workflow_journal_tailer_maps_launched_started_result() -> Result<()> {
         .into_iter()
         .map(|o| o.body.kind())
         .collect();
-    assert!(
-        kinds
-            .iter()
-            .any(|k| *k == remuda_protocol::ObservationKind::WorkflowRun)
-    );
+    assert!(kinds.contains(&remuda_protocol::ObservationKind::WorkflowRun));
     assert!(
         kinds
             .iter()

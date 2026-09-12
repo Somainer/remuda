@@ -22,13 +22,16 @@ pub enum ProviderKind {
     Google,
 }
 
-/// Who owns upstream account pooling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// How the CLI authenticates. `decisions.md` D-012. Default is native login.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Delegation {
-    /// AsterGate (or equivalent) owns account pool, cooldown, and affinity.
-    Astergate,
-    /// Remuda injects a direct provider key.
+    /// CLI uses its own native login. No env/settings overlay is injected.
+    #[default]
+    None,
+    /// Any Anthropic-Messages-compatible endpoint (`ANTHROPIC_BASE_URL` overlay).
+    Gateway,
+    /// Direct provider keys with runtime rotation. v2; rejected at materialize.
     Direct,
 }
 
@@ -102,12 +105,14 @@ pub struct ProviderProfile {
     pub id: Id,
     /// Client wire contract.
     pub kind: ProviderKind,
-    /// Ingress base URL written into the settings overlay, never a secret.
+    /// Ingress base URL for [`Delegation::Gateway`]. Ignored for [`Delegation::None`].
     pub base_url: String,
-    /// Whether AsterGate owns upstream accounts.
+    /// Authentication mode. Default [`Delegation::None`] is native CLI login.
+    #[serde(default)]
     pub delegation: Delegation,
-    /// Vault/env/file/helper reference. Never a raw token.
-    pub secret_ref: SecretRef,
+    /// Vault/env/file/helper reference. Unused when `delegation` is `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<SecretRef>,
     /// Catalog model ids this profile may resolve.
     pub models: Vec<String>,
     /// Last known health. Only [`ProviderHealth::Healthy`] auto-launches.

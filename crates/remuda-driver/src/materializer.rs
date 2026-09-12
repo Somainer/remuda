@@ -3,14 +3,14 @@
 use crate::binary::{BinaryPin, pin_binary};
 use crate::error::{DriverError, DriverResult};
 use crate::flags::{reject_banned_env, validate_spec_args};
-use crate::profile::{ProviderHealth, ProviderKind, ProviderProfile};
+use crate::profile::{Delegation, ProviderHealth, ProviderKind, ProviderProfile};
 use crate::recipe::{
     EnvAllowlistEntry, EnvAllowlistSource, FileLifetime, FileRole, LaunchAudit, LaunchRecipe,
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
 };
 use remuda_protocol::{
     AgentKind, ApprovalAuthority, BoolLiteral, ClaudePermissionMode, DriverKind, EnvBinding, Id,
-    InputDelivery, InstanceSpec, PermissionMode,
+    InputDelivery, InputOrigin, InstanceSpec, PermissionMode,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -72,6 +72,8 @@ pub struct MaterializeRequest<'a> {
     pub binary: BinarySource,
     /// Override `--setting-sources`. Default `user,project,local`.
     pub setting_sources: Option<Vec<String>>,
+    /// Who originated this launch. Bot specs cannot request bypass/yolo.
+    pub origin: InputOrigin,
 }
 
 /// Materialize `spec` + `profile` into a durable recipe and 0600 overlay files.
@@ -81,12 +83,16 @@ pub struct MaterializeRequest<'a> {
 pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecipe> {
     validate_spec_profile(request.spec, request.profile)?;
     validate_paths(request)?;
+    if request.profile.delegation == Delegation::Direct {
+        return Err(DriverError::DirectDelegationV2);
+    }
     let extras = validate_spec_args(request.spec.driver, &request.spec.args)?;
     reject_spec_env(request.spec)?;
     let setting_sources = setting_sources(request)?;
     let binary = pin_source(&request.binary)?;
     let model = resolve_model(request.spec, request.profile)?;
-    let (permission, debt, approval) = permission_plan(request.spec)?;
+    let (permission, debt, approval) = permission_plan(request.spec, request.origin)?;
+    let inject_provider = request.profile.delegation == Delegation::Gateway;
 
     fs::create_dir_all(&request.launch_dir)?;
     set_dir_mode(&request.launch_dir, 0o700)?;
@@ -99,23 +105,28 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
 
     match request.spec.driver {
         DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => {
-            let settings_path = request.launch_dir.join("settings.json");
-            let settings = claude_settings_json(request.profile, &model)?;
-            let bytes = serde_json::to_vec_pretty(&settings)?;
-            write_private_file(&settings_path, &bytes)?;
-            let digest = crate::binary::hash_bytes(&bytes)?;
-            files.push(MaterializedFile {
-                path: settings_path.to_string_lossy().into_owned(),
-                role: FileRole::Settings,
-                mode: "0600".into(),
-                content_digest: digest.clone(),
-                lifetime: FileLifetime::Launch,
-            });
+            let settings_path = if inject_provider {
+                let path = request.launch_dir.join("settings.json");
+                let settings = claude_settings_json(request.profile, &model)?;
+                let bytes = serde_json::to_vec_pretty(&settings)?;
+                write_private_file(&path, &bytes)?;
+                let digest = crate::binary::hash_bytes(&bytes)?;
+                files.push(MaterializedFile {
+                    path: path.to_string_lossy().into_owned(),
+                    role: FileRole::Settings,
+                    mode: "0600".into(),
+                    content_digest: digest,
+                    lifetime: FileLifetime::Launch,
+                });
+                Some(path)
+            } else {
+                None
+            };
             argv = claude_argv(
                 request.spec.driver,
                 &permission,
                 &setting_sources,
-                &settings_path,
+                settings_path.as_deref(),
                 &model,
                 &request.session,
                 &extras,
@@ -136,21 +147,27 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
                 EnvAllowlistSource::NativeHome,
                 None,
             );
-            push_env(
-                &mut env_allowlist,
-                "ANTHROPIC_BASE_URL",
-                EnvAllowlistSource::ProviderOverlay,
-                None,
-            );
-            if let Some(helper) = request.profile.secret_ref.helper_command() {
-                let _ = helper;
-            } else {
+            if inject_provider {
                 push_env(
                     &mut env_allowlist,
-                    "ANTHROPIC_AUTH_TOKEN",
-                    EnvAllowlistSource::Credential,
-                    Some(request.profile.secret_ref.as_str().to_string()),
+                    "ANTHROPIC_BASE_URL",
+                    EnvAllowlistSource::ProviderOverlay,
+                    None,
                 );
+                match request.profile.secret_ref.as_ref() {
+                    Some(secret) if secret.helper_command().is_some() => {}
+                    Some(secret) => push_env(
+                        &mut env_allowlist,
+                        "ANTHROPIC_AUTH_TOKEN",
+                        EnvAllowlistSource::Credential,
+                        Some(secret.as_str().to_string()),
+                    ),
+                    None => {
+                        return Err(DriverError::InvalidLaunchSpec(
+                            "gateway delegation requires a secret_ref".into(),
+                        ));
+                    }
+                }
             }
         }
         DriverKind::CodexAppserver => {
@@ -164,12 +181,19 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
                 EnvAllowlistSource::NativeHome,
                 None,
             );
-            push_env(
-                &mut env_allowlist,
-                "RUNTIME_PROVIDER_TOKEN",
-                EnvAllowlistSource::Credential,
-                Some(request.profile.secret_ref.as_str().to_string()),
-            );
+            if inject_provider {
+                let secret = request.profile.secret_ref.as_ref().ok_or_else(|| {
+                    DriverError::InvalidLaunchSpec(
+                        "gateway delegation requires a secret_ref".into(),
+                    )
+                })?;
+                push_env(
+                    &mut env_allowlist,
+                    "RUNTIME_PROVIDER_TOKEN",
+                    EnvAllowlistSource::Credential,
+                    Some(secret.as_str().to_string()),
+                );
+            }
         }
         DriverKind::GrokAcp => {
             argv = vec![
@@ -194,12 +218,19 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
                 EnvAllowlistSource::ProviderOverlay,
                 None,
             );
-            push_env(
-                &mut env_allowlist,
-                "RUNTIME_PROVIDER_TOKEN",
-                EnvAllowlistSource::Credential,
-                Some(request.profile.secret_ref.as_str().to_string()),
-            );
+            if inject_provider {
+                let secret = request.profile.secret_ref.as_ref().ok_or_else(|| {
+                    DriverError::InvalidLaunchSpec(
+                        "gateway delegation requires a secret_ref".into(),
+                    )
+                })?;
+                push_env(
+                    &mut env_allowlist,
+                    "RUNTIME_PROVIDER_TOKEN",
+                    EnvAllowlistSource::Credential,
+                    Some(secret.as_str().to_string()),
+                );
+            }
         }
         DriverKind::AgyPrint => {
             argv = vec![
@@ -211,12 +242,19 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
             argv.extend(extras);
             input_delivery = InputDelivery::DeferredArgv;
             session_id = None;
-            push_env(
-                &mut env_allowlist,
-                "GEMINI_API_KEY",
-                EnvAllowlistSource::Credential,
-                Some(request.profile.secret_ref.as_str().to_string()),
-            );
+            if inject_provider {
+                let secret = request.profile.secret_ref.as_ref().ok_or_else(|| {
+                    DriverError::InvalidLaunchSpec(
+                        "gateway delegation requires a secret_ref".into(),
+                    )
+                })?;
+                push_env(
+                    &mut env_allowlist,
+                    "GEMINI_API_KEY",
+                    EnvAllowlistSource::Credential,
+                    Some(secret.as_str().to_string()),
+                );
+            }
         }
         DriverKind::GenericPty => {
             argv = extras;
@@ -225,7 +263,7 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
         }
     }
 
-    collect_spec_env(request.spec, &mut env_allowlist)?;
+    collect_spec_env(request.spec, request.profile.delegation, &mut env_allowlist)?;
 
     let settings_digest = files
         .iter()
@@ -255,7 +293,11 @@ pub fn materialize(request: &MaterializeRequest<'_>) -> DriverResult<LaunchRecip
             kind: request.profile.kind,
             base_url: request.profile.base_url.clone(),
             delegation: request.profile.delegation,
-            secret_ref: request.profile.secret_ref.as_str().to_string(),
+            secret_ref: request
+                .profile
+                .secret_ref
+                .as_ref()
+                .map(|secret| secret.as_str().to_string()),
             model_requested: model,
         },
         permission,
@@ -386,29 +428,55 @@ fn resolve_model(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult
 
 fn permission_plan(
     spec: &InstanceSpec,
+    origin: InputOrigin,
 ) -> DriverResult<(RecipePermission, Vec<String>, ApprovalAuthority)> {
     match &spec.permission_mode {
         PermissionMode::Claude(claude) => {
+            if claude.mode == ClaudePermissionMode::BypassPermissions
+                && matches!(origin, InputOrigin::Bot | InputOrigin::Agent)
+            {
+                return Err(DriverError::BypassNotAllowedForBot);
+            }
             let (cli, dont_ask) = map_claude_mode(claude.mode);
             let mut debt = Vec::new();
-            let (prompts, authority) = match spec.driver {
+            let bypass = claude.mode == ClaudePermissionMode::BypassPermissions;
+            let (prompts, extra_flags, authority) = match spec.driver {
+                DriverKind::ClaudePrint if bypass => (
+                    None,
+                    vec!["--allow-dangerously-skip-permissions".into()],
+                    ApprovalAuthority::Unknown,
+                ),
                 DriverKind::ClaudePrint if dont_ask => {
                     debt.push(TECH_DEBT_M0_PERM_01.to_string());
-                    (Some("none".into()), ApprovalAuthority::Unknown)
+                    (Some("none".into()), vec![], ApprovalAuthority::Unknown)
                 }
-                DriverKind::ClaudePrint => (Some("host".into()), ApprovalAuthority::RuntimeHost),
+                DriverKind::ClaudePrint => {
+                    (Some("host".into()), vec![], ApprovalAuthority::RuntimeHost)
+                }
+                DriverKind::ClaudePty | DriverKind::ClaudeBg if bypass => (
+                    None,
+                    vec!["--dangerously-skip-permissions".into()],
+                    ApprovalAuthority::Unknown,
+                ),
                 DriverKind::ClaudePty | DriverKind::ClaudeBg => {
                     if dont_ask {
                         debt.push(TECH_DEBT_M0_PERM_01.to_string());
                     }
-                    (None, ApprovalAuthority::NativeTty)
+                    (None, vec![], ApprovalAuthority::NativeTty)
                 }
-                _ => (None, ApprovalAuthority::Unknown),
+                _ => (None, vec![], ApprovalAuthority::Unknown),
             };
+            let cli_mode =
+                if matches!(spec.driver, DriverKind::ClaudePty | DriverKind::ClaudeBg) && bypass {
+                    None
+                } else {
+                    Some(cli.to_string())
+                };
             Ok((
                 RecipePermission {
-                    cli_mode: Some(cli.to_string()),
+                    cli_mode,
                     prompts,
+                    extra_flags,
                 },
                 debt,
                 authority,
@@ -421,6 +489,7 @@ fn permission_plan(
             RecipePermission {
                 cli_mode: None,
                 prompts: None,
+                extra_flags: vec![],
             },
             vec![],
             ApprovalAuthority::Unknown,
@@ -440,6 +509,11 @@ fn map_claude_mode(mode: ClaudePermissionMode) -> (&'static str, bool) {
 }
 
 fn claude_settings_json(profile: &ProviderProfile, model: &str) -> DriverResult<Value> {
+    if profile.base_url.trim().is_empty() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "gateway delegation requires a base_url".into(),
+        ));
+    }
     let mut env = BTreeMap::new();
     env.insert(
         "ANTHROPIC_BASE_URL".to_string(),
@@ -453,7 +527,11 @@ fn claude_settings_json(profile: &ProviderProfile, model: &str) -> DriverResult<
         "model": model,
         "env": env,
     });
-    if let Some(helper) = profile.secret_ref.helper_command() {
+    if let Some(helper) = profile
+        .secret_ref
+        .as_ref()
+        .and_then(crate::profile::SecretRef::helper_command)
+    {
         if !Path::new(helper).is_absolute() {
             return Err(DriverError::InvalidLaunchSpec(
                 "apiKeyHelper command must be an absolute path".into(),
@@ -471,7 +549,7 @@ fn claude_argv(
     driver: DriverKind,
     permission: &RecipePermission,
     setting_sources: &[String],
-    settings_path: &Path,
+    settings_path: Option<&Path>,
     model: &str,
     session: &SessionAction,
     extras: &[String],
@@ -508,10 +586,13 @@ fn claude_argv(
             argv.push("stdio".into());
         }
     }
+    argv.extend(permission.extra_flags.iter().cloned());
     argv.push("--setting-sources".into());
     argv.push(setting_sources.join(","));
-    argv.push("--settings".into());
-    argv.push(settings_path.to_string_lossy().into_owned());
+    if let Some(settings_path) = settings_path {
+        argv.push("--settings".into());
+        argv.push(settings_path.to_string_lossy().into_owned());
+    }
     argv.push("--model".into());
     argv.push(model.to_string());
     if driver != DriverKind::ClaudeBg {
@@ -564,9 +645,13 @@ fn reject_spec_env(spec: &InstanceSpec) -> DriverResult<()> {
 
 fn collect_spec_env(
     spec: &InstanceSpec,
+    delegation: Delegation,
     allowlist: &mut Vec<EnvAllowlistEntry>,
 ) -> DriverResult<()> {
     for (name, binding) in &spec.env {
+        if delegation == Delegation::None && is_anthropic_env(name) {
+            continue;
+        }
         let (source, secret_ref) = match binding {
             EnvBinding::Literal(_) => (EnvAllowlistSource::Literal, None),
             EnvBinding::Credential(cred) => (
@@ -581,6 +666,13 @@ fn collect_spec_env(
         push_env(allowlist, name, source, secret_ref);
     }
     Ok(())
+}
+
+fn is_anthropic_env(name: &str) -> bool {
+    name == "ANTHROPIC_BASE_URL"
+        || name == "ANTHROPIC_AUTH_TOKEN"
+        || name == "ANTHROPIC_API_KEY"
+        || name.starts_with("ANTHROPIC_")
 }
 
 fn push_env(

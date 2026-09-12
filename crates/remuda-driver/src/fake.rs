@@ -101,8 +101,8 @@ impl FakeDriver {
                 profile_id: spec.provider_profile.id.clone(),
                 kind: ProviderKind::Anthropic,
                 base_url: "https://gateway.example".into(),
-                delegation: Delegation::Astergate,
-                secret_ref: "env:REMUDA_FAKE_SECRET".into(),
+                delegation: Delegation::None,
+                secret_ref: None,
                 model_requested: spec
                     .model_id
                     .clone()
@@ -111,6 +111,7 @@ impl FakeDriver {
             permission: RecipePermission {
                 cli_mode: Some("dontAsk".into()),
                 prompts: Some("none".into()),
+                extra_flags: vec![],
             },
             technical_debt: vec![crate::recipe::TECH_DEBT_M0_PERM_01.into()],
             audit: LaunchAudit {

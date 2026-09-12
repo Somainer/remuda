@@ -100,10 +100,11 @@ pub struct RecipeProvider {
     pub kind: crate::profile::ProviderKind,
     /// Ingress URL.
     pub base_url: String,
-    /// Delegation mode.
+    /// Delegation mode (`none` / `gateway` / `direct`).
     pub delegation: crate::profile::Delegation,
     /// Secret reference spelling (scheme + name/path), never the secret.
-    pub secret_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
     /// Requested model id.
     pub model_requested: String,
 }
@@ -118,6 +119,9 @@ pub struct RecipePermission {
     /// `--permission-prompts` value, when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts: Option<String>,
+    /// Extra permission flags, e.g. `--allow-dangerously-skip-permissions`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_flags: Vec<String>,
 }
 
 /// Durable launch decision. Safe to serialize to SQLite; contains no secrets or prompts.

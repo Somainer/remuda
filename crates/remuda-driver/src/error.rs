@@ -10,6 +10,12 @@ pub enum DriverError {
     /// Spec, argv, or overlay could not be turned into a launch recipe.
     #[error("invalid launch spec: {0}")]
     InvalidLaunchSpec(String),
+    /// Bypass/yolo is only allowed on human-originated specs. `decisions.md` D-011.
+    #[error("bypass permissions (yolo) is not allowed for bot-originated specs")]
+    BypassNotAllowedForBot,
+    /// Direct provider rotation is v2. `decisions.md` D-012.
+    #[error("direct provider delegation is v2")]
+    DirectDelegationV2,
     /// A prohibited native mode or env would disable required features.
     #[error("native feature disabled: {0}")]
     NativeFeatureDisabled(String),
@@ -62,6 +68,8 @@ impl DriverError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::InvalidLaunchSpec(_) => ErrorCode::InvalidLaunchSpec,
+            Self::BypassNotAllowedForBot => ErrorCode::InvalidLaunchSpec,
+            Self::DirectDelegationV2 => ErrorCode::CapabilityUnsupported,
             Self::NativeFeatureDisabled(_) => ErrorCode::NativeFeatureDisabled,
             Self::ProviderProtocolMismatch(_) => ErrorCode::ProviderProtocolMismatch,
             Self::ProviderUnavailable(_) => ErrorCode::ProviderUnavailable,

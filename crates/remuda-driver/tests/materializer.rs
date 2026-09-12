@@ -6,8 +6,8 @@ use remuda_driver::{
     pin_binary,
 };
 use remuda_protocol::{
-    ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, EnvBinding, EnvVisibility, Id,
-    InstanceSpec, LiteralEnv, PermissionMode,
+    ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, DriverKind, EnvBinding,
+    EnvVisibility, Id, InputOrigin, InstanceSpec, LiteralEnv, PermissionMode,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -22,9 +22,21 @@ fn profile() -> ProviderProfile {
         id: "pvp_01993ab0-0000-7000-8000-000000000001".parse().unwrap(),
         kind: ProviderKind::Anthropic,
         base_url: "https://gateway.example".into(),
-        delegation: Delegation::Astergate,
-        secret_ref: SecretRef::parse("env:REMUDA_TEST_SECRET").unwrap(),
+        delegation: Delegation::Gateway,
+        secret_ref: Some(SecretRef::parse("env:REMUDA_TEST_SECRET").unwrap()),
         models: vec!["passthrough/example-model".into()],
+        health: ProviderHealth::Healthy,
+    }
+}
+
+fn native_profile() -> ProviderProfile {
+    ProviderProfile {
+        id: "pvp_01993ab0-0000-7000-8000-000000000001".parse().unwrap(),
+        kind: ProviderKind::Anthropic,
+        base_url: String::new(),
+        delegation: Delegation::None,
+        secret_ref: None,
+        models: vec!["sonnet".into()],
         health: ProviderHealth::Healthy,
     }
 }
@@ -54,6 +66,7 @@ fn request<'a>(
         launch_id: Id::new("launch").unwrap(),
         binary,
         setting_sources: None,
+        origin: InputOrigin::Human,
     }
 }
 
@@ -261,4 +274,153 @@ fn recipe_round_trip_json_has_no_env_values() {
     let decoded: LaunchRecipe = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(recipe.argv, decoded.argv);
     assert!(value.get("env").is_none());
+}
+
+#[test]
+fn none_delegation_does_not_inject_anthropic_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.env.insert(
+        "ANTHROPIC_API_KEY".into(),
+        EnvBinding::Literal(Box::new(LiteralEnv {
+            value: "sk-should-not-appear".into(),
+            visibility: EnvVisibility::Private,
+        })),
+    );
+    let recipe = materialize(&request(
+        &spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .unwrap();
+    assert!(!recipe.argv.iter().any(|flag| flag == "--settings"));
+    assert!(recipe.materialized_files.is_empty());
+    assert!(
+        !recipe
+            .env_allowlist
+            .iter()
+            .any(|entry| entry.name.starts_with("ANTHROPIC_"))
+    );
+    let json = serde_json::to_string(&recipe).unwrap();
+    assert!(!json.contains("sk-should-not-appear"));
+    assert_eq!(recipe.provider.delegation, Delegation::None);
+}
+
+#[test]
+fn direct_delegation_is_v2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut profile = profile();
+    profile.delegation = Delegation::Direct;
+    let error = materialize(&request(
+        &load_spec(),
+        &profile,
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .unwrap_err();
+    assert!(matches!(error, DriverError::DirectDelegationV2));
+}
+
+#[test]
+fn print_bypass_emits_yolo_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
+        mode: ClaudePermissionMode::BypassPermissions,
+        interaction: ClaudeInteractionMode::Host,
+    }));
+    let recipe = materialize(&request(
+        &spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .unwrap();
+    assert!(
+        recipe
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
+    );
+    assert!(
+        recipe
+            .argv
+            .iter()
+            .any(|flag| flag == "--allow-dangerously-skip-permissions")
+    );
+}
+
+#[test]
+fn pty_bypass_emits_dangerously_skip_permissions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.driver = DriverKind::ClaudePty;
+    spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
+        mode: ClaudePermissionMode::BypassPermissions,
+        interaction: ClaudeInteractionMode::NativeTty,
+    }));
+    let recipe = materialize(&request(
+        &spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .unwrap();
+    assert!(
+        recipe
+            .argv
+            .iter()
+            .any(|flag| flag == "--dangerously-skip-permissions")
+    );
+    assert!(
+        !recipe
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
+    );
+}
+
+#[test]
+fn bot_origin_rejects_bypass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
+        mode: ClaudePermissionMode::BypassPermissions,
+        interaction: ClaudeInteractionMode::Host,
+    }));
+    let profile = native_profile();
+    let mut req = request(&spec, &profile, &launch, &home, pin_source(&binary));
+    req.origin = InputOrigin::Bot;
+    let error = materialize(&req).unwrap_err();
+    assert!(matches!(error, DriverError::BypassNotAllowedForBot));
+    assert!(
+        error
+            .to_string()
+            .contains("not allowed for bot-originated specs")
+    );
 }

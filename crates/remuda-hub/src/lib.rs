@@ -49,7 +49,11 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-pub use config::{DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS};
+pub use auth::{bootstrap_issued_at, rotate_bootstrap};
+pub use config::{
+    DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
+    DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS,
+};
 pub use error::HubError;
 pub use transport::{ConnectedNodes, NodeTransport, StdioTransport, TransportKind, WssTransport};
 
@@ -82,6 +86,41 @@ pub struct RunningHub {
 }
 
 impl RunningHub {
+    /// Mint a single-use Node enroll token against this Hub's store (D-018).
+    ///
+    /// In-process equivalent of `POST /v1/hosts/enroll-token`, used by
+    /// `remuda dev` to enroll its own local Node without the device access code.
+    pub async fn mint_enroll_token(&self, ttl_minutes: u64) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let token = config::random_token();
+        let hash = auth::hash_secret(&token)?;
+        let expires = time::OffsetDateTime::now_utc()
+            + time::Duration::minutes(i64::try_from(ttl_minutes.max(1)).unwrap_or(60));
+        let expires_at = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            expires.year(),
+            u8::from(expires.month()),
+            expires.day(),
+            expires.hour(),
+            expires.minute(),
+            expires.second(),
+            expires.millisecond()
+        );
+        store
+            .insert_enroll_token(
+                hash,
+                auth::token_prefix(&token).map(str::to_string),
+                "dev-local".into(),
+                expires_at,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("mint enroll token: {err}"))?;
+        Ok(token)
+    }
+
     /// Stop HTTP/WS accept and wait for the SQLite writer thread to close.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown.take() {

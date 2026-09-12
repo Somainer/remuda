@@ -613,10 +613,7 @@ fn ensure_runtime_identity(node: &DevNode, enrollment: &Enrollment) -> Result<()
 }
 
 fn env_bootstrap_token() -> Option<String> {
-    std::env::var("REMUDA_BOOTSTRAP_TOKEN")
-        .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+    crate::enroll::enroll_token_from_env()
 }
 
 fn rpc_code(error: &NodeError) -> i64 {

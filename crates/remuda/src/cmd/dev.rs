@@ -141,11 +141,14 @@ pub(crate) async fn run(
         config.data_dir.join("node"),
         node_config.follow_buffer_capacity,
     )?);
-    let (host_id, node_token) = load_dev_enrollment(
-        &identity_dir,
-        &config.data_dir,
-        &running_hub.bootstrap_token,
-    )?;
+    // D-018: the access code pairs devices only. The local Node enrolls with a
+    // freshly minted single-use enroll token, exactly like a remote Node.
+    let enroll_token = running_hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .context("mint local node enroll token")?;
+    let (host_id, node_token) =
+        load_dev_enrollment(&identity_dir, &config.data_dir, &enroll_token)?;
     tracing::info!(
         path = %identity_dir.join("enrollment.json").display(),
         host_id = %host_id.as_id(),
@@ -256,7 +259,7 @@ pub(crate) async fn run(
 fn load_dev_enrollment(
     identity_dir: &Path,
     hub_dir: &Path,
-    bootstrap: &str,
+    enroll_token: &str,
 ) -> anyhow::Result<(HostId, String)> {
     if identity_dir != hub_dir
         && !identity_dir.join("enrollment.json").is_file()
@@ -269,7 +272,7 @@ fn load_dev_enrollment(
     let token = enrollment
         .node_token
         .filter(|token| !token.is_empty())
-        .unwrap_or_else(|| bootstrap.to_owned());
+        .unwrap_or_else(|| enroll_token.to_owned());
     Ok((enrollment.host_id, token))
 }
 

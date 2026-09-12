@@ -328,7 +328,6 @@ pub(crate) async fn handle_node_method(
                 .authenticate_host(
                     HostAuthRequest {
                         presented: token.to_string(),
-                        bootstrap: state.config.bootstrap_token.clone(),
                         hello_host_id: hello_host,
                         label,
                         node_version,

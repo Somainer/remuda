@@ -135,7 +135,10 @@ pub async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-/// `POST /v1/login` — bootstrap token → device token + cookie.
+/// `POST /v1/login` — bootstrap access code → device token + cookie.
+///
+/// D-018: the access code pairs **devices** only. It is one-shot per device
+/// name and expires after `bootstrap_ttl_hours`; it never enrolls a Node.
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -143,6 +146,24 @@ pub async fn login(
 ) -> Result<Response, HubError> {
     require_origin(&headers, &state.config)?;
     if !crate::config::secret_eq(&body.bootstrap_token, &state.config.bootstrap_token) {
+        return Err(HubError::Unauthenticated);
+    }
+    if !crate::auth::bootstrap_within_ttl(&state.config.data_dir, state.config.bootstrap_ttl_hours)
+    {
+        tracing::warn!("bootstrap access code expired; rotate with `remuda hub rotate-bootstrap`");
+        return Err(HubError::Unauthenticated);
+    }
+    // One-shot per device: the same code cannot silently pair a second device
+    // under the same name. Re-pairing requires a rotate or a pairing code.
+    if state
+        .store
+        .device_name_exists(body.device_name.clone())
+        .await?
+    {
+        tracing::warn!(
+            device = %body.device_name,
+            "bootstrap access code already redeemed for this device name"
+        );
         return Err(HubError::Unauthenticated);
     }
     let token = crate::config::random_token();
@@ -158,6 +179,56 @@ pub async fn login(
         "name": device.name,
     });
     Ok((StatusCode::OK, [(header::SET_COOKIE, cookie)], Json(body)).into_response())
+}
+
+/// `POST /v1/hosts/enroll-token` — mint a single-use Node enroll token (D-018).
+///
+/// Requires an authenticated device. The plaintext is returned once and only
+/// its Argon2 hash is stored.
+pub async fn mint_enroll_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = require_device(&state.store, &headers).await?;
+    let token = crate::config::random_token();
+    let hash = hash_secret(&token)?;
+    let ttl_minutes = state.config.enroll_token_ttl_minutes.max(1);
+    let expires_at = rfc3339_in(i64::try_from(ttl_minutes).unwrap_or(60).saturating_mul(60));
+    let id = state
+        .store
+        .insert_enroll_token(
+            hash,
+            crate::auth::token_prefix(&token).map(str::to_string),
+            device.id.clone(),
+            expires_at.clone(),
+        )
+        .await?;
+    tracing::info!(
+        enroll_token_id = %id,
+        device = %device.id,
+        "minted node enroll token"
+    );
+    Ok(Json(json!({
+        "enrollTokenId": id,
+        "token": token,
+        "expiresAt": expires_at,
+    })))
+}
+
+/// RFC3339 UTC `secs` from now.
+fn rfc3339_in(secs: i64) -> String {
+    let t = time::OffsetDateTime::now_utc() + time::Duration::seconds(secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
 }
 
 /// `GET /v1/hosts`

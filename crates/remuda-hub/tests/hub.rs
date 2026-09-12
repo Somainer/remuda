@@ -19,12 +19,11 @@ async fn offline_host_exits_in_background_and_is_only_listed_in_history() -> Res
     let mut config = HubConfig::for_test(dir.path().join("data"));
     config.host_lost_grace_ms = 20;
     let hub = spawn(config).await?;
-    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &hub.bootstrap_token).await?;
     let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    request.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {}", hub.bootstrap_token).parse()?,
-    );
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
     let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
     let instance_id = InstanceId::new();
     node.send(Message::Text(json!({"jsonrpc":"2.0", "id":"1", "method":"node.hello",
@@ -175,6 +174,34 @@ async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<(String, S
     Ok((cookie, token))
 }
 
+/// Mint a single-use Node enroll token with a paired device's cookie (D-018).
+async fn enroll_token(addr: std::net::SocketAddr, cookie: &str) -> Result<String> {
+    let (status, _, rest) = http(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", cookie)],
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "enroll-token {status} {rest}");
+    let value: Value = serde_json::from_str(rest.trim())?;
+    value["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("enroll token")
+}
+
+/// Pair a device and mint an enroll token in one step.
+async fn device_and_enroll(
+    addr: std::net::SocketAddr,
+    bootstrap: &str,
+) -> Result<(String, String, String)> {
+    let (cookie, token) = login(addr, bootstrap).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    Ok((cookie, token, enroll))
+}
+
 #[tokio::test]
 async fn healthz_ok() -> Result<()> {
     let (hub, _, _dir) = boot().await?;
@@ -277,15 +304,13 @@ async fn node_ws_rejects_missing_token() -> Result<()> {
 #[tokio::test]
 async fn fake_node_hello_heartbeat_append_then_http_and_follow() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
 
     let mut req = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("node request")?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
         .await
         .context("node connect timeout")??;
@@ -442,14 +467,12 @@ async fn fake_node_hello_heartbeat_append_then_http_and_follow() -> Result<()> {
 #[tokio::test]
 async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
 
     // Enroll a host then drop the socket so it is offline.
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
     let host_id = HostId::new();
     node.send(Message::Text(
@@ -584,14 +607,12 @@ async fn restart_marks_hosts_offline_and_rejects_create() -> Result<()> {
     let config = HubConfig::for_test(data_dir.clone());
     let bootstrap = config.bootstrap_token.clone();
     let hub = spawn(config).await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
     let (node, _) = {
         let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-        req.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {bootstrap}").parse().unwrap(),
-        );
+        req.headers_mut()
+            .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
         let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
             .await
             .context("connect")??;
@@ -655,11 +676,10 @@ async fn restart_marks_hosts_offline_and_rejects_create() -> Result<()> {
 #[tokio::test]
 async fn node_cannot_append_to_another_hosts_journal() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node_a, _) = tokio_tungstenite::connect_async(req).await?;
     let host_a = HostId::new();
     let instance = InstanceId::new();
@@ -694,10 +714,11 @@ async fn node_cannot_append_to_another_hosts_journal() -> Result<()> {
     let appended = recv_json(&mut node_a).await?;
     assert_eq!(appended["result"]["seq"], json!("1"));
 
+    let enroll_b = enroll_token(hub.addr, &cookie).await?;
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
     req.headers_mut().insert(
         "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
+        format!("Bearer {enroll_b}").parse().unwrap(),
     );
     let (mut node_b, _) = tokio_tungstenite::connect_async(req).await?;
     let host_b = HostId::new();
@@ -737,13 +758,11 @@ async fn node_cannot_append_to_another_hosts_journal() -> Result<()> {
 #[tokio::test]
 async fn follow_uses_cookie_or_header_and_never_query_token() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, token) = login(hub.addr, &bootstrap).await?;
+    let (cookie, token, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
 
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
     let host_id = HostId::new();
     node.send(Message::Text(
@@ -872,13 +891,11 @@ async fn revoking_current_device_expires_httponly_cookie() -> Result<()> {
 #[tokio::test]
 async fn create_instance_persists_delegation_and_provider_profile() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
 
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
     let host_id = HostId::new();
     node.send(Message::Text(
@@ -986,13 +1003,12 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
 #[tokio::test]
 async fn second_hello_on_socket_is_rejected() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
+    let (_cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let mut req = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("node request")?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
         .await
         .context("node connect")??;
@@ -1031,13 +1047,12 @@ async fn second_hello_on_socket_is_rejected() -> Result<()> {
 #[tokio::test]
 async fn node_auth_must_match_upgrade_bearer() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
+    let (_cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let mut req = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("node request")?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
         .await
         .context("node connect")??;
@@ -1060,13 +1075,12 @@ async fn node_auth_must_match_upgrade_bearer() -> Result<()> {
 #[tokio::test]
 async fn journal_duplicate_seq_is_acked() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
+    let (_cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let mut req = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("node request")?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
         .await
         .context("node connect")??;
@@ -1111,15 +1125,14 @@ async fn journal_duplicate_seq_is_acked() -> Result<()> {
 #[tokio::test]
 async fn stale_socket_does_not_offline_live_host() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
     let mut req_a = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("a")?;
-    req_a.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req_a
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node_a, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req_a))
         .await
         .context("connect a")??;
@@ -1201,7 +1214,7 @@ async fn stale_socket_does_not_offline_live_host() -> Result<()> {
 #[tokio::test]
 async fn bootstrap_cannot_impersonate_existing_host_but_host_token_can_reconnect() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
     let hello = |version: &str| {
         json!({
@@ -1225,10 +1238,8 @@ async fn bootstrap_cannot_impersonate_existing_host_but_host_token_can_reconnect
     let mut req = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("first node")?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
         .await
         .context("connect first")??;
@@ -1236,12 +1247,17 @@ async fn bootstrap_cannot_impersonate_existing_host_but_host_token_can_reconnect
     let first = recv_json(&mut node).await?;
     let node_token = first["result"]["nodeToken"]
         .as_str()
-        .context("host token")?;
+        .context("nodeToken")?
+        .to_string();
 
+    // A1: a *fresh* enroll token cannot claim this live host's identity, and
+    // the failed collision cannot steal or disconnect the victim's route.
+    let attacker_enroll = enroll_token(hub.addr, &cookie).await?;
     let mut attacker_req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    attacker_req
-        .headers_mut()
-        .insert("Authorization", format!("Bearer {bootstrap}").parse()?);
+    attacker_req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {attacker_enroll}").parse()?,
+    );
     let (mut attacker, _) = tokio_tungstenite::connect_async(attacker_req).await?;
     attacker
         .send(Message::Text(hello("attacker").into()))
@@ -1249,7 +1265,6 @@ async fn bootstrap_cannot_impersonate_existing_host_but_host_token_can_reconnect
     let rejected = recv_json(&mut attacker).await?;
     assert!(rejected.get("error").is_some(), "{rejected}");
     assert!(rejected.get("result").is_none(), "{rejected}");
-    // The failed collision cannot steal or disconnect the victim's route.
     node.send(Message::Text(
         json!({"jsonrpc":"2.0", "id":"heartbeat", "method":"runtime.heartbeat", "params":{}})
             .to_string()
@@ -1258,7 +1273,9 @@ async fn bootstrap_cannot_impersonate_existing_host_but_host_token_can_reconnect
     .await?;
     assert!(recv_json(&mut node).await?.get("result").is_some());
     drop(attacker);
+    drop(node);
 
+    // D-018: the enroll token is spent; re-announce uses the stored node token.
     let mut req = format!("ws://{}/v1/node", hub.addr)
         .into_client_request()
         .context("second node")?;
@@ -1312,16 +1329,14 @@ async fn follow_tty_relays_snapshot_input_and_resize() -> Result<()> {
     use remuda_protocol::{BinaryChannel, StreamUuid, encode_binary_frame};
 
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
     let instance_id = InstanceId::new();
     let stream_id = remuda_protocol::Id::new("tty")?;
 
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
         .await
         .context("node connect")??;
@@ -1493,7 +1508,8 @@ async fn tty_binary_frames_are_scoped_to_the_registering_socket() -> Result<()> 
     let instance_a = InstanceId::new();
     let stream_id = remuda_protocol::Id::new("tty")?;
 
-    let mut node_a = node_socket(hub.addr, &bootstrap, &host_a, "tty-host-a").await?;
+    let enroll_a = enroll_token(hub.addr, &cookie).await?;
+    let mut node_a = node_socket(hub.addr, &enroll_a, &host_a, "tty-host-a").await?;
     // Seed the instance so `tty.frame` passes the host-binding check.
     node_a
         .send(Message::Text(
@@ -1562,7 +1578,8 @@ async fn tty_binary_frames_are_scoped_to_the_registering_socket() -> Result<()> 
 
     // Host B replays A's stream UUID on its own socket.
     let host_b = HostId::new();
-    let mut node_b = node_socket(hub.addr, &bootstrap, &host_b, "tty-host-b").await?;
+    let enroll_b = enroll_token(hub.addr, &cookie).await?;
+    let mut node_b = node_socket(hub.addr, &enroll_b, &host_b, "tty-host-b").await?;
     let uuid = StreamUuid::from_prefixed_id(stream_id.as_str()).expect("stream uuid");
     let forged = encode_binary_frame(BinaryChannel::TtyOutput, uuid, 0, b"forged")?;
     node_b.send(Message::Binary(forged.into())).await?;
@@ -1622,6 +1639,88 @@ async fn node_socket(
     let hello = recv_json(&mut node).await?;
     anyhow::ensure!(hello.get("result").is_some(), "{hello}");
     Ok(node)
+}
+
+/// D-018: the device access code pairs devices only. It must not enroll a
+/// Node, and it is one-shot per device name with a TTL.
+#[tokio::test]
+async fn access_code_pairs_devices_but_never_enrolls_a_node() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+
+    // Same code, same device name: already redeemed.
+    let body = json!({ "bootstrapToken": bootstrap, "deviceName": "test-phone" }).to_string();
+    let (status, _, _) = http(hub.addr, "POST", "/v1/login", &[], Some(&body)).await?;
+    assert_eq!(status, 401, "access code must be one-shot per device");
+
+    // The access code must not authenticate a node socket.
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("node connect")??;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "node.hello",
+            "params": { "hostId": HostId::new().as_id().as_str(), "nodeVersion": "0.1.0" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let denied = recv_json(&mut node).await?;
+    assert_eq!(
+        denied["error"]["code"],
+        json!(-32000),
+        "device access code must not enroll a Node: {denied}"
+    );
+
+    // A minted enroll token does enroll, exactly once.
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let enrolled_host = HostId::new();
+    let node = node_socket(hub.addr, &enroll, &enrolled_host, "enrolled").await?;
+    drop(node);
+    let host_id = enrolled_host.as_id().as_str().to_string();
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut replay, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("replay connect")??;
+    replay
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "r",
+                "method": "node.hello",
+                "params": { "hostId": host_id, "nodeVersion": "0.1.0" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let denied = recv_json(&mut replay).await?;
+    assert_eq!(
+        denied["error"]["code"],
+        json!(-32000),
+        "enroll token must be single use: {denied}"
+    );
+    Ok(())
+}
+
+/// A device token is not an enroll token: minting requires authentication.
+#[tokio::test]
+async fn enroll_token_requires_an_authenticated_device() -> Result<()> {
+    let (hub, _bootstrap, _dir) = boot().await?;
+    let (status, _, _) = http(hub.addr, "POST", "/v1/hosts/enroll-token", &[], Some("{}")).await?;
+    assert_eq!(status, 401);
+    Ok(())
 }
 
 async fn recv_json<S>(ws: &mut S) -> Result<Value>

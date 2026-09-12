@@ -69,25 +69,23 @@ pub struct Store {
     _join: Arc<StoreJoin>,
 }
 
-/// Result of presenting a Node bootstrap or host token.
+/// Result of presenting a Node enroll or host token.
 pub enum HostAuthOutcome {
-    /// Token matched an enrolled host, or bootstrap enrolled a new one.
+    /// Token matched an enrolled host, or an enroll token minted a new one.
     Authenticated {
         /// Host index row.
         host: Box<HostRecord>,
         /// Fresh host token, only on first enrollment.
         node_token: Option<String>,
     },
-    /// Secret did not match bootstrap or any host verifier.
+    /// Secret did not match any host verifier or a live enroll token.
     Rejected,
 }
 
 /// Inputs for [`Store::authenticate_host`].
 pub struct HostAuthRequest {
-    /// Presented bearer secret.
+    /// Presented bearer secret: a host's node token, or a one-shot enroll token.
     pub presented: String,
-    /// Configured bootstrap token.
-    pub bootstrap: String,
     /// Optional `hostId` from hello params.
     pub hello_host_id: Option<String>,
     /// Optional label.
@@ -494,6 +492,19 @@ impl Store {
         .await
     }
 
+    /// Whether a device with this name is already paired (D-018 one-shot).
+    pub async fn device_name_exists(&self, name: String) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM devices WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+    }
+
     /// Indexed lookup, followed by one full-token verification. Legacy cookies
     /// may migrate using an explicit device id, never a scan of salted hashes.
     pub async fn find_device_by_token<F>(
@@ -535,7 +546,12 @@ impl Store {
         .await
     }
 
-    /// Enroll or refresh a host using `verify` against stored token hashes.
+    /// Enroll or refresh a host.
+    ///
+    /// D-018: the device access code is **not** accepted here. An existing host
+    /// re-announces with its own stored node token; a new host presents a
+    /// single-use enroll token minted by an authenticated device. Neither path
+    /// lets a caller claim a `host_id` it cannot already authenticate as.
     pub async fn authenticate_host<F>(
         &self,
         request: HostAuthRequest,
@@ -560,6 +576,7 @@ impl Store {
                     params![id], read_row,
                 ).optional()?;
             }
+            // Authenticated as *this* host; the claimed hello hostId is ignored (A1).
             if let Some((id, hash)) = candidate
                 && verify(&request.presented, &hash) {
                     conn.execute("UPDATE hosts SET token_prefix = ?1 WHERE id = ?2", params![prefix, id])?;
@@ -569,21 +586,28 @@ impl Store {
                         node_token: None,
                     });
             }
-            if !crate::config::secret_eq(&request.presented, &request.bootstrap) {
+            let now = now_rfc3339();
+            let Some(enroll_id) = consume_enroll_token(conn, &request.presented, &now, &verify)?
+            else {
                 return Ok(HostAuthOutcome::Rejected);
-            }
+            };
             let host_id = match request.hello_host_id {
                 Some(id) => id,
                 None => new_id("hst").map_err(|e| StoreError::Id(e.to_string()))?,
             };
+            // An enroll token mints a *new* host only. Re-enrolling an existing
+            // host_id requires that host's own token, so a leaked enroll token
+            // cannot steal the routing slot of a live Node (A1/A2).
             if load_host(conn, &host_id)?.is_some() {
-                // Bootstrap authorizes enrollment only. Reconnecting to an
-                // existing identity requires its own host token above.
+                tracing::warn!(
+                    host_id = %host_id,
+                    enroll_token_id = %enroll_id,
+                    "enroll token presented for an existing host; rejecting"
+                );
                 return Ok(HostAuthOutcome::Rejected);
             }
             let node_token = crate::config::random_token();
             let token_hash = hash_new(&node_token)?;
-            let now = now_rfc3339();
             let label = request.label.unwrap_or_else(|| host_id.clone());
             conn.execute(
                 "INSERT INTO hosts
@@ -598,6 +622,39 @@ impl Store {
                 host: Box::new(host),
                 node_token: Some(node_token),
             })
+        })
+        .await
+    }
+
+    /// Store a hashed single-use node enroll token (D-018).
+    ///
+    /// `token_prefix` is the indexed lookup key (see [`crate::auth::token_prefix`]);
+    /// `None` keeps the row unreachable by the fast path, which is what test
+    /// fixtures with non-hex secrets want.
+    pub async fn insert_enroll_token(
+        &self,
+        token_hash: String,
+        token_prefix: Option<String>,
+        created_by: String,
+        expires_at: String,
+    ) -> Result<String, StoreError> {
+        self.run(move |conn| {
+            let prefix = token_prefix;
+            let id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO enroll_tokens
+                    (id, token_hash, token_prefix, created_by, expires_at, used, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                params![
+                    id,
+                    token_hash,
+                    prefix,
+                    created_by,
+                    expires_at,
+                    now_rfc3339()
+                ],
+            )?;
+            Ok(id)
         })
         .await
     }
@@ -1789,6 +1846,17 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS enroll_tokens (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            token_prefix TEXT,
+            created_by TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            used_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS enroll_tokens_prefix ON enroll_tokens(token_prefix);
         CREATE TABLE IF NOT EXISTS interactions (
             id TEXT PRIMARY KEY,
             instance_id TEXT NOT NULL,
@@ -1989,6 +2057,48 @@ fn apply_command_projection(
     Ok(())
 }
 
+/// Consume a single-use node enroll token, returning its id when it verifies.
+///
+/// Marks the row used inside the same write transaction as the caller's host
+/// insert, so a token cannot enroll two hosts even under concurrent hellos.
+fn consume_enroll_token<F>(
+    conn: &Connection,
+    presented: &str,
+    now: &str,
+    verify: &F,
+) -> Result<Option<String>, StoreError>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    let Some(prefix) = crate::auth::token_prefix(presented) else {
+        return Ok(None);
+    };
+    // Indexed by prefix, so one candidate and one Argon2 verify per attempt
+    // rather than a scan of every live token (A4).
+    let candidate = conn
+        .query_row(
+            "SELECT id, token_hash FROM enroll_tokens
+             WHERE token_prefix = ?1 AND used = 0 AND expires_at > ?2",
+            params![prefix, now],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((id, hash)) = candidate else {
+        return Ok(None);
+    };
+    if !verify(presented, &hash) {
+        return Ok(None);
+    }
+    let claimed = conn.execute(
+        "UPDATE enroll_tokens SET used = 1, used_at = ?1 WHERE id = ?2 AND used = 0",
+        params![now, id],
+    )?;
+    if claimed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(id))
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -2010,6 +2120,35 @@ fn ensure_column(
 mod tests {
     use super::*;
 
+    /// Mint an enroll token whose plaintext is its own "hash", so tests can use
+    /// a trivial `verify` of string equality (D-018).
+    async fn enroll_token(store: &Store, label: &str) -> String {
+        // Real tokens are 64 hex chars; the prefix index only applies to those.
+        let plaintext = hex_token(label);
+        let plaintext = plaintext.as_str();
+        store
+            .insert_enroll_token(
+                plaintext.to_string(),
+                crate::auth::token_prefix(plaintext).map(str::to_string),
+                "dev_test".into(),
+                "2099-01-01T00:00:00.000Z".into(),
+            )
+            .await
+            .expect("insert enroll token");
+        plaintext.to_string()
+    }
+
+    /// Deterministic, distinct 64-hex token derived from a readable label.
+    fn hex_token(label: &str) -> String {
+        let mut hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+        hex.truncate(64);
+        format!("{hex:0<64}")
+    }
+
+    fn verify_eq(presented: &str, hash: &str) -> bool {
+        presented == hash
+    }
+
     #[tokio::test]
     async fn host_lost_obeys_offline_grace_and_reconnect_and_preserves_history() {
         let dir = tempfile::tempdir().unwrap();
@@ -2018,13 +2157,12 @@ mod tests {
         store
             .authenticate_host(
                 HostAuthRequest {
-                    presented: "bootstrap".into(),
-                    bootstrap: "bootstrap".into(),
+                    presented: enroll_token(&store, "enroll-reclaim").await,
                     hello_host_id: Some(host.clone()),
                     label: Some("reclaim-test".into()),
                     node_version: None,
                 },
-                |_, _| false,
+                verify_eq,
                 |_| Ok("test-hash".into()),
             )
             .await
@@ -2086,16 +2224,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("data dir");
         let store = Store::open(dir.path()).expect("store");
         let host_id = new_id("hst").expect("host id");
+        let token = enroll_token(&store, "enroll-1").await;
         let outcome = store
             .authenticate_host(
                 HostAuthRequest {
-                    presented: "bootstrap".into(),
-                    bootstrap: "bootstrap".into(),
+                    presented: token,
                     hello_host_id: Some(host_id.clone()),
                     label: Some("slow-node".into()),
                     node_version: Some("test".into()),
                 },
-                |_, _| false,
+                verify_eq,
                 |_| Ok("test-hash".into()),
             )
             .await
@@ -2215,22 +2353,24 @@ mod tests {
         assert_eq!(online.connectivity, "connected");
     }
 
+    /// D-018: an enrolled host re-announces with its own stored node token,
+    /// and that token authenticates its owner regardless of the hello hostId.
     #[tokio::test]
-    async fn existing_host_requires_its_own_token() {
+    async fn enrolled_host_reannounces_with_its_own_node_token() {
         let dir = tempfile::tempdir().expect("data dir");
         let store = Store::open(dir.path()).expect("store");
         let host_id = new_id("hst").expect("host id");
+        let token = enroll_token(&store, "enroll-reannounce").await;
         let first = store
             .authenticate_host(
                 HostAuthRequest {
-                    presented: "bootstrap".into(),
-                    bootstrap: "bootstrap".into(),
+                    presented: token,
                     hello_host_id: Some(host_id.clone()),
                     label: Some("local-development".into()),
                     node_version: Some("1".into()),
                 },
-                |_, _| false,
-                |token| Ok(format!("hash:{token}")),
+                verify_eq,
+                |secret| Ok(secret.to_string()),
             )
             .await
             .expect("first enroll");
@@ -2246,43 +2386,18 @@ mod tests {
             .mark_host_offline(host_id.clone())
             .await
             .expect("offline");
-        let second = store
-            .authenticate_host(
-                HostAuthRequest {
-                    presented: "bootstrap".into(),
-                    bootstrap: "bootstrap".into(),
-                    hello_host_id: Some(host_id.clone()),
-                    label: Some("local-development".into()),
-                    node_version: Some("2".into()),
-                },
-                |_, _| false,
-                |_| Ok("hash-2".into()),
-            )
-            .await
-            .expect("reannounce");
-        assert!(matches!(second, HostAuthOutcome::Rejected));
-        let existing = store
-            .get_host(host_id.clone())
-            .await
-            .expect("query")
-            .expect("host");
-        assert!(
-            !existing.online,
-            "rejected enrollment must not change liveness"
-        );
-        assert_eq!(existing.node_version.as_deref(), Some("1"));
+
         let authenticated = store
             .authenticate_host(
                 HostAuthRequest {
                     presented: node_token,
-                    bootstrap: "bootstrap".into(),
                     // A host token authenticates its owner, regardless of a
                     // different identity claimed in the hello payload.
                     hello_host_id: Some(new_id("hst").expect("other host")),
                     label: Some("attacker label".into()),
                     node_version: Some("2".into()),
                 },
-                |token, hash| hash == format!("hash:{token}"),
+                verify_eq,
                 |_| panic!("reconnect must not mint a new token"),
             )
             .await
@@ -2299,6 +2414,108 @@ mod tests {
         assert!(host.online);
         let listed = store.list_hosts().await.expect("list");
         assert_eq!(listed.len(), 1, "{listed:?}");
+    }
+
+    /// D-018 + A1: an enroll token mints a new host and never claims an
+    /// existing one, and it cannot be replayed for a second host.
+    #[tokio::test]
+    async fn enroll_token_is_single_use_and_cannot_claim_an_existing_host() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let victim = new_id("hst").expect("host id");
+        let token = enroll_token(&store, "enroll-once").await;
+        let first = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: token.clone(),
+                    hello_host_id: Some(victim.clone()),
+                    label: None,
+                    node_version: None,
+                },
+                verify_eq,
+                |secret| Ok(secret.to_string()),
+            )
+            .await
+            .expect("first enroll");
+        assert!(matches!(
+            first,
+            HostAuthOutcome::Authenticated {
+                node_token: Some(_),
+                ..
+            }
+        ));
+
+        // Same token again: consumed, so rejected even for a brand-new host id.
+        let replay = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: token,
+                    hello_host_id: Some(new_id("hst").expect("host id")),
+                    label: None,
+                    node_version: None,
+                },
+                verify_eq,
+                |secret| Ok(secret.to_string()),
+            )
+            .await
+            .expect("replay");
+        assert!(
+            matches!(replay, HostAuthOutcome::Rejected),
+            "an enroll token must be single use"
+        );
+
+        // A *fresh* enroll token still cannot take over the existing host.
+        let second = enroll_token(&store, "enroll-takeover").await;
+        let takeover = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: second,
+                    hello_host_id: Some(victim.clone()),
+                    label: None,
+                    node_version: None,
+                },
+                verify_eq,
+                |secret| Ok(secret.to_string()),
+            )
+            .await
+            .expect("takeover");
+        assert!(
+            matches!(takeover, HostAuthOutcome::Rejected),
+            "enroll token must not authenticate an existing host (A1)"
+        );
+        let listed = store.list_hosts().await.expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+    }
+
+    /// An expired enroll token is rejected.
+    #[tokio::test]
+    async fn expired_enroll_token_is_rejected() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let stale = hex_token("stale");
+        store
+            .insert_enroll_token(
+                stale.clone(),
+                crate::auth::token_prefix(&stale).map(str::to_string),
+                "dev_test".into(),
+                "2000-01-01T00:00:00.000Z".into(),
+            )
+            .await
+            .expect("insert");
+        let outcome = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: stale.clone(),
+                    hello_host_id: None,
+                    label: None,
+                    node_version: None,
+                },
+                verify_eq,
+                |secret| Ok(secret.to_string()),
+            )
+            .await
+            .expect("expired");
+        assert!(matches!(outcome, HostAuthOutcome::Rejected));
     }
 
     #[tokio::test]
@@ -2335,16 +2552,16 @@ mod tests {
     }
 
     async fn enroll_labeled(store: &Store, host_id: String, label: &str) {
+        let token = enroll_token(store, &format!("enroll-{host_id}")).await;
         let outcome = store
             .authenticate_host(
                 HostAuthRequest {
-                    presented: "bootstrap".into(),
-                    bootstrap: "bootstrap".into(),
+                    presented: token,
                     hello_host_id: Some(host_id),
                     label: Some(label.to_owned()),
                     node_version: Some("test".into()),
                 },
-                |_, _| false,
+                verify_eq,
                 |secret| Ok(format!("hash-{secret}")),
             )
             .await

@@ -4,7 +4,7 @@
 //! web/dist when present and otherwise uses the crate's fallback page.
 
 use crate::{Shutdown, config::Config, dispatcher};
-use clap::Args as ClapArgs;
+use clap::{Args as ClapArgs, Subcommand};
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(ClapArgs)]
@@ -19,6 +19,17 @@ pub(crate) struct Args {
     /// Run the configured Feishu dispatcher against this Hub in the same process.
     #[arg(long)]
     with_dispatcher: bool,
+    #[command(subcommand)]
+    command: Option<HubCommand>,
+}
+
+/// Hub maintenance that runs without serving (D-018).
+#[derive(Subcommand)]
+pub(crate) enum HubCommand {
+    /// Replace the device pairing access code and print the new one.
+    ///
+    /// Paired devices keep their tokens; only future pairing is affected.
+    RotateBootstrap,
 }
 
 impl Args {
@@ -30,6 +41,17 @@ impl Args {
             config.hub.web_root = Some(root);
         }
     }
+}
+
+/// `remuda hub rotate-bootstrap`: mint a new device pairing access code.
+fn rotate_bootstrap(config: &Config) -> anyhow::Result<()> {
+    let token = remuda_hub::rotate_bootstrap(&config.data_dir)?;
+    tracing::info!(
+        path = %config.data_dir.join("bootstrap-token").display(),
+        "rotated device pairing access code"
+    );
+    println!("{token}");
+    Ok(())
 }
 
 pub(crate) async fn start(config: &Config) -> anyhow::Result<remuda_hub::RunningHub> {
@@ -60,6 +82,10 @@ pub(crate) async fn run(
     args: Args,
     mut shutdown: Shutdown,
 ) -> anyhow::Result<()> {
+    if let Some(HubCommand::RotateBootstrap) = args.command {
+        config.validate()?;
+        return rotate_bootstrap(&config);
+    }
     let with_dispatcher = args.with_dispatcher;
     args.apply(&mut config);
     config.validate()?;

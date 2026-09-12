@@ -57,6 +57,24 @@ fn cookie_from(head: &str) -> Option<String> {
     None
 }
 
+/// Mint a single-use Node enroll token with a paired device's cookie (D-018).
+async fn enroll_token(addr: std::net::SocketAddr, cookie: &str) -> Result<String> {
+    let (status, _, rest) = http(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", cookie)],
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "enroll-token {status} {rest}");
+    let value: Value = serde_json::from_str(rest.trim())?;
+    value["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("enroll token")
+}
+
 async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<String> {
     let body = json!({
         "bootstrapToken": bootstrap,
@@ -135,12 +153,11 @@ async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
     let hub = spawn(config).await?;
     let addr = hub.addr;
     let cookie = login(addr, &bootstrap).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
 
     let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) =
         tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req)).await??;
     let host_id = HostId::new();

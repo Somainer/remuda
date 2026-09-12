@@ -10,6 +10,31 @@ use std::path::{Path, PathBuf};
 
 const ENROLLMENT_FILE: &str = "enrollment.json";
 
+/// One-shot enroll token from the environment (D-018).
+///
+/// `REMUDA_ENROLL_TOKEN` is minted by `POST /v1/hosts/enroll-token` on an
+/// authenticated device. `REMUDA_BOOTSTRAP_TOKEN` is still read so an older
+/// deployment fails with a clear warning here rather than an opaque Hub
+/// rejection — the Hub no longer enrolls Nodes with the device access code.
+#[must_use]
+pub fn enroll_token_from_env() -> Option<String> {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|token| token.trim().to_owned())
+            .filter(|token| !token.is_empty())
+    };
+    if let Some(token) = read("REMUDA_ENROLL_TOKEN") {
+        return Some(token);
+    }
+    let legacy = read("REMUDA_BOOTSTRAP_TOKEN")?;
+    tracing::warn!(
+        "REMUDA_BOOTSTRAP_TOKEN is the device pairing access code and no longer enrolls a Node; \
+         mint one with POST /v1/hosts/enroll-token and set REMUDA_ENROLL_TOKEN"
+    );
+    Some(legacy)
+}
+
 /// Durable Node identity presented on `node.hello` / `node.auth`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,10 +72,7 @@ pub fn load_or_create(data_dir: &Path) -> Result<Enrollment, NodeError> {
     let host_id = load_or_create_host_id(&data_dir.join("node"))?;
     let enrollment = Enrollment {
         host_id,
-        node_token: std::env::var("REMUDA_BOOTSTRAP_TOKEN")
-            .ok()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty()),
+        node_token: enroll_token_from_env(),
     };
     save(data_dir, &enrollment)?;
     Ok(enrollment)

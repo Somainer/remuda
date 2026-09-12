@@ -92,6 +92,24 @@ fn cookie_from(head: &str) -> Option<String> {
     None
 }
 
+/// Mint a single-use Node enroll token with a paired device's cookie (D-018).
+async fn enroll_token(addr: std::net::SocketAddr, cookie: &str) -> Result<String> {
+    let (status, _, rest) = http(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", cookie)],
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "enroll-token {status} {rest}");
+    let value: Value = serde_json::from_str(rest.trim())?;
+    value["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("enroll token")
+}
+
 async fn login(
     addr: std::net::SocketAddr,
     bootstrap: &str,
@@ -129,14 +147,12 @@ where
 
 async fn connect_node(
     addr: std::net::SocketAddr,
-    bootstrap: &str,
+    enroll: &str,
     host_id: &str,
 ) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>> {
     let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) =
         tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req)).await??;
     node.send(Message::Text(
@@ -241,7 +257,8 @@ async fn pairing_list_revoke_and_push_with_follow_suppress() -> Result<()> {
 
     let host_id = HostId::new();
     let instance_id = InstanceId::new();
-    let mut node = connect_node(hub.addr, &hub.bootstrap_token, host_id.as_id().as_str()).await?;
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let mut node = connect_node(hub.addr, &enroll, host_id.as_id().as_str()).await?;
     append(
         &mut node,
         instance_id.as_id().as_str(),

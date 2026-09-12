@@ -68,6 +68,24 @@ async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<String> {
     cookie_from(&head).context("set-cookie")
 }
 
+/// Mint a single-use Node enroll token with a paired device's cookie (D-018).
+async fn enroll_token(addr: std::net::SocketAddr, cookie: &str) -> Result<String> {
+    let (status, _, rest) = http(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", cookie)],
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "enroll-token {status} {rest}");
+    let value: Value = serde_json::from_str(rest.trim())?;
+    value["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("enroll token")
+}
+
 async fn recv_json<S>(ws: &mut S) -> Result<Value>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -126,7 +144,8 @@ async fn hub_restart_keeps_host_journal_interactions_and_device() -> Result<()> 
     let instance_id = InstanceId::new();
     let interaction_id = InteractionId::new();
 
-    let (mut node, hello) = node_hello(addr, &bootstrap, host_id.as_id().as_str()).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (mut node, hello) = node_hello(addr, &enroll, host_id.as_id().as_str()).await?;
     let node_token = hello["result"]["nodeToken"]
         .as_str()
         .context("nodeToken")?
@@ -362,7 +381,8 @@ async fn follow_backpressure_does_not_duplicate_journal() -> Result<()> {
     let cookie = login(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
     let instance_id = InstanceId::new();
-    let (mut node, _) = node_hello(hub.addr, &bootstrap, host_id.as_id().as_str()).await?;
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, _) = node_hello(hub.addr, &enroll, host_id.as_id().as_str()).await?;
     node.send(Message::Text(
         json!({
             "jsonrpc": "2.0",

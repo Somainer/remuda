@@ -105,6 +105,23 @@
         }
       }
     },
+    "/v1/hosts/enroll-token": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "mintEnrollToken",
+        "summary": "Mint a single-use Node enroll token (D-018)",
+        "description": "Requires an authenticated device. The plaintext is returned once; the Hub stores only its Argon2 hash. The device pairing access code never enrolls a Node.",
+        "responses": {
+          "200": {
+            "description": "Enroll token",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/EnrollToken" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/hosts": {
       "get": {
         "tags": ["hosts"],
@@ -884,6 +901,15 @@
           "deviceId": { "type": "string" },
           "token": { "type": "string" },
           "name": { "type": "string" }
+        }
+      },
+      "EnrollToken": {
+        "type": "object",
+        "required": ["enrollTokenId", "token", "expiresAt"],
+        "properties": {
+          "enrollTokenId": { "type": "string" },
+          "token": { "type": "string", "description": "Single-use secret; returned once." },
+          "expiresAt": { "type": "string", "format": "date-time" }
         }
       },
       "Device": {

@@ -10,4 +10,31 @@ description = "Hub authentication, host registry, routing, and embedded Web asse
 [lints]
 workspace = true
 
+[features]
+default = []
+# Embed `web/dist` when present at compile time; otherwise a 404 placeholder.
+embed-web = []
+
 [dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+axum.workspace = true
+futures.workspace = true
+remuda-protocol.workspace = true
+rusqlite.workspace = true
+rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true

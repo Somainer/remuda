@@ -17,7 +17,7 @@ mod server_request;
 mod types;
 
 pub use codec::{decode_line, is_skippable_line};
-pub use error::WireError;
+pub use error::{RpcError, WireError};
 pub use notification::{
     AgentMessageDeltaNotification, DeprecationNoticeNotification, ErrorNotification,
     ItemCompletedNotification, ItemStartedNotification, McpServerStartupStatusUpdatedNotification,

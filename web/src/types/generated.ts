@@ -42,10 +42,10 @@ export type ActorRef = ({
 export type ActorType = ("human" | "bot" | "agent" | "system");
 
 /** AdapterTransport wire values; `protocol.md` §3.2. */
-export type AdapterTransport = ("native-rust-wire" | "claude-sdk-sidecar" | "claude-pty-herdr" | "claude-bg-herdr-attach" | "codex-appserver-spawn" | "codex-embedded" | "grok-acp" | "agy-native" | "generic-herdr");
+export type AdapterTransport = ("native-rust-wire" | "claude-sdk-sidecar" | "claude-pty-herdr" | "claude-bg-herdr-attach" | "codex-appserver-spawn" | "codex-embedded" | "grok-acp" | "agy-native" | "generic-herdr" | "shell-pty");
 
 /** AgentKind wire values; `protocol.md` §1.3. */
-export type AgentKind = ("claude" | "codex" | "grok" | "agy" | "generic");
+export type AgentKind = ("claude" | "codex" | "grok" | "agy" | "generic" | "terminal");
 
 /** AgyPermission; `protocol.md` §4.1. */
 export type AgyPermission = ({
@@ -148,7 +148,7 @@ export type AttachRef = ({
 export type BgInputDelivery = ("deferred-argv");
 
 /** Output stream category; the byte values are fixed by `protocol.md` §7.4. */
-export type BinaryChannel = ("tty-output" | "object-chunk");
+export type BinaryChannel = ("tty-output" | "object-chunk" | "tty-input");
 
 /** Decoded metadata for the 32-byte binary header; JSON is for fixtures only; §7.4. */
 export type BinaryHeader = ({
@@ -240,6 +240,8 @@ export type CarrierSpec = (({
   "argvInputPolicy": ArgvInputPolicy;
   "inputDelivery": BgInputDelivery;
   "type": "claude-bg";
+}) | ({
+  "type": "shell-pty";
 }));
 
 /** ChangeApplication wire values; `protocol.md` §5.2. */
@@ -656,7 +658,7 @@ export type DriverInput = (PromptInput & ({
 }));
 
 /** DriverKind wire values; `protocol.md` §3.1. */
-export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty");
+export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
 
 /** ElicitationAction wire values; `protocol.md` §5.4. */
 export type ElicitationAction = ("accept" | "decline" | "cancel");
@@ -3348,6 +3350,7 @@ export type TtyAttachResult = ({
   "representation": TtyRepresentation;
   "screenSnapshotRef": (Id | (null));
   "snapshotAtOffset": Knowledge3;
+  "snapshotBase64"?: (string | null);
   "streamEpoch": Id;
   "streamId": Id;
   "writerLease": (TtyWriterLease | (null));

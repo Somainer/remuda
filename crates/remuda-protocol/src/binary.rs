@@ -13,14 +13,16 @@ pub const BINARY_HEADER_LEN: usize = 32;
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum BinaryChannel {
-    /// Terminal output, never terminal input.
+    /// Terminal output (ANSI / PTY bytes).
     TtyOutput = 1,
     /// Object transfer chunk.
     ObjectChunk = 2,
+    /// Terminal input: raw bytes as the client emitted them (keyboard and mouse).
+    TtyInput = 3,
 }
 
 /// Canonical UUIDv7 portion of a registered stream ID; `protocol.md` §7.4.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct StreamUuid(Uuid);
 
@@ -41,6 +43,23 @@ impl TryFrom<String> for StreamUuid {
 impl From<StreamUuid> for String {
     fn from(value: StreamUuid) -> Self {
         value.0.to_string()
+    }
+}
+
+impl StreamUuid {
+    /// UUID bytes carried in the binary header (no `tty_` prefix).
+    #[must_use]
+    pub fn uuid(self) -> Uuid {
+        self.0
+    }
+
+    /// Strip a registered `tty_…` (or other) ID down to the UUIDv7 header field.
+    pub fn from_prefixed_id(id: &str) -> Result<Self, BinaryFrameError> {
+        let uuid_text = id.split_once('_').map(|(_, rest)| rest).unwrap_or(id);
+        uuid_text
+            .to_owned()
+            .try_into()
+            .map_err(|_| BinaryFrameError::InvalidStream)
     }
 }
 impl JsonSchema for StreamUuid {
@@ -104,6 +123,35 @@ impl BinaryHeader {
         bytes[28..32].copy_from_slice(&self.payload_length.to_be_bytes());
         Ok(bytes)
     }
+
+    /// Encode header plus payload as one frame.
+    pub fn encode_frame(&self, payload: &[u8]) -> Result<Vec<u8>, BinaryFrameError> {
+        if payload.len() as u64 != u64::from(self.payload_length) {
+            return Err(BinaryFrameError::LengthMismatch);
+        }
+        let mut frame = Vec::with_capacity(BINARY_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&self.encode()?);
+        frame.extend_from_slice(payload);
+        Ok(frame)
+    }
+}
+
+/// Encode one v1 binary frame; `protocol.md` §7.4.
+pub fn encode_binary_frame(
+    channel: BinaryChannel,
+    stream_uuid: StreamUuid,
+    offset: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, BinaryFrameError> {
+    let payload_length =
+        u32::try_from(payload.len()).map_err(|_| BinaryFrameError::PayloadLimit)?;
+    BinaryHeader {
+        channel,
+        stream_uuid,
+        offset: U64(offset),
+        payload_length,
+    }
+    .encode_frame(payload)
 }
 
 /// Decode one complete frame without allocating payload bytes; `protocol.md` §7.4.
@@ -125,6 +173,7 @@ pub fn decode_binary_frame(
     let channel = match prefix[1] {
         1 => BinaryChannel::TtyOutput,
         2 => BinaryChannel::ObjectChunk,
+        3 => BinaryChannel::TtyInput,
         _ => return Err(BinaryFrameError::UnsupportedHeader),
     };
     let uuid = Uuid::from_slice(&prefix[4..20]).map_err(|_| BinaryFrameError::InvalidStream)?;

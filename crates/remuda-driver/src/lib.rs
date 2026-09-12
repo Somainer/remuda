@@ -19,6 +19,8 @@ mod process;
 mod profile;
 mod recipe;
 mod secrets;
+pub mod shell_pty;
+pub mod tty;
 
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;
@@ -51,6 +53,8 @@ pub use secrets::KeychainSecretBroker;
 pub use secrets::{FileSecretStore, TokenBroker};
 #[cfg(unix)]
 pub use secrets::{request_secret, serve_token_broker};
+pub use shell_pty::{ShellPtyDriver, ShellPtyOptions, default_shell};
+pub use tty::{HerdrTty, LocalPty, TTY_SNAPSHOT_MAX, TtyBridge, logical_keys_to_bytes};
 
 #[cfg(any(test, feature = "test-stub"))]
 pub use fake::FakeDriver;

@@ -195,6 +195,11 @@ enum Control {
     Shutdown,
 }
 
+enum TtyWire {
+    Json(Value),
+    Binary(Vec<u8>),
+}
+
 struct PendingAppend {
     reply: oneshot::Sender<Result<Value, NodeError>>,
     instance_id: String,
@@ -522,6 +527,11 @@ async fn session_task(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = heartbeat.tick().await;
 
+    let (tty_tx, mut tty_rx) = mpsc::channel::<TtyWire>(64);
+    if let Some(runtime) = runtime.as_ref() {
+        spawn_wss_tty_pump(runtime.node.clone(), tty_tx);
+    }
+
     loop {
         tokio::select! {
             control = control_rx.recv() => {
@@ -595,9 +605,67 @@ async fn session_task(
                     }
                 }
             }
+            tty = tty_rx.recv() => {
+                let Some(tty) = tty else { continue; };
+                let send_ok = match tty {
+                    TtyWire::Json(value) => send_ws(&mut stream, &value).await.is_ok(),
+                    TtyWire::Binary(bytes) => stream
+                        .send(Message::Binary(bytes.into()))
+                        .await
+                        .is_ok(),
+                };
+                if !send_ok
+                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err()
+                {
+                    break;
+                }
+            }
         }
     }
     fail_pending(&mut pending, NodeError::Disconnected, &metrics);
+}
+
+fn spawn_wss_tty_pump(node: crate::DevNode, tx: mpsc::Sender<TtyWire>) {
+    tokio::spawn(async move {
+        let mut events = node.tty().subscribe();
+        loop {
+            match events.recv().await {
+                Ok(crate::TtyEvent::Open {
+                    instance_id,
+                    stream_id,
+                }) => {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "tty.frame",
+                        "params": {
+                            "instanceId": instance_id,
+                            "streamId": stream_id,
+                            "channel": 1,
+                            "offset": "0",
+                        }
+                    });
+                    if tx.send(TtyWire::Json(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(crate::TtyEvent::Bytes {
+                    stream_id,
+                    offset,
+                    payload,
+                    ..
+                }) => match crate::encode_tty_frame(&stream_id, offset, &payload) {
+                    Ok(frame) => {
+                        if tx.send(TtyWire::Binary(frame)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 async fn handle_incoming(

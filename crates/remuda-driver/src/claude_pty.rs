@@ -494,6 +494,18 @@ impl Driver for ClaudePtyDriver {
         Ok(DriverAck::transport_written())
     }
 
+    async fn tty_bridge(&self) -> Option<crate::tty::TtyBridge> {
+        let inner = self.inner.lock().await;
+        let live = inner.as_ref()?;
+        if live.closed {
+            return None;
+        }
+        Some(crate::tty::TtyBridge::Herdr {
+            client: live.client.clone(),
+            pane_id: live.pane_id.clone(),
+        })
+    }
+
     async fn cancel(&self) -> DriverResult<DriverAck> {
         self.send_keys(vec!["esc".into()]).await
     }

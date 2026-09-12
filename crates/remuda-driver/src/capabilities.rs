@@ -84,6 +84,8 @@ pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
         (AgyPrint, _) => MatrixMark::Unknown,
         (GenericPty, TtyAttach | LiveAttach) => MatrixMark::SupportedStar,
         (GenericPty, _) => MatrixMark::NotProvided,
+        (ShellPty, TtyAttach | LiveAttach) => MatrixMark::SupportedStar,
+        (ShellPty, _) => MatrixMark::NotProvided,
     }
 }
 
@@ -141,6 +143,7 @@ fn adapter_transport(kind: DriverKind) -> AdapterTransport {
         DriverKind::GrokAcp => AdapterTransport::GrokAcp,
         DriverKind::AgyPrint => AdapterTransport::AgyNative,
         DriverKind::GenericPty => AdapterTransport::GenericHerdr,
+        DriverKind::ShellPty => AdapterTransport::ShellPty,
     }
 }
 

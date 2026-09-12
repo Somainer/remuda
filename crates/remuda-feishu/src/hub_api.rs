@@ -156,6 +156,7 @@ fn agent_wire(kind: AgentKind) -> &'static str {
         AgentKind::Grok => "grok",
         AgentKind::Agy => "agy",
         AgentKind::Generic => "generic",
+        AgentKind::Terminal => "terminal",
     }
 }
 
@@ -166,6 +167,7 @@ fn driver_for(kind: AgentKind) -> &'static str {
         AgentKind::Grok => "grok-acp",
         AgentKind::Agy => "agy-print",
         AgentKind::Generic => "generic-pty",
+        AgentKind::Terminal => "shell-pty",
     }
 }
 

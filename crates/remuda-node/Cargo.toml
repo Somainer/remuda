@@ -24,6 +24,7 @@ path = "src/bin/node_stdio.rs"
 anyhow.workspace = true
 async-trait = "0.1"
 axum.workspace = true
+base64 = "0.22"
 clap.workspace = true
 futures.workspace = true
 remuda-driver.workspace = true

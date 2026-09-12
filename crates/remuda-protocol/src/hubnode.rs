@@ -46,6 +46,10 @@ pub const METHOD_TTY_FRAME: &str = "tty.frame";
 pub const METHOD_TTY_WRITE: &str = "tty.write";
 /// Alias accepted for [`METHOD_TTY_WRITE`].
 pub const METHOD_INSTANCE_KEYS: &str = "instance.keys";
+/// Resize a live PTY (follow JSON `tty.resize` / Hub→Node).
+pub const METHOD_TTY_RESIZE: &str = "tty.resize";
+/// Attach (or refresh) a TTY stream; Hub→Node. Snapshot bytes may be in the result.
+pub const METHOD_TTY_ATTACH: &str = "tty.attach";
 /// HTTP Authorization scheme for `GET /v1/node`.
 pub const WS_AUTHORIZATION_SCHEME: &str = "Bearer";
 /// `params.scheme` on [`METHOD_NODE_AUTH`].
@@ -132,6 +136,10 @@ pub enum HubNodeMethod {
     TtyWrite,
     /// [`METHOD_INSTANCE_KEYS`].
     InstanceKeys,
+    /// [`METHOD_TTY_RESIZE`].
+    TtyResize,
+    /// [`METHOD_TTY_ATTACH`].
+    TtyAttach,
 }
 
 /// `node.auth` params (stdio first frame).
@@ -394,6 +402,45 @@ impl TtyWriteParams {
     }
 }
 
+/// `tty.resize` params (follow JSON and Hub→Node).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtyResizeParams {
+    /// Target Instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Stream identity when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// Columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    /// Rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+    /// Optional revision; older values are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize_revision: Option<Value>,
+}
+
+/// `tty.attach` params (Hub→Node / follow `tty=1`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtyAttachParams {
+    /// Target Instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// `read` or `write`. Write requires command permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Requested columns for the snapshot paint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    /// Requested rows for the snapshot paint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+}
+
 /// Batched `journal.append` with an optional sequence watermark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -468,6 +515,8 @@ pub struct TtyBinaryEnvelopeSpec {
     pub tty_output_channel: u8,
     /// Channel byte for object chunks.
     pub object_chunk_channel: u8,
+    /// Channel byte for terminal input (raw PTY bytes).
+    pub tty_input_channel: u8,
     /// Byte layout of the 32-byte header.
     pub layout: String,
 }
@@ -487,7 +536,8 @@ impl TtyBinaryEnvelopeSpec {
             header_len: TTY_BINARY_HEADER_LEN as u32,
             tty_output_channel: BinaryChannel::TtyOutput as u8,
             object_chunk_channel: BinaryChannel::ObjectChunk as u8,
-            layout: "byte0=version(1) byte1=channel bytes2-3=reserved(0) bytes4-19=streamUuidv7 bytes20-27=offsetBE u64 bytes28-31=payloadLenBE u32 payload".into(),
+            tty_input_channel: BinaryChannel::TtyInput as u8,
+            layout: "byte0=version(1) byte1=channel(1=output,2=object,3=input) bytes2-3=reserved(0) bytes4-19=streamUuidv7 bytes20-27=offsetBE u64 bytes28-31=payloadLenBE u32 payload".into(),
         }
     }
 }
@@ -511,6 +561,8 @@ impl HubNodeMethod {
             Self::TtyFrame => METHOD_TTY_FRAME,
             Self::TtyWrite => METHOD_TTY_WRITE,
             Self::InstanceKeys => METHOD_INSTANCE_KEYS,
+            Self::TtyResize => METHOD_TTY_RESIZE,
+            Self::TtyAttach => METHOD_TTY_ATTACH,
         }
     }
 
@@ -532,6 +584,8 @@ impl HubNodeMethod {
             METHOD_TTY_FRAME => Self::TtyFrame,
             METHOD_TTY_WRITE => Self::TtyWrite,
             METHOD_INSTANCE_KEYS => Self::InstanceKeys,
+            METHOD_TTY_RESIZE => Self::TtyResize,
+            METHOD_TTY_ATTACH => Self::TtyAttach,
             _ => return None,
         })
     }
@@ -560,6 +614,8 @@ impl HubNodeMethod {
                 | Self::InteractionRespond
                 | Self::TtyWrite
                 | Self::InstanceKeys
+                | Self::TtyResize
+                | Self::TtyAttach
         )
     }
 }
@@ -817,6 +873,7 @@ mod tests {
         let spec = TtyBinaryEnvelopeSpec::v1();
         assert_eq!(spec.header_len as usize, BINARY_HEADER_LEN);
         assert_eq!(spec.tty_output_channel, BinaryChannel::TtyOutput as u8);
+        assert_eq!(spec.tty_input_channel, BinaryChannel::TtyInput as u8);
     }
 
     #[test]

@@ -181,6 +181,12 @@ fn materialize_inner(
     let input_delivery;
     let session_id;
 
+    if request.spec.driver == DriverKind::ShellPty {
+        return Err(DriverError::InvalidLaunchSpec(
+            "shell-pty does not use the Claude/generic materializer".into(),
+        ));
+    }
+
     match request.spec.driver {
         DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => {
             let settings_path = if inject_provider {
@@ -344,6 +350,11 @@ fn materialize_inner(
             input_delivery = InputDelivery::Tty;
             session_id = None;
         }
+        DriverKind::ShellPty => {
+            argv = extras;
+            input_delivery = InputDelivery::Tty;
+            session_id = None;
+        }
     }
 
     collect_spec_env(request.spec, request.profile.delegation, &mut env_allowlist)?;
@@ -447,6 +458,7 @@ fn agent_kind(driver: DriverKind) -> AgentKind {
         DriverKind::GrokAcp => AgentKind::Grok,
         DriverKind::AgyPrint => AgentKind::Agy,
         DriverKind::GenericPty => AgentKind::Generic,
+        DriverKind::ShellPty => AgentKind::Terminal,
     }
 }
 
@@ -458,7 +470,7 @@ fn provider_matches(driver: DriverKind, kind: ProviderKind) -> bool {
         DriverKind::CodexAppserver => kind == ProviderKind::OpenaiResponses,
         DriverKind::GrokAcp => kind == ProviderKind::Xai || kind == ProviderKind::OpenaiResponses,
         DriverKind::AgyPrint => kind == ProviderKind::Google,
-        DriverKind::GenericPty => true,
+        DriverKind::GenericPty | DriverKind::ShellPty => true,
     }
 }
 

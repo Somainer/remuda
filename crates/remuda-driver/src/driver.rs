@@ -128,10 +128,34 @@ pub trait Driver: Send + Sync {
 
     /// Write logical keys to the live PTY (`enter`, `esc`, `ctrl+c`, …).
     async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
-        let _ = keys;
+        let bytes = crate::tty::logical_keys_to_bytes(&keys);
+        if bytes.is_empty() {
+            return Err(crate::error::DriverError::CapabilityUnsupported(
+                "send_keys requires a tty-attach driver".into(),
+            ));
+        }
+        self.write_tty(&bytes).await
+    }
+
+    /// Write raw PTY bytes (keyboard and mouse sequences, unfiltered).
+    async fn write_tty(&self, bytes: &[u8]) -> DriverResult<DriverAck> {
+        let _ = bytes;
         Err(crate::error::DriverError::CapabilityUnsupported(
-            "send_keys requires a tty-attach driver".into(),
+            "write_tty requires a tty-attach driver".into(),
         ))
+    }
+
+    /// Resize the live PTY.
+    async fn resize_tty(&self, cols: u16, rows: u16) -> DriverResult<DriverAck> {
+        let _ = (cols, rows);
+        Err(crate::error::DriverError::CapabilityUnsupported(
+            "resize_tty requires a tty-attach driver".into(),
+        ))
+    }
+
+    /// Herdr pane or local PTY used by the Node TTY bridge.
+    async fn tty_bridge(&self) -> Option<crate::tty::TtyBridge> {
+        None
     }
 
     /// Request cancellation of the active Run.

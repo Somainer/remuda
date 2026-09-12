@@ -131,6 +131,11 @@ pub fn preset_for_spec(spec: &InstanceSpec) -> DriverResult<&'static KindPreset>
             .map(String::as_str)
             .or(spec.model_id.as_deref())
             .unwrap_or("gemini"),
+        AgentKind::Terminal => {
+            return Err(DriverError::InvalidLaunchSpec(
+                "kind terminal uses driver shell-pty, not generic-pty".into(),
+            ));
+        }
     };
     preset_by_id(id).ok_or_else(|| {
         DriverError::InvalidLaunchSpec(format!("no generic-pty preset for kind {id}"))
@@ -618,13 +623,32 @@ impl Driver for GenericPtyDriver {
     }
 
     async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
+        GenericPtyDriver::send_keys(self, keys).await
+    }
+
+    async fn write_tty(&self, bytes: &[u8]) -> DriverResult<DriverAck> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        if live.failed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
         live.client
-            .agent_send_keys(&live.agent_name, keys)
+            .pane_send_text(&live.pane_id, String::from_utf8_lossy(bytes).into_owned())
             .await
             .map_err(map_herdr)?;
         Ok(DriverAck::transport_written())
+    }
+
+    async fn tty_bridge(&self) -> Option<crate::tty::TtyBridge> {
+        let inner = self.inner.lock().await;
+        let live = inner.as_ref()?;
+        if live.failed.load(Ordering::SeqCst) || live.closed {
+            return None;
+        }
+        Some(crate::tty::TtyBridge::Herdr {
+            client: live.client.clone(),
+            pane_id: live.pane_id.clone(),
+        })
     }
 
     async fn cancel(&self) -> DriverResult<DriverAck> {
@@ -1247,6 +1271,7 @@ fn agent_name_for(spec: &InstanceSpec) -> String {
         AgentKind::Grok => "grok",
         AgentKind::Agy => "agy",
         AgentKind::Generic => "pty",
+        AgentKind::Terminal => "term",
     };
     let uniq: String = uuid::Uuid::now_v7()
         .simple()

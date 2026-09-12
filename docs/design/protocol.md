@@ -194,7 +194,7 @@ stateDiagram-v2
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
 | `hostId` / `workspaceId` | `Id` / `Id` | 创建后不变；跨主机迁移创建新 Instance 并记录关系 |
-| `kind` / `driver` | `claude\|codex\|grok\|agy\|generic` / `DriverKind` | kind 是原生产品，driver 是控制方式 |
+| `kind` / `driver` | `claude\|codex\|grok\|agy\|generic\|terminal` / `DriverKind` | kind 是原生产品，driver 是控制方式；`terminal` + `shell-pty` 是无 agent 的 login shell |
 | `lifecycle` | `requested\|preparing\|starting\|ready\|closing\|exited\|failed\|unknown\|reconciling` | 进程/会话状态 |
 | `activity` | `Knowledge<idle\|working\|waiting-interaction\|draining>` | 当前活动；附带 activityEvidenceEventIds |
 | `connectivity` | `connected\|disconnected\|reconciling` | Node 到原生 carrier 的连通性，与 Host 状态独立 |
@@ -353,7 +353,7 @@ stateDiagram-v2
 
 ~~~typescript
 type DriverKind = "claude-print" | "claude-pty" | "claude-bg" | "codex-appserver"
-  | "grok-acp" | "agy-print" | "generic-pty";
+  | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty";
 type CallContext = {
   commandId: Id; instanceId: Id; runId: Id | null;
   ownerFence: U64; processGeneration: U64; runGeneration: U64 | null;
@@ -449,6 +449,7 @@ CapabilitySnapshot 的 adapterTransport 必填，Rust print 与 SDK sidecar、sp
 | `grok-acp` / 1.0.25 | S* `session/load` 同/新进程已验证；`session/resume` 仅同进程实测 | N v1；有扩展但未验证不冒充 steer | U，configOptions 有 model，但文档 set_config_option 输入实测 -32602 | U `_x.ai/session/fork` 仅字符串证据，v1 不启用 | N Claude Workflow；ACP plan 不升格 workflow | S* 已知 tool content/diff；应用专用 Artifact U | N，stdio ACP 不含 TUI | S* native hooks 与 hook 通知；完整控制覆盖 U |
 | `agy-print` / 1.2.1 | S* `--conversation`，store 可用 | N v1；持续 stdin 的语义 U | N live；新进程 `--model` 与 resume 兼容性 U | U，help 未建立 | N Claude Workflow；agy task/subagent schema U | U，工具存在不证明输出协议 | N | U，不能把 Gemini hooks 表当 agy 已验证协议 |
 | `generic-pty` / binary pin | N 默认；产品专用恢复由新 driver 声明 | N | N 语义 API；允许人控键盘 | N | N | N 语义 artifact；普通文件浏览另计 | S* 自有 PTY 或已验证 carrier | N 默认；自定义探针须另建版本化 adapter |
+| `shell-pty` / login `$SHELL` | N | N | N | N | N | N | S* portable-pty；kind=`terminal`；无法识别的 agent CLI 的 fallback | N |
 
 依据：agent-protocols §2–5、§9、Claude control-plane、Codex schema、Grok 专项实测、hooks-integrations。Grok 的 plan、Codex collab 与 runtime child 不能用 `engine=claude-workflow`。claude-pty 无法自动回答的提示继续留在原生 TUI，不以降级 print 代替。
 
@@ -1277,11 +1278,11 @@ cursor 是服务器签名的 opaque token，绑定 principal、journal、方向�
 
 一个 Hub↔Node WSS 连接同时承载：JSON-RPC 控制帧、按 subscriptionId 分流的多个 instance journal、多个 tty/object binary streams。TTY 输出只路由给被授权的 stream subscriber；stdio/app-server/ACP 内容绝不写到 TTY channel。控制与审批优先级高于事件，再高于大对象/TTY replay；各 channel 有独立有界队列和窗口，避免一台设备的慢终端阻塞全部审批。
 
-协商 `tty-binary-v1` 后，输出二进制帧采用 32-byte header：byte 0 为 framingVersion=1；byte 1 为 channelType（1=TTY output，2=object chunk）；bytes 2–3 保留且必须为 0；bytes 4–19 为 stream UUID 的 16 bytes（不含前缀）；bytes 20–27 为大端 uint64 byte offset；bytes 28–31 为大端 uint32 payloadLength；之后恰有 payloadLength 原始 bytes。streamId 对应 tty.attach/object.read 返回的 ID；kind/type/length/offset 不合法即拒绝该流，不能把未注册 stream 当另一个 Instance 的输入。
+协商 `tty-binary-v1` 后，二进制帧采用 32-byte header：byte 0 为 framingVersion=1；byte 1 为 channelType（1=TTY output，2=object chunk，3=TTY input）；bytes 2–3 保留且必须为 0；bytes 4–19 为 stream UUID 的 16 bytes（不含前缀）；bytes 20–27 为大端 uint64 byte offset；bytes 28–31 为大端 uint32 payloadLength；之后恰有 payloadLength 原始 bytes。streamId 对应 tty.attach/object.read 返回的 ID；kind/type/length/offset 不合法即拒绝该流，不能把未注册 stream 当另一个 Instance 的输入。channel 3 的 payload 是 xterm.js（或等价客户端）发出的原字节，含键盘与鼠标转义，服务端不得过滤。Web follow 合同见 [remote-terminal.md](remote-terminal.md)。
 
-`tty.attach` 只订阅已经存在的 bridge，不能创建 `claude attach` pane；payload 中不存在 allowWake、job ID 或 launch 参数，额外字段拒绝。刷新、重连与 reconciliation 禁止推导 open_terminal。`tty.attach` 参数 `{instanceId,processGeneration,mode:read|write,previousStreamId:Id|null,afterOffset:U64|null}`；返回 `{streamId,streamEpoch,representation:pty-bytes|rendered-ansi,nextOffset,availableFrom,screenSnapshotRef:Id|null,snapshotAtOffset:Knowledge<U64>,writerLease:{leaseId:Id,expiresAt:Timestamp,inputNextSeq:U64}|null}`。streamId 与 epoch 必须同时关联，每次重建原生 terminal bridge 都分配新 streamId/streamEpoch，不复用旧 offset 空间；只有原 bridge 未断时 previousStreamId/afterOffset 可恢复。read attach 没有输入权；write lease 同一 Instance 同时只有一个，设备失联后到期释放。其他设备继续读。显式接管产生审计事件，并使旧 lease 的写入返回 `TTY_LEASE_LOST`。关闭终端面板只 detach，不 close 原生进程。
+`tty.attach` 只订阅已经存在的 bridge，不能创建 `claude attach` pane；payload 中不存在 allowWake、job ID 或 launch 参数，额外字段拒绝。刷新、重连与 reconciliation 禁止推导 open_terminal。浏览器 `GET /v1/follow?instanceId=&tty=1` 触发 Hub→Node `tty.attach`。`tty.attach` 参数 `{instanceId,processGeneration,mode:read|write,previousStreamId:Id|null,afterOffset:U64|null}`；返回 `{streamId,streamEpoch,representation:pty-bytes|rendered-ansi,nextOffset,availableFrom,screenSnapshotRef:Id|null,snapshotAtOffset:Knowledge<U64>,writerLease:{leaseId:Id,expiresAt:Timestamp,inputNextSeq:U64}|null,snapshotBase64?:string}`。`snapshotBase64` 是 attach 时刻的全屏 ANSI 或最近 ≤256 KiB 回放，Hub 必须先把它写成 channel-1 二进制帧发给该 follower，再转发 live `tty.frame`。streamId 与 epoch 必须同时关联，每次重建原生 terminal bridge 都分配新 streamId/streamEpoch，不复用旧 offset 空间；只有原 bridge 未断时 previousStreamId/afterOffset 可恢复。read attach 没有输入权；write lease 同一 Instance 同时只有一个，设备失联后到期释放。其他设备继续读。显式接管产生审计事件，并使旧 lease 的写入返回 `TTY_LEASE_LOST`。关闭终端面板只 detach，不 close 原生进程。写权限限于可对该 Instance `POST …/commands` 的设备；单帧输入不超过 `maxTtyInputBytes`。
 
-`tty.write` 参数 `{commandId,instanceId,processGeneration,streamId,streamEpoch,writerLeaseId,inputSeq:U64,dataBase64:string}`；Node 持久 intent 后写一次 PTY，返回 scope=tty-bytes，inputSeq 在该 lease 下严格单调。相同 commandId/inputSeq 的重试只查记录；已可能写入但 ACK 丢失时返回 unknown，不重复送 Enter、Ctrl+C 或粘贴。响应超时不自动重传按键。`tty.resize` 参数 `{instanceId,streamId,writerLeaseId,resizeRevision,cols,rows}` 是状态设置，较旧 revision 忽略并返回实际尺寸，新设置可安全幂等重发。
+`tty.write` 参数 `{commandId,instanceId,processGeneration,streamId,streamEpoch,writerLeaseId,inputSeq:U64,dataBase64:string,keys?:string[]}`；Node 把 `dataBase64` 原字节写入 PTY，或把逻辑键（`enter`=`\\r`、`esc`=`\\x1b`、`ctrl+c`=`\\x03` 等）映射成字节后写入，返回 scope=tty-bytes。Web 终端优先走 channel-3 二进制，不经 keys。inputSeq 在该 lease 下严格单调。相同 commandId/inputSeq 的重试只查记录；已可能写入但 ACK 丢失时返回 unknown，不重复送 Enter、Ctrl+C 或粘贴。响应超时不自动重传按键。`tty.resize` 参数 `{instanceId,streamId,writerLeaseId,resizeRevision,cols,rows}` 是状态设置；follow 套接字上的简写是 `{type:"tty.resize",cols,rows}`。较旧 revision 忽略并返回实际尺寸，新设置可安全幂等重发。
 
 输出 offset 按字节而非字符计数，UTF-8/ANSI 可以跨帧，终端客户端保留增量解析状态。断线从 afterOffset 补该 stream 实际保存的 bytes；新终端需要从有效终端状态快照的 snapshotAtOffset 开始，或从 stream 开头重放。前缀已 GC 且无可恢复终端快照时明确 `TTY_HISTORY_GAP`，不把普通屏幕截图当 xterm serialize state。
 

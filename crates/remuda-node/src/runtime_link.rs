@@ -91,7 +91,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .await?;
             serde_json::to_value(&result).map_err(NodeError::from)
         }
-        "tty.write" | "instance.keys" => {
+        "tty.write" | "instance.keys" | "tty.resize" | "tty.attach" => {
             crate::transport::hubnode::dispatch_method(node, method, params).await
         }
         method if crate::worktree::is_worktree_method(method) => crate::worktree::handle_rpc(
@@ -144,6 +144,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             Some("pty" | "generic-pty" | "generic_pty" | "genericPty") => {
                 Some(DriverKind::GenericPty)
             }
+            Some("shell" | "shell-pty" | "terminal") => Some(DriverKind::ShellPty),
             _ => serde_json::from_value(value.clone()).ok(),
         })
         .unwrap_or(DriverKind::ClaudePrint);

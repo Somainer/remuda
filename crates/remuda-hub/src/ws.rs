@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 /// Live event for `/v1/follow`.
@@ -33,6 +34,66 @@ pub struct FollowEvent {
     pub seq: i64,
     /// Event JSON.
     pub event: Value,
+    /// Binary `tty.frame` envelope when this is TTY output.
+    pub binary: Option<Vec<u8>>,
+}
+
+impl FollowEvent {
+    /// Journal / JSON follow event.
+    #[must_use]
+    pub fn json(instance_id: impl Into<String>, seq: i64, event: Value) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            seq,
+            event,
+            binary: None,
+        }
+    }
+}
+
+/// Stream UUID → instance and bounded output cache for snapshot-on-attach.
+#[derive(Clone, Default)]
+pub struct TtyRelay {
+    streams: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    buffers: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+impl TtyRelay {
+    fn bind(&self, stream_uuid: &str, instance_id: &str) {
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.insert(stream_uuid.to_owned(), instance_id.to_owned());
+        }
+    }
+
+    fn instance_of(&self, stream_uuid: &str) -> Option<String> {
+        self.streams
+            .lock()
+            .ok()
+            .and_then(|streams| streams.get(stream_uuid).cloned())
+    }
+
+    fn push_output(&self, instance_id: &str, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        if let Ok(mut buffers) = self.buffers.lock() {
+            let buf = buffers.entry(instance_id.to_owned()).or_default();
+            buf.extend_from_slice(payload);
+            const MAX: usize = 256 * 1024;
+            if buf.len() > MAX {
+                let drop = buf.len() - MAX;
+                buf.drain(..drop);
+            }
+        }
+    }
+
+    fn snapshot(&self, instance_id: &str) -> Vec<u8> {
+        self.buffers
+            .lock()
+            .ok()
+            .and_then(|buffers| buffers.get(instance_id).cloned())
+            .unwrap_or_default()
+    }
 }
 
 /// Broadcast bus for follow sockets.
@@ -84,6 +145,9 @@ pub struct FollowQuery {
     instance_id: Option<String>,
     /// Device token for browsers that cannot set WS headers.
     token: Option<String>,
+    /// `tty=1` attaches the instance TTY (snapshot then live binary frames).
+    #[serde(default)]
+    tty: Option<u8>,
 }
 
 /// `GET /v1/node` (and `/node/v1/connect`).
@@ -115,7 +179,8 @@ pub async fn follow_socket(
         require_device(&state.store, &headers).await?
     };
     let filter = query.instance_id;
-    Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device.id)))
+    let tty = query.tty == Some(1);
+    Ok(ws.on_upgrade(move |socket| follow_session(state, socket, filter, device.id, tty)))
 }
 
 async fn node_session(state: AppState, socket: WebSocket, token: String) {
@@ -441,11 +506,56 @@ async fn handle_node_method(
                 if instance.host_id != *host_id {
                     return Err(HubError::Forbidden);
                 }
-                state.bus.publish(FollowEvent {
-                    instance_id,
-                    seq: 0,
-                    event: json!({ "type": "tty.frame", "params": params }),
-                });
+                if let Some(stream_id) =
+                    typed
+                        .as_ref()
+                        .and_then(|p| p.stream_id.clone())
+                        .or_else(|| {
+                            params
+                                .get("streamId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                    && let Some(uuid) = stream_uuid_of(&stream_id)
+                {
+                    state.tty.bind(&uuid, &instance_id);
+                }
+                if let Some(b64) =
+                    typed
+                        .as_ref()
+                        .and_then(|p| p.data_base64.clone())
+                        .or_else(|| {
+                            params
+                                .get("dataBase64")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                    && let Ok(bytes) = decode_b64(&b64)
+                {
+                    state.tty.push_output(&instance_id, &bytes);
+                    if let Some(frame) = encode_output_frame(
+                        typed
+                            .as_ref()
+                            .and_then(|p| p.stream_id.as_deref())
+                            .or_else(|| params.get("streamId").and_then(Value::as_str))
+                            .unwrap_or(""),
+                        0,
+                        &bytes,
+                    ) {
+                        state.bus.publish(FollowEvent {
+                            instance_id: instance_id.clone(),
+                            seq: 0,
+                            event: json!({ "type": "tty.frame", "params": params }),
+                            binary: Some(frame),
+                        });
+                    }
+                } else {
+                    state.bus.publish(FollowEvent::json(
+                        instance_id,
+                        0,
+                        json!({ "type": "tty.frame", "params": params }),
+                    ));
+                }
             }
             Ok(Some(json!({ "ok": true })))
         }
@@ -473,11 +583,17 @@ fn handle_tty_binary(state: &AppState, host_id: Option<&str>, bytes: &[u8]) {
     let Ok((header, payload)) = hubnode::decode_tty_binary_frame(bytes, max) else {
         return;
     };
-    let Some(host_id) = host_id else {
+    let _ = host_id;
+    if header.channel != remuda_protocol::BinaryChannel::TtyOutput {
+        return;
+    }
+    let uuid = header.stream_uuid.uuid().to_string();
+    let Some(instance_id) = state.tty.instance_of(&uuid) else {
         return;
     };
+    state.tty.push_output(&instance_id, payload);
     state.bus.publish(FollowEvent {
-        instance_id: host_id.to_owned(),
+        instance_id,
         seq: 0,
         event: json!({
             "type": "tty.frame",
@@ -485,9 +601,38 @@ fn handle_tty_binary(state: &AppState, host_id: Option<&str>, bytes: &[u8]) {
             "channel": header.channel as u8,
             "offset": header.offset,
             "payloadLength": payload.len(),
-            "envelope": hubnode::TtyBinaryEnvelopeSpec::v1(),
         }),
+        binary: Some(bytes.to_vec()),
     });
+}
+
+fn stream_uuid_of(stream_id: &str) -> Option<String> {
+    remuda_protocol::StreamUuid::from_prefixed_id(stream_id)
+        .ok()
+        .map(|uuid| uuid.uuid().to_string())
+}
+
+fn decode_b64(raw: &str) -> Result<Vec<u8>, ()> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(raw.as_bytes())
+        .map_err(|_| ())
+}
+
+fn encode_b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn encode_output_frame(stream_id: &str, offset: u64, payload: &[u8]) -> Option<Vec<u8>> {
+    let uuid = remuda_protocol::StreamUuid::from_prefixed_id(stream_id).ok()?;
+    remuda_protocol::encode_binary_frame(
+        remuda_protocol::BinaryChannel::TtyOutput,
+        uuid,
+        offset,
+        payload,
+    )
+    .ok()
 }
 
 fn map_host_store(err: crate::store::StoreError) -> HubError {
@@ -500,11 +645,11 @@ fn map_host_store(err: crate::store::StoreError) -> HubError {
 }
 
 fn publish_journal(bus: &Bus, record: &JournalRecord) {
-    bus.publish(FollowEvent {
-        instance_id: record.instance_id.clone(),
-        seq: record.seq,
-        event: record.event.clone(),
-    });
+    bus.publish(FollowEvent::json(
+        record.instance_id.clone(),
+        record.seq,
+        record.event.clone(),
+    ));
 }
 
 fn hello_result(host: &HostRecord, node_token: Option<String>) -> Result<Value, HubError> {
@@ -585,14 +730,20 @@ fn rpc_code(err: &HubError) -> i32 {
     }
 }
 
+enum FollowMsg {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
 async fn follow_session(
     state: AppState,
     socket: WebSocket,
     filter: Option<String>,
     device_id: String,
+    mut want_tty: bool,
 ) {
     let cap = state.config.follow_buffer_events.max(1);
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(cap);
+    let (out_tx, mut out_rx) = mpsc::channel::<FollowMsg>(cap);
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.bus.subscribe();
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
@@ -601,8 +752,12 @@ async fn follow_session(
     }
 
     let writer = async {
-        while let Some(text) = out_rx.recv().await {
-            if sink.send(Message::Text(text.into())).await.is_err() {
+        while let Some(msg) = out_rx.recv().await {
+            let send = match msg {
+                FollowMsg::Text(text) => sink.send(Message::Text(text.into())).await,
+                FollowMsg::Binary(bytes) => sink.send(Message::Binary(bytes.into())).await,
+            };
+            if send.is_err() {
                 break;
             }
         }
@@ -610,8 +765,9 @@ async fn follow_session(
 
     let pump = async {
         for id in &instance_ids {
-            if let Ok(frame) = snapshot_json(&state, id).await
-                && out_tx.send(frame.to_string()).await.is_err()
+            if send_follow_snapshot(&state, &out_tx, id, want_tty)
+                .await
+                .is_err()
             {
                 return;
             }
@@ -620,25 +776,39 @@ async fn follow_session(
             tokio::select! {
                 incoming = stream.next() => {
                     let Some(Ok(msg)) = incoming else { break; };
-                    let Message::Text(text) = msg else { continue; };
-                    if let Ok(value) = serde_json::from_str::<Value>(&text)
-                        && value.get("type").and_then(Value::as_str) == Some("subscribe")
-                        && let Some(ids) = value.get("instanceIds").and_then(Value::as_array)
-                    {
-                        state.followers.unwatch(&device_id, &instance_ids).await;
-                        instance_ids = ids
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect();
-                        for id in &instance_ids {
-                            state.followers.watch(device_id.clone(), id.clone()).await;
-                            if let Ok(frame) = snapshot_json(&state, id).await
-                                && out_tx.send(frame.to_string()).await.is_err()
-                            {
-                                return;
+                    match msg {
+                        Message::Binary(bytes) => {
+                            if want_tty {
+                                handle_follow_input(&state, &instance_ids, &bytes).await;
                             }
                         }
+                        Message::Text(text) => {
+                            let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
+                            let kind = value.get("type").and_then(Value::as_str);
+                            if kind == Some("subscribe")
+                                && let Some(ids) = value.get("instanceIds").and_then(Value::as_array)
+                            {
+                                want_tty = value.get("tty").and_then(Value::as_u64) == Some(1) || want_tty;
+                                state.followers.unwatch(&device_id, &instance_ids).await;
+                                instance_ids = ids
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect();
+                                for id in &instance_ids {
+                                    state.followers.watch(device_id.clone(), id.clone()).await;
+                                    if send_follow_snapshot(&state, &out_tx, id, want_tty)
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            } else if kind == Some("tty.resize") && want_tty {
+                                handle_follow_resize(&state, &instance_ids, &value).await;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 event = rx.recv() => {
@@ -649,16 +819,22 @@ async fn follow_session(
                             {
                                 continue;
                             }
-                            let frame = json!({
-                                "type": "event",
-                                "instanceId": event.instance_id,
-                                "seq": event.seq.to_string(),
-                                "event": event.event,
-                            });
-                            match out_tx.try_send(frame.to_string()) {
+                            let send = if want_tty && let Some(binary) = event.binary {
+                                FollowMsg::Binary(binary)
+                            } else if event.binary.is_some() {
+                                continue;
+                            } else {
+                                FollowMsg::Text(json!({
+                                    "type": "event",
+                                    "instanceId": event.instance_id,
+                                    "seq": event.seq.to_string(),
+                                    "event": event.event,
+                                }).to_string())
+                            };
+                            match out_tx.try_send(send) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                    if resync_after_gap(&state, &out_tx, &instance_ids).await.is_err()
+                                    if resync_after_gap(&state, &out_tx, &instance_ids, want_tty).await.is_err()
                                     {
                                         return;
                                     }
@@ -667,7 +843,7 @@ async fn follow_session(
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if resync_after_gap(&state, &out_tx, &instance_ids).await.is_err() {
+                            if resync_after_gap(&state, &out_tx, &instance_ids, want_tty).await.is_err() {
                                 return;
                             }
                         }
@@ -685,17 +861,162 @@ async fn follow_session(
     state.followers.unwatch(&device_id, &instance_ids).await;
 }
 
+async fn send_follow_snapshot(
+    state: &AppState,
+    out_tx: &mpsc::Sender<FollowMsg>,
+    instance_id: &str,
+    want_tty: bool,
+) -> Result<(), ()> {
+    if let Ok(frame) = snapshot_json(state, instance_id).await {
+        out_tx
+            .send(FollowMsg::Text(frame.to_string()))
+            .await
+            .map_err(|_| ())?;
+    }
+    if want_tty {
+        send_tty_snapshot(state, out_tx, instance_id).await?;
+    }
+    Ok(())
+}
+
+async fn send_tty_snapshot(
+    state: &AppState,
+    out_tx: &mpsc::Sender<FollowMsg>,
+    instance_id: &str,
+) -> Result<(), ()> {
+    if let Some(host_id) = state
+        .store
+        .get_instance(instance_id.to_string())
+        .await
+        .ok()
+        .flatten()
+        .map(|instance| instance.host_id)
+        && let Ok(Some(response)) = state
+            .nodes
+            .call(
+                &host_id,
+                "tty.attach",
+                json!({ "instanceId": instance_id, "mode": "write" }),
+                Duration::from_secs(5),
+            )
+            .await
+    {
+        let result = response.get("result").cloned().unwrap_or(response);
+        if let Some(stream_id) = result.get("streamId").and_then(Value::as_str)
+            && let Some(uuid) = stream_uuid_of(stream_id)
+        {
+            state.tty.bind(&uuid, instance_id);
+        }
+        if let Some(b64) = result.get("snapshotBase64").and_then(Value::as_str)
+            && let Ok(bytes) = decode_b64(b64)
+            && !bytes.is_empty()
+        {
+            state.tty.push_output(instance_id, &bytes);
+            let stream_id = result.get("streamId").and_then(Value::as_str).unwrap_or("");
+            let offset = result
+                .get("availableFrom")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if let Some(frame) = encode_output_frame(stream_id, offset, &bytes) {
+                out_tx
+                    .send(FollowMsg::Binary(frame))
+                    .await
+                    .map_err(|_| ())?;
+                return Ok(());
+            }
+        }
+    }
+    let cached = state.tty.snapshot(instance_id);
+    if cached.is_empty() {
+        return Ok(());
+    }
+    Ok(())
+}
+
+async fn handle_follow_input(state: &AppState, instance_ids: &[String], bytes: &[u8]) {
+    let max = default_limits().max_tty_input_bytes;
+    let Ok((header, payload)) = hubnode::decode_tty_binary_frame(bytes, max) else {
+        return;
+    };
+    if header.channel != remuda_protocol::BinaryChannel::TtyInput {
+        return;
+    }
+    if payload.len() > max as usize {
+        return;
+    }
+    let uuid = header.stream_uuid.uuid().to_string();
+    let instance_id = state
+        .tty
+        .instance_of(&uuid)
+        .or_else(|| instance_ids.first().cloned());
+    let Some(instance_id) = instance_id else {
+        return;
+    };
+    let Some(host_id) = state
+        .store
+        .get_instance(instance_id.clone())
+        .await
+        .ok()
+        .flatten()
+        .map(|instance| instance.host_id)
+    else {
+        return;
+    };
+    let _ = state
+        .nodes
+        .call(
+            &host_id,
+            "tty.write",
+            json!({
+                "instanceId": instance_id,
+                "dataBase64": encode_b64(payload),
+            }),
+            Duration::from_secs(5),
+        )
+        .await;
+}
+
+async fn handle_follow_resize(state: &AppState, instance_ids: &[String], value: &Value) {
+    let Some(instance_id) = instance_ids.first() else {
+        return;
+    };
+    let cols = value.get("cols").and_then(Value::as_u64).unwrap_or(80);
+    let rows = value.get("rows").and_then(Value::as_u64).unwrap_or(24);
+    let Some(host_id) = state
+        .store
+        .get_instance(instance_id.clone())
+        .await
+        .ok()
+        .flatten()
+        .map(|instance| instance.host_id)
+    else {
+        return;
+    };
+    let _ = state
+        .nodes
+        .call(
+            &host_id,
+            "tty.resize",
+            json!({ "instanceId": instance_id, "cols": cols, "rows": rows }),
+            Duration::from_secs(5),
+        )
+        .await;
+}
+
 async fn resync_after_gap(
     state: &AppState,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &mpsc::Sender<FollowMsg>,
     instance_ids: &[String],
+    want_tty: bool,
 ) -> Result<(), ()> {
     let gap = json!({ "type": "gap", "reason": "backpressure" });
-    out_tx.send(gap.to_string()).await.map_err(|_| ())?;
+    out_tx
+        .send(FollowMsg::Text(gap.to_string()))
+        .await
+        .map_err(|_| ())?;
     for id in instance_ids {
-        if let Ok(frame) = snapshot_json(state, id).await {
-            out_tx.send(frame.to_string()).await.map_err(|_| ())?;
-        }
+        send_follow_snapshot(state, out_tx, id, want_tty).await?;
     }
     Ok(())
 }
@@ -718,21 +1039,9 @@ mod tests {
     async fn follow_bus_reports_lag_when_capacity_exceeded() {
         let bus = Bus::with_capacity(1);
         let mut rx = bus.subscribe();
-        bus.publish(FollowEvent {
-            instance_id: "ins".into(),
-            seq: 1,
-            event: json!({"n": 1}),
-        });
-        bus.publish(FollowEvent {
-            instance_id: "ins".into(),
-            seq: 2,
-            event: json!({"n": 2}),
-        });
-        bus.publish(FollowEvent {
-            instance_id: "ins".into(),
-            seq: 3,
-            event: json!({"n": 3}),
-        });
+        bus.publish(FollowEvent::json("ins", 1, json!({"n": 1})));
+        bus.publish(FollowEvent::json("ins", 2, json!({"n": 2})));
+        bus.publish(FollowEvent::json("ins", 3, json!({"n": 3})));
         let first = rx.recv().await;
         match first {
             Err(broadcast::error::RecvError::Lagged(skipped)) => assert!(skipped >= 1),

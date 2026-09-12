@@ -198,6 +198,8 @@ pub async fn dispatch_method(
         Some(HubNodeMethod::TtyWrite | HubNodeMethod::InstanceKeys) => {
             dispatch_keys(node, params).await
         }
+        Some(HubNodeMethod::TtyResize) => dispatch_resize(node, params).await,
+        Some(HubNodeMethod::TtyAttach) => dispatch_attach(node, params).await,
         Some(HubNodeMethod::JournalAppend) => {
             let parsed: JournalAppendParams = serde_json::from_value(params)?;
             Ok(json!({
@@ -370,6 +372,28 @@ async fn dispatch_cancel(node: &DevNode, params: Value) -> Result<Value, NodeErr
     .await
 }
 
+async fn dispatch_attach(node: &DevNode, params: Value) -> Result<Value, NodeError> {
+    let instance_id = params
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| NodeError::InvalidRequest("tty.attach requires instanceId".into()))?;
+    let instance_id = InstanceId::from_str(instance_id)?;
+    let _ = node.get_instance(&instance_id)?;
+    node.tty().attach(&instance_id).await?.into_json()
+}
+
+async fn dispatch_resize(node: &DevNode, params: Value) -> Result<Value, NodeError> {
+    let instance_id = params
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| NodeError::InvalidRequest("tty.resize requires instanceId".into()))?;
+    let instance_id = InstanceId::from_str(instance_id)?;
+    let cols = params.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+    let rows = params.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+    let (cols, rows) = node.tty().resize(&instance_id, cols, rows).await?;
+    Ok(json!({ "cols": cols, "rows": rows, "resizeRevision": "1" }))
+}
+
 async fn dispatch_keys(node: &DevNode, params: Value) -> Result<Value, NodeError> {
     let parsed: TtyWriteParams = serde_json::from_value(params.clone()).unwrap_or_default();
     let instance_id = parsed
@@ -378,9 +402,24 @@ async fn dispatch_keys(node: &DevNode, params: Value) -> Result<Value, NodeError
         .or_else(|| params.get("instanceId").and_then(Value::as_str))
         .ok_or_else(|| NodeError::InvalidRequest("tty.write requires instanceId".into()))?;
     let instance_id = InstanceId::from_str(instance_id)?;
+    if let Some(raw) = parsed
+        .data_base64
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        let bytes = decode_data_base64(raw)?;
+        node.tty().write_bytes(&instance_id, &bytes).await?;
+        return Ok(json!({ "ok": true, "accepted": "tty-bytes" }));
+    }
     let keys = parsed.key_names();
     if keys.is_empty() {
-        return Err(NodeError::InvalidRequest("tty.write requires keys".into()));
+        return Err(NodeError::InvalidRequest(
+            "tty.write requires keys or dataBase64".into(),
+        ));
+    }
+    let bytes = remuda_driver::logical_keys_to_bytes(&keys);
+    if node.tty().write_bytes(&instance_id, &bytes).await.is_ok() {
+        return Ok(json!({ "ok": true, "accepted": "tty-bytes" }));
     }
     submit(
         node,
@@ -394,6 +433,13 @@ async fn dispatch_keys(node: &DevNode, params: Value) -> Result<Value, NodeError
         Some(keys),
     )
     .await
+}
+
+fn decode_data_base64(raw: &str) -> Result<Vec<u8>, NodeError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(raw.as_bytes())
+        .map_err(|error| NodeError::InvalidRequest(format!("invalid dataBase64: {error}")))
 }
 
 async fn dispatch_respond(node: &DevNode, params: Value) -> Result<Value, NodeError> {

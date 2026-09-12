@@ -260,7 +260,7 @@ pub fn default_command(kind: remuda_protocol::DriverKind) -> Option<&'static str
         CodexAppserver => Some("codex"),
         GrokAcp => Some("grok"),
         AgyPrint => Some("agy"),
-        GenericPty => None,
+        GenericPty | ShellPty => None,
     }
 }
 

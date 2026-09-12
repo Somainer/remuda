@@ -718,6 +718,7 @@ fn first_matching_wait_line<'a>(re: &regex::Regex, text: &'a str) -> Option<&'a 
 pub(crate) fn normalize_driver(driver: &str) -> String {
     match driver {
         "pty" | "generic-pty" | "generic_pty" | "genericPty" => "generic-pty".into(),
+        "shell" | "shell-pty" | "terminal" => "shell-pty".into(),
         other => other.to_string(),
     }
 }
@@ -725,7 +726,7 @@ pub(crate) fn normalize_driver(driver: &str) -> String {
 pub(crate) fn tty_attach_driver(driver: &str) -> bool {
     matches!(
         normalize_driver(driver).as_str(),
-        "generic-pty" | "claude-pty" | "claude-bg"
+        "generic-pty" | "claude-pty" | "claude-bg" | "shell-pty"
     )
 }
 

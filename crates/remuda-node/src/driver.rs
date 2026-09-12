@@ -150,6 +150,12 @@ pub trait Driver: Send + Sync {
     fn launch_recipe(&self) -> Option<remuda_driver::LaunchRecipe> {
         None
     }
+    /// Herdr pane or local PTY for the Node TTY bridge.
+    fn tty_bridge(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<remuda_driver::TtyBridge>> + Send + '_>> {
+        Box::pin(async { None })
+    }
     /// Native start reported a failed agent (process gone / shell prompt / not ready).
     fn startup_error(&self) -> Option<String> {
         None
@@ -311,11 +317,94 @@ impl DriverRegistry {
         }
     }
 
-    /// Registry containing the default Claude print fake driver.
+    /// Registry containing the default Claude print fake driver and `shell-pty`.
     pub fn with_fake() -> Result<Self, NodeError> {
         let registry = Self::default();
         registry.register_factory(Arc::new(FakeDriverFactory))?;
+        registry.register_factory(Arc::new(ShellPtyFactory))?;
         Ok(registry)
+    }
+}
+
+struct ShellPtyFactory;
+
+impl DriverFactory for ShellPtyFactory {
+    fn kind(&self) -> DriverKind {
+        DriverKind::ShellPty
+    }
+
+    fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
+        let mut options = remuda_driver::ShellPtyOptions::login(launch.workspace_root);
+        options.args = launch.request.args;
+        Ok(Arc::new(NativeShellAdapter {
+            inner: remuda_driver::ShellPtyDriver::new(options),
+        }))
+    }
+}
+
+struct NativeShellAdapter {
+    inner: remuda_driver::ShellPtyDriver,
+}
+
+impl Driver for NativeShellAdapter {
+    fn kind(&self) -> DriverKind {
+        DriverKind::ShellPty
+    }
+
+    fn start(&self) -> DriverStartFuture<'_> {
+        Box::pin(async move {
+            let handle = self
+                .inner
+                .spawn()
+                .await
+                .map_err(|error| DriverError::Failed(error.to_string()))?;
+            Ok(Some(handle.into_events()))
+        })
+    }
+
+    fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
+        Box::pin(async move {
+            use remuda_driver::Driver as _;
+            match request {
+                DriverRequest::Send { prompt } => {
+                    let mut bytes = prompt.into_bytes();
+                    bytes.push(b'\r');
+                    self.inner
+                        .write_tty(&bytes)
+                        .await
+                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                }
+                DriverRequest::SendKeys { keys } => {
+                    self.inner
+                        .send_keys(keys)
+                        .await
+                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                }
+                DriverRequest::Cancel => {
+                    self.inner
+                        .write_tty(&[0x03])
+                        .await
+                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                }
+                DriverRequest::Close => {
+                    self.inner
+                        .close()
+                        .await
+                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                }
+                DriverRequest::RespondInteraction { .. } => {}
+            }
+            Ok(Vec::new())
+        })
+    }
+
+    fn tty_bridge(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<remuda_driver::TtyBridge>> + Send + '_>> {
+        Box::pin(async move {
+            use remuda_driver::Driver as _;
+            self.inner.tty_bridge().await
+        })
     }
 }
 

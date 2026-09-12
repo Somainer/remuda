@@ -8,7 +8,7 @@ use remuda_driver::claude_print::{ClaudePrintDriver, ClaudePrintOptions};
 use remuda_driver::{
     BinarySource, ClaudeBgDriver, ClaudeBgOptions, ClaudePtyDriver, ClaudePtyOptions, Delegation,
     Driver as NativeDriver, GenericPtyDriver, GenericPtyOptions, ProviderHealth, ProviderKind,
-    ProviderProfile, preset_by_id,
+    ProviderProfile, ShellPtyDriver, ShellPtyOptions, preset_by_id,
 };
 use remuda_protocol::{
     ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode, ClaudePermission,
@@ -17,6 +17,8 @@ use remuda_protocol::{
     NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend, PtyCarrier,
     SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 /// Filesystem and binary settings shared by native Claude driver factories.
@@ -115,6 +117,7 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
         DriverKind::ClaudePty,
         DriverKind::ClaudeBg,
         DriverKind::GenericPty,
+        DriverKind::ShellPty,
     ] {
         registry.register_factory(Arc::new(NativeClaudeFactory {
             kind,
@@ -167,6 +170,7 @@ impl DriverFactory for NativeClaudeFactory {
                     remuda_protocol::AgentKind::Agy => "agy",
                     remuda_protocol::AgentKind::Generic => "gemini",
                     remuda_protocol::AgentKind::Claude => "claude",
+                    remuda_protocol::AgentKind::Terminal => "sh",
                 })
                 .map(|preset| preset.binary)
                 .unwrap_or("claude");
@@ -218,6 +222,12 @@ impl DriverFactory for NativeClaudeFactory {
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
                 Arc::new(GenericPtyDriver::new(options))
+            }
+            DriverKind::ShellPty => {
+                let mut options = ShellPtyOptions::login(launch.workspace_root.clone());
+                options.extra_env = self.config.extra_env.clone();
+                options.args = launch.request.args.clone();
+                Arc::new(ShellPtyDriver::new(options))
             }
             other => {
                 return Err(DriverError::Unsupported(format!(
@@ -293,6 +303,12 @@ impl Driver for NativeAdapter {
                 .map_err(map_driver_error)?;
             Ok(Vec::new())
         })
+    }
+
+    fn tty_bridge(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<remuda_driver::TtyBridge>> + Send + '_>> {
+        Box::pin(async move { self.native.tty_bridge().await })
     }
 
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
@@ -381,13 +397,14 @@ fn instance_spec(
     };
     let interaction = if matches!(
         launch.request.driver,
-        DriverKind::ClaudePty | DriverKind::GenericPty
+        DriverKind::ClaudePty | DriverKind::GenericPty | DriverKind::ShellPty
     ) {
         ClaudeInteractionMode::NativeTty
     } else {
         ClaudeInteractionMode::Host
     };
     let carrier = match launch.request.driver {
+        DriverKind::ShellPty => CarrierSpec::ShellPty,
         DriverKind::ClaudePty | DriverKind::GenericPty => CarrierSpec::Pty(Box::new(PtyCarrier {
             backend: PtyBackend::Herdr,
             server: HerdrServer {

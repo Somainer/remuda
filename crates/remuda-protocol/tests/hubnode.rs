@@ -3,8 +3,9 @@
 use remuda_protocol::hubnode::{
     self, HubNodeMethod, HubNodeRequest, InstanceCreateParams, JournalAppendParams,
     METHOD_INSTANCE_CREATE, METHOD_INSTANCE_KEYS, METHOD_JOURNAL_APPEND, METHOD_NODE_AUTH,
-    METHOD_NODE_HELLO, METHOD_TTY_FRAME, METHOD_TTY_WRITE, NodeAuthParams, NodeHelloParams,
-    TTY_BINARY_HEADER_LEN, TtyBinaryEnvelopeSpec, TtyFrameParams, TtyWriteParams,
+    METHOD_NODE_HELLO, METHOD_TTY_ATTACH, METHOD_TTY_FRAME, METHOD_TTY_RESIZE, METHOD_TTY_WRITE,
+    NodeAuthParams, NodeHelloParams, TTY_BINARY_HEADER_LEN, TtyBinaryEnvelopeSpec, TtyFrameParams,
+    TtyResizeParams, TtyWriteParams,
 };
 use remuda_protocol::{BINARY_HEADER_LEN, PROTOCOL_VERSION, from_json_slice};
 use serde_json::Value;
@@ -75,6 +76,28 @@ fn tty_binary_envelope_is_32_bytes() {
     let spec = TtyBinaryEnvelopeSpec::v1();
     assert_eq!(spec.header_len as usize, BINARY_HEADER_LEN);
     assert_eq!(TTY_BINARY_HEADER_LEN, 32);
+}
+
+#[test]
+fn tty_resize_and_attach_are_instance_methods() {
+    assert_eq!(
+        HubNodeMethod::parse(METHOD_TTY_RESIZE),
+        Some(HubNodeMethod::TtyResize)
+    );
+    assert_eq!(
+        HubNodeMethod::parse(METHOD_TTY_ATTACH),
+        Some(HubNodeMethod::TtyAttach)
+    );
+    assert!(HubNodeMethod::TtyResize.is_instance());
+    assert!(HubNodeMethod::TtyAttach.is_instance());
+    let resize: TtyResizeParams = serde_json::from_value(serde_json::json!({
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "cols": 120,
+        "rows": 40
+    }))
+    .unwrap();
+    assert_eq!(resize.cols, Some(120));
+    assert_eq!(resize.rows, Some(40));
 }
 
 #[test]

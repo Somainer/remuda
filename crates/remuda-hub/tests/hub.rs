@@ -887,6 +887,179 @@ async fn hello_reannounce_same_host_id_updates_one_row() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn follow_tty_relays_snapshot_input_and_resize() -> Result<()> {
+    use remuda_protocol::{BinaryChannel, StreamUuid, encode_binary_frame};
+
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+    let stream_id = remuda_protocol::Id::new("tty")?;
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("node connect")??;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "node.hello",
+            "params": { "hostId": host_id.as_id().as_str(), "label": "tty-node" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id.as_id().as_str(),
+                "event": { "kind": "lifecycle", "payload": { "status": "ready" } }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+
+    let snapshot = b"\x1b[2J\x1b[Hsnapshot";
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "tty.frame",
+            "params": {
+                "instanceId": instance_id.as_id().as_str(),
+                "streamId": stream_id.as_str(),
+                "channel": 1
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+
+    let uuid = StreamUuid::from_prefixed_id(stream_id.as_str()).expect("stream uuid");
+    let output = encode_binary_frame(BinaryChannel::TtyOutput, uuid, 0, snapshot)?;
+    node.send(Message::Binary(output.clone().into())).await?;
+
+    let mut follow_req = format!(
+        "ws://{}/v1/follow?instanceId={}&tty=1",
+        hub.addr,
+        instance_id.as_id().as_str()
+    )
+    .into_client_request()?;
+    follow_req
+        .headers_mut()
+        .insert("Cookie", cookie.parse().unwrap());
+
+    let node_task = tokio::spawn(async move {
+        let mut saw_attach = false;
+        let mut saw_write = false;
+        let mut saw_resize = false;
+        let mut node = node;
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(Duration::from_millis(400), node.next()).await
+            else {
+                if saw_attach && saw_write && saw_resize {
+                    break;
+                }
+                continue;
+            };
+            let Message::Text(text) = msg else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = value.get("id").cloned().unwrap_or(Value::Null);
+            if method == "tty.attach" {
+                saw_attach = true;
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "streamId": stream_id.as_str(),
+                        "streamEpoch": "epoch_01993ab0-0000-7000-8000-000000000099",
+                        "availableFrom": "0",
+                        "nextOffset": snapshot.len().to_string(),
+                        "snapshotBase64": base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            snapshot
+                        )
+                    }
+                });
+                let _ = node.send(Message::Text(reply.to_string().into())).await;
+            } else if method == "tty.write" {
+                saw_write = true;
+                let reply = json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}});
+                let _ = node.send(Message::Text(reply.to_string().into())).await;
+            } else if method == "tty.resize" {
+                saw_resize = true;
+                let cols = value.pointer("/params/cols").and_then(Value::as_u64);
+                let rows = value.pointer("/params/rows").and_then(Value::as_u64);
+                let reply = json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}});
+                let _ = node.send(Message::Text(reply.to_string().into())).await;
+                if cols == Some(100) && rows == Some(30) && saw_write && saw_attach {
+                    return Ok::<_, anyhow::Error>((saw_attach, saw_write, saw_resize));
+                }
+            }
+        }
+        Ok((saw_attach, saw_write, saw_resize))
+    });
+
+    let (mut follow, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(follow_req))
+            .await
+            .context("follow")??;
+
+    let mut got_snapshot = false;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while tokio::time::Instant::now() < deadline && !got_snapshot {
+        match tokio::time::timeout(Duration::from_millis(400), follow.next()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                assert_eq!(bytes[1], 1, "snapshot uses output channel");
+                if bytes.windows(snapshot.len()).any(|w| w == snapshot) {
+                    got_snapshot = true;
+                }
+            }
+            Ok(Some(Ok(Message::Text(_)))) => continue,
+            _ => continue,
+        }
+    }
+    anyhow::ensure!(got_snapshot, "follow tty=1 did not replay snapshot first");
+
+    let input = encode_binary_frame(BinaryChannel::TtyInput, uuid, 0, b"\x1b[<0;1;1M")?;
+    follow.send(Message::Binary(input.into())).await?;
+    follow
+        .send(Message::Text(
+            json!({ "type": "tty.resize", "cols": 100, "rows": 30 })
+                .to_string()
+                .into(),
+        ))
+        .await?;
+
+    let (attach, write, resize) = tokio::time::timeout(TIMEOUT, node_task)
+        .await
+        .context("node task")???;
+    anyhow::ensure!(attach, "hub did not relay tty.attach");
+    anyhow::ensure!(write, "hub did not relay tty.write input");
+    anyhow::ensure!(resize, "hub did not relay tty.resize");
+    Ok(())
+}
+
 async fn recv_json<S>(ws: &mut S) -> Result<Value>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,

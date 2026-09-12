@@ -260,7 +260,10 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
         .as_str()
         .expect("instanceId")
         .to_owned();
-    assert_eq!(created["command"]["payload"]["spec"]["model"], json!("haiku"));
+    assert_eq!(
+        created["command"]["payload"]["spec"]["model"],
+        json!("haiku")
+    );
     assert_eq!(
         created["command"]["payload"]["spec"]["args"],
         json!(["--max-budget-usd", "0.3"])

@@ -43,21 +43,26 @@ enum Command {
     },
     /// SSH remote hosts: list, probe, bootstrap, and stdio node.
     Ssh(cmd::ssh::SshArgs),
-    /// Create, send, wait, read, or stop a Hub-backed instance.
+    /// Create, list, send, wait, read, keys, stop, or rm a Hub-backed instance.
     Instance {
         #[command(flatten)]
         hub: cmd::hub_client::HubOpts,
         #[command(subcommand)]
         command: cmd::instance::InstanceCommand,
     },
-    /// Run a spec on many hosts (Hub fleet HTTP).
+    /// Run a spec on many hosts, or broadcast a prompt (`fleet send`).
     Fleet {
         #[command(flatten)]
         hub: cmd::hub_client::HubOpts,
         #[command(subcommand)]
         command: cmd::fleet::FleetCommand,
     },
-    /// stdio MCP server (JSON-RPC 2.0) for the same instance/fleet tools.
+    /// Create a git worktree (`git worktree add -b wt/<name>/…`).
+    Worktree {
+        #[command(subcommand)]
+        command: cmd::worktree::WorktreeCommand,
+    },
+    /// stdio MCP server (JSON-RPC 2.0) for the same instance/fleet/worktree tools.
     Mcp {
         #[command(flatten)]
         hub: cmd::hub_client::HubOpts,
@@ -110,6 +115,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ssh(args) => cmd::ssh::run_blocking(args),
         Command::Instance { hub, command } => cmd::instance::run(hub, command),
         Command::Fleet { hub, command } => cmd::fleet::run(hub, command),
+        Command::Worktree { command } => cmd::worktree::run(command),
         Command::Mcp { hub } => cmd::mcp::run(hub),
         _ => unreachable!("version and service commands are handled above"),
     }
@@ -244,6 +250,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"instance".to_string()));
         assert!(names.contains(&"fleet".to_string()));
+        assert!(names.contains(&"worktree".to_string()));
         assert!(names.contains(&"mcp".to_string()));
     }
 
@@ -272,6 +279,27 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n == "host"));
         assert!(names.iter().any(|n| n == "labels"));
+        assert!(names.iter().any(|n| n == "worktree"));
+        assert!(names.iter().any(|n| n == "name"));
+        assert!(names.iter().any(|n| n == "cwd"));
+    }
+
+    #[test]
+    fn instance_wait_declares_until_and_timeout() {
+        let instance = Cli::command()
+            .find_subcommand("instance")
+            .expect("instance")
+            .clone();
+        let wait = instance.find_subcommand("wait").expect("wait");
+        let names: Vec<_> = wait
+            .get_arguments()
+            .map(|a| a.get_id().as_str().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "until"));
+        assert!(names.iter().any(|n| n == "timeout"));
+        assert!(instance.find_subcommand("list").is_some());
+        assert!(instance.find_subcommand("keys").is_some());
+        assert!(instance.find_subcommand("rm").is_some());
     }
 
     #[test]
@@ -287,5 +315,6 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n == "hosts"));
         assert!(names.iter().any(|n| n == "labels"));
+        assert!(fleet.find_subcommand("send").is_some());
     }
 }

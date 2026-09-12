@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::Args;
 use serde_json::Value;
 
-pub(crate) use remuda_hub_client::{ClientError, HubClient, pick_host};
+pub(crate) use remuda_hub_client::{ClientError, HubClient, host_matches_labels, pick_host};
 
 /// Shared `--hub` / `--token` / `--bootstrap-token` flags (`REMUDA_*` env).
 #[derive(Debug, Clone, Args)]

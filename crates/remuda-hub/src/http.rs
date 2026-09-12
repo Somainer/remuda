@@ -44,6 +44,17 @@ pub struct CreateInstanceBody {
     driver: String,
     title: Option<String>,
     prompt: Option<String>,
+    /// Live instance name (stored as title when title is omitted).
+    #[serde(default)]
+    name: Option<String>,
+    /// Working directory recorded on the instance workspace / spec.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Worktree name created by `remuda worktree create`.
+    #[serde(default)]
+    worktree: Option<String>,
+    #[serde(default, rename = "requiredCapabilities")]
+    required_capabilities: Option<Value>,
     #[serde(default)]
     placement: Option<Value>,
     #[serde(default)]
@@ -164,12 +175,18 @@ pub async fn create_instance(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     require_device(&state.store, &headers).await?;
+    let title = body.title.clone().or(body.name.clone());
+    let workspace_id = body.workspace_id.clone().or(body.cwd.clone());
     let mut spec = json!({
         "kind": body.kind,
         "driver": body.driver,
-        "workspaceId": body.workspace_id,
+        "workspaceId": workspace_id,
         "prompt": body.prompt,
-        "title": body.title,
+        "title": title,
+        "name": body.name,
+        "cwd": body.cwd,
+        "worktree": body.worktree,
+        "requiredCapabilities": body.required_capabilities,
     });
     if let Some(delegation) = &body.delegation
         && let Some(obj) = spec.as_object_mut()
@@ -195,8 +212,8 @@ pub async fn create_instance(
         crate::placement::SpawnRequest {
             kind: body.kind,
             driver: body.driver,
-            workspace_id: body.workspace_id,
-            title: body.title,
+            workspace_id,
+            title,
             prompt: body.prompt,
             spec,
         },

@@ -225,6 +225,18 @@ async fn mcp_tools_list_and_instance_create_against_in_process_hub() -> Result<(
         names.contains(&"remuda_instance_create".into()),
         "tools {names:?}"
     );
+    assert!(
+        names.contains(&"remuda_worktree_create".into()),
+        "tools {names:?}"
+    );
+    assert!(
+        names.contains(&"remuda_fleet_send".into()),
+        "tools {names:?}"
+    );
+    assert!(
+        names.contains(&"remuda_instance_keys".into()),
+        "tools {names:?}"
+    );
 
     let call = &replies[2];
     assert_eq!(call["result"]["isError"], json!(false), "{call}");

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "remuda": {
+      "command": "remuda",
+      "args": ["mcp"],
+      "env": {
+        "REMUDA_HUB": "http://127.0.0.1:8080",
+        "REMUDA_BOOTSTRAP_TOKEN": "<device-bootstrap-or-omit-if-REMUDA_TOKEN-set>",
+        "RUST_LOG": "warn"
+      }
+    }
+  }
+}

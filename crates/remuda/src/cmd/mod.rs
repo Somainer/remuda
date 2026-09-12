@@ -5,6 +5,7 @@ pub mod hub_client;
 pub mod instance;
 pub mod mcp;
 pub mod ssh;
+pub mod worktree;
 
 #[cfg(test)]
 pub(crate) mod test_hub;

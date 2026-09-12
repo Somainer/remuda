@@ -132,6 +132,12 @@ pub struct InstanceRecord {
     pub connectivity: String,
     /// UI title.
     pub title: Option<String>,
+    /// Live name (from spec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Working directory recorded on the workspace / spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Journal id (`obj_…`).
     pub journal_id: String,
     /// Durable seq as decimal string.
@@ -1160,21 +1166,37 @@ fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreErr
 fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, StoreError> {
     conn.query_row(
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
-                title, journal_id, durable_seq, created_at, updated_at
+                title, journal_id, durable_seq, created_at, updated_at, spec_json
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
             let durable: i64 = row.get(10)?;
+            let workspace_id: Option<String> = row.get(2)?;
+            let title: Option<String> = row.get(8)?;
+            let spec_raw: String = row.get(13)?;
+            let spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+            let cwd = spec
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| workspace_id.clone());
+            let name = spec
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| title.clone());
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 host_id: row.get(1)?,
-                workspace_id: row.get(2)?,
+                workspace_id,
                 kind: row.get(3)?,
                 driver: row.get(4)?,
                 lifecycle: row.get(5)?,
                 activity: row.get(6)?,
                 connectivity: row.get(7)?,
-                title: row.get(8)?,
+                title,
+                name,
+                cwd,
                 journal_id: row.get(9)?,
                 durable_seq: durable.to_string(),
                 created_at: row.get(11)?,

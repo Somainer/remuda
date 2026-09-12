@@ -20,6 +20,7 @@ remuda-node.workspace = true
 remuda-protocol.workspace = true
 remuda-ssh.workspace = true
 remuda-hub-client.workspace = true
+regex = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -39,6 +40,7 @@ time.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 futures.workspace = true
+remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-hub.workspace = true
 remuda-protocol.workspace = true
 serde_json.workspace = true

@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { Link } from "react-router-dom";
-import { FleetBoard, fleetStore, useFleets } from "../features/fleet";
+import { BroadcastBox, FleetBoard, fleetStore, useFleets } from "../features/fleet";
 import { useHostViews } from "../features/hosts";
 import { hubStore, useHub } from "../lib/store";
 import css from "../features/hosts/hosts.module.css";
@@ -20,6 +20,7 @@ export function FleetPage() {
       </p>
       <h1 style={{ fontSize: 18 }}>Fleet</h1>
       <p className={css.meta}>跨主机聚合。各 Instance seq 独立，不假设跨主机因果序。</p>
+      <BroadcastBox hosts={hosts} instances={hub.instances} />
       <FleetBoard fleets={fleets} hosts={hosts} />
     </div>
   );

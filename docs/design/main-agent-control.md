@@ -15,7 +15,8 @@ Claude Code  --stdio MCP-->  remuda mcp  --HTTP-->  Hub  --JSON-RPC/WSS-->  Node
 Tools (JSON-RPC `tools/list`): `remuda_instance_create`, `remuda_instance_list`,
 `remuda_instance_send`, `remuda_instance_wait`, `remuda_instance_read`,
 `remuda_instance_keys`, `remuda_instance_stop`, `remuda_instance_rm`,
-`remuda_worktree_create`, `remuda_fleet_run`, `remuda_fleet_send`. Create takes
+`remuda_worktree_create`, `remuda_fleet_run`, `remuda_fleet_send`,
+`remuda_fleet_keys`. Create takes
 `host` **or** `labels` (`["region=sg"]`); Hub placement resolves the host. Wait
 polls until `idle` / `done` / `blocked` / `line:<regex>` (default 30s). Seq
 numbers are per-instance; a fleet view does not imply cross-host order.

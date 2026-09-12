@@ -10,7 +10,9 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 
-use super::fleet::{FleetRunOpts, FleetSendOpts, fleet_run, fleet_send_opts};
+use super::fleet::{
+    FleetFilter, FleetKeysOpts, FleetRunOpts, FleetSendOpts, fleet_keys, fleet_run, fleet_send_opts,
+};
 use super::hub_client::{HubClient, HubOpts, block_on};
 use super::instance::{CreateOpts, create, list_instances, read, send, send_keys, stop, wait};
 use super::merge;
@@ -283,14 +285,33 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
         ),
         tool(
             "remuda_fleet_send",
-            "Broadcast a prompt to running instances (`all` or `labels`).",
+            "Broadcast a prompt to running instances (POST /v1/fleet/broadcast). Select with `all` and/or `labels`/`hosts`/`kinds`; returns per-instance results with an accepted/failed summary.",
             json!({
                 "type": "object",
                 "properties": {
                     "all": { "type": "boolean" },
                     "labels": { "type": "array", "items": { "type": "string" } },
+                    "hosts": { "type": "array", "items": { "type": "string" } },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "idempotencyKey": { "type": "string" },
                     "text": { "type": "string" },
                     "file": { "type": "string" }
+                }
+            }),
+        ),
+        tool(
+            "remuda_fleet_keys",
+            "Broadcast logical keys (`enter`, `esc`, `ctrl+c`) to running instances (POST /v1/fleet/broadcast with tty.write). Keys are validated before any bytes are sent.",
+            json!({
+                "type": "object",
+                "required": ["keys"],
+                "properties": {
+                    "all": { "type": "boolean" },
+                    "labels": { "type": "array", "items": { "type": "string" } },
+                    "hosts": { "type": "array", "items": { "type": "string" } },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "idempotencyKey": { "type": "string" },
+                    "keys": { "type": "array", "items": { "type": "string" } }
                 }
             }),
         ),
@@ -421,9 +442,24 @@ async fn call_tool(name: &str, args: Value, client: &HubClient) -> Result<Value>
             fleet_send_opts(
                 client,
                 FleetSendOpts {
-                    all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
-                    labels: string_list(&args, "labels"),
+                    filter: fleet_filter_from_json(&args),
+                    idempotency_key: opt_str(&args, "idempotencyKey").map(str::to_string),
                     text,
+                },
+            )
+            .await
+        }
+        "remuda_fleet_keys" => {
+            let keys = string_list(&args, "keys");
+            if keys.is_empty() {
+                return Err(anyhow!("remuda_fleet_keys requires keys"));
+            }
+            fleet_keys(
+                client,
+                FleetKeysOpts {
+                    filter: fleet_filter_from_json(&args),
+                    idempotency_key: opt_str(&args, "idempotencyKey").map(str::to_string),
+                    keys,
                 },
             )
             .await
@@ -483,6 +519,21 @@ fn fleet_opts_from_json(args: &Value) -> Result<FleetRunOpts> {
         title: opt_str(args, "title").map(str::to_string),
         prompt: opt_str(args, "prompt").map(str::to_string),
     })
+}
+
+/// Shared `all` / `labels` / `hosts` / `kinds` selection for the fleet
+/// broadcast tools. `host` / `kind` are accepted as singular aliases.
+fn fleet_filter_from_json(args: &Value) -> FleetFilter {
+    let mut hosts = string_list(args, "hosts");
+    hosts.extend(string_list(args, "host"));
+    let mut kinds = string_list(args, "kinds");
+    kinds.extend(string_list(args, "kind"));
+    FleetFilter {
+        all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+        labels: string_list(args, "labels"),
+        hosts,
+        kinds,
+    }
 }
 
 fn string_list(args: &Value, key: &str) -> Vec<String> {
@@ -681,6 +732,7 @@ mod tests {
             "remuda_worktree_create",
             "remuda_fleet_run",
             "remuda_fleet_send",
+            "remuda_fleet_keys",
             "remuda_merge",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
@@ -738,7 +790,62 @@ mod tests {
         assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
         let text = resp["result"]["content"][0]["text"].as_str().expect("text");
         let body: Value = serde_json::from_str(text).expect("json");
-        assert_eq!(body["sent"], json!(1));
+        assert_eq!(body["accepted"], json!(1));
+        assert_eq!(body["failed"], json!(0));
+        assert_eq!(body["results"][0]["instanceId"], json!("ins_test"));
+        assert_eq!(body["text"], json!("PAUSE git commits"));
+
+        let keys = json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "remuda_fleet_keys",
+                "arguments": { "all": true, "kind": "claude", "keys": ["esc"] }
+            }
+        });
+        let resp = handle_rpc(&keys, &client).await.expect("fleet keys");
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+        let body: Value = serde_json::from_str(text).expect("json");
+        assert_eq!(body["operation"], json!("tty.write"));
+        assert_eq!(body["accepted"], json!(1));
+        assert_eq!(body["keys"], json!(["esc"]));
+
+        // A kind filter that matches nothing still returns a summary, not an error.
+        let miss = json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "tools/call",
+            "params": {
+                "name": "remuda_fleet_send",
+                "arguments": { "all": true, "kinds": ["codex"], "text": "hi" }
+            }
+        });
+        let resp = handle_rpc(&miss, &client).await.expect("fleet send miss");
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().expect("text");
+        let body: Value = serde_json::from_str(text).expect("json");
+        assert_eq!(body["accepted"], json!(0));
+        assert_eq!(body["skipped"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn fleet_keys_rejects_unknown_key_before_hub_call() {
+        let client = dummy_client();
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 15,
+            "method": "tools/call",
+            "params": {
+                "name": "remuda_fleet_keys",
+                "arguments": { "all": true, "keys": ["nope"] }
+            }
+        });
+        let resp = handle_rpc(&call, &client).await.expect("response");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("unknown key"), "{text}");
     }
 
     #[tokio::test]

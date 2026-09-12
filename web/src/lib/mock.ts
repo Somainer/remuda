@@ -845,6 +845,60 @@ function ensureLongJournal() {
   journals.set(journalLong, buildLongObservations({ instanceId: insLong, journalId: journalLong, hostId }));
 }
 
+/** Lifecycles a broadcast skips; mirrors the Hub's `is_broadcast_target`. */
+const BROADCAST_SKIP: ReadonlySet<string> = new Set(["exited", "failed", "closing"]);
+
+/**
+ * Mirror of `POST /v1/fleet/broadcast` over the mock instances: `all` and/or
+ * `hosts` / `labels` / `kinds`, filters intersecting.
+ */
+export function mockFleetBroadcast(body: {
+  all?: boolean;
+  hosts?: string[];
+  labels?: string[];
+  kinds?: string[];
+  operation?: "instance.send" | "tty.write";
+  payload?: Record<string, unknown>;
+}) {
+  const operation = body.operation ?? "instance.send";
+  let allowed: string[] | null = body.hosts?.length ? [...body.hosts] : null;
+  if (body.labels?.length) {
+    const matched = hosts
+      .filter((host) => body.labels!.every((label) => (host.labels ?? []).includes(label)))
+      .map((host) => host.id as string);
+    allowed = allowed ? allowed.filter((id) => matched.includes(id)) : matched;
+  }
+  const results = [];
+  let accepted = 0;
+  let skipped = 0;
+  for (const inst of instances) {
+    if (BROADCAST_SKIP.has(inst.lifecycle)) {
+      skipped += 1;
+      continue;
+    }
+    if (allowed && !allowed.includes(inst.hostId)) {
+      skipped += 1;
+      continue;
+    }
+    if (body.kinds?.length && !body.kinds.includes(inst.kind)) {
+      skipped += 1;
+      continue;
+    }
+    accepted += 1;
+    results.push({
+      instanceId: inst.id as string,
+      hostId: inst.hostId as string,
+      kind: inst.kind as string,
+      ok: true,
+      commandId: id("cmd_") as string,
+      state: "accepted",
+      forwarded: true,
+      replayed: false,
+    });
+  }
+  return { operation, accepted, failed: 0, skipped, selected: results.length, results };
+}
+
 export const mockInstanceIds = {
   insWorking,
   insBlocked,

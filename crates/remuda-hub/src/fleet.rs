@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/fleet/instances", post(create_fleet))
+        .route("/v1/fleet/broadcast", post(broadcast))
         .route("/v1/fleet/{id}", get(get_fleet))
         .route("/v1/fleet/{id}/commands", post(fleet_commands))
 }
@@ -54,6 +55,193 @@ struct FleetCommandBody {
 
 fn default_op() -> String {
     "instance.send".into()
+}
+
+/// `POST /v1/fleet/broadcast` body: select running instances, fan one command out.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BroadcastBody {
+    /// Every running instance. Required unless `hosts` / `labels` / `kinds`
+    /// narrow the set.
+    #[serde(default)]
+    all: bool,
+    /// Restrict to these host ids.
+    #[serde(default)]
+    hosts: Vec<String>,
+    /// Restrict to hosts carrying every one of these `key=value` labels.
+    #[serde(default)]
+    labels: Vec<String>,
+    /// Restrict to these agent kinds (`claude`, `codex`, …).
+    #[serde(default)]
+    kinds: Vec<String>,
+    /// `instance.send` (default) or `tty.write`.
+    #[serde(default = "default_op")]
+    operation: String,
+    /// Per-instance command payload; `instanceId` is filled in per member.
+    #[serde(default)]
+    payload: Value,
+    /// Base key; each instance gets `<key>:<instanceId>` so a retried
+    /// broadcast replays instead of double-sending.
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// Instances a broadcast may target. Terminal and draining lifecycles are
+/// skipped; `requested` / `starting` are kept because the Hub queues their
+/// commands until the pane is live.
+fn is_broadcast_target(lifecycle: &str) -> bool {
+    !matches!(lifecycle, "exited" | "failed" | "closing")
+}
+
+/// `POST /v1/fleet/broadcast` — fan `operation` out to every matching running
+/// instance. Selection is `all` OR any of `hosts` / `labels` / `kinds`; the
+/// filters intersect. Per-instance results carry their own error so one
+/// offline host cannot fail the batch.
+async fn broadcast(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BroadcastBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    require_device(&state.store, &headers).await?;
+    let filtered = !body.hosts.is_empty() || !body.labels.is_empty() || !body.kinds.is_empty();
+    if !body.all && !filtered {
+        return Err(HubError::BadRequest(
+            "broadcast requires all=true or one of hosts/labels/kinds".into(),
+        ));
+    }
+    if !matches!(body.operation.as_str(), "instance.send" | "tty.write") {
+        return Err(HubError::BadRequest(format!(
+            "broadcast operation must be instance.send or tty.write, got {}",
+            body.operation
+        )));
+    }
+
+    let hosts = state.store.list_hosts().await?;
+    let mut allowed: Option<Vec<String>> = None;
+    if !body.hosts.is_empty() {
+        allowed = Some(body.hosts.clone());
+    }
+    if !body.labels.is_empty() {
+        let matched: Vec<String> = hosts
+            .iter()
+            .filter(|host| {
+                body.labels
+                    .iter()
+                    .all(|label| placement::host_has_label(host, label))
+            })
+            .map(|host| host.host_id.clone())
+            .collect();
+        allowed = Some(match allowed {
+            Some(prev) => prev.into_iter().filter(|id| matched.contains(id)).collect(),
+            None => matched,
+        });
+    }
+
+    let instances = state.store.list_instances(None).await?;
+    let mut results = Vec::new();
+    let (mut accepted, mut failed, mut skipped) = (0usize, 0usize, 0usize);
+    for instance in instances {
+        if !is_broadcast_target(&instance.lifecycle) {
+            skipped += 1;
+            continue;
+        }
+        if let Some(ids) = &allowed
+            && !ids.contains(&instance.host_id)
+        {
+            skipped += 1;
+            continue;
+        }
+        if !body.kinds.is_empty() && !body.kinds.iter().any(|k| k == &instance.kind) {
+            skipped += 1;
+            continue;
+        }
+        let mut payload = body.payload.clone();
+        if payload.is_null() {
+            payload = json!({});
+        }
+        let Some(obj) = payload.as_object_mut() else {
+            return Err(HubError::BadRequest(
+                "broadcast payload must be an object".into(),
+            ));
+        };
+        obj.insert("instanceId".into(), json!(instance.instance_id.clone()));
+        // Per-instance derivation: one key per (broadcast, instance) pair.
+        let key = body
+            .idempotency_key
+            .as_ref()
+            .map(|base| format!("{base}:{}", instance.instance_id));
+        let queued = state
+            .store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                instance.host_id.clone(),
+                body.operation.clone(),
+                payload,
+                key,
+            )
+            .await
+            .map_err(crate::http::map_store);
+        let (command, created) = match queued {
+            Ok(pair) => pair,
+            Err(err) => {
+                failed += 1;
+                results.push(json!({
+                    "instanceId": instance.instance_id,
+                    "hostId": instance.host_id,
+                    "kind": instance.kind,
+                    "ok": false,
+                    "error": err.to_string(),
+                }));
+                continue;
+            }
+        };
+        let online = hosts
+            .iter()
+            .find(|host| host.host_id == instance.host_id)
+            .map(|host| host.online)
+            .unwrap_or(false);
+        let command = if created {
+            match crate::http::forward_if_online(&state, command.clone(), online).await {
+                Ok(forwarded) => forwarded,
+                Err(err) => {
+                    failed += 1;
+                    results.push(json!({
+                        "instanceId": instance.instance_id,
+                        "hostId": instance.host_id,
+                        "kind": instance.kind,
+                        "ok": false,
+                        "commandId": command.command_id,
+                        "error": err.to_string(),
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            command
+        };
+        accepted += 1;
+        results.push(json!({
+            "instanceId": instance.instance_id,
+            "hostId": instance.host_id,
+            "kind": instance.kind,
+            "ok": true,
+            "commandId": command.command_id,
+            "state": command.state,
+            "resolution": command.resolution,
+            "forwarded": command.forwarded,
+            "replayed": !created,
+        }));
+    }
+    Ok(Json(json!({
+        "operation": body.operation,
+        "accepted": accepted,
+        "failed": failed,
+        "skipped": skipped,
+        "selected": results.len(),
+        "results": results,
+    })))
 }
 
 async fn create_fleet(

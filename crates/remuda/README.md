@@ -119,8 +119,24 @@ remuda fleet run --labels region=sg --max 3 --prompt "cargo test"
 Always `POST /v1/fleet/instances` with `{spec, hosts|labels, max}` as in
 proposal §4.6.
 
-`remuda fleet send --all|--labels` broadcasts `instance.send` to matching
-running instances (no fleet id required).
+## `remuda fleet send` / `remuda fleet keys`
+
+```text
+remuda fleet send --all "PAUSE git commits"
+remuda fleet send --all --kind codex --idempotency-key pause-1 --file /tmp/resume.md
+remuda fleet keys --all --host hst_a esc
+```
+
+Both `POST /v1/fleet/broadcast`, which selects running instances Hub-side and
+fans `instance.send` / `tty.write` out to each. Selection is `--all` and/or
+`--labels` / `--host` / `--kind`; the filters intersect, and at least one is
+required. Instances in `exited`, `failed`, or `closing` are skipped.
+
+Stdout carries per-instance `results` plus an `accepted` / `failed` /
+`skipped` summary, so a partial fan-out is visible without re-querying. With
+`--idempotency-key`, each instance is queued under `<key>:<instanceId>`, so
+re-running the same broadcast replays the original commands instead of
+sending twice. `keys` validates every key name before any bytes are sent.
 
 ## `remuda mcp`
 
@@ -147,7 +163,7 @@ Checked-in example: `docs/design/remuda-mcp.json` (`docs/design/remuda-mcp.md`).
 Tools: `remuda_instance_create`, `remuda_instance_list`, `remuda_instance_send`,
 `remuda_instance_wait`, `remuda_instance_read`, `remuda_instance_keys`,
 `remuda_instance_stop`, `remuda_instance_rm`, `remuda_worktree_create`,
-`remuda_fleet_run`, `remuda_fleet_send`. Coordinator skill:
+`remuda_fleet_run`, `remuda_fleet_send`, `remuda_fleet_keys`. Coordinator skill:
 `skills/remuda/SKILL.md`.
 
 ## Workflow example

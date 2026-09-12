@@ -225,7 +225,7 @@ fn consider(
     Ok(())
 }
 
-fn host_has_label(host: &HostRecord, wanted: &str) -> bool {
+pub(crate) fn host_has_label(host: &HostRecord, wanted: &str) -> bool {
     let want = normalize_label(wanted);
     host.labels.iter().any(|have| normalize_label(have) == want)
 }

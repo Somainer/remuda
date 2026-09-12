@@ -8,7 +8,7 @@ use clap::Args;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-pub(crate) use remuda_hub_client::{ClientError, HubClient, host_matches_labels, pick_host};
+pub(crate) use remuda_hub_client::{ClientError, HubClient, pick_host};
 
 /// `remuda dev` Hub listen used by dogfood when no `listen` file is present.
 const DEV_HUB_URL: &str = "http://127.0.0.1:18080";

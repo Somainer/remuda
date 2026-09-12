@@ -304,6 +304,26 @@
         }
       }
     },
+    "/v1/fleet/broadcast": {
+      "post": {
+        "tags": ["fleet"],
+        "operationId": "fleetBroadcast",
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/FleetBroadcast" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-instance fan-out results with an accepted/failed summary",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/FleetBroadcastResult" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/fleet/{id}": {
       "get": {
         "tags": ["fleet"],
@@ -1090,6 +1110,50 @@
         "properties": {
           "fleetId": { "type": "string" },
           "instanceIds": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "FleetBroadcast": {
+        "type": "object",
+        "description": "Select running instances and fan one command out. Requires `all` or at least one of `hosts` / `labels` / `kinds`; filters intersect.",
+        "properties": {
+          "all": { "type": "boolean" },
+          "hosts": { "type": "array", "items": { "type": "string" } },
+          "labels": { "type": "array", "items": { "type": "string" } },
+          "kinds": { "type": "array", "items": { "type": "string" } },
+          "operation": { "type": "string", "enum": ["instance.send", "tty.write"] },
+          "payload": { "type": "object", "additionalProperties": true },
+          "idempotencyKey": {
+            "type": "string",
+            "description": "Base key; each instance is queued under `<key>:<instanceId>` so a retry replays instead of double-sending."
+          }
+        }
+      },
+      "FleetBroadcastResult": {
+        "type": "object",
+        "properties": {
+          "operation": { "type": "string" },
+          "accepted": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "skipped": { "type": "integer" },
+          "selected": { "type": "integer" },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "instanceId": { "type": "string" },
+                "hostId": { "type": "string" },
+                "kind": { "type": "string" },
+                "ok": { "type": "boolean" },
+                "commandId": { "type": "string" },
+                "state": { "type": "string" },
+                "resolution": { "type": ["string", "null"] },
+                "forwarded": { "type": "boolean" },
+                "replayed": { "type": "boolean" },
+                "error": { "type": "string" }
+              }
+            }
+          }
         }
       },
       "PushSubscribe": {

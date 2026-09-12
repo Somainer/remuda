@@ -258,9 +258,10 @@ fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
         host: opt_str(args, "host").map(str::to_string),
         labels: string_list(args, "labels"),
         kind: opt_str(args, "kind").unwrap_or("claude").to_string(),
-        driver: opt_str(args, "driver")
-            .unwrap_or("claude-print")
-            .to_string(),
+        driver: match opt_str(args, "driver").unwrap_or("claude-print") {
+            "pty" => "generic-pty".to_string(),
+            other => other.to_string(),
+        },
         workspace_id: opt_str(args, "workspaceId").map(str::to_string),
         title: opt_str(args, "title").map(str::to_string),
         prompt: opt_str(args, "prompt").map(str::to_string),
@@ -274,9 +275,10 @@ fn fleet_opts_from_json(args: &Value) -> Result<FleetRunOpts> {
         labels: string_list(args, "labels"),
         max: args.get("max").and_then(Value::as_u64).map(|n| n as u32),
         kind: opt_str(args, "kind").unwrap_or("claude").to_string(),
-        driver: opt_str(args, "driver")
-            .unwrap_or("claude-print")
-            .to_string(),
+        driver: match opt_str(args, "driver").unwrap_or("claude-print") {
+            "pty" => "generic-pty".to_string(),
+            other => other.to_string(),
+        },
         workspace_id: opt_str(args, "workspaceId").map(str::to_string),
         title: opt_str(args, "title").map(str::to_string),
         prompt: opt_str(args, "prompt").map(str::to_string),

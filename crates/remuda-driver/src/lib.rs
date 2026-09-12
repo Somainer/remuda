@@ -12,6 +12,7 @@ pub mod claude_pty;
 mod driver;
 mod error;
 mod flags;
+pub mod generic_pty;
 pub mod interaction;
 mod materializer;
 mod process;
@@ -30,6 +31,7 @@ pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
 pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
+pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, KindPreset, WaitUntil, preset_by_id};
 pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
     materialize_with_token_broker, render_api_key_helper_script,

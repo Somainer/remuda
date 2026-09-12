@@ -623,6 +623,10 @@ fn validate_kind_driver(
             )
             | (AgentKind::Grok, remuda_protocol::DriverKind::GrokAcp)
             | (AgentKind::Agy, remuda_protocol::DriverKind::AgyPrint)
+            | (AgentKind::Claude, remuda_protocol::DriverKind::GenericPty)
+            | (AgentKind::Codex, remuda_protocol::DriverKind::GenericPty)
+            | (AgentKind::Grok, remuda_protocol::DriverKind::GenericPty)
+            | (AgentKind::Agy, remuda_protocol::DriverKind::GenericPty)
             | (AgentKind::Generic, remuda_protocol::DriverKind::GenericPty)
     );
     if valid {

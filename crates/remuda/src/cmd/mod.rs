@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod fleet;
 pub mod hub;
 pub mod hub_client;
+mod hub_maintenance;
 pub mod instance;
 mod instance_interaction;
 pub mod mcp;

@@ -20,8 +20,10 @@ mod http;
 mod instances;
 mod interactions;
 mod inventory;
+mod maintenance;
 mod placement;
 mod providers;
+mod proxy;
 mod push_http;
 mod rate_limit;
 mod registry;
@@ -51,6 +53,7 @@ use tokio::task::JoinHandle;
 
 pub use config::{DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS};
 pub use error::HubError;
+pub use maintenance::migrate;
 pub use transport::{ConnectedNodes, NodeTransport, StdioTransport, TransportKind, WssTransport};
 
 /// Process-wide Hub state shared by HTTP and WS handlers.
@@ -139,6 +142,7 @@ async fn spawn_inner(
     mut config: HubConfig,
     transport: Option<Arc<dyn remuda_push::Transport>>,
 ) -> anyhow::Result<RunningHub> {
+    proxy::configure_public_origin(&mut config)?;
     std::fs::create_dir_all(&config.data_dir)?;
     resolve_bootstrap(&mut config)?;
     let bootstrap_token = config.bootstrap_token.clone();
@@ -239,6 +243,10 @@ pub fn router(state: AppState) -> Router {
             rate_limit::limit_auth_attempts,
         ))
         .layer(axum::middleware::map_response(web::security_headers))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            proxy::secure_cookies,
+        ))
         .with_state(state)
 }
 

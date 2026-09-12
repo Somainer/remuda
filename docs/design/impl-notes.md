@@ -1055,3 +1055,41 @@ The reconnect teardown was also repeated against the rebuilt binary after the
 regression landed. Hub stopped at `11:09:26`, Node entered reconnect backoff,
 SIGINT reached Node at `11:09:40.207484`, and the process exited successfully
 in 0.901 seconds—inside the one-second carrier fallback bound.
+
+## c-sshhost — supervised SSH host onboarding (2026-09-13)
+
+The Hub now owns a persisted SSH host supervisor, exposed through authenticated
+`POST /v1/hosts/ssh`, existing host reads, and `DELETE /v1/hosts/{id}`. Keeping SSH
+in the Hub reuses its durable registry, placement and Node dispatcher without
+depending on a separate local bastion Node. Preflight checks the release and can
+upload a compatible artifact to `/tmp/remuda-ssh-<hostId>/`; it never installs a
+system service or sends the Hub bootstrap token remotely. The Hub can select the
+upload artifact through `REMUDA_SSH_UPLOAD_BINARY`; same-platform binaries and
+the deploy/m1 Linux musl artifact are supported. Targets and policies survive
+restart, reconnect has capped backoff, and last errors remain visible to the
+mobile Hosts page. Removing an active host returns 409 until instances stop.
+
+The SSH Node runs native drivers through the same composition as other Nodes.
+The existing main CLI's stdio branch had only wired its carrier; the minimal
+`crates/remuda/src/cmd/node.rs` change composes native drivers and isolated data
+before serving. Small shared touches expose the Hub Node dispatcher, identify
+its SSH transport, fence placement until hello completes, preserve SSH identities
+from legacy display-name deduplication, and route stdio `instance.close` through
+the existing command/journal path. No changes were made to x-term's driver or
+terminal-streaming implementation, x-place's provider launch configuration, or
+x-prov's provider UI.
+
+Real browser acceptance on the assigned ports added the redacted SG host,
+observed inventory, created a remote Codex `generic-pty` instance and received
+`PONG` with the discovered gateway model `claude-gpt-5.6-sol`. The original Codex
+login block was recorded; the later user-authorized gateway reference resolved
+it without migrating a local Codex OAuth login. Browser stop reached `exited`,
+host removal returned 204, and acceptance-only remote temporary directories were
+cleaned up. Evidence, source limitations, model discovery and test results are
+in [SSH host onboarding 1](./evidence/ssh-host-1.md).
+
+Remaining dependency: this base has no production `shell-pty` driver. Managed SSH
+`generic-pty` placement without Herdr is rejected with a clear 422 reason, while
+`claude-print` can run without Herdr. Automatic Codex/Grok fallback still requires
+x-term's shell driver and the related launch/tty integration; this commit does
+not claim it is implemented. The real PONG acceptance used existing remote Herdr.

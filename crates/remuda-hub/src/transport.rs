@@ -1,8 +1,7 @@
-//! Hub↔Node carriers. WSS is implemented; SSH stdio plugs in later (D-013).
+//! Hub↔Node RPC channels for outbound WSS and supervised SSH stdio.
 //!
-//! `ssh <alias> remuda node --stdio` is the no-port path. This crate does not
-//! spawn SSH; a later module inserts a [`NodeTransport`] that speaks JSON-RPC
-//! over that pipe.
+//! `ssh_hosts` owns the SSH process and attaches the same request/reply channel
+//! used by the WebSocket dispatcher, with [`TransportKind::SshStdio`].
 
 use crate::error::HubError;
 use futures::Future;
@@ -57,8 +56,9 @@ pub trait NodeTransport: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, HubError>> + Send + '_>>;
 }
 
-/// Live WSS Node (JSON text frames on `/v1/node`).
+/// Live Node RPC channel, backed by a WebSocket or the SSH supervisor's writer.
 pub struct WssTransport {
+    kind: TransportKind,
     outbound: mpsc::Sender<Value>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
 }
@@ -69,13 +69,24 @@ impl WssTransport {
         outbound: mpsc::Sender<Value>,
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     ) -> Self {
-        Self { outbound, pending }
+        Self {
+            outbound,
+            pending,
+            kind: TransportKind::OutboundWss,
+        }
+    }
+}
+
+impl WssTransport {
+    pub(crate) fn with_kind(mut self, kind: TransportKind) -> Self {
+        self.kind = kind;
+        self
     }
 }
 
 impl NodeTransport for WssTransport {
     fn kind(&self) -> TransportKind {
-        TransportKind::OutboundWss
+        self.kind
     }
 
     fn call(
@@ -117,7 +128,7 @@ impl NodeTransport for WssTransport {
     }
 }
 
-/// Placeholder for `ssh <host> remuda node --stdio`. Not attached in this crate.
+/// Legacy disconnected placeholder. Managed SSH uses the shared live RPC channel.
 pub struct StdioTransport {
     host_id: String,
 }

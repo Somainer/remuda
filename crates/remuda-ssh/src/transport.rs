@@ -1,4 +1,4 @@
-//! [`NodeTransport`]: SSH stdio (length-prefixed JSON) and WebSocket (one message per JSON).
+//! [`NodeTransport`]: SSH stdio (NDJSON) and WebSocket (one message per JSON).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::io::{BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
@@ -17,9 +17,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::client::{SshClient, spawn_ssh};
 use crate::error::Error;
-use crate::frame::{MAX_JSON_FRAME_BYTES, read_json_frame, write_json_frame};
+use crate::frame::{MAX_JSON_FRAME_BYTES, write_json_frame};
 
-/// Hub↔Node JSON carrier. Stdio uses a 4-byte length prefix; WSS uses WS message bounds.
+/// Hub↔Node JSON carrier. Stdio uses newline bounds; WSS uses WS message bounds.
 pub trait NodeTransport {
     /// Send one JSON value.
     fn send_json(&mut self, value: &Value) -> impl Future<Output = Result<(), Error>> + Send;
@@ -80,9 +80,10 @@ pub struct StdioTransport {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    partial_frame: Vec<u8>,
     /// Reconnect policy after ssh exits.
     pub backoff: Backoff,
-    /// Length-prefix cap.
+    /// JSON frame size cap.
     pub max_frame_bytes: u32,
 }
 
@@ -96,7 +97,7 @@ impl StdioTransport {
         Self::spawn(recipe, Backoff::default(), MAX_JSON_FRAME_BYTES).await
     }
 
-    /// Spawn a local program that speaks length-prefixed JSON on stdio (tests).
+    /// Spawn a local program that speaks NDJSON on stdio (tests).
     pub async fn connect_local(
         program: impl Into<PathBuf>,
         args: Vec<String>,
@@ -157,6 +158,7 @@ impl StdioTransport {
             child,
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
+            partial_frame: Vec::new(),
             backoff,
             max_frame_bytes,
         })
@@ -205,11 +207,33 @@ impl NodeTransport for StdioTransport {
     }
 
     async fn recv_json(&mut self) -> Result<Option<Value>, Error> {
-        match read_json_frame(&mut self.stdout, self.max_frame_bytes).await {
-            Ok(None) => Ok(None),
-            Ok(Some(value)) => Ok(Some(value)),
-            Err(err) if err.is_disconnect() => Ok(None),
-            Err(err) => Err(err),
+        // Retain partial bytes across select! cancellation by the outbound writer.
+        loop {
+            let bytes = self.stdout.fill_buf().await?;
+            if bytes.is_empty() {
+                return if self.partial_frame.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(Error::TruncatedFrame)
+                };
+            }
+            let end = bytes.iter().position(|byte| *byte == b'\n');
+            let count = end.map_or(bytes.len(), |end| end + 1);
+            if self.partial_frame.len() + count > self.max_frame_bytes as usize + 1 {
+                return Err(Error::FrameTooLarge {
+                    len: (self.partial_frame.len() + count).min(u32::MAX as usize) as u32,
+                    max: self.max_frame_bytes,
+                });
+            }
+            self.partial_frame.extend_from_slice(&bytes[..count]);
+            self.stdout.consume(count);
+            if end.is_some() {
+                let line = std::mem::take(&mut self.partial_frame);
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                return Ok(Some(serde_json::from_slice(&line)?));
+            }
         }
     }
 
@@ -308,6 +332,33 @@ pub fn node_stdio_argv(remote_bin: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_receive_preserves_partial_frame_during_send() {
+        let mut transport = StdioTransport::connect_local(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "printf '{\"ready\":'; IFS= read -r input; printf 'true}\\n'".into(),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), transport.recv_json())
+                .await
+                .is_err()
+        );
+        assert_eq!(transport.partial_frame, b"{\"ready\":");
+        transport.send_json(&serde_json::json!({})).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), transport.recv_json())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, Some(serde_json::json!({"ready": true})));
+        transport.close().await.unwrap();
+    }
 
     #[test]
     fn backoff_doubles_then_caps() {

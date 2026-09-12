@@ -62,7 +62,9 @@ export type HostCli = {
 export type Host = EntityMeta & {
   label: string;
   ownerPrincipalId: Id;
-  state: "enrolled" | "online" | "offline" | "reconciling" | "retired";
+  state: "enrolled" | "connecting" | "online" | "offline" | "reconciling" | "retired";
+  ssh?: { workspaceRoot?: string; target: string; remudaBinaryPolicy: "require_installed" | "upload_if_missing" };
+  lastError?: string;
   transport: { mode: HostTransport; endpointRef: Id };
   hostname?: string;
   port?: number;

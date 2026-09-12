@@ -162,7 +162,7 @@ impl SshClient {
     /// OpenSSH joins extra arguments with spaces and hands them to the remote
     /// login shell, so each token must be POSIX-quoted.
     pub fn command(&self, remote_argv: &[impl AsRef<OsStr>]) -> Result<Command, Error> {
-        crate::target::validate_alias(&self.alias)?;
+        crate::managed::validate_target(&self.alias)?;
         let mut cmd = Command::new(&self.options.ssh_binary);
         self.options.apply(&mut cmd)?;
         cmd.arg(&self.alias).arg("--");

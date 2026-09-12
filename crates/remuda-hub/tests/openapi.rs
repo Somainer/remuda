@@ -87,6 +87,8 @@ fn overlapping_web_client_operations_exist() {
     let paths = spec["paths"].as_object().expect("paths");
     for (path, method) in [
         ("/v1/hosts", "get"),
+        ("/v1/hosts/ssh", "post"),
+        ("/v1/hosts/{id}", "delete"),
         ("/v1/hosts/{id}", "get"),
         ("/v1/instances", "get"),
         ("/v1/instances", "post"),

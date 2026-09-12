@@ -1,97 +1,59 @@
 import { useState } from "react";
 import { Button } from "../../components/Button";
 import { Modal } from "../../components/Modal";
+import { api } from "../../lib/api";
+import { hubStore } from "../../lib/store";
 import ui from "../../styles/ui.module.css";
-import { SSH_ALIASES } from "./fixtures";
 import css from "./hosts.module.css";
-import { hostRegistry } from "./registry";
-import { bootstrapPlan, probeSshAlias, runBootstrap, type BootstrapStep, type ProbeResult } from "./ssh";
 
 export function AddHostForm({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [alias, setAlias] = useState(SSH_ALIASES[0]?.alias ?? "");
-  const [probe, setProbe] = useState<ProbeResult | null>(null);
-  const [steps, setSteps] = useState<BootstrapStep[]>(bootstrapPlan(alias));
+  const [target, setTarget] = useState("");
+  const [label, setLabel] = useState("");
+  const [labels, setLabels] = useState("");
+  const [policy, setPolicy] = useState<"require_installed" | "upload_if_missing">("require_installed");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
   return (
-    <Modal open={open} onClose={onClose}>
-      <h2 style={{ marginTop: 0, fontSize: 16 }}>添加主机</h2>
-      <p className={css.meta}>从 ~/.ssh/config 别名选择，走 ssh-stdio（proposal §4.6）。无 tailcat。</p>
-      <label className={ui.field}>
-        SSH 别名
-        <select
-          className={`${ui.select} ${ui.touchSelect}`}
-          data-testid="add-host-alias"
-          value={alias}
-          onChange={(e) => {
-            setAlias(e.target.value);
-            setProbe(null);
-            setSteps(bootstrapPlan(e.target.value));
-            setError(null);
-          }}
-        >
-          {SSH_ALIASES.map((row) => (
-            <option key={row.alias} value={row.alias}>
-              {row.alias}
-            </option>
-          ))}
-        </select>
-      </label>
-      <div className={ui.row} style={{ marginTop: 12 }}>
-        <Button
-          disabled={busy}
-          data-testid="add-host-probe"
-          onClick={() => {
-            setBusy(true);
-            setError(null);
-            void probeSshAlias(alias)
-              .then((result) => setProbe(result))
-              .finally(() => setBusy(false));
-          }}
-        >
-          Probe
-        </Button>
-        <Button
-          variant="primary"
-          disabled={busy || !probe?.ok}
-          data-testid="add-host-bootstrap"
-          onClick={() => {
-            setBusy(true);
-            setError(null);
-            void runBootstrap(alias, setSteps)
-              .then((host) => {
-                hostRegistry.enroll(host);
-                onClose();
-              })
-              .catch((err: unknown) => setError(err instanceof Error ? err.message : "bootstrap failed"))
-              .finally(() => setBusy(false));
-          }}
-        >
-          Bootstrap
-        </Button>
-      </div>
-      {probe && !probe.ok ? (
-        <p data-testid="add-host-probe-error" style={{ color: "var(--dust)" }}>
-          {probe.error}
-        </p>
-      ) : null}
-      {probe?.ok ? (
-        <p className={css.meta} data-testid="add-host-probe-ok">
-          {probe.hostname} · {probe.rttMs}ms · {probe.cli.map((c) => `${c.kind} ${c.version}`).join(" · ")}
-        </p>
-      ) : null}
-      <div className={css.progress} data-testid="add-host-progress">
-        {steps.map((step) => (
-          <div key={step.id} className={step.state === "pending" ? css.step : css.stepOn}>
-            {step.state === "done" ? "✓" : step.state === "running" ? "…" : "○"} {step.label}
-          </div>
-        ))}
-      </div>
-      {error ? <p style={{ color: "var(--dust)" }}>{error}</p> : null}
-      <div className={ui.row} style={{ marginTop: 12, justifyContent: "flex-end" }}>
-        <Button onClick={onClose}>取消</Button>
-      </div>
+    <Modal open={open} onClose={() => { if (!busy) onClose(); }}>
+      <form className={css.fields} onSubmit={(event) => {
+        event.preventDefault();
+        setBusy(true);
+        setError(null);
+        void api.hostSshAdd({
+          target: target.trim(), label: label.trim() || target.trim(),
+          labels: labels.split(",").map((value) => value.trim()).filter(Boolean),
+          remuda_binary_policy: policy,
+        }).then(async () => {
+          await hubStore.refreshHosts();
+          setTarget(""); setLabel(""); setLabels("");
+          onClose();
+        }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "添加失败"))
+          .finally(() => setBusy(false));
+      }}>
+        <h2 style={{ margin: 0, fontSize: 18 }}>添加主机</h2>
+        <p className={css.meta}>填写 Hub 所在机器能够 SSH 登录的地址或 SSH 配置别名。连接中断后自动重连。</p>
+        <label className={ui.field}>SSH 目标
+          <input autoFocus required autoCapitalize="none" autoCorrect="off" spellCheck={false} className={ui.input} data-testid="add-host-target" placeholder="dev@host 或 SSH 别名" maxLength={255} value={target} onChange={(e) => setTarget(e.target.value)} />
+        </label>
+        <label className={ui.field}>显示名
+          <input className={ui.input} data-testid="add-host-label" placeholder="默认使用 SSH 目标" maxLength={128} value={label} onChange={(e) => setLabel(e.target.value)} />
+        </label>
+        <label className={ui.field}>标签（逗号分隔）
+          <input className={ui.input} data-testid="add-host-labels" placeholder="egress:gateway, region:sg" value={labels} onChange={(e) => setLabels(e.target.value)} />
+        </label>
+        <label className={ui.field}>Remuda 安装策略
+          <select className={`${ui.select} ${ui.touchSelect}`} data-testid="add-host-policy" value={policy} onChange={(e) => setPolicy(e.target.value as typeof policy)}>
+            <option value="require_installed">使用已安装版本</option>
+            <option value="upload_if_missing">缺少时上传临时副本</option>
+          </select>
+        </label>
+        <p className={css.meta}>上传和运行数据保存在远端专属临时目录。版本不兼容时显示错误。</p>
+        {error ? <p role="alert" className={css.sshError}>{error}</p> : null}
+        <div className={ui.row} style={{ justifyContent: "flex-end", marginTop: 12 }}>
+          <Button type="button" disabled={busy} onClick={onClose}>取消</Button>
+          <Button type="submit" variant="primary" disabled={busy || !target.trim()} data-testid="add-host-submit">{busy ? "正在添加…" : "添加主机"}</Button>
+        </div>
+      </form>
     </Modal>
   );
 }

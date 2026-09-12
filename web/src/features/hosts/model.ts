@@ -22,6 +22,7 @@ export type HostSortable = {
   state?: string;
   online?: boolean;
   lastSeenAt?: string;
+  ssh?: Host["ssh"];
 };
 
 export type HostView = {
@@ -30,6 +31,8 @@ export type HostView = {
   state: Host["state"];
   online: boolean;
   transport: Carrier;
+  ssh?: Host["ssh"];
+  lastError?: string;
   hostname?: string;
   port?: number;
   lastSeenAt?: string;
@@ -63,7 +66,7 @@ export function hostIsOnline(host: HostSortable): boolean {
 }
 
 export function isStaleOffline(host: HostSortable, now = Date.now()): boolean {
-  if (hostIsOnline(host)) return false;
+  if (hostIsOnline(host) || host.ssh || host.state === "connecting") return false;
   if (!host.lastSeenAt) return true;
   const at = Date.parse(host.lastSeenAt);
   if (Number.isNaN(at)) return true;

@@ -21,6 +21,7 @@ mod client;
 mod enroll;
 mod error;
 mod frame;
+mod managed;
 mod probe;
 mod target;
 mod transport;
@@ -36,6 +37,9 @@ pub use client::{
 pub use enroll::{EnrollResult, HubEnroll, bridge_until_close, enroll_stdio, node_socket_url};
 pub use error::Error;
 pub use frame::{MAX_JSON_FRAME_BYTES, encode_json_frame, read_json_frame, write_json_frame};
+pub use managed::{
+    BinaryPolicy, ManagedNode, prepare_managed_node, validate_target, version_compatible,
+};
 pub use probe::{BinStatus, ProbeReport, probe};
 pub use target::{SshTarget, list_config_hosts, list_user_hosts};
 pub use transport::{Backoff, NodeTransport, StdioTransport, WssTransport, node_stdio_argv};

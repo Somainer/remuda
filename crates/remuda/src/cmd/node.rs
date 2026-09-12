@@ -7,8 +7,8 @@ use crate::{
 use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 use remuda_node::{
-    Backoff, CarrierKind, DevNode, DevServerConfig, HostInventoryConfig, HubCarrier, NodeHello,
-    ServeConfig, StdioCarrier, WssConfig, WssLink, compose, load_or_create_host_id,
+    Backoff, CarrierKind, DevNode, DevServerConfig, HostInventoryConfig, NodeHello, ServeConfig,
+    WssConfig, WssLink, compose, load_or_create_host_id,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -20,6 +20,9 @@ pub(crate) struct Args {
     /// Carry Node NDJSON over stdin/stdout; logs always use stderr.
     #[arg(long, conflicts_with = "hub_url")]
     stdio: bool,
+    /// Registry display name for a supervised SSH host.
+    #[arg(long)]
+    display_label: Option<String>,
     /// Authenticated outbound WSS endpoint; defaults to the configured hub_url.
     #[arg(long)]
     hub_url: Option<String>,
@@ -90,13 +93,28 @@ pub(crate) async fn run(
     std::fs::create_dir_all(&node_dir)?;
     hello.params.host.host_id = load_or_create_host_id(&node_dir)?;
     if args.stdio {
-        // TODO(remuda-node): StdioCarrier handles inventory/heartbeat but does not
-        // yet dispatch instance commands. It owns no driver processes to stop.
-        let mut carrier = StdioCarrier::new();
-        return tokio::select! {
-            result = carrier.run(&hello) => result.map_err(Into::into),
+        let mut native = remuda_node::NativeDriverConfig::new(config.data_dir.clone());
+        native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
+        native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
+        std::fs::create_dir_all(&config.node.workspace)?;
+        let runtime = compose(&ServeConfig {
+            http: DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone()),
+            data_dir: config.data_dir.clone(),
+            drivers: remuda_node::LocalDrivers::Native(native),
+        })?;
+        let opts = remuda_node::StdioOptions {
+            labels: config.node.labels.clone(),
+            max_instances: config.node.max_instances,
+            display_label: args.display_label,
+            transport: "ssh-stdio".into(),
+            data_dir: config.data_dir.clone(),
+        };
+        let result = tokio::select! {
+            result = remuda_node::run_stdio_runtime_opts(runtime.clone(), opts) => result.map_err(Into::into),
             result = shutdown.wait() => result,
         };
+        shutdown_drivers(&runtime, config.shutdown_timeout()).await?;
+        return result;
     }
     let token_file = node_dir.join("host-token");
     let token_ref = config
@@ -378,6 +396,7 @@ mod tests {
         let args = Args {
             no_herdr_orphan_sweep: false,
             stdio: true,
+            display_label: None,
             hub_url: None,
             host_token_file: None,
             labels: vec!["region=cli".into()],

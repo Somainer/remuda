@@ -188,6 +188,22 @@ pub async fn dispatch_method(
         )
         .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?;
     }
+    if method == "instance.close" {
+        let parsed: InstanceCancelParams = serde_json::from_value(params)?;
+        let instance_id = InstanceId::from_str(&parsed.instance_id)?;
+        return submit(
+            node,
+            &instance_id,
+            CommandAction::Close,
+            None,
+            parsed.command_id.as_deref(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
     match HubNodeMethod::parse(method) {
         Some(HubNodeMethod::InstanceCreate) => dispatch_create(node, params).await,
         Some(HubNodeMethod::InstanceSend) => dispatch_send(node, params).await,

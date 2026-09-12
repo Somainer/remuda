@@ -232,6 +232,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/ssh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Persist a Hub-supervised SSH host and start preflight/reconnect */
+        post: operations["hostSshAdd"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts/{id}": {
         parameters: {
             query?: never;
@@ -243,7 +260,8 @@ export interface paths {
         get: operations["hostGet"];
         put?: never;
         post?: never;
-        delete?: never;
+        /** Remove a supervised SSH host after stopping its instances; keep journal history */
+        delete: operations["hostRemove"];
         options?: never;
         head?: never;
         patch: operations["hostPatch"];
@@ -594,6 +612,7 @@ export interface components {
             instanceCount?: number;
             label: string;
             labels?: string[];
+            lastError?: string | null;
             lastSeenAt?: string | null;
             maxInstances?: number;
             name?: string;
@@ -601,6 +620,15 @@ export interface components {
             online: boolean;
             resources?: {
                 [key: string]: unknown;
+            } | null;
+            ssh?: {
+                /**
+                 * @default require_installed
+                 * @enum {string}
+                 */
+                remudaBinaryPolicy: "require_installed" | "upload_if_missing";
+                target: string;
+                workspaceRoot?: string;
             } | null;
             state: string;
             transport?: string;
@@ -785,6 +813,18 @@ export interface components {
                 auth: string;
                 p256dh: string;
             };
+        };
+        SshHostCreate: {
+            label: string;
+            /** @description Placement labels such as egress:gateway or region=sg. */
+            labels?: string[];
+            /**
+             * @default require_installed
+             * @enum {string}
+             */
+            remuda_binary_policy: "require_installed" | "upload_if_missing";
+            /** @description SSH config alias or user@host, resolved by the Hub system SSH client. */
+            target: string;
         };
         WorktreeCreate: {
             /** @description Start-point (default main). */
@@ -1176,6 +1216,34 @@ export interface operations {
             401: components["responses"]["Error"];
         };
     };
+    hostSshAdd: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SshHostCreate"];
+            };
+        };
+        responses: {
+            /** @description Host registered; inspect state and lastError while connecting */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostView"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
     hostGet: {
         parameters: {
             query?: never;
@@ -1198,6 +1266,30 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    hostRemove: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Supervisor cancelled, connection closed, registration removed; remote files retained */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     hostPatch: {

@@ -143,6 +143,12 @@ pub struct HostRecord {
     /// Hostname or SSH alias.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Hub-supervised SSH target and binary policy, absent for externally enrolled Nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<Value>,
+    /// Latest SSH preflight/connection error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Instance index row.
@@ -454,7 +460,7 @@ impl Store {
         let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(BUSY_WAIT)).await;
     }
 
-    async fn run<T, F>(&self, f: F) -> Result<T, StoreError>
+    pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
@@ -600,8 +606,12 @@ impl Store {
     pub async fn mark_all_hosts_offline(&self) -> Result<(), StoreError> {
         self.run(|conn| {
             conn.execute(
-                "UPDATE hosts SET state = 'offline', offline_since = COALESCE(offline_since, last_seen_at, created_at) WHERE state = 'online'",
-                [],
+                // SSH inventory is collected at connect, so last_seen_at may
+                // predate a still-live carrier. Start its lost grace at restart.
+                "UPDATE hosts SET state = 'offline', offline_since = COALESCE(offline_since,
+                    CASE WHEN EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id)
+                    THEN ?1 ELSE COALESCE(last_seen_at, created_at) END) WHERE state = 'online'",
+                params![now_rfc3339()],
             )?;
             conn.execute(
                 "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
@@ -616,8 +626,11 @@ impl Store {
     /// Overlay Hub<->Node liveness onto a stored host row.
     #[must_use]
     pub fn with_live_link(mut host: HostRecord, connected: bool) -> HostRecord {
-        host.online = connected;
-        if connected {
+        // A supervised SSH link is ready only after hello has been acknowledged.
+        // Retirement also fences placement before the carrier is torn down.
+        host.online =
+            connected && host.state != "retired" && (host.ssh.is_none() || host.state == "online");
+        if host.online {
             host.state = "online".into();
         } else if host.state == "online" {
             host.state = "offline".into();
@@ -668,7 +681,7 @@ impl Store {
         self.run(move |conn| {
             let now = now_rfc3339();
             conn.execute(
-                "UPDATE hosts SET last_seen_at = ?1, state = 'online', offline_since = NULL WHERE id = ?2",
+                "UPDATE hosts SET last_seen_at = ?1, state = CASE WHEN EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) THEN state ELSE 'online' END, offline_since = NULL WHERE id = ?2 AND state != 'retired'",
                 params![&now, &host_id],
             )?;
             conn.execute(
@@ -788,6 +801,11 @@ impl Store {
                     "{}: at maxInstances {}",
                     host.host_id, host.max_instances
                 )));
+            }
+            if host.ssh.is_some() && !host.online {
+                return Err(StoreError::Id(
+                    "SSH host is not online; retry after reconnect".into(),
+                ));
             }
             let instance_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
             let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
@@ -1710,6 +1728,12 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             max_instances INTEGER NOT NULL DEFAULT 8,
             hostname TEXT
         );
+        CREATE TABLE IF NOT EXISTS ssh_hosts (
+            host_id TEXT PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
+            target TEXT NOT NULL UNIQUE,
+            policy_json TEXT NOT NULL,
+            last_error TEXT
+        );
         CREATE TABLE IF NOT EXISTS instances (
             id TEXT PRIMARY KEY,
             host_id TEXT NOT NULL,
@@ -2336,8 +2360,8 @@ fn touch_host_online(
 ) -> Result<HostRecord, StoreError> {
     let now = now_rfc3339();
     conn.execute(
-        "UPDATE hosts SET state = 'online', offline_since = NULL, last_seen_at = ?1, node_version = COALESCE(?2, node_version)
-         WHERE id = ?3",
+        "UPDATE hosts SET state = CASE WHEN EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) THEN state ELSE 'online' END, offline_since = NULL, last_seen_at = ?1, node_version = COALESCE(?2, node_version)
+         WHERE id = ?3 AND state != 'retired'",
         params![now, node_version, host_id],
     )?;
     load_host(conn, host_id)?.ok_or_else(|| StoreError::Id("host vanished after auth".into()))
@@ -2353,7 +2377,7 @@ struct HostDedupRow {
 fn dedup_duplicate_hosts(conn: &Connection) -> Result<(), rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, label, IFNULL(hostname, ''), state, IFNULL(last_seen_at, ''), created_at
-         FROM hosts",
+         FROM hosts WHERE NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id)",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -2417,7 +2441,7 @@ fn dedup_duplicate_hosts(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreError> {
+pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreError> {
     let row = conn
         .query_row(
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
@@ -2467,7 +2491,31 @@ fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreErr
         |row| row.get(0),
     )?;
     let labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
+    let managed = conn
+        .query_row(
+            "SELECT target, policy_json, last_error FROM ssh_hosts WHERE host_id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (ssh, last_error) = match managed {
+        Some((target, policy, error)) => (
+            Some(
+                json!({"target": target, "workspaceRoot": format!("/tmp/remuda-ssh-{id}/workspace"), "remudaBinaryPolicy": serde_json::from_str::<Value>(&policy)?}),
+            ),
+            error,
+        ),
+        None => (None, None),
+    };
     Ok(Some(HostRecord {
+        ssh,
+        last_error,
         host_id,
         label,
         online: state == "online",

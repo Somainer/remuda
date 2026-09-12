@@ -239,6 +239,12 @@ class HubStore {
     await this.refreshDevices();
   }
 
+  async refreshHosts() {
+    const hosts = await api.hostList();
+    const workspaces = await api.workspaceList();
+    this.emit({ hosts: hosts.items, workspaces: workspaces.items });
+  }
+
   async refresh() {
     const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
     this.emit({ instances: instances.items, interactions });

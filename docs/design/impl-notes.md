@@ -339,3 +339,23 @@ test result: FAILED. 12 passed; 1 failed; 0 ignored
 
 Likely ETXTBSY while replacing a still-running stub binary. Crate test isolation, not a workflow/lockfile issue.
 
+## hubnode codec status
+
+Landed on main: `remuda_protocol::hubnode` (`f8826c6`, `pub mod hubnode` +
+`src/hubnode.rs`), Hub `/v1/node` (`b578aba` `ws.rs`), Node
+`src/enroll.rs` + `src/transport/hubnode_codec.rs`, SSH enroll without
+translation. There is no uncommitted `src/hubnode/` directory; the module
+is the tracked file `crates/remuda-protocol/src/hubnode.rs`.
+
+**Stdio now:** `run_stdio` emits optional `node.auth` then JSON-RPC
+`node.hello` (`id`, persisted `hostId`, `transport`, `label`, `version`).
+Inbound `instance.create` / `send` / `cancel` / `respond` dispatch into a
+local `DevNode`. `journal.append` and `tty.frame` are acked; interaction
+methods go through `dispatch_interaction`. Legacy `{type:hub.hello|hub.ping}`
+is still answered.
+
+**Left:** bind stdio `DevNode` to the enrollment `hostId`; persist Hub
+`nodeToken` for the next `node.auth`; share one runtime with
+`WssLink::connect_runtime`; pump journal observations back to Hub over
+stdio; binary tty on stdio; schema/TS generation still exempts hubnode types.
+

@@ -86,6 +86,29 @@ pub struct RunningHub {
 }
 
 impl RunningHub {
+    /// Mint a scoped device token against this Hub's store (D-018).
+    ///
+    /// In-process equivalent of `POST /v1/login`, for components composed into
+    /// the same process as the Hub (`hub --with-dispatcher`, `remuda dev`).
+    /// They get a real, revocable device token instead of holding the pairing
+    /// access code, which under D-018 pairs devices and nothing else.
+    pub async fn mint_device_token(&self, device_name: &str) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let token = config::random_token();
+        let hash = auth::hash_secret(&token)?;
+        let prefix = auth::token_prefix(&token)
+            .ok_or_else(|| anyhow::anyhow!("generated device token is not indexable"))?
+            .to_owned();
+        store
+            .insert_device(device_name.to_owned(), hash, prefix)
+            .await
+            .map_err(|err| anyhow::anyhow!("mint device token: {err}"))?;
+        Ok(token)
+    }
+
     /// Mint a single-use Node enroll token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/hosts/enroll-token`, used by

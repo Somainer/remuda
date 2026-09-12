@@ -1642,16 +1642,19 @@ async fn node_socket(
 }
 
 /// D-018: the device access code pairs devices only. It must not enroll a
-/// Node, and it is one-shot per device name with a TTL.
+/// Node. Repeat pairing under the same name is allowed on purpose — see the
+/// note on `http::login`; the enforceable half of A2 is the TTL and rotation.
 #[tokio::test]
 async fn access_code_pairs_devices_but_never_enrolls_a_node() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
     let (cookie, _) = login(hub.addr, &bootstrap).await?;
 
-    // Same code, same device name: already redeemed.
+    // A repeat login under the same device name still succeeds: `deviceName` is
+    // unauthenticated, so refusing it would only break honest repeat clients
+    // (CLI, `hub --with-dispatcher`) without stopping an attacker.
     let body = json!({ "bootstrapToken": bootstrap, "deviceName": "test-phone" }).to_string();
     let (status, _, _) = http(hub.addr, "POST", "/v1/login", &[], Some(&body)).await?;
-    assert_eq!(status, 401, "access code must be one-shot per device");
+    assert_eq!(status, 200, "repeat pairing under the same name must work");
 
     // The access code must not authenticate a node socket.
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
@@ -1711,6 +1714,32 @@ async fn access_code_pairs_devices_but_never_enrolls_a_node() -> Result<()> {
         json!(-32000),
         "enroll token must be single use: {denied}"
     );
+    Ok(())
+}
+
+/// Regression: two clients sharing a hardcoded `deviceName` (the CLI and the
+/// `hub --with-dispatcher` combined mode both use `remuda-hub-client`) must
+/// both authenticate. A one-shot-per-name rule broke this with a 401.
+#[tokio::test]
+async fn repeat_pairing_under_a_shared_device_name_succeeds() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    for attempt in 0..3 {
+        let body =
+            json!({ "bootstrapToken": bootstrap, "deviceName": "remuda-hub-client" }).to_string();
+        let (status, head, rest) = http(hub.addr, "POST", "/v1/login", &[], Some(&body)).await?;
+        assert_eq!(status, 200, "attempt {attempt}: {rest}");
+        let cookie = cookie_from(&head).context("set-cookie")?;
+        // Each login mints a *distinct*, independently usable device token.
+        let (status, _, hosts) = http(
+            hub.addr,
+            "GET",
+            "/v1/hosts",
+            &[("Cookie", cookie.as_str())],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "attempt {attempt}: {hosts}");
+    }
     Ok(())
 }
 

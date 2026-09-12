@@ -492,19 +492,6 @@ impl Store {
         .await
     }
 
-    /// Whether a device with this name is already paired (D-018 one-shot).
-    pub async fn device_name_exists(&self, name: String) -> Result<bool, StoreError> {
-        self.run(move |conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM devices WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )?;
-            Ok(count > 0)
-        })
-        .await
-    }
-
     /// Indexed lookup, followed by one full-token verification. Legacy cookies
     /// may migrate using an explicit device id, never a scan of salted hashes.
     pub async fn find_device_by_token<F>(

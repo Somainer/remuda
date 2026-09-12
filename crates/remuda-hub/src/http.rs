@@ -137,8 +137,17 @@ pub async fn healthz() -> Json<Value> {
 
 /// `POST /v1/login` — bootstrap access code → device token + cookie.
 ///
-/// D-018: the access code pairs **devices** only. It is one-shot per device
-/// name and expires after `bootstrap_ttl_hours`; it never enrolls a Node.
+/// D-018: the access code pairs **devices** only — it never enrolls a Node —
+/// and it expires after `bootstrap_ttl_hours`, rotatable via
+/// `remuda hub rotate-bootstrap`.
+///
+/// It is deliberately *not* one-shot per device name. `deviceName` is
+/// caller-supplied and unauthenticated, so refusing a repeat name stops no
+/// attacker (they pick another name) while breaking legitimate repeat logins:
+/// `HubClient` holds its device token in memory only, so every CLI invocation
+/// and the `--with-dispatcher` combined mode re-login under a fixed name.
+/// Genuine one-shot-per-device needs the client to persist its device token
+/// first; until then TTL plus rotation is the enforceable half of A2.
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -151,19 +160,6 @@ pub async fn login(
     if !crate::auth::bootstrap_within_ttl(&state.config.data_dir, state.config.bootstrap_ttl_hours)
     {
         tracing::warn!("bootstrap access code expired; rotate with `remuda hub rotate-bootstrap`");
-        return Err(HubError::Unauthenticated);
-    }
-    // One-shot per device: the same code cannot silently pair a second device
-    // under the same name. Re-pairing requires a rotate or a pairing code.
-    if state
-        .store
-        .device_name_exists(body.device_name.clone())
-        .await?
-    {
-        tracing::warn!(
-            device = %body.device_name,
-            "bootstrap access code already redeemed for this device name"
-        );
         return Err(HubError::Unauthenticated);
     }
     let token = crate::config::random_token();

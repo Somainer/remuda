@@ -54,14 +54,20 @@ herdrx
     herdrx/web/src/lib/terminalTouch.ts
     herdrx/web/src/lib/displayPreferences.ts
     herdrx/web/src/components/TerminalPane.tsx
+    herdrx/internal/push/service.go
+    herdrx/internal/push/outbound.go
+    herdrx/internal/httpapi/push.go
   Local paths:
     web/src/features/session/tty/terminalFit.ts
     web/src/features/session/tty/terminalTouch.ts
     web/src/lib/viewport.ts
     web/src/features/session/tty/TerminalView.tsx
+    crates/remuda-push
   Fit/touch/IME/aux-key/viewport behaviour preserved in simplified form for
   Remuda tty-binary-v1 and Night Corral tokens. Font family is IBM Plex Mono
   instead of JetBrains Mono. Not a verbatim import.
+  Push: VAPID 0600 file, subscription upsert, 404/410 prune, and `/push/*`
+  JSON shape rewritten in Rust. Not a Go copy.
 
 -------------------------------------------------------------------------------
 Future Apache-2.0 imports (vibe-kanban, Herdr detect, Codex crates, …) must

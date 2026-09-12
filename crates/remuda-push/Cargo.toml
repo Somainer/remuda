@@ -1,0 +1,34 @@
+[package]
+name = "remuda-push"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Web Push (VAPID) for the Hub: subscriptions, RFC 8291 payloads, and an axum fragment."
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+base64 = "0.22"
+p256 = { version = "0.13", features = ["ecdsa"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+web-push = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+anyhow.workspace = true
+ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }

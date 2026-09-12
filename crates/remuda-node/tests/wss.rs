@@ -896,3 +896,391 @@ fn assert_unique_seqs(seqs: &[String]) {
         assert!(seen.insert(seq.clone()), "duplicate hub follow seq {seq}");
     }
 }
+
+/// Source: deterministic fake-claude and in-process Hub/Node, no model calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
+    use remuda_node::{
+        DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, native_driver_registry,
+    };
+    use remuda_protocol::{ActorType, CommandId, CommandOrigin, CommandState};
+    use remuda_testing::ensure_workspace_bin;
+    use std::sync::Arc;
+
+    async fn request(
+        addr: std::net::SocketAddr,
+        token: &str,
+        path: &str,
+        body: Option<Value>,
+        approval: Option<&str>,
+    ) -> (u16, Value) {
+        let auth = format!("Bearer {token}");
+        let mut headers = vec![("Authorization", auth.as_str())];
+        if let Some(id) = approval {
+            headers.push(("x-remuda-approval-id", id));
+        }
+        let body = body.map(|v| v.to_string());
+        let (status, text) = http(
+            addr,
+            if body.is_some() { "POST" } else { "GET" },
+            path,
+            &headers,
+            body.as_deref(),
+        )
+        .await;
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(json!({"raw":text})),
+        )
+    }
+    async fn settled(node: &DevNode, body: &Value) -> remuda_protocol::Command {
+        let id: CommandId = body["command"]["commandId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let command = node.get_command(&id).unwrap();
+                if command.state == CommandState::Settled {
+                    return command;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fake command settlement")
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
+        .await
+        .unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = DevServerConfig::loopback(0).with_workspace_root(workspace);
+    let native = NativeDriverConfig::new(dir.path().join("node"))
+        .with_claude_binary(ensure_workspace_bin("fake-claude"));
+    let node = DevNode::with_parts(
+        &config,
+        Arc::new(MemoryStore::open_journaled(dir.path().join("node-store"), 512).unwrap()),
+        native_driver_registry(native).unwrap(),
+    )
+    .unwrap();
+    let host = node.host().meta.id.as_id().as_str().to_string();
+    let link = WssLink::connect_runtime(
+        WssConfig::loopback(hub.addr, enroll_token(&hub).await, host.clone()),
+        node.clone(),
+    )
+    .await
+    .unwrap();
+    let (_, human) = login(hub.addr, &hub.bootstrap_token).await;
+
+    let (status, parent) = request(
+        hub.addr,
+        &human,
+        "/v1/instances",
+        Some(json!({"hostId":host,"permissionMode":"bypassPermissions","prompt":"human-origin"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{parent}");
+    let command = settled(&node, &parent).await;
+    assert_eq!(command.origin, CommandOrigin::Ui);
+    assert_eq!(command.actor.actor_type, ActorType::Human);
+    let parent_id = parent["instance"]["instanceId"].as_str().unwrap();
+    let recipe = node
+        .launch_recipe(&parent_id.parse().unwrap())
+        .unwrap()
+        .unwrap_or_else(|| panic!("Human launch failed: {command:?}"));
+    assert_eq!(
+        recipe.permission.cli_mode.as_deref(),
+        Some("bypassPermissions")
+    );
+    assert!(
+        recipe
+            .argv
+            .iter()
+            .any(|flag| flag == "--allow-dangerously-skip-permissions")
+    );
+    assert!(
+        !serde_json::to_string(&parent)
+            .unwrap()
+            .contains("agentCredential")
+    );
+
+    let (status, issued) = request(
+        hub.addr,
+        &human,
+        &format!("/v1/instances/{parent_id}/mcp-token"),
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{issued}");
+    let agent = issued["token"].as_str().unwrap();
+    let (_, context) = request(hub.addr, agent, "/v1/caller", None, None).await;
+    assert_eq!(context["origin"], "agent");
+    assert_eq!(context["instanceId"], parent_id);
+
+    let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
+    assert_eq!(status, 200, "{child}");
+    assert_eq!(child["instance"]["parentInstanceId"], parent_id);
+    assert_eq!(child["command"]["payload"]["origin"], "agent");
+    let command = settled(&node, &child).await;
+    assert_eq!(command.origin, CommandOrigin::Mcp);
+    assert_eq!(command.actor.actor_type, ActorType::Agent);
+    let child_id = child["instance"]["instanceId"].as_str().unwrap();
+    let recipe = node
+        .launch_recipe(&child_id.parse().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(recipe.permission.cli_mode.as_deref(), Some("default"));
+    let serialized = serde_json::to_string(&recipe).unwrap();
+    assert!(!serialized.contains(agent));
+    assert!(!serialized.contains("REMUDA_TOKEN"));
+    let (_, context) = request(hub.addr, agent, "/v1/caller", None, None).await;
+    assert!(
+        context["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == child_id)
+    );
+
+    let (status, denied_launch) = request(
+        hub.addr,
+        agent,
+        "/v1/instances",
+        Some(json!({"hostId":host,"permissionMode":"bypassPermissions"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{denied_launch}");
+    let denied = settled(&node, &denied_launch).await;
+    assert!(
+        serde_json::to_string(&denied.settlement)
+            .unwrap()
+            .contains("not allowed")
+    );
+    assert!(
+        node.launch_recipe(
+            &denied_launch["instance"]["instanceId"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let (status, sibling) = request(
+        hub.addr,
+        &human,
+        "/v1/instances",
+        Some(json!({"hostId":host,"permissionMode":"manual"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{sibling}");
+    settled(&node, &sibling).await;
+    let sibling_id = sibling["instance"]["instanceId"].as_str().unwrap();
+    let path = format!("/v1/instances/{sibling_id}/commands");
+    let command_id = CommandId::new();
+    let send = json!({"commandId":command_id, "operation":"instance.send", "payload":{"instanceId":parent_id,"input":{"text":"approved-cross-send","origin":"human"},"origin":"human"}});
+    let (status, held) = request(hub.addr, agent, &path, Some(send.clone()), None).await;
+    assert_eq!(status, 409, "{held}");
+    assert_eq!(held["code"], "HUMAN_APPROVAL_REQUIRED");
+    assert!(
+        node.get_command(&command_id).is_err(),
+        "approval must precede dispatch"
+    );
+    let approval = held["interactionId"].as_str().unwrap();
+    let (_, pending) = request(hub.addr, &human, "/v1/interactions", None, None).await;
+    let ticket = pending["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["interactionId"] == approval)
+        .unwrap();
+    assert_eq!(ticket["state"], "pending");
+    serde_json::from_value::<remuda_protocol::Interaction>(ticket.clone())
+        .expect("schema-valid broker interaction");
+    let answer = json!({"answer":{"kind":"approval","optionId":"allow-once","inputDigest":ticket["request"]["inputDigest"]}});
+    let answer_path = format!("/v1/interactions/{approval}/answer");
+    assert_eq!(
+        request(hub.addr, agent, &answer_path, Some(answer.clone()), None)
+            .await
+            .0,
+        403
+    );
+    let (status, answered) =
+        request(hub.addr, &human, &answer_path, Some(answer.clone()), None).await;
+    assert_eq!(status, 200, "{answered}");
+    assert_eq!(
+        request(hub.addr, &human, &answer_path, Some(answer), None)
+            .await
+            .0,
+        409,
+        "first answer wins"
+    );
+    let mut changed = send.clone();
+    changed["payload"]["input"]["text"] = json!("different action");
+    assert_eq!(
+        request(hub.addr, agent, &path, Some(changed), Some(approval))
+            .await
+            .0,
+        403
+    );
+    let (status, sent) = request(hub.addr, agent, &path, Some(send.clone()), Some(approval)).await;
+    assert_eq!(status, 200, "{sent}");
+    assert_eq!(sent["command"]["payload"]["instanceId"], sibling_id);
+    assert_eq!(settled(&node, &sent).await.origin, CommandOrigin::Mcp);
+    assert_eq!(
+        request(hub.addr, agent, &path, Some(send), Some(approval))
+            .await
+            .0,
+        403,
+        "approval cannot be replayed"
+    );
+
+    let child_path = format!("/v1/instances/{child_id}/commands");
+    let (status, sent) = request(
+        hub.addr,
+        agent,
+        &child_path,
+        Some(json!({"operation":"instance.send","payload":{"prompt":"own-child"}})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{sent}");
+    assert_eq!(settled(&node, &sent).await.origin, CommandOrigin::Mcp);
+    let (status, sent) = request(hub.addr, &human, &child_path, Some(json!({"operation":"instance.send","payload":{"prompt":"human-after-agent","origin":"agent"}})), None).await;
+    assert_eq!(status, 200, "{sent}");
+    assert_eq!(settled(&node, &sent).await.origin, CommandOrigin::Ui);
+    assert_eq!(
+        request(
+            hub.addr,
+            agent,
+            &child_path,
+            Some(json!({"operation":"tty.write","payload":{"keys":["enter"]}})),
+            None
+        )
+        .await
+        .0,
+        409,
+        "keys require approval even for a child"
+    );
+    assert_eq!(
+        request(
+            hub.addr,
+            agent,
+            "/v1/devices/pair-code",
+            Some(json!({})),
+            None
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request(
+            hub.addr,
+            agent,
+            &format!("/v1/instances/{child_id}/mcp-token"),
+            Some(json!({})),
+            None
+        )
+        .await
+        .0,
+        403
+    );
+
+    // A terminal's initial prompt is raw input too: aliases cannot bypass the
+    // same approval gate by using create instead of keys.
+    let before_shell = node.list_instances().unwrap().items.len();
+    for alias in ["shell-pty", "shell", "terminal"] {
+        let (status, held) = request(
+            hub.addr,
+            agent,
+            "/v1/instances",
+            Some(json!({"hostId":host,"kind":"terminal","driver":alias,"prompt":"echo held"})),
+            None,
+        )
+        .await;
+        assert_eq!(status, 409, "{held}");
+        assert_eq!(held["code"], "HUMAN_APPROVAL_REQUIRED");
+    }
+    assert_eq!(node.list_instances().unwrap().items.len(), before_shell);
+
+    let remote_id = HostId::new().as_id().as_str().to_string();
+    let remote = WssLink::connect(WssConfig::loopback(
+        hub.addr,
+        &hub.bootstrap_token,
+        remote_id.clone(),
+    ))
+    .await
+    .unwrap();
+    let (status, cross_create) = request(
+        hub.addr,
+        agent,
+        "/v1/instances",
+        Some(json!({"hostId":remote_id})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "{cross_create}");
+    assert_eq!(cross_create["code"], "HUMAN_APPROVAL_REQUIRED");
+
+    let (status, bot_login) = http(hub.addr, "POST", "/v1/login", &[], Some(&json!({"bootstrapToken":hub.bootstrap_token,"deviceName":"dispatcher","deviceKind":"bot"}).to_string())).await;
+    assert_eq!(status, 200, "{bot_login}");
+    let bot_login: Value = serde_json::from_str(&bot_login).unwrap();
+    let bot = bot_login["token"].as_str().unwrap();
+    let (status, bot_create) = request(
+        hub.addr,
+        bot,
+        "/v1/instances",
+        Some(json!({"hostId":host,"permissionMode":"bypassPermissions"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{bot_create}");
+    let bot_command = settled(&node, &bot_create).await;
+    assert_eq!(bot_command.origin, CommandOrigin::Bot);
+    assert!(
+        serde_json::to_string(&bot_command.settlement)
+            .unwrap()
+            .contains("not allowed")
+    );
+
+    let (status, sent) = request(
+        hub.addr,
+        bot,
+        &child_path,
+        Some(
+            json!({"operation":"instance.send","payload":{"prompt":"bot-origin","origin":"human"}}),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{sent}");
+    let command = settled(&node, &sent).await;
+    assert_eq!(command.origin, CommandOrigin::Bot);
+    assert_eq!(command.actor.actor_type, ActorType::Bot);
+
+    for id in [parent_id, child_id, sibling_id] {
+        let (_, closed) = request(
+            hub.addr,
+            &human,
+            &format!("/v1/instances/{id}/commands"),
+            Some(json!({"operation":"instance.close"})),
+            None,
+        )
+        .await;
+        settled(&node, &closed).await;
+    }
+    remote.shutdown().await;
+    link.shutdown().await;
+    hub.shutdown().await;
+}

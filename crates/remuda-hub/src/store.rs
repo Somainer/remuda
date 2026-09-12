@@ -437,11 +437,9 @@ impl Store {
                 None => new_id("hst").map_err(|e| StoreError::Id(e.to_string()))?,
             };
             if load_host(conn, &host_id)?.is_some() {
-                let host = touch_host_online(conn, &host_id, &request.node_version)?;
-                return Ok(HostAuthOutcome::Authenticated {
-                    host: Box::new(host),
-                    node_token: None,
-                });
+                // Bootstrap authorizes enrollment only. Reconnecting to an
+                // existing identity requires its own host token above.
+                return Ok(HostAuthOutcome::Rejected);
             }
             let node_token = crate::config::random_token();
             let token_hash = hash_new(&node_token)?;
@@ -1699,7 +1697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_reannounce_updates_the_same_host() {
+    async fn existing_host_requires_its_own_token() {
         let dir = tempfile::tempdir().expect("data dir");
         let store = Store::open(dir.path()).expect("store");
         let host_id = new_id("hst").expect("host id");
@@ -1713,18 +1711,22 @@ mod tests {
                     node_version: Some("1".into()),
                 },
                 |_, _| false,
-                |_| Ok("hash-1".into()),
+                |token| Ok(format!("hash:{token}")),
             )
             .await
             .expect("first enroll");
         let HostAuthOutcome::Authenticated {
             host,
-            node_token: Some(_),
+            node_token: Some(node_token),
         } = first
         else {
             panic!("first enroll must insert a host token");
         };
         assert_eq!(host.host_id, host_id);
+        store
+            .mark_host_offline(host_id.clone())
+            .await
+            .expect("offline");
         let second = store
             .authenticate_host(
                 HostAuthRequest {
@@ -1739,10 +1741,37 @@ mod tests {
             )
             .await
             .expect("reannounce");
+        assert!(matches!(second, HostAuthOutcome::Rejected));
+        let existing = store
+            .get_host(host_id.clone())
+            .await
+            .expect("query")
+            .expect("host");
+        assert!(
+            !existing.online,
+            "rejected enrollment must not change liveness"
+        );
+        assert_eq!(existing.node_version.as_deref(), Some("1"));
+        let authenticated = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: node_token,
+                    bootstrap: "bootstrap".into(),
+                    // A host token authenticates its owner, regardless of a
+                    // different identity claimed in the hello payload.
+                    hello_host_id: Some(new_id("hst").expect("other host")),
+                    label: Some("attacker label".into()),
+                    node_version: Some("2".into()),
+                },
+                |token, hash| hash == format!("hash:{token}"),
+                |_| panic!("reconnect must not mint a new token"),
+            )
+            .await
+            .expect("host token reconnect");
         let HostAuthOutcome::Authenticated {
             host,
             node_token: None,
-        } = second
+        } = authenticated
         else {
             panic!("reannounce must update without inserting");
         };

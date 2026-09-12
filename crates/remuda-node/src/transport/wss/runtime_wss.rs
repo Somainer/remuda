@@ -102,6 +102,9 @@ async fn dispatch_hub(
             catch_up(runtime, &instance_id).await?;
             Ok(result)
         }
+        Some(HubNodeMethod::TtyResize | HubNodeMethod::TtyAttach) => {
+            crate::transport::hubnode::dispatch_method(&runtime.node, method, params).await
+        }
         _ if method == "instance.close" => {
             let (instance_id, result) = close_from_params(&runtime.node, params).await?;
             catch_up(runtime, &instance_id).await?;
@@ -327,9 +330,31 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
         .ok_or_else(|| NodeError::InvalidRequest("tty.write requires instanceId".into()))?;
     let instance_id = InstanceId::try_from(instance_id.to_owned())
         .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
+    if let Some(raw) = parsed
+        .data_base64
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        let bytes = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(raw.as_bytes())
+                .map_err(|error| {
+                    NodeError::InvalidRequest(format!("invalid dataBase64: {error}"))
+                })?
+        };
+        node.tty().write_bytes(&instance_id, &bytes).await?;
+        return Ok((instance_id, json!({ "ok": true, "accepted": "tty-bytes" })));
+    }
     let keys = parsed.key_names();
     if keys.is_empty() {
-        return Err(NodeError::InvalidRequest("tty.write requires keys".into()));
+        return Err(NodeError::InvalidRequest(
+            "tty.write requires keys or dataBase64".into(),
+        ));
+    }
+    let mapped = remuda_driver::logical_keys_to_bytes(&keys);
+    if node.tty().write_bytes(&instance_id, &mapped).await.is_ok() {
+        return Ok((instance_id, json!({ "ok": true, "accepted": "tty-bytes" })));
     }
     let command_id = parsed
         .command_id
@@ -400,6 +425,7 @@ async fn respond_from_params(
 fn driver_kind_from_str(raw: &str) -> Option<DriverKind> {
     match raw {
         "pty" | "generic-pty" | "generic_pty" | "genericPty" => Some(DriverKind::GenericPty),
+        "shell" | "shell-pty" | "terminal" => Some(DriverKind::ShellPty),
         other => serde_json::from_value(json!(other)).ok(),
     }
 }

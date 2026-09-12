@@ -221,6 +221,11 @@
           "const": "generic-herdr",
           "description": "Wire value `generic-herdr`.",
           "type": "string"
+        },
+        {
+          "const": "shell-pty",
+          "description": "Wire value `shell-pty`.",
+          "type": "string"
         }
       ]
     },
@@ -250,6 +255,11 @@
         {
           "const": "generic",
           "description": "Wire value `generic`.",
+          "type": "string"
+        },
+        {
+          "const": "terminal",
+          "description": "Wire value `terminal`.",
           "type": "string"
         }
       ]
@@ -712,12 +722,17 @@
       "oneOf": [
         {
           "const": "tty-output",
-          "description": "Terminal output, never terminal input.",
+          "description": "Terminal output (ANSI / PTY bytes).",
           "type": "string"
         },
         {
           "const": "object-chunk",
           "description": "Object transfer chunk.",
+          "type": "string"
+        },
+        {
+          "const": "tty-input",
+          "description": "Terminal input: raw bytes as the client emitted them (keyboard and mouse).",
           "type": "string"
         }
       ]
@@ -1152,6 +1167,20 @@
             "type",
             "inputDelivery",
             "argvInputPolicy"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Login `$SHELL` in a local PTY (`shell-pty` / kind `terminal`).",
+          "properties": {
+            "type": {
+              "const": "shell-pty",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
           ],
           "type": "object"
         }
@@ -3021,6 +3050,11 @@
         {
           "const": "generic-pty",
           "description": "Wire value `generic-pty`.",
+          "type": "string"
+        },
+        {
+          "const": "shell-pty",
+          "description": "Wire value `shell-pty`.",
           "type": "string"
         }
       ]
@@ -14845,6 +14879,13 @@
         "snapshotAtOffset": {
           "$ref": "#/$defs/Knowledge3",
           "description": "`snapshot_at_offset`; protocol §7.4."
+        },
+        "snapshotBase64": {
+          "description": "Bounded snapshot bytes (standard base64) for attach-time replay; D-016.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "streamEpoch": {
           "$ref": "#/$defs/Id",

@@ -1169,6 +1169,7 @@ fn agent_wire(kind: AgentKind) -> &'static str {
         AgentKind::Grok => "grok",
         AgentKind::Agy => "agy",
         AgentKind::Generic => "generic",
+        AgentKind::Terminal => "terminal",
     }
 }
 
@@ -1178,6 +1179,7 @@ fn agent_from_wire(raw: &str) -> AgentKind {
         "grok" => AgentKind::Grok,
         "agy" => AgentKind::Agy,
         "generic" => AgentKind::Generic,
+        "terminal" => AgentKind::Terminal,
         _ => AgentKind::Claude,
     }
 }

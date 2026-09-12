@@ -183,11 +183,18 @@ where
 
     let mut input = BufReader::new(input).lines();
     let (journal_tx, mut journal_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
+    let (tty_tx, mut tty_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
+    spawn_stdio_tty_pump(node.clone(), tty_tx);
     let mut pumps = HashMap::<InstanceId, JoinHandle<()>>::new();
 
     loop {
         tokio::select! {
             frame = journal_rx.recv(), if !pumps.is_empty() => {
+                if let Some(frame) = frame {
+                    write_ndjson(&mut output, &frame).await?;
+                }
+            }
+            frame = tty_rx.recv() => {
                 if let Some(frame) = frame {
                     write_ndjson(&mut output, &frame).await?;
                 }
@@ -404,6 +411,58 @@ fn reply_legacy(enrollment: &Enrollment, frame: &Value) -> Value {
             "NDJSON application frame requires type or method",
         ),
     }
+}
+
+fn spawn_stdio_tty_pump(node: DevNode, output: mpsc::Sender<Value>) {
+    tokio::spawn(async move {
+        let mut events = node.tty().subscribe();
+        loop {
+            match events.recv().await {
+                Ok(crate::TtyEvent::Open {
+                    instance_id,
+                    stream_id,
+                }) => {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "tty.frame",
+                        "params": {
+                            "instanceId": instance_id,
+                            "streamId": stream_id,
+                            "channel": 1,
+                            "offset": "0",
+                        }
+                    });
+                    if output.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(crate::TtyEvent::Bytes {
+                    instance_id,
+                    stream_id,
+                    offset,
+                    payload,
+                }) => {
+                    use base64::Engine;
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "tty.frame",
+                        "params": {
+                            "instanceId": instance_id,
+                            "streamId": stream_id,
+                            "channel": 1,
+                            "offset": offset.to_string(),
+                            "dataBase64": base64::engine::general_purpose::STANDARD.encode(&payload),
+                        }
+                    });
+                    if output.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 fn ensure_journal_pump(

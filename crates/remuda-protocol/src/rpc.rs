@@ -855,6 +855,9 @@ pub struct TtyAttachResult {
     /// `writer_lease`; protocol §7.4.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub writer_lease: Option<TtyWriterLease>,
+    /// Bounded snapshot bytes (standard base64) for attach-time replay; D-016.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_base64: Option<String>,
 }
 
 /// TtyDetachParams; `protocol.md` §7.4.

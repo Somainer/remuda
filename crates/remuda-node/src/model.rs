@@ -20,6 +20,7 @@ fn deserialize_driver_kind<'de, D: serde::Deserializer<'de>>(
     let raw = String::deserialize(deserializer)?;
     match raw.as_str() {
         "pty" => Ok(DriverKind::GenericPty),
+        "shell" | "terminal" | "shell-pty" => Ok(DriverKind::ShellPty),
         other => serde_json::from_value(serde_json::Value::String(other.to_owned()))
             .map_err(serde::de::Error::custom),
     }

@@ -554,31 +554,34 @@ async fn web_jsonrpc_shape_can_create_and_follow_a_live_fixture() {
 #[tokio::test]
 async fn tty_endpoint_emits_protocol_v1_binary_fixture() {
     let server = spawn_server(DevServerConfig::loopback(0)).await;
-    let created = http_json(
-        server.address,
-        "POST",
-        "/v1/instances",
-        Some(include_str!("fixtures/create-instance.json")),
-        &[],
-    )
-    .await;
+    let body = serde_json::json!({
+        "kind": "terminal",
+        "driver": "shell-pty",
+        "args": ["python3", "-u", "-c", "import os,sys\nos.write(1,b'hello-tty')\nos.read(0,1)"],
+        "prompt": ""
+    })
+    .to_string();
+    let created = http_json(server.address, "POST", "/v1/instances", Some(&body), &[]).await;
     let instance_id = created.body["instance"]["id"]
         .as_str()
         .expect("instance id");
-    let (mut tty, _) = connect_async(format!(
-        "ws://{}/v1/instances/{instance_id}/tty",
-        server.address
-    ))
-    .await
-    .expect("connect TTY fixture");
-    let frame = tokio::time::timeout(Duration::from_secs(3), tty.next())
-        .await
-        .expect("TTY timeout")
-        .expect("TTY socket open")
-        .expect("TTY frame valid");
-    let Message::Binary(bytes) = frame else {
-        panic!("expected binary TTY frame");
-    };
+    let url = format!("ws://{}/v1/instances/{instance_id}/tty", server.address);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let mut bytes = None;
+    while tokio::time::Instant::now() < deadline {
+        let Ok((mut tty, _)) = connect_async(&url).await else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        match tokio::time::timeout(Duration::from_millis(400), tty.next()).await {
+            Ok(Some(Ok(Message::Binary(frame)))) => {
+                bytes = Some(frame);
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let bytes = bytes.expect("expected binary TTY frame");
     assert!(bytes.len() > 32);
     assert_eq!(&bytes[..4], &[1, 1, 0, 0]);
     assert_eq!(

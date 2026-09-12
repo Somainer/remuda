@@ -21,6 +21,7 @@ keychain = []
 async-trait = "0.1"
 chacha20poly1305 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
+portable-pty.workspace = true
 remuda-claude-wire.workspace = true
 remuda-herdr.workspace = true
 remuda-protocol.workspace = true

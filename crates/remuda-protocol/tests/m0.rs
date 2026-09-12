@@ -195,6 +195,11 @@ fn binary_header_preserves_uuid_big_endian_offset_and_split_utf8() {
         decode_binary_frame(&frame, 3).unwrap().0.channel,
         BinaryChannel::ObjectChunk
     );
+    frame[1] = 3;
+    assert_eq!(
+        decode_binary_frame(&frame, 3).unwrap().0.channel,
+        BinaryChannel::TtyInput
+    );
 }
 
 #[test]
@@ -222,7 +227,7 @@ fn binary_ingress_rejects_invalid_lengths_versions_ids_and_ranges() {
         decode_binary_frame(&extra, 3).unwrap_err(),
         BinaryFrameError::LengthMismatch
     );
-    for (index, value) in [(0, 2), (1, 3), (2, 1), (3, 1)] {
+    for (index, value) in [(0, 2), (1, 4), (2, 1), (3, 1)] {
         let mut bad = frame.clone();
         bad[index] = value;
         assert_eq!(

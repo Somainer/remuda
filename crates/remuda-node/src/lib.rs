@@ -59,4 +59,8 @@ pub use transport::{
     Backoff, HubRequest, JournalSender, NodeTransport, TransportMetrics, TransportMetricsSnapshot,
     WssCarrier, WssConfig, WssLink,
 };
-pub use tty::{TTY_CHANNEL_OUTPUT, TTY_FRAME_HEADER_BYTES, encode_tty_frame};
+pub use tty::{
+    TTY_CHANNEL_INPUT, TTY_CHANNEL_OUTPUT, TTY_DEFAULT_COLS, TTY_DEFAULT_ROWS,
+    TTY_FRAME_HEADER_BYTES, TTY_MAX_INPUT_BYTES, TtyAttach, TtyEvent, TtyRegistry,
+    decode_tty_input, encode_tty_frame, encode_tty_input,
+};

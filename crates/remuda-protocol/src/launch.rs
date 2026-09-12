@@ -443,6 +443,9 @@ pub enum CarrierSpec {
     /// Native daemon job; opening an attach pane is a separate explicit Command.
     #[serde(rename = "claude-bg")]
     ClaudeBg(Box<ClaudeBgCarrier>),
+    /// Login `$SHELL` in a local PTY (`shell-pty` / kind `terminal`).
+    #[serde(rename = "shell-pty")]
+    ShellPty,
 }
 
 impl<'de> Deserialize<'de> for CarrierSpec {
@@ -462,6 +465,10 @@ impl<'de> Deserialize<'de> for CarrierSpec {
                 .map(Box::new)
                 .map(Self::ClaudeBg)
                 .map_err(serde::de::Error::custom),
+            Some("shell-pty") if fields.is_empty() => Ok(Self::ShellPty),
+            Some("shell-pty") => Err(serde::de::Error::custom(
+                "shell-pty carrier accepts only type",
+            )),
             _ => Err(serde::de::Error::custom("unknown carrier type")),
         }
     }

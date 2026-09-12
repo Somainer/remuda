@@ -2,7 +2,7 @@
 
 use crate::{
     CommandAction, CreateInstanceRequest, DevNode, DevServerConfig, InstanceCommandRequest,
-    NodeError, encode_tty_frame,
+    NodeError, TTY_MAX_INPUT_BYTES, decode_tty_input, encode_tty_frame,
 };
 use axum::{
     Json, Router,
@@ -39,7 +39,6 @@ const ACCESS_CODE_HEADER: &str = "x-remuda-access-code";
 const ACCESS_CODE_COOKIE: &str = "remuda_dev_access_code";
 const MAX_JSON_FRAME_BYTES: usize = 1024 * 1024;
 const DEFAULT_EVENT_LIMIT: usize = 128;
-const TTY_FIXTURE: &[u8] = b"\x1b[2J\x1b[HRemuda local TTY fixture\r\n";
 
 #[derive(Clone)]
 struct AppState {
@@ -320,23 +319,73 @@ async fn tty_upgrade(
     state.node.get_instance(&instance_id)?;
     Ok(upgrade
         .max_message_size(MAX_JSON_FRAME_BYTES)
-        .on_upgrade(tty_socket)
+        .on_upgrade(move |socket| tty_socket(socket, state.node, instance_id))
         .into_response())
 }
 
-async fn tty_socket(mut socket: WebSocket) {
-    let stream_id = match Id::new("tty") {
-        Ok(value) => value,
+async fn tty_socket(
+    mut socket: WebSocket,
+    node: DevNode,
+    instance_id: remuda_protocol::InstanceId,
+) {
+    let attached = match node.tty().attach(&instance_id).await {
+        Ok(attached) => attached,
         Err(error) => {
-            tracing::error!(%error, "failed to allocate TTY fixture stream");
+            tracing::debug!(%error, "tty attach on local socket");
             return;
         }
     };
-    match encode_tty_frame(&stream_id, 0, TTY_FIXTURE) {
-        Ok(frame) => {
-            let _ = socket.send(Message::Binary(frame.into())).await;
+    let stream_id = attached.stream_id.clone();
+    if !attached.snapshot.is_empty() {
+        match encode_tty_frame(&stream_id, attached.available_from, &attached.snapshot) {
+            Ok(frame) => {
+                let _ = socket.send(Message::Binary(frame.into())).await;
+            }
+            Err(error) => tracing::error!(%error, "failed to encode TTY snapshot"),
         }
-        Err(error) => tracing::error!(%error, "failed to encode TTY fixture frame"),
+    }
+    let mut events = node.tty().subscribe();
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                let Some(Ok(msg)) = incoming else { break; };
+                match msg {
+                    Message::Binary(bytes) => {
+                        if let Ok((_, payload)) = decode_tty_input(&bytes, TTY_MAX_INPUT_BYTES as u32)
+                            && node.tty().write_bytes(&instance_id, &payload).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Message::Text(text) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text)
+                            && value.get("type").and_then(Value::as_str) == Some("tty.resize")
+                        {
+                            let cols = value.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+                            let rows = value.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+                            let _ = node.tty().resize(&instance_id, cols, rows).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(crate::TtyEvent::Bytes { instance_id: id, stream_id: sid, offset, payload })
+                        if id == instance_id =>
+                    {
+                        if let Ok(frame) = encode_tty_frame(&sid, offset, &payload)
+                            && socket.send(Message::Binary(frame.into())).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
     }
 }
 
@@ -661,10 +710,12 @@ async fn client_socket(socket: WebSocket, node: DevNode) {
         }
 
         if envelope.method == "tty.attach" {
-            match tty_attach(&node, &envelope.params) {
-                Ok((result, frame)) => {
+            match tty_attach(&node, &envelope.params).await {
+                Ok((result, frames)) => {
                     let _ = queue_json(&outgoing, rpc_success(&envelope.id, result)).await;
-                    let _ = outgoing.send(Message::Binary(frame.into())).await;
+                    for frame in frames {
+                        let _ = outgoing.send(Message::Binary(frame.into())).await;
+                    }
                 }
                 Err(error) => {
                     let _ = queue_json(&outgoing, rpc_node_failure(&envelope.id, error)).await;
@@ -862,16 +913,22 @@ async fn dispatch_rpc(
                 .ok_or_else(|| NodeError::InvalidRequest("events.ack requires throughSeq".to_owned()))?,
         })),
         "events.unsubscribe" | "tty.detach" => Ok(Value::Null),
-        "tty.resize" => Ok(json!({
-            "resizeRevision": params
-                .get("resizeRevision")
-                .cloned()
-                .unwrap_or_else(|| json!("1")),
-            "cols": params.get("cols").cloned().unwrap_or_else(|| json!(80)),
-            "rows": params.get("rows").cloned().unwrap_or_else(|| json!(24)),
-        })),
+        "tty.resize" => {
+            let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
+            let cols = params.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+            let rows = params.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+            let (cols, rows) = node.tty().resize(&instance_id, cols, rows).await?;
+            Ok(json!({ "resizeRevision": "1", "cols": cols, "rows": rows }))
+        }
         "tty.write" | "instance.keys" => {
             let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
+            if let Some(raw) = params.get("dataBase64").and_then(Value::as_str)
+                && !raw.is_empty()
+            {
+                let bytes = decode_data_base64(raw)?;
+                node.tty().write_bytes(&instance_id, &bytes).await?;
+                return Ok(json!({ "ok": true, "accepted": "tty-bytes" }));
+            }
             let keys: Vec<String> = params
                 .get("keys")
                 .and_then(Value::as_array)
@@ -885,8 +942,12 @@ async fn dispatch_rpc(
                 .unwrap_or_default();
             if keys.is_empty() {
                 return Err(NodeError::InvalidRequest(
-                    "tty.write requires keys".to_owned(),
+                    "tty.write requires keys or dataBase64".to_owned(),
                 ));
+            }
+            let bytes = remuda_driver::logical_keys_to_bytes(&keys);
+            if node.tty().write_bytes(&instance_id, &bytes).await.is_ok() {
+                return Ok(json!({ "ok": true, "accepted": "tty-bytes" }));
             }
             let result = node
                 .submit_command(
@@ -1002,7 +1063,7 @@ fn runtime_hello(params: &Value, connection_id: Option<&Id>) -> Result<Value, No
     }))
 }
 
-fn tty_attach(node: &DevNode, params: &Value) -> Result<(Value, Vec<u8>), NodeError> {
+async fn tty_attach(node: &DevNode, params: &Value) -> Result<(Value, Vec<Vec<u8>>), NodeError> {
     let instance_id = parse_id_field::<InstanceId>(params, "instanceId")?;
     let instance = node.get_instance(&instance_id)?;
     if let Some(requested_generation) = optional_u64_field(params, "processGeneration")?
@@ -1010,19 +1071,16 @@ fn tty_attach(node: &DevNode, params: &Value) -> Result<(Value, Vec<u8>), NodeEr
     {
         return Err(NodeError::Conflict("stale process generation".to_owned()));
     }
-    let stream_id = Id::new("tty")?;
-    let frame = encode_tty_frame(&stream_id, 0, TTY_FIXTURE)?;
-    let result = json!({
-        "streamId": stream_id,
-        "streamEpoch": Id::new("epoch")?,
-        "representation": "rendered-ansi",
-        "nextOffset": TTY_FIXTURE.len().to_string(),
-        "availableFrom": "0",
-        "screenSnapshotRef": null,
-        "snapshotAtOffset": {"state": "known", "value": "0"},
-        "writerLease": null
-    });
-    Ok((result, frame))
+    let attached = node.tty().attach(&instance_id).await?;
+    let mut frames = Vec::new();
+    if !attached.snapshot.is_empty() {
+        frames.push(encode_tty_frame(
+            &attached.stream_id,
+            attached.available_from,
+            &attached.snapshot,
+        )?);
+    }
+    Ok((attached.into_json()?, frames))
 }
 
 fn parse_instance_id(raw: &str) -> ApiResult<InstanceId> {
@@ -1041,6 +1099,13 @@ where
         .and_then(Value::as_str)
         .ok_or_else(|| NodeError::InvalidRequest(format!("missing {name}")))?;
     T::from_str(raw).map_err(NodeError::from)
+}
+
+fn decode_data_base64(raw: &str) -> Result<Vec<u8>, NodeError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(raw.as_bytes())
+        .map_err(|error| NodeError::InvalidRequest(format!("invalid dataBase64: {error}")))
 }
 
 fn optional_id_field<T>(params: &Value, name: &str) -> Result<Option<T>, NodeError>

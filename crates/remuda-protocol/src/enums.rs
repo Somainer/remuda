@@ -6,6 +6,7 @@ wire_enum!(AgentKind, "1.3", {
     Grok => "grok",
     Agy => "agy",
     Generic => "generic",
+    Terminal => "terminal",
 });
 
 wire_enum!(DriverKind, "3.1", {
@@ -16,6 +17,7 @@ wire_enum!(DriverKind, "3.1", {
     GrokAcp => "grok-acp",
     AgyPrint => "agy-print",
     GenericPty => "generic-pty",
+    ShellPty => "shell-pty",
 });
 
 wire_enum!(HostState, "2.1", {
@@ -845,4 +847,5 @@ wire_enum!(AdapterTransport, "3.2", {
     GrokAcp => "grok-acp",
     AgyNative => "agy-native",
     GenericHerdr => "generic-herdr",
+    ShellPty => "shell-pty",
 });

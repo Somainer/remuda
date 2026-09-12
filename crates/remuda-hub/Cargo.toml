@@ -19,6 +19,7 @@ embed-web = []
 anyhow.workspace = true
 argon2.workspace = true
 axum.workspace = true
+base64 = "0.22"
 futures.workspace = true
 remuda-driver.workspace = true
 remuda-protocol.workspace = true

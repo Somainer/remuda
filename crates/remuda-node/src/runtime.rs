@@ -3,7 +3,7 @@
 use crate::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, Driver, DriverEmission,
     DriverLaunch, DriverRegistry, DriverRequest, InstanceCommandRequest, InteractionRuntime,
-    LocalStore, MemoryStore, NodeError,
+    LocalStore, MemoryStore, NodeError, TtyRegistry,
     store::{timestamp_now, unknown},
 };
 use futures::FutureExt;
@@ -48,6 +48,7 @@ pub(crate) struct DevNodeInner {
     host: Host,
     workspace: Workspace,
     projection_epoch: Id,
+    tty: TtyRegistry,
 }
 
 /// In-process Node used by the development REST/JSON-RPC/WS surface.
@@ -112,6 +113,7 @@ impl DevNode {
                 host,
                 workspace,
                 projection_epoch: Id::new("epoch")?,
+                tty: TtyRegistry::new(),
             }),
         })
     }
@@ -124,6 +126,12 @@ impl DevNode {
     /// Return the local development Workspace registry record.
     pub fn workspace(&self) -> Workspace {
         self.inner.workspace.clone()
+    }
+
+    /// Per-instance TTY bridges (herdr control / shell-pty).
+    #[must_use]
+    pub fn tty(&self) -> &TtyRegistry {
+        &self.inner.tty
     }
 
     /// Persisted launch recipe for an Instance, if the driver wrote one.
@@ -445,6 +453,7 @@ impl DevNode {
             .insert(instance_id.clone(), driver.clone());
         let store = self.inner.store.clone();
         let interactions = Arc::clone(&self.inner.interactions);
+        let tty = self.inner.tty.clone();
         let worker_instance = instance_id.clone();
         let worker = tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(materialize_instance(
@@ -453,6 +462,7 @@ impl DevNode {
                 driver,
                 receiver,
                 interactions,
+                tty,
                 create_command,
                 initial_prompt,
             ))
@@ -574,6 +584,7 @@ async fn materialize_instance(
     driver: Arc<dyn Driver>,
     mut receiver: mpsc::Receiver<QueuedCommand>,
     interactions: Arc<InteractionRuntime>,
+    tty: TtyRegistry,
     mut create_command: Command,
     initial_prompt: String,
 ) -> Result<(), NodeError> {
@@ -621,6 +632,22 @@ async fn materialize_instance(
     if let Some(recipe) = driver.launch_recipe() {
         store.put_launch_recipe(&instance_id, &recipe)?;
     }
+    if let Some(bridge) = driver.tty_bridge().await
+        && let Err(error) = tty
+            .start(
+                instance_id.clone(),
+                bridge,
+                crate::TTY_DEFAULT_COLS,
+                crate::TTY_DEFAULT_ROWS,
+            )
+            .await
+    {
+        tracing::warn!(
+            %error,
+            instance_id = %instance_id.as_id(),
+            "tty bridge failed to start"
+        );
+    }
     append_instance_lifecycle(
         store.as_ref(),
         &instance_id,
@@ -648,7 +675,9 @@ async fn materialize_instance(
         .await?;
     }
 
-    instance_worker(store, instance_id, driver, receiver, interactions).await
+    let result = instance_worker(store, instance_id.clone(), driver, receiver, interactions).await;
+    tty.stop(&instance_id).await;
+    result
 }
 
 async fn reject_materialization(
@@ -956,6 +985,8 @@ fn validate_kind_driver(
             | (AgentKind::Grok, remuda_protocol::DriverKind::GenericPty)
             | (AgentKind::Agy, remuda_protocol::DriverKind::GenericPty)
             | (AgentKind::Generic, remuda_protocol::DriverKind::GenericPty)
+            | (AgentKind::Terminal, remuda_protocol::DriverKind::ShellPty)
+            | (AgentKind::Generic, remuda_protocol::DriverKind::ShellPty)
     );
     if valid {
         Ok(())
@@ -1365,7 +1396,16 @@ fn fixture_capabilities(
             fork: unsupported.clone(),
             structured_workflow: unsupported.clone(),
             artifact: unsupported.clone(),
-            tty_attach: unsupported.clone(),
+            tty_attach: if matches!(
+                driver,
+                remuda_protocol::DriverKind::GenericPty
+                    | remuda_protocol::DriverKind::ClaudePty
+                    | remuda_protocol::DriverKind::ShellPty
+            ) {
+                supported.clone()
+            } else {
+                unsupported.clone()
+            },
             hooks: unsupported,
             interactive_approval: unknown_capability.clone(),
             question: unknown_capability.clone(),

@@ -8,21 +8,17 @@ use crate::{
 use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 use remuda_node::{
-    DevNode, DevServerConfig, HubRequest, JournalSender, MemoryStore, NativeDriverConfig,
-    WssConfig, WssLink, dev_router, dispatch_hub_rpc, native_driver_registry,
+    DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, WssConfig, WssLink, dev_router,
+    native_driver_registry,
 };
-use remuda_protocol::InstanceId;
-use serde_json::Value;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::broadcast;
 
 #[derive(ClapArgs)]
 pub(crate) struct Args {
@@ -130,10 +126,9 @@ pub(crate) async fn run(
         node.host().meta.id.as_id().to_string(),
     );
     wss.label = "local-development".into();
-    let mut link = WssLink::connect(wss)
+    let link = WssLink::connect_runtime(wss, node.clone())
         .await
         .context("local Node could not enroll with the development Hub")?;
-    let journal = link.journal_sender();
     let listener = tokio::net::TcpListener::bind(node_config.bind_addr).await?;
     let address = listener.local_addr()?;
     let accepting = Arc::new(AtomicBool::new(true));
@@ -168,19 +163,11 @@ pub(crate) async fn run(
     } else {
         tracing::info!(file = %config.data_dir.join("bootstrap-token").display(), "development access code file");
     }
-    let (reason, server_finished) = loop {
-        tokio::select! {
-            result = shutdown.wait() => break (result, false),
-            result = &mut server => {
-                let result = result.context("local Node server task failed").and_then(|result| result.map_err(Into::into));
-                break (result.and_then(|()| Err(anyhow::anyhow!("local Node server exited before shutdown"))), true);
-            }
-            request = link.next_hub_request() => {
-                let Some(request) = request else {
-                    break (Err(anyhow::anyhow!("local Node Hub link closed before shutdown")), false);
-                };
-                handle_hub_request(&node, &journal, request).await;
-            }
+    let (reason, server_finished) = tokio::select! {
+        result = shutdown.wait() => (result, false),
+        result = &mut server => {
+            let result = result.context("local Node server task failed").and_then(|result| result.map_err(Into::into));
+            (result.and_then(|()| Err(anyhow::anyhow!("local Node server exited before shutdown"))), true)
         }
     };
     accepting.store(false, Ordering::Release);
@@ -227,70 +214,6 @@ fn resolve_claude_binary() -> Option<PathBuf> {
         }
     }
     None
-}
-
-async fn handle_hub_request(node: &DevNode, journal: &JournalSender, request: HubRequest) {
-    let method = request.method.clone();
-    let params = request.params.clone();
-    let result = dispatch_hub_rpc(node, &method, params).await;
-    if method == "instance.create"
-        && let Ok(value) = &result
-        && let Some(instance_id) = create_instance_id(value)
-    {
-        spawn_journal_mirror(node.clone(), journal.clone(), instance_id);
-    }
-    if let Err(error) = request.respond(result).await {
-        tracing::warn!(%error, "failed to reply to Hub request");
-    }
-}
-
-fn create_instance_id(value: &Value) -> Option<String> {
-    value
-        .pointer("/instance/id")
-        .or_else(|| value.pointer("/instance/instanceId"))
-        .or_else(|| value.get("instanceId"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn spawn_journal_mirror(node: DevNode, journal: JournalSender, instance_id: String) {
-    tokio::spawn(async move {
-        let Ok(id) = InstanceId::from_str(&instance_id) else {
-            return;
-        };
-        let Ok(mut rx) = node.subscribe(&id) else {
-            return;
-        };
-        let Ok(instance) = node.get_instance(&id) else {
-            return;
-        };
-        if let Ok(page) = node.read_journal(&instance.journal_id, None, 256) {
-            for event in page.events {
-                let Ok(value) = serde_json::to_value(&event) else {
-                    continue;
-                };
-                if let Err(error) = journal.append(instance_id.clone(), value).await {
-                    tracing::debug!(%error, %instance_id, "hub journal backfill stopped");
-                    return;
-                }
-            }
-        }
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let Ok(value) = serde_json::to_value(&event) else {
-                        continue;
-                    };
-                    if let Err(error) = journal.append(instance_id.clone(), value).await {
-                        tracing::debug!(%error, %instance_id, "hub journal mirror stopped");
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
 }
 
 fn validate_private_access_code_file(path: &Path) -> anyhow::Result<()> {

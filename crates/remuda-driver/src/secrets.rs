@@ -24,6 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
+use zeroize::Zeroize;
 
 const MASTER_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
@@ -153,6 +154,14 @@ impl SecretBroker for FileSecretStore {
             ));
         };
         self.get_named(name)
+    }
+}
+
+/// S7: the vault master key decrypts every stored secret, so wipe it on drop
+/// rather than leaving 32 bytes of key material in freed memory.
+impl Drop for FileSecretStore {
+    fn drop(&mut self) {
+        self.master.zeroize();
     }
 }
 
@@ -560,7 +569,7 @@ impl TokenBroker {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct BrokerRequest {
     #[serde(rename = "instanceId")]
     instance_id: String,
@@ -569,6 +578,21 @@ struct BrokerRequest {
     token: String,
     #[serde(rename = "secretRef")]
     secret_ref: String,
+}
+
+/// Hand-written so the bearer cannot reach a log through `{:?}` (S6).
+///
+/// The derive that used to sit here was the landmine `BrokerResponse` and
+/// `TokenBrokerBind` were given redacting impls to avoid.
+impl fmt::Debug for BrokerRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrokerRequest")
+            .field("instance_id", &self.instance_id)
+            .field("token", &"[redacted]")
+            .field("secret_ref", &self.secret_ref)
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -742,4 +766,47 @@ fn now_rfc3339() -> String {
         t.second(),
         t.millisecond()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S6: the derive that used to sit on `BrokerRequest` printed the bearer,
+    /// directly under a "Never logged" comment — the landmine `BrokerResponse`
+    /// and `TokenBrokerBind` were given hand-written impls to avoid.
+    #[test]
+    fn broker_request_debug_redacts_the_bearer() {
+        let request = BrokerRequest {
+            instance_id: "ins_01993ab0-0000-7000-8000-000000000001".into(),
+            token: "brk-bearer-that-must-not-be-logged".into(),
+            secret_ref: "env:REMUDA_TEST_SECRET".into(),
+        };
+        let debug = format!("{request:?}");
+        assert!(
+            !debug.contains("brk-bearer-that-must-not-be-logged"),
+            "{debug}"
+        );
+        assert!(debug.contains("[redacted]"), "{debug}");
+        // The non-secret fields stay useful for diagnosis.
+        assert!(
+            debug.contains("ins_01993ab0-0000-7000-8000-000000000001"),
+            "{debug}"
+        );
+        assert!(debug.contains("env:REMUDA_TEST_SECRET"), "{debug}");
+    }
+
+    /// The redacting Debug must not change what goes on the wire.
+    #[test]
+    fn broker_request_still_serializes_the_token() {
+        let request = BrokerRequest {
+            instance_id: "ins_x".into(),
+            token: "brk-wire-token".into(),
+            secret_ref: "env:X".into(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("brk-wire-token"), "{json}");
+        assert!(json.contains("\"instanceId\""), "{json}");
+        assert!(json.contains("\"secretRef\""), "{json}");
+    }
 }

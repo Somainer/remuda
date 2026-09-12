@@ -1,8 +1,12 @@
 //! Inbound normalize: consume NDJSON → [`Inbound`], with allowlist and commands.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use remuda_protocol::AgentKind;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -392,6 +396,203 @@ impl Default for Deduper {
     }
 }
 
+/// How long a delivered event id stays remembered across restarts (F11).
+///
+/// Feishu redelivers for well under a day; anything older cannot be a replay of a
+/// prompt we would still want to suppress.
+pub const INBOUND_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Inbound gate state: delivery idempotency plus the chat types learned from
+/// admitted messages.
+///
+/// The in-memory [`Deduper`] ring is a cache; when a path is configured the same
+/// facts are written to SQLite so a dispatcher restart does not re-run a first
+/// prompt from a Feishu redelivery (F11), and so a card click cannot slip past the
+/// chat gate just because the process forgot which chats are groups (F10).
+pub struct InboundLog {
+    ring: Deduper,
+    chats: BTreeMap<String, ChatType>,
+    store: Option<Mutex<Connection>>,
+    retention: Duration,
+}
+
+impl std::fmt::Debug for InboundLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundLog")
+            .field("chats", &self.chats.len())
+            .field("persisted", &self.store.is_some())
+            .finish()
+    }
+}
+
+impl Default for InboundLog {
+    fn default() -> Self {
+        Self::memory()
+    }
+}
+
+impl InboundLog {
+    /// Process-local gate state (tests, and the in-memory dispatcher).
+    #[must_use]
+    pub fn memory() -> Self {
+        Self {
+            ring: Deduper::default(),
+            chats: BTreeMap::new(),
+            store: None,
+            retention: INBOUND_RETENTION,
+        }
+    }
+
+    /// Open or create the durable gate state at `path` (parent `0700`, file `0600`).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|err| Error::SessionStore(err.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let conn = Connection::open(path).map_err(sql_err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS seen_events (
+                key TEXT PRIMARY KEY,
+                seen_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS known_chats (
+                chat_id TEXT PRIMARY KEY,
+                chat_type TEXT NOT NULL
+            );",
+        )
+        .map_err(sql_err)?;
+        let mut log = Self {
+            ring: Deduper::default(),
+            chats: BTreeMap::new(),
+            store: Some(Mutex::new(conn)),
+            retention: INBOUND_RETENTION,
+        };
+        log.load_chats()?;
+        Ok(log)
+    }
+
+    /// Shorten the replay window (tests).
+    #[must_use]
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// True when this event id was already handled, including before a restart.
+    ///
+    /// Records `key` as handled on the first sighting. Errors are propagated rather
+    /// than swallowed: a gate that cannot remember must not silently let replays in.
+    pub fn seen_or_insert(&mut self, key: String, now: SystemTime) -> Result<bool, Error> {
+        if self.ring.seen_or_insert(key.clone()) {
+            return Ok(true);
+        }
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
+        let conn = store.lock().unwrap_or_else(|err| err.into_inner());
+        let cutoff = unix_secs(now).saturating_sub(self.retention.as_secs() as i64);
+        conn.execute(
+            "DELETE FROM seen_events WHERE seen_at < ?1",
+            params![cutoff],
+        )
+        .map_err(sql_err)?;
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO seen_events (key, seen_at) VALUES (?1, ?2)",
+                params![key, unix_secs(now)],
+            )
+            .map_err(sql_err)?;
+        // Zero rows means the key survived from a previous run: a redelivery.
+        Ok(inserted == 0)
+    }
+
+    /// Chat type observed on an admitted message, if this chat has produced one.
+    #[must_use]
+    pub fn chat_type(&self, chat_id: &str) -> Option<ChatType> {
+        self.chats.get(chat_id).copied()
+    }
+
+    /// Record the chat type carried by an admitted message.
+    pub fn remember_chat(&mut self, chat_id: &str, chat_type: ChatType) -> Result<(), Error> {
+        if self.chats.insert(chat_id.to_string(), chat_type) == Some(chat_type) {
+            return Ok(());
+        }
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let conn = store.lock().unwrap_or_else(|err| err.into_inner());
+        conn.execute(
+            "INSERT INTO known_chats (chat_id, chat_type) VALUES (?1, ?2)
+             ON CONFLICT(chat_id) DO UPDATE SET chat_type = excluded.chat_type",
+            params![chat_id, chat_type_wire(chat_type)],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn load_chats(&mut self) -> Result<(), Error> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let conn = store.lock().unwrap_or_else(|err| err.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT chat_id, chat_type FROM known_chats")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_err)?;
+        let mut chats = BTreeMap::new();
+        for row in rows {
+            let (chat_id, raw) = row.map_err(sql_err)?;
+            if let Some(chat_type) = chat_type_from_wire(&raw) {
+                chats.insert(chat_id, chat_type);
+            }
+        }
+        drop(stmt);
+        drop(conn);
+        self.chats = chats;
+        Ok(())
+    }
+}
+
+fn sql_err(err: rusqlite::Error) -> Error {
+    Error::SessionStore(err.to_string())
+}
+
+fn unix_secs(now: SystemTime) -> i64 {
+    now.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn chat_type_wire(chat_type: ChatType) -> &'static str {
+    match chat_type {
+        ChatType::P2p => "p2p",
+        ChatType::Group => "group",
+    }
+}
+
+fn chat_type_from_wire(raw: &str) -> Option<ChatType> {
+    match raw {
+        "p2p" => Some(ChatType::P2p),
+        "group" => Some(ChatType::Group),
+        _ => None,
+    }
+}
+
 /// Parse one stdout line from `lark-cli event consume`.
 pub fn parse_event_line(line: &str) -> Result<RawEvent, Error> {
     let line = line.trim();
@@ -511,20 +712,22 @@ fn is_ticket_id(token: &str) -> bool {
 pub fn admit(
     event: RawEvent,
     policy: &InboundPolicy,
-    dedup: &mut Deduper,
+    log: &mut InboundLog,
+    now: SystemTime,
 ) -> Result<GateDecision, Error> {
     match event {
-        RawEvent::Message(msg) => admit_message(msg, policy, dedup),
-        RawEvent::CardAction(action) => admit_card(action, policy, dedup),
+        RawEvent::Message(msg) => admit_message(msg, policy, log, now),
+        RawEvent::CardAction(action) => admit_card(action, policy, log, now),
     }
 }
 
 fn admit_message(
     msg: ImMessage,
     policy: &InboundPolicy,
-    dedup: &mut Deduper,
+    log: &mut InboundLog,
+    now: SystemTime,
 ) -> Result<GateDecision, Error> {
-    if dedup.seen_or_insert(msg.message_id.clone()) {
+    if log.seen_or_insert(msg.message_id.clone(), now)? {
         return Ok(GateDecision::Drop {
             reason: DropReason::Duplicate,
         });
@@ -550,6 +753,9 @@ fn admit_message(
             reason: DropReason::GroupRequiresMention,
         });
     }
+    // Remember whether this chat is a group so a later card click in it is held to
+    // the same allowlist rule the message path just applied (F10).
+    log.remember_chat(&msg.chat_id, msg.chat_type)?;
     let thread = ThreadRef {
         thread_id: msg.thread_id.clone(),
         root_id: msg.root_id.clone(),
@@ -576,10 +782,11 @@ fn admit_message(
 fn admit_card(
     action: CardAction,
     policy: &InboundPolicy,
-    dedup: &mut Deduper,
+    log: &mut InboundLog,
+    now: SystemTime,
 ) -> Result<GateDecision, Error> {
     let idem = card_idempotency_key(&action);
-    if dedup.seen_or_insert(idem.clone()) {
+    if log.seen_or_insert(idem.clone(), now)? {
         return Ok(GateDecision::Drop {
             reason: DropReason::Duplicate,
         });
@@ -589,35 +796,35 @@ fn admit_card(
             reason: DropReason::OwnerNotAllowed,
         });
     }
-    if !policy.chat_allowlist.is_empty() {
-        let Some(chat_id) = action.chat_id.as_deref().filter(|id| !id.is_empty()) else {
-            return Ok(GateDecision::Drop {
-                reason: DropReason::ChatNotAllowed,
-            });
-        };
-        if !policy.chat_allowlist.iter().any(|id| id == chat_id) {
-            return Ok(GateDecision::Drop {
-                reason: DropReason::ChatNotAllowed,
-            });
-        }
+    // F10: a card click gets the same chat gate as a message in that chat. The
+    // previous `if !chat_allowlist.is_empty()` guard meant an empty allowlist — a
+    // valid config — admitted clicks from any group while dropping its messages.
+    let Some(chat_id) = action.chat_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(GateDecision::Drop {
+            reason: DropReason::ChatNotAllowed,
+        });
+    };
+    // Cards carry no `chat_type`. Use the type learned from an admitted message in
+    // this chat; an unseen chat is treated as a group, the stricter of the two.
+    let chat_type = log.chat_type(chat_id).unwrap_or(ChatType::Group);
+    if !chat_allowed(chat_id, chat_type, policy) {
+        return Ok(GateDecision::Drop {
+            reason: DropReason::ChatNotAllowed,
+        });
     }
     let thread = ThreadRef {
         thread_id: None,
         root_id: None,
         reply_to: None,
     };
-    let chat_id = action
-        .chat_id
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default();
+    let chat_id = chat_id.to_string();
     let callback = action.callback().ok();
     Ok(GateDecision::Take(Box::new(Inbound {
         session_key: SessionKey::from_parts(&chat_id, &thread),
         idempotency_key: idem,
         actor_open_id: action.operator_id.clone(),
         chat_id,
-        chat_type: None,
+        chat_type: Some(chat_type),
         thread,
         kind: InboundKind::CardAction {
             callback,

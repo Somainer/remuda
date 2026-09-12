@@ -86,7 +86,7 @@ impl ClaudeBgOptions {
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,
-            broker: Arc::new(EnvFileSecretBroker),
+            broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: BTreeMap::new(),
             setting_sources: None,
             inherit_default_config: false,
@@ -245,6 +245,7 @@ impl ClaudeBgDriver {
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin,
             settings_overlay_path: self.options.settings_overlay_path.clone(),
+            secret_policy: None,
         };
         let mut recipe = materialize(&request)?;
         recipe.argv = strip_named_flags(&recipe.argv, &["--session-id", "--cwd", "--continue"]);
@@ -559,6 +560,17 @@ impl Driver for ClaudeBgDriver {
     async fn close(&self) -> DriverResult<DriverAck> {
         self.closed.store(true, Ordering::SeqCst);
         let stopped = self.stop_job().await;
+        // S5: the job is stopped, so the launch overlays can go. Runs even when
+        // stop_job failed — a stuck job must not leave the helper script behind.
+        let recipe = self
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .map(|live| live.recipe.clone());
+        if let Some(recipe) = recipe {
+            crate::recipe::report_launch_cleanup(&recipe, "claude-bg");
+        }
         self.resources.close().await?;
         stopped
     }

@@ -30,12 +30,14 @@ shutdown_timeout_secs = 10
 
 [dispatcher]
 hub_url = "http://127.0.0.1:8080"
-bootstrap_token = "env:REMUDA_DISPATCHER_BOOTSTRAP_TOKEN"
+# A scoped, revocable Hub device token. The bootstrap credential is refused for
+# this role: the dispatcher holds it for the process lifetime, and the bootstrap
+# grants both device login and node enrollment.
+token = "env:REMUDA_DISPATCHER_TOKEN"
 profile = "remuda"
 lark_cli = "lark-cli"
 owner_open_ids = ["ou_your_owner_open_id"]
 outbound = "dry-run"
-# Optional: token = "file:./secrets/device-token" (device token takes precedence)
 # Optional: session_db = "./data/dispatcher/sessions.sqlite"
 # Optional group routing:
 # chat_allowlist = ["oc_your_chat_id"]
@@ -58,15 +60,16 @@ DryRun records outbound message argv in memory; **inbound consume and Hub instan
 
 `hub --with-dispatcher` connects to the actual bound Hub listener, including an OS-assigned port, and uses that Hub's bootstrap credential. It ignores the standalone dispatcher's URL and credentials. SIGINT/SIGTERM stops event intake and sends SIGTERM to both consume children while retaining their stdin until the supervisor shuts them down. The active dispatch and already-buffered inbound events are allowed to finish up to `shutdown_timeout_secs`; the closed receiver accepts no further events during the drain. A deadline failure exits with an error that identifies the uncertain in-flight operation. The local Hub stays available through this drain. Existing remote instances remain managed by their Nodes.
 
-File configuration is overridden by environment and then dispatcher CLI flags. `--hub-url`, `--profile`, `--lark-cli`, `--session-db`, `--token-file`, `--bootstrap-token-file`, `--owner-open-id` (repeatable), `--chat` (repeatable), and `--outbound` are available on the standalone subcommand. Owner/chat flags replace the corresponding lists. Token flags select their credential method explicitly.
+File configuration is overridden by environment and then dispatcher CLI flags. `--hub-url`, `--profile`, `--lark-cli`, `--session-db`, `--token-file`, `--owner-open-id` (repeatable), `--chat` (repeatable), and `--outbound` are available on the standalone subcommand. Owner/chat flags replace the corresponding lists. There is no bootstrap-token flag: standalone mode requires a scoped device token.
 
 | Environment override | Value |
 | --- | --- |
 | `REMUDA_DISPATCHER_HUB_URL` | Hub HTTP(S) base URL without a path, userinfo, query, or fragment |
 | `REMUDA_DISPATCHER_PROFILE`, `REMUDA_DISPATCHER_LARK_CLI` | Dedicated profile and executable |
 | `REMUDA_DISPATCHER_SESSION_DB` | SQLite session map path |
-| `REMUDA_DISPATCHER_TOKEN`, `REMUDA_DISPATCHER_BOOTSTRAP_TOKEN` | Resolved only by the Hub consumer; omitted from config diagnostics |
-| `REMUDA_DISPATCHER_TOKEN_FILE`, `REMUDA_DISPATCHER_BOOTSTRAP_TOKEN_FILE` | Credential paths; corresponding direct token variables take precedence |
+| `REMUDA_DISPATCHER_TOKEN` | Resolved only by the Hub consumer; omitted from config diagnostics |
+| `REMUDA_DISPATCHER_TOKEN_FILE` | Credential path; the direct token variable takes precedence |
+| `REMUDA_DISPATCHER_BOOTSTRAP_TOKEN`, `…_BOOTSTRAP_TOKEN_FILE` | Still parsed, then **refused** at validation — the dispatcher requires a scoped device token |
 | `REMUDA_DISPATCHER_OWNER_OPEN_IDS`, `REMUDA_DISPATCHER_CHAT_ALLOWLIST` | JSON string arrays |
 | `REMUDA_DISPATCHER_BOT_OPEN_ID`, `REMUDA_DISPATCHER_BOT_NAME` | Mention matching |
 | `REMUDA_DISPATCHER_ALLOW_UNADDRESSED` | `true` or `false` |

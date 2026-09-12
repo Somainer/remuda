@@ -201,7 +201,7 @@ impl GenericPtyOptions {
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,
-            broker: Arc::new(EnvFileSecretBroker),
+            broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: BTreeMap::new(),
             agent_start_timeout_ms: 120_000,
             liveness_timeout_ms: 60_000,
@@ -347,6 +347,7 @@ impl GenericPtyDriver {
             setting_sources: None,
             origin: self.options.origin,
             settings_overlay_path: None,
+            secret_policy: None,
         };
         let mut recipe = materialize(&request)?;
         merge_yolo_argv(&mut recipe.argv, preset);
@@ -729,8 +730,11 @@ impl Driver for GenericPtyDriver {
         live.interactions.close().await?;
         let events = live.events.clone();
         let ctx = live.ctx.clone();
+        let recipe = live.recipe.clone();
         drop(inner);
         self.resources.close().await?;
+        // S5: the pane is closed, so the launch overlays can go.
+        crate::recipe::report_launch_cleanup(&recipe, "generic-pty");
         crate::claude_pty::emit_pty_closed(&events, &self.seq, &ctx).await?;
         self.inner.lock().await.take();
         Ok(DriverAck::not_dispatched())

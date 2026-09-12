@@ -2,6 +2,8 @@
 
 use remuda_protocol::{ApprovalAuthority, BoolLiteral, Digest, DriverKind, Id, InputDelivery};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::Path;
 
 /// M0 technical-debt tag applied when `--permission-mode dontAsk` is emitted.
 pub const TECH_DEBT_M0_PERM_01: &str = "TD-M0-PERM-01";
@@ -161,4 +163,57 @@ pub struct LaunchRecipe {
     pub technical_debt: Vec<String>,
     /// Redacted audit record.
     pub audit: LaunchAudit,
+}
+
+impl LaunchRecipe {
+    /// Delete every [`FileLifetime::Launch`] overlay. Call after the child exits.
+    ///
+    /// The lifetime was documented as "deleted after the child exits" but nothing
+    /// ever removed them (S5), so `settings.json` and the `api-key-helper` script
+    /// — the latter holding the per-instance broker token — outlived the run. The
+    /// helper is overwritten with zeros before unlinking so the token does not
+    /// linger in freed blocks.
+    ///
+    /// Returns the paths removed. Errors are reported per path rather than
+    /// aborting: cleanup runs on a shutdown path and must not mask the exit.
+    pub fn cleanup_launch_files(&self) -> Vec<(String, Option<std::io::Error>)> {
+        let mut results = Vec::new();
+        for file in &self.materialized_files {
+            if file.lifetime != FileLifetime::Launch {
+                continue;
+            }
+            results.push((file.path.clone(), shred_file(Path::new(&file.path))));
+        }
+        results
+    }
+}
+
+/// Overwrite with zeros, then unlink. `NotFound` is success — already gone.
+fn shred_file(path: &Path) -> Option<std::io::Error> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path) {
+                let _ = file.write_all(&vec![0u8; meta.len() as usize]);
+                let _ = file.sync_all();
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(error),
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(error),
+    }
+}
+
+/// Run [`LaunchRecipe::cleanup_launch_files`] and warn on whatever could not be
+/// removed. Drivers call this from `close()`, where an error must not mask the exit.
+pub fn report_launch_cleanup(recipe: &LaunchRecipe, driver: &str) {
+    for (path, error) in recipe.cleanup_launch_files() {
+        if let Some(error) = error {
+            tracing::warn!(%driver, %path, %error, "launch overlay cleanup failed");
+        }
+    }
 }

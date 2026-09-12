@@ -36,12 +36,10 @@ pub(crate) struct Args {
     /// Persistent topic-to-instance SQLite map.
     #[arg(long)]
     session_db: Option<PathBuf>,
-    /// File holding a Hub device bearer token.
-    #[arg(long, conflicts_with = "bootstrap_token_file")]
-    token_file: Option<PathBuf>,
-    /// File holding a Hub bootstrap credential used to log in.
+    /// File holding a Hub device bearer token. The bootstrap token is not accepted
+    /// for this role — mint a scoped, revocable device token instead.
     #[arg(long)]
-    bootstrap_token_file: Option<PathBuf>,
+    token_file: Option<PathBuf>,
     /// Allowed owner open ID; repeated values replace the configured owner list.
     #[arg(long = "owner-open-id")]
     owners: Vec<String>,
@@ -71,10 +69,6 @@ impl Args {
         if let Some(path) = self.token_file {
             settings.token = Some(SecretRef::File(path));
             settings.bootstrap_token = None;
-        }
-        if let Some(path) = self.bootstrap_token_file {
-            settings.bootstrap_token = Some(SecretRef::File(path));
-            settings.token = None;
         }
         if !self.owners.is_empty() {
             settings.owner_open_ids = self.owners;
@@ -111,18 +105,27 @@ pub(crate) async fn run_configured(
     settings.validate()?;
     let consume = consume_settings(settings)?;
     let client = match local_hub {
+        // Combined mode: the credential never leaves this process, and the Hub it
+        // authenticates to is the one we just started.
         Some(hub) => HubClient::new(
             local_hub_url(hub.addr),
             None,
             Some(hub.bootstrap_token.clone()),
         )?,
         None => {
-            let (token, bootstrap) = match (&settings.token, &settings.bootstrap_token) {
-                (Some(reference), _) => (Some(reference.resolve()?.into_string()), None),
-                (None, Some(reference)) => (None, Some(reference.resolve()?.into_string())),
-                _ => bail!("dispatcher requires a Hub token or bootstrap_token secret reference"),
+            // F13: no bootstrap fallback. `Settings::validate` already rejects
+            // `bootstrap_token`; this is the matching refusal at the point of use.
+            let Some(reference) = &settings.token else {
+                bail!(
+                    "dispatcher requires dispatcher.token — a scoped Hub device token \
+                     (env:NAME or file:PATH). The bootstrap token is not accepted for this role."
+                );
             };
-            HubClient::new(settings.hub_url.clone(), token, bootstrap)?
+            HubClient::new(
+                settings.hub_url.clone(),
+                Some(reference.resolve()?.into_string()),
+                None,
+            )?
         }
     };
     tokio::pin!(stop);

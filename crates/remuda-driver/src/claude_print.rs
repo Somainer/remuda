@@ -99,7 +99,7 @@ impl ClaudePrintOptions {
             inherit_default_config: false,
             binary,
             origin: InputOrigin::Human,
-            broker: Arc::new(EnvFileSecretBroker),
+            broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: std::collections::BTreeMap::new(),
             setting_sources: None,
             handshake_timeout: Duration::from_secs(30),
@@ -265,6 +265,7 @@ impl ClaudePrintDriver {
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin.into(),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
+            secret_policy: None,
         };
         let mut recipe = materialize(&request)?;
         apply_bypass_flag(&mut recipe);
@@ -534,12 +535,18 @@ impl Driver for ClaudePrintDriver {
     async fn close(&self) -> DriverResult<DriverAck> {
         self.inner.closed.store(true, Ordering::SeqCst);
         let mut live_guard = self.inner.live.lock().await;
+        let recipe = live_guard.as_ref().map(|live| live.recipe.clone());
         if let Some(live) = live_guard.as_mut() {
             let _ = live.process.close_stdin().await;
             let _ = live.process.wait().await;
         }
         *live_guard = None;
         *self.inner.events.lock().await = None;
+        drop(live_guard);
+        // S5: the child has exited, so the launch overlays can go.
+        if let Some(recipe) = recipe {
+            crate::recipe::report_launch_cleanup(&recipe, "claude-print");
+        }
         Ok(DriverAck::not_dispatched())
     }
 

@@ -59,7 +59,8 @@ pub enum Error {
     Cli {
         /// Process exit code, if the OS reported one.
         status: Option<i32>,
-        /// Captured stderr (secrets must already be absent).
+        /// Captured stderr, already scrubbed and capped by
+        /// [`crate::redact_cli_stderr`] — this value is logged.
         stderr: String,
     },
     /// Live `lark-cli` exceeded the outbound timeout.

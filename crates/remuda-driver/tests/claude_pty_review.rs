@@ -254,6 +254,7 @@ fn inject_hook_writes_launch_dir_not_native_home_and_keeps_sources() {
         setting_sources: None,
         origin: LaunchOrigin::Human,
         settings_overlay_path: None,
+        secret_policy: None,
     })
     .unwrap();
     let injected = review::inject_hook(&mut recipe, &launch).unwrap();
@@ -330,6 +331,7 @@ fn tty_bypass_strips_print_flag() {
         setting_sources: None,
         origin: LaunchOrigin::Human,
         settings_overlay_path: None,
+        secret_policy: None,
     })
     .unwrap();
     recipe
@@ -429,7 +431,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
         session_name: "remuda-test".into(),
         socket_dir: Some(socket_dir),
         herdr_binary: Some(fake_bin),
-        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
         extra_env: Default::default(),
         setting_sources: None,
         agent_start_timeout_ms: 5_000,
@@ -518,7 +520,7 @@ async fn bg_resume_keeps_settings_attach_after_stop_does_not_wake() {
         session_name: "remuda-test".into(),
         socket_dir: None,
         herdr_binary: None,
-        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
         extra_env: Default::default(),
         setting_sources: None,
         inherit_default_config: false,
@@ -631,7 +633,7 @@ async fn bg_attach_before_dispatch_would_wake() {
         session_name: "remuda-test".into(),
         socket_dir: None,
         herdr_binary: None,
-        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
         extra_env: Default::default(),
         setting_sources: None,
         inherit_default_config: false,

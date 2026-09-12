@@ -191,6 +191,18 @@ impl Dispatcher {
             !self.lark_cli.as_os_str().is_empty(),
             "dispatcher.lark_cli must not be empty"
         );
+        // F13: the dispatcher holds its credential for the process lifetime. The Hub
+        // bootstrap is an immortal, unlimited secret that grants both device login and
+        // node enrollment, so a leak from here is a full Hub join rather than this
+        // dispatcher's scope. Standalone mode requires a scoped device token; the
+        // combined `hub --with-dispatcher` mode is checked in `cmd::dispatcher`, where
+        // the in-process Hub is visible.
+        ensure!(
+            self.bootstrap_token.is_none(),
+            "dispatcher.bootstrap_token is not accepted: it is an unlimited, unrotatable Hub \
+             join credential. Set dispatcher.token to a scoped device token instead \
+             (env:NAME or file:PATH)."
+        );
         ensure!(
             self.session_db
                 .as_ref()

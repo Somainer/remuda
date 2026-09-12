@@ -15,7 +15,9 @@ mod config;
 mod devices;
 mod error;
 mod fleet;
+mod hosts;
 mod http;
+mod instances;
 mod interactions;
 mod inventory;
 mod placement;
@@ -25,6 +27,7 @@ mod rate_limit;
 mod registry;
 mod store;
 mod transport;
+mod tty;
 mod web;
 mod ws;
 
@@ -216,9 +219,11 @@ async fn spawn_inner(
 pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .merge(http::routes())
+        .merge(hosts::routes())
+        .merge(instances::routes())
         .merge(interactions::routes())
+        .merge(tty::routes())
         .merge(ws::routes())
-        .merge(registry::routes())
         .merge(placement::routes())
         .merge(fleet::routes())
         .merge(devices::routes())

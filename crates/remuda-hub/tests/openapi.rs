@@ -10,20 +10,16 @@ fn spec() -> Value {
 }
 
 fn source_route_paths() -> BTreeSet<String> {
-    let files = [
-        include_str!("../src/http.rs"),
-        include_str!("../src/registry.rs"),
-        include_str!("../src/devices.rs"),
-        include_str!("../src/fleet.rs"),
-        include_str!("../src/placement.rs"),
-        include_str!("../src/interactions.rs"),
-        include_str!("../src/ws.rs"),
-        include_str!("../src/lib.rs"),
-        include_str!("../src/push_http.rs"),
-        include_str!("../src/providers.rs"),
-    ];
+    // Discover feature modules so registering a route never needs a second
+    // registration in this test. Skip inline test fixtures below #[cfg(test)].
+    let files = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| std::fs::read_to_string(path).unwrap());
     let mut paths = BTreeSet::new();
     for src in files {
+        let src = src.split("#[cfg(test)]").next().unwrap();
         let mut rest = src;
         while let Some(idx) = rest.find(".route(") {
             rest = &rest[idx + ".route(".len()..];

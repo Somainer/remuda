@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct MergeArgs {
     /// Local branch to merge into main (the committed snapshot is pinned).
     pub branch: String,
-    /// Run the full gate before advancing main.
+    /// Run the gate before advancing main.
     #[arg(long, required_unless_present = "dry_run")]
     #[serde(default)]
     pub gate: bool,
@@ -23,6 +23,14 @@ pub(crate) struct MergeArgs {
     #[arg(long)]
     #[serde(default)]
     pub dry_run: bool,
+    /// Test changed crates and their reverse dependencies (default).
+    #[arg(long, default_value_t = true, conflicts_with = "full")]
+    #[serde(default = "default_affected")]
+    pub affected: bool,
+    /// Test the entire workspace instead of selecting affected crates.
+    #[arg(long)]
+    #[serde(default)]
+    pub full: bool,
     /// Include web checks even when the merge does not change web/.
     #[arg(long)]
     #[serde(default)]
@@ -43,6 +51,10 @@ pub(crate) struct MergeArgs {
     pub target_dir: Option<PathBuf>,
 }
 
+fn default_affected() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Step {
@@ -57,6 +69,10 @@ pub(crate) struct Step {
     cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    crates: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selection: Option<String>,
 }
 
 impl Step {
@@ -70,6 +86,8 @@ impl Step {
             command: Vec::new(),
             cwd: None,
             error: None,
+            crates: None,
+            selection: None,
         }
     }
 }
@@ -81,6 +99,7 @@ pub(crate) struct MergeReport {
     status: String,
     branch: String,
     dry_run: bool,
+    affected: bool,
     expected_main: Option<String>,
     source: Option<String>,
     merged: Option<String>,
@@ -116,6 +135,13 @@ pub(crate) fn run(args: MergeArgs) -> Result<i32> {
                 step.duration_ms,
                 if step.retried { " [retried]" } else { "" }
             );
+            if let Some(crates) = &step.crates {
+                println!(
+                    "  crates: {} ({})",
+                    crates.join(", "),
+                    step.selection.as_deref().unwrap_or("")
+                );
+            }
         }
         println!("merge: {}", report.status);
         if let Some(sha) = &report.merged {
@@ -138,6 +164,7 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
         status: "gate_failed".into(),
         branch: args.branch.clone(),
         dry_run: args.dry_run,
+        affected: args.affected && !args.full,
         expected_main: None,
         source: None,
         merged: None,
@@ -238,7 +265,9 @@ fn execute_inner(
         report.web |= web_changed(&diff.stdout);
         report.steps.push(Step::planned("worktree"));
         report.steps.push(Step::planned("merge"));
-        report.steps.extend(gate_plan(&repo, report.web)?);
+        report
+            .steps
+            .extend(gate_plan(&repo, report.web, test_range(report))?);
         report.steps.push(Step::planned("verify-tree"));
         report.steps.push(Step::planned("update-main"));
         if !args.no_push {
@@ -364,7 +393,15 @@ fn record<T>(
     result
 }
 
-fn gate_command(repo: &Path, web: bool) -> Command {
+fn test_range(report: &MergeReport) -> Option<(&str, &str)> {
+    report
+        .expected_main
+        .as_deref()
+        .zip(report.merged.as_deref().or(report.source.as_deref()))
+        .filter(|_| report.affected)
+}
+
+fn gate_command(repo: &Path, web: bool, range: Option<(&str, &str)>) -> Command {
     let mut command = Command::new("bash");
     command
         .arg(repo.join("scripts/ci/gate.sh"))
@@ -373,11 +410,16 @@ fn gate_command(repo: &Path, web: bool) -> Command {
     if web {
         command.arg("--web");
     }
+    if let Some((base, head)) = range {
+        command.args(["--affected", "--base", base, "--head", head]);
+    } else {
+        command.arg("--full");
+    }
     command
 }
 
-fn gate_plan(repo: &Path, web: bool) -> Result<Vec<Step>> {
-    let output = gate_command(repo, web)
+fn gate_plan(repo: &Path, web: bool, range: Option<(&str, &str)>) -> Result<Vec<Step>> {
+    let output = gate_command(repo, web, range)
         .arg("--list")
         .output()
         .context("read gate plan")?;
@@ -391,8 +433,8 @@ fn run_gate(
     target: &Path,
     report_file: &Path,
 ) -> Result<()> {
-    let planned = gate_plan(repo, report.web)?;
-    let status = gate_command(repo, report.web)
+    let planned = gate_plan(repo, report.web, test_range(report))?;
+    let status = gate_command(repo, report.web, test_range(report))
         .arg("--report")
         .arg(report_file)
         .env("CARGO_TARGET_DIR", target)
@@ -608,6 +650,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn affected_is_default_and_full_is_an_explicit_override() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: MergeArgs,
+        }
+        let defaults = Cli::try_parse_from(["merge", "topic", "--gate"])
+            .unwrap()
+            .args;
+        assert!(defaults.affected && !defaults.full);
+        let full = Cli::try_parse_from(["merge", "topic", "--gate", "--full"])
+            .unwrap()
+            .args;
+        assert!(full.full);
+        assert!(Cli::try_parse_from(["merge", "topic", "--gate", "--full", "--affected"]).is_err());
+        let mcp: MergeArgs =
+            serde_json::from_value(serde_json::json!({"branch":"topic", "gate":true})).unwrap();
+        assert!(mcp.affected && !mcp.full);
+    }
+
+    #[test]
     fn branch_inputs_are_local_and_never_options() {
         assert_eq!(branch_ref("topic").unwrap(), "refs/heads/topic");
         assert_eq!(branch_ref("refs/heads/topic").unwrap(), "refs/heads/topic");
@@ -626,7 +690,7 @@ mod tests {
     #[test]
     fn gate_plan_has_shared_order_and_optional_web_steps() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let plan = gate_plan(&repo, false).unwrap();
+        let plan = gate_plan(&repo, false, None).unwrap();
         let names: Vec<_> = plan.iter().map(|step| step.name.as_str()).collect();
         assert_eq!(
             names,
@@ -643,12 +707,12 @@ mod tests {
         );
         assert!(plan[5..].iter().all(|step| step.status == "skipped"));
         assert!(
-            gate_plan(&repo, true)
+            gate_plan(&repo, true, None)
                 .unwrap()
                 .iter()
                 .all(|step| step.status == "planned")
         );
-        let output = gate_command(&repo, false)
+        let output = gate_command(&repo, false, None)
             .args(["--list", "--web-only"])
             .output()
             .unwrap();

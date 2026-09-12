@@ -134,7 +134,6 @@ impl Default for Bus {
 /// WS + follow routes. Placement/fleet merge on later.
 pub fn routes() -> axum::Router<crate::AppState> {
     axum::Router::new()
-        .route("/v1/follow", axum::routing::get(follow_socket))
         .route("/v1/node", axum::routing::get(node_socket))
         .route("/node/v1/connect", axum::routing::get(node_socket))
 }

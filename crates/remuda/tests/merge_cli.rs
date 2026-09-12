@@ -10,6 +10,7 @@ use std::process::{Command, Output, Stdio};
 use serde_json::{Value, json};
 
 const GATE: &str = include_str!("../../../scripts/ci/gate.sh");
+const AFFECTED: &str = include_str!("../../../scripts/ci/affected.py");
 const STUB: &str = include_str!("fixtures/merge-gate-stub.py");
 
 fn git_command(repo: &Path) -> Command {
@@ -73,6 +74,32 @@ impl Repo {
         git(&root, &["config", "user.name", "merge test"]);
         git(&root, &["config", "commit.gpgsign", "false"]);
         fs::write(root.join("scripts/ci/gate.sh"), GATE).unwrap();
+        fs::write(root.join("scripts/ci/affected.py"), AFFECTED).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/core\", \"crates/app\", \"crates/other\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        let mut rust_files = vec!["Cargo.toml".to_owned(), "Cargo.lock".to_owned()];
+        for name in ["core", "app", "other"] {
+            fs::create_dir_all(root.join(format!("crates/{name}/src"))).unwrap();
+            let manifest = format!("crates/{name}/Cargo.toml");
+            let library = format!("crates/{name}/src/lib.rs");
+            fs::write(root.join(&manifest), format!(
+                "[package]\nname = \"gate-{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{}",
+                if name == "app" { "[dependencies]\ngate-core = { path = \"../core\" }\n" } else { "" }
+            )).unwrap();
+            fs::write(root.join(&library), "pub fn fixture() {}\n").unwrap();
+            rust_files.extend([manifest, library]);
+        }
+        assert!(
+            Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(root.join("web/.keep"), "fixture\n").unwrap();
         fs::write(root.join(".gitignore"), "/data/tmp/\n/target-gate/\n").unwrap();
         fs::write(root.join("shared file.txt"), "base\n").unwrap();
@@ -80,13 +107,16 @@ impl Repo {
             ".gitignore",
             "shared file.txt",
             "scripts/ci/gate.sh",
+            "scripts/ci/affected.py",
             "web/.keep",
         ];
         let mut add = vec!["add", "--"];
         add.extend(initial);
+        add.extend(rust_files.iter().map(String::as_str));
         git(&root, &add);
         let mut commit = vec!["commit", "-m", "fixture base", "--"];
         commit.extend(initial);
+        commit.extend(rust_files.iter().map(String::as_str));
         git(&root, &commit);
         let base = git(&root, &["rev-parse", "HEAD"]);
         git(
@@ -201,6 +231,61 @@ fn assert_exit(output: &Output, report: &Value, code: i32) {
             .iter()
             .all(|step| step["durationMs"].is_u64())
     );
+}
+
+#[test]
+fn affected_gate_tests_only_changed_crates_and_reverse_dependencies() {
+    let repo = Repo::new();
+    git(&repo.source, &["reset", "--hard", &repo.base]);
+    commit_file(
+        &repo.source,
+        "crates/core/src/lib.rs",
+        "pub fn changed() {}\n",
+    );
+    let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(report["affected"], true);
+    assert_eq!(
+        step(&report, "cargo-test")["crates"],
+        json!(["gate-app", "gate-core"])
+    );
+    assert_eq!(step(&report, "cargo-test")["status"], "ok");
+    repo.assert_cleaned();
+}
+
+#[test]
+fn full_gate_reports_all_workspace_crates() {
+    let repo = Repo::new();
+    git(&repo.source, &["reset", "--hard", &repo.base]);
+    commit_file(
+        &repo.source,
+        "crates/app/src/lib.rs",
+        "pub fn changed() {}\n",
+    );
+    let (output, report) = repo.merge(&["--gate", "--full", "--no-push"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(report["affected"], false);
+    assert_eq!(
+        step(&report, "cargo-test")["crates"],
+        json!(["gate-app", "gate-core", "gate-other"])
+    );
+    repo.assert_cleaned();
+}
+
+#[test]
+fn docs_only_gate_skips_tests_but_keeps_the_other_rust_checks() {
+    let repo = Repo::new();
+    git(&repo.source, &["reset", "--hard", &repo.base]);
+    commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(step(&report, "cargo-test")["status"], "skipped");
+    assert_eq!(step(&report, "cargo-test")["crates"], json!([]));
+    for name in ["secret-scan", "cargo-fmt", "cargo-check", "cargo-clippy"] {
+        assert_eq!(step(&report, name)["status"], "ok");
+    }
+    assert!(!repo.trace().iter().any(|line| line["step"] == "cargo-test"));
+    repo.assert_cleaned();
 }
 
 #[test]

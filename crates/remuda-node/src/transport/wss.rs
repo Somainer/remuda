@@ -816,7 +816,15 @@ pub(crate) fn value_i64(value: &Value) -> Option<i64> {
 pub(crate) fn already_durable(error: &NodeError, seq: i64) -> bool {
     match error {
         NodeError::HubRpc { message, .. } => {
-            message.contains("journal gap") && message.contains(&format!("got {seq}"))
+            if message == &format!("journal duplicate seq {seq}") {
+                return true;
+            }
+            if !message.contains("journal gap") {
+                return false;
+            }
+            message
+                .rsplit_once("got ")
+                .is_some_and(|(_, got)| got.trim() == seq.to_string())
         }
         _ => false,
     }
@@ -869,6 +877,25 @@ mod tests {
                 .and_then(|mark: &JournalSeqWatermark| mark.durable_i64()),
             Some(4)
         );
+    }
+
+    #[test]
+    fn already_durable_matches_exact_got_seq() {
+        let ten = NodeError::HubRpc {
+            code: -32602,
+            message: "journal gap: expected 11, got 10".into(),
+        };
+        assert!(already_durable(&ten, 10));
+        assert!(
+            !already_durable(&ten, 1),
+            "seq 1 must not match suffix got 10"
+        );
+        let dup = NodeError::HubRpc {
+            code: -32602,
+            message: "journal duplicate seq 4".into(),
+        };
+        assert!(already_durable(&dup, 4));
+        assert!(!already_durable(&dup, 40));
     }
 
     #[test]

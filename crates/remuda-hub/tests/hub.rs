@@ -585,6 +585,221 @@ async fn get_instance_and_follow_with_query_token() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn second_hello_on_socket_is_rejected() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let mut req = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .context("node request")?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("node connect")??;
+    let host_id = HostId::new();
+    let hello = json!({
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "node.hello",
+        "params": { "hostId": host_id.as_id().as_str(), "label": "once" }
+    });
+    node.send(Message::Text(hello.to_string().into())).await?;
+    let first = recv_json(&mut node).await?;
+    assert!(first["result"]["nodeToken"].as_str().is_some(), "{first}");
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "2",
+            "method": "node.hello",
+            "params": { "hostId": host_id.as_id().as_str() }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let second = recv_json(&mut node).await?;
+    assert!(second.get("error").is_some(), "{second}");
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("hello already")),
+        "{second}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn node_auth_must_match_upgrade_bearer() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let mut req = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .context("node request")?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("node connect")??;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "a",
+            "method": "node.auth",
+            "params": { "token": "forged", "scheme": "bearer" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let denied = recv_json(&mut node).await?;
+    assert_eq!(denied["error"]["code"], json!(-32000), "{denied}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn journal_duplicate_seq_is_acked() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let mut req = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .context("node request")?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("node connect")??;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "node.hello",
+            "params": { "hostId": host_id.as_id().as_str() }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    recv_json(&mut node).await?;
+    let event = json!({ "kind": "message", "payload": { "text": "once" } });
+    for id in ["2", "3"] {
+        node.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "journal.append",
+                "params": {
+                    "instanceId": instance_id.as_id().as_str(),
+                    "seq": "1",
+                    "event": event,
+                    "events": [event.clone()]
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        let ack = recv_json(&mut node).await?;
+        assert_eq!(ack["result"]["seq"], json!("1"), "{ack}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_socket_does_not_offline_live_host() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let mut req_a = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .context("a")?;
+    req_a.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node_a, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req_a))
+        .await
+        .context("connect a")??;
+    node_a
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "a1",
+                "method": "node.hello",
+                "params": { "hostId": host_id.as_id().as_str(), "label": "live" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let hello_a = recv_json(&mut node_a).await?;
+    let host_token = hello_a["result"]["nodeToken"]
+        .as_str()
+        .context("nodeToken")?
+        .to_string();
+
+    let mut req_b = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .context("b")?;
+    req_b.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {host_token}").parse().unwrap(),
+    );
+    let (mut node_b, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req_b))
+        .await
+        .context("connect b")??;
+    node_b
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "b1",
+                "method": "node.hello",
+                "params": { "hostId": host_id.as_id().as_str() }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let hello_b = recv_json(&mut node_b).await?;
+    assert!(hello_b.get("result").is_some(), "{hello_b}");
+
+    drop(node_a);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (status, _, hosts) = http(
+        hub.addr,
+        "GET",
+        "/v1/hosts",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{hosts}");
+    let hosts: Value = serde_json::from_str(hosts.trim())?;
+    assert_eq!(hosts["items"][0]["online"], json!(true), "{hosts}");
+
+    node_b
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": "b2",
+                "method": "node.heartbeat",
+                "params": {}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+    let beat = recv_json(&mut node_b).await?;
+    assert!(beat.get("result").is_some(), "{beat}");
+    Ok(())
+}
+
 async fn recv_json<S>(ws: &mut S) -> Result<Value>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,

@@ -171,7 +171,7 @@ fn load_of(host: &HostRecord, running: &[(String, i64)]) -> f64 {
 
 fn consider(
     host: &HostRecord,
-    _running: &[(String, i64)],
+    running: &[(String, i64)],
     placement: &Placement,
     spec: &PlaceSpec,
 ) -> Result<(), String> {
@@ -198,6 +198,17 @@ fn consider(
             }
         }
         Placement::Host { .. } => {}
+    }
+    let running_n = running
+        .iter()
+        .find(|(id, _)| id == &host.host_id)
+        .map(|(_, n)| *n)
+        .unwrap_or(host.instance_count);
+    if running_n >= host.max_instances {
+        return Err(format!(
+            "{}: at maxInstances {}",
+            host.host_id, host.max_instances
+        ));
     }
     if spec.driver == "claude-pty" && !has_herdr(host) {
         return Err(format!(
@@ -419,6 +430,27 @@ mod tests {
         match err {
             HubError::Unsatisfiable { reasons } => {
                 assert!(reasons.iter().any(|r| r.contains("herdr")));
+            }
+            other => panic!("{other}"),
+        }
+    }
+
+    #[test]
+    fn at_capacity_host_is_unsatisfiable() {
+        let a = host("hst_full", true, &[], false, 2);
+        let hosts = [a];
+        let running = vec![("hst_full".into(), 2)];
+        let spec = PlaceSpec {
+            driver: "claude-print".into(),
+            delegation: None,
+        };
+        let err = select_hosts(&hosts, &running, &Placement::Any, &spec).unwrap_err();
+        match err {
+            HubError::Unsatisfiable { reasons } => {
+                assert!(
+                    reasons.iter().any(|r| r.contains("maxInstances")),
+                    "{reasons:?}"
+                );
             }
             other => panic!("{other}"),
         }

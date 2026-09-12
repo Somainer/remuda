@@ -468,8 +468,19 @@ impl Store {
         spec: Value,
     ) -> Result<InstanceRecord, StoreError> {
         self.run(move |conn| {
-            if load_host(conn, &host_id)?.is_none() {
-                return Err(StoreError::Id("unknown host".into()));
+            let host =
+                load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
+            let running: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM instances
+                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
+                params![host_id],
+                |row| row.get(0),
+            )?;
+            if running >= host.max_instances {
+                return Err(StoreError::Id(format!(
+                    "{}: at maxInstances {}",
+                    host.host_id, host.max_instances
+                )));
             }
             let instance_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
             let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
@@ -696,7 +707,7 @@ impl Store {
         instance_id: String,
         seq: Option<i64>,
         mut event: Value,
-    ) -> Result<JournalRecord, StoreError> {
+    ) -> Result<(JournalRecord, bool), StoreError> {
         self.run(move |conn| {
             let inst = load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
@@ -709,6 +720,12 @@ impl Store {
                 .unwrap_or(0)
                 + 1;
             let seq = seq.unwrap_or(next);
+            if seq < next {
+                let existing = load_journal_row(conn, &instance_id, seq)?.ok_or_else(|| {
+                    StoreError::Id(format!("journal gap: expected {next}, got {seq}"))
+                })?;
+                return Ok((existing, false));
+            }
             if seq != next {
                 return Err(StoreError::Id(format!(
                     "journal gap: expected {next}, got {seq}"
@@ -739,13 +756,16 @@ impl Store {
                 "UPDATE instances SET durable_seq = ?1, connectivity = 'connected', updated_at = ?2 WHERE id = ?3",
                 params![seq, now, instance_id],
             )?;
-            Ok(JournalRecord {
-                instance_id,
-                seq,
-                event_id,
-                event,
-                observed_at: now,
-            })
+            Ok((
+                JournalRecord {
+                    instance_id,
+                    seq,
+                    event_id,
+                    event,
+                    observed_at: now,
+                },
+                true,
+            ))
         })
         .await
     }
@@ -1179,6 +1199,31 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 durable_seq: durable.to_string(),
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn load_journal_row(
+    conn: &Connection,
+    instance_id: &str,
+    seq: i64,
+) -> Result<Option<JournalRecord>, StoreError> {
+    conn.query_row(
+        "SELECT instance_id, seq, event_id, payload_json, observed_at
+         FROM journal WHERE instance_id = ?1 AND seq = ?2",
+        params![instance_id, seq],
+        |row| {
+            let payload: String = row.get(3)?;
+            let event: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+            Ok(JournalRecord {
+                instance_id: row.get(0)?,
+                seq: row.get(1)?,
+                event_id: row.get(2)?,
+                event,
+                observed_at: row.get(4)?,
             })
         },
     )

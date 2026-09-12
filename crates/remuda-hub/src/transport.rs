@@ -88,7 +88,13 @@ impl NodeTransport for WssTransport {
         Box::pin(async move {
             let rpc_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
-            self.pending.lock().await.insert(rpc_id.clone(), tx);
+            {
+                let mut pending = self.pending.lock().await;
+                if pending.len() >= 32 {
+                    return Err(HubError::Internal("too many in-flight node rpcs".into()));
+                }
+                pending.insert(rpc_id.clone(), tx);
+            }
             let frame = json!({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
@@ -145,10 +151,15 @@ impl NodeTransport for StdioTransport {
     }
 }
 
+struct NodeSlot {
+    generation: u64,
+    link: Arc<dyn NodeTransport>,
+}
+
 /// Connected Node transports, keyed by host id.
 #[derive(Clone, Default)]
 pub struct ConnectedNodes {
-    inner: Arc<Mutex<HashMap<String, Arc<dyn NodeTransport>>>>,
+    inner: Arc<Mutex<HashMap<String, NodeSlot>>>,
 }
 
 impl ConnectedNodes {
@@ -160,15 +171,27 @@ impl ConnectedNodes {
         params: Value,
         timeout: Duration,
     ) -> Result<Option<Value>, HubError> {
-        let Some(link) = self.inner.lock().await.get(host_id).cloned() else {
+        let Some(link) = self
+            .inner
+            .lock()
+            .await
+            .get(host_id)
+            .map(|slot| slot.link.clone())
+        else {
             return Ok(None);
         };
         link.call(method, params, timeout).await
     }
 
-    /// Record a live session (WSS today; stdio later).
-    pub async fn insert(&self, host_id: String, link: Arc<dyn NodeTransport>) {
-        self.inner.lock().await.insert(host_id, link);
+    /// Record a live session. Returns a generation used to retire only this session.
+    pub async fn insert(&self, host_id: String, link: Arc<dyn NodeTransport>) -> u64 {
+        let mut inner = self.inner.lock().await;
+        let generation = inner
+            .get(&host_id)
+            .map(|slot| slot.generation.wrapping_add(1))
+            .unwrap_or(1);
+        inner.insert(host_id, NodeSlot { generation, link });
+        generation
     }
 
     /// Drop the live session (does not kill the native Node process).
@@ -176,9 +199,25 @@ impl ConnectedNodes {
         self.inner.lock().await.remove(host_id);
     }
 
+    /// Drop the session only if `generation` is still current (stale WS must not offline a live host).
+    pub async fn remove_generation(&self, host_id: &str, generation: u64) -> bool {
+        let mut inner = self.inner.lock().await;
+        match inner.get(host_id) {
+            Some(slot) if slot.generation == generation => {
+                inner.remove(host_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Carrier for a connected host, if any.
     pub async fn kind_of(&self, host_id: &str) -> Option<TransportKind> {
-        self.inner.lock().await.get(host_id).map(|link| link.kind())
+        self.inner
+            .lock()
+            .await
+            .get(host_id)
+            .map(|slot| slot.link.kind())
     }
 
     /// Host ids with a live Node session.

@@ -35,8 +35,16 @@ export function checkForUpdate(): void {
 }
 
 export function startPWA(): void {
-  if (import.meta.env.PROD && window.isSecureContext && "serviceWorker" in navigator) {
-    void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" });
+  if (window.isSecureContext && "serviceWorker" in navigator) {
+    if (import.meta.env.PROD) {
+      void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" });
+    }
+    navigator.serviceWorker.addEventListener("message", (event) => {
+      const data = event.data as { type?: string; url?: string } | undefined;
+      if (data?.type === "push-open" && typeof data.url === "string" && data.url.startsWith("/")) {
+        window.location.assign(data.url);
+      }
+    });
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") checkForUpdate();

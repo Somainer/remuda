@@ -38,3 +38,24 @@ export function asRecord(value: unknown): Record<string, unknown> | null {
 export function asString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
+
+export function formatClock(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "—";
+  return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+export function formatListTime(iso: string, nowMs = Date.now()): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "—";
+  const delta = nowMs - t;
+  if (delta < 45_000) return "刚刚";
+  if (delta < 3_600_000) return `${Math.max(1, Math.round(delta / 60_000))}m`;
+  const date = new Date(t);
+  const today = new Date(nowMs);
+  if (date.toDateString() === today.toDateString()) return formatClock(iso);
+  const yesterday = new Date(nowMs);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return "昨天";
+  return date.toLocaleDateString([], { month: "numeric", day: "numeric" });
+}

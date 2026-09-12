@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Button } from "../components/Button";
 import { hubStore, useHub } from "../lib/store";
 import { composing, useWorkbenchViewport } from "../lib/viewport";
 import { readNewSessionPrefs, rememberNewSessionSuccess, sortRecent } from "../lib/prefs";
@@ -13,9 +12,9 @@ import {
   providerProfileForDelegation,
   type DelegationId,
 } from "../lib/sessionOptions";
-import ui from "../styles/ui.module.css";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
+import css from "./NewSessionPage.module.css";
 
 type CreateKind = Exclude<Kind, "generic">;
 
@@ -70,219 +69,262 @@ export function NewSessionPage() {
   const workspace = hostWorkspaces.find((w) => w.id === workspaceId) ?? hostWorkspaces[0];
   const driver: DriverKind = mobile || !wantTty ? "claude-print" : "claude-pty";
   const canStart = Boolean(hostId && workspace?.id && !offline && !busy);
-
   const hosts = sortRecent(hub.hosts, prefs.recentHostIds);
   const workspaces = sortRecent(hostWorkspaces, prefs.recentWorkspaceIds);
+  const close = () => navigate("/sessions");
 
   return (
-    <form
-      className={ui.card}
-      data-testid="new-session-sheet"
-      style={{ margin: 16, maxWidth: 560, padding: 16 }}
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (!canStart || !workspace) return;
-        setBusy(true);
-        setError(null);
-        void hubStore
-          .create({
-            hostId,
-            workspaceId: workspace.id,
-            kind,
-            driver,
-            model,
-            providerProfileId: providerProfileForDelegation(delegation),
-            permissionMode,
-            delegation,
-            prompt,
-            worktree,
-            settingsOverlayPath: settingsOverlayPath || undefined,
-            claudeConfigDir: claudeConfigDir || undefined,
-            maxBudgetUsd: maxBudgetUsd || undefined,
-            name: name || undefined,
-          })
-          .then((instance) => {
-            rememberNewSessionSuccess({ hostId, workspaceId: workspace.id, model, permissionMode, driver, delegation });
-            navigate(`/s/${instance.id}`);
-          })
-          .catch((err: unknown) => setError(err instanceof Error ? err.message : "create failed"))
-          .finally(() => setBusy(false));
-      }}
-    >
-      <div className={ui.row} style={{ justifyContent: "space-between" }}>
-        <h1 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>新建会话</h1>
-        <Button variant="ghost" onClick={() => navigate(-1)} aria-label="关闭">
-          ✕
-        </Button>
-      </div>
-      <label className={ui.field} style={{ marginTop: 12 }}>
-        提示词
-        <textarea
-          ref={promptRef}
-          className={ui.textarea}
-          data-testid="new-session-prompt"
-          autoFocus
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => {
-            if (composing(e)) return;
-            if (!mobile && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-              e.currentTarget.form?.requestSubmit();
-            }
-          }}
-        />
-      </label>
-      <label className={ui.field} style={{ marginTop: 12 }}>
-        主机
-        <select
-          className={`${ui.select} ${ui.touchSelect}`}
-          data-testid="new-session-host"
-          value={hostId}
-          onChange={(e) => setHostId(e.target.value)}
-        >
-          {hosts.map((h) => (
-            <option key={h.id} value={h.id}>
-              {h.label} · {h.state}
-            </option>
-          ))}
-        </select>
-      </label>
-      <p className={ui.listMeta}>{host?.state === "online" ? "在线" : host?.state} · claude 2.1.268</p>
-      <label className={ui.field} style={{ marginTop: 12 }}>
-        项目（Workspace）
-        <select
-          className={`${ui.select} ${ui.touchSelect}`}
-          data-testid="new-session-workspace"
-          value={workspace?.id ?? ""}
-          onChange={(e) => setWorkspaceId(e.target.value)}
-        >
-          {workspaces.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.label} · {w.rootPath}
-            </option>
-          ))}
-        </select>
-      </label>
-      <p className={ui.listMeta}>{workspace?.rootPath}</p>
-      <label className={ui.row} style={{ marginTop: 8 }}>
-        <input type="checkbox" checked={worktree} onChange={(e) => setWorktree(e.target.checked)} />
-        新 worktree
-      </label>
-      <fieldset style={{ border: 0, padding: 0, marginTop: 12 }}>
-        <legend className={ui.listMeta}>运行时</legend>
-        <div className={ui.row}>
-          {KINDS.map((k) => (
-            <button
-              key={k.id}
-              type="button"
-              className={`${ui.chip} ${kind === k.id ? ui.chipOn : ""}`}
-              disabled={!k.enabled}
-              onClick={() => k.enabled && setKind(k.id)}
-            >
-              {k.label}
-              {k.id === "claude" ? " ●" : ""}
-            </button>
-          ))}
+    <div className={css.overlay}>
+      <button type="button" className={css.scrim} aria-label="关闭遮罩" onClick={close} />
+      <form
+        className={css.sheet}
+        data-testid="new-session-sheet"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!canStart || !workspace) return;
+          setBusy(true);
+          setError(null);
+          void hubStore
+            .create({
+              hostId,
+              workspaceId: workspace.id,
+              kind,
+              driver,
+              model,
+              providerProfileId: providerProfileForDelegation(delegation),
+              permissionMode,
+              delegation,
+              prompt,
+              worktree,
+              settingsOverlayPath: settingsOverlayPath || undefined,
+              claudeConfigDir: claudeConfigDir || undefined,
+              maxBudgetUsd: maxBudgetUsd || undefined,
+              name: name || undefined,
+            })
+            .then((instance) => {
+              rememberNewSessionSuccess({ hostId, workspaceId: workspace.id, model, permissionMode, driver, delegation });
+              navigate(`/s/${instance.id}`);
+            })
+            .catch((err: unknown) => setError(err instanceof Error ? err.message : "create failed"))
+            .finally(() => setBusy(false));
+        }}
+      >
+        <div className={css.handle}>
+          <div className={css.handleBar} />
         </div>
-      </fieldset>
-      <label className={ui.field} style={{ marginTop: 12 }}>
-        模型
-        <input className={ui.select} data-testid="new-session-model" value={model} onChange={(e) => setModel(e.target.value)} />
-      </label>
-      <fieldset style={{ border: 0, padding: 0, marginTop: 12 }}>
-        <legend className={ui.listMeta}>权限</legend>
-        <div className={ui.row}>
-          {PERMISSION_OPTIONS.map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              className={`${ui.chip} ${permissionMode === opt.id ? ui.chipOn : ""}`}
-              data-testid={`new-session-perm-${opt.id}`}
-              onClick={() => setPermissionMode(opt.id)}
-            >
-              {opt.label}
-              {opt.id === "manual" ? " ●" : ""}
-            </button>
-          ))}
-        </div>
-        {permissionMode === "bypassPermissions" ? (
-          <p className={ui.listMeta} data-testid="new-session-yolo-hint" style={{ color: "var(--dust)" }}>
-            {YOLO_HINT}
-          </p>
-        ) : null}
-      </fieldset>
-      <fieldset style={{ border: 0, padding: 0, marginTop: 12 }}>
-        <legend className={ui.listMeta}>Provider / 鉴权</legend>
-        <div className={ui.row}>
-          {DELEGATION_OPTIONS.map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              className={`${ui.chip} ${delegation === opt.id ? ui.chipOn : ""}`}
-              data-testid={`new-session-delegation-${opt.id}`}
-              onClick={() => setDelegation(opt.id)}
-            >
-              {opt.label}
-              {opt.id === "none" ? " ●" : ""}
-            </button>
-          ))}
-        </div>
-        <p className={ui.listMeta}>
-          {delegation === "none"
-            ? "使用该主机上 CLI 的原生登录态（Claude 订阅 / Codex ChatGPT / grok xAI / agy Google）。"
-            : "走 Anthropic-Messages 兼容网关；模型名原样传递。"}
-        </p>
-      </fieldset>
-      {mobile ? (
-        <p className={ui.listMeta}>手机固定 structured print。</p>
-      ) : (
-        <fieldset style={{ border: 0, padding: 0, marginTop: 12 }}>
-          <legend className={ui.listMeta}>视图</legend>
-          <div className={ui.row}>
-            <button type="button" className={`${ui.chip} ${!wantTty ? ui.chipOn : ""}`} onClick={() => setWantTty(false)}>
-              结构化 print
-            </button>
-            <button type="button" className={`${ui.chip} ${wantTty ? ui.chipOn : ""}`} onClick={() => setWantTty(true)}>
-              需要 TUI → pty
-            </button>
+        <header className={css.head}>
+          <h1 className={css.headTitle}>新建会话</h1>
+          <button type="button" className={css.close} onClick={close} aria-label="关闭">
+            ✕
+          </button>
+        </header>
+        <div className={css.body}>
+          <label className={css.field}>
+            <span className={css.label}>提示词 · 第一焦点</span>
+            <textarea
+              ref={promptRef}
+              className={css.prompt}
+              data-testid="new-session-prompt"
+              autoFocus
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (composing(e)) return;
+                if (!mobile && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.currentTarget.form?.requestSubmit();
+                }
+              }}
+            />
+          </label>
+          <div className={css.pair}>
+            <label className={css.field}>
+              <span className={css.label}>主机</span>
+              <div className={css.selectWrap}>
+                <span className={`${css.hostDot} ${offline ? css.hostDotOff : ""}`} />
+                <select
+                  className={css.select}
+                  data-testid="new-session-host"
+                  value={hostId}
+                  onChange={(e) => setHostId(e.target.value)}
+                >
+                  {hosts.map((h) => (
+                    <option key={h.id} value={h.id}>
+                      {h.label} · {h.state}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <span className={css.hint}>{host?.state === "online" ? "在线" : host?.state} · claude 2.1.268</span>
+            </label>
+            <label className={css.field}>
+              <span className={css.label}>项目 · Workspace</span>
+              <div className={css.selectWrap}>
+                <select
+                  className={css.select}
+                  data-testid="new-session-workspace"
+                  value={workspace?.id ?? ""}
+                  onChange={(e) => setWorkspaceId(e.target.value)}
+                >
+                  {workspaces.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.label} · {w.rootPath}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <span className={css.hint}>
+                <span>{workspace?.rootPath}</span>
+                <span className={css.worktree}>
+                  <input type="checkbox" checked={worktree} onChange={(e) => setWorktree(e.target.checked)} />
+                  新 worktree
+                </span>
+              </span>
+            </label>
           </div>
-        </fieldset>
-      )}
-      <button type="button" className={ui.chip} style={{ marginTop: 12 }} onClick={() => setAdvanced(!advanced)}>
-        {advanced ? "收起高级" : "高级"}
-      </button>
-      {advanced ? (
-        <div style={{ marginTop: 8 }}>
-          <label className={ui.field}>
-            settings overlay 路径
-            <input className={ui.input} value={settingsOverlayPath} onChange={(e) => setSettingsOverlayPath(e.target.value)} />
-          </label>
-          <label className={ui.field} style={{ marginTop: 8 }}>
-            CLAUDE_CONFIG_DIR
-            <input className={ui.input} value={claudeConfigDir} onChange={(e) => setClaudeConfigDir(e.target.value)} />
-          </label>
-          <label className={ui.field} style={{ marginTop: 8 }}>
-            max budget (USD)
-            <input className={ui.input} value={maxBudgetUsd} onChange={(e) => setMaxBudgetUsd(e.target.value)} />
-          </label>
-          <label className={ui.field} style={{ marginTop: 8 }}>
-            name
-            <input className={ui.input} value={name} onChange={(e) => setName(e.target.value)} />
-          </label>
+          <div className={css.pair}>
+            <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
+              <legend className={css.label}>运行时</legend>
+              <div className={css.seg}>
+                {KINDS.map((k) => (
+                  <button
+                    key={k.id}
+                    type="button"
+                    className={`${css.choice} ${kind === k.id ? css.choiceOn : ""} ${k.enabled ? "" : css.choiceDisabled}`}
+                    disabled={!k.enabled}
+                    onClick={() => k.enabled && setKind(k.id)}
+                  >
+                    {k.label}
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+            <label className={css.field}>
+              <span className={css.label}>模型</span>
+              <div className={css.selectWrap}>
+                <input
+                  className={css.select}
+                  data-testid="new-session-model"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                />
+              </div>
+            </label>
+          </div>
+          <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
+            <legend className={css.label}>权限</legend>
+            <div className={css.seg}>
+              {PERMISSION_OPTIONS.map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  className={`${css.choice} ${permissionMode === opt.id ? (opt.id === "bypassPermissions" ? css.choiceDust : css.choiceOn) : ""}`}
+                  data-testid={`new-session-perm-${opt.id}`}
+                  onClick={() => setPermissionMode(opt.id)}
+                >
+                  {opt.label}
+                  <span className={css.choiceId}>{opt.id === "bypassPermissions" ? "bypassPermissions" : opt.id}</span>
+                </button>
+              ))}
+            </div>
+            {permissionMode === "bypassPermissions" ? (
+              <div className={css.yolo} data-testid="new-session-yolo-hint">
+                <div className={css.yoloHead}>
+                  <span className={css.yoloDot} />
+                  <span className={css.yoloTitle}>yolo · 该会话不再产生任何审批</span>
+                </div>
+                <div className={css.yoloBody}>{YOLO_HINT}</div>
+              </div>
+            ) : null}
+          </fieldset>
+          <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
+            <legend className={css.label}>Provider / 鉴权</legend>
+            <div className={css.seg}>
+              {DELEGATION_OPTIONS.map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  className={`${css.choice} ${delegation === opt.id ? css.choiceOn : ""}`}
+                  data-testid={`new-session-delegation-${opt.id}`}
+                  onClick={() => setDelegation(opt.id)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+          <div className={css.advanced}>
+            <button type="button" className={css.advancedToggle} onClick={() => setAdvanced(!advanced)}>
+              <span>{advanced ? "▾" : "▸"}</span>
+              <span>高级 · 驱动</span>
+              <span className={css.m3}>M3 才启用</span>
+            </button>
+            {advanced ? (
+              <div className={css.driverList}>
+                {mobile ? (
+                  <p className={css.hint}>手机固定 structured print。</p>
+                ) : (
+                  <>
+                    <button type="button" className={css.driverRow} onClick={() => setWantTty(false)}>
+                      <span className={`${css.radio} ${wantTty ? "" : css.radioOn}`} />
+                      <span>结构化 print</span>
+                      <span className={css.driverId}>claude-print · structured-only · 默认</span>
+                    </button>
+                    <button type="button" className={`${css.driverRow} ${css.driverOff}`} disabled>
+                      <span className={css.radio} />
+                      <span>后台可唤醒</span>
+                      <span className={css.driverIdOff}>claude-bg · 忽略 --session-id</span>
+                    </button>
+                    <button type="button" className={css.driverRow} onClick={() => setWantTty(true)}>
+                      <span className={`${css.radio} ${wantTty ? css.radioOn : ""}`} />
+                      <span>需要 /workflows 面板</span>
+                      <span className={css.driverId}>claude-pty · 订阅登录 profile</span>
+                    </button>
+                  </>
+                )}
+                <label className={css.field}>
+                  <span className={css.label}>settings overlay 路径</span>
+                  <div className={css.selectWrap}>
+                    <input className={css.select} value={settingsOverlayPath} onChange={(e) => setSettingsOverlayPath(e.target.value)} />
+                  </div>
+                </label>
+                <label className={css.field}>
+                  <span className={css.label}>CLAUDE_CONFIG_DIR</span>
+                  <div className={css.selectWrap}>
+                    <input className={css.select} value={claudeConfigDir} onChange={(e) => setClaudeConfigDir(e.target.value)} />
+                  </div>
+                </label>
+                <label className={css.field}>
+                  <span className={css.label}>max budget (USD)</span>
+                  <div className={css.selectWrap}>
+                    <input className={css.select} value={maxBudgetUsd} onChange={(e) => setMaxBudgetUsd(e.target.value)} />
+                  </div>
+                </label>
+                <label className={css.field}>
+                  <span className={css.label}>name</span>
+                  <div className={css.selectWrap}>
+                    <input className={css.select} value={name} onChange={(e) => setName(e.target.value)} />
+                  </div>
+                </label>
+              </div>
+            ) : null}
+          </div>
+          {error ? (
+            <p data-testid="new-session-error" className={css.error}>
+              {error}
+            </p>
+          ) : null}
+          {offline ? <p className={css.hint}>主机离线，不能开始。</p> : null}
         </div>
-      ) : null}
-      {error ? (
-        <p data-testid="new-session-error" style={{ color: "var(--dust)" }}>
-          {error}
-        </p>
-      ) : null}
-      {offline ? <p className={ui.listMeta}>主机离线，不能开始。</p> : null}
-      <div className={ui.row} style={{ marginTop: 16, justifyContent: "flex-end" }}>
-        <Button onClick={() => navigate(-1)}>取消</Button>
-        <Button variant="primary" type="submit" disabled={!canStart} data-testid="new-session-start">
-          {busy ? "启动中" : "开始"}
-        </Button>
-      </div>
-    </form>
+        <footer className={css.foot}>
+          <div className={css.footNote}>Provider {delegation === "gateway" ? "gateway" : "none"} · 默认全填上次成功值</div>
+          <button type="button" className={css.cancel} onClick={close}>
+            取消
+          </button>
+          <button type="submit" className={css.start} disabled={!canStart} data-testid="new-session-start">
+            {busy ? "启动中" : "开始"}
+          </button>
+        </footer>
+      </form>
+    </div>
   );
 }

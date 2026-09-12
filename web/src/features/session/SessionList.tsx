@@ -1,9 +1,10 @@
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { Instance, UiStatus } from "../../types/instance";
 import { StateDot } from "../../components/StateDot";
-import { nativeShort, projectStatus } from "../../lib/status";
+import { formatListTime, shortId } from "../../lib/format";
+import { nativeShort, projectStatus, uiMode } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
-import ui from "../../styles/ui.module.css";
+import css from "./SessionList.module.css";
 
 const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] = [
   { id: "blocked", title: "待处理", match: (s) => s === "blocked" },
@@ -25,7 +26,20 @@ function toggleCsv(params: URLSearchParams, key: string, value: string): URLSear
   return next;
 }
 
-export function SessionList({ instances }: { instances?: Instance[] }) {
+function exitLabel(instance: Instance): string | null {
+  if (instance.exit.state !== "known") return null;
+  const code = instance.exit.value.code;
+  return code == null ? "exit" : `exit ${code}`;
+}
+
+function pendingBadge(kind: string | undefined, title: string | undefined, fields: number | undefined): string | null {
+  if (kind === "approval") return `等你批准 ${title ?? ""}`.trim();
+  if (kind === "question") return `AskUserQuestion · ${fields ?? 0} 题`;
+  if (kind === "plan-review") return "计划待审";
+  return null;
+}
+
+export function SessionList({ instances, variant = "full" }: { instances?: Instance[]; variant?: "full" | "compact" }) {
   const hub = useHub();
   const location = useLocation();
   const [params, setParams] = useSearchParams();
@@ -49,111 +63,239 @@ export function SessionList({ instances }: { instances?: Instance[] }) {
     return title.includes(q) || cwd.includes(q) || native.includes(q) || instance.id.toLowerCase().includes(q);
   });
 
+  const filterCount = [hostFilter, workspaceFilter, kindFilter, statusFilter].filter((f) => f.length).length;
+  const share = params.toString();
+
   if (hub.hosts.length === 0) {
     return (
-      <p className={ui.listMeta} style={{ padding: 16 }}>
+      <p className={css.empty} data-testid="session-list">
         无主机。<Link to="/hosts">添加主机</Link>
       </p>
     );
   }
   if (hub.instances.length === 0) {
     return (
-      <p className={ui.listMeta} style={{ padding: 16 }}>
+      <p className={css.empty} data-testid="session-list">
         还没有会话。<Link to="/sessions/new">新建会话</Link>
       </p>
     );
   }
 
-  return (
-    <div data-testid="session-list">
-      <input
-        className={ui.input}
-        style={{ margin: "8px 12px", width: "calc(100% - 24px)" }}
-        placeholder="搜索标题 / cwd / 原生 id"
-        value={params.get("q") ?? ""}
-        onChange={(e) => {
-          const next = new URLSearchParams(params);
-          if (e.target.value) next.set("q", e.target.value);
-          else next.delete("q");
-          setParams(next);
-        }}
-      />
-      <div className={ui.row} style={{ padding: "0 12px 8px" }}>
-        {(["blocked", "working", "starting", "idle", "exited"] as const).map((s) => (
-          <button
-            key={s}
-            className={`${ui.chip} ${statusFilter.includes(s) ? ui.chipOn : ""}`}
-            onClick={() => setParams(toggleCsv(params, "status", s))}
-          >
-            {s}
-          </button>
-        ))}
+  const live = hub.connection === "live";
+
+  if (variant === "compact") {
+    return (
+      <div className={css.root} data-testid="session-list">
+        <header className={css.compactTop}>
+          <div className={css.compactTitle}>会话</div>
+          {hostFilter.length ? <div className={css.compactHint}>host:{hostFilter.length}</div> : null}
+        </header>
+        {filtered.map((instance) => {
+          const status = projectStatus(instance);
+          const workspace = hubStore.workspaceOf(instance.workspaceId);
+          const to = `/s/${instance.id}`;
+          const active = location.pathname === to || location.pathname.startsWith(`${to}/`);
+          return (
+            <Link
+              key={instance.id}
+              to={to}
+              className={`${css.compactRow} ${active ? css.compactRowActive : ""}`}
+              data-testid="session-row"
+              data-status={status}
+            >
+              <div className={css.compactHead}>
+                <StateDot status={status} />
+                <span className={`${css.compactName} ${status === "exited" || status === "unknown" ? css.compactNameMute : ""}`}>
+                  {hubStore.titleOf(instance.id)}
+                </span>
+              </div>
+              <div className={css.compactMeta}>
+                {hubStore.hostName(instance.hostId)} / {workspace?.label} · {formatListTime(instance.updatedAt)}
+              </div>
+            </Link>
+          );
+        })}
       </div>
-      <div className={ui.row} style={{ padding: "0 12px 8px" }}>
-        {hub.hosts.map((h) => (
-          <button
-            key={h.id}
-            className={`${ui.chip} ${hostFilter.includes(h.id) ? ui.chipOn : ""}`}
-            onClick={() => setParams(toggleCsv(params, "host", h.id))}
-          >
-            {h.label}
-          </button>
-        ))}
-        {hub.workspaces.map((w) => (
-          <button
-            key={w.id}
-            className={`${ui.chip} ${workspaceFilter.includes(w.id) ? ui.chipOn : ""}`}
-            onClick={() => setParams(toggleCsv(params, "workspace", w.id))}
-          >
-            {w.label}
-          </button>
-        ))}
-        {(["claude", "codex", "grok", "agy"] as const).map((k) => (
-          <button
-            key={k}
-            className={`${ui.chip} ${kindFilter.includes(k) ? ui.chipOn : ""}`}
-            onClick={() => setParams(toggleCsv(params, "kind", k))}
-          >
-            {k}
-          </button>
-        ))}
+    );
+  }
+
+  return (
+    <div className={css.root} data-testid="session-list">
+      <header className={css.top}>
+        <div className={css.title}>会话</div>
+        <div className={css.count}>
+          {source.length} 个实例 · {hub.hosts.length} 台主机
+        </div>
+        <div className={css.live}>
+          <span className={`${css.liveDot} ${live ? "" : css.liveOff}`} />
+          {live ? "live" : hub.connection}
+        </div>
+        <button type="button" className={css.filterBtn} aria-label="筛选">
+          筛选{filterCount ? <span className={css.filterCount}>{filterCount}</span> : null}
+        </button>
+        <Link className={css.newBtn} to="/sessions/new">
+          ＋ 新建
+        </Link>
+      </header>
+      <div className={css.toolbar}>
+        <label className={css.search}>
+          <span className={css.searchGlyph}>⌕</span>
+          <input
+            className={css.searchInput}
+            placeholder="搜索标题 / cwd / 原生 id"
+            value={params.get("q") ?? ""}
+            onChange={(e) => {
+              const next = new URLSearchParams(params);
+              if (e.target.value) next.set("q", e.target.value);
+              else next.delete("q");
+              setParams(next);
+            }}
+          />
+        </label>
+        <div className={css.chips}>
+          {hub.hosts.map((h) => (
+            <button
+              key={h.id}
+              type="button"
+              className={`${css.chip} ${hostFilter.includes(h.id) ? css.chipOn : ""}`}
+              onClick={() => setParams(toggleCsv(params, "host", h.id))}
+            >
+              {hostFilter.includes(h.id) ? (
+                <>
+                  <span className={css.chipKey}>host:</span>
+                  {h.label}
+                  <span className={css.chipX}>✕</span>
+                </>
+              ) : (
+                h.label
+              )}
+            </button>
+          ))}
+          {hub.workspaces.map((w) => (
+            <button
+              key={w.id}
+              type="button"
+              className={`${css.chip} ${workspaceFilter.includes(w.id) ? css.chipOn : ""}`}
+              onClick={() => setParams(toggleCsv(params, "workspace", w.id))}
+            >
+              {workspaceFilter.includes(w.id) ? `${w.label} ✕` : `${w.label} ▾`}
+            </button>
+          ))}
+          {(["claude", "codex", "grok", "agy"] as const).map((k) => (
+            <button
+              key={k}
+              type="button"
+              className={`${css.chip} ${kindFilter.includes(k) ? css.chipOn : ""}`}
+              onClick={() => setParams(toggleCsv(params, "kind", k))}
+            >
+              {kindFilter.includes(k) ? (
+                <>
+                  <span className={css.chipKey}>kind:</span>
+                  {k}
+                  <span className={css.chipX}>✕</span>
+                </>
+              ) : (
+                k
+              )}
+            </button>
+          ))}
+          {(["blocked", "working", "starting", "idle", "exited"] as const).map((s) => (
+            <button
+              key={s}
+              type="button"
+              className={`${css.chip} ${statusFilter.includes(s) ? css.chipOn : ""}`}
+              onClick={() => setParams(toggleCsv(params, "status", s))}
+            >
+              {statusFilter.includes(s) ? `${s} ✕` : s}
+            </button>
+          ))}
+          {share ? <span className={css.share}>?{share} · 可分享</span> : null}
+        </div>
       </div>
       {GROUPS.map((group) => {
         const items = filtered.filter((i) => group.match(projectStatus(i)));
         if (!items.length) return null;
         return (
           <section key={group.id} data-testid={`session-group-${group.id}`}>
-            <div className={ui.groupTitle}>
-              {group.title} ({items.length})
+            <div className={css.group}>
+              <div className={`${css.groupTitle} ${group.id === "blocked" ? css.groupTitleBlocked : ""}`}>{group.title}</div>
+              <div className={css.groupMeta}>
+                {items.length}
+                {group.id === "blocked" ? " · 置顶，不进折叠组" : group.id === "recent" ? " · 子 agent 不在此列" : ""}
+              </div>
             </div>
             {items.map((instance) => {
               const status = projectStatus(instance);
               const pending = hub.interactions.find((i) => i.instanceId === instance.id && i.state === "pending");
               const to = `/s/${instance.id}`;
-              const active = location.pathname === to;
-              const summary =
-                pending?.request.kind === "approval"
-                  ? `等你批准 ${pending.request.title}`
-                  : pending?.request.kind === "question"
-                    ? `AskUserQuestion · ${pending.request.fields.length} 题`
-                    : hubStore.summaryOf(instance.id) ?? status;
               const workspace = hubStore.workspaceOf(instance.workspaceId);
+              const badge = pendingBadge(
+                pending?.request.kind,
+                pending && pending.request.kind !== "elicitation" ? pending.request.title : undefined,
+                pending?.request.kind === "question" ? pending.request.fields.length : undefined,
+              );
+              const summary = hubStore.summaryOf(instance.id);
+              const tty = uiMode(instance) === "tty-attachable";
+              const compactRecent = status === "idle" || status === "exited" || status === "unknown";
+              const title = hubStore.titleOf(instance.id);
               return (
                 <Link
                   key={instance.id}
                   to={to}
-                  className={`${ui.listItem} ${active ? ui.listItemActive : ""}`}
+                  className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""} ${compactRecent ? css.rowIdle : ""}`}
                   data-testid="session-row"
                   data-status={status}
                 >
                   <StateDot status={status} />
-                  <span>
-                    <div>{hubStore.titleOf(instance.id)}</div>
-                    <div className={ui.listMeta}>
-                      {status} · {hubStore.hostName(instance.hostId)} · {workspace?.label} · {instance.kind} · {nativeShort(instance)}
+                  <span className={`${css.body} ${compactRecent ? css.bodyIdle : ""}`}>
+                    {compactRecent ? (
+                      <div className={css.idleMeta}>
+                        <span>{status}</span>
+                        <span className={css.sep}> | </span>
+                        <span className={status === "unknown" ? undefined : css.metaHost}>{hubStore.hostName(instance.hostId)}</span>
+                        {" / "}
+                        {workspace?.label} · {instance.driver}
+                      </div>
+                    ) : (
+                      <div className={css.meta}>
+                        <span>{status}</span>
+                        <span className={css.sep}>|</span>
+                        <span className={css.metaHost}>{hubStore.hostName(instance.hostId)}</span>
+                        <span>/ {workspace?.label}</span>
+                        <span>· {instance.driver}</span>
+                        <span className={css.sep}>|</span>
+                        <span>{shortId(instance.id, 8)}</span>
+                        {status === "working" ? <span>· {formatListTime(instance.updatedAt)}</span> : null}
+                      </div>
+                    )}
+                    <div className={css.headline}>
+                      <div className={`${css.name} ${status === "starting" || status === "exited" || status === "unknown" ? css.nameMute : ""}`}>
+                        {title}
+                      </div>
+                      {badge ? <div className={css.badge}>{badge}</div> : null}
+                      {exitLabel(instance) ? <div className={css.exit}>{exitLabel(instance)}</div> : null}
                     </div>
-                    <div className={ui.listMeta}>{summary}</div>
+                    {status === "starting" ? (
+                      <div className={css.cmd}>正在拉起 · lifecycle={instance.lifecycle}</div>
+                    ) : status === "blocked" && pending?.request.kind === "approval" ? (
+                      <div className={css.cmd}>{pending.request.description}</div>
+                    ) : summary && status !== "blocked" ? (
+                      <div className={css.cmd}>{summary}</div>
+                    ) : status === "idle" ? (
+                      <div className={css.cmd}>回合结束、进程仍在 · 可继续 send</div>
+                    ) : status === "unknown" ? (
+                      <div className={css.cmd}>connectivity={instance.connectivity} · 不推断成功或结束</div>
+                    ) : null}
                   </span>
+                  <div className={css.side}>
+                    {tty ? (
+                      <span className={css.tty} title={nativeShort(instance)}>
+                        终端
+                      </span>
+                    ) : null}
+                    {status === "blocked" ? <span className={css.unread} /> : null}
+                    <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt)}</span>
+                  </div>
                 </Link>
               );
             })}

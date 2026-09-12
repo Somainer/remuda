@@ -46,16 +46,24 @@
 }
 .dotStarting {
   background: var(--mute);
-  animation: pulse 1.2s ease-in-out infinite;
+  animation: dim 1.6s ease-in-out infinite;
 }
 .dotIdle {
   background: var(--ok);
 }
 .dotExited {
+  width: 8px;
+  height: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: transparent;
-  box-shadow: inset 0 0 0 1px var(--mute);
   border-radius: 0;
-  transform: rotate(45deg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1;
+  color: var(--mute);
+  text-align: center;
 }
 .dotUnknown {
   background: transparent;
@@ -351,6 +359,16 @@
 }
 
 @keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes dim {
+  0%,
+  100% {
+    opacity: 1;
+  }
   50% {
     opacity: 0.35;
   }

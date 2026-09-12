@@ -1,8 +1,7 @@
 import { useMemo } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { ApprovalCard } from "../features/approvals/ApprovalCard";
-import { Button } from "../components/Button";
 import { StateDot } from "../components/StateDot";
+import { formatClock } from "../lib/format";
 import { hubStore, useHub } from "../lib/store";
 import { projectStatus } from "../lib/status";
 import {
@@ -11,15 +10,22 @@ import {
   thisDeviceId,
   type InteractionUiState,
 } from "../lib/interactionStatus";
-import ui from "../styles/ui.module.css";
+import css from "./ApprovalsPage.module.css";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 
 const KIND_FILTERS = ["all", "approval", "question", "plan-review"] as const;
 
 function preview(item: Interaction): string {
-  if (item.request.kind === "approval") return `${item.request.title}  ${item.request.description}`;
+  if (item.request.kind === "approval") return item.request.description;
   if (item.request.kind === "question") return `问你 ${item.request.fields.length} 题 · AskUserQuestion`;
   if (item.request.kind === "plan-review") return item.request.title;
+  return item.request.title;
+}
+
+function kindLabel(item: Interaction): string {
+  if (item.request.kind === "approval") return item.request.title;
+  if (item.request.kind === "question") return "AskUserQuestion";
+  if (item.request.kind === "plan-review") return "计划";
   return item.request.title;
 }
 
@@ -54,132 +60,182 @@ export function ApprovalsPage() {
       });
   }, [hub, kind, hostFilter, workspaceFilter, deviceId]);
 
-  const pendingCount = rows.filter((r) => r.uiState === "pending" || r.uiState === "answering" || r.uiState === "paused").length;
+  const queue = rows.filter((r) => r.uiState === "pending" || r.uiState === "answering" || r.uiState === "paused");
+  const departed = rows.filter((r) => r.uiState === "expired" || r.uiState === "superseded");
+  const pendingCount = queue.length;
 
   const respond = (item: Interaction, answer: InteractionAnswer) => {
     void hubStore.respond(item.id, answer);
   };
 
+  const setKind = (id: (typeof KIND_FILTERS)[number]) => {
+    const next = new URLSearchParams(params);
+    if (id === "all") next.delete("kind");
+    else next.set("kind", id);
+    setParams(next);
+  };
+
   return (
-    <div style={{ padding: 16, maxWidth: 720 }} data-testid="approvals-page">
-      <h1 style={{ fontSize: 18 }}>审批中心</h1>
-      <p className={ui.listMeta}>待处理 {pendingCount} · 本设备已处理的会从队列消失</p>
-      <div className={ui.row} style={{ margin: "12px 0" }}>
-        {KIND_FILTERS.map((id) => (
-          <button
-            key={id}
-            className={`${ui.chip} ${kind === id ? ui.chipOn : ""}`}
-            onClick={() => {
-              const next = new URLSearchParams(params);
-              if (id === "all") next.delete("kind");
-              else next.set("kind", id);
-              setParams(next);
-            }}
-          >
-            {id === "all" ? "全部" : id === "approval" ? "审批" : id === "question" ? "提问" : "计划"}
-          </button>
-        ))}
-      </div>
-      <div className={ui.row} style={{ marginBottom: 12 }}>
-        {hub.hosts.map((h) => (
-          <button
-            key={h.id}
-            className={`${ui.chip} ${hostFilter === h.id ? ui.chipOn : ""}`}
-            onClick={() => {
-              const next = new URLSearchParams(params);
-              if (hostFilter === h.id) next.delete("host");
-              else next.set("host", h.id);
-              setParams(next);
-            }}
-          >
-            {h.label}
-          </button>
-        ))}
-        {hub.workspaces.map((w) => (
-          <button
-            key={w.id}
-            className={`${ui.chip} ${workspaceFilter === w.id ? ui.chipOn : ""}`}
-            onClick={() => {
-              const next = new URLSearchParams(params);
-              if (workspaceFilter === w.id) next.delete("workspace");
-              else next.set("workspace", w.id);
-              setParams(next);
-            }}
-          >
-            {w.label}
-          </button>
-        ))}
-      </div>
-      {rows.map(({ item, instance, uiState }) => {
-        const focused = focus === item.id;
-        const paused = uiState === "paused";
-        const answering = uiState === "answering";
-        const showQueue = uiState === "pending" || uiState === "answering" || uiState === "paused";
-        return (
-          <article
-            key={item.id}
-            className={ui.card}
-            data-testid="approval-row"
-            data-state={uiState}
-            style={{ marginBottom: 12, outline: focused ? "1px solid var(--dust)" : undefined }}
-          >
-            <div className={ui.cardHead}>
+    <div className={css.page} data-testid="approvals-page">
+      <header className={css.top}>
+        <h1 className={css.title}>审批中心</h1>
+        <div className={css.pending}>
+          <span className={css.pendingDot} />
+          待处理 {pendingCount}
+        </div>
+        <div className={css.note}>本设备已处理的会从队列消失</div>
+        <div className={css.seg}>
+          {KIND_FILTERS.map((id) => (
+            <button key={id} type="button" className={`${css.segBtn} ${kind === id ? css.segOn : ""}`} onClick={() => setKind(id)}>
+              {id === "all" ? "全部" : id === "approval" ? "审批" : id === "question" ? "提问" : "计划"}
+            </button>
+          ))}
+        </div>
+      </header>
+      <div className={css.body}>
+        <div className={css.filters}>
+          {hub.hosts.map((h) => (
+            <button
+              key={h.id}
+              type="button"
+              className={`${css.hostBtn} ${hostFilter === h.id ? css.hostOn : ""}`}
+              onClick={() => {
+                const next = new URLSearchParams(params);
+                if (hostFilter === h.id) next.delete("host");
+                else next.set("host", h.id);
+                setParams(next);
+              }}
+            >
+              {h.label}
+            </button>
+          ))}
+          {hub.workspaces.map((w) => (
+            <button
+              key={w.id}
+              type="button"
+              className={`${css.hostBtn} ${workspaceFilter === w.id ? css.hostOn : ""}`}
+              onClick={() => {
+                const next = new URLSearchParams(params);
+                if (workspaceFilter === w.id) next.delete("workspace");
+                else next.set("workspace", w.id);
+                setParams(next);
+              }}
+            >
+              {w.label}
+            </button>
+          ))}
+        </div>
+        {queue.map(({ item, instance, uiState }) => {
+          const focused = focus === item.id;
+          const paused = uiState === "paused";
+          const answering = uiState === "answering";
+          const workspace = hubStore.workspaceOf(instance?.workspaceId ?? "");
+          return (
+            <article
+              key={item.id}
+              className={`${css.card} ${uiState === "pending" ? css.cardPending : ""} ${focused ? css.cardFocus : ""}`}
+              data-testid="approval-row"
+              data-state={uiState}
+            >
               {instance ? <StateDot status={projectStatus(instance)} /> : null}
-              <span>
-                {new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · {hubStore.hostName(item.hostId)} /{" "}
-                {hubStore.workspaceOf(instance?.workspaceId ?? "")?.label} / {instance?.kind}
-              </span>
-              <span className={ui.pill}>{INTERACTION_LABEL[uiState as InteractionUiState]}</span>
-            </div>
-            <p>{preview(item)}</p>
-            {uiState === "expired" ? <p className={ui.listMeta}>过期，未作用于新进程</p> : null}
-            {uiState === "superseded" ? <p className={ui.listMeta}>已在其它设备处理</p> : null}
-            {paused ? <p className={ui.listMeta}>主机离线，交互暂停</p> : null}
-            {showQueue && item.kind === "approval" && item.request.kind === "approval" ? (
-              <ApprovalCard
-                interaction={item}
-                busy={answering || paused}
-                onRespond={(answer) => respond(item, answer)}
-              />
-            ) : null}
-            {showQueue && item.kind === "question" ? (
-              <div className={ui.row}>
-                <Link to={`/s/${item.instanceId}`}>
-                  <Button variant="primary" disabled={paused}>
+              <div className={css.bodyCol}>
+                <div className={css.meta}>
+                  <span>{formatClock(item.createdAt)}</span>
+                  <span className={css.sep}>·</span>
+                  <span className={css.metaHost}>{hubStore.hostName(item.hostId)}</span>
+                  <span>
+                    / {workspace?.label} / {instance?.kind}
+                  </span>
+                  <span className={css.sep}>·</span>
+                  <span>{INTERACTION_LABEL[uiState as InteractionUiState]}</span>
+                </div>
+                <div className={css.headline}>
+                  <div className={`${css.kind} ${paused ? css.kindMute : ""}`}>{kindLabel(item)}</div>
+                  <p className={`${css.preview} ${paused ? css.previewMute : ""}`}>{preview(item)}</p>
+                </div>
+                {paused ? <p className={css.note}>主机离线，交互暂停</p> : null}
+              </div>
+              <div className={css.actions}>
+                {answering ? (
+                  <span className={`${css.btn} ${css.btnDash}`}>
+                    <span className={`${css.spin} spin`} />
+                    已提交
+                  </span>
+                ) : null}
+                {!answering && item.kind === "approval" && item.request.kind === "approval"
+                  ? item.request.options.map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        className={`${css.btn} ${opt.effect === "deny" ? "" : css.btnDust} ${paused ? css.btnDash : ""}`}
+                        disabled={paused}
+                        onClick={() =>
+                          respond(item, {
+                            kind: "approval",
+                            optionId: opt.id,
+                            inputDigest: item.request.kind === "approval" ? item.request.inputDigest : "",
+                          })
+                        }
+                      >
+                        {opt.label}
+                      </button>
+                    ))
+                  : null}
+                {!answering && item.kind === "question" ? (
+                  <Link to={`/s/${item.instanceId}`} className={`${css.btn} ${css.btnDust}`}>
                     去回答
-                  </Button>
+                  </Link>
+                ) : null}
+                {!answering && item.kind === "plan-review" && item.request.kind === "plan-review"
+                  ? item.request.options.map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        className={`${css.btn} ${opt.effect === "deny" ? "" : css.btnDust}`}
+                        disabled={paused || answering}
+                        onClick={() =>
+                          respond(item, {
+                            kind: "plan-review",
+                            optionId: opt.id,
+                            planRevision: item.request.kind === "plan-review" ? item.request.planRevision : "1",
+                            planDigest: item.request.kind === "plan-review" ? item.request.planDigest : "",
+                            feedback: null,
+                          })
+                        }
+                      >
+                        {opt.label}
+                      </button>
+                    ))
+                  : null}
+                <Link to={`/s/${item.instanceId}`} className={`${css.btn} ${css.btnMute}`}>
+                  打开会话
                 </Link>
               </div>
-            ) : null}
-            {showQueue && item.kind === "plan-review" && item.request.kind === "plan-review" ? (
-              <div className={ui.row}>
-                {item.request.options.map((opt) => (
-                  <Button
-                    key={opt.id}
-                    variant={opt.effect === "deny" ? "danger" : "primary"}
-                    disabled={paused || answering}
-                    onClick={() =>
-                      respond(item, {
-                        kind: "plan-review",
-                        optionId: opt.id,
-                        planRevision: item.request.kind === "plan-review" ? item.request.planRevision : "1",
-                        planDigest: item.request.kind === "plan-review" ? item.request.planDigest : "",
-                        feedback: null,
-                      })
-                    }
-                  >
-                    {opt.label}
-                  </Button>
-                ))}
-              </div>
-            ) : null}
-            <div className={ui.row} style={{ marginTop: 8 }}>
-              <Link to={`/s/${item.instanceId}`}>打开会话</Link>
-            </div>
-          </article>
-        );
-      })}
-      {rows.length === 0 ? <p className={ui.listMeta}>没有待处理交互</p> : null}
+            </article>
+          );
+        })}
+        {departed.length ? (
+          <div className={css.departed}>
+            <div className={css.departedLabel}>已离队</div>
+            {departed.map(({ item, instance, uiState }) => {
+              const workspace = hubStore.workspaceOf(instance?.workspaceId ?? "");
+              return (
+                <article key={item.id} className={css.departedRow} data-testid="approval-row" data-state={uiState}>
+                  <div className={css.departedMark}>○</div>
+                  <div className={css.departedMeta}>
+                    {formatClock(item.createdAt)} · {hubStore.hostName(item.hostId)} / {workspace?.label}
+                  </div>
+                  <div className={css.departedTitle}>
+                    {kindLabel(item)} · {preview(item)}
+                  </div>
+                  <div className={css.departedState}>{INTERACTION_LABEL[uiState as InteractionUiState]}</div>
+                </article>
+              );
+            })}
+          </div>
+        ) : null}
+        {rows.length === 0 ? <p className={css.empty}>没有待处理交互</p> : null}
+      </div>
     </div>
   );
 }

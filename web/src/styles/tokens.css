@@ -1,5 +1,10 @@
-:root {
+:root,
+:root[data-theme="night"],
+[data-theme="night"] {
+  --canvas: #0c0f14;
   --ink: #12161c;
+  --ink-0: #0f1319;
+  --ink-1: #151b23;
   --ink-2: #1a212b;
   --line: #2a3340;
   --paper: #e7dcc8;
@@ -7,15 +12,45 @@
   --dust: #c9842a;
   --cold: #6a8b9a;
   --ok: #7a8f62;
+  --on-dust: #12161c;
+  --scrim: rgba(12, 15, 20, 0.72);
+  --diff-add: rgba(122, 143, 98, 0.13);
+  --diff-del: rgba(231, 220, 200, 0.05);
+  --diff-ctx: rgba(231, 220, 200, 0.03);
   --danger: #8f3d2c;
-  --font: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+[data-theme="ledger"] {
+  --canvas: #e4e0d6;
+  --ink: #f3f0ea;
+  --ink-0: #eae5da;
+  --ink-1: #efe8d8;
+  --ink-2: #faf8f3;
+  --line: #c5c1b7;
+  --paper: #1e2a32;
+  --mute: #5e6b72;
+  --dust: #8c6a16;
+  --cold: #3d5a68;
+  --ok: #556a3c;
+  --on-dust: #f8f6f1;
+  --scrim: rgba(30, 42, 50, 0.55);
+  --diff-add: rgba(85, 106, 60, 0.16);
+  --diff-del: rgba(143, 61, 44, 0.1);
+  --diff-ctx: rgba(30, 42, 50, 0.03);
+  --danger: #8f3d2c;
+}
+
+:root {
+  --font: "IBM Plex Sans", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --radius: 4px;
   --text: 14px;
   --rail: 48px;
   --list: 280px;
   --aside: 300px;
-  --bar: 52px;
+  --bar: 64px;
+  --top: 56px;
+  --top-mobile: 52px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --workbench-height: 100dvh;
 }
@@ -33,6 +68,11 @@ body,
   margin: 0;
 }
 
+html {
+  background: var(--canvas);
+  color-scheme: dark;
+}
+
 body {
   font-family: var(--font);
   font-size: var(--text);
@@ -40,6 +80,7 @@ body {
   background: var(--ink);
   color: var(--paper);
   text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
 }
 
 button,
@@ -53,7 +94,7 @@ select {
 input,
 textarea,
 select {
-  background: var(--ink);
+  background: var(--ink-0);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 8px 10px;
@@ -68,6 +109,10 @@ a {
   text-decoration: none;
 }
 
+a:hover {
+  color: var(--paper);
+}
+
 code,
 pre,
 kbd {
@@ -77,6 +122,22 @@ kbd {
 :focus-visible {
   outline: 1px solid var(--cold);
   outline-offset: 2px;
+}
+
+@keyframes dim {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

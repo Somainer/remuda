@@ -1,12 +1,19 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { Bell, Folder, Key, MessageSquare, Monitor, Plus, Settings, Bot } from "lucide-react";
-import { isSessionRoute } from "../lib/nav";
+import { isSessionRoute, MORE_NAV } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SessionList } from "../features/session/SessionList";
+import { SessionsPage } from "../pages/SessionsPage";
 import { InstallBar } from "./InstallBar";
 import css from "./Shell.module.css";
+
+function layoutOf(pathname: string): "sessions" | "session" | "sheet" | "page" {
+  if (pathname === "/sessions/new") return "sheet";
+  if (pathname.startsWith("/s/")) return "session";
+  if (pathname === "/sessions") return "sessions";
+  return "page";
+}
 
 export function Shell() {
   const hub = useHub();
@@ -16,7 +23,15 @@ export function Shell() {
   const pending = hub.interactions.filter((i) => i.state === "pending").length;
   const onSessions = isSessionRoute(location.pathname);
   const onSessionPage = location.pathname.startsWith("/s/");
-  const showMobileList = mobile && onSessions && !onSessionPage && location.pathname !== "/sessions/new";
+  const onNew = location.pathname === "/sessions/new";
+  const showSidebarList = !mobile && onSessionPage;
+  const moreActive = MORE_NAV.some((item) => location.pathname.startsWith(item.to));
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [morePath, setMorePath] = useState(location.pathname);
+  if (morePath !== location.pathname) {
+    setMorePath(location.pathname);
+    setMoreOpen(false);
+  }
 
   useEffect(() => {
     const onVis = () => {
@@ -37,64 +52,81 @@ export function Shell() {
   }, [hub.toast]);
 
   return (
-    <div className={css.shell} data-compact={mobile ? "1" : "0"}>
+    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layoutOf(location.pathname)}>
       <div className={css.install}>
         <InstallBar />
       </div>
       <nav className={css.rail} aria-label="主导航">
-        <Link className={`${css.icon} ${onSessions ? css.iconActive : ""}`} to="/sessions" title="会话">
-          <MessageSquare size={18} />
+        <Link className={`${css.icon} ${onSessions && !onNew ? css.iconActive : ""}`} to="/sessions" title="会话">
+          ▤
         </Link>
-        <Link className={`${css.icon} ${location.pathname.startsWith("/approvals") ? css.iconActive : ""}`} to="/approvals" title="审批">
-          <Bell size={18} />
+        <Link
+          className={`${css.icon} ${location.pathname.startsWith("/approvals") ? css.iconActive : ""}`}
+          to="/approvals"
+          title="审批"
+        >
+          ◆
           {pending ? <span className={css.badge}>{pending}</span> : null}
         </Link>
         <Link className={css.icon} to="/sessions/new" title="新建">
-          <Plus size={18} />
+          <span className={css.plusBox}>＋</span>
         </Link>
         <div className={css.more}>
-          <Link className={css.icon} to="/hosts" title="主机">
-            <Monitor size={18} />
-          </Link>
-          <Link className={css.icon} to="/projects" title="项目">
-            <Folder size={18} />
-          </Link>
-          <Link className={css.icon} to="/providers" title="Provider">
-            <Key size={18} />
-          </Link>
-          <Link className={css.icon} to="/bots" title="Bot">
-            <Bot size={18} />
-          </Link>
-          <Link className={css.icon} to="/settings" title="设置">
-            <Settings size={18} />
-          </Link>
+          <button
+            type="button"
+            className={`${css.icon} ${moreActive ? css.iconActive : ""}`}
+            title="更多"
+            aria-expanded={moreOpen}
+            aria-haspopup="menu"
+            onClick={() => setMoreOpen((v) => !v)}
+          >
+            ⋯
+          </button>
+          {moreOpen ? (
+            <div className={css.moreMenu} role="menu">
+              {MORE_NAV.map((item) => (
+                <Link
+                  key={item.id}
+                  role="menuitem"
+                  className={`${css.moreItem} ${location.pathname.startsWith(item.to) ? css.moreItemActive : ""}`}
+                  to={item.to}
+                >
+                  {item.label}
+                </Link>
+              ))}
+            </div>
+          ) : null}
         </div>
+        <Link className={css.me} to="/settings" title="设置">
+          <span className={css.meDot}>me</span>
+        </Link>
       </nav>
-      {onSessions ? (
-        <aside className={`${css.list} ${showMobileList ? css.listMobile : ""}`}>
-          <header className={css.header}>
-            <strong className={css.grow}>会话</strong>
-            <Link to="/sessions/new">＋ 新建</Link>
-          </header>
-          <SessionList />
+      {showSidebarList ? (
+        <aside className={css.list}>
+          <SessionList variant="compact" />
         </aside>
-      ) : (
-        <aside className={css.list} />
-      )}
-      <main className={`${css.main} ${showMobileList ? css.hideMainOnList : ""}`}>
+      ) : null}
+      <main className={css.main}>
+        {onNew ? <SessionsPage dimmed /> : null}
         <Outlet />
       </main>
       <nav className={css.bar} aria-label="手机底栏">
         <Link className={onSessions && !location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/sessions">
+          <span className={css.barGlyph}>▤</span>
           会话
         </Link>
         <Link className={location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/approvals">
-          审批{pending ? `·${pending}` : ""}
+          <span className={css.barGlyph}>◆</span>
+          {pending ? <span className={css.barBadge}>{pending}</span> : null}
+          审批
         </Link>
-        <button type="button" onClick={() => navigate("/sessions/new")}>
-          ＋
+        <button type="button" onClick={() => navigate("/sessions/new")} aria-label="新建">
+          <span className={css.barPlus}>＋</span>
         </button>
-        <Link to="/settings">更多</Link>
+        <button type="button" className={moreActive ? css.barActive : ""} onClick={() => setMoreOpen((v) => !v)}>
+          <span className={css.barGlyph}>⋯</span>
+          更多
+        </button>
       </nav>
       {hub.toast ? <div className={css.toast}>{hub.toast.text}</div> : null}
     </div>

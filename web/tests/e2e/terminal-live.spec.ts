@@ -42,6 +42,34 @@ test.describe("live remote terminal", () => {
     await page.screenshot({ path: path.join(dir, "terminal-1-shell.png"), animations: "disabled" });
   });
 
+  test("type echo and mouse click round-trip on a shell PTY", async ({ page }) => {
+    await login(page);
+    await page.goto("/sessions/new");
+    await page.getByTestId("new-session-kind-terminal").click();
+    await expect(page.getByTestId("new-session-start")).toBeEnabled();
+    await page.getByTestId("new-session-start").click();
+    await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+    const lab = page.locator("[data-tty-lab='1']");
+    await expect(lab).toBeVisible();
+    await expect(lab).toHaveAttribute("data-tty-status", "live", { timeout: 30_000 });
+    await page.locator(".xterm textarea, .xterm-helper-textarea").first().click({ force: true });
+    await page.keyboard.type("echo TERMUI_ECHO");
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("tty-ansi-preview")).toContainText("TERMUI_ECHO", { timeout: 15_000 });
+    await page.screenshot({ path: path.join(dir, "terminal-1-echo.png"), animations: "disabled" });
+
+    await page.keyboard.type("printf '\\033[?1000h\\033[?1006h'; cat");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(600);
+    const host = page.locator("[data-tty-lab='1'] .xterm");
+    const box = await host.boundingBox();
+    expect(box).toBeTruthy();
+    await page.mouse.click(box!.x + Math.min(80, box!.width * 0.35), box!.y + Math.min(48, box!.height * 0.35));
+    await expect(page.getByTestId("tty-raw-tail")).toContainText("[<", { timeout: 10_000 });
+    await page.screenshot({ path: path.join(dir, "terminal-1-mouse.png"), animations: "disabled" });
+    await page.keyboard.press("Control+c");
+  });
+
   test("grok pty session defaults to the terminal tab", async ({ page }) => {
     await login(page);
     await page.goto("/sessions/new");

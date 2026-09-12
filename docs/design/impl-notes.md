@@ -137,3 +137,54 @@ modules through `remuda-node`'s `lib.rs` and dependency manifest, commit the API
 fixture tests, compose `remuda dev` plus `remuda node --stdio` in the binary
 crate, then run build/test/clippy and the loopback/LAN CLI smoke checks against
 the exact staged tree.
+
+## CI failures for crate owners
+
+### GitHub Actions `34683616964` (`c01250c`, 2026-09-12)
+
+Tests passed. Clippy `-D warnings` failed.
+
+**remuda-node** — `clippy::too_many_arguments` (8/7)
+
+```
+error: this function has too many arguments (8/7)
+   --> crates/remuda-node/src/transport/wss.rs:376:1
+    |
+376 | / async fn session_task(
+377 | |     mut config: WssConfig,
+...
+384 | |     ready: Option<oneshot::Sender<Result<Value, NodeError>>>,
+385 | | ) {
+    = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+
+error: could not compile `remuda-node` (lib) due to 1 previous error
+```
+
+### GitHub Actions `34683772080` (`7ab8278`, 2026-09-12)
+
+Required jobs: rust, m0-stub, web failed; secret-scan passed.
+
+**remuda-testing** — `m0-print-stub` missing crate deps (also fails `cargo test --workspace` via `bin "m0-print-stub" test`):
+
+```
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `remuda_driver`
+ --> crates/remuda-testing/src/bin/m0-print-stub.rs:5:5
+error[E0432]: unresolved import `clap`
+error[E0432]: unresolved import `remuda_driver`
+error[E0432]: unresolved import `remuda_journal`
+error[E0432]: unresolved import `remuda_protocol`
+error[E0432]: unresolved import `sha2`
+error: cannot find attribute `command` in this scope
+  --> crates/remuda-testing/src/bin/m0-print-stub.rs:28:3
+error: could not compile `remuda-testing` (bin "m0-print-stub" test) due to 10 previous errors
+```
+
+**web / remuda-hub** — CI step `Generated OpenAPI client is current`:
+
+```
+git diff --exit-code -- web/src/lib/api.generated.ts
+##[error]Process completed with exit code 1
+```
+
+Committed `web/src/lib/api.generated.ts` is stale vs Hub OpenAPI. Crate owners should regenerate and commit the client (do not drop the CI check).
+

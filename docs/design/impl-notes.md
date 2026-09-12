@@ -359,3 +359,17 @@ is still answered.
 `WssLink::connect_runtime`; pump journal observations back to Hub over
 stdio; binary tty on stdio; schema/TS generation still exempts hubnode types.
 
+### GitHub Actions `34687481986` (`48083c3`, 2026-09-12)
+
+**remuda-driver** — `cargo test --workspace --locked` failed:
+
+```
+test recipe_round_trip_json_has_no_env_values ... FAILED
+thread 'recipe_round_trip_json_has_no_env_values' panicked at crates/remuda-driver/tests/materializer.rs:74:43:
+called `Result::unwrap()` on an `Err` value: Io(Os { code: 26, kind: ExecutableFileBusy, message: "Text file busy" })
+error: test failed, to rerun pass `-p remuda-driver --test materializer`
+test result: FAILED. 12 passed; 1 failed; 1 ignored
+```
+
+Same ETXTBSY class as `claude_pty_review` (writing a stub binary while it is still mapped). Crate test isolation, not workflow/lockfile.
+

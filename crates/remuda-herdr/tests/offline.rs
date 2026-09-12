@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use remuda_herdr::{
     AgentPromptParams, AgentReadParams, AgentStartParams, AgentStatus, AgentWaitParams, Client,
@@ -106,17 +106,33 @@ fn spawn_fake(socket: &std::path::Path, script: &str) -> ChildGuard {
         .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn fake-herdr");
-    let guard = ChildGuard(Some(child));
-    for _ in 0..100 {
+    let mut guard = ChildGuard(Some(child));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
         if socket.exists() {
             return guard;
         }
+        let status = guard
+            .0
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .expect("poll fake-herdr");
+        assert!(
+            status.is_none(),
+            "fake-herdr exited before binding {}: {status:?}",
+            socket.display()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "fake-herdr socket {} did not appear within 15 seconds",
+            socket.display()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("fake-herdr socket {} did not appear", socket.display());
 }
 
 #[tokio::test]

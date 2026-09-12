@@ -170,14 +170,15 @@ impl ClaudePtyDriver {
     }
 
     /// Transcript path recorded by the SessionStart hook, if it has fired.
-    pub async fn session_transcript(&self) -> Option<String> {
-        let inner = self.inner.lock().await;
-        inner.as_ref().and_then(|live| {
-            live.transcript_path
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-        })
+    pub async fn session_transcript(&self) -> Option<PathBuf> {
+        if let Some(inner) = self.inner.lock().await.as_ref()
+            && let Ok(guard) = inner.transcript_path.lock()
+            && let Some(path) = guard.as_ref()
+            && !path.is_empty()
+        {
+            return Some(PathBuf::from(path));
+        }
+        read_session_meta_transcript(&self.options.launch_dir)
     }
 
     /// Open a read-only Herdr terminal observer for the live pane.
@@ -600,6 +601,16 @@ fn spawn_status_pump(
             }
         }
     })
+}
+
+fn read_session_meta_transcript(launch_dir: &Path) -> Option<PathBuf> {
+    let body = std::fs::read_to_string(launch_dir.join("session-meta.json")).ok()?;
+    let value: Value = serde_json::from_str(&body).ok()?;
+    value
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 fn spawn_hook_watch(

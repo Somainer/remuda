@@ -12,8 +12,13 @@ import {
   mockConfigure,
   mockCreate,
   mockDb,
+  mockDeviceList,
+  mockDeviceRevoke,
   mockHostName,
+  mockLogin,
   mockPage,
+  mockPairCode,
+  mockPairRedeem,
   mockReadJournal,
   mockRespond,
   mockResume,
@@ -23,6 +28,8 @@ import {
 } from "./mock";
 import { digestPlaceholder, id, now } from "./ids";
 import { accessHeaders } from "./accessCode";
+import { HubHttpError } from "./httpError";
+import { readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
 
 export const MOCK = import.meta.env.VITE_MOCK === "1";
 
@@ -205,6 +212,11 @@ type JsonRpcResponse<T> = JsonRpcSuccess<T> | JsonRpcFailure;
 
 export type HubApi = {
   mock: boolean;
+  login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
+  pairRedeem(code: string, deviceName: string): Promise<DeviceSession>;
+  pairCode(): Promise<PairCode>;
+  deviceList(): Promise<{ items: PairedDevice[] }>;
+  deviceRevoke(deviceId: string): Promise<{ ok: boolean }>;
   hello(): Promise<HelloResult>;
   instanceList(q?: { hostId?: string; workspaceId?: string; kind?: string }): Promise<Page<Instance>>;
   instanceGet(instanceId: Id): Promise<Instance>;
@@ -255,15 +267,29 @@ function wsUrl(): string {
   return `${proto}://${location.host}/v1/client`;
 }
 
-async function rest<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function rest<T>(path: string, init: RequestInit & { auth?: boolean } = {}): Promise<T> {
+  const { auth = true, ...req } = init;
+  const headers = {
+    ...(auth ? accessHeaders() : { "content-type": "application/json" }),
+    ...(req.headers as Record<string, string> | undefined),
+  };
   const res = await fetch(`${hubBase()}${path}`, {
     credentials: "include",
-    ...init,
-    headers: { ...accessHeaders(), ...(init.headers as Record<string, string> | undefined) },
+    ...req,
+    headers,
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || `HTTP ${res.status}`);
+    let code = `HTTP_${res.status}`;
+    let message = text || `HTTP ${res.status}`;
+    try {
+      const body = JSON.parse(text) as { code?: string; error?: string };
+      if (body.code) code = body.code;
+      if (body.error) message = body.error;
+    } catch {
+      /* raw */
+    }
+    throw new HubHttpError(res.status, code, message);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -283,6 +309,21 @@ function createMockApi(): HubApi {
   const subs = new Map<Id, (batch: EventsBatch["params"]) => void>();
   return {
     mock: true,
+    async login(bootstrapToken, deviceName) {
+      return mockLogin(bootstrapToken, deviceName);
+    },
+    async pairRedeem(code, deviceName) {
+      return mockPairRedeem(code, deviceName);
+    },
+    async pairCode() {
+      return mockPairCode(readSession()?.token);
+    },
+    async deviceList() {
+      return mockDeviceList(readSession()?.token);
+    },
+    async deviceRevoke(deviceId) {
+      return mockDeviceRevoke(readSession()?.token, deviceId);
+    },
     async hello() {
       return {
         protocol: { major: 1, minor: 0 },
@@ -509,6 +550,34 @@ function createLiveApi(): HubApi {
 
   return {
     mock: false,
+    async login(bootstrapToken, deviceName) {
+      const body: HubBody<"/v1/login", "post"> = { bootstrapToken, deviceName };
+      return rest<HubJson<"/v1/login", "post">>("/v1/login", {
+        method: "POST",
+        auth: false,
+        body: JSON.stringify(body),
+      });
+    },
+    async pairRedeem(code, deviceName) {
+      const body: HubBody<"/v1/devices/pair", "post"> = { code, deviceName };
+      return rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
+        method: "POST",
+        auth: false,
+        body: JSON.stringify(body),
+      });
+    },
+    async pairCode() {
+      return rest<HubJson<"/v1/devices/pair-code", "post">>("/v1/devices/pair-code", {
+        method: "POST",
+        body: "{}",
+      });
+    },
+    async deviceList() {
+      return rest<HubJson<"/v1/devices", "get">>("/v1/devices");
+    },
+    async deviceRevoke(deviceId) {
+      return rest<HubJson<"/v1/devices/{id}", "delete">>(`/v1/devices/${deviceId}`, { method: "DELETE" });
+    },
     async hello() {
       await ensureSocket();
       return send<HelloResult>("runtime.hello", {

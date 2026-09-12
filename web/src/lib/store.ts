@@ -6,9 +6,22 @@ import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
 import type { Workspace } from "../types/workspace";
 import { api, observationText, type InstanceCreateSpec } from "./api";
+import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
 import { mockGappedTail, mockJournalIds } from "./mock";
+import { readDeviceSettings } from "../features/settings/prefs";
+import {
+  MOCK_BOOTSTRAP_TOKEN,
+  clearSession,
+  dropDeviceCookie,
+  readLoggedOut,
+  readSession,
+  writeSession,
+  type DeviceSession,
+  type PairCode,
+  type PairedDevice,
+} from "./session";
 
 export type ConnectionUi = "live" | "reconnecting" | "offline";
 export type Toast = { id: string; text: string } | null;
@@ -29,6 +42,9 @@ export type HubState = {
   error: string | null;
   toast: Toast;
   connection: ConnectionUi;
+  session: DeviceSession | null;
+  devices: PairedDevice[];
+  pairCode: PairCode | null;
   instances: Instance[];
   hosts: Host[];
   workspaces: Workspace[];
@@ -43,10 +59,13 @@ export type HubState = {
 
 const initial: HubState = {
   ready: false,
-  authed: api.mock,
+  authed: false,
   error: null,
   toast: null,
   connection: "live",
+  session: readSession(),
+  devices: [],
+  pairCode: null,
   instances: [],
   hosts: [],
   workspaces: [],
@@ -103,32 +122,98 @@ class HubStore {
   }
 
   async bootstrap() {
+    if (api.mock && readLoggedOut() && !readSession()) {
+      this.emit({ ready: true, authed: false, session: null, devices: [], connection: "offline" });
+      return;
+    }
+    if (api.mock && !readSession()) {
+      const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
+      writeSession(session);
+      this.emit({ session });
+    }
     try {
       await api.hello();
-      const [instances, hosts, workspaces, interactions] = await Promise.all([
+      const [instances, hosts, workspaces, interactions, devices] = await Promise.all([
         api.instanceList(),
         api.hostList(),
         api.workspaceList(),
         api.interactionList(),
+        api.deviceList().catch(() => ({ items: [] as PairedDevice[] })),
       ]);
       this.emit({
         ready: true,
         authed: true,
         error: null,
         connection: "live",
+        session: readSession(),
+        devices: devices.items,
         instances: instances.items,
         hosts: hosts.items,
         workspaces: workspaces.items,
         interactions,
       });
     } catch (err) {
+      const unauth = isUnauthorized(err);
+      if (unauth) {
+        clearSession();
+        dropDeviceCookie();
+      }
       this.emit({
         ready: true,
-        authed: api.mock,
+        authed: false,
+        session: unauth ? null : this.state.session,
         error: err instanceof Error ? err.message : "bootstrap failed",
         connection: "offline",
       });
     }
+  }
+
+  async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
+    const session =
+      kind === "pair" ? await api.pairRedeem(secret, deviceName) : await api.login(secret, deviceName);
+    writeSession(session);
+    this.emit({ session, authed: true, error: null });
+    await this.bootstrap();
+  }
+
+  logout() {
+    const mine = this.state.session?.deviceId;
+    if (mine) void api.deviceRevoke(mine).catch(() => undefined);
+    clearSession();
+    dropDeviceCookie();
+    api.disconnect();
+    this.emit({
+      authed: false,
+      session: null,
+      devices: [],
+      pairCode: null,
+      instances: [],
+      hosts: [],
+      workspaces: [],
+      interactions: [],
+      events: {},
+      connection: "offline",
+    });
+  }
+
+  async issuePairCode() {
+    const issued = await api.pairCode();
+    this.emit({ pairCode: issued });
+    return issued;
+  }
+
+  async refreshDevices() {
+    const devices = await api.deviceList();
+    this.emit({ devices: devices.items });
+  }
+
+  async revokeDevice(deviceId: string) {
+    await api.deviceRevoke(deviceId);
+    if (this.state.session?.deviceId === deviceId) {
+      this.logout();
+      return;
+    }
+    await this.refreshDevices();
   }
 
   async refresh() {

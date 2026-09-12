@@ -11,13 +11,13 @@ import { FleetPage } from "../pages/FleetPage";
 import { ProjectsPage, ProjectDetailPage } from "../pages/ProjectsPage";
 import { ProvidersPage, ProviderDetailPage } from "../pages/ProvidersPage";
 import { BotsPage, BotDetailPage } from "../pages/BotsPage";
-import { PairPage, SettingsPage } from "../pages/SettingsPage";
+import { SettingsPage } from "../pages/SettingsPage";
 
 export function AppRouter() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
-      <Route path="/pair" element={<PairPage />} />
+      <Route path="/pair" element={<LoginPage mode="pair" />} />
       <Route element={<AuthGate />}>
         <Route element={<Shell />}>
           <Route path="/" element={<Navigate to="/sessions" replace />} />

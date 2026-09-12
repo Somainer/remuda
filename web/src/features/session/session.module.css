@@ -470,6 +470,13 @@
   pointer-events: none;
 }
 
+.composerRoot {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
 .composer {
   display: flex;
   align-items: flex-end;
@@ -548,6 +555,255 @@
 
 .sendIcon:disabled {
   opacity: 0.5;
+}
+
+.controlBar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  white-space: nowrap;
+  min-width: max-content;
+  position: relative;
+}
+
+.chipMark {
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--paper);
+  flex: none;
+}
+
+.chipCaret {
+  color: var(--mute);
+  font-size: 11px;
+}
+
+.chipModel {
+  color: var(--paper);
+}
+
+.barSpacer {
+  flex: 1;
+}
+
+.contextRing {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  box-sizing: border-box;
+  position: relative;
+  flex: none;
+}
+
+.contextRing::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--cold);
+  clip-path: polygon(0 0, 100% 0, 100% var(--ctx-pct, 0%), 0 var(--ctx-pct, 0%));
+}
+
+.popover {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 7px 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 326px;
+  max-width: 100%;
+  z-index: 5;
+}
+
+.popoverUp {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+}
+
+.menuHead {
+  padding: 5px 12px 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--mute);
+  letter-spacing: 0.06em;
+}
+
+.menuFoot {
+  border-top: 1px solid var(--line);
+  margin-top: 5px;
+  padding: 8px 12px 3px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--mute);
+  line-height: 1.5;
+}
+
+.menuSection {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 6px;
+  margin-bottom: 4px;
+}
+
+.effortRow,
+.harnessRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  background: transparent;
+  border: 0;
+  color: var(--paper);
+  text-align: left;
+  width: 100%;
+}
+
+.effortOn,
+.harnessOn {
+  background: var(--ink);
+}
+
+.harnessOff {
+  color: var(--mute);
+}
+
+.harnessName {
+  font-size: 13px;
+}
+
+.harnessMeta {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.harnessPlus {
+  margin-left: auto;
+  font-size: 16px;
+  color: var(--mute);
+}
+
+.radio {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  box-sizing: border-box;
+  flex: none;
+}
+
+.radioOn {
+  border: 3px solid var(--paper);
+}
+
+.effortName {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  width: 92px;
+  flex: none;
+}
+
+.effortDesc {
+  font-size: 12px;
+  color: var(--mute);
+  flex: 1;
+}
+
+@keyframes ember {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
+  }
+}
+
+@keyframes halo {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(201, 132, 42, 0.5), 0 0 10px 2px rgba(201, 132, 42, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(201, 132, 42, 0), 0 0 16px 4px rgba(201, 132, 42, 0.5);
+  }
+}
+
+@keyframes spark {
+  0% {
+    transform: translateY(0) scale(1);
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-13px) scale(0.4);
+    opacity: 0;
+  }
+}
+
+.ember {
+  color: var(--dust);
+  border-color: var(--dust);
+  background-image: linear-gradient(90deg, transparent, rgba(201, 132, 42, 0.18), transparent);
+  background-size: 200% 100%;
+  animation: ember 2.8s linear infinite, halo 2.2s ease-in-out infinite;
+}
+
+.emberSpark {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--dust);
+  left: 8px;
+  bottom: 6px;
+  animation: spark 1.2s ease-out infinite;
+  pointer-events: none;
+}
+
+.emberSpark2 {
+  left: 18px;
+  animation-delay: 0.35s;
+}
+
+.emberSpark3 {
+  left: 28px;
+  animation-delay: 0.7s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ember,
+  .emberSpark,
+  .emberSpark2,
+  .emberSpark3 {
+    animation: none !important;
+  }
 }
 
 .approval {
@@ -760,6 +1016,10 @@
   .composer {
     align-items: center;
     gap: 10px;
+  }
+
+  .chip {
+    height: 32px;
   }
 
   .input {

@@ -10,6 +10,7 @@ describe("device settings", () => {
     expect(DEFAULT_SETTINGS.autoRevealTty).toBe(false);
     expect(DEFAULT_SETTINGS.theme).toBe("night-corral");
     expect(DEFAULT_SETTINGS.permissionDefault).toBe("manual");
+    expect(DEFAULT_SETTINGS.defaultEffortIndex).toBe(1);
     expect(readDeviceSettings().autoRevealTty).toBe(false);
   });
 

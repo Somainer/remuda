@@ -951,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_aborts_an_unresponsive_session_task() {
-        let (journal, _journal_rx) = journal_channel(1);
+        let (journal, _journal_rx, metrics) = journal_channel(1);
         let (control, _control_rx) = mpsc::channel(1);
         let (_hub_tx, hub_rx) = mpsc::channel(1);
         let task = tokio::spawn(std::future::pending());
@@ -960,6 +960,7 @@ mod tests {
             node_token: None,
             hello: json!({}),
             journal,
+            metrics,
             control,
             hub_rx,
             task,

@@ -164,21 +164,34 @@ async fn wss_hello_heartbeat_append_reconnect_against_hub() {
         "prompt": "do not replay"
     })
     .to_string();
-    let (status, body) = http(
-        hub.addr,
-        "POST",
-        "/v1/instances",
-        &[("Cookie", cookie.as_str())],
-        Some(&create),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
+    let create_task = tokio::spawn({
+        let cookie = cookie.clone();
+        async move {
+            http(
+                hub.addr,
+                "POST",
+                "/v1/instances",
+                &[("Cookie", cookie.as_str())],
+                Some(&create),
+            )
+            .await
+        }
+    });
 
     let request = tokio::time::timeout(TIMEOUT, link.next_hub_request())
         .await
         .expect("hub request timeout")
         .expect("instance.create");
     assert_eq!(request.method, "instance.create");
+    request
+        .respond(Ok(json!({ "accepted": true })))
+        .await
+        .expect("application reply");
+    let (status, body) = tokio::time::timeout(TIMEOUT, create_task)
+        .await
+        .expect("create response timeout")
+        .expect("create task");
+    assert_eq!(status, 200, "{body}");
 
     tokio::time::timeout(TIMEOUT, link.reconnect())
         .await

@@ -76,12 +76,35 @@ impl WssConfig {
 /// Hub→Node JSON-RPC request. Not stored across reconnects.
 #[derive(Debug, Clone)]
 pub struct HubRequest {
-    /// JSON-RPC id to echo on the reply (already answered by the session).
+    /// JSON-RPC id to echo on the reply.
     pub id: Value,
     /// Method (`instance.create`, `instance.send`, …).
     pub method: String,
     /// Params object.
     pub params: Value,
+    reply: mpsc::Sender<HubReply>,
+}
+
+impl HubRequest {
+    /// Complete this request after the application has durably accepted or rejected it.
+    pub async fn respond(self, result: Result<Value, NodeError>) -> Result<(), NodeError> {
+        if self.id.is_null() {
+            return Ok(());
+        }
+        self.reply
+            .send(HubReply {
+                id: self.id,
+                result,
+            })
+            .await
+            .map_err(|_| NodeError::Disconnected)
+    }
+}
+
+#[derive(Debug)]
+struct HubReply {
+    id: Value,
+    result: Result<Value, NodeError>,
 }
 
 struct JournalJob {
@@ -144,6 +167,7 @@ impl WssLink {
         let host_id = config.host_id.clone();
         let (journal_tx, journal_rx) = mpsc::channel(config.journal_queue.max(1));
         let (hub_tx, hub_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
+        let (hub_reply_tx, hub_reply_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
         let (control_tx, control_rx) = mpsc::channel(4);
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(session_task(
@@ -151,6 +175,8 @@ impl WssLink {
             token,
             journal_rx,
             hub_tx,
+            hub_reply_tx,
+            hub_reply_rx,
             control_rx,
             Some(ready_tx),
         ));
@@ -179,7 +205,7 @@ impl WssLink {
         self.journal.append(instance_id.into(), event).await
     }
 
-    /// Next Hub→Node request already auto-acked. Empty after reconnect.
+    /// Next Hub→Node request. The caller must invoke [`HubRequest::respond`].
     pub async fn next_hub_request(&mut self) -> Option<HubRequest> {
         self.hub_rx.recv().await
     }
@@ -352,6 +378,8 @@ async fn session_task(
     mut token: String,
     mut journal_rx: mpsc::Receiver<JournalJob>,
     hub_tx: mpsc::Sender<HubRequest>,
+    hub_reply_tx: mpsc::Sender<HubReply>,
+    mut hub_reply_rx: mpsc::Receiver<HubReply>,
     mut control_rx: mpsc::Receiver<Control>,
     ready: Option<oneshot::Sender<Result<Value, NodeError>>>,
 ) {
@@ -446,10 +474,32 @@ async fn session_task(
                     }
                 }
             }
+            reply = hub_reply_rx.recv() => {
+                let Some(reply) = reply else { break; };
+                let frame = match reply.result {
+                    Ok(result) => rpc_ok(reply.id, result),
+                    Err(error) => rpc_node_error(reply.id, &error),
+                };
+                if send_ws(&mut stream, &frame).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &ids, &mut attempt)
+                        .await
+                        .is_err()
+                {
+                    fail_pending(&mut pending, NodeError::Disconnected);
+                    break;
+                }
+            }
             incoming = recv_ws(&mut stream) => {
                 match incoming {
                     Ok(Some(frame)) => {
-                        handle_incoming(frame, &mut pending, &hub_tx, &mut stream).await;
+                        handle_incoming(
+                            frame,
+                            &mut pending,
+                            &hub_tx,
+                            &hub_reply_tx,
+                            &mut stream,
+                        )
+                        .await;
                     }
                     Ok(None) | Err(_) => {
                         fail_pending(&mut pending, NodeError::Disconnected);
@@ -471,20 +521,26 @@ async fn handle_incoming(
     frame: Value,
     pending: &mut HashMap<String, oneshot::Sender<Result<Value, NodeError>>>,
     hub_tx: &mpsc::Sender<HubRequest>,
+    hub_reply_tx: &mpsc::Sender<HubReply>,
     stream: &mut WsStream,
 ) {
     let method = frame.get("method").and_then(Value::as_str);
     if let Some(method) = method {
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
         let params = frame.get("params").cloned().unwrap_or(json!({}));
-        if !id.is_null() {
-            let _ = send_ws(stream, &rpc_ok(id.clone(), json!({ "ok": true }))).await;
-        }
-        let _ = hub_tx.try_send(HubRequest {
-            id,
+        let request = HubRequest {
+            id: id.clone(),
             method: method.to_owned(),
             params,
-        });
+            reply: hub_reply_tx.clone(),
+        };
+        if hub_tx.try_send(request).is_err() && !id.is_null() {
+            let _ = send_ws(
+                stream,
+                &rpc_error(id, -32001, "Node application queue is full"),
+            )
+            .await;
+        }
         return;
     }
     let Some(id) = frame.get("id").and_then(|id| {
@@ -506,6 +562,24 @@ async fn handle_incoming(
             "rpc response missing result".into(),
         )));
     }
+}
+
+fn rpc_node_error(id: Value, error: &NodeError) -> Value {
+    let code = match error {
+        NodeError::InvalidRequest(_) | NodeError::NotFound { .. } => -32602,
+        NodeError::QueueFull => -32001,
+        NodeError::DriverUnavailable => -32002,
+        _ => -32603,
+    };
+    rpc_error(id, code, &error.to_string())
+}
+
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message },
+    })
 }
 
 fn fail_pending(

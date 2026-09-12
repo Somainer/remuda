@@ -119,7 +119,7 @@ async fn spawn_inner(
         config: Arc::new(config.clone()),
         store,
         nodes: crate::transport::ConnectedNodes::default(),
-        bus: Bus::new(),
+        bus: Bus::with_capacity(config.follow_buffer_events),
         push,
         followers: Followers::default(),
         blocked: BlockedWatch::default(),

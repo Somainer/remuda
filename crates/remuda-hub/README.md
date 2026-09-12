@@ -54,7 +54,8 @@ OpenAPI 3.1: `openapi/openapi.json`. Web client: `pnpm --dir web run gen:api`.
 | POST | `/v1/instances` | device | Index + forward `instance.create` if the Node is online |
 | POST | `/v1/instances/:id/commands` | device | Command ledger (`queued`/`accepted`/`settled`); same `commandId` is idempotent and **never resent** |
 | GET | `/v1/instances/:id/journal` | device | Mirrored events + `durableSeq` |
-| GET WS | `/v1/follow?instanceId=` | device | Snapshot (`asOfSeq`) then live `{type:event,seq}` |
+| GET WS | `/v1/follow?instanceId=` | device | Snapshot (`asOfSeq`) then live `{type:event,seq}`. Slow sockets get `{type:gap,reason:backpressure}` and a resync snapshot (`follow_buffer_events`, default 256). |
+| GET | `/v1/interactions` | device | Pending cards from SQLite (survives Hub restart), merged with live Node RPC |
 | GET WS | `/v1/node` | host/bootstrap bearer | Node control plane |
 | GET WS | `/node/v1/connect` | host/bootstrap bearer | Alias from `plan-phase0.md` §1.5 |
 | GET | `/v1/hosts/:id` | device | Single host including last inventory |
@@ -78,7 +79,7 @@ request **must** be hello. Wire names follow `protocol.md` §7; the task aliases
 
 | Method | Dir | Purpose |
 | --- | --- | --- |
-| `runtime.hello` / `node.hello` | Node→Hub | Identity + inventory (`host.labels`, `cli`, `herdr`, `resources`, `maxInstances`). First enroll returns `nodeToken`. |
+| `runtime.hello` / `node.hello` | Node→Hub | Identity + inventory (`host.labels`, `cli`, `herdr`, `resources`, `maxInstances`). First enroll returns `nodeToken`. Re-enroll with that token keeps the same `hostId` and returns `instanceWatermarks[]` (`instanceId`, `journalId`, `durableSeq`) so the Node can resume the journal mirror without duplicates. |
 | `runtime.heartbeat` / `node.heartbeat` | Node→Hub | Refresh `lastSeenAt` and the same inventory fields |
 | `host.report` | Node→Hub | Inventory (`driverInventory` or `cli`) |
 | `journal.append` | Node→Hub | Push an observation; Hub assigns `seq` and mirrors it |
@@ -109,9 +110,26 @@ attention rule).
 
 ## SQLite (`data-dir/hub.sqlite`)
 
-WAL writer thread (no `rusqlite::Connection` across `.await`): `devices`,
-`hosts`, `instances` (index), `commands` (inbox), `journal` (cache). Node
-journals remain authoritative.
+WAL writer thread (no `rusqlite::Connection` across `.await`). Tables:
+
+| Table | Survives Hub restart |
+| --- | --- |
+| `devices` | Device Argon2id hashes; cookies / bearer tokens stay valid |
+| `hosts` | Enrollment (`hostId`, token hash, inventory). Re-hello with the host token reuses the row |
+| `instances` | Cross-host index + `durable_seq` watermark |
+| `commands` | Inbox; `forwarded` means never resend |
+| `journal` | Observation mirror. `journal.append` with an already-mirrored `seq` is idempotent |
+| `interactions` | Pending cards from `interaction.requested` events until answered/expired |
+| `fleets` / `fleet_members` / `pair_codes` | Fleet index and one-time pairing codes |
+
+Node journals remain authoritative. After a Hub process restart:
+
+1. Device sessions still authenticate (same cookie / token).
+2. A Node presenting its host token re-enrolls as the same `hostId`.
+3. Hello includes `instanceWatermarks`; replaying seq ≤ watermark does not duplicate rows.
+4. `GET /v1/interactions` still lists pending cards even if the Node is offline.
+
+`/v1/follow` uses a per-socket bounded queue (`HubConfig.follow_buffer_events`, default 256, also the live broadcast capacity). Overflow or a lagged broadcast emits `{type:gap,reason:backpressure}` then a fresh snapshot so the client can resync instead of silently dropping seqs.
 
 ## `deploy/compose.hub.yml`
 

@@ -44,7 +44,12 @@ pub struct Bus {
 impl Bus {
     /// Create a bounded broadcast channel.
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(256);
+        Self::with_capacity(256)
+    }
+
+    /// Create a broadcast bus with `capacity` live slots (slow followers gap).
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity.max(1));
         Self { tx }
     }
 
@@ -295,7 +300,15 @@ async fn handle_node_method(
                 )
                 .await;
             *session_generation = Some(generation);
-            Ok(Some(hello_result(&host, node_token)?))
+            let watermarks = state
+                .store
+                .list_instance_watermarks(host.host_id.clone())
+                .await?;
+            let mut result = hello_result(&host, node_token)?;
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("instanceWatermarks".into(), json!(watermarks));
+            }
+            Ok(Some(result))
         }
         "runtime.heartbeat" | "node.heartbeat" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
@@ -383,26 +396,27 @@ async fn handle_node_method(
             let mut last = None;
             let mut seq = seq;
             for event in events {
-                let (record, inserted) = state
+                let appended = state
                     .store
                     .append_journal(host_id.clone(), instance_id.clone(), seq, event)
                     .await
                     .map_err(map_host_store)?;
-                if inserted {
-                    publish_journal(&state.bus, &record);
-                    crate::alerts::observe(state, &record);
+                if !appended.replayed {
+                    publish_journal(&state.bus, &appended.record);
+                    crate::alerts::observe(state, &appended.record);
                 }
-                seq = Some(record.seq.saturating_add(1));
-                last = Some(record);
+                seq = Some(appended.record.seq.saturating_add(1));
+                last = Some(appended);
             }
-            let record = last.ok_or_else(|| {
+            let appended = last.ok_or_else(|| {
                 HubError::BadRequest("journal.append requires event or events".into())
             })?;
             Ok(Some(json!({
-                "seq": record.seq.to_string(),
-                "eventId": record.event_id,
-                "durableSeq": record.seq.to_string(),
-                "watermark": { "durableSeq": record.seq.to_string() },
+                "seq": appended.record.seq.to_string(),
+                "eventId": appended.record.event_id,
+                "durableSeq": appended.durable_seq.to_string(),
+                "replayed": appended.replayed,
+                "watermark": { "durableSeq": appended.durable_seq.to_string() },
             })))
         }
         "tty.frame" => {
@@ -577,6 +591,8 @@ async fn follow_session(
     filter: Option<String>,
     device_id: String,
 ) {
+    let cap = state.config.follow_buffer_events.max(1);
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(cap);
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.bus.subscribe();
     let mut instance_ids: Vec<String> = filter.into_iter().collect();
@@ -584,72 +600,150 @@ async fn follow_session(
         state.followers.watch(device_id.clone(), id.clone()).await;
     }
 
-    if let Some(id) = instance_ids.first().cloned() {
-        let _ = send_snapshot(&state, &mut sink, &id).await;
-    }
+    let writer = async {
+        while let Some(text) = out_rx.recv().await {
+            if sink.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    };
 
-    loop {
-        tokio::select! {
-            incoming = stream.next() => {
-                let Some(Ok(msg)) = incoming else { break; };
-                let Message::Text(text) = msg else { continue; };
-                if let Ok(value) = serde_json::from_str::<Value>(&text)
-                    && value.get("type").and_then(Value::as_str) == Some("subscribe")
-                    && let Some(ids) = value.get("instanceIds").and_then(Value::as_array)
-                {
-                    state.followers.unwatch(&device_id, &instance_ids).await;
-                    instance_ids = ids
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect();
-                    for id in &instance_ids {
-                        state.followers.watch(device_id.clone(), id.clone()).await;
-                        let _ = send_snapshot(&state, &mut sink, id).await;
+    let pump = async {
+        for id in &instance_ids {
+            if let Ok(frame) = snapshot_json(&state, id).await
+                && out_tx.send(frame.to_string()).await.is_err()
+            {
+                return;
+            }
+        }
+        loop {
+            tokio::select! {
+                incoming = stream.next() => {
+                    let Some(Ok(msg)) = incoming else { break; };
+                    let Message::Text(text) = msg else { continue; };
+                    if let Ok(value) = serde_json::from_str::<Value>(&text)
+                        && value.get("type").and_then(Value::as_str) == Some("subscribe")
+                        && let Some(ids) = value.get("instanceIds").and_then(Value::as_array)
+                    {
+                        state.followers.unwatch(&device_id, &instance_ids).await;
+                        instance_ids = ids
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                        for id in &instance_ids {
+                            state.followers.watch(device_id.clone(), id.clone()).await;
+                            if let Ok(frame) = snapshot_json(&state, id).await
+                                && out_tx.send(frame.to_string()).await.is_err()
+                            {
+                                return;
+                            }
+                        }
                     }
                 }
-            }
-            event = rx.recv() => {
-                match event {
-                    Ok(event) => {
-                        if !instance_ids.is_empty()
-                            && !instance_ids.iter().any(|id| id == &event.instance_id)
-                        {
-                            continue;
+                event = rx.recv() => {
+                    match event {
+                        Ok(event) => {
+                            if !instance_ids.is_empty()
+                                && !instance_ids.iter().any(|id| id == &event.instance_id)
+                            {
+                                continue;
+                            }
+                            let frame = json!({
+                                "type": "event",
+                                "instanceId": event.instance_id,
+                                "seq": event.seq.to_string(),
+                                "event": event.event,
+                            });
+                            match out_tx.try_send(frame.to_string()) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    if resync_after_gap(&state, &out_tx, &instance_ids).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                            }
                         }
-                        let frame = json!({
-                            "type": "event",
-                            "instanceId": event.instance_id,
-                            "seq": event.seq.to_string(),
-                            "event": event.event,
-                        });
-                        if sink.send(Message::Text(frame.to_string().into())).await.is_err() {
-                            break;
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if resync_after_gap(&state, &out_tx, &instance_ids).await.is_err() {
+                                return;
+                            }
                         }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
+    };
+
+    tokio::select! {
+        () = writer => {}
+        () = pump => {}
     }
     state.followers.unwatch(&device_id, &instance_ids).await;
 }
 
-async fn send_snapshot(
+async fn resync_after_gap(
     state: &AppState,
-    sink: &mut futures::stream::SplitSink<WebSocket, Message>,
-    instance_id: &str,
-) -> Result<(), HubError> {
+    out_tx: &mpsc::Sender<String>,
+    instance_ids: &[String],
+) -> Result<(), ()> {
+    let gap = json!({ "type": "gap", "reason": "backpressure" });
+    out_tx.send(gap.to_string()).await.map_err(|_| ())?;
+    for id in instance_ids {
+        if let Ok(frame) = snapshot_json(state, id).await {
+            out_tx.send(frame.to_string()).await.map_err(|_| ())?;
+        }
+    }
+    Ok(())
+}
+
+async fn snapshot_json(state: &AppState, instance_id: &str) -> Result<Value, HubError> {
     let (events, durable) = state.store.read_journal(instance_id.to_string(), 0).await?;
-    let frame = json!({
+    Ok(json!({
         "type": "snapshot",
         "instanceId": instance_id,
         "asOfSeq": durable.to_string(),
         "events": events,
-    });
-    sink.send(Message::Text(frame.to_string().into()))
-        .await
-        .map_err(|err| HubError::Internal(err.to_string()))?;
-    Ok(())
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn follow_bus_reports_lag_when_capacity_exceeded() {
+        let bus = Bus::with_capacity(1);
+        let mut rx = bus.subscribe();
+        bus.publish(FollowEvent {
+            instance_id: "ins".into(),
+            seq: 1,
+            event: json!({"n": 1}),
+        });
+        bus.publish(FollowEvent {
+            instance_id: "ins".into(),
+            seq: 2,
+            event: json!({"n": 2}),
+        });
+        bus.publish(FollowEvent {
+            instance_id: "ins".into(),
+            seq: 3,
+            event: json!({"n": 3}),
+        });
+        let first = rx.recv().await;
+        match first {
+            Err(broadcast::error::RecvError::Lagged(skipped)) => assert!(skipped >= 1),
+            Ok(_) => {
+                let second = rx.recv().await;
+                assert!(
+                    matches!(second, Err(broadcast::error::RecvError::Lagged(_))),
+                    "{second:?}"
+                );
+            }
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+    }
 }

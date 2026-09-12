@@ -24,10 +24,10 @@ pnpm dev
 VITE_MOCK=1 pnpm dev
 ```
 
-接真实 Hub（JSON-RPC `POST /v1/rpc` + `WSS /v1/client`）：
+接真实 Hub（JSON-RPC `POST /v1/rpc` + `WSS /v1/client`）。`remuda-node` HTTP 路由尚未落地（M0-11），live client 按 `protocol.md` 写，origin 用 `VITE_API_BASE`：
 
 ```bash
-VITE_MOCK=0 VITE_HUB_URL=https://hub.example pnpm dev
+VITE_MOCK=0 VITE_API_BASE=http://127.0.0.1:8787 pnpm dev
 ```
 
 ## 脚本
@@ -36,7 +36,8 @@ VITE_MOCK=0 VITE_HUB_URL=https://hub.example pnpm dev
 | --- | --- |
 | `pnpm dev` | Vite 开发服 |
 | `pnpm build` | `tsc -b` + 生产包 |
-| `pnpm test` | Vitest（journal seq/gap/重连、tool registry 分派） |
+| `pnpm test` | Vitest（status 投影、tool registry、journal seq/gap、transcript assemble） |
+| `pnpm test:e2e` | Playwright `tests/e2e/session-structured.spec.ts`（chromium + mobile-webkit） |
 | `pnpm lint` | oxlint `src` |
 | `pnpm preview` | 预览生产包（注册 `public/sw.js`） |
 

@@ -65,35 +65,44 @@ function EditWriteCard({
   );
 }
 
-function ReadCard({ call }: { call: ToolCallPayload }) {
+function ReadCard({ call, result }: { call: ToolCallPayload; result: ToolResultPayload | null }) {
   const rec = asRecord(knowledgeValue(call.input));
+  const offset = rec?.offset;
+  const limit = rec?.limit;
+  const range = typeof offset === "number" || typeof limit === "number" ? `:${String(offset ?? 1)}-${String(limit ?? "")}` : "";
+  const snippet = result
+    ? result.blocks
+        .map((b) => (b.type === "text" ? b.text : ""))
+        .filter(Boolean)
+        .join("\n")
+    : "";
   return (
     <article className={ui.card}>
       <div className={ui.cardHead}>
         <strong>Read</strong>
-        <span className={ui.path}>{asString(rec?.file_path) ?? "file"}</span>
+        <span className={ui.path}>
+          {asString(rec?.file_path) ?? "file"}
+          {range}
+        </span>
       </div>
+      {snippet ? <pre className={ui.pre}>{snippet}</pre> : null}
     </article>
   );
 }
 
 function WorkflowCard({
-  call,
   runTitle,
   members,
 }: {
-  call: ToolCallPayload;
   runTitle?: string;
   members?: { label: string; state: string }[];
 }) {
-  const rec = asRecord(knowledgeValue(call.input));
   return (
     <article className={ui.card}>
       <div className={ui.cardHead}>
         <strong>Workflow</strong>
         <span>{runTitle ?? "running"}</span>
       </div>
-      {rec?.script ? <pre className={ui.pre}>{asString(rec.script)}</pre> : null}
       <ul>
         {(members ?? []).map((m) => (
           <li key={m.label}>
@@ -185,8 +194,8 @@ export function ToolCard({
   const family = familyFor(driverKind, name);
   if (family === "Bash") return <BashCard call={call} result={result} completeness={completeness} />;
   if (family === "Edit" || family === "Write") return <EditWriteCard family={family} call={call} result={result} diffState={diffState} />;
-  if (family === "Read") return <ReadCard call={call} />;
-  if (family === "Workflow") return <WorkflowCard call={call} runTitle={workflowTitle} members={workflowMembers} />;
+  if (family === "Read") return <ReadCard call={call} result={result} />;
+  if (family === "Workflow") return <WorkflowCard runTitle={workflowTitle} members={workflowMembers} />;
   if (family === "Task") return <TaskCard call={call} />;
   if (family === "MCP") return <McpCard call={call} result={result} />;
   return <GenericCard call={call} result={result} />;

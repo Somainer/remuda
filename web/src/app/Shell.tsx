@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { Bell, Folder, Key, MessageSquare, Monitor, Plus, Settings, Bot } from "lucide-react";
 import { isSessionRoute } from "../lib/nav";
@@ -13,7 +13,6 @@ export function Shell() {
   const { mobile } = useWorkbenchViewport();
   const location = useLocation();
   const navigate = useNavigate();
-  const [query, setQuery] = useState("");
   const pending = hub.interactions.filter((i) => i.state === "pending").length;
   const onSessions = isSessionRoute(location.pathname);
   const onSessionPage = location.pathname.startsWith("/s/");
@@ -77,14 +76,7 @@ export function Shell() {
             <strong className={css.grow}>会话</strong>
             <Link to="/sessions/new">＋ 新建</Link>
           </header>
-          <input
-            className="search"
-            style={{ margin: "8px 12px", width: "calc(100% - 24px)" }}
-            placeholder="搜索标题 / cwd / 原生 id"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <SessionList instances={hub.instances} query={query} statusFilter="" />
+          <SessionList />
         </aside>
       ) : (
         <aside className={css.list} />

@@ -15,7 +15,7 @@ export function ApprovalCard({
   if (req.kind !== "approval") return null;
   const disabled = busy || !interaction.answerable || interaction.state !== "pending";
   return (
-    <section className={ui.approval}>
+    <section className={ui.approval} data-testid="approval-card">
       <div className={ui.cardHead}>
         <strong>审批 · {req.title}</strong>
         <span>{interaction.state}</span>

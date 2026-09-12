@@ -7,12 +7,14 @@ import type { Workspace } from "../types/workspace";
 import type { JournalRead } from "./journal";
 import {
   mockClose,
+  mockConfigure,
   mockCreate,
   mockDb,
   mockHostName,
   mockPage,
   mockReadJournal,
   mockRespond,
+  mockResume,
   mockSend,
   mockSnapshot,
   mockWorkspaceLabel,
@@ -54,6 +56,8 @@ export type HubApi = {
   instanceCreate(spec: InstanceCreateSpec): Promise<{ command: CommandResult["command"]; instance: Instance }>;
   instanceSend(instanceId: Id, prompt: string): Promise<CommandResult>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
+  instanceResume(instanceId: Id): Promise<CommandResult>;
+  instanceConfigure(instanceId: Id, permissionMode: string): Promise<CommandResult>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
   interactionRespond(interactionId: Id, answer: InteractionAnswer): Promise<CommandResult>;
@@ -75,13 +79,17 @@ export type HubApi = {
   eventsAck(subscriptionId: Id, journalId: Id, throughSeq: U64): Promise<{ acknowledgedSeq: U64 }>;
   eventsUnsubscribe(subscriptionId: Id): Promise<void>;
   titleOf(instanceId: Id): string;
+  summaryOf(instanceId: Id): string | undefined;
+  permissionModeOf(instanceId: Id): string;
   hostName(hostId: Id): string;
   workspaceLabel(workspaceId: Id): string;
   disconnect(): void;
 };
 
+/** Live Hub origin. remuda-node HTTP router is not shipped yet (M0-11); JSON-RPC per protocol.md. */
 function hubBase(): string {
-  return (import.meta.env.VITE_HUB_URL ?? "").replace(/\/$/, "");
+  const raw = import.meta.env.VITE_API_BASE ?? import.meta.env.VITE_HUB_URL ?? "";
+  return raw.replace(/\/$/, "");
 }
 
 function wsUrl(): string {
@@ -159,6 +167,12 @@ function createMockApi(): HubApi {
     async instanceClose(instanceId) {
       return mockClose(instanceId);
     },
+    async instanceResume(instanceId) {
+      return mockResume(instanceId);
+    },
+    async instanceConfigure(instanceId, permissionMode) {
+      return mockConfigure(instanceId, permissionMode);
+    },
     async interactionList(q) {
       return mockDb.interactions.filter((i) => {
         if (q?.instanceId && i.instanceId !== q.instanceId) return false;
@@ -222,6 +236,12 @@ function createMockApi(): HubApi {
     },
     titleOf(instanceId) {
       return mockDb.titles.get(instanceId) ?? "会话";
+    },
+    summaryOf(instanceId) {
+      return mockDb.summaries.get(instanceId);
+    },
+    permissionModeOf(instanceId) {
+      return mockDb.permissionMode.get(instanceId) ?? "manual";
     },
     hostName(hostId) {
       return mockDb.hosts.find((h) => h.id === hostId)?.label ?? mockHostName;
@@ -313,6 +333,13 @@ function createLiveApi(): HubApi {
     async instanceClose(instanceId) {
       return send<CommandResult>("instance.close", { instanceId, mode: "terminate", retainNativeSession: true });
     },
+    async instanceResume(instanceId) {
+      return send<CommandResult>("instance.resume", { instanceId });
+    },
+    async instanceConfigure(instanceId, permissionMode) {
+      // TODO(M0-11): remuda-node router not shipped; method name from protocol.md instance.configure.
+      return send<CommandResult>("instance.configure", { instanceId, permissionMode, effective: "next-turn" });
+    },
     async interactionList(q) {
       const page = await send<{ items?: Interaction[] } | Interaction[]>("interaction.list", q ?? {});
       return Array.isArray(page) ? page : (page.items ?? []);
@@ -366,6 +393,12 @@ function createLiveApi(): HubApi {
     },
     titleOf(instanceId) {
       return titles.get(instanceId) ?? "会话";
+    },
+    summaryOf() {
+      return undefined;
+    },
+    permissionModeOf() {
+      return "manual";
     },
     hostName(hostId) {
       return hosts.get(hostId)?.label ?? hostId.slice(0, 8);

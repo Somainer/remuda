@@ -46,6 +46,7 @@ const insWorking = id("ins_");
 const insBlocked = id("ins_");
 const insIdle = id("ins_");
 const runWorking = id("run_");
+const workflowId = id("obj_");
 const interactionId = id("int_");
 const nativeSession = String(claudeInit.session_id);
 
@@ -303,7 +304,7 @@ journals.set(journalWorking, [
     input: known({ script: "agent({model:'passthrough/auto'})" }),
   }),
   obs(insWorking, journalWorking, 11, "workflow.run", {
-    workflowId: id("obj_"),
+    workflowId,
     engine: "claude-workflow",
     nativeRunId: known("wf_9f3"),
     nativeTaskId: unknownKnowledge("none"),
@@ -313,8 +314,17 @@ journals.set(journalWorking, [
     title: known("compile"),
     resultRef: null,
   }),
-  obs(insWorking, journalWorking, 12, "workflow.member", {
-    workflowId: id("obj_"),
+  obs(insWorking, journalWorking, 12, "workflow.phase", {
+    workflowId,
+    phaseId: id("obj_"),
+    nativePhaseId: known("compile"),
+    label: known("compile"),
+    state: "running",
+    revision: "1",
+    parentPhaseId: null,
+  }),
+  obs(insWorking, journalWorking, 13, "workflow.member", {
+    workflowId,
     memberId: id("obj_"),
     nativeAgentId: known("agent-1"),
     nativeKey: known("haiku"),
@@ -327,7 +337,7 @@ journals.set(journalWorking, [
     resultRef: null,
     revision: "1",
   }),
-  obs(insWorking, journalWorking, 13, "tool_call", {
+  obs(insWorking, journalWorking, 14, "tool_call", {
     ...bashCall(),
     toolCallId: id("obj_"),
     toolName: known("Task"),
@@ -335,7 +345,7 @@ journals.set(journalWorking, [
     category: "agent",
     input: known({ prompt: "summarize" }),
   }),
-  obs(insWorking, journalWorking, 14, "tool_call", {
+  obs(insWorking, journalWorking, 15, "tool_call", {
     ...bashCall(),
     toolCallId: id("obj_"),
     toolName: known("mcp__claude_ai_Google_Drive__search_files"),
@@ -343,7 +353,7 @@ journals.set(journalWorking, [
     category: "mcp",
     input: known({ query: "spill" }),
   }),
-  obs(insWorking, journalWorking, 15, "message", {
+  obs(insWorking, journalWorking, 16, "message", {
     nodeId: id("obj_"),
     revision: "1",
     operation: "open",
@@ -357,7 +367,7 @@ journals.set(journalWorking, [
     nativeOrigin: known("assistant"),
     status: "complete",
   }),
-  obs(insWorking, journalWorking, 16, "usage", {
+  obs(insWorking, journalWorking, 17, "usage", {
     usageId: id("obj_"),
     scope: "turn",
     scopeId: runWorking,
@@ -373,6 +383,20 @@ journals.set(journalWorking, [
     cost: known({ amount: "0.12", currency: "USD" }),
     accounting: "estimated",
     nativeFieldsRef: null,
+  }),
+  obs(insWorking, journalWorking, 18, "opaque", {
+    nativeType: "rate_limit_event",
+    reason: "unmapped-native",
+    rawRef: {
+      objectId: id("obj_"),
+      offset: "0",
+      length: "0",
+      digest: digestPlaceholder(),
+      mediaType: "application/json",
+      redaction: "none",
+    },
+    affects: [],
+    summary: "rate_limit_event",
   }),
 ]);
 
@@ -441,7 +465,15 @@ const questionInteraction: Interaction = {
   resolution: { state: "not-applicable" },
 };
 
+const insStarting = id("ins_");
+const insExited = id("ins_");
 instances.push(instanceBase(insQuestion, journalQuestion, "ready", known("waiting-interaction")));
+instances.push({ ...instanceBase(insStarting, id("obj_"), "starting", unknownKnowledge("starting")), activeRunIds: [] });
+instances.push({
+  ...instanceBase(insExited, id("obj_"), "exited", known("idle")),
+  activeRunIds: [],
+  exit: known({ code: 1, signal: null, observedAt: ts }),
+});
 interactions.push(questionInteraction);
 journals.set(journalQuestion, [
   obs(insQuestion, journalQuestion, 1, "message", {
@@ -466,7 +498,17 @@ const titles = new Map<Id, string>([
   [insWorking, "看 TaskManager spill 这段为啥抖"],
   [insIdle, "空闲会话"],
   [insQuestion, "spill 从哪改？"],
+  [insStarting, "正在启动"],
+  [insExited, "失败会话"],
 ]);
+
+const summaries = new Map<Id, string>([
+  [insWorking, "Workflow wf_9f3 · phase compile"],
+  [insBlocked, "等你批准 Bash"],
+  [insQuestion, "AskUserQuestion · 1 题"],
+]);
+
+export const mockInstanceIds = { insWorking, insBlocked, insIdle, insQuestion, insStarting, insExited };
 
 export type MockDb = {
   hosts: Host[];
@@ -475,9 +517,13 @@ export type MockDb = {
   interactions: Interaction[];
   journals: Map<Id, Observation[]>;
   titles: Map<Id, string>;
+  summaries: Map<Id, string>;
+  permissionMode: Map<Id, string>;
 };
 
-export const mockDb: MockDb = { hosts, workspaces, instances, interactions, journals, titles };
+const permissionMode = new Map<Id, string>();
+
+export const mockDb: MockDb = { hosts, workspaces, instances, interactions, journals, titles, summaries, permissionMode };
 
 export function mockReadJournal(journalId: Id, afterSeq?: U64, limit = 128) {
   const all = journals.get(journalId) ?? [];
@@ -582,6 +628,52 @@ export function mockSend(instanceId: Id, prompt: string): CommandResult {
     resolution: "clear",
   };
   return { command, relatedCommandIds: [] };
+}
+
+export function mockConfigure(instanceId: Id, permission: string): CommandResult {
+  const inst = instances.find((i) => i.id === instanceId);
+  if (!inst) throw new Error("INSTANCE_NOT_FOUND");
+  permissionMode.set(instanceId, permission);
+  const commandId = id("cmd_");
+  return {
+    command: {
+      ...meta(commandId),
+      commandId,
+      actor: { principalId: id("prn_"), type: "human", deviceId: id("dev_"), instanceId },
+      origin: "ui",
+      operation: "instance.configure",
+      target: { hostId, instanceId, runId: null },
+      payloadDigest: digestPlaceholder(),
+      state: "accepted",
+      dispatch: "intent-durable",
+      resolution: "clear",
+    },
+    relatedCommandIds: [],
+  };
+}
+
+export function mockResume(instanceId: Id): CommandResult {
+  const inst = instances.find((i) => i.id === instanceId);
+  if (!inst) throw new Error("INSTANCE_NOT_FOUND");
+  inst.lifecycle = "ready";
+  inst.activity = known("idle");
+  inst.updatedAt = now();
+  const commandId = id("cmd_");
+  return {
+    command: {
+      ...meta(commandId),
+      commandId,
+      actor: { principalId: id("prn_"), type: "human", deviceId: id("dev_"), instanceId },
+      origin: "ui",
+      operation: "instance.resume",
+      target: { hostId, instanceId, runId: null },
+      payloadDigest: digestPlaceholder(),
+      state: "accepted",
+      dispatch: "intent-durable",
+      resolution: "clear",
+    },
+    relatedCommandIds: [],
+  };
 }
 
 export function mockClose(instanceId: Id): CommandResult {

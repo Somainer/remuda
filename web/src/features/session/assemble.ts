@@ -5,12 +5,14 @@ import type {
   ToolResultPayload,
   UsagePayload,
   WorkflowMemberPayload,
+  WorkflowPhasePayload,
   WorkflowRunPayload,
 } from "../../types/observation";
 import type { Interaction } from "../../types/interaction";
 import { knowledgeValue } from "../../types/command";
 import { familyFor, type ToolFamily } from "./toolRegistry";
 import { observationText } from "../../lib/api";
+import type { LocalBubble } from "../../lib/store";
 
 export type DiffState = "proposed" | "applied" | "unknown";
 
@@ -19,6 +21,7 @@ export type ToolNode = {
   id: string;
   family: ToolFamily;
   name: string;
+  driverKind: string;
   call: ToolCallPayload;
   result: ToolResultPayload | null;
   completeness: Observation["completeness"];
@@ -26,16 +29,23 @@ export type ToolNode = {
 };
 
 export type TranscriptNode =
-  | { type: "message"; id: string; role: "user" | "assistant" | "system"; text: string; status: string }
+  | { type: "message"; id: string; role: "user" | "assistant" | "system"; text: string; status: string; local?: LocalBubble }
   | { type: "thought"; id: string; text: string; completeness: Observation["completeness"] }
   | ToolNode
-  | { type: "workflow"; id: string; run: WorkflowRunPayload; members: WorkflowMemberPayload[] }
+  | {
+      type: "workflow";
+      id: string;
+      run: WorkflowRunPayload;
+      phases: WorkflowPhasePayload[];
+      members: WorkflowMemberPayload[];
+    }
   | { type: "usage"; id: string; payload: UsagePayload }
-  | { type: "interaction"; id: string; interaction: Interaction }
-  | { type: "opaque"; id: string; kind: string }
+  | { type: "interaction"; id: string; interaction: Interaction; pending: boolean }
+  | { type: "error"; id: string; text: string }
+  | { type: "opaque"; id: string; kind: string; summary: string | null; raw: unknown }
   | { type: "compact"; id: string; toolCount: number; thoughtCount: number; children: TranscriptNode[] };
 
-function diffState(call: ToolCallPayload, result: ToolResultPayload | null, completeness: Observation["completeness"]): DiffState {
+export function diffState(call: ToolCallPayload, result: ToolResultPayload | null, completeness: Observation["completeness"]): DiffState {
   if (completeness === "partial" && !result) return "unknown";
   if (!result) return call.state === "proposed" ? "proposed" : "unknown";
   const app = result.changes[0]?.application;
@@ -45,10 +55,14 @@ function diffState(call: ToolCallPayload, result: ToolResultPayload | null, comp
   return "unknown";
 }
 
-export function assembleTranscript(events: Observation[]): TranscriptNode[] {
+export function assembleTranscript(events: Observation[], bubbles: LocalBubble[] = []): TranscriptNode[] {
   const tools = new Map<string, ToolNode>();
-  const workflows = new Map<string, { type: "workflow"; id: string; run: WorkflowRunPayload; members: WorkflowMemberPayload[] }>();
+  const workflows = new Map<
+    string,
+    { type: "workflow"; id: string; run: WorkflowRunPayload; phases: WorkflowPhasePayload[]; members: WorkflowMemberPayload[] }
+  >();
   const nodes: TranscriptNode[] = [];
+  const seenUser = new Set<string>();
 
   const pushTool = (node: ToolNode) => {
     tools.set(node.call.toolCallId, node);
@@ -58,10 +72,12 @@ export function assembleTranscript(events: Observation[]): TranscriptNode[] {
   for (const ev of events) {
     if (ev.kind === "message") {
       const text = observationText(ev);
+      const role = (ev.payload as { role: "user" | "assistant" | "system" }).role;
+      if (role === "user") seenUser.add(text);
       nodes.push({
         type: "message",
         id: ev.eventId,
-        role: (ev.payload as { role: "user" | "assistant" | "system" }).role,
+        role,
         text,
         status: (ev.payload as { status: string }).status,
       });
@@ -86,6 +102,7 @@ export function assembleTranscript(events: Observation[]): TranscriptNode[] {
         id: call.toolCallId,
         family: familyFor(ev.source.driverKind, name),
         name,
+        driverKind: ev.source.driverKind,
         call,
         result: existing?.result ?? null,
         completeness: ev.completeness,
@@ -118,11 +135,18 @@ export function assembleTranscript(events: Observation[]): TranscriptNode[] {
         type: "workflow" as const,
         id: run.workflowId,
         run,
-        members: [],
+        phases: [] as WorkflowPhasePayload[],
+        members: [] as WorkflowMemberPayload[],
       };
       current.run = run;
       workflows.set(run.workflowId, current);
       if (!nodes.includes(current)) nodes.push(current);
+      continue;
+    }
+    if (ev.kind === "workflow.phase") {
+      const phase = ev.payload as WorkflowPhasePayload;
+      const current = workflows.get(phase.workflowId);
+      if (current) current.phases = current.phases.filter((p) => p.phaseId !== phase.phaseId).concat(phase);
       continue;
     }
     if (ev.kind === "workflow.member") {
@@ -138,26 +162,59 @@ export function assembleTranscript(events: Observation[]): TranscriptNode[] {
       continue;
     }
     if (ev.kind === "interaction.requested") {
+      const interaction = (ev.payload as { interaction: Interaction }).interaction;
       nodes.push({
         type: "interaction",
         id: ev.eventId,
-        interaction: (ev.payload as { interaction: Interaction }).interaction,
+        interaction,
+        pending: interaction.state === "pending",
       });
       continue;
     }
     if (ev.kind === "lifecycle") continue;
     if (ev.kind === "interaction.answered" || ev.kind === "interaction.expired") continue;
-    nodes.push({ type: "opaque", id: ev.eventId, kind: ev.kind });
+    if (ev.kind === "opaque") {
+      const payload = ev.payload as { nativeType?: string; reason?: string; summary?: string | null };
+      nodes.push({
+        type: "opaque",
+        id: ev.eventId,
+        kind: payload.nativeType ?? ev.kind,
+        summary: payload.summary ?? payload.reason ?? null,
+        raw: ev.payload,
+      });
+      continue;
+    }
+    nodes.push({
+      type: "opaque",
+      id: ev.eventId,
+      kind: ev.kind,
+      summary: null,
+      raw: ev.payload,
+    });
+  }
+
+  for (const bubble of bubbles) {
+    if (bubble.state === "settled") continue;
+    if (seenUser.has(bubble.text) && bubble.state !== "queued") continue;
+    nodes.push({
+      type: "message",
+      id: bubble.id,
+      role: "user",
+      text: bubble.text,
+      status: bubble.state,
+      local: bubble,
+    });
   }
 
   return nodes;
 }
 
+/** Compact only after a turn ends (assistant or usage). In-flight tools stay expanded. */
 export function compactTranscript(nodes: TranscriptNode[], enabled: boolean): TranscriptNode[] {
   if (!enabled) return nodes;
   const out: TranscriptNode[] = [];
   let pending: TranscriptNode[] = [];
-  const flushPending = () => {
+  const compactPending = () => {
     const tools = pending.filter((n) => n.type === "tool");
     const thoughts = pending.filter((n) => n.type === "thought");
     const rest = pending.filter((n) => n.type !== "tool" && n.type !== "thought");
@@ -177,22 +234,23 @@ export function compactTranscript(nodes: TranscriptNode[], enabled: boolean): Tr
   };
   for (const node of nodes) {
     if (node.type === "message" && node.role === "user") {
-      flushPending();
+      out.push(...pending);
+      pending = [];
       out.push(node);
       continue;
     }
-    if (node.type === "message" && node.role === "assistant") {
-      flushPending();
+    if ((node.type === "message" && node.role === "assistant") || node.type === "usage") {
+      compactPending();
       out.push(node);
       continue;
     }
-    if (node.type === "usage" || node.type === "interaction") {
-      flushPending();
-      out.push(node);
+    if (node.type === "interaction" && node.pending) {
+      out.push(...pending);
+      pending = [];
       continue;
     }
     pending.push(node);
   }
-  flushPending();
+  out.push(...pending);
   return out;
 }

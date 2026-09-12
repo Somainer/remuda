@@ -2,13 +2,18 @@ import { Link } from "react-router-dom";
 import { Button } from "../components/Button";
 import { subscribePush } from "../lib/push";
 import { MORE_NAV } from "../lib/nav";
+import { hubStore, useHub } from "../lib/store";
 import ui from "../styles/ui.module.css";
 
 export function SettingsPage() {
+  const hub = useHub();
   return (
     <div style={{ padding: 16 }}>
       <h1 style={{ fontSize: 18 }}>设置</h1>
       <p className={ui.listMeta}>v1 无浅色开关。主题 Night Corral。</p>
+      <div className={ui.row} style={{ margin: "12px 0" }}>
+        <Button onClick={() => hubStore.setCompact(!hub.compact)}>Compact {hub.compact ? "开" : "关"}</Button>
+      </div>
       <p className={ui.listMeta}>iOS 需加到主屏幕后才有 Notification。</p>
       <div className={ui.row} style={{ margin: "12px 0" }}>
         <Button

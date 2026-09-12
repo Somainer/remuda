@@ -4,13 +4,20 @@ import { readDraft, writeDraft } from "../../lib/drafts";
 import { composing } from "../../lib/viewport";
 import ui from "../../styles/ui.module.css";
 
+const MODES = [
+  { id: "manual", label: "询问" },
+  { id: "acceptEdits", label: "可改文件" },
+  { id: "dontAsk", label: "全自动" },
+];
+
 export function Composer({
   instanceId,
   mobile,
   disabled,
   sending,
   onSend,
-  permissionMode,
+  permissionMode = "manual",
+  onPermission,
 }: {
   instanceId: string;
   mobile: boolean;
@@ -18,8 +25,10 @@ export function Composer({
   sending?: boolean;
   onSend: (text: string) => Promise<void> | void;
   permissionMode?: string;
+  onPermission?: (mode: string) => void;
 }) {
   const [text, setText] = useState(() => readDraft(instanceId));
+  const [permOpen, setPermOpen] = useState(false);
 
   const submit = async () => {
     const value = text.trim();
@@ -37,9 +46,12 @@ export function Composer({
     }
   };
 
+  const permLabel = MODES.find((m) => m.id === permissionMode)?.label ?? permissionMode;
+
   return (
     <form
       className={ui.card}
+      data-testid="composer"
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
@@ -57,7 +69,26 @@ export function Composer({
         onKeyDown={onKeyDown}
       />
       <div className={ui.row} style={{ marginTop: 8, justifyContent: "space-between" }}>
-        <span className={ui.listMeta}>权限:{permissionMode ?? "询问"}</span>
+        <div>
+          <button type="button" className={ui.chip} data-testid="permission-chip" onClick={() => setPermOpen(!permOpen)}>
+            权限:{permLabel}
+          </button>
+          {permOpen
+            ? MODES.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  className={`${ui.chip} ${permissionMode === m.id ? ui.chipOn : ""}`}
+                  onClick={() => {
+                    onPermission?.(m.id);
+                    setPermOpen(false);
+                  }}
+                >
+                  {m.label}
+                </button>
+              ))
+            : null}
+        </div>
         <Button variant="primary" disabled={disabled || sending || !text.trim()} onClick={() => void submit()}>
           {sending ? "发送中" : "送出"}
         </Button>

@@ -28,7 +28,7 @@ export function QuestionForm({
   };
 
   return (
-    <section className={ui.approval}>
+    <section className={ui.approval} data-testid="question-form">
       <div className={ui.cardHead}>
         <strong>{req.title}</strong>
         <span>
@@ -72,6 +72,14 @@ export function QuestionForm({
         >
           上一题
         </Button>
+        <Button
+          disabled={disabled}
+          onClick={() => {
+            if (index < req.fields.length - 1) setIndex(index + 1);
+          }}
+        >
+          Skip
+        </Button>
         {index < req.fields.length - 1 ? (
           <Button onClick={() => setIndex(index + 1)}>下一题</Button>
         ) : (
@@ -83,6 +91,13 @@ export function QuestionForm({
             提交
           </Button>
         )}
+        <Button
+          variant="danger"
+          disabled={disabled}
+          onClick={() => onRespond({ kind: "question", answers: {} })}
+        >
+          关闭
+        </Button>
       </div>
     </section>
   );

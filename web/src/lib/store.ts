@@ -1,14 +1,26 @@
 import { useSyncExternalStore } from "react";
+import type { Command } from "../types/command";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
 import type { Workspace } from "../types/workspace";
-import { api, type InstanceCreateSpec } from "./api";
+import { api, observationText, type InstanceCreateSpec } from "./api";
 import { JournalClient } from "./journal";
+import { id, now } from "./ids";
 
 export type ConnectionUi = "live" | "reconnecting" | "offline";
 export type Toast = { id: string; text: string } | null;
+export type LocalBubble = {
+  id: Id;
+  instanceId: Id;
+  text: string;
+  commandId: Id;
+  state: Command["state"] | "unknown";
+  createdAt: string;
+};
+
+const COMPACT_KEY = "runtime.compact";
 
 export type HubState = {
   ready: boolean;
@@ -22,6 +34,9 @@ export type HubState = {
   interactions: Interaction[];
   events: Record<string, Observation[]>;
   journalStatus: Record<string, JournalClient["status"]>;
+  bubbles: LocalBubble[];
+  permissionMode: Record<string, string>;
+  compact: boolean;
 };
 
 const initial: HubState = {
@@ -36,6 +51,9 @@ const initial: HubState = {
   interactions: [],
   events: {},
   journalStatus: {},
+  bubbles: [],
+  permissionMode: {},
+  compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
 };
 
 type Listener = () => void;
@@ -70,6 +88,15 @@ class HubStore {
 
   setAuthed(authed: boolean) {
     this.emit({ authed });
+  }
+
+  setCompact(compact: boolean) {
+    try {
+      localStorage.setItem(COMPACT_KEY, compact ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    this.emit({ compact });
   }
 
   async bootstrap() {
@@ -112,6 +139,7 @@ class HubStore {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
     if (this.journals.has(instance.journalId)) return;
+    this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
     const history = await api.eventsRead({ journalId: instance.journalId, limit: 512 });
     this.emit({
       events: { ...this.state.events, [instanceId]: history.events },
@@ -119,7 +147,11 @@ class HubStore {
     const client = new JournalClient(instance.journalId, api.eventsRead, {
       onEvents: (events) => {
         const current = this.state.events[instanceId] ?? [];
-        this.emit({ events: { ...this.state.events, [instanceId]: current.concat(events) } });
+        const next = current.concat(events);
+        this.emit({
+          events: { ...this.state.events, [instanceId]: next },
+          bubbles: settleBubbles(this.state.bubbles, instanceId, next),
+        });
       },
       onStatus: (status) => {
         this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: status } });
@@ -166,13 +198,52 @@ class HubStore {
   }
 
   async send(instanceId: Id, prompt: string) {
-    await api.instanceSend(instanceId, prompt);
-    await this.catchup(instanceId);
+    const localId = id("local_");
+    const bubble: LocalBubble = {
+      id: localId,
+      instanceId,
+      text: prompt,
+      commandId: localId,
+      state: "queued",
+      createdAt: now(),
+    };
+    this.emit({ bubbles: this.state.bubbles.concat(bubble) });
+    try {
+      const result = await api.instanceSend(instanceId, prompt);
+      this.emit({
+        bubbles: this.state.bubbles.map((b) =>
+          b.id === localId ? { ...b, state: result.command.state, commandId: result.command.commandId } : b,
+        ),
+      });
+      await this.catchup(instanceId);
+      const events = this.state.events[instanceId] ?? [];
+      this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
+    } catch {
+      this.emit({
+        bubbles: this.state.bubbles.map((b) => (b.id === localId ? { ...b, state: "unknown" } : b)),
+      });
+    }
+  }
+
+  retract(bubbleId: Id) {
+    const bubble = this.state.bubbles.find((b) => b.id === bubbleId);
+    if (!bubble || bubble.state === "accepted" || bubble.state === "settled") return;
+    this.emit({ bubbles: this.state.bubbles.filter((b) => b.id !== bubbleId) });
   }
 
   async close(instanceId: Id) {
     await api.instanceClose(instanceId);
     await this.refresh();
+  }
+
+  async resume(instanceId: Id) {
+    await api.instanceResume(instanceId);
+    await this.refresh();
+  }
+
+  async configure(instanceId: Id, permissionMode: string) {
+    await api.instanceConfigure(instanceId, permissionMode);
+    this.emit({ permissionMode: { ...this.state.permissionMode, [instanceId]: permissionMode } });
   }
 
   async respond(interactionId: Id, answer: InteractionAnswer) {
@@ -186,6 +257,14 @@ class HubStore {
     return api.titleOf(instanceId);
   }
 
+  summaryOf(instanceId: Id) {
+    return api.summaryOf(instanceId);
+  }
+
+  permissionModeOf(instanceId: Id) {
+    return this.state.permissionMode[instanceId] ?? api.permissionModeOf(instanceId);
+  }
+
   hostName(hostId: Id) {
     return this.state.hosts.find((h) => h.id === hostId)?.label ?? api.hostName(hostId);
   }
@@ -193,6 +272,17 @@ class HubStore {
   workspaceOf(workspaceId: Id): Workspace | undefined {
     return this.state.workspaces.find((w) => w.id === workspaceId);
   }
+}
+
+function settleBubbles(bubbles: LocalBubble[], instanceId: Id, events: Observation[]): LocalBubble[] {
+  return bubbles.map((bubble) => {
+    if (bubble.instanceId !== instanceId) return bubble;
+    if (bubble.state === "queued") return bubble;
+    const match = events.some(
+      (ev) => ev.kind === "message" && observationText(ev) === bubble.text && (ev.payload as { role?: string }).role === "user",
+    );
+    return match ? { ...bubble, state: "settled" as const } : bubble;
+  });
 }
 
 export const hubStore = new HubStore();

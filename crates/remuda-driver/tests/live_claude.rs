@@ -98,6 +98,17 @@ fn redact_path(path: &str) -> String {
     }
 }
 
+fn session_meta_transcript(launch_dir: &Path) -> Option<String> {
+    let meta = launch_dir.join("session-meta.json");
+    let body = fs::read_to_string(meta).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    value
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn jsonl_type_histogram(path: &Path) -> String {
     let Ok(body) = fs::read_to_string(path) else {
         return "missing".into();
@@ -244,7 +255,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
     while Instant::now() < deadline {
         let next = tokio::time::timeout(Duration::from_millis(800), handle.recv()).await;
         let Ok(Some(obs)) = next else {
-            if !hook && let Some(path) = driver.session_transcript().await {
+            if !hook && let Some(path) = session_meta_transcript(&launch) {
                 hook = true;
                 append_evidence(&format!(
                     "- SessionStart transcript `{}`",
@@ -306,7 +317,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
         preview.replace('`', "'")
     ));
 
-    if let Some(path) = driver.session_transcript().await {
+    if let Some(path) = session_meta_transcript(&launch) {
         let p = PathBuf::from(&path);
         append_evidence(&format!(
             "- jsonl exists={} {}",

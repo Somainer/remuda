@@ -257,3 +257,20 @@ error: could not compile `remuda-driver` (test "live_claude") due to 5 previous 
 
 web job also failed: `pnpm-lock.yaml` still has `registry.npmjs.org` tarball URLs (lockfile; rewritten separately).
 
+### GitHub Actions `34684629841` (`b39c12e`, 2026-09-12)
+
+**remuda-node** — `cargo test --workspace --locked` failed compiling the lib (incomplete module / match):
+
+```
+error[E0583]: file not found for module `interactions`
+ --> crates/remuda-node/src/lib.rs:8:1
+
+error[E0004]: non-exhaustive patterns: `NodeError::InteractionExpired` and `NodeError::InteractionSuperseded { .. }` not covered
+    --> crates/remuda-node/src/server.rs:1065:28
+    --> crates/remuda-node/src/error.rs:7:10
+
+error: could not compile `remuda-node` (lib) due to 2 previous errors
+```
+
+`mod interactions` is declared but `src/interactions.rs` was not in the pushed tree. Do not treat this as a lockfile/CI issue.
+

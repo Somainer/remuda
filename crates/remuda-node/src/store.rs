@@ -49,6 +49,12 @@ pub trait LocalStore: Send + Sync {
         lifecycle: Option<InstanceLifecycle>,
         activity: Option<Knowledge<Activity>>,
     ) -> Result<Instance, NodeError>;
+    /// Mark the instance failed and record `lastError`.
+    fn set_instance_failure(
+        &self,
+        instance_id: &InstanceId,
+        last_error: &str,
+    ) -> Result<Instance, NodeError>;
     /// Atomically insert a command, returning false for a matching idempotent replay.
     fn insert_command(&self, instance_id: &InstanceId, command: Command)
     -> Result<bool, NodeError>;
@@ -424,6 +430,32 @@ impl LocalStore for MemoryStore {
         ) {
             record.instance.active_run_ids.clear();
         }
+        record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
+        record.instance.meta.updated_at = now;
+        let instance = record.instance.clone();
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&instance)?;
+        }
+        Ok(instance)
+    }
+
+    fn set_instance_failure(
+        &self,
+        instance_id: &InstanceId,
+        last_error: &str,
+    ) -> Result<Instance, NodeError> {
+        let now = timestamp_now()?;
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let record = state
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        record.instance.lifecycle = InstanceLifecycle::Failed;
+        record.instance.activity = unknown(last_error);
+        record.instance.connectivity = remuda_protocol::Connectivity::Disconnected;
+        record.instance.last_error = Some(last_error.to_owned());
+        record.instance.active_run_ids.clear();
         record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
         record.instance.meta.updated_at = now;
         let instance = record.instance.clone();

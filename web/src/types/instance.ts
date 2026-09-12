@@ -39,6 +39,7 @@ export type Instance = EntityMeta & {
   journalId: Id;
   durableSeq: U64;
   exit: Knowledge<{ code: number | null; signal: string | null; observedAt: Timestamp }>;
+  lastError?: string | null;
   activityEvidenceEventIds?: Id[];
 };
 

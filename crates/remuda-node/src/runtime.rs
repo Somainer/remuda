@@ -196,14 +196,22 @@ impl DevNode {
         let observations = match driver.start().await {
             Ok(observations) => observations,
             Err(error) => {
-                record_task_exit(
-                    self.inner.store.as_ref(),
-                    &instance_id,
-                    "native-driver-start-failed",
-                );
+                record_task_exit(self.inner.store.as_ref(), &instance_id, &error.to_string());
                 return Err(NodeError::Driver(error.to_string()));
             }
         };
+        if let Some(error) = driver.startup_error() {
+            if let Some(mut pending) = observations {
+                while let Ok(observation) = pending.try_recv() {
+                    let _ = self
+                        .inner
+                        .store
+                        .append_driver_observation(&instance_id, observation);
+                }
+            }
+            record_task_exit(self.inner.store.as_ref(), &instance_id, &error);
+            return Err(NodeError::Driver(error));
+        }
         if let Some(observations) = observations {
             self.spawn_observation_pump(instance_id.clone(), observations);
         }
@@ -365,6 +373,9 @@ impl DevNode {
         let interactions = Arc::clone(&self.inner.interactions);
         tokio::spawn(async move {
             while let Some(observation) = observations.recv().await {
+                if let Some(reason) = native_failure_reason(&observation) {
+                    record_task_exit(store.as_ref(), &instance_id, &reason);
+                }
                 match store.append_driver_observation(&instance_id, observation) {
                     Ok(committed) => {
                         if let Err(error) = interactions.ingest(&committed).await {
@@ -517,6 +528,7 @@ async fn instance_worker(
                     Completeness::Structured,
                     diagnostic.into_payload()?,
                 )?;
+                record_task_exit(store.as_ref(), &instance_id, &error.to_string());
                 settle_command(
                     &mut command,
                     SettlementOutcome::Rejected,
@@ -574,11 +586,7 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
     if let Err(error) = store.mark_unsettled_unknown(instance_id) {
         tracing::error!(%error, "failed to mark commands unknown after task exit");
     }
-    if let Err(error) = store.set_instance_state(
-        instance_id,
-        Some(InstanceLifecycle::Failed),
-        Some(unknown("driver-task-ended")),
-    ) {
+    if let Err(error) = store.set_instance_failure(instance_id, reason) {
         tracing::error!(%error, "failed to mark instance failed after task exit");
         return;
     }
@@ -586,6 +594,34 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
         append_instance_lifecycle(store, instance_id, Some("ready"), "failed", reason)
     {
         tracing::error!(%error, "failed to append task-exit lifecycle event");
+    }
+}
+
+fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<String> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    let name = native.native_name.to_ascii_lowercase();
+    let failed = native.severity == remuda_protocol::Severity::Error
+        || name.contains("error")
+        || name == "exit"
+        || name.contains("gone")
+        || name.contains("agent_not_ready")
+        || name.contains("shell");
+    if !failed {
+        return None;
+    }
+    if let Some(message) = native.related_ids.get("lastError")
+        && !message.is_empty()
+    {
+        return Some(message.clone());
+    }
+    match &native.status {
+        Knowledge::Known { value } if !value.is_empty() => Some(value.clone()),
+        _ => Some(native.native_name.clone()),
     }
 }
 
@@ -1017,6 +1053,7 @@ pub(crate) fn fixture_instance(
         journal_id: Id::new("obj")?,
         durable_seq: U64(0),
         exit: Knowledge::NotApplicable,
+        last_error: None,
     })
 }
 
@@ -1127,6 +1164,10 @@ mod tests {
         let instance = node
             .get_instance(&created.instance.meta.id)
             .expect("failed instance");
+        assert!(
+            instance.last_error.is_some(),
+            "failed instance must set lastError"
+        );
         let events = node
             .read_journal(&instance.journal_id, None, 128)
             .expect("task-exit journal");

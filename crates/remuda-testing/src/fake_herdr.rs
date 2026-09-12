@@ -4,7 +4,7 @@
 //! `remuda-herdr` uses. Result objects are serialized from `remuda_herdr`
 //! types so the client can decode them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -49,14 +49,17 @@ pub enum FakeHerdrScript {
     Ok,
     /// `agent.start` is blocked on a trust dialog until `agent.send_keys`.
     Trust,
+    /// `agent.start` RPC succeeds, then the process is gone / pane is a shell (startup crash).
+    StartFail,
 }
 
 impl FakeHerdrScript {
-    /// Parse `ok` / `trust`.
+    /// Parse `ok` / `trust` / `start-fail`.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim() {
             "ok" | "OK" => Some(Self::Ok),
             "trust" | "trust-dialog" | "blocked" => Some(Self::Trust),
+            "start-fail" | "start_fail" | "crash" | "die" => Some(Self::StartFail),
             _ => None,
         }
     }
@@ -300,7 +303,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
 fn print_help() {
     eprintln!(
         "fake-herdr — Herdr JSON-RPC test double\n\n\
-         Usage:\n  fake-herdr [--socket PATH] [--script ok|trust] [--frames PATH]\n  \
+         Usage:\n  fake-herdr [--socket PATH] [--script ok|trust|start-fail] [--frames PATH]\n  \
          fake-herdr terminal [session] observe <pane> [--cols N] [--rows N] [--frames PATH]\n"
     );
 }
@@ -377,6 +380,8 @@ struct State {
     agents: HashMap<String, AgentInfo>,
     screens: HashMap<String, String>,
     subscribers: Vec<mpsc::UnboundedSender<Value>>,
+    dead_agents: HashSet<String>,
+    shell_panes: HashSet<String>,
 }
 
 impl State {
@@ -392,6 +397,8 @@ impl State {
             agents: HashMap::new(),
             screens: HashMap::new(),
             subscribers: Vec::new(),
+            dead_agents: HashSet::new(),
+            shell_panes: HashSet::new(),
         }
     }
 
@@ -809,17 +816,27 @@ fn pane_process_info(st: &State, params: &Value) -> Result<Value, (&'static str,
         .or_else(|| st.panes.keys().next().map(String::as_str))
         .ok_or(("invalid_request", "missing pane_id".into()))?
         .to_string();
+    let foreground_processes = if st.shell_panes.contains(&pane_id) {
+        vec![PaneProcessInfoProcess {
+            pid: 4242,
+            name: "zsh".into(),
+            argv0: Some("zsh".into()),
+            argv: Some(vec!["zsh".into()]),
+        }]
+    } else {
+        vec![PaneProcessInfoProcess {
+            pid: 4242,
+            name: "fake-herdr".into(),
+            argv0: Some("fake-herdr".into()),
+            argv: Some(vec!["fake-herdr".into()]),
+        }]
+    };
     serde_json::to_value(PaneProcessInfoResult {
         kind: "pane_process_info".into(),
         process_info: Some(PaneProcessInfo {
             pane_id,
             shell_pid: Some(4242),
-            foreground_processes: vec![PaneProcessInfoProcess {
-                pid: 4242,
-                name: "fake-herdr".into(),
-                argv0: Some("fake-herdr".into()),
-                argv: Some(vec!["fake-herdr".into()]),
-            }],
+            foreground_processes,
         }),
     })
     .map_err(json_err)
@@ -889,6 +906,9 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
             ),
         ));
     }
+    if st.script == FakeHerdrScript::StartFail {
+        mark_agent_crashed(st, &start.name, &start.pane_id, &start.args);
+    }
     let mut argv = vec![start.kind.clone()];
     argv.extend(start.args);
     serde_json::to_value(AgentStarted {
@@ -899,6 +919,44 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
     .map_err(json_err)
 }
 
+fn mark_agent_crashed(st: &mut State, name: &str, pane_id: &str, args: &[String]) {
+    st.dead_agents.insert(name.to_string());
+    st.shell_panes.insert(pane_id.to_string());
+    st.screens.insert(pane_id.to_string(), crash_screen(args));
+    if let Some(agent) = st.agents.get_mut(name) {
+        agent.interactive_ready = false;
+        agent.launch_pending = false;
+        agent.agent_status = AgentStatus::Unknown;
+        agent.agent_session = None;
+    }
+    if let Some(pane) = st.panes.get_mut(pane_id) {
+        pane.agent_status = AgentStatus::Unknown;
+        pane.agent = None;
+    }
+}
+
+fn crash_screen(args: &[String]) -> String {
+    if let Some(bin) = args.iter().find(|token| {
+        let path = std::path::Path::new(token.as_str());
+        path.is_file()
+    }) && let Ok(output) = std::process::Command::new(bin)
+        .args(args.iter().filter(|token| token.as_str() != bin.as_str()))
+        .output()
+    {
+        let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stdout));
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        if !text.contains('%') {
+            text.push('%');
+            text.push('\n');
+        }
+        return text;
+    }
+    "error: unexpected argument '--name' found\nUsage: grok [OPTIONS] [PROMPT]\n%\n".into()
+}
+
 fn agent_prompt(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {
     let target = params
         .get("target")
@@ -906,6 +964,12 @@ fn agent_prompt(st: &mut State, params: &Value) -> Result<Value, (&'static str, 
         .ok_or(("invalid_request", "missing target".into()))?;
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
     let name = resolve_agent(st, target)?;
+    if st.dead_agents.contains(&name) {
+        return Err((
+            "agent_not_ready",
+            format!("agent {name} exited during startup and is not ready for prompts"),
+        ));
+    }
     {
         let agent = st
             .agents
@@ -976,6 +1040,12 @@ fn agent_get(st: &State, params: &Value) -> Result<Value, (&'static str, String)
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing target".into()))?;
     let name = resolve_agent(st, target)?;
+    if st.dead_agents.contains(&name) {
+        return Err((
+            "agent_not_ready",
+            format!("agent {name} exited during startup and is not ready"),
+        ));
+    }
     serde_json::to_value(AgentInfoResult {
         kind: "agent_info".into(),
         agent: st.agents[&name].clone(),

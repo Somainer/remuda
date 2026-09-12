@@ -9,7 +9,7 @@ use remuda_protocol::{
     AgentKind, ContentBlock, DriverInput, InputOrigin, InstanceSpec, LifecyclePayload,
     ObservationPayload, PromptInput, PromptMode, TextBlock,
 };
-use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin};
+use remuda_testing::{FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,20 @@ use std::time::Duration;
 fn stub_bin(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, "#!/bin/sh\necho 'stub 0.0.0'\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn stub_crash_bin(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(
+        &path,
+        "#!/bin/sh\n\
+         echo \"error: unexpected argument '--name' found\" >&2\n\
+         echo 'Usage: grok [OPTIONS] [PROMPT]' >&2\n\
+         exit 2\n",
+    )
+    .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -69,6 +83,9 @@ fn yolo_presets_match_dogfood() {
         preset_by_id("agy").unwrap().yolo_argv,
         &["--dangerously-skip-permissions"]
     );
+    assert!(preset_by_id("grok").unwrap().name_flag.is_none());
+    assert!(preset_by_id("codex").unwrap().name_flag.is_none());
+    assert!(preset_by_id("agy").unwrap().name_flag.is_none());
 }
 
 #[tokio::test]
@@ -143,6 +160,78 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
     }
     assert!(saw_status, "expected screen-derived status or prompt echo");
     driver.close().await.expect("stop");
+}
+
+#[tokio::test]
+async fn fake_herdr_start_failure_emits_error_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let mut options = FakeHerdrOptions::new(&socket);
+    options.script = FakeHerdrScript::StartFail;
+    let _fake = FakeHerdrServer::spawn(options).unwrap();
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let bin = stub_crash_bin(tmp.path(), "grok");
+
+    let driver = GenericPtyDriver::new(GenericPtyOptions {
+        profile: profile(),
+        launch_dir: launch,
+        native_home: home,
+        binary: BinarySource::Pinned(pin_binary(&bin).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker),
+        extra_env: Default::default(),
+        agent_start_timeout_ms: 5_000,
+        line_matcher: None,
+    });
+
+    let spec = spec(&cwd, AgentKind::Grok);
+    let mut handle = driver.start(spec).await.expect("start returns a handle");
+    let last_error = handle
+        .ack()
+        .native_ids
+        .get("lastError")
+        .cloned()
+        .expect("lastError on ack");
+    assert!(
+        last_error.contains("unexpected argument")
+            || last_error.contains("agent_not_ready")
+            || last_error.contains("shell")
+            || last_error.contains("gone"),
+        "lastError={last_error}"
+    );
+    assert!(
+        !handle.recipe().argv.iter().any(|token| token == "--name"),
+        "grok argv must not include --name"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_error = false;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(400), handle.recv()).await
+        else {
+            continue;
+        };
+        if let ObservationPayload::Lifecycle(payload) = &obs.body
+            && let LifecyclePayload::Native(native) = payload.as_ref()
+            && native.severity == remuda_protocol::Severity::Error
+            && (native.native_name == "error" || native.native_name == "exit")
+        {
+            saw_error = true;
+            break;
+        }
+    }
+    assert!(saw_error, "expected lifecycle error/exit observation");
+    let _ = driver.close().await;
 }
 
 fn live_kind(_kind: AgentKind, binary: &str) {

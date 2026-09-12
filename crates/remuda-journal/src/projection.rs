@@ -146,6 +146,9 @@ pub struct StatusProjection {
     pub activity: Activity,
     /// Current connectivity.
     pub connectivity: Connectivity,
+    /// Last native/driver error when the instance failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 impl Default for StatusProjection {
@@ -154,6 +157,7 @@ impl Default for StatusProjection {
             lifecycle: InstanceLifecycle::Unknown,
             activity: Activity::Idle,
             connectivity: Connectivity::Disconnected,
+            last_error: None,
         }
     }
 }
@@ -368,13 +372,32 @@ impl StatusProjection {
                             self.activity = *value;
                         }
                         self.connectivity = instance.connectivity;
+                        if instance.last_error.is_some() {
+                            self.last_error = instance.last_error.clone();
+                        }
+                    }
+                    if entity.state == "failed" {
+                        self.lifecycle = InstanceLifecycle::Failed;
+                        self.activity = Activity::Idle;
+                        self.connectivity = Connectivity::Disconnected;
+                        if self.last_error.is_none() && !entity.reason_code.is_empty() {
+                            self.last_error = Some(entity.reason_code.clone());
+                        }
                     }
                 }
                 LifecyclePayload::Native(native) => {
                     let name = native.native_name.to_ascii_lowercase();
+                    if native_lifecycle_failed(native) {
+                        self.lifecycle = InstanceLifecycle::Failed;
+                        self.activity = Activity::Idle;
+                        self.connectivity = Connectivity::Disconnected;
+                        self.last_error = native_lifecycle_error_text(native);
+                    }
                     match native.topic {
                         LifecycleTopic::Session => {
-                            if name.contains("init") || name.contains("start") {
+                            if self.lifecycle == InstanceLifecycle::Failed {
+                                // Keep the failed fold; do not revive from a later session status.
+                            } else if name.contains("init") || name.contains("start") {
                                 self.lifecycle = InstanceLifecycle::Ready;
                                 self.connectivity = Connectivity::Connected;
                                 self.activity = Activity::Idle;
@@ -434,6 +457,30 @@ impl StatusProjection {
             }
             _ => {}
         }
+    }
+}
+
+fn native_lifecycle_failed(native: &remuda_protocol::NativeLifecycle) -> bool {
+    if native.severity == remuda_protocol::Severity::Error {
+        return true;
+    }
+    let name = native.native_name.to_ascii_lowercase();
+    name.contains("error")
+        || name.contains("exit")
+        || name.contains("gone")
+        || name.contains("agent_not_ready")
+        || name.contains("shell")
+}
+
+fn native_lifecycle_error_text(native: &remuda_protocol::NativeLifecycle) -> Option<String> {
+    if let Some(message) = native.related_ids.get("lastError").cloned()
+        && !message.is_empty()
+    {
+        return Some(message);
+    }
+    match &native.status {
+        Knowledge::Known { value } if !value.is_empty() => Some(value.clone()),
+        _ => None,
     }
 }
 

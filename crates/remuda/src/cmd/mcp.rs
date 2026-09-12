@@ -26,7 +26,7 @@ enum Framing {
 /// Run `remuda mcp` on stdio until stdin EOF.
 pub(crate) fn run(hub: HubOpts) -> Result<()> {
     block_on(async move {
-        let client = HubClient::connect(&hub)?;
+        let client = hub.connect()?;
         let stdin = BufReader::new(tokio::io::stdin());
         let stdout = tokio::io::stdout();
         serve_rpc(stdin, stdout, client).await

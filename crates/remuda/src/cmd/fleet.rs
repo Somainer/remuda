@@ -54,7 +54,7 @@ pub(crate) struct FleetRunOpts {
 /// Run a `remuda fleet` subcommand.
 pub(crate) fn run(hub: HubOpts, command: FleetCommand) -> Result<()> {
     block_on(async move {
-        let client = HubClient::connect(&hub)?;
+        let client = hub.connect()?;
         match command {
             FleetCommand::Run {
                 hosts,

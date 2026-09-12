@@ -48,6 +48,7 @@ const insBlocked = id("ins_");
 const insIdle = id("ins_");
 const runWorking = id("run_");
 const workflowId = id("obj_");
+const phaseCompileId = id("obj_");
 const interactionId = id("int_");
 const nativeSession = String(claudeInit.session_id);
 
@@ -177,7 +178,7 @@ function obs(
     rawRef: null,
     evidenceEventIds: [],
     payload,
-  };
+  } as Observation;
 }
 
 function bashCall(): ToolCallPayload {
@@ -317,7 +318,7 @@ journals.set(journalWorking, [
   }),
   obs(insWorking, journalWorking, 12, "workflow.phase", {
     workflowId,
-    phaseId: id("obj_"),
+    phaseId: phaseCompileId,
     nativePhaseId: known("compile"),
     label: known("compile"),
     state: "running",
@@ -330,15 +331,30 @@ journals.set(journalWorking, [
     nativeAgentId: known("agent-1"),
     nativeKey: known("haiku"),
     attempt: known("1"),
-    phaseId: null,
+    phaseId: phaseCompileId,
     label: known("haiku"),
     state: "running",
     modelRequested: known("haiku"),
     modelResolved: known("claude-haiku-4-5-20251001"),
     resultRef: null,
     revision: "1",
+    childInstanceId: insIdle,
   }),
-  obs(insWorking, journalWorking, 14, "tool_call", {
+  obs(insWorking, journalWorking, 14, "workflow.member", {
+    workflowId,
+    memberId: id("obj_"),
+    nativeAgentId: known("agent-2"),
+    nativeKey: known("sonnet"),
+    attempt: known("1"),
+    phaseId: null,
+    label: known("sonnet-cold"),
+    state: "completed",
+    modelRequested: known("sonnet"),
+    modelResolved: known("passthrough/auto"),
+    resultRef: null,
+    revision: "1",
+  }),
+  obs(insWorking, journalWorking, 15, "tool_call", {
     ...bashCall(),
     toolCallId: id("obj_"),
     toolName: known("Task"),
@@ -346,7 +362,7 @@ journals.set(journalWorking, [
     category: "agent",
     input: known({ prompt: "summarize" }),
   }),
-  obs(insWorking, journalWorking, 15, "tool_call", {
+  obs(insWorking, journalWorking, 16, "tool_call", {
     ...bashCall(),
     toolCallId: id("obj_"),
     toolName: known("mcp__claude_ai_Google_Drive__search_files"),
@@ -354,7 +370,7 @@ journals.set(journalWorking, [
     category: "mcp",
     input: known({ query: "spill" }),
   }),
-  obs(insWorking, journalWorking, 16, "message", {
+  obs(insWorking, journalWorking, 17, "message", {
     nodeId: id("obj_"),
     revision: "1",
     operation: "open",
@@ -368,7 +384,7 @@ journals.set(journalWorking, [
     nativeOrigin: known("assistant"),
     status: "complete",
   }),
-  obs(insWorking, journalWorking, 17, "usage", {
+  obs(insWorking, journalWorking, 18, "usage", {
     usageId: id("obj_"),
     scope: "turn",
     scopeId: runWorking,
@@ -385,9 +401,9 @@ journals.set(journalWorking, [
     accounting: "estimated",
     nativeFieldsRef: null,
   }),
-  obs(insWorking, journalWorking, 18, "opaque", {
+  obs(insWorking, journalWorking, 19, "opaque", {
     nativeType: "rate_limit_event",
-    reason: "unmapped-native",
+    reason: "unmapped-fields",
     rawRef: {
       objectId: id("obj_"),
       offset: "0",

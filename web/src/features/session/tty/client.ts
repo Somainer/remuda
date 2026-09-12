@@ -1,8 +1,11 @@
 import type { Instance } from "../../../types/instance";
-import type { Id, U64 } from "../../../types/wire";
+import { readAccessCode } from "../../../lib/accessCode";
+import { readSession } from "../../../lib/session";
 import {
   CHANNEL_TTY_OUTPUT,
+  concatBytes,
   decodeTtyBinaryFrame,
+  encodeTtyInputFrame,
   encodeTtyOutputFrame,
   sameUuid,
   streamIdToUuidBytes,
@@ -13,52 +16,53 @@ import {
   TTY_LAB_LEASE_ID,
   TTY_LAB_STREAM_ID,
 } from "./fixture";
-import { bytesToBase64, newId, utf8Bytes } from "./ids";
+import { bytesFromBase64, toBytes } from "./ids";
 
 export type TtyStatus = "connecting" | "live" | "reconnecting" | "failed";
 
-export type TtyWriterLease = {
-  leaseId: Id;
-  expiresAt: string;
-  inputNextSeq: U64;
-};
-
-export type TtyAttachResult = {
-  streamId: Id;
-  streamEpoch: Id;
-  representation: "pty-bytes" | "rendered-ansi";
-  nextOffset: U64;
-  availableFrom: U64;
-  screenSnapshotRef: Id | null;
-  snapshotAtOffset: { state: "known"; value: U64 } | { state: "unknown"; reason: string; evidenceEventIds: Id[] };
-  writerLease: TtyWriterLease | null;
-};
-
 export type TtyHandlers = {
-  onFrame: (payload: Uint8Array, offset: bigint, streamId: string, representation: TtyAttachResult["representation"]) => void;
+  onFrame: (payload: Uint8Array, offset: bigint, streamId: string, reset: boolean) => void;
   onStatus: (status: TtyStatus, message?: string) => void;
+  onSnapshot?: () => void;
 };
 
 export type TtySession = {
-  write(data: string): Promise<void>;
+  write(data: string | Uint8Array): Promise<void>;
   resize(cols: number, rows: number): Promise<{ cols: number; rows: number }>;
   detach(): Promise<void>;
   disconnectForTest(): void;
   reconnectForTest(): void;
 };
 
+export const TTY_INPUT_BATCH_MS = 8;
 const MAX_TTY_INPUT = 4096;
+const RECONNECT_MIN_MS = 400;
+const RECONNECT_MAX_MS = 5000;
 
 function mockMode(): boolean {
   return import.meta.env.VITE_MOCK === "1";
 }
 
-function hubWsUrl(): string {
-  const raw = (import.meta.env.VITE_API_BASE ?? import.meta.env.VITE_HUB_URL ?? "").replace(/\/$/, "");
-  if (raw.startsWith("https://")) return `${raw.replace(/^https/, "wss")}/v1/client`;
-  if (raw.startsWith("http://")) return `${raw.replace(/^http/, "ws")}/v1/client`;
+function hubWsUrl(path: string): string {
+  // Match `api.ts` hubBase(): in Vite dev, VITE_HUB_URL is proxied same-origin
+  // so the device cookie is sent. Direct-to-hub WS would be a different port.
+  const raw =
+    import.meta.env.DEV && import.meta.env.VITE_HUB_URL
+      ? ""
+      : (import.meta.env.VITE_API_BASE ?? import.meta.env.VITE_HUB_URL ?? "").replace(/\/$/, "");
+  if (raw.startsWith("https://")) return `${raw.replace(/^https/, "wss")}${path}`;
+  if (raw.startsWith("http://")) return `${raw.replace(/^http/, "ws")}${path}`;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/v1/client`;
+  return `${proto}://${location.host}${path}`;
+}
+
+export function followTtyUrl(instanceId: string): string {
+  const url = new URL(hubWsUrl("/v1/follow"));
+  url.searchParams.set("instanceId", instanceId);
+  url.searchParams.set("tty", "1");
+  const token = readSession()?.token ?? readAccessCode();
+  if (token) url.searchParams.set("token", token);
+  return url.toString();
 }
 
 function shouldReplay(instance: Instance): boolean {
@@ -66,15 +70,13 @@ function shouldReplay(instance: Instance): boolean {
 }
 
 export function openTtySession(instance: Instance, handlers: TtyHandlers): TtySession {
-  if (shouldReplay(instance)) return openReplaySession(instance, handlers);
+  if (shouldReplay(instance)) return openReplaySession(handlers);
   return openLiveSession(instance, handlers);
 }
 
-function openReplaySession(_instance: Instance, handlers: TtyHandlers): TtySession {
+function openReplaySession(handlers: TtyHandlers): TtySession {
   let streamId = TTY_LAB_STREAM_ID;
   let offset = 0n;
-  let inputSeq = 1n;
-  let resizeRevision = 1n;
   let attached = true;
   let status: TtyStatus = "connecting";
   const writerLeaseId = TTY_LAB_LEASE_ID;
@@ -84,7 +86,8 @@ function openReplaySession(_instance: Instance, handlers: TtyHandlers): TtySessi
     const frame = encodeTtyOutputFrame(streamId, offset, ANSI_FIXTURE_BYTES);
     const decoded = decodeTtyBinaryFrame(frame);
     if (!decoded.ok) return;
-    handlers.onFrame(decoded.frame.payload, decoded.frame.offset, streamId, "rendered-ansi");
+    handlers.onSnapshot?.();
+    handlers.onFrame(decoded.frame.payload, decoded.frame.offset, streamId, true);
     offset += BigInt(decoded.frame.payload.byteLength);
     status = "live";
     handlers.onStatus("live");
@@ -94,13 +97,11 @@ function openReplaySession(_instance: Instance, handlers: TtyHandlers): TtySessi
   queueMicrotask(emitFixture);
 
   return {
-    async write(data: string) {
+    async write(data) {
       if (!attached || status !== "live") return;
-      if (!writerLeaseId || utf8Bytes(data).byteLength === 0) return;
-      inputSeq += 1n;
+      if (!writerLeaseId || toBytes(data).byteLength === 0) return;
     },
-    async resize(cols: number, rows: number) {
-      resizeRevision += 1n;
+    async resize(cols, rows) {
       return { cols, rows };
     },
     async detach() {
@@ -120,139 +121,208 @@ function openReplaySession(_instance: Instance, handlers: TtyHandlers): TtySessi
   };
 }
 
+function asArrayBuffer(data: unknown): ArrayBuffer | null {
+  if (data instanceof ArrayBuffer) return data;
+  if (data instanceof Uint8Array) {
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+  }
+  return null;
+}
+
+function extractStreamId(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const rec = value as Record<string, unknown>;
+  if (typeof rec.streamId === "string") return rec.streamId;
+  const tty = rec.tty;
+  if (tty && typeof tty === "object" && typeof (tty as { streamId?: unknown }).streamId === "string") {
+    return (tty as { streamId: string }).streamId;
+  }
+  const params = rec.params;
+  if (params && typeof params === "object" && typeof (params as { streamId?: unknown }).streamId === "string") {
+    return (params as { streamId: string }).streamId;
+  }
+  return null;
+}
+
+function extractBase64(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const rec = value as Record<string, unknown>;
+  if (typeof rec.dataBase64 === "string") return rec.dataBase64;
+  const tty = rec.tty;
+  if (tty && typeof tty === "object" && typeof (tty as { dataBase64?: unknown }).dataBase64 === "string") {
+    return (tty as { dataBase64: string }).dataBase64;
+  }
+  const params = rec.params;
+  if (params && typeof params === "object" && typeof (params as { dataBase64?: unknown }).dataBase64 === "string") {
+    return (params as { dataBase64: string }).dataBase64;
+  }
+  return null;
+}
+
 function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession {
   let socket: WebSocket | null = null;
-  let rpcSeq = 0;
-  const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  let attach: TtyAttachResult | null = null;
   let streamUuid: Uint8Array | null = null;
-  let inputSeq = 1n;
-  let resizeRevision = 1n;
+  let streamId = "";
+  let inputOffset = 0n;
   let closed = false;
   let reconnectTimer = 0;
+  let inputTimer = 0;
+  let backoff = RECONNECT_MIN_MS;
+  let resetNext = true;
+  const inputQueue: Uint8Array[] = [];
+  let lastCols = 80;
+  let lastRows = 24;
+  let sawSnapshot = false;
 
-  const send = <T,>(method: string, params: unknown): Promise<T> => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error("WSS_CLOSED"));
-    const id = `t${++rpcSeq}`;
-    return new Promise<T>((resolve, reject) => {
-      pending.set(id, { resolve: (v) => resolve(v as T), reject });
-      socket!.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-    });
+  const setStream = (id: string) => {
+    const uuid = streamIdToUuidBytes(id);
+    if (!uuid) return;
+    streamId = id;
+    streamUuid = uuid;
+  };
+
+  const deliverOutput = (payload: Uint8Array, offset: bigint, id: string) => {
+    const reset = resetNext;
+    resetNext = false;
+    handlers.onFrame(payload, offset, id, reset);
   };
 
   const handleBinary = (buffer: ArrayBuffer) => {
     const decoded = decodeTtyBinaryFrame(buffer);
     if (!decoded.ok) return;
     if (decoded.frame.channelType !== CHANNEL_TTY_OUTPUT) return;
-    if (!streamUuid || !sameUuid(decoded.frame.streamUuid, streamUuid)) return;
-    if (!attach) return;
-    handlers.onFrame(decoded.frame.payload, decoded.frame.offset, attach.streamId, attach.representation);
+    if (!streamUuid) streamUuid = decoded.frame.streamUuid;
+    else if (!sameUuid(decoded.frame.streamUuid, streamUuid)) return;
+    if (!streamId) streamId = `tty_${[...decoded.frame.streamUuid].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+    deliverOutput(decoded.frame.payload, decoded.frame.offset, streamId);
+    if (sawSnapshot) {
+      handlers.onStatus("live");
+    }
   };
 
-  const attachNow = async () => {
-    handlers.onStatus("connecting");
-    attach = await send<TtyAttachResult>("tty.attach", {
-      instanceId: instance.id,
-      processGeneration: instance.processRef.processGeneration,
-      mode: "write",
-      previousStreamId: null,
-      afterOffset: null,
-    });
-    streamUuid = streamIdToUuidBytes(attach.streamId);
-    inputSeq = attach.writerLease ? BigInt(attach.writerLease.inputNextSeq) : 1n;
-    handlers.onStatus("live");
+  const handleJson = (raw: string) => {
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const type = typeof msg.type === "string" ? msg.type : "";
+    if (type === "snapshot" || type === "tty.snapshot") {
+      sawSnapshot = true;
+      resetNext = true;
+      handlers.onSnapshot?.();
+      const sid = extractStreamId(msg);
+      if (sid) setStream(sid);
+      const b64 = extractBase64(msg);
+      if (b64) {
+        const payload = bytesFromBase64(b64);
+        if (payload) deliverOutput(payload, 0n, streamId || "tty_snapshot");
+      }
+      handlers.onStatus("live");
+      return;
+    }
+    if (type === "gap") {
+      resetNext = true;
+      handlers.onStatus("reconnecting", "gap");
+      return;
+    }
+    const event = msg.event && typeof msg.event === "object" ? (msg.event as Record<string, unknown>) : msg;
+    const eventType = typeof event.type === "string" ? event.type : "";
+    if (eventType === "tty.frame" || type === "tty.frame") {
+      const sid = extractStreamId(event) ?? extractStreamId(msg);
+      if (sid) setStream(sid);
+      const b64 = extractBase64(event) ?? extractBase64(msg);
+      if (!b64) return;
+      const payload = bytesFromBase64(b64);
+      if (!payload) return;
+      deliverOutput(payload, 0n, streamId || sid || "tty_json");
+      handlers.onStatus("live");
+    }
+  };
+
+  const flushInput = () => {
+    inputTimer = 0;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !streamUuid || !inputQueue.length) return;
+    const payload = concatBytes(inputQueue.splice(0));
+    let rest = payload;
+    while (rest.byteLength) {
+      const chunk = rest.subarray(0, MAX_TTY_INPUT);
+      rest = rest.subarray(chunk.byteLength);
+      const frame = encodeTtyInputFrame(streamUuid, inputOffset, chunk);
+      inputOffset += BigInt(chunk.byteLength);
+      socket.send(frame.slice().buffer);
+    }
+  };
+
+  const queueInput = (data: Uint8Array) => {
+    if (!data.byteLength || closed) return;
+    const copy = data.slice();
+    inputQueue.push(copy);
+    if (!inputTimer) inputTimer = window.setTimeout(flushInput, TTY_INPUT_BATCH_MS);
+  };
+
+  const sendResize = (cols: number, rows: number) => {
+    lastCols = cols;
+    lastRows = rows;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "tty.resize", cols, rows, instanceId: instance.id }));
   };
 
   const openSocket = () => {
     if (closed) return;
-    const ws = new WebSocket(hubWsUrl());
+    handlers.onStatus(sawSnapshot ? "reconnecting" : "connecting");
+    resetNext = true;
+    const ws = new WebSocket(followTtyUrl(instance.id));
     ws.binaryType = "arraybuffer";
     socket = ws;
     ws.addEventListener("open", () => {
-      void send("runtime.hello", {
-        protocol: { major: 1, minMinor: 0, maxMinor: 0 },
-        observationSchemaMajors: [1],
-        features: ["snapshot-follow-v1", "tty-binary-v1"],
-      })
-        .then(() => attachNow())
-        .catch((err: Error) => {
-          handlers.onStatus("failed", err.message);
-        });
+      backoff = RECONNECT_MIN_MS;
+      ws.send(
+        JSON.stringify({
+          type: "subscribe",
+          instanceIds: [instance.id],
+          tty: 1,
+        }),
+      );
+      sendResize(lastCols, lastRows);
     });
     ws.addEventListener("message", (ev) => {
-      if (typeof ev.data !== "string") {
-        if (ev.data instanceof ArrayBuffer) handleBinary(ev.data);
+      if (typeof ev.data === "string") {
+        handleJson(ev.data);
         return;
       }
-      const msg = JSON.parse(ev.data) as { id?: string; result?: unknown; error?: { message: string } };
-      if (msg.id == null) return;
-      const waiter = pending.get(String(msg.id));
-      if (!waiter) return;
-      pending.delete(String(msg.id));
-      if (msg.error) waiter.reject(new Error(msg.error.message));
-      else waiter.resolve(msg.result);
+      const buf = asArrayBuffer(ev.data);
+      if (buf) handleBinary(buf);
+    });
+    ws.addEventListener("error", () => {
+      if (closed) return;
+      handlers.onStatus("reconnecting");
     });
     ws.addEventListener("close", () => {
-      for (const waiter of pending.values()) waiter.reject(new Error("WSS_CLOSED"));
-      pending.clear();
-      attach = null;
-      streamUuid = null;
       if (closed) return;
       handlers.onStatus("reconnecting");
       window.clearTimeout(reconnectTimer);
-      reconnectTimer = window.setTimeout(openSocket, 800);
+      reconnectTimer = window.setTimeout(openSocket, backoff);
+      backoff = Math.min(RECONNECT_MAX_MS, backoff * 2);
     });
   };
 
   openSocket();
 
   return {
-    async write(data: string) {
-      if (!attach?.writerLease) return;
-      const bytes = utf8Bytes(data).slice(0, MAX_TTY_INPUT);
-      const commandId = newId("cmd");
-      const seq = inputSeq;
-      inputSeq += 1n;
-      await send("tty.write", {
-        commandId,
-        payload: {
-          instanceId: instance.id,
-          processGeneration: instance.processRef.processGeneration,
-          streamId: attach.streamId,
-          streamEpoch: attach.streamEpoch,
-          writerLeaseId: attach.writerLease.leaseId,
-          inputSeq: seq.toString(),
-          dataBase64: bytesToBase64(bytes),
-        },
-      });
+    async write(data) {
+      queueInput(toBytes(data).slice());
     },
-    async resize(cols: number, rows: number) {
-      if (!attach?.writerLease) return { cols, rows };
-      resizeRevision += 1n;
-      const result = await send<{ cols: number; rows: number }>("tty.resize", {
-        instanceId: instance.id,
-        streamId: attach.streamId,
-        writerLeaseId: attach.writerLease.leaseId,
-        resizeRevision: resizeRevision.toString(),
-        cols,
-        rows,
-      });
-      return result;
+    async resize(cols, rows) {
+      sendResize(cols, rows);
+      return { cols, rows };
     },
     async detach() {
       closed = true;
       window.clearTimeout(reconnectTimer);
-      if (attach && socket?.readyState === WebSocket.OPEN) {
-        try {
-          await send("tty.detach", {
-            instanceId: instance.id,
-            streamId: attach.streamId,
-            writerLeaseId: attach.writerLease?.leaseId,
-          });
-        } catch {
-          /* detach is best-effort; unmount still closes the socket */
-        }
-      }
+      window.clearTimeout(inputTimer);
+      flushInput();
       socket?.close();
       socket = null;
     },
@@ -261,7 +331,12 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     },
     reconnectForTest() {
       if (socket && socket.readyState === WebSocket.OPEN) return;
+      window.clearTimeout(reconnectTimer);
       openSocket();
     },
   };
+}
+
+export function utf8Preview(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes);
 }

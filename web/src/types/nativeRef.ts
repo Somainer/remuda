@@ -3,7 +3,7 @@ import type { Digest, Id, Knowledge, U64 } from "./wire";
 export type NativeRef = {
   hostId: Id;
   nativeStoreId: Id;
-  kind: "claude" | "codex" | "grok" | "agy" | "generic";
+  kind: "claude" | "codex" | "grok" | "agy" | "generic" | "terminal";
   sessionId: Knowledge<string>;
   transcript: Knowledge<{ objectId: Id; sourcePath: string }>;
   codex?: { threadId: string };
@@ -60,7 +60,8 @@ export type DriverKind =
   | "codex-appserver"
   | "grok-acp"
   | "agy-print"
-  | "generic-pty";
+  | "generic-pty"
+  | "shell-pty";
 
 export type CapabilitySnapshot = {
   id: Id;

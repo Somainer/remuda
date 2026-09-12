@@ -91,6 +91,15 @@ describe("uiMode / nativeShort", () => {
     expect(uiMode(instance({ lifecycle: "ready", activity: known("idle"), connectivity: "connected" }))).toBe("structured-only");
   });
 
+  it("terminal and generic-pty are tty-attachable", () => {
+    expect(
+      uiMode(instance({ lifecycle: "ready", activity: known("idle"), connectivity: "connected", kind: "terminal", driver: "shell-pty" })),
+    ).toBe("tty-attachable");
+    expect(
+      uiMode(instance({ lifecycle: "ready", activity: known("idle"), connectivity: "connected", kind: "grok", driver: "generic-pty" })),
+    ).toBe("tty-attachable");
+  });
+
   it("shortens known native session ids", () => {
     expect(nativeShort(instance({ lifecycle: "ready", activity: known("idle"), connectivity: "connected" }))).toBe("a324ee05");
   });

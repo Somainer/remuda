@@ -10,7 +10,9 @@ import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
 import { openTtySession, type TtySession, type TtyStatus } from "./client";
+import { binaryStringToBytes } from "./ids";
 import { LocalInput } from "./LocalInput";
+import { attachTerminalRenderer, type TerminalRenderer } from "./renderer";
 import { createFontMeasure, fittedTerminalFont, responsiveTerminalSize, whenFontsReady } from "./terminalFit";
 import { attachTerminalTouch } from "./terminalTouch";
 import { NIGHT_CORRAL_THEME, TERMINAL_FONT_FAMILY } from "./theme";
@@ -29,6 +31,17 @@ declare global {
 
 type DisplayMode = "fit" | "fixed" | "responsive";
 
+function concatQueued(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((n, chunk) => n + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 export function TerminalView({
   instance,
   onAttachFailed,
@@ -43,13 +56,18 @@ export function TerminalView({
   const sessionRef = useRef<TtySession | null>(null);
   const resetStreamRef = useRef(true);
   const generationRef = useRef(0);
+  const directRef = useRef(true);
   const { mobile, offsetTop } = useWorkbenchViewport();
   const [inputOverride, setInputOverride] = useState<{ direct: boolean; mode: DisplayMode } | null>(null);
   const [status, setStatus] = useState<TtyStatus>("connecting");
   const [cols, setCols] = useState(80);
   const [rows, setRows] = useState(24);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [renderer, setRenderer] = useState<TerminalRenderer>("dom");
+  const [mouseMode, setMouseMode] = useState("none");
   const directInput = inputOverride?.direct ?? !mobile;
   const mode = inputOverride?.mode ?? (mobile ? "responsive" : "fit");
+  const ioMode = directInput ? "raw" : "keys";
   const modeRef = useRef<DisplayMode>(mode);
   const failRef = useRef(onAttachFailed);
   const applyFitRef = useRef<() => void>(() => {});
@@ -60,7 +78,7 @@ export function TerminalView({
   const [ready, setReady] = useState(false);
   const frozen = status === "reconnecting" || status === "failed";
 
-  const send = (data: string) => {
+  const send = (data: string | Uint8Array) => {
     void sessionRef.current?.write(data);
   };
 
@@ -73,6 +91,9 @@ export function TerminalView({
   useEffect(() => {
     instanceRef.current = instance;
   }, [instance]);
+  useEffect(() => {
+    directRef.current = directInput;
+  }, [directInput]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -86,10 +107,10 @@ export function TerminalView({
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 14,
       lineHeight: 1,
-      scrollback: 0,
+      scrollback: 4000,
       convertEol: false,
       disableStdin: true,
-      screenReaderMode: true,
+      macOptionIsMeta: true,
       theme: NIGHT_CORRAL_THEME,
     });
     const fit = new FitAddon();
@@ -104,6 +125,19 @@ export function TerminalView({
     termRef.current = term;
     searchRef.current = search;
     const font = createFontMeasure(host, TERMINAL_FONT_FAMILY);
+    const outQueue: Uint8Array[] = [];
+    let outRaf = 0;
+    let resizeTimer = 0;
+
+    const flushOut = () => {
+      outRaf = 0;
+      if (!outQueue.length) return;
+      const merged = concatQueued(outQueue.splice(0));
+      term.write(merged, () => {
+        setReady(true);
+        setMouseMode(term.modes.mouseTrackingMode);
+      });
+    };
 
     const applyFit = () => {
       if (!termRef.current || !viewportRef.current) return;
@@ -120,7 +154,10 @@ export function TerminalView({
         if (size) {
           setCols(size.cols);
           setRows(size.rows);
-          void sessionRef.current?.resize(size.cols, size.rows);
+          window.clearTimeout(resizeTimer);
+          resizeTimer = window.setTimeout(() => {
+            void sessionRef.current?.resize(size.cols, size.rows);
+          }, 40);
         }
         return;
       }
@@ -136,34 +173,50 @@ export function TerminalView({
       }
       setCols(term.cols);
       setRows(term.rows);
-      void sessionRef.current?.resize(term.cols, term.rows);
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        void sessionRef.current?.resize(term.cols, term.rows);
+      }, 40);
     };
 
     const inputDisposable = term.onData((data) => {
       if (term.options.disableStdin) return;
       send(data);
     });
+    const binaryDisposable = term.onBinary((data) => {
+      if (term.options.disableStdin) return;
+      send(binaryStringToBytes(data));
+    });
 
     applyFitRef.current = applyFit;
     void whenFontsReady().then(() => applyFitRef.current());
     applyFit();
+    void attachTerminalRenderer(term).then((name) => {
+      setRenderer(name);
+      applyFitRef.current();
+    });
 
     const session = openTtySession(instanceRef.current, {
-      onFrame: (payload, _offset, _streamId, representation) => {
-        const reset = resetStreamRef.current;
-        if (reset && representation === "rendered-ansi") term.options.scrollback = 0;
-        const bytes = payloadForStreamWrite(payload, reset && representation === "rendered-ansi");
-        resetStreamRef.current = false;
+      onSnapshot: () => {
+        resetStreamRef.current = true;
+        term.reset();
+      },
+      onFrame: (payload, _offset, _streamId, reset) => {
+        const shouldReset = reset || resetStreamRef.current;
+        if (shouldReset) {
+          term.reset();
+          resetStreamRef.current = false;
+        }
+        const bytes = payloadForStreamWrite(payload, false);
         const text = stripAnsi(payload);
-        setPreview((current) => (reset ? text : current + text));
-        term.write(bytes, () => {
-          setReady(true);
-        });
+        setPreview((current) => (shouldReset ? text : current + text));
+        outQueue.push(bytes);
+        if (!outRaf) outRaf = requestAnimationFrame(flushOut);
       },
       onStatus: (next, message) => {
         setStatus(next);
         if (next === "connecting") resetStreamRef.current = true;
-        if (next === "failed") failRef.current?.(message ?? "tty.attach failed");
+        if (next === "failed") failRef.current?.(message ?? "tty follow failed");
       },
     });
     sessionRef.current = session;
@@ -185,6 +238,7 @@ export function TerminalView({
       },
       getGeneration: () => generationRef.current,
       hasSelection: () => term.hasSelection(),
+      enabled: () => !(directRef.current && term.modes.mouseTrackingMode !== "none"),
     });
 
     window.__ttyLab = {
@@ -201,7 +255,10 @@ export function TerminalView({
       observer.disconnect();
       window.visualViewport?.removeEventListener("resize", onViewport);
       window.removeEventListener("resize", onViewport);
+      window.clearTimeout(resizeTimer);
+      if (outRaf) cancelAnimationFrame(outRaf);
       inputDisposable.dispose();
+      binaryDisposable.dispose();
       font.dispose();
       void session.detach();
       sessionRef.current = null;
@@ -212,7 +269,7 @@ export function TerminalView({
 
   useEffect(() => {
     applyFitRef.current();
-  }, [mode]);
+  }, [mode, fullscreen]);
 
   useEffect(() => {
     const term = termRef.current;
@@ -220,6 +277,13 @@ export function TerminalView({
     term.options.disableStdin = frozen || !directInput;
     if (directInput && !frozen) term.focus();
   }, [directInput, frozen]);
+
+  useEffect(() => {
+    document.documentElement.dataset.ttyFullscreen = fullscreen ? "1" : "0";
+    return () => {
+      delete document.documentElement.dataset.ttyFullscreen;
+    };
+  }, [fullscreen]);
 
   return (
     <section
@@ -229,11 +293,15 @@ export function TerminalView({
       data-tty-status={status}
       data-tty-cols={cols}
       data-tty-rows={rows}
+      data-tty-io={ioMode}
+      data-tty-renderer={renderer}
+      data-tty-mouse={mouseMode}
+      data-tty-fullscreen={fullscreen ? "1" : "0"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
       <header className={css.toolbar}>
-        <span className={css.geo}>
-          {cols}×{rows} · {mode} · Unicode11 · WebLinks
+        <span className={css.geo} data-testid="tty-io-mode">
+          {cols}×{rows} · {ioMode} · {renderer} · {mode}
         </span>
         <div className={css.seg}>
           <button
@@ -253,6 +321,9 @@ export function TerminalView({
             直连
           </button>
         </div>
+        <span className={css.modePill} data-testid="tty-mode-pill">
+          {ioMode}
+        </span>
         {!mobile ? <AuxKeys disabled={frozen} onKey={send} variant="toolbar" /> : null}
         {!mobile ? (
           <button
@@ -273,6 +344,15 @@ export function TerminalView({
             搜索
           </button>
         ) : null}
+        <button
+          type="button"
+          className={css.geo}
+          data-testid="tty-fullscreen"
+          aria-pressed={fullscreen}
+          onClick={() => setFullscreen((open) => !open)}
+        >
+          {fullscreen ? "退出全屏" : "全屏"}
+        </button>
         {searchOpen && !mobile ? (
           <form
             className={css.search}
@@ -329,8 +409,8 @@ export function TerminalView({
       <div className={css.dock}>
         {directInput ? (
           <>
-            <span className={css.dockLabel}>本地输入</span>
-            <div className={css.directGhost}>直连开启中 —— 击键直接进 PTY</div>
+            <span className={css.dockLabel}>raw</span>
+            <div className={css.directGhost}>直连开启中 —— 击键 / 鼠标 / 粘贴直接进 PTY</div>
             <div className={css.directGhostSend}>发送</div>
           </>
         ) : (
@@ -339,7 +419,9 @@ export function TerminalView({
       </div>
       {mobile ? <AuxKeys disabled={frozen} onKey={send} /> : null}
       {!mobile ? (
-        <div className={css.note}>TTY 字节走独立 raw_tty 流，不进 transcript 节点 · 结构化卡片仍在「结构」tab 看同一 journal</div>
+        <div className={css.note}>
+          TTY 字节走 `/v1/follow?tty=1` binary envelope · 结构 tab 看同一 journal
+        </div>
       ) : null}
     </section>
   );

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   CHANNEL_OBJECT_CHUNK,
+  CHANNEL_TTY_INPUT,
   CHANNEL_TTY_OUTPUT,
   decodeTtyBinaryFrame,
+  encodeTtyInputFrame,
   encodeTtyOutputFrame,
   HEADER_SIZE,
   sameUuid,
@@ -45,6 +47,19 @@ describe("tty-binary-v1 framing", () => {
     if (!decoded.ok) return;
     expect(decoded.frame.channelType).toBe(CHANNEL_OBJECT_CHUNK);
     expect(decoded.frame.channelType).not.toBe(CHANNEL_TTY_OUTPUT);
+  });
+
+  it("round-trips a TTY input frame on channel 3", () => {
+    const uuid = streamIdToUuidBytes(TTY_LAB_STREAM_ID)!;
+    const payload = new Uint8Array([0x1b, 0x5b, 0x4d, 0x20, 0x21, 0x21]);
+    const raw = encodeTtyInputFrame(uuid, 7n, payload);
+    const decoded = decodeTtyBinaryFrame(raw);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.frame.channelType).toBe(CHANNEL_TTY_INPUT);
+    expect(decoded.frame.offset).toBe(7n);
+    expect(Array.from(decoded.frame.payload)).toEqual(Array.from(payload));
+    expect(sameUuid(decoded.frame.streamUuid, uuid)).toBe(true);
   });
 
   it("does not apply a foreign stream UUID as this instance's input", () => {

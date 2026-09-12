@@ -7,6 +7,41 @@
   background: var(--ink);
 }
 
+.lab[data-tty-fullscreen="1"] {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  width: 100vw;
+  height: 100dvh;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+  box-sizing: border-box;
+}
+
+.lab[data-tty-fullscreen="1"] .note {
+  display: none;
+}
+
+.lab[data-tty-fullscreen="1"] .host {
+  padding: 8px;
+}
+
+.modePill {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dust);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 8px;
+}
+
+.keyOn {
+  color: var(--dust) !important;
+  border-color: var(--dust) !important;
+}
+
 .toolbar {
   flex: none;
   display: flex;
@@ -251,7 +286,8 @@
 .keys {
   display: flex;
   gap: 6px;
-  overflow: hidden;
+  flex-wrap: wrap;
+  overflow: auto;
   padding: 8px 10px;
   background: var(--ink-2, #1a212b);
   border-top: 1px solid var(--line);

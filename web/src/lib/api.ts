@@ -56,7 +56,7 @@ export type HubBody<Path extends keyof paths, Method extends keyof paths[Path]> 
     : never;
 
 const HUB_CAPABILITIES = printCapabilities();
-const KINDS: Instance["kind"][] = ["claude", "codex", "grok", "agy", "generic"];
+const KINDS: Instance["kind"][] = ["claude", "codex", "grok", "agy", "generic", "terminal"];
 const DRIVERS: Instance["driver"][] = [
   "claude-print",
   "claude-pty",
@@ -65,6 +65,7 @@ const DRIVERS: Instance["driver"][] = [
   "grok-acp",
   "agy-print",
   "generic-pty",
+  "shell-pty",
 ];
 const LIFECYCLES: Instance["lifecycle"][] = [
   "requested",
@@ -185,7 +186,10 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     },
     specRevision: "1",
     launchId: unknownKnowledge("hub"),
-    capabilities: driver === "generic-pty" || driver === "claude-pty" ? ptyCapabilities(driver) : HUB_CAPABILITIES,
+    capabilities:
+      driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty"
+        ? ptyCapabilities(driver)
+        : HUB_CAPABILITIES,
     ownerFence: "1",
     activeRunIds: [],
     parent: null,
@@ -243,8 +247,8 @@ export type HelloResult = {
 export type InstanceCreateSpec = {
   hostId: Id;
   workspaceId?: Id;
-  kind: "claude" | "codex" | "grok" | "agy";
-  driver: "claude-print" | "claude-pty" | "claude-bg" | "generic-pty";
+  kind: "claude" | "codex" | "grok" | "agy" | "terminal";
+  driver: "claude-print" | "claude-pty" | "claude-bg" | "generic-pty" | "shell-pty";
   model: string;
   providerProfileId: string;
   permissionMode: string;

@@ -59,8 +59,8 @@
 
 会话页内部两个视图，**不是**两个顶层导航，也**不是** herdr 多 pane 工作台：
 
-- `structured`：transcript（**默认**；M0 唯一主视图）
-- `terminal`：xterm attach 原生 TUI（可选第二视图；仅 `mode=tty-attachable`。v1 一实例一终端，无分屏）
+- `structured`：transcript（print 默认；pty-backed 的第二视图）
+- `terminal`：xterm attach 原生 TUI（`mode=tty-attachable`：`claude-pty` / `generic-pty` / `shell-pty` / kind `terminal` / codex·grok·agy。v1 一实例一终端，无分屏）。pty-backed 默认打开终端 tab。
 
 ### 1.2 URL 路由表
 
@@ -72,8 +72,9 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 | `/` | 重定向 `/sessions` | |
 | `/sessions` | 会话列表 | query：`?host=&workspace=&kind=&status=`（`status` 是 §2.1 投影名） |
 | `/sessions/new` | 新建会话 | query 可预填 `host` `workspace` `kind` |
-| `/s/:instanceId` | 会话页，默认 structured | wire 类型是 Instance，不是 Session |
-| `/s/:instanceId/tty` | 会话页终端视图 | 无 `tty-attach` 或 `mode=structured-only` 时 404 → structured 并 toast |
+| `/s/:instanceId` | 会话页 | print 默认 structured；pty-backed（codex/grok/agy/`claude-pty`/`terminal`）默认终端 |
+| `/s/:instanceId/tty` | 会话页终端视图 | 无 tty 时回 structured 并 toast |
+| `/s/:instanceId/structured` | 会话页结构化视图 | pty-backed 的第二视图 |
 | `/s/:instanceId/files` | 会话页文件/diff（桌面右栏；手机全屏） | |
 | `/approvals` | 审批中心 | `?focus=:interactionId` 高亮一条；手机底栏一等入口 |
 | `/hosts` | 主机列表 | |
@@ -109,7 +110,7 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 - 左航轨固定 48px 图标：会话、审批（badge）、新建、更多（主机/项目/Provider/Bot/设置）。
 - 第二列是当前区域的索引（会话列表、主机列表…）。会话页打开时第二列仍是会话列表，当前行高亮。
 - 右栏默认关。有 diff / Workflow 树 / Artifact 时自动开；空间不够先关右栏，再压中栏（抄 DSH `computeColumns` 顺序，不要先压中栏）。
-- 会话页顶栏：标题、status 点（§2.1 投影）、structured|terminal 切换（仅 `tty-attachable`）、Stop、主机/项目芯片。terminal 是第二视图，不替换 structured。
+- 会话页顶栏：标题、status 点（§2.1 投影）、terminal|structured 切换（仅 `tty-attachable`）、Stop、主机/项目芯片。pty-backed 默认 terminal，structured 是第二视图。
 
 **手机**
 
@@ -311,38 +312,46 @@ Diff 三分态文案：**拟修改** / **已写入** / **结果未知**。未知
 
 ### 2.3 会话页 · 终端视图 `/s/:instanceId/tty`
 
+pty-backed 会话（kind `terminal` / driver `shell-pty` / `generic-pty` / `claude-pty` / codex·grok·agy）打开 `/s/:id` 即终端。结构是第二视图 `/s/:id/structured`。
+
 ```
-┌  结构 | ●终端    80×24  fit    [本地输入|直连] [Esc ⇧ ⌃ ⌥ ⌘ Tab] [■]
+┌  ●终端 | 结构    80×24  raw  webgl  [本地输入|直连] [esc tab ctrl alt ↑ ↓ pgup pgdn ctrl+c] [全屏]
 ├─────────────────────────────────────────────────────────────────────┐
-│  xterm.js  ·  Unicode11  ·  WebLinks  ·  Search                     │
-│  原生 Claude TUI（/workflows 面板、Artifact、spinner）               │
+│  xterm.js  ·  fit  ·  WebGL/canvas  ·  Unicode11  ·  Night Corral 256│
+│  原生 TUI（vim / grok / claude 全屏，鼠标跟踪开启时点击进 PTY）        │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
-│  本地输入：________________________________  [发送]                  │
-│  直连关闭时击键进 textarea；打开时击键进 PTY（桌面默认直连）           │
+│  raw：击键 / 粘贴 / 鼠标序列直接进 PTY                                │
+│  keys：本地输入条（手机默认；IME composing 不送）                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+**真·全屏**：隐藏 chrome，`position:fixed; inset:0; height:100dvh`，`env(safe-area-inset-*)`。
 
 **从 herdrx 抄交互与 viewport 算法，重接 runtime API**（不要搬 herdr snapshot 绑定）
 
 | 能力 | 算法来源 | 接到 |
 |---|---|---|
-| xterm + Search/Unicode11/WebLinks | `herdrx/web/src/components/TerminalPane.tsx` | Hub `raw_tty` / attach |
-| 手机默认本地输入、桌面默认直连 | `WorkbenchPage.tsx` | 本会话 tty 流 |
-| IME 安全发送 | `Composer.tsx` `composing()` | Command `instance.send` |
+| xterm + fit + WebGL/canvas + Search/Unicode11/WebLinks | `TerminalPane.tsx` | Hub `/v1/follow?tty=1` binary `tty.frame` |
+| 256 色 Night Corral | tokens.css → `theme.ts` `extendedAnsi` | xterm `ITheme` |
+| 手机默认 keys、桌面默认 raw | `WorkbenchPage.tsx` | follow 输入 channel |
+| IME 安全发送 | xterm composition + `composing()` | raw onData 不拆候选 |
+| 鼠标 | xterm mouse tracking (`onData` + `onBinary`) | 应用 DECSET 1000/1002/1003/1006 时转发 |
+| 辅助键条 | `terminalTouch.ts` + `AuxKeys` | esc/tab/ctrl/alt/arrows/pgup/pgdn/ctrl+c |
 | `visualViewport` 缩键盘、pinch zoom 不 reflow | `displayPreferences.ts` | 本页 layout |
-| 辅助键条 | `WorkbenchPage` `auxiliaryKeysOpen` | `tty.write` |
-| 触控选字 | `lib/terminalTouch.ts` | 本页 xterm |
-| fit/fixed/responsive 字号 | `TerminalDisplay`；手机默认 `responsive` | 本页 |
-| 断线：终端保留最后一帧，标 reconnecting | `connectionEpoch` 重建 attach | Instance.connectivity |
+| fit/fixed/responsive 字号 | `terminalFit.ts`；手机默认 `responsive` | `tty.resize {cols,rows}` |
+| 断线：终端保留最后一帧，标 reconnecting | follow 重连 + snapshot replay | Instance.connectivity |
 
 **不要抄** DSH `TerminalBlock`（剥了绝对光标、清屏、alternate-screen）。
 
-**数据**
+**数据 / 线协议**
 
-- TTY 字节：独立 `raw_tty` 流，**不**进 transcript 节点。
-- 结构化卡片仍可在「结构」tab 看同一 journal。
-- attach 失败（无 TTY、driver 无 `tty-attach`）：回 structured + toast。`claude attach` 无 TTY 会空转（`claude-control-plane.md` §0）。
+- 输出：`/v1/follow?tty=1` 上已有 32-byte `tty.frame` envelope，channel = output，payload = 原始 ANSI。
+- attach：打开 follow 且 `tty=1`，先吃完整 snapshot replay，再跟 live 帧。
+- 输入：同一 binary envelope，channel = input，payload = xterm `onData` + `onBinary` 的原始字节（含鼠标序列）。
+- resize：JSON `tty.resize {cols, rows}`。
+- TTY 字节**不**进 transcript 节点。结构化卡片仍在「结构」tab 看同一 journal。
+- attach 失败：回 structured + toast。
 
 **何时自动切到终端**
 
@@ -376,7 +385,7 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 │ 主机   [devbox ▾]     在线 · claude 2.1.268 │
 │ 项目   [sfe-root      ▾]   /home/…/sfe-root      │
 │        （Workspace）         新 worktree □       │
-│ 运行时 [Claude ●]  （Codex/Grok/agy M4）         │
+│ 运行时 [Claude ●] [Codex] [Grok] [agy] [Terminal]│
 │ 模型   [passthrough/auto_model/… ▾]              │
 │ 权限   [询问 ●] [可改文件] [全自动]               │
 │                    [取消]  [开始]                │
@@ -397,7 +406,7 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 |---|---|
 | 主机 | `hostId` |
 | 项目 / worktree | `workspaceId`, `cwd`, `worktree?` |
-| 运行时 | `kind=claude`；`driver` 见上（M0 只 `claude-print`） |
+| 运行时 | `kind=claude\|codex\|grok\|agy\|terminal`；`terminal` → `driver=shell-pty`（cwd/worktree，prompt 可空） |
 | 模型 | `model`（网关名原样；禁止分类器式裸 `claude-sonnet-5`）。网关混合模型走 print；Artifact/TUI 用订阅登录 profile + pty（M3） |
 | Provider | `providerProfileId`（M0–M2 默认 `astergate-default`） |
 | 权限 | `permissionMode`：询问=`manual`+`permission-prompts host`；可改文件=`acceptEdits`（仅本 cwd 覆盖）；全自动=`dontAsk`（个人遥控默认不要） |

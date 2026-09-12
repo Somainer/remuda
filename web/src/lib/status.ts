@@ -21,12 +21,17 @@ export function projectStatus(instance: Instance): UiStatus {
 }
 
 export function isGenericPty(instance: Instance): boolean {
-  return instance.driver === "generic-pty";
+  return (
+    instance.driver === "generic-pty" ||
+    instance.driver === "shell-pty" ||
+    instance.kind === "terminal"
+  );
 }
 
 export function uiMode(instance: Instance): "structured-only" | "tty-attachable" {
+  if (instance.kind === "terminal" || instance.driver === "shell-pty") return "tty-attachable";
   if (instance.driver === "claude-print") return "structured-only";
-  if (instance.driver === "generic-pty") return "tty-attachable";
+  if (instance.driver === "generic-pty" || instance.driver === "claude-pty") return "tty-attachable";
   const tty = instance.capabilities.capabilities["tty-attach"];
   return tty?.state === "supported" ? "tty-attachable" : "structured-only";
 }

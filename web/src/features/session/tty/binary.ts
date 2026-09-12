@@ -3,6 +3,8 @@
 export const TTY_FRAMING_VERSION = 1;
 export const CHANNEL_TTY_OUTPUT = 1;
 export const CHANNEL_OBJECT_CHUNK = 2;
+/** Client→PTY raw bytes on `/v1/follow?tty=1` (same 32-byte envelope as output). */
+export const CHANNEL_TTY_INPUT = 3;
 export const HEADER_SIZE = 32;
 
 export type TtyBinaryFrame = {
@@ -38,19 +40,44 @@ export function streamIdToUuidBytes(streamId: string): Uint8Array | null {
   return uuidToBytes(streamId.slice(split + 1));
 }
 
-export function encodeTtyOutputFrame(streamId: string, offset: bigint, payload: Uint8Array): Uint8Array {
-  const uuid = streamIdToUuidBytes(streamId);
-  if (!uuid) throw new Error("invalid streamId UUID");
+export function encodeTtyFrame(
+  channel: number,
+  streamUuid: Uint8Array,
+  offset: bigint,
+  payload: Uint8Array,
+): Uint8Array {
+  if (streamUuid.byteLength !== 16) throw new Error("streamUuid must be 16 bytes");
   if (payload.byteLength > 0xffff_ffff) throw new Error("payload too large");
   const out = new Uint8Array(HEADER_SIZE + payload.byteLength);
   const view = new DataView(out.buffer);
   view.setUint8(0, TTY_FRAMING_VERSION);
-  view.setUint8(1, CHANNEL_TTY_OUTPUT);
+  view.setUint8(1, channel);
   view.setUint16(2, 0);
-  out.set(uuid, 4);
+  out.set(streamUuid, 4);
   view.setBigUint64(20, offset, false);
   view.setUint32(28, payload.byteLength, false);
   out.set(payload, HEADER_SIZE);
+  return out;
+}
+
+export function encodeTtyOutputFrame(streamId: string, offset: bigint, payload: Uint8Array): Uint8Array {
+  const uuid = streamIdToUuidBytes(streamId);
+  if (!uuid) throw new Error("invalid streamId UUID");
+  return encodeTtyFrame(CHANNEL_TTY_OUTPUT, uuid, offset, payload);
+}
+
+export function encodeTtyInputFrame(streamUuid: Uint8Array, offset: bigint, payload: Uint8Array): Uint8Array {
+  return encodeTtyFrame(CHANNEL_TTY_INPUT, streamUuid, offset, payload);
+}
+
+export function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((n, chunk) => n + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
   return out;
 }
 
@@ -61,7 +88,11 @@ export function decodeTtyBinaryFrame(buffer: ArrayBuffer | Uint8Array): DecodeOk
   const framingVersion = view.getUint8(0);
   if (framingVersion !== TTY_FRAMING_VERSION) return { ok: false, error: "bad framingVersion" };
   const channelType = view.getUint8(1);
-  if (channelType !== CHANNEL_TTY_OUTPUT && channelType !== CHANNEL_OBJECT_CHUNK) {
+  if (
+    channelType !== CHANNEL_TTY_OUTPUT &&
+    channelType !== CHANNEL_OBJECT_CHUNK &&
+    channelType !== CHANNEL_TTY_INPUT
+  ) {
     return { ok: false, error: "bad channelType" };
   }
   if (view.getUint16(2, false) !== 0) return { ok: false, error: "reserved bytes must be 0" };

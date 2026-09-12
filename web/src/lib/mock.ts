@@ -1086,8 +1086,11 @@ export function mockCreate(prompt: string, extras?: { hostId?: Id; workspaceId?:
   if (extras?.workspaceId) ins.workspaceId = extras.workspaceId;
   if (extras?.driver) ins.driver = extras.driver;
   if (extras?.kind) ins.kind = extras.kind;
-  if (extras?.driver === "generic-pty" || extras?.driver === "claude-pty") {
+  if (extras?.driver === "generic-pty" || extras?.driver === "claude-pty" || extras?.driver === "shell-pty") {
     ins.capabilities = ptyCapabilities(extras.driver);
+  }
+  if (extras?.kind === "terminal") {
+    ins.capabilities = ptyCapabilities(extras.driver ?? "shell-pty");
   }
   ins.activeRunIds = [];
   instances.unshift(ins);

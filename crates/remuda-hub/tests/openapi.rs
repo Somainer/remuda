@@ -20,12 +20,18 @@ fn source_route_paths() -> BTreeSet<String> {
         include_str!("../src/ws.rs"),
         include_str!("../src/lib.rs"),
         include_str!("../src/push_http.rs"),
+        include_str!("../src/providers.rs"),
     ];
     let mut paths = BTreeSet::new();
     for src in files {
         let mut rest = src;
-        while let Some(idx) = rest.find(".route(\"") {
-            rest = &rest[idx + ".route(\"".len()..];
+        while let Some(idx) = rest.find(".route(") {
+            rest = &rest[idx + ".route(".len()..];
+            let rest_trim = rest.trim_start();
+            if !rest_trim.starts_with('"') {
+                continue;
+            }
+            rest = &rest_trim[1..];
             if let Some(end) = rest.find('"') {
                 let path = &rest[..end];
                 if path.starts_with('/') {

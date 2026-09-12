@@ -662,6 +662,8 @@ agy 没有在现有 help 中建立 `--settings`/专属 config-dir 参数；不�
 
 ProviderProfile v1 至少有 `id, revision, ingress, endpointCandidates[], models[], credentialRefs[], rotationOwner: gateway|runtime, selectionPolicy: pinned|weighted-healthy, nativeHomeRef, supportedDrivers[]`。endpointCandidate 包含 `id, baseUrl, priority, weight, health: healthy|cooldown|disabled|unknown, cooldownUntil`；同优先级健康候选按权重选择，unknown 默认不自动接流量。运行中固定 ProviderSelection；记录 requested/resolved model，未知 resolved 不回填 requested。AsterGate 作为账号池时 runtime 只轮换 endpoint/profile，不再自行轮换其背后的 upstream accounts。gateway-auth
 
+Hub 操作面（M1）先落地一个薄的可配置子集：`id, name, kind: gateway|direct, baseUrl, models[], defaultModel, headers, defaultGateway, secret: {present, last4, fingerprint}`。auth token 只在 create/rotate 提交，经 SecretBroker 信封加密落在 Hub data dir，GET 永不返回。Claude `delegation=gateway` 的 launch overlay 见 [providers.md](./providers.md)。
+
 换 endpoint/key 分三类：尚未 native 派发的新命令可重选；原生支持且已验收的 credential helper 可在其原生机制内刷新；其它运行中的请求先进入 reconciliation。恢复必须获得原生 session 单 owner lease、确认旧执行已终止、绑定新 generation、显式 native resume，不重投已可能执行的 prompt。失败尝试的 observation 保留，不能通过“换 provider 再跑一次”把已产生的文件修改或 tool effects 隐去。profile 的 ingress 不兼容返回 `PROVIDER_PROTOCOL_MISMATCH`，不临时搭一个有损协议转换器。
 
 ## 5. Observation envelope、payload 与原生映射

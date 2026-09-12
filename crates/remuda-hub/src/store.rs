@@ -273,6 +273,101 @@ pub struct InteractionRecord {
     pub updated_at: String,
 }
 
+/// Hub registry row for a gateway/direct provider profile. Secret bytes stay in the vault.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRecord {
+    /// `pvp_…`.
+    pub id: String,
+    /// Operator label.
+    pub name: String,
+    /// `gateway` or `direct`.
+    pub kind: String,
+    /// Ingress base URL.
+    pub base_url: String,
+    /// Catalog model ids.
+    pub models: Vec<String>,
+    /// Prefill for New Session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// Extra HTTP headers (never the auth token).
+    pub headers: BTreeMap<String, String>,
+    /// New Session `delegation=gateway` selects this profile.
+    pub default_gateway: bool,
+    /// Monotonic revision.
+    pub revision: i64,
+    /// Vault key (`provider-<id>`); omitted from GET JSON.
+    #[serde(skip)]
+    pub secret_name: Option<String>,
+    /// Token is present in the vault.
+    pub secret_present: bool,
+    /// Last four UTF-8 characters of the token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_last4: Option<String>,
+    /// SHA-256 prefix (16 hex chars).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_fingerprint: Option<String>,
+    /// Last `/test` result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_ok: Option<bool>,
+    /// Last `/test` time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_at: Option<String>,
+    /// Last `/test` message (no secrets).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_message: Option<String>,
+    /// Create-time.
+    pub created_at: String,
+    /// Update-time.
+    pub updated_at: String,
+}
+
+impl ProviderRecord {
+    /// Public REST view. Never includes the auth token.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "kind": self.kind,
+            "baseUrl": self.base_url,
+            "models": self.models,
+            "defaultModel": self.default_model,
+            "headers": self.headers,
+            "defaultGateway": self.default_gateway,
+            "revision": self.revision.to_string(),
+            "secret": {
+                "present": self.secret_present,
+                "last4": self.secret_last4,
+                "fingerprint": self.secret_fingerprint,
+            },
+            "health": self.last_test_ok.map(|ok| json!({
+                "ok": ok,
+                "checkedAt": self.last_test_at,
+                "message": self.last_test_message,
+            })),
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+        })
+    }
+
+    /// Overlay spec threaded into `instance.create` (no token).
+    pub fn overlay_spec(&self, model: Option<&str>) -> Value {
+        let model = model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(self.default_model.as_deref())
+            .or(self.models.first().map(String::as_str))
+            .unwrap_or("");
+        json!({
+            "profileId": self.id,
+            "kind": self.kind,
+            "baseUrl": self.base_url,
+            "model": model,
+            "headers": self.headers,
+        })
+    }
+}
+
 impl InteractionRecord {
     /// REST list item.
     pub fn to_list_item(&self) -> Value {
@@ -1268,6 +1363,270 @@ impl Store {
         })
         .await
     }
+
+    /// List provider profiles (metadata only).
+    pub async fn list_providers(&self) -> Result<Vec<ProviderRecord>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
+                        is_default, revision, secret_name, secret_last4, secret_fingerprint,
+                        last_test_ok, last_test_at, last_test_message, created_at, updated_at
+                 FROM provider_profiles
+                 ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([], load_provider_row)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Fetch one profile.
+    pub async fn get_provider(&self, id: String) -> Result<Option<ProviderRecord>, StoreError> {
+        self.run(move |conn| load_provider(conn, &id)).await
+    }
+
+    /// The profile marked default gateway, if any.
+    pub async fn default_gateway(&self) -> Result<Option<ProviderRecord>, StoreError> {
+        self.run(move |conn| {
+            let id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM provider_profiles WHERE is_default = 1 AND kind = 'gateway' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match id {
+                Some(id) => load_provider(conn, &id),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Insert a provider metadata row. Secret bytes belong in the vault.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_provider(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        base_url: String,
+        models: Vec<String>,
+        default_model: Option<String>,
+        headers: BTreeMap<String, String>,
+        default_gateway: bool,
+        secret_name: Option<String>,
+        secret_last4: Option<String>,
+        secret_fingerprint: Option<String>,
+    ) -> Result<ProviderRecord, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            if default_gateway {
+                conn.execute(
+                    "UPDATE provider_profiles SET is_default = 0 WHERE is_default = 1",
+                    [],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO provider_profiles
+                 (id, name, kind, base_url, models_json, default_model, headers_json,
+                  is_default, revision, secret_name, secret_last4, secret_fingerprint,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12)",
+                params![
+                    id,
+                    name,
+                    kind,
+                    base_url,
+                    serde_json::to_string(&models)?,
+                    default_model,
+                    serde_json::to_string(&headers)?,
+                    i64::from(default_gateway),
+                    secret_name,
+                    secret_last4,
+                    secret_fingerprint,
+                    now,
+                ],
+            )?;
+            load_provider(conn, &id)?
+                .ok_or_else(|| StoreError::Id("provider insert missing".into()))
+        })
+        .await
+    }
+
+    /// Patch provider metadata. `clear_default` is unused; `default_gateway` is the source of truth.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_provider(
+        &self,
+        id: String,
+        name: Option<String>,
+        kind: Option<String>,
+        base_url: Option<String>,
+        models: Option<Vec<String>>,
+        default_model: Option<Option<String>>,
+        headers: Option<BTreeMap<String, String>>,
+        default_gateway: Option<bool>,
+        secret_name: Option<Option<String>>,
+        secret_last4: Option<Option<String>>,
+        secret_fingerprint: Option<Option<String>>,
+    ) -> Result<ProviderRecord, StoreError> {
+        self.run(move |conn| {
+            if load_provider(conn, &id)?.is_none() {
+                return Err(StoreError::Id("unknown provider".into()));
+            }
+            if default_gateway == Some(true) {
+                conn.execute(
+                    "UPDATE provider_profiles SET is_default = 0 WHERE is_default = 1 AND id != ?1",
+                    params![id],
+                )?;
+            }
+            if let Some(name) = name {
+                conn.execute(
+                    "UPDATE provider_profiles SET name = ?1 WHERE id = ?2",
+                    params![name, id],
+                )?;
+            }
+            if let Some(kind) = kind {
+                conn.execute(
+                    "UPDATE provider_profiles SET kind = ?1 WHERE id = ?2",
+                    params![kind, id],
+                )?;
+            }
+            if let Some(base_url) = base_url {
+                conn.execute(
+                    "UPDATE provider_profiles SET base_url = ?1 WHERE id = ?2",
+                    params![base_url, id],
+                )?;
+            }
+            if let Some(models) = models {
+                conn.execute(
+                    "UPDATE provider_profiles SET models_json = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&models)?, id],
+                )?;
+            }
+            if let Some(default_model) = default_model {
+                conn.execute(
+                    "UPDATE provider_profiles SET default_model = ?1 WHERE id = ?2",
+                    params![default_model, id],
+                )?;
+            }
+            if let Some(headers) = headers {
+                conn.execute(
+                    "UPDATE provider_profiles SET headers_json = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&headers)?, id],
+                )?;
+            }
+            if let Some(default_gateway) = default_gateway {
+                conn.execute(
+                    "UPDATE provider_profiles SET is_default = ?1 WHERE id = ?2",
+                    params![i64::from(default_gateway), id],
+                )?;
+            }
+            if let Some(secret_name) = secret_name {
+                conn.execute(
+                    "UPDATE provider_profiles SET secret_name = ?1 WHERE id = ?2",
+                    params![secret_name, id],
+                )?;
+            }
+            if let Some(secret_last4) = secret_last4 {
+                conn.execute(
+                    "UPDATE provider_profiles SET secret_last4 = ?1 WHERE id = ?2",
+                    params![secret_last4, id],
+                )?;
+            }
+            if let Some(secret_fingerprint) = secret_fingerprint {
+                conn.execute(
+                    "UPDATE provider_profiles SET secret_fingerprint = ?1 WHERE id = ?2",
+                    params![secret_fingerprint, id],
+                )?;
+            }
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE provider_profiles SET revision = revision + 1, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+            load_provider(conn, &id)?.ok_or_else(|| StoreError::Id("unknown provider".into()))
+        })
+        .await
+    }
+
+    /// Record a `/test` probe on the profile (does not bump revision).
+    pub async fn record_provider_test(
+        &self,
+        id: String,
+        ok: bool,
+        message: String,
+    ) -> Result<ProviderRecord, StoreError> {
+        self.run(move |conn| {
+            if load_provider(conn, &id)?.is_none() {
+                return Err(StoreError::Id("unknown provider".into()));
+            }
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE provider_profiles
+                 SET last_test_ok = ?1, last_test_at = ?2, last_test_message = ?3, updated_at = ?2
+                 WHERE id = ?4",
+                params![i64::from(ok), now, message, id],
+            )?;
+            load_provider(conn, &id)?.ok_or_else(|| StoreError::Id("unknown provider".into()))
+        })
+        .await
+    }
+
+    /// Delete a profile row. Caller deletes the vault entry.
+    pub async fn delete_provider(&self, id: String) -> Result<Option<ProviderRecord>, StoreError> {
+        self.run(move |conn| {
+            let existing = load_provider(conn, &id)?;
+            if existing.is_some() {
+                conn.execute("DELETE FROM provider_profiles WHERE id = ?1", params![id])?;
+            }
+            Ok(existing)
+        })
+        .await
+    }
+}
+
+fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderRecord>, StoreError> {
+    conn.query_row(
+        "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
+                is_default, revision, secret_name, secret_last4, secret_fingerprint,
+                last_test_ok, last_test_at, last_test_message, created_at, updated_at
+         FROM provider_profiles WHERE id = ?1",
+        params![id],
+        load_provider_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
+    let models_json: String = row.get(4)?;
+    let headers_json: String = row.get(6)?;
+    let models: Vec<String> = serde_json::from_str(&models_json).unwrap_or_default();
+    let headers: BTreeMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
+    let secret_name: Option<String> = row.get(9)?;
+    let last_test_ok: Option<i64> = row.get(12)?;
+    Ok(ProviderRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        base_url: row.get(3)?,
+        models,
+        default_model: row.get(5)?,
+        headers,
+        default_gateway: row.get::<_, i64>(7)? != 0,
+        revision: row.get(8)?,
+        secret_present: secret_name.as_ref().is_some_and(|s| !s.is_empty()),
+        secret_name,
+        secret_last4: row.get(10)?,
+        secret_fingerprint: row.get(11)?,
+        last_test_ok: last_test_ok.map(|v| v != 0),
+        last_test_at: row.get(13)?,
+        last_test_message: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
 }
 
 fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
@@ -1388,6 +1747,25 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS interactions_instance ON interactions(instance_id);
         CREATE INDEX IF NOT EXISTS interactions_host_state ON interactions(host_id, state);
+        CREATE TABLE IF NOT EXISTS provider_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            base_url TEXT NOT NULL DEFAULT '',
+            models_json TEXT NOT NULL DEFAULT '[]',
+            default_model TEXT,
+            headers_json TEXT NOT NULL DEFAULT '{}',
+            is_default INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 1,
+            secret_name TEXT,
+            secret_last4 TEXT,
+            secret_fingerprint TEXT,
+            last_test_ok INTEGER,
+            last_test_at TEXT,
+            last_test_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         ",
     )?;
     ensure_column(&conn, "hosts", "labels_json", "TEXT NOT NULL DEFAULT '[]'")?;

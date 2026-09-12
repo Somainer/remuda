@@ -38,8 +38,9 @@ pub use materializer::{
 };
 pub use process::current_process_identity;
 pub use profile::{
-    Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind, ProviderProfile, Secret,
-    SecretBroker, SecretRef,
+    ClaudeProviderOverlay, Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind,
+    ProviderProfile, Secret, SecretBroker, SecretRef, claude_provider_settings_json,
+    write_claude_provider_overlay,
 };
 pub use recipe::{
     EnvAllowlistEntry, EnvAllowlistSource, FileLifetime, FileRole, LaunchAudit, LaunchRecipe,
@@ -48,7 +49,7 @@ pub use recipe::{
 pub use remuda_protocol::DriverKind;
 #[cfg(all(target_os = "macos", feature = "keychain"))]
 pub use secrets::KeychainSecretBroker;
-pub use secrets::{FileSecretStore, TokenBroker};
+pub use secrets::{FileSecretStore, TokenBroker, fingerprint_secret};
 #[cfg(unix)]
 pub use secrets::{request_secret, serve_token_broker};
 

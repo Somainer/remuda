@@ -376,6 +376,11 @@ wire_enum!(ProviderIngress, "4.1", {
     NativeLogin => "native-login",
 });
 
+wire_enum!(ProviderProfileKind, "4.4", {
+    Gateway => "gateway",
+    Direct => "direct",
+});
+
 wire_enum!(SelectionReason, "4.1", {
     Pinned => "pinned",
     WeightedHealthy => "weighted-healthy",

@@ -17,6 +17,8 @@ import {
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst } from "../features/hosts";
+import { defaultGatewayProfile, fromHub, type ProviderProfile } from "../features/providers";
+import { api } from "../lib/api";
 import css from "./NewSessionPage.module.css";
 
 type CreateKind = Exclude<Kind, "generic">;
@@ -55,10 +57,20 @@ export function NewSessionPage() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [gatewayProfiles, setGatewayProfiles] = useState<ProviderProfile[]>([]);
 
   useEffect(() => {
     promptRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    void api
+      .providerList()
+      .then((page) => setGatewayProfiles(page.items.map(fromHub).filter((p) => p.delegation === "gateway")))
+      .catch(() => setGatewayProfiles([]));
+  }, []);
+
+  const defaultGateway = defaultGatewayProfile(gatewayProfiles);
 
   const pickerHosts = sortHostsOnlineFirst(
     hub.hosts.filter((h) => !isStaleOffline(h)),
@@ -138,7 +150,7 @@ export function NewSessionPage() {
               kind: activeKind,
               driver,
               model,
-              providerProfileId: providerProfileForDelegation(delegation),
+              providerProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
               permissionMode: activeKind === "claude" ? permissionMode : "bypassPermissions",
               delegation,
               prompt,
@@ -376,12 +388,22 @@ export function NewSessionPage() {
                   type="button"
                   className={`${css.choice} ${delegation === opt.id ? css.choiceOn : ""}`}
                   data-testid={`new-session-delegation-${opt.id}`}
-                  onClick={() => setDelegation(opt.id)}
+                  onClick={() => {
+                    setDelegation(opt.id);
+                    if (opt.id === "gateway" && defaultGateway?.defaultModel) setModel(defaultGateway.defaultModel);
+                  }}
                 >
                   {opt.label}
                 </button>
               ))}
             </div>
+            {delegation === "gateway" ? (
+              <span className={css.hint} data-testid="new-session-gateway-profile">
+                {defaultGateway
+                  ? `${defaultGateway.name} · ${defaultGateway.defaultModel || defaultGateway.models[0] || "model"}`
+                  : "请先在 Provider 页配置网关"}
+              </span>
+            ) : null}
           </fieldset>
           <div className={css.advanced}>
             <button type="button" className={css.advancedToggle} onClick={() => setAdvanced(!advanced)}>

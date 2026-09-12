@@ -11,8 +11,24 @@ test.describe("providers bots settings", () => {
     await page.locator('[data-testid=provider-row][data-delegation=gateway]').click();
     await expect(page.getByTestId("provider-detail")).toBeVisible();
     await expect(page.getByTestId("provider-health")).toContainText("健康 200");
-    await expect(page.getByTestId("provider-secret")).toContainText("sk-a****");
-    await expect(page.getByTestId("provider-secret")).toContainText("前 4 位");
+    await expect(page.getByTestId("provider-secret")).toContainText("••••34ef");
+    await expect(page.getByTestId("provider-secret")).toContainText("last4");
+  });
+
+  test("create dummy gateway and test reports unreachable", async ({ page }) => {
+    await page.goto("/providers");
+    await page.getByTestId("provider-add").click();
+    await expect(page.getByTestId("provider-form")).toBeVisible();
+    await page.getByTestId("provider-name").fill("dummy-gateway");
+    await page.getByTestId("provider-base-url").fill("http://127.0.0.1:1");
+    await page.getByTestId("provider-token").fill("sk-dummy-token-zzzz");
+    await page.getByTestId("provider-models").fill("passthrough/auto");
+    await page.getByTestId("provider-save").click();
+    await expect(page.getByTestId("provider-form")).toHaveCount(0);
+    await expect(page.getByText("dummy-gateway")).toBeVisible();
+    await page.getByText("dummy-gateway").click();
+    await page.getByTestId("provider-test").click();
+    await expect(page.getByTestId("provider-test-result")).toContainText("unreachable");
   });
 
   test("bots show Feishu binding fields and deliveries", async ({ page }) => {

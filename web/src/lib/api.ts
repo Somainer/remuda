@@ -4,6 +4,8 @@ import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import type { Workspace } from "../types/workspace";
+import type { ProviderCreate, ProviderPatch, ProviderTestResult } from "../features/providers";
+import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import type { components, paths } from "./api.generated";
 import { printCapabilities, ptyCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
@@ -287,6 +289,23 @@ export type WorktreeCreateSpec = {
 
 export type PtyKey = "enter" | "esc" | "ctrl+c";
 
+/** Hub GET `/v1/providers` row. Auth token is never present. */
+export type HubProviderRow = {
+  id: string;
+  name: string;
+  kind: "gateway" | "direct" | string;
+  baseUrl: string;
+  models: string[];
+  defaultModel?: string | null;
+  headers?: Record<string, string>;
+  defaultGateway: boolean;
+  revision: string;
+  secret: { present: boolean; last4?: string | null; fingerprint?: string | null };
+  health?: { ok: boolean; checkedAt?: string | null; message?: string | null; status?: number | null; latencyMs?: number | null } | null;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
 export type HubApi = {
   mock: boolean;
   login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
@@ -313,6 +332,12 @@ export type HubApi = {
   hostList(): Promise<Page<Host>>;
   hostGet(hostId: Id): Promise<Host>;
   workspaceList(hostId?: Id): Promise<Page<Workspace>>;
+  providerList(): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
+  providerGet(id: string): Promise<HubProviderRow>;
+  providerCreate(body: ProviderCreate): Promise<HubProviderRow>;
+  providerPatch(id: string, body: ProviderPatch): Promise<HubProviderRow>;
+  providerDelete(id: string): Promise<{ ok: boolean }>;
+  providerTest(id: string): Promise<ProviderTestResult>;
   eventsRead: JournalRead;
   eventsSubscribe(
     journalId: Id,
@@ -384,6 +409,30 @@ async function rest<T>(path: string, init: RequestInit & { auth?: boolean } = {}
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+function seedMockProviders(): HubProviderRow[] {
+  return PROVIDER_PROFILES.filter((p) => p.kind !== "native").map((p) => ({
+    id: p.id,
+    name: p.name,
+    kind: p.kind === "direct" ? "direct" : "gateway",
+    baseUrl: p.baseUrl ?? "",
+    models: p.models,
+    defaultModel: p.defaultModel,
+    headers: p.headers,
+    defaultGateway: p.defaultGateway,
+    revision: "1",
+    secret: { present: p.secret.present, last4: p.secret.last4, fingerprint: p.secret.fingerprint },
+    health: p.health,
+    createdAt: "2026-09-12T00:00:00.000Z",
+    updatedAt: "2026-09-12T00:00:00.000Z",
+  }));
+}
+
+let mockProviders: HubProviderRow[] = seedMockProviders();
+
+function mockProviderFingerprint(token: string): { last4: string; fingerprint: string } {
+  return { last4: token.slice(-4), fingerprint: "0123456789abcdef" };
 }
 
 function createMockApi(): HubApi {
@@ -521,6 +570,76 @@ function createMockApi(): HubApi {
       const found = mockDb.hosts.find((h) => h.id === hostId);
       if (!found) throw new Error("HOST_NOT_FOUND");
       return found;
+    },
+    async providerList() {
+      return { items: mockProviders.slice(), nextCursor: null };
+    },
+    async providerGet(providerId) {
+      const found = mockProviders.find((p) => p.id === providerId);
+      if (!found) throw new Error("NOT_FOUND");
+      return found;
+    },
+    async providerCreate(body) {
+      if (!body.authToken) throw new Error("authToken is required on create");
+      if (body.defaultGateway) mockProviders = mockProviders.map((p) => ({ ...p, defaultGateway: false }));
+      const fp = mockProviderFingerprint(body.authToken);
+      const row: HubProviderRow = {
+        id: id("pvp_"),
+        name: body.name,
+        kind: body.kind,
+        baseUrl: body.baseUrl,
+        models: body.models,
+        defaultModel: body.defaultModel ?? body.models[0] ?? null,
+        headers: body.headers ?? {},
+        defaultGateway: Boolean(body.defaultGateway && body.kind === "gateway"),
+        revision: "1",
+        secret: { present: true, last4: fp.last4, fingerprint: fp.fingerprint },
+        health: null,
+        createdAt: now(),
+        updatedAt: now(),
+      };
+      mockProviders = [...mockProviders, row];
+      return row;
+    },
+    async providerPatch(providerId, body) {
+      const index = mockProviders.findIndex((p) => p.id === providerId);
+      if (index < 0) throw new Error("NOT_FOUND");
+      if (body.defaultGateway) mockProviders = mockProviders.map((p) => ({ ...p, defaultGateway: p.id === providerId }));
+      const prev = mockProviders[index];
+      const fp = body.authToken ? mockProviderFingerprint(body.authToken) : null;
+      const row: HubProviderRow = {
+        ...prev,
+        name: body.name ?? prev.name,
+        kind: body.kind ?? prev.kind,
+        baseUrl: body.baseUrl ?? prev.baseUrl,
+        models: body.models ?? prev.models,
+        defaultModel: body.defaultModel === undefined ? prev.defaultModel : body.defaultModel,
+        headers: body.headers ?? prev.headers,
+        defaultGateway: body.defaultGateway ?? prev.defaultGateway,
+        revision: String(Number(prev.revision) + 1),
+        secret: fp ? { present: true, last4: fp.last4, fingerprint: fp.fingerprint } : prev.secret,
+        updatedAt: now(),
+      };
+      mockProviders = mockProviders.map((p) => (p.id === providerId ? row : p));
+      return row;
+    },
+    async providerDelete(providerId) {
+      const before = mockProviders.length;
+      mockProviders = mockProviders.filter((p) => p.id !== providerId);
+      if (mockProviders.length === before) throw new Error("NOT_FOUND");
+      return { ok: true };
+    },
+    async providerTest(providerId) {
+      const found = mockProviders.find((p) => p.id === providerId);
+      if (!found) throw new Error("NOT_FOUND");
+      const dummy = /127\.0\.0\.1:1|:1$|invalid|example/.test(found.baseUrl);
+      const result: ProviderTestResult = dummy
+        ? { ok: false, reachable: false, message: `unreachable: connection refused (${found.baseUrl}/v1/models)`, models: [] }
+        : { ok: true, reachable: true, status: 200, latencyMs: 12, message: "reachable (200); 1 models", models: found.models };
+      found.health = dummy
+        ? { ok: false, message: result.message }
+        : { ok: true, status: 200, latencyMs: 12, message: result.message, checkedAt: now() };
+      return result;
     },
     async workspaceList(hostId) {
       const items = hostId ? mockDb.workspaces.filter((w) => w.hostId === hostId) : mockDb.workspaces;
@@ -778,6 +897,24 @@ function createLiveApi(): HubApi {
       const host = mapHost(await rest<HubJson<"/v1/hosts/{id}", "get">>(`/v1/hosts/${hostId}`));
       hosts.set(host.id, host);
       return host;
+    },
+    async providerList() {
+      return rest<{ items: HubProviderRow[]; nextCursor?: string | null }>("/v1/providers");
+    },
+    async providerGet(providerId) {
+      return rest<HubProviderRow>(`/v1/providers/${providerId}`);
+    },
+    async providerCreate(body) {
+      return rest<HubProviderRow>("/v1/providers", { method: "POST", body: JSON.stringify(body) });
+    },
+    async providerPatch(providerId, body) {
+      return rest<HubProviderRow>(`/v1/providers/${providerId}`, { method: "PATCH", body: JSON.stringify(body) });
+    },
+    async providerDelete(providerId) {
+      return rest<{ ok: boolean }>(`/v1/providers/${providerId}`, { method: "DELETE" });
+    },
+    async providerTest(providerId) {
+      return rest<ProviderTestResult>(`/v1/providers/${providerId}/test`, { method: "POST", body: "{}" });
     },
     async workspaceList(hostId) {
       const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;

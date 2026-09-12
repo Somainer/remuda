@@ -1,12 +1,15 @@
-//! Thin ProviderProfile and M0 env/file SecretBroker.
+//! Thin ProviderProfile, M0 env/file SecretBroker, and Claude settings overlay.
 
 use crate::error::{DriverError, DriverResult};
 use async_trait::async_trait;
 use remuda_protocol::Id;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Client-side wire contract of a profile, not the upstream vendor brand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +233,145 @@ fn trim_secret_bytes(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+/// Inputs for [`write_claude_provider_overlay`]. x-place calls this at Claude launch.
+///
+/// The secret is written only into the 0600 settings file. Do not log this struct
+/// with a custom formatter that exposes [`Secret::expose`].
+pub struct ClaudeProviderOverlay<'a> {
+    /// `gateway` writes `ANTHROPIC_AUTH_TOKEN`; `direct` writes `ANTHROPIC_API_KEY`.
+    pub delegation: Delegation,
+    /// Ingress base URL. Required for [`Delegation::Gateway`].
+    pub base_url: &'a str,
+    /// Overlay `model` field (also passed as `--model` by the materializer).
+    pub model: &'a str,
+    /// Auth token. Never log [`Secret::expose`].
+    pub secret: &'a Secret,
+    /// Extra env names copied into `settings.env` (non-secret).
+    pub extra_env: &'a BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ClaudeProviderOverlay<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeProviderOverlay")
+            .field("delegation", &self.delegation)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("secret", &self.secret)
+            .field("extra_env_keys", &self.extra_env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Build Claude `settings.json` for a gateway/direct profile. Never log the return.
+pub fn claude_provider_settings_json(overlay: &ClaudeProviderOverlay<'_>) -> DriverResult<Value> {
+    if overlay.delegation == Delegation::None {
+        return Err(DriverError::InvalidLaunchSpec(
+            "native delegation does not write a provider settings overlay".into(),
+        ));
+    }
+    let token = overlay.secret.expose_str()?.to_string();
+    if token.is_empty() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "provider overlay requires a non-empty auth token".into(),
+        ));
+    }
+    let mut env = BTreeMap::new();
+    match overlay.delegation {
+        Delegation::Gateway => {
+            if overlay.base_url.trim().is_empty() {
+                return Err(DriverError::InvalidLaunchSpec(
+                    "gateway delegation requires a base_url".into(),
+                ));
+            }
+            env.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                Value::String(overlay.base_url.trim().to_string()),
+            );
+            env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), Value::String(token));
+            env.insert(
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".to_string(),
+                Value::String("1".into()),
+            );
+        }
+        Delegation::Direct => {
+            env.insert("ANTHROPIC_API_KEY".to_string(), Value::String(token));
+            if !overlay.base_url.trim().is_empty() {
+                env.insert(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    Value::String(overlay.base_url.trim().to_string()),
+                );
+            }
+        }
+        Delegation::None => unreachable!(),
+    }
+    for (name, value) in overlay.extra_env {
+        if name == "ANTHROPIC_AUTH_TOKEN" || name == "ANTHROPIC_API_KEY" {
+            continue;
+        }
+        env.entry(name.clone())
+            .or_insert_with(|| Value::String(value.clone()));
+    }
+    Ok(json!({
+        "model": overlay.model,
+        "env": env,
+    }))
+}
+
+/// Write 0600 `settings.json` into `launch_dir` and return the path for `--settings`.
+///
+/// Callers must not log the file contents. Existing `materialize` still uses
+/// `apiKeyHelper` when a token broker is bound; this function is the Hub/Node
+/// path that puts the token in the overlay env.
+pub fn write_claude_provider_overlay(
+    launch_dir: &Path,
+    overlay: &ClaudeProviderOverlay<'_>,
+) -> DriverResult<PathBuf> {
+    if !launch_dir.is_absolute() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "launch dir must be an absolute path".into(),
+        ));
+    }
+    fs::create_dir_all(launch_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(launch_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let settings = claude_provider_settings_json(overlay)?;
+    let bytes = serde_json::to_vec_pretty(&settings)?;
+    let path = launch_dir.join("settings.json");
+    write_private_overlay(&path, &bytes)?;
+    Ok(path)
+}
+
+fn write_private_overlay(path: &Path, bytes: &[u8]) -> DriverResult<()> {
+    let tmp = {
+        let mut raw = path.as_os_str().to_os_string();
+        raw.push(".tmp");
+        PathBuf::from(raw)
+    };
+    {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +389,49 @@ mod tests {
             .unwrap();
         assert_eq!(secret.expose_str().unwrap(), value);
         assert!(!format!("{secret:?}").contains(value));
+    }
+
+    #[test]
+    fn gateway_overlay_writes_env_and_redacts_debug() {
+        let secret = Secret::new(b"sk-overlay-secret-value".to_vec());
+        let extra = BTreeMap::new();
+        let overlay = ClaudeProviderOverlay {
+            delegation: Delegation::Gateway,
+            base_url: "https://gateway.example/v1",
+            model: "passthrough/auto",
+            secret: &secret,
+            extra_env: &extra,
+        };
+        let json = claude_provider_settings_json(&overlay).unwrap();
+        assert_eq!(json["model"], "passthrough/auto");
+        assert_eq!(
+            json["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.example/v1"
+        );
+        assert_eq!(
+            json["env"]["ANTHROPIC_AUTH_TOKEN"],
+            "sk-overlay-secret-value"
+        );
+        assert_eq!(
+            json["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
+            "1"
+        );
+        assert!(!format!("{overlay:?}").contains("sk-overlay-secret-value"));
+    }
+
+    #[test]
+    fn direct_overlay_writes_api_key() {
+        let secret = Secret::new(b"sk-direct-key".to_vec());
+        let extra = BTreeMap::new();
+        let overlay = ClaudeProviderOverlay {
+            delegation: Delegation::Direct,
+            base_url: "",
+            model: "claude-sonnet",
+            secret: &secret,
+            extra_env: &extra,
+        };
+        let json = claude_provider_settings_json(&overlay).unwrap();
+        assert_eq!(json["env"]["ANTHROPIC_API_KEY"], "sk-direct-key");
+        assert!(json["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
     }
 }

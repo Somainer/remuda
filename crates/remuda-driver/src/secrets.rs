@@ -109,6 +109,24 @@ impl FileSecretStore {
         Ok(vault.secrets.keys().cloned().collect())
     }
 
+    /// Fetch a named secret. Never log the return value.
+    pub fn get(&self, name: &str) -> DriverResult<Secret> {
+        self.get_named(name)
+    }
+
+    /// Remove a named secret. Returns whether it was present.
+    pub fn delete(&self, name: &str) -> DriverResult<bool> {
+        validate_secret_name(name)?;
+        let _guard = self.lock.lock().unwrap_or_else(|err| err.into_inner());
+        let mut vault = self.load_unlocked()?;
+        let removed = vault.secrets.remove(name).is_some();
+        if removed {
+            write_private(&self.vault_path, &encode_vault(&self.vault_path, &vault)?)?;
+            info!(name, "secret store delete");
+        }
+        Ok(removed)
+    }
+
     fn get_named(&self, name: &str) -> DriverResult<Secret> {
         validate_secret_name(name)?;
         let _guard = self.lock.lock().unwrap_or_else(|err| err.into_inner());
@@ -675,6 +693,30 @@ pub async fn request_secret(
         Err(DriverError::CredentialUnavailable(
             response.error.unwrap_or_else(|| "broker denied".into()),
         ))
+    }
+}
+
+/// SHA-256 prefix (16 hex chars) and last four UTF-8 characters of a secret.
+///
+/// Used by Hub GET `/v1/providers` so the token itself is never returned.
+#[must_use]
+pub fn fingerprint_secret(secret: &[u8]) -> (String, String) {
+    let digest = Sha256::digest(secret);
+    let fingerprint = hex_encode(&digest[..8]);
+    (fingerprint, utf8_last4(secret))
+}
+
+fn utf8_last4(secret: &[u8]) -> String {
+    match std::str::from_utf8(secret) {
+        Ok(text) if !text.is_empty() => {
+            let mut chars: Vec<char> = text.chars().collect();
+            if chars.len() > 4 {
+                chars = chars.split_off(chars.len() - 4);
+            }
+            chars.into_iter().collect()
+        }
+        _ if secret.len() >= 2 => hex_encode(&secret[secret.len() - 2..]),
+        _ => "****".into(),
     }
 }
 

@@ -170,6 +170,63 @@
   color: var(--mute);
 }
 
+.badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  border: 1px solid var(--dust);
+  color: var(--dust);
+  border-radius: 3px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: min(420px, 100%);
+}
+
+.seg {
+  display: flex;
+  gap: 6px;
+}
+
+.choice {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--mute);
+  border-radius: var(--radius);
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.choiceOn {
+  border-color: var(--dust);
+  color: var(--paper);
+}
+
+.toggleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--paper);
+}
+
+.error {
+  color: var(--dust);
+  font-size: 13px;
+  margin: 0;
+}
+
 @media (max-width: 767px) {
   .head {
     height: 52px;

@@ -2614,6 +2614,48 @@ export type ProtocolVersion = ({
 /** ProviderIngress wire values; `protocol.md` §4.1. */
 export type ProviderIngress = ("anthropic-messages" | "openai-responses" | "openai-chat" | "gemini-native" | "native-login");
 
+/** Launch overlay the Node writes as Claude `--settings`. The token stays off this type. */
+export type ProviderOverlaySpec = ({
+  "baseUrl": (string);
+  "headers": ({
+  [key: string]: (string);
+});
+  "kind": ProviderProfileKind;
+  "model": (string);
+  "profileId": Id;
+  [key: string]: unknown;
+});
+
+/** Operator-configured provider profile (Hub registry). `protocol.md` §4.4 / D-012.  GET never includes the auth token; only [`ProviderSecretView`]. */
+export type ProviderProfile = ({
+  "baseUrl": (string);
+  "createdAt": Timestamp;
+  "defaultGateway": (boolean);
+  "defaultModel": (string | null);
+  "headers": ({
+  [key: string]: (string);
+});
+  "id": Id;
+  "kind": ProviderProfileKind;
+  "models": (((string))[]);
+  "name": (string);
+  "revision": U64;
+  "secret": ProviderSecretView;
+  "updatedAt": Timestamp;
+  [key: string]: unknown;
+});
+
+/** ProviderProfileKind wire values; `protocol.md` §4.4. */
+export type ProviderProfileKind = ("gateway" | "direct");
+
+/** Public secret metadata for a stored ProviderProfile. The token is never on this type. */
+export type ProviderSecretView = ({
+  "fingerprint": (string | null);
+  "last4": (string | null);
+  "present": (boolean);
+  [key: string]: unknown;
+});
+
 /** ProviderSelection; `protocol.md` §4.1. */
 export type ProviderSelection = ({
   "credentialRef": (Id | (null));

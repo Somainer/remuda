@@ -11530,6 +11530,165 @@
         }
       ]
     },
+    "ProviderOverlaySpec": {
+      "description": "Launch overlay the Node writes as Claude `--settings`. The token stays off this type.",
+      "properties": {
+        "baseUrl": {
+          "description": "Ingress base URL copied onto `ANTHROPIC_BASE_URL` for gateway.",
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra HTTP headers for the gateway. Empty for direct.",
+          "type": "object"
+        },
+        "kind": {
+          "$ref": "#/$defs/ProviderProfileKind",
+          "description": "`gateway` or `direct`."
+        },
+        "model": {
+          "description": "Model written into the settings overlay and `--model`.",
+          "type": "string"
+        },
+        "profileId": {
+          "$ref": "#/$defs/Id",
+          "description": "Profile identity (`pvp_` prefix)."
+        }
+      },
+      "required": [
+        "profileId",
+        "kind",
+        "baseUrl",
+        "model",
+        "headers"
+      ],
+      "type": "object"
+    },
+    "ProviderProfile": {
+      "description": "Operator-configured provider profile (Hub registry). `protocol.md` §4.4 / D-012.\n\nGET never includes the auth token; only [`ProviderSecretView`].",
+      "properties": {
+        "baseUrl": {
+          "description": "Ingress base URL. Required for [`ProviderProfileKind::Gateway`].",
+          "type": "string"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Create-time."
+        },
+        "defaultGateway": {
+          "description": "When true, New Session `delegation=gateway` selects this profile.",
+          "type": "boolean"
+        },
+        "defaultModel": {
+          "description": "Prefill for New Session when `modelId` is omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra HTTP headers for the gateway (never Authorization / x-api-key).",
+          "type": "object"
+        },
+        "id": {
+          "$ref": "#/$defs/Id",
+          "description": "Profile identity (`pvp_` prefix)."
+        },
+        "kind": {
+          "$ref": "#/$defs/ProviderProfileKind",
+          "description": "`gateway` (Anthropic-Messages compatible) or `direct` (provider key)."
+        },
+        "models": {
+          "description": "Catalog model ids this profile may resolve.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Operator label.",
+          "type": "string"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "Monotonic revision; increments on PATCH (including token rotate)."
+        },
+        "secret": {
+          "$ref": "#/$defs/ProviderSecretView",
+          "description": "Fingerprint/last4 only."
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Update-time."
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "name",
+        "kind",
+        "baseUrl",
+        "models",
+        "defaultModel",
+        "headers",
+        "defaultGateway",
+        "secret",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "ProviderProfileKind": {
+      "description": "ProviderProfileKind wire values; `protocol.md` §4.4.",
+      "oneOf": [
+        {
+          "const": "gateway",
+          "description": "Wire value `gateway`.",
+          "type": "string"
+        },
+        {
+          "const": "direct",
+          "description": "Wire value `direct`.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProviderSecretView": {
+      "description": "Public secret metadata for a stored ProviderProfile. The token is never on this type.",
+      "properties": {
+        "fingerprint": {
+          "description": "First 16 hex characters of SHA-256(token), or null when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last4": {
+          "description": "Last four UTF-8 characters of the token, or null when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "present": {
+          "description": "True when the Hub vault holds a token for this profile.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "present",
+        "last4",
+        "fingerprint"
+      ],
+      "type": "object"
+    },
     "ProviderSelection": {
       "description": "ProviderSelection; `protocol.md` §4.1.",
       "properties": {

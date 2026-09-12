@@ -19,6 +19,7 @@ mod http;
 mod interactions;
 mod inventory;
 mod placement;
+mod providers;
 mod push_http;
 mod registry;
 mod store;
@@ -34,6 +35,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::Uri;
 use axum::response::Response;
+use remuda_driver::FileSecretStore;
 use remuda_push::{OpenOptions, PushService};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,6 +53,8 @@ pub struct AppState {
     /// Frozen listen/auth config.
     pub config: Arc<HubConfig>,
     store: Store,
+    /// Envelope-encrypted provider tokens under `data_dir/secrets`.
+    secrets: Arc<FileSecretStore>,
     nodes: ConnectedNodes,
     bus: Bus,
     push: Option<PushService>,
@@ -135,6 +139,8 @@ async fn spawn_inner(
         .mark_all_hosts_offline()
         .await
         .map_err(|err| anyhow::anyhow!("mark hosts offline: {err}"))?;
+    let secrets = FileSecretStore::open(config.data_dir.join("secrets"))
+        .map_err(|err| anyhow::anyhow!("provider secrets: {err}"))?;
     let push = match transport {
         Some(t) => Some(PushService::open_with(
             &config.data_dir,
@@ -151,6 +157,7 @@ async fn spawn_inner(
     let state = AppState {
         config: Arc::new(config.clone()),
         store: store.clone(),
+        secrets: Arc::new(secrets),
         nodes: crate::transport::ConnectedNodes::default(),
         bus: Bus::with_capacity(config.follow_buffer_events),
         push,
@@ -191,7 +198,8 @@ pub fn router(state: AppState) -> Router {
         .merge(registry::routes())
         .merge(placement::routes())
         .merge(fleet::routes())
-        .merge(devices::routes());
+        .merge(devices::routes())
+        .merge(providers::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }

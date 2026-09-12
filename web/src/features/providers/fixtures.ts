@@ -1,39 +1,42 @@
-import type { ProviderProfile } from "./model";
+import { NATIVE_PROFILE, type ProviderProfile } from "./model";
 
 /** Mock ProviderProfile rows. Wire ids are none | gateway | direct (D-012). */
 export const PROVIDER_PROFILES: ProviderProfile[] = [
+  NATIVE_PROFILE,
   {
-    profileId: "none",
-    delegation: "none",
-    protocol: "native-cli",
-    baseUrl: null,
-    health: null,
-    secretRef: null,
-    models: [],
-    lastError: null,
-    rotationOwner: "native",
-    available: true,
-  },
-  {
+    id: "gateway",
     profileId: "gateway",
+    name: "示例网关",
     delegation: "gateway",
+    kind: "gateway",
     protocol: "anthropic-messages",
     baseUrl: "https://gateway.example/v1",
     health: { ok: true, status: 200, latencyMs: 12, checkedAt: "2026-09-12T00:00:00.000Z" },
-    secretRef: "sk-ab12cd34ef",
+    secret: { present: true, last4: "34ef", fingerprint: "0123456789abcdef" },
+    secretRef: "34ef",
     models: ["passthrough/auto", "passthrough/auto_model"],
+    defaultModel: "passthrough/auto",
+    defaultGateway: true,
+    headers: {},
     lastError: null,
     rotationOwner: "gateway",
     available: true,
   },
   {
+    id: "direct",
     profileId: "direct",
+    name: "Direct 多 key",
     delegation: "direct",
+    kind: "direct",
     protocol: "provider-native",
     baseUrl: null,
     health: null,
+    secret: { present: false, last4: null, fingerprint: null },
     secretRef: null,
     models: [],
+    defaultModel: null,
+    defaultGateway: false,
+    headers: {},
     lastError: null,
     rotationOwner: "runtime",
     available: false,
@@ -41,5 +44,5 @@ export const PROVIDER_PROFILES: ProviderProfile[] = [
 ];
 
 export function profileById(id: string | undefined): ProviderProfile | undefined {
-  return PROVIDER_PROFILES.find((p) => p.profileId === id);
+  return PROVIDER_PROFILES.find((p) => p.profileId === id || p.id === id);
 }

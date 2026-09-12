@@ -14,6 +14,71 @@ pub struct ProfileRef {
     pub revision: U64,
 }
 
+/// Public secret metadata for a stored ProviderProfile. The token is never on this type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSecretView {
+    /// True when the Hub vault holds a token for this profile.
+    pub present: bool,
+    /// Last four UTF-8 characters of the token, or null when absent.
+    #[serde(deserialize_with = "crate::scalar::required_option")]
+    pub last4: Option<String>,
+    /// First 16 hex characters of SHA-256(token), or null when absent.
+    #[serde(deserialize_with = "crate::scalar::required_option")]
+    pub fingerprint: Option<String>,
+}
+
+/// Operator-configured provider profile (Hub registry). `protocol.md` §4.4 / D-012.
+///
+/// GET never includes the auth token; only [`ProviderSecretView`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderProfile {
+    /// Profile identity (`pvp_` prefix).
+    pub id: Id,
+    /// Monotonic revision; increments on PATCH (including token rotate).
+    pub revision: U64,
+    /// Operator label.
+    pub name: String,
+    /// `gateway` (Anthropic-Messages compatible) or `direct` (provider key).
+    pub kind: ProviderProfileKind,
+    /// Ingress base URL. Required for [`ProviderProfileKind::Gateway`].
+    pub base_url: String,
+    /// Catalog model ids this profile may resolve.
+    pub models: Vec<String>,
+    /// Prefill for New Session when `modelId` is omitted.
+    #[serde(deserialize_with = "crate::scalar::required_option")]
+    pub default_model: Option<String>,
+    /// Extra HTTP headers for the gateway (never Authorization / x-api-key).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// When true, New Session `delegation=gateway` selects this profile.
+    pub default_gateway: bool,
+    /// Fingerprint/last4 only.
+    pub secret: ProviderSecretView,
+    /// Create-time.
+    pub created_at: Timestamp,
+    /// Update-time.
+    pub updated_at: Timestamp,
+}
+
+/// Launch overlay the Node writes as Claude `--settings`. The token stays off this type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderOverlaySpec {
+    /// Profile identity (`pvp_` prefix).
+    pub profile_id: Id,
+    /// `gateway` or `direct`.
+    pub kind: ProviderProfileKind,
+    /// Ingress base URL copied onto `ANTHROPIC_BASE_URL` for gateway.
+    pub base_url: String,
+    /// Model written into the settings overlay and `--model`.
+    pub model: String,
+    /// Extra HTTP headers for the gateway. Empty for direct.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
 /// SettingsOverlay; `protocol.md` §4.1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]

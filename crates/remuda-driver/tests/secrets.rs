@@ -32,6 +32,12 @@ async fn file_store_round_trip_json_and_hides_debug() {
     let raw = fs::read_to_string(dir.path().join("secrets.json")).unwrap();
     assert!(!raw.contains(value));
     assert_eq!(store.list_names().unwrap(), vec!["anthropic".to_string()]);
+
+    let (fingerprint, last4) = remuda_driver::fingerprint_secret(value.as_bytes());
+    assert_eq!(last4, "alue");
+    assert_eq!(fingerprint.len(), 16);
+    store.delete("anthropic").unwrap();
+    assert!(store.list_names().unwrap().is_empty());
 }
 
 #[tokio::test]

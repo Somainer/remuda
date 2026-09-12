@@ -37,7 +37,9 @@ use axum::response::Response;
 use remuda_push::{OpenOptions, PushService};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 pub use config::{DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS};
 pub use error::HubError;
@@ -63,6 +65,29 @@ pub struct RunningHub {
     /// Bootstrap token devices and Nodes exchange on first enroll.
     pub bootstrap_token: String,
     shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+    store: Option<Store>,
+}
+
+impl RunningHub {
+    /// Stop HTTP/WS accept and wait for the SQLite writer thread to close.
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(mut task) = self.task.take() {
+            tokio::select! {
+                _ = &mut task => {}
+                () = tokio::time::sleep(Duration::from_secs(5)) => {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
+        if let Some(store) = self.store.take() {
+            store.close().await;
+        }
+    }
 }
 
 impl Drop for RunningHub {
@@ -70,6 +95,10 @@ impl Drop for RunningHub {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.store.take();
     }
 }
 
@@ -117,7 +146,7 @@ async fn spawn_inner(
     };
     let state = AppState {
         config: Arc::new(config.clone()),
-        store,
+        store: store.clone(),
         nodes: crate::transport::ConnectedNodes::default(),
         bus: Bus::with_capacity(config.follow_buffer_events),
         push,
@@ -129,7 +158,7 @@ async fn spawn_inner(
     let addr = listener.local_addr()?;
     persist_listen(&config.data_dir, addr)?;
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let shutdown = async {
             let _ = rx.await;
         };
@@ -144,6 +173,8 @@ async fn spawn_inner(
         addr,
         bootstrap_token,
         shutdown: Some(tx),
+        task: Some(task),
+        store: Some(store),
     })
 }
 

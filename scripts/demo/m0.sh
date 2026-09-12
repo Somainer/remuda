@@ -389,6 +389,18 @@ step_login() {
   export REMUDA_HUB="http://$HUB_LISTEN"
   export REMUDA_TOKEN="$TOKEN"
   export REMUDA_BOOTSTRAP_TOKEN="$ACCESS_CODE"
+  local i resp count
+  for i in $(seq 1 40); do
+    resp="$(http_json GET "http://$HUB_LISTEN/v1/hosts")" || true
+    count="$(python3 -c 'import json,sys; b=json.load(sys.stdin).get("body") or {}; print(len(b.get("items") or []))' <<<"$resp")"
+    if [[ "$count" != "0" ]]; then
+      log "hub has $count enrolled host(s)"
+      return 0
+    fi
+    sleep 0.15
+  done
+  fail_gap "GET http://$HUB_LISTEN/v1/hosts" "timed out waiting for an enrolled Node"$'\n'"$resp" \
+    "crates/remuda (codex-astra), crates/remuda-node (codex-sol)"
 }
 
 step_create_print() {

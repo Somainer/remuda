@@ -130,7 +130,6 @@ pub(crate) async fn run(
         node.host().meta.id.as_id().to_string(),
     );
     wss.label = "local-development".into();
-    wss = wss.with_collected_inventory();
     let mut link = WssLink::connect(wss)
         .await
         .context("local Node could not enroll with the development Hub")?;

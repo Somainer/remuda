@@ -931,6 +931,24 @@ impl Store {
         .await
     }
 
+    /// Mark a create that the Node rejected so it does not occupy a slot.
+    pub async fn fail_instance(
+        &self,
+        instance_id: String,
+        last_error: String,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE instances
+                 SET lifecycle = 'failed', last_error = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![last_error, now_rfc3339(), instance_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// List instances, optionally filtered by host.
     pub async fn list_instances(
         &self,

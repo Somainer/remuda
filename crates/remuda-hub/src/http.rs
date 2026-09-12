@@ -574,6 +574,14 @@ pub(crate) async fn forward_if_online(
             schedule_create_settlement_watch(state, &accepted);
             Ok(accepted)
         }
+        Ok(Some(response)) if response.get("error").is_some() => {
+            tracing::warn!(
+                command_id = %command.command_id,
+                response = %response,
+                "node did not durably accept command; will not resend"
+            );
+            fail_unaccepted_create(state, &command, node_rpc_error_message(&response)).await
+        }
         Ok(Some(response)) => {
             tracing::warn!(
                 command_id = %command.command_id,
@@ -603,6 +611,42 @@ pub(crate) async fn forward_if_online(
                 .ok_or(HubError::NotFound)
         }
     }
+}
+
+async fn fail_unaccepted_create(
+    state: &AppState,
+    command: &CommandRecord,
+    message: String,
+) -> Result<CommandRecord, HubError> {
+    if command.operation == "instance.create"
+        && let Some(instance_id) = command.instance_id.clone()
+    {
+        state
+            .store
+            .fail_instance(instance_id, message.clone())
+            .await?;
+        return Err(HubError::BadRequest(message));
+    }
+    state
+        .store
+        .get_command(command.command_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)
+}
+
+fn node_rpc_error_message(response: &Value) -> String {
+    response
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            response
+                .pointer("/error/data/message")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("node did not accept instance.create")
+        .trim()
+        .trim_start_matches("invalid request: ")
+        .to_string()
 }
 
 fn node_accepted(response: &Value, command_id: &str) -> bool {

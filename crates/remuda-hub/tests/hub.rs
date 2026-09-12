@@ -1132,6 +1132,112 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
 }
 
 #[tokio::test]
+async fn create_instance_fails_when_node_rejects_cwd() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "runtime.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "label": "local-development"
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let _ = node
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": "invalid request: cwd must resolve inside the registered workspace or a worktree beside it: /private/tmp resolves outside /tmp/workspace"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+        }
+    });
+
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "permissionMode": "manual",
+        "delegation": "none",
+        "cwd": "/tmp",
+        "prompt": "Use Bash to write a file"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 400, "{body}");
+    let body: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(body["code"], json!("BAD_REQUEST"));
+    let message = body["error"].as_str().unwrap_or("");
+    assert!(
+        message.contains("cwd must resolve inside the registered workspace"),
+        "{message}"
+    );
+
+    let (status, _, listed) = http(
+        hub.addr,
+        "GET",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(listed.trim())?;
+    let item = listed["items"]
+        .as_array()
+        .and_then(|items| items.first())
+        .cloned()
+        .context("listed instance")?;
+    assert_eq!(item["lifecycle"], json!("failed"), "{item}");
+    assert_eq!(item["durableSeq"], json!("0"), "{item}");
+    let last_error = item["lastError"].as_str().unwrap_or("");
+    assert!(
+        last_error.contains("cwd must resolve inside the registered workspace"),
+        "{last_error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn second_hello_on_socket_is_rejected() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
     let (_cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;

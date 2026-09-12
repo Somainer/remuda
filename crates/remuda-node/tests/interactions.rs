@@ -54,6 +54,14 @@ fn cookie_from(text: &str) -> Option<String> {
     None
 }
 
+/// D-018: a Node enrolls with a single-use enroll token, never the device
+/// pairing access code. The in-process Hub mints one directly.
+async fn enroll_token(hub: &remuda_hub::RunningHub) -> String {
+    hub.mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .expect("mint enroll token")
+}
+
 async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> String {
     let body = json!({
         "bootstrapToken": bootstrap,
@@ -80,7 +88,7 @@ async fn fake_can_use_tool_answered_via_hub_http() {
         .expect("hub");
     let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
-    let config = WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host_id);
+    let config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id);
     let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config))
         .await
         .expect("connect timeout")
@@ -268,7 +276,7 @@ async fn pty_approval_hub_cas_settlement_and_restart_do_not_replay() {
         .unwrap();
     let host = node.host().meta.id.as_id().to_string();
     let link = WssLink::connect_runtime(
-        WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host.clone()),
+        WssConfig::loopback(hub.addr, enroll_token(&hub).await, host.clone()),
         node.clone(),
     )
     .await

@@ -56,6 +56,14 @@ fn cookie_from(body_and_head: &str) -> Option<String> {
     None
 }
 
+/// D-018: a Node enrolls with a single-use enroll token, never the device
+/// pairing access code. The in-process Hub mints one directly.
+async fn enroll_token(hub: &remuda_hub::RunningHub) -> String {
+    hub.mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .expect("mint enroll token")
+}
+
 async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> (String, String) {
     let body = json!({
         "bootstrapToken": bootstrap,
@@ -87,7 +95,7 @@ async fn wss_hello_heartbeat_append_reconnect_against_hub() {
     let host_id = HostId::new();
     let mut config = WssConfig::loopback(
         hub.addr,
-        hub.bootstrap_token.clone(),
+        enroll_token(&hub).await,
         host_id.as_id().as_str().to_owned(),
     );
     config.heartbeat_interval = Duration::from_millis(50);
@@ -219,7 +227,7 @@ async fn wss_reannounce_keeps_a_single_host_row() {
     let host_id = HostId::new();
     let mut config = WssConfig::loopback(
         hub.addr,
-        hub.bootstrap_token.clone(),
+        enroll_token(&hub).await,
         host_id.as_id().as_str().to_owned(),
     );
     config.cli = json!([
@@ -285,7 +293,7 @@ async fn enrollment_file_keeps_the_same_host_id_across_hello() {
     let first = load_or_create_enrollment(&identity).expect("first identity");
     let mut config = WssConfig::loopback(
         hub.addr,
-        hub.bootstrap_token.clone(),
+        enroll_token(&hub).await,
         first.host_id.as_id().as_str().to_owned(),
     );
     let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config.clone()))
@@ -316,10 +324,8 @@ async fn enrollment_file_keeps_the_same_host_id_across_hello() {
 
     let second = load_or_create_enrollment(&identity).expect("reload identity");
     assert_eq!(second.host_id, first.host_id);
-    let token = second
-        .node_token
-        .clone()
-        .unwrap_or_else(|| hub.bootstrap_token.clone());
+    // D-018: re-announce presents the host's own stored node token.
+    let token = second.node_token.clone().expect("persisted node token");
     config.token = token;
     config.url = format!("ws://{}/v1/node", hub.addr);
     let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config))
@@ -362,7 +368,7 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
         .expect("hub");
     let node = DevNode::new(&DevServerConfig::loopback(0)).expect("dev node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
-    let mut config = WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host_id.clone());
+    let mut config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
     config.heartbeat_interval = Duration::from_millis(80);
     config.backoff = Backoff {
         initial: Duration::from_millis(5),
@@ -579,7 +585,7 @@ async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
     let node =
         DevNode::with_parts(&node_config, Arc::new(MemoryStore::new(256)), drivers).expect("node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
-    let mut config = WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host_id.clone());
+    let mut config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
     config.heartbeat_interval = Duration::from_millis(100);
     config.backoff = Backoff {
         initial: Duration::from_millis(5),
@@ -747,7 +753,7 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
     })
     .expect("compose");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
-    let mut config = WssConfig::loopback(hub.addr, hub.bootstrap_token.clone(), host_id.clone());
+    let mut config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
     config.host = Some(json!({
         "hostname": "local-development",
         "labels": { "egress": "gateway" },

@@ -57,7 +57,10 @@ fn load_spec() -> InstanceSpec {
     serde_json::from_str(include_str!("fixtures/instance-spec.json")).unwrap()
 }
 
-fn driver_for(kind: ScriptKind, spec: InstanceSpec) -> (ClaudePrintDriver, InstanceSpec, PathBuf) {
+fn driver_for(
+    kind: ScriptKind,
+    spec: InstanceSpec,
+) -> (tempfile::TempDir, ClaudePrintDriver, InstanceSpec, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let launch = tmp.path().join("launch");
     let home = tmp.path().join("home");
@@ -75,8 +78,7 @@ fn driver_for(kind: ScriptKind, spec: InstanceSpec) -> (ClaudePrintDriver, Insta
     options.handshake_timeout = Duration::from_secs(5);
     let mut spec = spec;
     spec.cwd = cwd.to_string_lossy().into_owned();
-    std::mem::forget(tmp);
-    (ClaudePrintDriver::new(options), spec, cwd)
+    (tmp, ClaudePrintDriver::new(options), spec, cwd)
 }
 
 fn prompt(text: &str) -> DriverInput {
@@ -223,7 +225,7 @@ fn refuse_bare_and_no_session_persistence() {
 #[tokio::test]
 async fn start_completes_initialize_before_user_and_keeps_stdin_open() {
     let spec = load_spec();
-    let (driver, spec, _) = driver_for(ScriptKind::Ok, spec);
+    let (_tmp, driver, spec, _) = driver_for(ScriptKind::Ok, spec);
     let mut handle = driver.start(spec).await.expect("handshake must complete");
     assert!(
         !handle
@@ -251,7 +253,7 @@ async fn start_completes_initialize_before_user_and_keeps_stdin_open() {
 #[tokio::test]
 async fn workflow_keeps_reading_after_first_result() {
     let spec = load_spec();
-    let (driver, spec, _) = driver_for(ScriptKind::Workflow, spec);
+    let (_tmp, driver, spec, _) = driver_for(ScriptKind::Workflow, spec);
     let mut handle = driver.start(spec).await.expect("start");
     driver.send(prompt("wf")).await.expect("send");
     let events = collect_until(&mut handle, Duration::from_secs(8), |obs| {
@@ -281,7 +283,7 @@ async fn workflow_keeps_reading_after_first_result() {
 async fn resume_reapplies_settings_and_model() {
     let mut spec = load_spec();
     spec.model_id = Some("haiku".into());
-    let (driver, spec, _) = driver_for(ScriptKind::Ok, spec.clone());
+    let (_tmp, driver, spec, _) = driver_for(ScriptKind::Ok, spec.clone());
     let handle = driver.start(spec.clone()).await.expect("start");
     let first_argv = handle.recipe().argv.clone();
     assert!(

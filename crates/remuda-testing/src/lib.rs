@@ -14,6 +14,7 @@ mod fake_herdr;
 mod flags;
 mod paths;
 mod script;
+mod stub;
 
 pub use bin_locator::{
     cargo_bin_exe, cargo_target_dir, ensure_workspace_bin, env_bin_override, fallback_bin_path,
@@ -31,6 +32,7 @@ pub use fake_herdr::{
 pub use flags::ClaudeFlags;
 pub use paths::{FIXED_SESSION_ID, ScriptKind, fixtures_dir, script_kind_from_name, script_path};
 pub use script::{load_script, load_script_from_env};
+pub use stub::install_executable;
 
 /// Directory containing captured Claude / Codex / grok / agy samples.
 pub fn captured_samples_dir() -> std::path::PathBuf {

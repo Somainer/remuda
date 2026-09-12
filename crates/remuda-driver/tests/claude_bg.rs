@@ -10,8 +10,8 @@ use remuda_protocol::{
     ClaudeBgRef, ContentBlock, DriverInput, InputOrigin, InstanceSpec, Knowledge, NativeRef,
     PromptInput, PromptMode, TextBlock,
 };
+use remuda_testing::install_executable;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -72,10 +72,7 @@ exit 1
 "#;
 
 fn stub_claude(dir: &Path) -> PathBuf {
-    let path = dir.join("claude");
-    fs::write(&path, STUB).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    install_executable(dir, "claude", STUB)
 }
 
 fn profile() -> ProviderProfile {

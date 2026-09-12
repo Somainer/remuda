@@ -12,10 +12,9 @@ use remuda_protocol::{
     ContentBlock, DriverInput, InputOrigin, InstanceSpec, Knowledge, NativeRef, ObservationPayload,
     PermissionMode, PromptInput, PromptMode, TextBlock,
 };
-use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin};
+use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin, install_executable};
 use serde_json::json;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,10 +23,7 @@ fn ensure_fake_herdr_bin() -> PathBuf {
 }
 
 fn stub_claude(dir: &Path) -> PathBuf {
-    let path = dir.join("claude");
-    fs::write(&path, "#!/bin/sh\necho '2.1.268 (Claude Code)'\n").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    install_executable(dir, "claude", "#!/bin/sh\necho '2.1.268 (Claude Code)'\n")
 }
 
 const BG_STUB: &str = r#"#!/bin/sh
@@ -80,10 +76,7 @@ exit 1
 "#;
 
 fn stub_bg_claude(dir: &Path) -> PathBuf {
-    let path = dir.join("claude");
-    fs::write(&path, BG_STUB).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    install_executable(dir, "claude", BG_STUB)
 }
 
 fn profile() -> ProviderProfile {
@@ -647,4 +640,5 @@ async fn bg_attach_before_dispatch_would_wake() {
         .await
         .expect_err("undispatched attach");
     assert!(matches!(err, DriverError::AttachWouldWake));
+    driver.close().await.expect("close undispatched");
 }

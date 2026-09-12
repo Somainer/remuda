@@ -6,7 +6,9 @@
 
 mod binary;
 mod capabilities;
+pub mod claude_bg;
 pub mod claude_print;
+pub mod claude_pty;
 mod driver;
 mod error;
 mod flags;
@@ -20,6 +22,8 @@ mod recipe;
 mod fake;
 
 pub use binary::{BinaryPin, default_command, pin_binary, resolve_binary};
+pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
+pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
 pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
 };

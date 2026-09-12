@@ -18,6 +18,7 @@ test-stub = []
 [dependencies]
 async-trait = "0.1"
 remuda-claude-wire.workspace = true
+remuda-herdr.workspace = true
 remuda-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

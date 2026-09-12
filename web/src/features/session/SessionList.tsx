@@ -1,5 +1,8 @@
+import { useEffect, useState, type FormEvent, type MouseEvent } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
-import type { Instance, UiStatus } from "../../types/instance";
+import type { Id } from "../../types/wire";
+import type { Instance, Kind, UiStatus } from "../../types/instance";
+import { knowledgeValue } from "../../types/command";
 import { StateDot } from "../../components/StateDot";
 import { formatListTime, shortId } from "../../lib/format";
 import { nativeShort, projectStatus, uiMode } from "../../lib/status";
@@ -30,6 +33,18 @@ function exitLabel(instance: Instance): string | null {
   if (instance.exit.state !== "known") return null;
   const code = instance.exit.value.code;
   return code == null ? "exit" : `exit ${code}`;
+}
+
+function kindClass(kind: Kind): string {
+  if (kind === "codex") return css.kindCodex;
+  if (kind === "grok") return css.kindGrok;
+  if (kind === "agy") return css.kindAgy;
+  return css.kindClaude;
+}
+
+function stopRow(event: MouseEvent | FormEvent) {
+  event.preventDefault();
+  event.stopPropagation();
 }
 
 function pendingBadge(kind: string | undefined, title: string | undefined, fields: number | undefined): string | null {
@@ -65,6 +80,21 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
 
   const filterCount = [hostFilter, workspaceFilter, kindFilter, statusFilter].filter((f) => f.length).length;
   const share = params.toString();
+  const live = hub.connection === "live";
+  const [selected, setSelected] = useState<string[]>([]);
+  const [broadcast, setBroadcast] = useState("");
+  const ptyKey = source
+    .filter((instance) => uiMode(instance) === "tty-attachable")
+    .map((instance) => instance.id)
+    .join(",");
+
+  useEffect(() => {
+    if (variant !== "full" || !ptyKey) return;
+    const ids = ptyKey.split(",") as Id[];
+    void hubStore.refreshScreens(ids);
+    const timer = window.setInterval(() => void hubStore.refreshScreens(ids), 2500);
+    return () => window.clearInterval(timer);
+  }, [variant, ptyKey]);
 
   if (hub.hosts.length === 0) {
     return (
@@ -80,8 +110,6 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
       </p>
     );
   }
-
-  const live = hub.connection === "live";
 
   if (variant === "compact") {
     return (
@@ -211,6 +239,28 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
           ))}
           {share ? <span className={css.share}>?{share} · 可分享</span> : null}
         </div>
+        {selected.length ? (
+          <form
+            className={css.fleet}
+            data-testid="board-fleet"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void hubStore.broadcast(selected as Id[], broadcast).then(() => setBroadcast(""));
+            }}
+          >
+            <span className={css.fleetCount}>{selected.length} 已选</span>
+            <input
+              className={css.fleetInput}
+              data-testid="board-broadcast"
+              placeholder="群发文本…"
+              value={broadcast}
+              onChange={(event) => setBroadcast(event.target.value)}
+            />
+            <button type="submit" className={css.fleetSend} data-testid="board-broadcast-send" disabled={!broadcast.trim()}>
+              群发
+            </button>
+          </form>
+        ) : null}
       </div>
       {GROUPS.map((group) => {
         const items = filtered.filter((i) => group.match(projectStatus(i)));
@@ -238,44 +288,69 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
               const tty = uiMode(instance) === "tty-attachable";
               const compactRecent = status === "idle" || status === "exited" || status === "unknown";
               const title = hubStore.titleOf(instance.id);
+              const activity = knowledgeValue(instance.activity) ?? "—";
+              const screen = hub.screens[instance.id];
+              const checked = selected.includes(instance.id);
+              const worktree = workspace?.worktreeLabel ?? workspace?.label;
+              const branch = workspace?.branch;
               return (
-                <Link
+                <article
                   key={instance.id}
-                  to={to}
                   className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""} ${compactRecent ? css.rowIdle : ""}`}
-                  data-testid="session-row"
+                  data-testid="board-card"
                   data-status={status}
+                  data-kind={instance.kind}
                 >
-                  <StateDot status={status} />
-                  <span className={`${css.body} ${compactRecent ? css.bodyIdle : ""}`}>
-                    {compactRecent ? (
-                      <div className={css.idleMeta}>
-                        <span>{status}</span>
-                        <span className={css.sep}> | </span>
-                        <span className={status === "unknown" ? undefined : css.metaHost}>{hubStore.hostName(instance.hostId)}</span>
-                        {" / "}
-                        {workspace?.label} · {instance.driver}
-                      </div>
-                    ) : (
-                      <div className={css.meta}>
-                        <span>{status}</span>
-                        <span className={css.sep}>|</span>
-                        <span className={css.metaHost}>{hubStore.hostName(instance.hostId)}</span>
-                        <span>/ {workspace?.label}</span>
-                        <span>· {instance.driver}</span>
-                        <span className={css.sep}>|</span>
-                        <span>{shortId(instance.id, 8)}</span>
-                        {status === "working" ? <span>· {formatListTime(instance.updatedAt)}</span> : null}
-                      </div>
-                    )}
+                  <label className={css.check}>
+                    <input
+                      type="checkbox"
+                      data-testid="board-select"
+                      checked={checked}
+                      onChange={() => {
+                        setSelected((cur) => (cur.includes(instance.id) ? cur.filter((id) => id !== instance.id) : [...cur, instance.id]));
+                      }}
+                    />
+                  </label>
+                  <Link
+                    to={to}
+                    className={`${css.body} ${compactRecent ? css.bodyIdle : ""}`}
+                    data-testid="session-row"
+                    data-status={status}
+                    data-kind={instance.kind}
+                  >
+                    <div className={css.meta}>
+                      <span>{instance.lifecycle}</span>
+                      <span className={css.sep}>·</span>
+                      <span>{activity}</span>
+                      <span className={css.sep}>·</span>
+                      <span>{instance.connectivity}</span>
+                      <span className={css.sep}>|</span>
+                      <span className={css.metaHost}>{hubStore.hostName(instance.hostId)}</span>
+                      <span>/ {worktree}</span>
+                      {branch ? <span className={css.branch}>{branch}</span> : null}
+                      <span>· {instance.driver}</span>
+                      <span className={css.sep}>|</span>
+                      <span>{shortId(instance.id, 8)}</span>
+                    </div>
                     <div className={css.headline}>
+                      <StateDot status={status} />
                       <div className={`${css.name} ${status === "starting" || status === "exited" || status === "unknown" ? css.nameMute : ""}`}>
                         {title}
                       </div>
+                      <span className={`${css.kind} ${kindClass(instance.kind)}`}>{instance.kind}</span>
+                      {screen?.done ? (
+                        <span className={css.done} data-testid="board-done">
+                          DONE
+                        </span>
+                      ) : null}
                       {badge ? <div className={css.badge}>{badge}</div> : null}
                       {exitLabel(instance) ? <div className={css.exit}>{exitLabel(instance)}</div> : null}
                     </div>
-                    {status === "starting" ? (
+                    {tty && screen?.lines.length ? (
+                      <pre className={css.snippet} data-testid="board-snippet">
+                        {screen.lines.join("\n")}
+                      </pre>
+                    ) : status === "starting" ? (
                       <div className={css.cmd}>正在拉起 · lifecycle={instance.lifecycle}</div>
                     ) : status === "blocked" && pending?.request.kind === "approval" ? (
                       <div className={css.cmd}>{pending.request.description}</div>
@@ -286,17 +361,71 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
                     ) : status === "unknown" ? (
                       <div className={css.cmd}>connectivity={instance.connectivity} · 不推断成功或结束</div>
                     ) : null}
-                  </span>
-                  <div className={css.side}>
+                  </Link>
+                  <form
+                    className={css.actions}
+                    onSubmit={(event) => {
+                      stopRow(event);
+                      const form = event.currentTarget;
+                      const input = form.elements.namedItem("prompt") as HTMLInputElement | null;
+                      const text = input?.value.trim() ?? "";
+                      if (text) {
+                        void hubStore.send(instance.id, text);
+                        if (input) input.value = "";
+                      }
+                    }}
+                  >
+                    <input
+                      className={css.actionInput}
+                      name="prompt"
+                      data-testid="board-prompt"
+                      placeholder="send…"
+                      onClick={(event) => event.stopPropagation()}
+                    />
+                    <button type="submit" className={css.actionBtn} data-testid="board-send">
+                      发送
+                    </button>
+                    <button
+                      type="button"
+                      className={css.actionBtn}
+                      data-testid="board-key-enter"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void hubStore.sendKeys(instance.id, "enter");
+                      }}
+                    >
+                      enter
+                    </button>
+                    <button
+                      type="button"
+                      className={css.actionBtn}
+                      data-testid="board-key-esc"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void hubStore.sendKeys(instance.id, "esc");
+                      }}
+                    >
+                      esc
+                    </button>
+                    <button
+                      type="button"
+                      className={css.actionBtn}
+                      data-testid="board-stop"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void hubStore.close(instance.id);
+                      }}
+                    >
+                      stop
+                    </button>
                     {tty ? (
                       <span className={css.tty} title={nativeShort(instance)}>
                         终端
                       </span>
                     ) : null}
-                    {status === "blocked" ? <span className={css.unread} /> : null}
                     <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt)}</span>
-                  </div>
-                </Link>
+                  </form>
+                </article>
               );
             })}
           </section>

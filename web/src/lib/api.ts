@@ -15,6 +15,7 @@ import {
   mockDeviceList,
   mockDeviceRevoke,
   mockHostName,
+  mockKeys,
   mockLogin,
   mockPage,
   mockPairCode,
@@ -22,11 +23,13 @@ import {
   mockReadJournal,
   mockRespond,
   mockResume,
+  mockScreenRead,
   mockSend,
   mockSnapshot,
   mockWorkspaceLabel,
 } from "./mock";
 import { digestPlaceholder, id, now } from "./ids";
+import { parseScreenBody, type ScreenRead } from "./screen";
 import { accessHeaders, readAccessCode, writeAccessCode } from "./accessCode";
 import { HubHttpError } from "./httpError";
 import { readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
@@ -222,6 +225,8 @@ export type HubApi = {
   instanceGet(instanceId: Id): Promise<Instance>;
   instanceCreate(spec: InstanceCreateSpec): Promise<{ command: CommandResult["command"]; instance: Instance }>;
   instanceSend(instanceId: Id, prompt: string): Promise<CommandResult>;
+  instanceKeys(instanceId: Id, key: "enter" | "esc"): Promise<CommandResult>;
+  screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
   instanceResume(instanceId: Id): Promise<CommandResult>;
   instanceConfigure(instanceId: Id, permissionMode: string): Promise<CommandResult>;
@@ -377,6 +382,12 @@ function createMockApi(): HubApi {
     },
     async instanceSend(instanceId, prompt) {
       return mockSend(instanceId, prompt);
+    },
+    async instanceKeys(instanceId, key) {
+      return mockKeys(instanceId, key);
+    },
+    async screenRead(instanceId, lines = 3) {
+      return mockScreenRead(instanceId, lines);
     },
     async instanceClose(instanceId) {
       return mockClose(instanceId);
@@ -580,6 +591,17 @@ function createLiveApi(): HubApi {
     },
     async instanceSend(instanceId, prompt) {
       return command(instanceId, "instance.send", { prompt });
+    },
+    async instanceKeys(instanceId, key) {
+      return command(instanceId, "tty.write", { keys: key });
+    },
+    async screenRead(instanceId, lines = 3) {
+      try {
+        const body = await rest<unknown>(`/v1/instances/${instanceId}/screen?lines=${lines}`);
+        return parseScreenBody(body);
+      } catch {
+        return { lines: [] };
+      }
     },
     async instanceClose(instanceId) {
       return command(instanceId, "instance.close", {});

@@ -6,4 +6,6 @@ export type Workspace = EntityMeta & {
   rootPath: string;
   writePolicy: string;
   canonicalRoot: Knowledge<string>;
+  worktreeLabel?: string;
+  branch?: string;
 };

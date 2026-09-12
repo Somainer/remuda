@@ -1,6 +1,6 @@
 import claudeInit from "../fixtures/claude-p-init.json" with { type: "json" };
 import type { Command, CommandResult, Page } from "../types/command";
-import type { Host, Instance } from "../types/instance";
+import type { Host, Instance, Kind } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type {
   EventsBatch,
@@ -12,7 +12,8 @@ import type {
 } from "../types/observation";
 import type { Workspace } from "../types/workspace";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
-import { printCapabilities } from "./capabilities";
+import { printCapabilities, ptyCapabilities } from "./capabilities";
+import type { DriverKind } from "../types/nativeRef";
 import { HubHttpError } from "./httpError";
 import { digestPlaceholder, id, now } from "./ids";
 import { MOCK_BOOTSTRAP_TOKEN, type DeviceSession, type PairCode, type PairedDevice } from "./session";
@@ -747,6 +748,97 @@ summaries.set(insGap, "mock gap backfill");
 summaries.set(insStale, "mock fill fail");
 summaries.set(insLong, `${LONG_EVENT_COUNT} events`);
 
+const screens = new Map<Id, string[]>();
+
+function addWorktree(label: string, branch: string, path: string) {
+  const wsp = id("wsp_");
+  workspaces.push({
+    ...meta(wsp),
+    hostId,
+    label,
+    rootPath: path,
+    writePolicy: "isolated-worktree",
+    canonicalRoot: known(path),
+    worktreeLabel: label,
+    branch,
+  });
+  return wsp;
+}
+
+function addPty(kind: Kind, driver: DriverKind, name: string, activity: Instance["activity"], workspace: Id, lines: string[]) {
+  const journalId = id("obj_");
+  const ins = instanceBase(id("ins_"), journalId, "ready", activity);
+  ins.kind = kind;
+  ins.driver = driver;
+  ins.workspaceId = workspace;
+  ins.nativeRef = { ...ins.nativeRef, kind };
+  ins.capabilities = ptyCapabilities(driver);
+  if (activity.state === "known" && activity.value === "idle") ins.activeRunIds = [];
+  instances.push(ins);
+  titles.set(ins.id, name);
+  journals.set(journalId, []);
+  screens.set(ins.id, lines);
+  return ins.id;
+}
+
+const wspCodex = addWorktree("codex-worker", "wt/x-codexdrv/wire-review", "/Users/dev/Documents/Projects/Community/remuda-wt/x-codexdrv");
+const wspGrok = addWorktree("grok-canary", "wt/x-acpwire/canary", "/Users/dev/Documents/Projects/Community/remuda-wt/x-acpwire");
+const wspAgy = addWorktree("agy-board", "wt/x-design/agent-board", "/Users/dev/Documents/Projects/Community/remuda-wt/x-design2");
+const wspClaudePty = addWorktree("claude-pty", "wt/x-tty/push-ui", "/Users/dev/Documents/Projects/Community/remuda-wt/x-tty");
+
+export const mockBoardIds = {
+  insCodexPty: addPty("codex", "generic-pty", "codex-worker", known("working"), wspCodex, [
+    "reviewing hubnode hello",
+    "cargo test -p remuda-hub",
+    "waiting on clippy",
+  ]),
+  insGrokPty: addPty("grok", "generic-pty", "grok-canary", known("idle"), wspGrok, [
+    "rebase onto main",
+    "cargo check --workspace --locked",
+    "DONE 8d3144d7ada59b21166f35d4e84f6676970aa3ad",
+  ]),
+  insAgyPty: addPty("agy", "generic-pty", "agy-board", known("working"), wspAgy, [
+    "reading dogfood.md",
+    "sketching agent board",
+    "kind badge + screen snippet",
+  ]),
+  insClaudePty: addPty("claude", "claude-pty", "claude-pty", known("working"), wspClaudePty, [
+    "attached tty",
+    "waiting for send-keys",
+    "ready",
+  ]),
+};
+
+export function mockScreenRead(instanceId: Id, n = 3): { lines: string[] } {
+  const lines = screens.get(instanceId) ?? [];
+  return { lines: lines.filter((line) => line.length > 0).slice(-n) };
+}
+
+export function mockKeys(instanceId: Id, key: "enter" | "esc"): CommandResult {
+  const inst = instances.find((i) => i.id === instanceId);
+  if (!inst) throw new Error("INSTANCE_NOT_FOUND");
+  const lines = screens.get(instanceId) ?? [];
+  lines.push(key === "enter" ? "^ENTER" : "^ESC");
+  screens.set(instanceId, lines);
+  inst.updatedAt = now();
+  const commandId = id("cmd_");
+  return {
+    command: {
+      ...meta(commandId),
+      commandId,
+      actor: { principalId: id("prn_"), type: "human", deviceId: id("dev_"), instanceId },
+      origin: "ui",
+      operation: "tty.write",
+      target: { hostId: inst.hostId, instanceId, runId: null },
+      payloadDigest: digestPlaceholder(),
+      state: "accepted",
+      dispatch: "intent-durable",
+      resolution: "clear",
+    },
+    relatedCommandIds: [],
+  };
+}
+
 function ensureLongJournal() {
   const cur = journals.get(journalLong);
   if (cur && cur.length >= LONG_EVENT_COUNT) return;
@@ -894,6 +986,11 @@ export function mockSend(instanceId: Id, prompt: string): CommandResult {
   journals.set(inst.journalId, events);
   inst.activity = known("working");
   inst.updatedAt = now();
+  const screen = screens.get(instanceId);
+  if (screen) {
+    screen.push(prompt);
+    screens.set(instanceId, screen);
+  }
   if (!titles.get(instanceId)) titles.set(instanceId, prompt.slice(0, 80) || "新会话");
   const commandId = id("cmd_");
   const command: Command = {

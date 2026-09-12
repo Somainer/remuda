@@ -442,6 +442,15 @@ export interface components {
             fleetId?: string;
             instanceIds?: string[];
         };
+        HostCli: {
+            /** @enum {string} */
+            auth?: "logged_in" | "logged_out" | "unknown";
+            kind: string;
+            path?: string | null;
+            version?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
         HostPage: {
             items: components["schemas"]["HostView"][];
             nextCursor?: string | null;
@@ -452,12 +461,14 @@ export interface components {
             name?: string;
         };
         HostView: {
-            cli?: {
+            capabilities?: {
                 [key: string]: unknown;
-            }[];
+            };
+            cli?: components["schemas"]["HostCli"][];
             herdr?: {
                 [key: string]: unknown;
             } | null;
+            /** @description Stable Node identity (`hst_…`). */
             hostId: string;
             hostname?: string | null;
             id?: string;
@@ -467,6 +478,7 @@ export interface components {
             lastSeenAt?: string | null;
             maxInstances?: number;
             name?: string;
+            nodeVersion?: string | null;
             online: boolean;
             resources?: {
                 [key: string]: unknown;

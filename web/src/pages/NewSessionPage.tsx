@@ -14,6 +14,7 @@ import {
 } from "../lib/sessionOptions";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
+import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst } from "../features/hosts";
 import css from "./NewSessionPage.module.css";
 
 type CreateKind = Exclude<Kind, "generic">;
@@ -53,9 +54,18 @@ export function NewSessionPage() {
     promptRef.current?.focus();
   }, []);
 
+  const pickerHosts = sortHostsOnlineFirst(
+    hub.hosts.filter((h) => !isStaleOffline(h)),
+    prefs.recentHostIds,
+  );
+
   useEffect(() => {
-    if (!hostId && hub.hosts[0]) setHostId(prefs.hostId || hub.hosts[0].id);
-  }, [hub.hosts, hostId, prefs.hostId]);
+    if (!pickerHosts.length) return;
+    if (!hostId || !pickerHosts.some((h) => h.id === hostId)) {
+      const preferred = pickerHosts.find((h) => h.id === prefs.hostId);
+      setHostId(preferred?.id || pickerHosts[0].id);
+    }
+  }, [pickerHosts, hostId, prefs.hostId]);
 
   useEffect(() => {
     const list = hub.workspaces.filter((w) => !hostId || w.hostId === hostId);
@@ -69,8 +79,14 @@ export function NewSessionPage() {
   const workspace = hostWorkspaces.find((w) => w.id === workspaceId) ?? hostWorkspaces[0];
   const driver: DriverKind = mobile || !wantTty ? "claude-print" : "claude-pty";
   const canStart = Boolean(hostId && workspace?.id && !offline && !busy);
-  const hosts = sortRecent(hub.hosts, prefs.recentHostIds);
+  const hosts = pickerHosts;
   const workspaces = sortRecent(hostWorkspaces, prefs.recentWorkspaceIds);
+  const hostCli = cliSummary(host?.cli);
+  const supportedKinds = installedCli(host?.cli).map((entry) => entry.kind);
+  const kindEnabled = (id: CreateKind) => (supportedKinds.length ? supportedKinds.includes(id) : id === "claude");
+  const activeKind: CreateKind = kindEnabled(kind)
+    ? kind
+    : (KINDS.find((item) => kindEnabled(item.id))?.id ?? "claude");
   const close = () => navigate("/sessions");
 
   return (
@@ -88,7 +104,7 @@ export function NewSessionPage() {
             .create({
               hostId,
               workspaceId: workspace.id,
-              kind,
+              kind: activeKind,
               driver,
               model,
               providerProfileId: providerProfileForDelegation(delegation),
@@ -150,11 +166,15 @@ export function NewSessionPage() {
                   {hosts.map((h) => (
                     <option key={h.id} value={h.id}>
                       {h.label} · {h.state}
+                      {cliSummary(h.cli) ? ` · ${cliSummary(h.cli)}` : ""}
                     </option>
                   ))}
                 </select>
               </div>
-              <span className={css.hint}>{host?.state === "online" ? "在线" : host?.state} · claude 2.1.268</span>
+              <span className={css.hint}>
+                {host?.state === "online" || host?.online ? "在线" : host?.state}
+                {hostCli ? ` · ${hostCli}` : ""}
+              </span>
             </label>
             <label className={css.field}>
               <span className={css.label}>项目 · Workspace</span>
@@ -189,9 +209,9 @@ export function NewSessionPage() {
                   <button
                     key={k.id}
                     type="button"
-                    className={`${css.choice} ${kind === k.id ? css.choiceOn : ""} ${k.enabled ? "" : css.choiceDisabled}`}
-                    disabled={!k.enabled}
-                    onClick={() => k.enabled && setKind(k.id)}
+                    className={`${css.choice} ${activeKind === k.id ? css.choiceOn : ""} ${kindEnabled(k.id) ? "" : css.choiceDisabled}`}
+                    disabled={!kindEnabled(k.id)}
+                    onClick={() => kindEnabled(k.id) && setKind(k.id)}
                   >
                     {k.label}
                   </button>

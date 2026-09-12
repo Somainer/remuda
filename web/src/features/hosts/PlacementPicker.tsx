@@ -1,6 +1,6 @@
 import type { Id } from "../../types/wire";
 import ui from "../../styles/ui.module.css";
-import { hostsMatching, type HostView, type Placement } from "./model";
+import { hostsMatching, sortHostsOnlineFirst, type HostView, type Placement } from "./model";
 
 /** New-session placement control. Import this instead of editing NewSessionPage. */
 export function PlacementPicker({
@@ -12,8 +12,9 @@ export function PlacementPicker({
   value: Placement;
   onChange: (next: Placement) => void;
 }) {
-  const labels = [...new Set(hosts.flatMap((h) => h.labels))].sort();
-  const matched = hostsMatching(hosts, value);
+  const ordered = sortHostsOnlineFirst(hosts);
+  const labels = [...new Set(ordered.flatMap((h) => h.labels))].sort();
+  const matched = hostsMatching(ordered, value);
   const selectedLabels = value.kind === "labels" ? value.labels : [];
 
   return (
@@ -33,7 +34,7 @@ export function PlacementPicker({
             className={`${ui.chip} ${value.kind === kind ? ui.chipOn : ""}`}
             data-testid={`placement-kind-${kind}`}
             onClick={() => {
-              if (kind === "host") onChange({ kind: "host", hostId: (value.kind === "host" ? value.hostId : hosts[0]?.id) ?? ("" as Id) });
+              if (kind === "host") onChange({ kind: "host", hostId: (value.kind === "host" ? value.hostId : ordered[0]?.id) ?? ("" as Id) });
               else if (kind === "labels") onChange({ kind: "labels", labels: selectedLabels });
               else onChange({ kind: "any" });
             }}
@@ -51,7 +52,7 @@ export function PlacementPicker({
             value={value.hostId}
             onChange={(e) => onChange({ kind: "host", hostId: e.target.value as Id })}
           >
-            {hosts.map((host) => (
+            {ordered.map((host) => (
               <option key={host.id} value={host.id}>
                 {host.label} · {host.state} · {host.transport}
               </option>

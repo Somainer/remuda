@@ -4,6 +4,7 @@ use crate::config::{new_id, now_rfc3339};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::thread;
 use thiserror::Error;
@@ -368,15 +369,7 @@ impl Store {
             for row in rows {
                 let (id, hash) = row?;
                 if verify(&request.presented, &hash) {
-                    let now = now_rfc3339();
-                    conn.execute(
-                        "UPDATE hosts SET state = 'online', last_seen_at = ?1, node_version = COALESCE(?2, node_version)
-                         WHERE id = ?3",
-                        params![now, request.node_version, id],
-                    )?;
-                    let host = load_host(conn, &id)?.ok_or_else(|| {
-                        StoreError::Id("host vanished after auth".into())
-                    })?;
+                    let host = touch_host_online(conn, &id, &request.node_version)?;
                     return Ok(HostAuthOutcome::Authenticated {
                         host: Box::new(host),
                         node_token: None,
@@ -391,9 +384,11 @@ impl Store {
                 None => new_id("hst").map_err(|e| StoreError::Id(e.to_string()))?,
             };
             if load_host(conn, &host_id)?.is_some() {
-                return Err(StoreError::Id(
-                    "host already enrolled; present the host token".into(),
-                ));
+                let host = touch_host_online(conn, &host_id, &request.node_version)?;
+                return Ok(HostAuthOutcome::Authenticated {
+                    host: Box::new(host),
+                    node_token: None,
+                });
             }
             let node_token = crate::config::random_token();
             let token_hash = hash_new(&node_token)?;
@@ -1310,6 +1305,7 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     )?;
     ensure_column(&conn, "hosts", "hostname", "TEXT")?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
+    dedup_duplicate_hosts(&conn)?;
     Ok(conn)
 }
 
@@ -1605,6 +1601,200 @@ mod tests {
             .expect("instance row");
         assert_eq!(online.connectivity, "connected");
     }
+
+    #[tokio::test]
+    async fn bootstrap_reannounce_updates_the_same_host() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host_id = new_id("hst").expect("host id");
+        let first = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: "bootstrap".into(),
+                    bootstrap: "bootstrap".into(),
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("local-development".into()),
+                    node_version: Some("1".into()),
+                },
+                |_, _| false,
+                |_| Ok("hash-1".into()),
+            )
+            .await
+            .expect("first enroll");
+        let HostAuthOutcome::Authenticated {
+            host,
+            node_token: Some(_),
+        } = first
+        else {
+            panic!("first enroll must insert a host token");
+        };
+        assert_eq!(host.host_id, host_id);
+        let second = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: "bootstrap".into(),
+                    bootstrap: "bootstrap".into(),
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("local-development".into()),
+                    node_version: Some("2".into()),
+                },
+                |_, _| false,
+                |_| Ok("hash-2".into()),
+            )
+            .await
+            .expect("reannounce");
+        let HostAuthOutcome::Authenticated {
+            host,
+            node_token: None,
+        } = second
+        else {
+            panic!("reannounce must update without inserting");
+        };
+        assert_eq!(host.host_id, host_id);
+        assert_eq!(host.node_version.as_deref(), Some("2"));
+        assert!(host.online);
+        let listed = store.list_hosts().await.expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn duplicate_label_hosts_merge_on_reopen() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let host_a = new_id("hst").expect("a");
+        let host_b = new_id("hst").expect("b");
+        {
+            let store = Store::open(dir.path()).expect("store");
+            enroll_labeled(&store, host_a.clone(), "dup-node").await;
+            enroll_labeled(&store, host_b.clone(), "dup-node").await;
+            store
+                .insert_instance(
+                    host_a.clone(),
+                    None,
+                    "claude".into(),
+                    "claude-print".into(),
+                    Some("kept".into()),
+                    json!({}),
+                )
+                .await
+                .expect("instance");
+            let listed = store.list_hosts().await.expect("list");
+            assert_eq!(listed.len(), 2);
+        }
+        let store = Store::open(dir.path()).expect("reopen");
+        let listed = store.list_hosts().await.expect("deduped");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].label, "dup-node");
+        assert_eq!(listed[0].instance_count, 1);
+        let instances = store.list_instances(None).await.expect("instances");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].host_id, listed[0].host_id);
+    }
+
+    async fn enroll_labeled(store: &Store, host_id: String, label: &str) {
+        let outcome = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: "bootstrap".into(),
+                    bootstrap: "bootstrap".into(),
+                    hello_host_id: Some(host_id),
+                    label: Some(label.to_owned()),
+                    node_version: Some("test".into()),
+                },
+                |_, _| false,
+                |secret| Ok(format!("hash-{secret}")),
+            )
+            .await
+            .expect("enroll");
+        assert!(matches!(outcome, HostAuthOutcome::Authenticated { .. }));
+    }
+}
+
+fn touch_host_online(
+    conn: &Connection,
+    host_id: &str,
+    node_version: &Option<String>,
+) -> Result<HostRecord, StoreError> {
+    let now = now_rfc3339();
+    conn.execute(
+        "UPDATE hosts SET state = 'online', last_seen_at = ?1, node_version = COALESCE(?2, node_version)
+         WHERE id = ?3",
+        params![now, node_version, host_id],
+    )?;
+    load_host(conn, host_id)?.ok_or_else(|| StoreError::Id("host vanished after auth".into()))
+}
+
+struct HostDedupRow {
+    id: String,
+    state: String,
+    last_seen: String,
+    created: String,
+}
+
+fn dedup_duplicate_hosts(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, label, IFNULL(hostname, ''), state, IFNULL(last_seen_at, ''), created_at
+         FROM hosts",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    let mut groups: BTreeMap<(String, String), Vec<HostDedupRow>> = BTreeMap::new();
+    for row in rows {
+        let (id, label, hostname, state, last_seen, created) = row?;
+        groups
+            .entry((label, hostname))
+            .or_default()
+            .push(HostDedupRow {
+                id,
+                state,
+                last_seen,
+                created,
+            });
+    }
+    drop(stmt);
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let mut members = members;
+        members.sort_by(|a, b| {
+            let a_online = a.state == "online";
+            let b_online = b.state == "online";
+            b_online
+                .cmp(&a_online)
+                .then(b.last_seen.cmp(&a.last_seen))
+                .then(b.created.cmp(&a.created))
+                .then(a.id.cmp(&b.id))
+        });
+        let survivor = members[0].id.clone();
+        for row in members.into_iter().skip(1) {
+            conn.execute(
+                "UPDATE instances SET host_id = ?1 WHERE host_id = ?2",
+                params![&survivor, &row.id],
+            )?;
+            conn.execute(
+                "UPDATE commands SET host_id = ?1 WHERE host_id = ?2",
+                params![&survivor, &row.id],
+            )?;
+            conn.execute(
+                "UPDATE fleet_members SET host_id = ?1 WHERE host_id = ?2",
+                params![&survivor, &row.id],
+            )?;
+            conn.execute(
+                "UPDATE interactions SET host_id = ?1 WHERE host_id = ?2",
+                params![&survivor, &row.id],
+            )?;
+            conn.execute("DELETE FROM hosts WHERE id = ?1", params![&row.id])?;
+        }
+    }
+    Ok(())
 }
 
 fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreError> {

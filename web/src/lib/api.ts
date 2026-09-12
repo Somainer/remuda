@@ -1,5 +1,5 @@
 import type { Command, CommandResult, Page } from "../types/command";
-import type { Host, Instance } from "../types/instance";
+import type { Host, HostCli, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
@@ -92,10 +92,23 @@ function mapLifecycle(raw: string): Instance["lifecycle"] {
   return LIFECYCLES.find((s) => s === raw) ?? "unknown";
 }
 
+function mapHostCli(raw: { kind?: unknown; version?: unknown; path?: unknown; auth?: unknown }): HostCli {
+  const auth = raw.auth === "logged_in" || raw.auth === "logged_out" || raw.auth === "unknown" ? raw.auth : "unknown";
+  return {
+    kind: typeof raw.kind === "string" ? raw.kind : "unknown",
+    version: typeof raw.version === "string" ? raw.version : undefined,
+    path: typeof raw.path === "string" ? raw.path : undefined,
+    auth,
+  };
+}
+
 function mapHost(h: components["schemas"]["HostView"]): Host {
   const id = (h.id ?? h.hostId) as Id;
   const state = HOST_STATES.find((s) => s === h.state) ?? (h.online ? "online" : "offline");
   const transport = h.transport === "ssh-dev" || h.transport === "ssh-stdio" ? "ssh-dev" : "outbound-wss";
+  const cli = Array.isArray(h.cli) ? h.cli.map(mapHostCli) : [];
+  const resources = h.resources && typeof h.resources === "object" ? h.resources : undefined;
+  const herdr = h.herdr && typeof h.herdr === "object" ? h.herdr : undefined;
   return {
     id,
     revision: "1",
@@ -106,6 +119,26 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
     state,
     transport: { mode: transport, endpointRef: id },
     hostname: h.hostname ?? undefined,
+    lastSeenAt: h.lastSeenAt ?? undefined,
+    cli,
+    labels: h.labels ?? [],
+    maxInstances: h.maxInstances ?? 8,
+    resources: resources
+      ? {
+          cpuPct: typeof resources.cpuPct === "number" ? resources.cpuPct : undefined,
+          memPct: typeof resources.memPct === "number" ? resources.memPct : undefined,
+        }
+      : undefined,
+    herdr: herdr
+      ? {
+          version: typeof herdr.version === "string" ? herdr.version : undefined,
+          socket: typeof herdr.socket === "string" ? herdr.socket : undefined,
+          path: typeof herdr.path === "string" ? herdr.path : undefined,
+        }
+      : undefined,
+    nodeVersion: "nodeVersion" in h && typeof h.nodeVersion === "string" ? h.nodeVersion : undefined,
+    instanceCount: h.instanceCount ?? 0,
+    online: h.online,
   };
 }
 

@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { HOST_FIXTURES } from "./fixtures";
-import { carrierOf, hostsMatching, type Placement } from "./model";
+import {
+  STALE_OFFLINE_MS,
+  carrierOf,
+  cliSummary,
+  compactCliVersion,
+  hostsMatching,
+  isStaleOffline,
+  sortHostsOnlineFirst,
+  type Placement,
+} from "./model";
 
 describe("host placement and carriers", () => {
   it("maps ssh-dev/ssh-tunnel onto ssh-stdio", () => {
@@ -27,5 +36,20 @@ describe("host placement and carriers", () => {
     expect(hostsMatching(HOST_FIXTURES, labels).every((h) => h.labels.includes("region:sg"))).toBe(true);
     expect(hostsMatching(HOST_FIXTURES, { kind: "any" }).every((h) => h.online)).toBe(true);
     expect(hostsMatching(HOST_FIXTURES, { kind: "labels", labels: ["no-such-label"] })).toEqual([]);
+  });
+
+  it("sorts online hosts first and hides stale offline", () => {
+    const now = Date.parse("2026-09-13T12:00:00.000Z");
+    const ordered = sortHostsOnlineFirst(HOST_FIXTURES);
+    expect(ordered[0]?.online).toBe(true);
+    expect(ordered.find((h) => h.label === "forge-doloris")?.online).toBe(false);
+    const stale = HOST_FIXTURES.find((h) => h.label === "forge-doloris")!;
+    expect(isStaleOffline(stale, now)).toBe(true);
+    expect(isStaleOffline(stale, Date.parse(stale.lastSeenAt!) + STALE_OFFLINE_MS - 1)).toBe(false);
+    expect(cliSummary(HOST_FIXTURES[0]?.cli)).toContain("claude");
+    expect(cliSummary(HOST_FIXTURES[0]?.cli)).toContain("grok");
+    expect(compactCliVersion("claude", "2.1.269 (Claude Code)")).toBe("claude 2.1.269");
+    expect(compactCliVersion("codex", "codex-cli 0.154.0")).toBe("codex 0.154.0");
+    expect(compactCliVersion("grok", "grok 1.0.30 (04b7ffed98c6)")).toBe("grok 1.0.30");
   });
 });

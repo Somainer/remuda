@@ -8,9 +8,11 @@ use crate::{
 use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 use remuda_node::{
-    DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, WssConfig, WssLink, dev_router,
-    native_driver_registry,
+    DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, WssConfig, WssLink,
+    apply_hello_result, dev_router, load_or_create_enrollment, native_driver_registry,
 };
+use remuda_protocol::HostId;
+use serde_json::json;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -119,16 +121,16 @@ pub(crate) async fn run(
     }
     let drivers = native_driver_registry(native)?;
     let store = Arc::new(MemoryStore::new(node_config.follow_buffer_capacity));
-    let node = DevNode::with_parts(&node_config, store, drivers)?;
-    let mut wss = WssConfig::loopback(
-        running_hub.addr,
-        running_hub.bootstrap_token.clone(),
-        node.host().meta.id.as_id().to_string(),
-    );
+    let (host_id, node_token) =
+        load_dev_enrollment(&config.data_dir, &running_hub.bootstrap_token)?;
+    let node = DevNode::with_parts_on_host(&node_config, store, drivers, host_id.clone())?;
+    let mut wss = WssConfig::loopback(running_hub.addr, node_token, host_id.as_id().to_string())
+        .with_collected_inventory();
     wss.label = "local-development".into();
     let link = WssLink::connect_runtime(wss, node.clone())
         .await
         .context("local Node could not enroll with the development Hub")?;
+    persist_dev_enrollment(&config.data_dir, &host_id, link.node_token.as_deref())?;
     let listener = tokio::net::TcpListener::bind(node_config.bind_addr).await?;
     let address = listener.local_addr()?;
     let accepting = Arc::new(AtomicBool::new(true));
@@ -196,6 +198,31 @@ pub(crate) async fn run(
     drivers?;
     http_result?;
     reason
+}
+
+fn load_dev_enrollment(data_dir: &Path, bootstrap: &str) -> anyhow::Result<(HostId, String)> {
+    let enrollment = load_or_create_enrollment(data_dir).context("node enrollment")?;
+    let token = enrollment
+        .node_token
+        .filter(|token| !token.is_empty())
+        .unwrap_or_else(|| bootstrap.to_owned());
+    Ok((enrollment.host_id, token))
+}
+
+fn persist_dev_enrollment(
+    data_dir: &Path,
+    host_id: &HostId,
+    node_token: Option<&str>,
+) -> anyhow::Result<()> {
+    apply_hello_result(
+        data_dir,
+        &json!({
+            "hostId": host_id,
+            "nodeToken": node_token,
+        }),
+    )
+    .context("persist node enrollment")?;
+    Ok(())
 }
 
 fn resolve_claude_binary() -> Option<PathBuf> {
@@ -274,5 +301,18 @@ mod tests {
         flags.apply(&mut config).expect("explicit LAN mode");
         assert!(config.hub.listen.ip().is_unspecified());
         assert!(config.node.listen.ip().is_unspecified());
+    }
+
+    #[test]
+    fn development_enrollment_reuses_the_same_host_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (first, token) =
+            load_dev_enrollment(dir.path(), "bootstrap-secret").expect("first enroll");
+        assert_eq!(token, "bootstrap-secret");
+        persist_dev_enrollment(dir.path(), &first, Some("host-secret")).expect("persist token");
+        let (second, token) =
+            load_dev_enrollment(dir.path(), "bootstrap-secret").expect("second enroll");
+        assert_eq!(first, second);
+        assert_eq!(token, "host-secret");
     }
 }

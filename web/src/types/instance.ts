@@ -45,6 +45,15 @@ export type Instance = EntityMeta & {
 
 export type HostTransport = "outbound-wss" | "ssh-dev";
 
+export type HostCliAuth = "logged_in" | "logged_out" | "unknown";
+
+export type HostCli = {
+  kind: string;
+  version?: string;
+  path?: string;
+  auth?: HostCliAuth;
+};
+
 export type Host = EntityMeta & {
   label: string;
   ownerPrincipalId: Id;
@@ -52,6 +61,15 @@ export type Host = EntityMeta & {
   transport: { mode: HostTransport; endpointRef: Id };
   hostname?: string;
   port?: number;
+  lastSeenAt?: string;
+  cli?: HostCli[];
+  labels?: string[];
+  maxInstances?: number;
+  resources?: { cpuPct?: number; memPct?: number };
+  herdr?: { version?: string; socket?: string; path?: string };
+  nodeVersion?: string;
+  instanceCount?: number;
+  online?: boolean;
 };
 
 export type UiStatus = "blocked" | "working" | "starting" | "idle" | "exited" | "unknown";

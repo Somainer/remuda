@@ -800,6 +800,93 @@ async fn stale_socket_does_not_offline_live_host() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn hello_reannounce_same_host_id_updates_one_row() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let hello = |version: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": version,
+            "method": "node.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "label": "local-development",
+                "nodeVersion": version,
+                "cli": [
+                    { "kind": "claude", "version": version, "path": "/usr/bin/claude", "auth": "unknown" },
+                    { "kind": "codex", "version": "0.1.0", "path": "/usr/bin/codex", "auth": "unknown" },
+                    { "kind": "grok", "version": "1.0.0", "path": "/usr/bin/grok", "auth": "unknown" }
+                ]
+            }
+        })
+        .to_string()
+    };
+
+    let mut req = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .context("first node")?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("connect first")??;
+    node.send(Message::Text(hello("1").into())).await?;
+    let first = recv_json(&mut node).await?;
+    assert!(first["result"]["nodeToken"].as_str().is_some(), "{first}");
+    drop(node);
+
+    let mut req = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .context("second node")?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {bootstrap}").parse().unwrap(),
+    );
+    let (mut node, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .context("connect second")??;
+    node.send(Message::Text(hello("2").into())).await?;
+    let second = recv_json(&mut node).await?;
+    assert!(second.get("result").is_some(), "{second}");
+    assert_eq!(
+        second["result"]["hostId"].as_str(),
+        Some(host_id.as_id().as_str())
+    );
+
+    let (status, _, hosts) = http(
+        hub.addr,
+        "GET",
+        "/v1/hosts",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{hosts}");
+    let hosts: Value = serde_json::from_str(hosts.trim())?;
+    let items = hosts["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 1, "{hosts}");
+    assert_eq!(items[0]["hostId"], json!(host_id.as_id().as_str()));
+    assert_eq!(items[0]["id"], json!(host_id.as_id().as_str()));
+    assert_eq!(items[0]["online"], json!(true));
+    assert_eq!(items[0]["nodeVersion"], json!("2"));
+    let empty = Vec::new();
+    let kinds: Vec<&str> = items[0]["cli"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|row| row["kind"].as_str())
+        .collect();
+    assert!(kinds.contains(&"claude"), "{items:?}");
+    assert!(kinds.contains(&"codex"), "{items:?}");
+    assert!(kinds.contains(&"grok"), "{items:?}");
+    drop(node);
+    Ok(())
+}
+
 async fn recv_json<S>(ws: &mut S) -> Result<Value>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,

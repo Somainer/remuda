@@ -1,6 +1,14 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { AddHostForm, hostRegistry, useHostViews, type HostView } from "../features/hosts";
+import {
+  AddHostForm,
+  cliSummary,
+  hostRegistry,
+  installedCli,
+  isStaleOffline,
+  useHostViews,
+  type HostView,
+} from "../features/hosts";
 import { useHub } from "../lib/store";
 import ui from "../styles/ui.module.css";
 import css from "../features/hosts/hosts.module.css";
@@ -9,6 +17,9 @@ export function HostsPage() {
   const hub = useHub();
   const hosts = useHostViews(hub.hosts, hub.instances);
   const [adding, setAdding] = useState(false);
+  const [showStale, setShowStale] = useState(false);
+  const stale = hosts.filter((h) => isStaleOffline(h));
+  const visible = showStale ? hosts : hosts.filter((h) => !isStaleOffline(h));
   const online = hosts.filter((h) => h.online).length;
 
   return (
@@ -16,17 +27,27 @@ export function HostsPage() {
       <header className={css.head}>
         <h1 className={css.title}>主机</h1>
         <div className={css.count}>
-          {hosts.length} 台 · {online} 在线
+          {visible.length} 台 · {online} 在线
         </div>
         <Link to="/fleet" className={css.count}>
           Fleet
         </Link>
         <div style={{ flex: 1 }} />
+        {stale.length > 0 ? (
+          <button
+            type="button"
+            className={`${css.toggle} ${showStale ? css.toggleOn : ""}`}
+            data-testid="hosts-show-stale"
+            onClick={() => setShowStale((on) => !on)}
+          >
+            {showStale ? "隐藏过期" : `显示过期 (${stale.length})`}
+          </button>
+        ) : null}
         <button type="button" className={css.add} data-testid="hosts-add" onClick={() => setAdding(true)}>
           添加
         </button>
       </header>
-      {hosts.map((host) => (
+      {visible.map((host) => (
         <Link
           key={host.id}
           to={`/hosts/${host.id}`}
@@ -34,6 +55,7 @@ export function HostsPage() {
           data-testid="host-row"
           data-transport={host.transport}
           data-online={host.online ? "1" : "0"}
+          data-stale={isStaleOffline(host) ? "1" : "0"}
           data-label={host.label}
         >
           <span className={`${css.dot} ${host.online ? css.dotOn : css.dotOff}`} aria-label={host.online ? "在线" : "离线"} />
@@ -43,14 +65,14 @@ export function HostsPage() {
               {host.online
                 ? `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}`
                 : `离线${host.lastSeenAt ? ` · 最后心跳 ${host.lastSeenAt.slice(11, 16)}` : ""}`}
-              {host.cli[0] ? ` · ${host.cli[0].kind}${host.cli[0].version ? ` ${host.cli[0].version}` : ""}` : ""}
+              {cliSummary(host.cli) ? ` · ${cliSummary(host.cli)}` : ""}
               {` · 会话 ${host.instanceCount}`}
             </span>
           </span>
           <span className={`${css.cell} ${css.cellRtt}`}>
             {host.online ? `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}` : "离线 —"}
           </span>
-          <span className={`${css.cell} ${css.cellCli}`}>{host.cli.map((c) => c.kind).join(" · ") || "—"}</span>
+          <span className={`${css.cell} ${css.cellCli}`}>{cliSummary(host.cli) || "—"}</span>
           <span className={`${css.cell} ${css.cellTransport}`}>
             {host.transport}
             {!host.online && host.lastSeenAt ? ` · 最后心跳 ${host.lastSeenAt.slice(11, 16)}` : ""}
@@ -131,8 +153,8 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label:
         <div>
           <div className={css.sectionLabel}>CLI · 按本机盘点，绝对路径 + 版本</div>
           <div className={css.cliTable}>
-            {host.cli.length === 0 ? <div className={css.cliRow}>尚无盘点</div> : null}
-            {host.cli.map((cli) => (
+            {installedCli(host.cli).length === 0 ? <div className={css.cliRow}>尚无盘点</div> : null}
+            {installedCli(host.cli).map((cli) => (
               <div key={`${cli.kind}:${cli.path}`} className={css.cliRow} data-testid="host-cli">
                 <span className={css.cliKind}>
                   {cli.kind}

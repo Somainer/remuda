@@ -211,6 +211,71 @@ async fn wss_hello_heartbeat_append_reconnect_against_hub() {
 }
 
 #[tokio::test]
+async fn wss_reannounce_keeps_a_single_host_row() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("data")))
+        .await
+        .expect("hub");
+    let host_id = HostId::new();
+    let mut config = WssConfig::loopback(
+        hub.addr,
+        hub.bootstrap_token.clone(),
+        host_id.as_id().as_str().to_owned(),
+    );
+    config.cli = json!([
+        { "kind": "claude", "version": "2.1.268", "path": "/usr/bin/claude", "auth": "unknown" },
+        { "kind": "codex", "version": "0.1.0", "path": "/usr/bin/codex", "auth": "unknown" },
+        { "kind": "grok", "version": "1.0.0", "path": "/usr/bin/grok", "auth": "unknown" },
+        { "kind": "agy", "version": "1.2.1", "path": "/usr/bin/agy", "auth": "unknown" }
+    ]);
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config.clone()))
+        .await
+        .expect("connect timeout")
+        .expect("first enroll");
+    let token = link
+        .node_token
+        .clone()
+        .expect("first hello returns a host token");
+    tokio::time::timeout(TIMEOUT, link.shutdown())
+        .await
+        .expect("shutdown timeout");
+
+    config.token = token;
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config))
+        .await
+        .expect("reconnect timeout")
+        .expect("reannounce");
+
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+    let (status, hosts) = http(
+        hub.addr,
+        "GET",
+        "/v1/hosts",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{hosts}");
+    let hosts: Value = serde_json::from_str(hosts.trim()).expect("hosts json");
+    let items = hosts["items"].as_array().cloned().unwrap_or_default();
+    assert_eq!(items.len(), 1, "{hosts}");
+    assert_eq!(items[0]["hostId"], json!(host_id.as_id().as_str()));
+    assert_eq!(items[0]["online"], json!(true));
+    let empty = Vec::new();
+    let kinds: Vec<&str> = items[0]["cli"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|row| row["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, ["claude", "codex", "grok", "agy"], "{items:?}");
+
+    tokio::time::timeout(TIMEOUT, link.shutdown())
+        .await
+        .expect("second shutdown");
+}
+
+#[tokio::test]
 async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
     use futures::StreamExt;
     use remuda_node::{DevNode, DevServerConfig};

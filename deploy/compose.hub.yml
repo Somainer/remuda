@@ -1,0 +1,59 @@
+# Remuda Hub only. Does not start or reconfigure Caddy / AsterGate / cloudflared.
+#
+# Attach to the existing compose project network on devbox-sg-host.
+# Verified 2026-09-12 (read-only `docker network ls`):
+#   NAME=deploy_default  DRIVER=bridge  SCOPE=local
+# Compose project `deploy` lives at ~/astergate/deploy on that host.
+#
+# No `ports:` — Hub is reached through Caddy on the same Docker network.
+# Image tags are placeholders; production must pin a digest.
+
+services:
+  remuda-migrate:
+    image: ghcr.io/somainer/remuda:0.1.0
+    command: ["migrate", "--database", "/data/remuda.db"]
+    user: "65532:65532"
+    read_only: true
+    volumes:
+      - /data00/remuda/hub:/data
+    secrets:
+      - remuda_master_key
+    environment:
+      REMUDA_MASTER_KEY_FILE: /run/secrets/remuda_master_key
+    restart: "no"
+    networks: [deploy_default]
+
+  remuda-hub:
+    image: ghcr.io/somainer/remuda:0.1.0
+    command: ["hub", "--config", "/etc/remuda/hub.toml"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - /data00/remuda/hub:/data
+      - ./hub.toml:/etc/remuda/hub.toml:ro
+    secrets:
+      - remuda_master_key
+      - remuda_web_password
+      - lark_app_secret
+    environment:
+      REMUDA_MASTER_KEY_FILE: /run/secrets/remuda_master_key
+      REMUDA_WEB_PASSWORD_FILE: /run/secrets/remuda_web_password
+      LARK_APP_SECRET_FILE: /run/secrets/lark_app_secret
+    depends_on:
+      remuda-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [deploy_default]
+
+networks:
+  deploy_default:
+    external: true
+
+secrets:
+  remuda_master_key:
+    file: /data00/remuda/secrets/master-key
+  remuda_web_password:
+    file: /data00/remuda/secrets/web-password
+  lark_app_secret:
+    file: /data00/remuda/secrets/lark-app-secret

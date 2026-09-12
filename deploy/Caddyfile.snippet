@@ -1,0 +1,32 @@
+# New server block for Remuda Hub. Append to the existing Caddyfile on
+# devbox-sg-host (`~/astergate/deploy/Caddyfile`); do not edit the
+# AsterGate site. `/v1` on that hostname is already the gateway and must
+# stay untouched.
+#
+# Replace remuda.example.com with a hostname in the same DNS zone already
+# served by this Caddy (Cloudflare DNS-01). Keep cookie/path isolation by
+# using a dedicated hostname rather than a path prefix.
+#
+# `deploy-caddy-1` must share Docker network `deploy_default` with
+# `remuda-hub` so the upstream name `remuda-hub` resolves.
+
+remuda.example.com {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+	}
+
+	reverse_proxy remuda-hub:8080 {
+		# SSE: disable proxy buffering so Hub event streams flush immediately.
+		flush_interval -1
+		header_up Host {host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-For {remote_host}
+		# WebSocket upgrade for Hub WSS (browser control + Node outbound via Caddy).
+		header_up Connection {http.request.header.Connection}
+		header_up Upgrade {http.request.header.Upgrade}
+	}
+}

@@ -2,6 +2,11 @@
 
 use clap::{Parser, Subcommand};
 
+/// Hub–Node wire protocol major; matches `remuda_protocol::PROTOCOL_VERSION.major`.
+const WIRE_MAJOR: u16 = 1;
+/// SQLite schema major. `0` until the first Hub/Node migration ships.
+const SCHEMA_MAJOR: u16 = 0;
+
 /// Remuda process selection.
 #[derive(Parser)]
 #[command(name = "remuda", version, about = "Unified remote agent runtime")]
@@ -19,13 +24,64 @@ enum Command {
     Node,
     /// Run the local development environment (bootstrap placeholder).
     Dev,
+    /// Print semver, commit, rustc, target, and wire/schema majors.
+    Version,
+}
+
+fn version_text() -> String {
+    format!(
+        "remuda {semver}\ncommit={commit}\nrustc={rustc}\ntarget={target}\nwire={wire}\nschema={schema}\n",
+        semver = env!("CARGO_PKG_VERSION"),
+        commit = env!("REMUDA_GIT_SHA"),
+        rustc = env!("REMUDA_RUSTC_VERSION"),
+        target = env!("REMUDA_TARGET"),
+        wire = WIRE_MAJOR,
+        schema = SCHEMA_MAJOR,
+    )
 }
 
 fn main() {
-    let mode = match Cli::parse().command {
-        Command::Hub => "hub",
-        Command::Node => "node",
-        Command::Dev => "dev",
-    };
-    println!("remuda {mode}: bootstrap placeholder; no service started");
+    match Cli::parse().command {
+        Command::Hub => {
+            println!("remuda hub: bootstrap placeholder; no service started");
+        }
+        Command::Node => {
+            println!("remuda node: bootstrap placeholder; no service started");
+        }
+        Command::Dev => {
+            println!("remuda dev: bootstrap placeholder; no service started");
+        }
+        Command::Version => {
+            print!("{}", version_text());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn declares_version_and_dev_subcommands() {
+        let names: Vec<_> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        assert!(names.contains(&"version".to_string()));
+        assert!(names.contains(&"dev".to_string()));
+        assert!(names.contains(&"hub".to_string()));
+        assert!(names.contains(&"node".to_string()));
+    }
+
+    #[test]
+    fn version_text_includes_identity_fields() {
+        let text = version_text();
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains("commit="));
+        assert!(text.contains("rustc="));
+        assert!(text.contains("target="));
+        assert!(text.contains("wire=1"));
+        assert!(text.contains("schema=0"));
+    }
 }

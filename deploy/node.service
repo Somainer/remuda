@@ -1,0 +1,26 @@
+[Unit]
+Description=Remuda Node Agent
+Documentation=https://github.com/Somainer/remuda
+Requires=remuda-herdr.service
+After=network-online.target remuda-herdr.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=remuda-agent
+Group=remuda-agent
+ExecStart=/opt/remuda/remuda node --config /etc/remuda/node.toml
+Environment=REMUDA_NODE_TOKEN_FILE=/etc/remuda/secrets/node-token
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/remuda /run/remuda /workspaces
+# Prefer systemd credentials when available:
+# LoadCredential=node-token:/etc/remuda/secrets/node-token
+# Environment=REMUDA_NODE_TOKEN_FILE=%d/node-token
+
+[Install]
+WantedBy=multi-user.target

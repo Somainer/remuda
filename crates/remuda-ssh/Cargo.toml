@@ -11,6 +11,8 @@ description = "SSH remote transport: OpenSSH stdio carrier, bootstrap, and host 
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,6 +21,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

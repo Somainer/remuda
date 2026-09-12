@@ -10,7 +10,13 @@ description = "Node instance management and outbound Hub connection."
 [lints]
 workspace = true
 
+[[bin]]
+name = "remuda-node-stdio"
+path = "src/bin/node_stdio.rs"
+
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
 futures.workspace = true
 remuda-protocol.workspace = true
 serde.workspace = true

@@ -27,6 +27,18 @@ No remuda-hub / remuda-node files were rewritten.
   after a restart is a new host row unless the Node persists enrollment
   (not implemented).
 
+- **Composition `remuda` binary.** `crates/remuda` currently fails to build
+  against the split Node crate (`HubConfig.push_block_ms`, missing exports).
+  M1 used `remuda-ssh` (same clap as `remuda ssh`) plus
+  `remuda-node-stdio` uploaded as `/tmp/remuda-m1/remuda`.
+
+### Verified (2026-09-12)
+
+`GET /v1/hosts` against a Mac loopback Hub showed `online=true`,
+`label=devbox-sg`, `hostname=devbox`, `labels=["region=sg"]`,
+`transport=ssh-stdio`, plus CLI/herdr inventory from the SG node. Remote
+files were only under `/tmp/remuda-m1/` and were removed afterwards.
+
 ## M0 demo gaps
 
 <!-- m0-demo-gaps:start -->

@@ -17,6 +17,11 @@ an interactive login. Do not replace this with russh.
 If the remote binary is older than `node --stdio`, `remuda ssh node` falls
 back to `remuda version` and prints a `version-fallback` object.
 
+`remuda ssh node <alias> --hub http://127.0.0.1:8080` enrolls the stdio
+session on Hub `GET /v1/node` (Bearer bootstrap token) so `GET /v1/hosts`
+lists the host as `transport=ssh-stdio`. The process holds the bridge until
+disconnect (`--no-hold` prints hello and exits).
+
 ## Commands (via `remuda`)
 
 ```

@@ -72,6 +72,9 @@ pub enum Error {
     /// `ssh` binary could not be located.
     #[error("ssh binary not found: {0}")]
     SshNotFound(PathBuf),
+    /// `node.hello` could not be enrolled with Hub.
+    #[error("hub enroll: {0}")]
+    Enroll(String),
 }
 
 impl Error {

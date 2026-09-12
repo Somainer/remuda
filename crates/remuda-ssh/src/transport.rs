@@ -11,6 +11,8 @@ use tokio::io::{BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::client::{SshClient, spawn_ssh};
@@ -232,7 +234,24 @@ pub struct WssTransport {
 impl WssTransport {
     /// Dial `ws://` or `wss://`.
     pub async fn connect(url: &str) -> Result<Self, Error> {
-        let (inner, _response) = tokio_tungstenite::connect_async(url)
+        Self::connect_with_bearer(url, None).await
+    }
+
+    /// Dial Hub `/v1/node` with an optional `Authorization: Bearer` token.
+    pub async fn connect_with_bearer(url: &str, token: Option<&str>) -> Result<Self, Error> {
+        let mut request = url
+            .into_client_request()
+            .map_err(|err| Error::WebSocket(err.to_string()))?;
+        if let Some(token) = token.filter(|t| !t.is_empty()) {
+            let value = format!("Bearer {token}");
+            let header = value.parse().map_err(
+                |err: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
+                    Error::WebSocket(format!("authorization header: {err}"))
+                },
+            )?;
+            request.headers_mut().insert(AUTHORIZATION, header);
+        }
+        let (inner, _response) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(|err| Error::WebSocket(err.to_string()))?;
         Ok(Self { inner })

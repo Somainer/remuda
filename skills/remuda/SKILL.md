@@ -181,8 +181,9 @@ remuda merge wt/reviewer/work --gate --json      # verify, then advance main
    touched.
 3. Runs `scripts/ci/gate.sh`, the single definition of gate order: secret
    scan → `cargo fmt --all --check` → `cargo check --workspace --all-targets
-   --locked` → `cargo clippy … -D warnings` → `cargo test --workspace
-   --locked`. **Only tests retry** (once, reported as `retried` /
+   --locked` → `cargo clippy … -D warnings` → `cargo test --locked` for
+   changed crates and their reverse dependencies (`--affected`, the default).
+   Use `--full` for all workspace tests. **Only tests retry** (once, reported as `retried` /
    `attempts: 2`); any other failure stops immediately and later steps report
    `skipped`.
 4. When the merge touches `web/` — or with `--web` — adds `pnpm install
@@ -215,9 +216,13 @@ neither that the merge is conflict-free nor that the gate would pass.
 `conflicts`, and per-step `name`/`status`/`durationMs`/`attempts`/`retried`.
 
 MCP `remuda_merge` takes `branch`, `gate: true` or `dryRun: true`, plus
-optional `repo`, `targetDir`, `web`, `noPush`. It runs git **on the MCP
+optional `repo`, `targetDir`, `web`, `noPush`, `affected`, `full`. It runs git **on the MCP
 server's machine**, not through Hub, and returns the same JSON as text and
 `structuredContent`; a nonzero `exitCode` sets `isError: true`.
+
+The `cargo-test` step reports selected `crates` and a `selection` reason.
+Docs-only changes skip tests; shared build inputs select the full workspace.
+See `docs/design/merge-affected.md` for selection and dry-run semantics.
 
 ## MCP equivalents
 

@@ -19,6 +19,8 @@ jobs:
         run: rustup show active-toolchain
       - name: Generated coordinator skill is current
         run: ./scripts/gen-skill.sh --check
+      - name: Coordinator script tests
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Prebuild remuda-testing bins
         run: cargo build -p remuda-testing --bins --locked
       - name: Shared Rust merge gate

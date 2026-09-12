@@ -276,6 +276,8 @@ pub(crate) fn tools_catalog() -> Vec<Value> {
                     "branch": { "type": "string" },
                     "gate": { "type": "boolean" },
                     "dryRun": { "type": "boolean" },
+                    "affected": { "type": "boolean", "default": true },
+                    "full": { "type": "boolean", "description": "Test the full workspace" },
                     "web": { "type": "boolean" },
                     "noPush": { "type": "boolean" },
                     "repo": { "type": "string" },

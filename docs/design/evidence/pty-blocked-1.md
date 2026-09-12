@@ -205,6 +205,7 @@ this follow-up, with incremental compilation disabled:
 ```sh
 export CARGO_TARGET_DIR="$(git rev-parse --path-format=absolute --git-common-dir)/../target"
 export CARGO_INCREMENTAL=0
+export RUSTFLAGS="--cfg remuda_c_blocked_rebase_validation"
 cargo fmt --all
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -212,12 +213,18 @@ cargo test -p remuda-driver -p remuda-node -p remuda-hub --locked
 ./scripts/ci/secret-scan.sh
 ```
 
-All follow-up checks passed: **190 tests passed**, with 9 existing live/local
-binary tests ignored; workspace clippy reported no warnings. The passing
-cases include blocked-answer isolation, disconnected/stalled observer
-shutdown, Node SIGTERM with open stdin, raw mouse escape round trips,
-terminal snapshots and Hub/Node WSS integration. Formatting, secret scan and
-diff whitespace checks also passed.
+The unused cfg gives this worktree distinct artifact fingerprints within the
+same target directory. An earlier shared-target run was rejected because
+its Node test executable listed two tests absent from this source and omitted
+this branch's PTY broker test, indicating concurrent artifact replacement.
+
+The run with distinct fingerprints passed every gate: **190 tests passed**,
+9 existing live/local binary tests ignored, and workspace clippy with zero
+warnings. Its output includes this branch's Node PTY broker test and excludes
+the foreign tests. Passing coverage also includes blocked-answer isolation,
+observer shutdown, Node SIGTERM, raw mouse input, terminal snapshots,
+resource reclamation and Hub/Node WSS integration. Formatting, secret scan
+and diff whitespace checks passed.
 
 The screenshots and executable digest earlier in this report remain the
 original isolated dev evidence; this follow-up validates the rebased source

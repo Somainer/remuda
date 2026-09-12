@@ -1,0 +1,466 @@
+//! Store seam and the M0 in-memory implementation.
+
+use crate::{NodeError, driver::runtime_source};
+use remuda_protocol::{
+    Activity, Command, CommandId, CommandState, Completeness, ConversationNode, EventId,
+    EventsReadResult, HistoryCoverage, Instance, InstanceId, InstanceLifecycle, InstanceSnapshot,
+    JournalEvent, Knowledge, Observation, ObservationPayload, ResolutionState, RunId,
+    SchemaVersion, U64,
+};
+use std::{collections::BTreeMap, sync::RwLock};
+use time::OffsetDateTime;
+use tokio::sync::broadcast;
+
+struct InstanceRecord {
+    instance: Instance,
+    command_ids: Vec<CommandId>,
+    events: Vec<JournalEvent>,
+    events_tx: broadcast::Sender<JournalEvent>,
+}
+
+#[derive(Default)]
+struct MemoryState {
+    instances: BTreeMap<InstanceId, InstanceRecord>,
+    commands: BTreeMap<CommandId, Command>,
+    journal_instances: BTreeMap<remuda_protocol::Id, InstanceId>,
+}
+
+/// Storage contract used by `DevNode`; the durable SQLite adapter can implement this seam later.
+pub trait LocalStore: Send + Sync {
+    /// Insert a newly materialized Instance.
+    fn insert_instance(&self, instance: Instance) -> Result<(), NodeError>;
+    /// Return all Instances in stable identity order.
+    fn list_instances(&self) -> Result<Vec<Instance>, NodeError>;
+    /// Read one Instance.
+    fn get_instance(&self, instance_id: &InstanceId) -> Result<Instance, NodeError>;
+    /// Change lifecycle/activity and return the revised Instance.
+    fn set_instance_state(
+        &self,
+        instance_id: &InstanceId,
+        lifecycle: Option<InstanceLifecycle>,
+        activity: Option<Knowledge<Activity>>,
+    ) -> Result<Instance, NodeError>;
+    /// Atomically insert a command, returning false for a matching idempotent replay.
+    fn insert_command(&self, instance_id: &InstanceId, command: Command)
+    -> Result<bool, NodeError>;
+    /// Read one command.
+    fn get_command(&self, command_id: &CommandId) -> Result<Command, NodeError>;
+    /// Replace one command with a later revision.
+    fn save_command(&self, command: Command) -> Result<(), NodeError>;
+    /// Mark every non-settled command for an Instance as dispatch-unknown.
+    fn mark_unsettled_unknown(&self, instance_id: &InstanceId) -> Result<(), NodeError>;
+    /// Append one protocol Observation and allocate its per-Instance sequence.
+    fn append_observation(
+        &self,
+        instance_id: &InstanceId,
+        run_id: Option<RunId>,
+        completeness: Completeness,
+        body: ObservationPayload,
+    ) -> Result<Observation, NodeError>;
+    /// Read a bounded page after an exclusive sequence.
+    fn read_events(
+        &self,
+        journal_id: &remuda_protocol::Id,
+        after_seq: Option<U64>,
+        limit: usize,
+    ) -> Result<EventsReadResult, NodeError>;
+    /// Build a projection snapshot at the same in-memory watermark as its entities.
+    fn snapshot(
+        &self,
+        instance_id: &InstanceId,
+        projection_epoch: remuda_protocol::Id,
+    ) -> Result<InstanceSnapshot, NodeError>;
+    /// Subscribe before taking a snapshot so later writes can be buffered without gaps.
+    fn subscribe(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<broadcast::Receiver<JournalEvent>, NodeError>;
+    /// Resolve a journal identity to its owning Instance.
+    fn instance_for_journal(
+        &self,
+        journal_id: &remuda_protocol::Id,
+    ) -> Result<InstanceId, NodeError>;
+}
+
+/// Thread-safe in-memory store used by `remuda dev` and local API tests.
+pub struct MemoryStore {
+    state: RwLock<MemoryState>,
+    follow_buffer_capacity: usize,
+}
+
+impl MemoryStore {
+    /// Create an empty store with a bounded per-Instance broadcast ring.
+    pub fn new(follow_buffer_capacity: usize) -> Self {
+        Self {
+            state: RwLock::new(MemoryState::default()),
+            follow_buffer_capacity: follow_buffer_capacity.max(1),
+        }
+    }
+}
+
+impl LocalStore for MemoryStore {
+    fn insert_instance(&self, instance: Instance) -> Result<(), NodeError> {
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        if state.instances.contains_key(&instance.meta.id) {
+            return Err(NodeError::Conflict(format!(
+                "instance {} already exists",
+                instance.meta.id.as_id()
+            )));
+        }
+        if state.journal_instances.contains_key(&instance.journal_id) {
+            return Err(NodeError::Conflict(format!(
+                "journal {} already has an owner",
+                instance.journal_id
+            )));
+        }
+        let instance_id = instance.meta.id.clone();
+        let journal_id = instance.journal_id.clone();
+        let (events_tx, _) = broadcast::channel(self.follow_buffer_capacity);
+        state.instances.insert(
+            instance_id.clone(),
+            InstanceRecord {
+                instance,
+                command_ids: Vec::new(),
+                events: Vec::new(),
+                events_tx,
+            },
+        );
+        state.journal_instances.insert(journal_id, instance_id);
+        Ok(())
+    }
+
+    fn list_instances(&self) -> Result<Vec<Instance>, NodeError> {
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        Ok(state
+            .instances
+            .values()
+            .map(|record| record.instance.clone())
+            .collect())
+    }
+
+    fn get_instance(&self, instance_id: &InstanceId) -> Result<Instance, NodeError> {
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        state
+            .instances
+            .get(instance_id)
+            .map(|record| record.instance.clone())
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))
+    }
+
+    fn set_instance_state(
+        &self,
+        instance_id: &InstanceId,
+        lifecycle: Option<InstanceLifecycle>,
+        activity: Option<Knowledge<Activity>>,
+    ) -> Result<Instance, NodeError> {
+        let now = timestamp_now()?;
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let record = state
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        if let Some(lifecycle) = lifecycle {
+            record.instance.lifecycle = lifecycle;
+        }
+        if let Some(activity) = activity {
+            record.instance.activity = activity;
+        }
+        if matches!(
+            record.instance.lifecycle,
+            InstanceLifecycle::Exited | InstanceLifecycle::Failed
+        ) {
+            record.instance.active_run_ids.clear();
+        }
+        record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
+        record.instance.meta.updated_at = now;
+        Ok(record.instance.clone())
+    }
+
+    fn insert_command(
+        &self,
+        instance_id: &InstanceId,
+        command: Command,
+    ) -> Result<bool, NodeError> {
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        if let Some(existing) = state.commands.get(&command.command_id) {
+            if existing.payload_digest == command.payload_digest
+                && existing.operation == command.operation
+                && existing.target.instance_id.as_ref() == Some(instance_id)
+            {
+                return Ok(false);
+            }
+            return Err(NodeError::Conflict(format!(
+                "command {} was reused with different content",
+                command.command_id.as_id()
+            )));
+        }
+        let record = state
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        record.command_ids.push(command.command_id.clone());
+        state.commands.insert(command.command_id.clone(), command);
+        Ok(true)
+    }
+
+    fn get_command(&self, command_id: &CommandId) -> Result<Command, NodeError> {
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        state
+            .commands
+            .get(command_id)
+            .cloned()
+            .ok_or_else(|| not_found("command", command_id.as_id().to_string()))
+    }
+
+    fn save_command(&self, command: Command) -> Result<(), NodeError> {
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let existing = state
+            .commands
+            .get(&command.command_id)
+            .ok_or_else(|| not_found("command", command.command_id.as_id().to_string()))?;
+        if command.meta.revision < existing.meta.revision {
+            return Err(NodeError::Conflict(format!(
+                "command {} revision moved backwards",
+                command.command_id.as_id()
+            )));
+        }
+        state.commands.insert(command.command_id.clone(), command);
+        Ok(())
+    }
+
+    fn mark_unsettled_unknown(&self, instance_id: &InstanceId) -> Result<(), NodeError> {
+        let now = timestamp_now()?;
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let command_ids = state
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?
+            .command_ids
+            .clone();
+        for command_id in command_ids {
+            if let Some(command) = state.commands.get_mut(&command_id)
+                && command.state != CommandState::Settled
+            {
+                command.resolution = ResolutionState::Unknown;
+                command.meta.revision.0 = command.meta.revision.0.saturating_add(1);
+                command.meta.updated_at = now.clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn append_observation(
+        &self,
+        instance_id: &InstanceId,
+        run_id: Option<RunId>,
+        completeness: Completeness,
+        body: ObservationPayload,
+    ) -> Result<Observation, NodeError> {
+        let now = timestamp_now()?;
+        let (event, sender) = {
+            let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+            let record = state
+                .instances
+                .get_mut(instance_id)
+                .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+            let seq = U64(record.instance.durable_seq.0.saturating_add(1));
+            let event = Observation {
+                schema_version: SchemaVersion,
+                event_id: EventId::new(),
+                journal_id: record.instance.journal_id.clone(),
+                instance_id: instance_id.clone(),
+                run_id: run_id.clone(),
+                host_id: record.instance.host_id.clone(),
+                process_generation: record.instance.process_ref.process_generation,
+                run_generation: run_id.map(|_| U64(1)),
+                seq,
+                observed_at: now.clone(),
+                native_at: unknown("not-emitted"),
+                source: runtime_source(&record.instance, seq),
+                completeness,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body,
+            };
+            record.instance.durable_seq = seq;
+            record.instance.meta.updated_at = now;
+            let journal_event = JournalEvent::Instance(Box::new(event.clone()));
+            record.events.push(journal_event.clone());
+            (event, (record.events_tx.clone(), journal_event))
+        };
+        let _ = sender.0.send(sender.1);
+        Ok(event)
+    }
+
+    fn read_events(
+        &self,
+        journal_id: &remuda_protocol::Id,
+        after_seq: Option<U64>,
+        limit: usize,
+    ) -> Result<EventsReadResult, NodeError> {
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        let instance_id = state
+            .journal_instances
+            .get(journal_id)
+            .ok_or_else(|| not_found("journal", journal_id.to_string()))?;
+        let record = state
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        let after = after_seq.unwrap_or_default().0;
+        let events = record
+            .events
+            .iter()
+            .filter(|event| event.position().1.0 > after)
+            .take(limit.clamp(1, 256))
+            .cloned()
+            .collect();
+        Ok(EventsReadResult {
+            events,
+            next_cursor: None,
+            floor_seq: U64(1),
+            durable_seq: record.instance.durable_seq,
+        })
+    }
+
+    fn snapshot(
+        &self,
+        instance_id: &InstanceId,
+        projection_epoch: remuda_protocol::Id,
+    ) -> Result<InstanceSnapshot, NodeError> {
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        let record = state
+            .instances
+            .get(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        let commands = record
+            .command_ids
+            .iter()
+            .filter_map(|command_id| state.commands.get(command_id).cloned())
+            .collect();
+        let nodes = record.events.iter().filter_map(conversation_node).collect();
+        Ok(InstanceSnapshot {
+            projection_version: "v1".to_owned(),
+            projection_epoch,
+            as_of_seq: record.instance.durable_seq,
+            instance: record.instance.clone(),
+            runs: Vec::new(),
+            commands,
+            pending_interactions: Vec::new(),
+            nodes,
+            history: HistoryCoverage {
+                earliest_retained_seq: U64(1),
+                complete: true,
+            },
+        })
+    }
+
+    fn subscribe(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<broadcast::Receiver<JournalEvent>, NodeError> {
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        state
+            .instances
+            .get(instance_id)
+            .map(|record| record.events_tx.subscribe())
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))
+    }
+
+    fn instance_for_journal(
+        &self,
+        journal_id: &remuda_protocol::Id,
+    ) -> Result<InstanceId, NodeError> {
+        let state = self.state.read().map_err(|_| NodeError::StorePoisoned)?;
+        state
+            .journal_instances
+            .get(journal_id)
+            .cloned()
+            .ok_or_else(|| not_found("journal", journal_id.to_string()))
+    }
+}
+
+fn conversation_node(event: &JournalEvent) -> Option<ConversationNode> {
+    let JournalEvent::Instance(event) = event else {
+        return None;
+    };
+    match &event.body {
+        ObservationPayload::Message(payload) => Some(ConversationNode::Message(payload.clone())),
+        ObservationPayload::Thought(payload) => Some(ConversationNode::Thought(payload.clone())),
+        ObservationPayload::ToolCall(payload) => Some(ConversationNode::ToolCall(payload.clone())),
+        ObservationPayload::ToolResult(payload) => {
+            Some(ConversationNode::ToolResult(payload.clone()))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn timestamp_now() -> Result<remuda_protocol::Timestamp, NodeError> {
+    let now = OffsetDateTime::now_utc();
+    let text = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.millisecond()
+    );
+    Ok(text.try_into()?)
+}
+
+pub(crate) fn unknown<T>(reason: &str) -> Knowledge<T> {
+    Knowledge::Unknown {
+        reason: reason.to_owned(),
+        evidence_event_ids: Vec::new(),
+    }
+}
+
+fn not_found(entity: &'static str, id: String) -> NodeError {
+    NodeError::NotFound { entity, id }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::fixture_instance;
+
+    #[test]
+    fn journal_pages_exclude_the_cursor() {
+        let store = MemoryStore::new(4);
+        let instance = fixture_instance(
+            InstanceId::new(),
+            remuda_protocol::HostId::new(),
+            remuda_protocol::WorkspaceId::new(),
+            remuda_protocol::DriverKind::ClaudePrint,
+        )
+        .expect("fixture instance");
+        let journal_id = instance.journal_id.clone();
+        let instance_id = instance.meta.id.clone();
+        store.insert_instance(instance).expect("insert instance");
+        let body = crate::driver::message_payload(
+            remuda_protocol::MessageRole::Assistant,
+            remuda_protocol::MessagePhase::Final,
+            "one".to_owned(),
+        )
+        .expect("message");
+        store
+            .append_observation(&instance_id, None, Completeness::Structured, body)
+            .expect("append one");
+        let body = crate::driver::message_payload(
+            remuda_protocol::MessageRole::Assistant,
+            remuda_protocol::MessagePhase::Final,
+            "two".to_owned(),
+        )
+        .expect("message");
+        store
+            .append_observation(&instance_id, None, Completeness::Structured, body)
+            .expect("append two");
+        let page = store
+            .read_events(&journal_id, Some(U64(1)), 10)
+            .expect("read page");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].position().1, U64(2));
+    }
+}

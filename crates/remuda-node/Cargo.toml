@@ -11,3 +11,16 @@ description = "Node instance management and outbound Hub connection."
 workspace = true
 
 [dependencies]
+futures.workspace = true
+remuda-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+remuda-hub.workspace = true
+tempfile = "3"
+tokio-tungstenite.workspace = true

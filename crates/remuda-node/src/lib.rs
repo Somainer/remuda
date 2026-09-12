@@ -42,7 +42,7 @@ pub use model::{
 pub use native::{NativeDriverConfig, native_driver_registry};
 pub use runtime::DevNode;
 pub use runtime_link::attach_runtime;
-pub use server::{DevServer, dev_router};
+pub use server::{DevServer, dev_router, dispatch_hub_rpc};
 pub use service::{LocalDrivers, RunningNode, ServeConfig, compose, serve};
 pub use stdio::{StdioOptions, run_stdio, run_stdio_opts};
 pub use store::{LocalStore, MemoryStore};

@@ -3044,9 +3044,11 @@ name = "remuda-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "futures",
+ "remuda-driver",
  "remuda-hub",
  "remuda-protocol",
  "serde",

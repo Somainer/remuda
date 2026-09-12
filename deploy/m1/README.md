@@ -1,5 +1,12 @@
 # M1 deploy package (prepared locally, operator-run)
 
+> **Superseded by D-020.** The intranet Hub + Tunnel rollout below is not
+> applicable and must not be executed. Use [deploy/public](../public/README.md)
+> for the retained public VPS variant; the current supported path is the
+> [intranet runbook](../../docs/design/deploy-runbook.md). The musl artifact,
+> `Dockerfile` and separate Hub/Caddy building blocks remain reusable; build web and the
+> binary before copying the binary into the image context.
+
 This directory is a **package**, not a rollout. Nothing here starts services
 on `devbox-sg-host` or `devbox-sg`. Artifacts are built on the
 operator laptop; copy-paste the blocks below on the hosts when you choose.

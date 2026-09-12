@@ -11,7 +11,7 @@ pub enum DriverError {
     #[error("invalid launch spec: {0}")]
     InvalidLaunchSpec(String),
     /// Bypass/yolo is only allowed on human-originated specs. `decisions.md` D-011.
-    #[error("bypass permissions (yolo) is not allowed for bot-originated specs")]
+    #[error("bypass permissions (yolo) is not allowed for bot/dispatcher-originated specs")]
     BypassNotAllowedForBot,
     /// Direct provider rotation is v2. `decisions.md` D-012.
     #[error("direct provider delegation is v2")]

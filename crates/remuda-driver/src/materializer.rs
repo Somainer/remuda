@@ -9,9 +9,10 @@ use crate::recipe::{
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
 };
 use remuda_protocol::{
-    AgentKind, ApprovalAuthority, BoolLiteral, ClaudePermissionMode, DriverKind, EnvBinding, Id,
-    InputDelivery, InputOrigin, InstanceSpec, PermissionMode,
+    AgentKind, ApprovalAuthority, BoolLiteral, ClaudePermissionMode, CommandOrigin, DriverKind,
+    EnvBinding, Id, InputDelivery, InputOrigin, InstanceSpec, PermissionMode,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -72,8 +73,39 @@ pub struct MaterializeRequest<'a> {
     pub binary: BinarySource,
     /// Override `--setting-sources`. Default `user,project,local`.
     pub setting_sources: Option<Vec<String>>,
-    /// Who originated this launch. Bot specs cannot request bypass/yolo.
-    pub origin: InputOrigin,
+    /// Who originated this launch. Bot/dispatcher specs cannot request bypass/yolo.
+    pub origin: LaunchOrigin,
+}
+
+/// Origin used to gate yolo/bypass. Dispatcher commands are [`CommandOrigin::Bot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaunchOrigin {
+    /// Human UI/CLI (and other non-bot command origins).
+    #[default]
+    Human,
+    /// Bot or dispatcher path. Cannot request bypass (D-011).
+    Bot,
+}
+
+impl From<InputOrigin> for LaunchOrigin {
+    fn from(value: InputOrigin) -> Self {
+        match value {
+            InputOrigin::Human => Self::Human,
+            InputOrigin::Bot | InputOrigin::Agent => Self::Bot,
+        }
+    }
+}
+
+impl From<CommandOrigin> for LaunchOrigin {
+    fn from(value: CommandOrigin) -> Self {
+        match value {
+            CommandOrigin::Bot => Self::Bot,
+            CommandOrigin::Ui | CommandOrigin::Cli | CommandOrigin::Mcp | CommandOrigin::System => {
+                Self::Human
+            }
+        }
+    }
 }
 
 /// Materialize `spec` + `profile` into a durable recipe and 0600 overlay files.
@@ -428,12 +460,11 @@ fn resolve_model(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult
 
 fn permission_plan(
     spec: &InstanceSpec,
-    origin: InputOrigin,
+    origin: LaunchOrigin,
 ) -> DriverResult<(RecipePermission, Vec<String>, ApprovalAuthority)> {
     match &spec.permission_mode {
         PermissionMode::Claude(claude) => {
-            if claude.mode == ClaudePermissionMode::BypassPermissions
-                && matches!(origin, InputOrigin::Bot | InputOrigin::Agent)
+            if claude.mode == ClaudePermissionMode::BypassPermissions && origin == LaunchOrigin::Bot
             {
                 return Err(DriverError::BypassNotAllowedForBot);
             }

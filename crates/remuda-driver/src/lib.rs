@@ -6,6 +6,7 @@
 
 mod binary;
 mod capabilities;
+pub mod claude_print;
 mod driver;
 mod error;
 mod flags;
@@ -23,7 +24,9 @@ pub use capabilities::{
 };
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
-pub use materializer::{BinarySource, MaterializeRequest, SessionAction, materialize};
+pub use materializer::{
+    BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, materialize,
+};
 pub use process::current_process_identity;
 pub use profile::{
     Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind, ProviderProfile, Secret,

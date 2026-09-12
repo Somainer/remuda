@@ -1,13 +1,13 @@
 //! Launch materializer: idempotency, secret omission, banned flags, binary pin.
 
 use remuda_driver::{
-    BinarySource, Delegation, DriverError, LaunchRecipe, MaterializeRequest, ProviderHealth,
-    ProviderKind, ProviderProfile, SecretRef, SessionAction, TECH_DEBT_M0_PERM_01, materialize,
-    pin_binary,
+    BinarySource, Delegation, DriverError, LaunchOrigin, LaunchRecipe, MaterializeRequest,
+    ProviderHealth, ProviderKind, ProviderProfile, SecretRef, SessionAction, TECH_DEBT_M0_PERM_01,
+    materialize, pin_binary,
 };
 use remuda_protocol::{
-    ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, DriverKind, EnvBinding,
-    EnvVisibility, Id, InputOrigin, InstanceSpec, LiteralEnv, PermissionMode,
+    ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, CommandOrigin, DriverKind,
+    EnvBinding, EnvVisibility, Id, InstanceSpec, LiteralEnv, PermissionMode,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -66,7 +66,7 @@ fn request<'a>(
         launch_id: Id::new("launch").unwrap(),
         binary,
         setting_sources: None,
-        origin: InputOrigin::Human,
+        origin: LaunchOrigin::Human,
     }
 }
 
@@ -415,12 +415,12 @@ fn bot_origin_rejects_bypass() {
     }));
     let profile = native_profile();
     let mut req = request(&spec, &profile, &launch, &home, pin_source(&binary));
-    req.origin = InputOrigin::Bot;
+    req.origin = CommandOrigin::Bot.into();
     let error = materialize(&req).unwrap_err();
     assert!(matches!(error, DriverError::BypassNotAllowedForBot));
     assert!(
         error
             .to_string()
-            .contains("not allowed for bot-originated specs")
+            .contains("not allowed for bot/dispatcher-originated specs")
     );
 }

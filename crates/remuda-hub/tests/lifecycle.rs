@@ -329,3 +329,157 @@ async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
     assert_eq!(view["activity"], json!("idle"));
     Ok(())
 }
+
+#[tokio::test]
+async fn pty_create_stays_accepted_with_a_queued_prompt_and_native_dialog() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0",
+                "host": { "herdr": { "version": "0.9.0" } }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    assert!(recv_json(&mut node).await?.get("result").is_some());
+
+    let create_cookie = cookie.clone();
+    let create = tokio::spawn(async move {
+        http(
+            addr,
+            "POST",
+            "/v1/instances",
+            &[("Cookie", &create_cookie)],
+            Some(
+                &json!({
+                    "hostId": host_id.as_id().as_str(), "kind": "claude",
+                    "driver": "claude-pty", "delegation": "none",
+                    "permissionMode": "bypass", "prompt": "Reply with exactly PONG."
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    });
+    let request = recv_json(&mut node).await.context("forwarded PTY create")?;
+    assert_eq!(request["method"], "instance.create");
+    let instance_id = request["params"]["instanceId"]
+        .as_str()
+        .context("instanceId")?;
+    let command_id = request["params"]["commandId"]
+        .as_str()
+        .context("commandId")?;
+    // The fake Node has launched the PTY, but control is blocked on its trust
+    // dialog. Resource creation settles successfully while native input waits.
+    let interaction_id = remuda_protocol::InteractionId::new();
+    for (rpc_id, event) in [
+        (
+            "ready",
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "entity", "state": "ready", "reasonCode": "driver-started"
+            }}),
+        ),
+        (
+            "queued",
+            json!({ "kind": "message", "payload": {
+                "operation": "open", "nodeId": "nod_queued", "revision": "1",
+                "baseRevision": null,
+                "messageId": "msg_queued", "role": "user", "status": "queued",
+                "blocks": [{ "type": "text", "text": "Reply with exactly PONG." }]
+            }}),
+        ),
+        (
+            "dialog",
+            json!({ "kind": "interaction.requested", "payload": { "interaction": {
+                "id": interaction_id.as_id().as_str(), "kind": "question",
+                "state": "pending", "blocking": true, "carrier": "native-tty",
+                "prompt": "Quick safety check: Is this a project you created or one you trust?"
+            }}}),
+        ),
+        (
+            "settled",
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "entity", "entityType": "command", "state": "settled",
+                "entity": { "commandId": command_id, "operation": "instance.create",
+                    "state": "settled", "settlement": { "state": "known", "value": {
+                        "outcome": "completed", "error": null
+                    }}
+                }
+            }}),
+        ),
+    ] {
+        append(&mut node, rpc_id, instance_id, event)
+            .await
+            .with_context(|| format!("append {rpc_id}"))?;
+    }
+
+    // Mirroring may outrun the RPC receipt. The Hub must preserve the successful
+    // settlement even though the queued prompt and native dialog remain pending.
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": request["id"],
+            "result": { "command": { "commandId": command_id, "state": "accepted" } }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let (status, _, body) = tokio::time::timeout(TIMEOUT, create).await???;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(created["command"]["state"], "settled");
+    assert_eq!(created["command"]["resolution"], "clear");
+
+    let view = get_instance(addr, &cookie, instance_id).await?;
+    assert_eq!(view["lifecycle"], "running", "{view}");
+    assert_eq!(view["activity"], "blocked", "{view}");
+    assert!(view["lastError"].is_null(), "{view}");
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        "/v1/interactions",
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let pending: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(pending["items"][0]["state"], "pending");
+    assert_eq!(pending["items"][0]["kind"], "question");
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}/journal"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let journal: Value = serde_json::from_str(body.trim())?;
+    let events = journal["events"].as_array().context("journal events")?;
+    assert_eq!(events[1]["event"]["payload"]["status"], "queued");
+    assert_eq!(
+        events[3]["event"]["payload"]["entity"]["settlement"]["value"]["outcome"],
+        "completed"
+    );
+    assert_eq!(
+        events[3]["event"]["payload"]["entity"]["commandId"],
+        command_id
+    );
+    node.close(None).await?;
+    hub.shutdown().await;
+    Ok(())
+}

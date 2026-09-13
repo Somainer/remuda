@@ -24,6 +24,8 @@ use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tokio::sync::{RwLock, mpsc};
 
+mod pty_queue;
+
 struct QueuedCommand {
     command_id: CommandId,
     request: DriverRequest,
@@ -252,6 +254,7 @@ impl DevNode {
                 instance: instance.clone(),
                 request: request.clone(),
                 workspace_root,
+                registered_workspace_root: self.inner.workspace.root_path.clone().into(),
             },
         )?;
         self.inner.store.insert_instance(instance)?;
@@ -479,6 +482,7 @@ impl DevNode {
         let interactions = Arc::clone(&self.inner.interactions);
         let tty = self.inner.tty.clone();
         let worker_instance = instance_id.clone();
+        let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(materialize_instance(
                 store.clone(),
@@ -501,6 +505,13 @@ impl DevNode {
                 Err(_) => {
                     record_task_exit(store.as_ref(), &worker_instance, "driver-task-panicked")
                 }
+            }
+            if store
+                .get_instance(&worker_instance)
+                .is_ok_and(|instance| instance.lifecycle == InstanceLifecycle::Exited)
+                && let Some(node) = node.upgrade()
+            {
+                node.senders.write().await.remove(&worker_instance);
             }
         });
         self.inner.workers.lock().await.insert(instance_id, worker);
@@ -525,12 +536,20 @@ impl DevNode {
         let store = self.inner.store.clone();
         let interactions = Arc::clone(&self.inner.interactions);
         let id = instance_id.clone();
+        let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             if let Err(error) =
                 instance_worker(store.clone(), id.clone(), driver, receiver, interactions).await
             {
                 tracing::error!(%error, "adopted instance task exited");
                 record_task_exit(store.as_ref(), &id, "driver-task-exited");
+            }
+            if store
+                .get_instance(&id)
+                .is_ok_and(|instance| instance.lifecycle == InstanceLifecycle::Exited)
+                && let Some(node) = node.upgrade()
+            {
+                node.senders.write().await.remove(&id);
             }
         });
         self.inner.workers.lock().await.insert(instance_id, worker);
@@ -564,7 +583,7 @@ impl DevNode {
             request,
             close_after,
         });
-        if close_after {
+        if close_after && !pty_queue::is_pty(self.inner.store.get_instance(instance_id)?.driver) {
             self.inner.senders.write().await.remove(instance_id);
         }
         Ok(command)
@@ -680,6 +699,19 @@ async fn materialize_instance(
         "driver-started",
     )?;
 
+    if pty_queue::is_pty(driver.kind()) {
+        let result = pty_queue::run(
+            store,
+            instance_id.clone(),
+            driver,
+            receiver,
+            interactions,
+            Some((create_command, initial_prompt)),
+        )
+        .await;
+        tty.stop(&instance_id).await;
+        return result;
+    }
     if initial_prompt.is_empty() {
         settle_without_driver(store.as_ref(), &instance_id, &mut create_command)?;
     } else {
@@ -744,6 +776,9 @@ async fn instance_worker(
     mut receiver: mpsc::Receiver<QueuedCommand>,
     interactions: Arc<InteractionRuntime>,
 ) -> Result<(), NodeError> {
+    if pty_queue::is_pty(driver.kind()) {
+        return pty_queue::run(store, instance_id, driver, receiver, interactions, None).await;
+    }
     while let Some(queued) = receiver.recv().await {
         let close_after = queued.close_after;
         execute_queued(
@@ -856,7 +891,9 @@ async fn execute_queued(
                 Completeness::Structured,
                 diagnostic.into_payload()?,
             )?;
-            record_task_exit(store.as_ref(), instance_id, &error.to_string());
+            if !pty_queue::is_pty(driver.kind()) {
+                record_task_exit(store.as_ref(), instance_id, &error.to_string());
+            }
             settle_command(
                 &mut command,
                 SettlementOutcome::Rejected,

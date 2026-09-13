@@ -46,6 +46,8 @@ pub struct NativeDriverConfig {
     pub herdr_session: String,
     /// Close unknown panes on startup; disable only for deliberate manual recovery.
     pub herdr_orphan_sweep: bool,
+    /// Automatically accept the exact Claude folder-trust dialog for registered workspaces.
+    pub auto_trust_registered_workspaces: bool,
     /// Claude print initialize timeout.
     pub print_handshake_timeout: Duration,
     /// Non-secret development environment forwarded to drivers.
@@ -79,6 +81,7 @@ impl NativeDriverConfig {
                 .unwrap_or_else(|_| "remuda-node".to_owned()),
             herdr_orphan_sweep: !std::env::var("REMUDA_HERDR_ORPHAN_SWEEP")
                 .is_ok_and(|v| matches!(v.as_str(), "0" | "false")),
+            auto_trust_registered_workspaces: true,
             print_handshake_timeout: Duration::from_secs(30),
             extra_env,
         }
@@ -248,6 +251,10 @@ impl DriverFactory for NativeClaudeFactory {
                 options.herdr_binary = self.config.herdr_binary.clone();
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay.clone();
+                options.auto_trust_registered_workspace = self
+                    .config
+                    .auto_trust_registered_workspaces
+                    && cwd_is_registered(&launch.workspace_root, &launch.registered_workspace_root);
                 Arc::new(ClaudePtyDriver::new(options))
             }
             DriverKind::ClaudeBg => {
@@ -291,6 +298,16 @@ impl DriverFactory for NativeClaudeFactory {
             recipe: std::sync::Mutex::new(None),
             startup_error: std::sync::Mutex::new(None),
         }))
+    }
+}
+
+fn cwd_is_registered(cwd: &Path, registered_root: &Path) -> bool {
+    match (
+        std::fs::canonicalize(cwd),
+        std::fs::canonicalize(registered_root),
+    ) {
+        (Ok(cwd), Ok(root)) => cwd.starts_with(root),
+        _ => false,
     }
 }
 
@@ -785,7 +802,10 @@ fn instance_spec(
 }
 
 fn map_driver_error(error: remuda_driver::DriverError) -> DriverError {
-    DriverError::Failed(error.to_string())
+    match error {
+        remuda_driver::DriverError::ControlUnavailable => DriverError::ControlUnavailable,
+        other => DriverError::Failed(other.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -793,6 +813,27 @@ mod tests {
     use super::*;
     use crate::runtime::fixture_instance;
     use remuda_protocol::{AgentKind, HostId, InstanceId, WorkspaceId};
+
+    #[test]
+    fn automatic_trust_requires_canonical_registered_containment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let child = root.join("subdirectory");
+        let sibling = dir.path().join("repo-other");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(NativeDriverConfig::new(dir.path().into()).auto_trust_registered_workspaces);
+        assert!(cwd_is_registered(&root, &root));
+        assert!(cwd_is_registered(&child, &root));
+        assert!(!cwd_is_registered(&sibling, &root));
+        assert!(!cwd_is_registered(&root.join("missing"), &root));
+        #[cfg(unix)]
+        {
+            let escape = root.join("escape");
+            std::os::unix::fs::symlink(&sibling, &escape).unwrap();
+            assert!(!cwd_is_registered(&escape, &root));
+        }
+    }
 
     #[test]
     fn registry_constructs_all_three_native_claude_drivers() {
@@ -837,6 +878,7 @@ mod tests {
                         instance,
                         request,
                         workspace_root: dir.path().to_path_buf(),
+                        registered_workspace_root: dir.path().to_path_buf(),
                     },
                 )
                 .expect("build driver");
@@ -952,6 +994,7 @@ mod tests {
                     instance,
                     request,
                     workspace_root: dir.path().to_path_buf(),
+                    registered_workspace_root: dir.path().to_path_buf(),
                 },
             )
             .expect("user overlay must be accepted while generated overlay is unavailable");
@@ -997,6 +1040,7 @@ mod tests {
                 instance,
                 request,
                 workspace_root: dir.path().to_path_buf(),
+                registered_workspace_root: dir.path().to_path_buf(),
             },
         ) {
             Ok(_) => panic!("gateway without overlay must fail closed"),
@@ -1051,6 +1095,7 @@ mod tests {
                 instance,
                 request,
                 workspace_root: dir.path().to_path_buf(),
+                registered_workspace_root: dir.path().to_path_buf(),
             },
         ) {
             Ok(_) => panic!("wrong-host scoped overlay must fail"),

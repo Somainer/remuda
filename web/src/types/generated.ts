@@ -552,7 +552,7 @@ export type ContentBlock = (TextBlock & ({
 }));
 
 /** ContentStatus wire values; `protocol.md` §5.2. */
-export type ContentStatus = ("streaming" | "complete" | "interrupted" | "unknown");
+export type ContentStatus = ("queued" | "streaming" | "complete" | "interrupted" | "unknown");
 
 /** ConversationNode; `protocol.md` §7.3. */
 export type ConversationNode = (({

@@ -40,8 +40,6 @@ use tracing::info;
 
 /// Last N screen lines stored on each journal snapshot.
 const SCREEN_SNAPSHOT_LINES: usize = 80;
-/// How long [`Driver::wait_control`] waits for a live pane.
-const CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Per-kind PTY launch conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +538,7 @@ impl GenericPtyDriver {
             ctx.clone(),
             tx.clone(),
             Arc::clone(&self.seq),
+            false,
         );
         let interaction_task = interactions.spawn();
         let status_task = spawn_status_pump(
@@ -615,20 +614,11 @@ impl Driver for GenericPtyDriver {
     }
 
     async fn wait_control(&self) -> DriverResult<()> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::SeqCst) || !*self.ready.borrow() {
             return Err(DriverError::ControlUnavailable);
         }
-        if !*self.ready.borrow() {
-            let mut rx = self.ready.subscribe();
-            tokio::time::timeout(CONTROL_READY_TIMEOUT, rx.wait_for(|ready| *ready))
-                .await
-                .map_err(|_| DriverError::ControlUnavailable)?
-                .map_err(|_| DriverError::ControlUnavailable)?;
-        }
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(DriverError::ControlUnavailable);
-        }
-        Ok(())
+        let (client, agent_name) = self.live_client().await?;
+        crate::pty_interaction::prompt_ready(&client, &agent_name).await
     }
 
     async fn attach(&self, _native_ref: NativeRef) -> DriverResult<DriverAck> {
@@ -938,27 +928,16 @@ fn last_n_lines(text: &str, n: usize) -> String {
 }
 
 async fn prompt_when_ready(client: &Client, agent_name: &str, text: &str) -> DriverResult<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match client
-            .agent_prompt(AgentPromptParams {
-                target: agent_name.to_owned(),
-                text: text.to_owned(),
-                wait: None,
-            })
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                let mapped = map_prompt_herdr(err);
-                if !matches!(mapped, DriverError::ControlUnavailable) || Instant::now() >= deadline
-                {
-                    return Err(mapped);
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
+    crate::pty_interaction::prompt_ready(client, agent_name).await?;
+    client
+        .agent_prompt(AgentPromptParams {
+            target: agent_name.to_owned(),
+            text: text.to_owned(),
+            wait: None,
+        })
+        .await
+        .map_err(map_prompt_herdr)?;
+    Ok(())
 }
 
 /// Prefix / substring matcher used for `^DONE ` without a regex crate.

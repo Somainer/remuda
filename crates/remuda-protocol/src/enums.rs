@@ -454,6 +454,7 @@ wire_enum!(MessagePhase, "5.2", {
 });
 
 wire_enum!(ContentStatus, "5.2", {
+    Queued => "queued",
     Streaming => "streaming",
     Complete => "complete",
     Interrupted => "interrupted",

@@ -102,6 +102,7 @@ pub(crate) async fn run(
     hello.params.host.host_id = load_or_create_host_id(&node_dir)?;
     if args.stdio {
         let mut native = remuda_node::NativeDriverConfig::new(config.data_dir.clone());
+        native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
         native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
         native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
         std::fs::create_dir_all(&config.node.workspace)?;
@@ -137,6 +138,7 @@ pub(crate) async fn run(
     let http = DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone());
     let mut service = ServeConfig::native(http, config.data_dir.clone());
     if let remuda_node::LocalDrivers::Native(native) = &mut service.drivers {
+        native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
         native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
     }
     let runtime = compose(&service)?;

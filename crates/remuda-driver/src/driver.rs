@@ -124,9 +124,11 @@ pub trait Driver: Send + Sync {
     /// Attach to a live native session. Must not wake a stopped job.
     async fn attach(&self, native_ref: NativeRef) -> DriverResult<DriverAck>;
 
-    /// Block until [`Self::send`] can reach the native control channel.
+    /// Check whether [`Self::send`] can reach the native control channel.
     ///
-    /// Default is immediate. PTY drivers wait until the pane is live.
+    /// Default is immediate. PTY drivers probe without waiting for startup or
+    /// dialogs, returning [`crate::DriverError::ControlUnavailable`] before dispatch so
+    /// the Node can retain queued input and keep other control operations usable.
     async fn wait_control(&self) -> DriverResult<()> {
         Ok(())
     }

@@ -770,12 +770,12 @@ type MessagePayload = NodeMutation & {
   targetBlock: number|null;
   parentToolCallId: Id|null;
   nativeOrigin: Knowledge<string>;
-  status: "streaming"|"complete"|"interrupted"|"unknown";
+  status: "queued"|"streaming"|"complete"|"interrupted"|"unknown";
 };
 type ThoughtPayload = NodeMutation & {
   thoughtId: Id; representation: "summary"|"text"|"redacted";
   text: string|null; partIndex: number;
-  status: "streaming"|"complete"|"interrupted"|"unknown";
+  status: "queued"|"streaming"|"complete"|"interrupted"|"unknown";
 };
 type ToolCallPayload = NodeMutation & {
   toolCallId: Id; parentToolCallId: Id|null;
@@ -795,6 +795,8 @@ type ToolResultPayload = NodeMutation & {
 ~~~
 
 open 的 revision 为 1、baseRevision 为 null；append/replace/close 的 revision 必须是当前 node revision+1，baseRevision 必须匹配。append 的 blocks 只包含新增内容，targetBlock 指向已有文本块；完整原生 message/item 到达时用 replace，再 close，不能把完整文本再 append 一遍。replace 给出完整当前值，空数组表示确实为空。Claude 对同一 message.id 分块发送的 assistant records 由专用 adapter 合并 content block ID/index，不覆盖此前已经观察到的另一 tool_use。某些源没有可确定 delta 语义时只做完整快照 replace 或 opaque。
+
+PTY 输入因原生交互或 control 尚未就绪而等待时，Node 以 user message 的 `status: "queued"` 记录待发文本；确认写入后用相同 node/message ID 的 replace 更新为 `complete`。这里的 complete 仅证明输入已发送，不证明 assistant turn 完成。排队期间 `instance.create` 可结算 accepted，Instance 保持 ready，原生阻塞交互仍可回答；未发送即取消/关闭的消息更新为 interrupted。`queued` 不用于 thought。
 
 同一 node 的 source 优先级由字段定义：结构化 native item/message 负责内容和最终 tool 结果；hook 负责它自身的前后事件和交互请求；screen 只负责展示提示。低信息来源不能把高信息值改成空值。usage 不随 message replace 被累加第二次。thought 只显示原生实际输出的文本/summary，redacted thinking 保存 redaction 标记，不尝试恢复隐藏内容。
 

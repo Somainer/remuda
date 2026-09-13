@@ -294,3 +294,102 @@ async fn same_kind_instances_keep_prompt_and_key_ownership() {
         second.close().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn claude_trust_is_auto_answered_only_when_node_enabled_it() {
+    for enabled in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("herdr");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
+        fake_options.script = FakeHerdrScript::Trust;
+        let _fake = FakeHerdrServer::spawn(fake_options).unwrap();
+        let bin = install_executable(dir.path(), "native-stub", "#!/bin/sh\necho 'stub 1.0'\n");
+        let profile = ProviderProfile {
+            id: Id::new("pvp").unwrap(),
+            kind: ProviderKind::Anthropic,
+            base_url: String::new(),
+            delegation: Delegation::None,
+            secret_ref: None,
+            models: vec!["default".into()],
+            health: ProviderHealth::Healthy,
+        };
+        let mut options = ClaudePtyOptions::new(
+            profile,
+            dir.path().join("launch"),
+            dir.path().join("home"),
+            BinarySource::Pinned(pin_binary(&bin).unwrap()),
+        );
+        options.socket_dir = Some(socket_dir.clone());
+        options.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
+        options.auto_trust_registered_workspace = enabled;
+        let driver = ClaudePtyDriver::new(options);
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ClaudePty;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        let mut handle = driver.start(spec).await.unwrap();
+        let interaction = requested(&mut handle).await;
+        assert!(interaction.blocking);
+        let client = remuda_herdr::Client::connect(socket_dir.join("herdr.sock"));
+        let pane = handle.ack().native_ids["paneId"].clone();
+        if enabled {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let observation = handle.recv().await.unwrap();
+                    if let ObservationPayload::Lifecycle(payload) = observation.body
+                        && let LifecyclePayload::Native(native) = *payload
+                        && native.native_name == "trust-dialog"
+                    {
+                        assert!(matches!(native.status, Knowledge::Known { value }
+                            if value == "trust-dialog auto-accepted (registered workspace)"));
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                driver.wait_control().await,
+                Err(remuda_driver::DriverError::ControlUnavailable)
+            ));
+            std::fs::write(
+                dir.path().join("launch/session-meta.json"),
+                serde_json::json!({
+                    "session_id": "fixture-session",
+                    "transcript_path": dir.path().join("transcript.jsonl"),
+                    "hook_event_name": "SessionStart",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while driver.wait_control().await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            assert!(matches!(
+                driver.wait_control().await,
+                Err(remuda_driver::DriverError::ControlUnavailable)
+            ));
+        }
+        let screen = client
+            .agent_read(remuda_herdr::AgentReadParams {
+                target: pane,
+                source: remuda_herdr::ReadSource::Visible,
+                lines: Some(32),
+                format: remuda_herdr::ReadFormat::Text,
+                strip_ansi: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            screen.text().matches("KEYS down enter").count(),
+            usize::from(enabled)
+        );
+        driver.close().await.unwrap();
+    }
+}

@@ -1,3 +1,4 @@
 # remuda-driver fixtures
 
 - `instance-spec.json` — copied from `crates/remuda-protocol/tests/fixtures/instance-spec.json` (`protocol.md` §4.1).
+- `claude-print-stream.jsonl` — 23 ordered stdout frames recorded on 2026-09-13 from a real `remuda dev` Claude print session with `--include-partial-messages`. The short Chinese prompt asked why streaming replies should merge into one message. This preserves the actual delta boundaries, empty thinking block, singleton assistant snapshots before each `content_block_stop`, and final result. Native message identity is replaced by `msg_recorded_stream_1`; per-frame UUIDs are distinct deterministic placeholders because the sanitized capture omitted the original identifiers. Thinking signature material is replaced by `recorded-signature-redacted`. No credentials, personal paths, or native account/session identifiers are retained. Live before/after evidence is in `docs/design/evidence/print-stream-1.md`.

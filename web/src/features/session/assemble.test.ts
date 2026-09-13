@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Observation, ToolCallPayload } from "../../types/observation";
+import type { MessagePayload, Observation, ToolCallPayload } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { assembleTranscript, compactTranscript, diffState } from "./assemble";
 
@@ -56,7 +56,77 @@ function call(name: string, toolCallId: string): ToolCallPayload {
   };
 }
 
+function message(seq: number, text: string, extra: Partial<MessagePayload> = {}): Observation {
+  return obs(seq, "message", {
+    nodeId: "message-node", messageId: "message", role: "assistant", phase: "final",
+    revision: String(seq), baseRevision: seq === 1 ? null : String(seq - 1),
+    operation: seq === 1 ? "open" : "append", status: "streaming",
+    blocks: [{ type: "text", text }], targetBlock: 0,
+    parentToolCallId: null, nativeOrigin: known("assistant"), ...extra,
+  });
+}
+
 describe("assembleTranscript", () => {
+  it("keeps one bubble through targeted deltas, replay, and complete snapshots", () => {
+    const events = [
+      message(1, "", { blocks: [{ type: "text", text: "Header" }, { type: "text", text: "我" }] }),
+      message(2, "先", { targetBlock: 1 }),
+      message(3, "看看", { targetBlock: 1 }),
+    ];
+    expect(assembleTranscript(events)).toMatchObject([{ id: "message", text: "Header\n我先看看", status: "streaming" }]);
+    events.push(events[1], message(4, "", {
+      operation: "replace", targetBlock: null,
+      blocks: [{ type: "text", text: "Header" }, { type: "text", text: "我先看看仓库。" }],
+    }), message(5, "", { operation: "close", blocks: [], status: "complete" }), events[2]);
+    expect(assembleTranscript(events)).toMatchObject([{ id: "message", text: "Header\n我先看看仓库。", status: "complete" }]);
+  });
+
+  it("uses node identity as a fallback, rejects missing delta bases, and accepts empty replacement", () => {
+    expect(assembleTranscript([
+      message(1, "first"),
+      message(3, "missing-base"),
+      message(4, "final", { operation: "close", messageId: "renamed", status: "complete" }),
+    ])).toMatchObject([{ id: "message", text: "final", status: "complete" }]);
+    expect(assembleTranscript([message(1, "first"), message(2, "", { operation: "replace", blocks: [] })]))
+      .toMatchObject([{ text: "" }]);
+  });
+
+  it("leaves historical fragments with distinct identities separate", () => {
+    expect(assembleTranscript([
+      message(1, "我"),
+      message(2, "先", { nodeId: "another-node", messageId: "another-message", operation: "open", revision: "1", baseRevision: null }),
+    ]).filter((node) => node.type === "message").map((node) => node.text)).toEqual(["我", "先"]);
+  });
+
+  it("assembles thinking deltas without duplicating the final snapshot", () => {
+    const thought = (seq: number, text: string, operation: "open" | "append" | "close") => obs(seq, "thought", {
+      nodeId: "thinking-node", thoughtId: "thinking", revision: String(seq),
+      baseRevision: seq === 1 ? null : String(seq - 1), operation,
+      representation: "text", text, partIndex: 0, status: operation === "close" ? "complete" : "streaming",
+    });
+    const events = [thought(1, "Check", "open"), thought(2, " files", "append")];
+    expect(assembleTranscript(events)).toMatchObject([{ type: "thought", id: "thinking", text: "Check files" }]);
+    expect(assembleTranscript([...events, events[1], thought(3, "Check files", "close"), events[0]]))
+      .toMatchObject([{ type: "thought", id: "thinking", text: "Check files" }]);
+  });
+
+  it("keeps streamed tool input and its separate result node in one card", () => {
+    const initial = call("Bash", "call");
+    const firstDelta = { ...initial, revision: "2", baseRevision: "1", operation: "append", input: unknownKnowledge("partial"), inputTextDelta: '{"command":' };
+    const events = [obs(1, "tool_call", initial), obs(2, "tool_call", firstDelta), obs(3, "tool_call", {
+      ...firstDelta, revision: "3", baseRevision: "2", inputTextDelta: '"pwd"}',
+    })];
+    expect(assembleTranscript([...events, events[1]])).toMatchObject([{ type: "tool", call: { inputTextDelta: '{"command":"pwd"}' } }]);
+    events.push(obs(4, "tool_call", { ...initial, operation: "replace", revision: "4", baseRevision: "3", input: known({ command: "pwd" }) }),
+      obs(5, "tool_call", { ...initial, operation: "close", revision: "5", baseRevision: "4", input: known({ command: "pwd" }) }),
+      obs(6, "tool_result", {
+        nodeId: "result-node", toolCallId: "call", revision: "1", baseRevision: null, operation: "open",
+        blocks: [{ type: "text", text: "/workspace" }], stage: "final", outcome: "succeeded", changes: [],
+        structuredResult: unknownKnowledge("text"), exitCode: known(0),
+      }));
+    expect(assembleTranscript(events)).toMatchObject([{ type: "tool", call: { input: known({ command: "pwd" }) }, result: { nodeId: "result-node", outcome: "succeeded" } }]);
+  });
+
   it("pairs tool call/result and keeps opaque + workflow phase", () => {
     const events = [
       obs(1, "message", {

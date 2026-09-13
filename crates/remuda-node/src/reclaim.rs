@@ -40,6 +40,16 @@ impl DevNode {
     /// Adopt known live panes and sweep orphans before accepting new commands.
     /// No prompt, approval, start, or semantic resume is replayed here.
     pub async fn reconcile_herdr(&self) -> Result<(), NodeError> {
+        self.reconcile_herdr_with(remuda_herdr::RetryPolicy::default())
+            .await
+    }
+
+    /// [`Self::reconcile_herdr`] with an explicit budget for waiting out a
+    /// previous Node's session server.
+    pub(crate) async fn reconcile_herdr_with(
+        &self,
+        policy: remuda_herdr::RetryPolicy,
+    ) -> Result<(), NodeError> {
         let Some(config) = &self.inner.herdr_config else {
             return Ok(());
         };
@@ -48,11 +58,7 @@ impl DevNode {
                 "Node reclamation requires an isolated Herdr session".into(),
             ));
         }
-        let socket = config
-            .herdr_socket_dir
-            .as_ref()
-            .map(|dir| dir.join("herdr.sock"))
-            .unwrap_or_else(|| remuda_herdr::session_sockets(&config.herdr_session).api);
+        let socket = crate::carrier_recovery::herdr_socket(config);
         let resources = self.inner.store.pty_resources()?;
         if !socket.exists() {
             for resource in resources.iter().filter(|r| r.socket_path == socket) {
@@ -64,7 +70,27 @@ impl DevNode {
             return Ok(());
         }
         let client = remuda_herdr::Client::connect(&socket).with_timeout(Duration::from_secs(2));
-        let snapshot = client.session_snapshot().await.map_err(node_error)?;
+        // A socket left by the *previous* Node may still be attached to a
+        // server that is shutting down: it answers `ping` but refuses real
+        // work with `server_unavailable`. Reconciling against it used to abort
+        // Node startup entirely, so wait it out and treat the panes as gone.
+        let snapshot = match wait_for_snapshot(&client, policy).await {
+            Ok(snapshot) => snapshot,
+            Err(CarrierWait::Gone) => {
+                tracing::warn!(
+                    socket = %socket.display(),
+                    "previous herdr server shut down during reconciliation; its panes are gone"
+                );
+                for resource in resources.iter().filter(|r| r.socket_path == socket) {
+                    self.inner.store.remove_pty_resource(&resource.key())?;
+                    if let Some(id) = &resource.instance_id {
+                        self.mark_exited(id, "carrier-shutdown")?;
+                    }
+                }
+                return Ok(());
+            }
+            Err(CarrierWait::Failed(error)) => return Err(error),
+        };
         let agents = client.agent_list().await.map_err(node_error)?.agents;
         let mut adopted = BTreeSet::new();
         let mut adopted_panes = BTreeSet::new();
@@ -291,6 +317,47 @@ impl Driver for AdoptedPty {
 
 fn node_error(error: impl std::fmt::Display) -> NodeError {
     NodeError::Driver(error.to_string())
+}
+
+/// Why a bounded snapshot wait did not produce a snapshot.
+enum CarrierWait {
+    /// The predecessor finished shutting down (or never came back): there is
+    /// nothing to adopt.
+    Gone,
+    /// A genuine failure the caller should surface.
+    Failed(NodeError),
+}
+
+/// Read a session snapshot, waiting out a predecessor that is shutting down.
+///
+/// Returns [`CarrierWait::Gone`] once the endpoint stops answering at all,
+/// which is the normal end of a restart race: the old server exited and took
+/// its panes with it.
+async fn wait_for_snapshot(
+    client: &remuda_herdr::Client,
+    policy: remuda_herdr::RetryPolicy,
+) -> Result<remuda_herdr::SessionSnapshot, CarrierWait> {
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        match client.session_snapshot().await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) if error.is_server_unavailable() => {
+                let Some(backoff) = policy.backoff(attempt, started.elapsed()) else {
+                    tracing::warn!(
+                        waited_secs = policy.max_wait().as_secs(),
+                        "previous herdr server never finished shutting down"
+                    );
+                    return Err(CarrierWait::Gone);
+                };
+                tokio::time::sleep(backoff).await;
+                attempt = attempt.saturating_add(1);
+            }
+            // The socket went away mid-wait: the predecessor is gone.
+            Err(error) if error.is_transient_carrier() => return Err(CarrierWait::Gone),
+            Err(error) => return Err(CarrierWait::Failed(node_error(error))),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -151,11 +151,13 @@ async fn call_inner(socket: &Path, request: &RpcRequest) -> Result<Value, Error>
     }
 }
 
+/// A dial that never landed. Distinct from [`Error::Disconnected`], which can
+/// only happen after the request bytes are already on the wire.
 fn map_connect(socket: &Path, err: std::io::Error) -> Error {
     match err.kind() {
         std::io::ErrorKind::NotFound
         | std::io::ErrorKind::ConnectionRefused
-        | std::io::ErrorKind::BrokenPipe => Error::Disconnected {
+        | std::io::ErrorKind::BrokenPipe => Error::Unreachable {
             socket: socket.to_path_buf(),
         },
         _ => Error::Io(err),

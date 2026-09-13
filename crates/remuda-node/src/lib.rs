@@ -2,6 +2,7 @@
 
 mod attachments;
 mod carrier;
+mod carrier_recovery;
 mod config;
 #[cfg(unix)]
 mod daemon;

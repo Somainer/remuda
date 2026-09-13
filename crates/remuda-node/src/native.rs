@@ -909,6 +909,9 @@ fn instance_spec(
 fn map_driver_error(error: remuda_driver::DriverError) -> DriverError {
     match error {
         remuda_driver::DriverError::ControlUnavailable => DriverError::ControlUnavailable,
+        // Stays a `Failed` so the command settles, but keeps the wording the
+        // carrier supervisor matches on: a lost session server is recoverable,
+        // an agent that is merely busy is not.
         other => DriverError::Failed(other.to_string()),
     }
 }

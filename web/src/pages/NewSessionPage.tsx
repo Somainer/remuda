@@ -34,6 +34,7 @@ import {
   defaultGatewayProfile,
   enabledModels,
   fromHub,
+  groupModels,
   resolveGatewayModel,
   type ProviderProfile,
 } from "../features/providers";
@@ -101,6 +102,9 @@ export function NewSessionPage() {
   // Only a gateway run is constrained to the profile's catalog; native and
   // direct sessions keep the free-text model box.
   const gatewayModels = delegation === "gateway" ? enabledModels(defaultGateway?.models ?? []) : [];
+  // A gateway can publish hundreds of ids; group them the way the Provider
+  // checklist does so the picker stays scannable.
+  const gatewayGroups = groupModels(gatewayModels);
   // The catalog is the source of truth, so derive the choice during render
   // rather than repairing it in the delegation button's click handler: on a
   // slow runner the profile lands after the click, and a model the catalog
@@ -387,18 +391,30 @@ export function NewSessionPage() {
                 <div className={css.selectWrap}>
                   {gatewayModels.length ? (
                     // A gateway profile publishes a catalog; offer only the
-                    // models it exposes rather than a free-text box.
+                    // models it exposes rather than a free-text box. Large
+                    // catalogs are grouped by id prefix, the same buckets the
+                    // Provider checklist uses.
                     <select
                       className={css.select}
                       data-testid="new-session-model"
                       value={gatewayModel ?? model}
                       onChange={(e) => setModel(e.target.value)}
                     >
-                      {gatewayModels.map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.label ? `${m.id} · ${m.label}` : m.id}
-                        </option>
-                      ))}
+                      {gatewayGroups.length > 1
+                        ? gatewayGroups.map((group) => (
+                            <optgroup key={group.key} label={group.key}>
+                              {group.models.map((m) => (
+                                <option key={m.id} value={m.id}>
+                                  {m.label ? `${m.id} · ${m.label}` : m.id}
+                                </option>
+                              ))}
+                            </optgroup>
+                          ))
+                        : gatewayModels.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.label ? `${m.id} · ${m.label}` : m.id}
+                            </option>
+                          ))}
                     </select>
                   ) : (
                     <input

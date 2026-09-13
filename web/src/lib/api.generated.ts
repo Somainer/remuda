@@ -1073,6 +1073,8 @@ export interface components {
             enabled: boolean;
             id: string;
             label?: string | null;
+            /** @description Gateway listings that reported this id (`anthropic`, `openai`). A gateway may serve a different catalog per header, so the probe unions both. Empty for a manually typed id. */
+            surfaces?: string[];
             tags?: string[];
         };
         /** @description A model id, or a structured entry. Bare strings migrate to enabled entries. */

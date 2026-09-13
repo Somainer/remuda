@@ -5,10 +5,13 @@ import {
   contextChip,
   defaultGatewayProfile,
   enabledModels,
+  filterModels,
   formatSecret,
   fromHub,
+  groupModels,
   healthLine,
   mergeDiscovered,
+  modelGroupKey,
   normalizeModels,
   parseModels,
   redactSecretRef,
@@ -173,5 +176,73 @@ describe("resolveGatewayModel", () => {
 
   it("treats a legacy bare id list as fully enabled", () => {
     expect(enabledModels(legacy).map((m) => m.id)).toEqual(["e2e/auto", "e2e/fast"]);
+  });
+});
+
+/**
+ * astergate serves ~300 models across many prefixes, so the checklist and the
+ * New Session picker both group and filter rather than rendering one long list.
+ */
+describe("catalog grouping and filtering", () => {
+  const catalog = normalizeModels([
+    { id: "passthrough/ark/seed-evolving", surfaces: ["openai"] },
+    { id: "passthrough/auto", label: "Auto", surfaces: ["openai"] },
+    { id: "cursor/gpt-5", surfaces: ["openai"] },
+    { id: "gemini-2.5-pro", surfaces: ["openai"] },
+    { id: "claude-opus-5", label: "Opus 5", surfaces: ["openai", "anthropic"] },
+    { id: "claude-haiku-4-5", surfaces: ["anthropic"] },
+    { id: "solo", surfaces: ["openai"] },
+  ]);
+
+  it("buckets an id by everything up to the first slash or dash", () => {
+    expect(modelGroupKey("passthrough/ark/seed-evolving")).toBe("passthrough/");
+    expect(modelGroupKey("cursor/gpt-5")).toBe("cursor/");
+    expect(modelGroupKey("gemini-2.5-pro")).toBe("gemini-");
+    expect(modelGroupKey("claude-opus-5")).toBe("claude-");
+    // An id with neither separator is its own bucket rather than vanishing.
+    expect(modelGroupKey("solo")).toBe("solo");
+  });
+
+  it("groups in first-seen order and keeps every model", () => {
+    const groups = groupModels(catalog);
+    expect(groups.map((g) => g.key)).toEqual([
+      "passthrough/",
+      "cursor/",
+      "gemini-",
+      "claude-",
+      "solo",
+    ]);
+    expect(groups[0].models.map((m) => m.id)).toEqual([
+      "passthrough/ark/seed-evolving",
+      "passthrough/auto",
+    ]);
+    expect(groups.flatMap((g) => g.models)).toHaveLength(catalog.length);
+  });
+
+  it("filters on id or label, case-insensitively", () => {
+    expect(filterModels(catalog, "claude").map((m) => m.id)).toEqual([
+      "claude-opus-5",
+      "claude-haiku-4-5",
+    ]);
+    // Matches the human label too, not just the wire id.
+    expect(filterModels(catalog, "opus 5").map((m) => m.id)).toEqual(["claude-opus-5"]);
+    expect(filterModels(catalog, "SEED").map((m) => m.id)).toEqual([
+      "passthrough/ark/seed-evolving",
+    ]);
+    expect(filterModels(catalog, "  ")).toHaveLength(catalog.length);
+    expect(filterModels(catalog, "nothing-matches")).toHaveLength(0);
+  });
+
+  it("carries the surfaces the Hub reported and survives a re-probe", () => {
+    expect(catalog[4].surfaces).toEqual(["openai", "anthropic"]);
+    // A manual id has no surface at all.
+    expect(normalizeModels([{ id: "typed" }])[0].surfaces).toBeUndefined();
+    // A re-probe restates surfaces rather than accumulating stale ones.
+    const { models } = mergeDiscovered(
+      [{ id: "claude-opus-5", enabled: false, surfaces: ["openai", "anthropic"] }],
+      [{ id: "claude-opus-5", enabled: true, surfaces: ["anthropic"] }],
+    );
+    expect(models[0].surfaces).toEqual(["anthropic"]);
+    expect(models[0].enabled).toBe(false);
   });
 });

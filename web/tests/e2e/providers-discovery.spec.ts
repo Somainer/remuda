@@ -46,21 +46,46 @@ test("discover a gateway catalog, expose two models, and launch with them", asyn
   // The Hub must not echo the token back into the discovery result.
   expect(await response.text()).not.toContain(token);
 
-  await expect(page.getByTestId("provider-model-row")).toHaveCount(3);
-  await expect(page.getByTestId("provider-models-count")).toContainText("3/3 已启用");
+  // The fake upstream answers /v1/models differently per header, so discovery
+  // must union both listings: 3 ids from the plain OpenAI-style one, plus
+  // cursor/e2e-wide only there and claude-e2e-only only in the Anthropic one.
+  await expect(page.getByTestId("provider-model-row")).toHaveCount(5);
+  await expect(page.getByTestId("provider-models-count")).toContainText("5/5 已启用");
   const auto = page.locator('[data-testid=provider-model-row][data-model="e2e/auto"]');
   await expect(auto).toContainText("E2E Auto");
   await expect(auto.getByTestId("provider-model-context")).toHaveText("1m");
+  // Served by both listings, so both surfaces are chipped.
+  await expect(auto.getByTestId("provider-model-surface")).toHaveText(["openai", "anthropic"]);
+  // An id only the Anthropic listing serves would be missed by a single probe.
+  const claudeOnly = page.locator(
+    '[data-testid=provider-model-row][data-model="claude-e2e-only"]',
+  );
+  await expect(claudeOnly.getByTestId("provider-model-surface")).toHaveText(["anthropic"]);
+  // ...and one only the plain listing serves, which the old probe also missed.
+  const cursorOnly = page.locator(
+    '[data-testid=provider-model-row][data-model="cursor/e2e-wide"]',
+  );
+  await expect(cursorOnly.getByTestId("provider-model-surface")).toHaveText(["openai"]);
+  // Ids are bucketed by prefix so a large catalog stays scannable.
+  await expect(page.getByTestId("provider-model-group")).toHaveCount(3);
   // A first probe has no prior catalog, so no row is badged 新增.
   await expect(page.locator('[data-testid=provider-model-row][data-new="1"]')).toHaveCount(0);
   const fast = page.locator('[data-testid=provider-model-row][data-model="e2e/fast"]');
   await expect(fast).toContainText("200k");
   await shot(page, "providers-2-discover-1440.png");
 
-  // Expose two of the three and keep e2e/auto as the default.
+  // The search box narrows a catalog too long to scan.
+  await page.getByTestId("provider-model-search").fill("cursor");
+  await expect(page.getByTestId("provider-model-row")).toHaveCount(1);
+  await page.getByTestId("provider-model-search").fill("");
+  await expect(page.getByTestId("provider-model-row")).toHaveCount(5);
+
+  // Expose two of the five and keep e2e/auto as the default.
   const plain = page.locator('[data-testid=provider-model-row][data-model="e2e/plain"]');
   await plain.getByTestId("provider-model-enabled").uncheck();
-  await expect(page.getByTestId("provider-models-count")).toContainText("2/3 已启用");
+  await cursorOnly.getByTestId("provider-model-enabled").uncheck();
+  await claudeOnly.getByTestId("provider-model-enabled").uncheck();
+  await expect(page.getByTestId("provider-models-count")).toContainText("2/5 已启用");
   await auto.getByTestId("provider-model-default").check();
   await shot(page, "providers-2-checklist-1440.png");
   await page.getByTestId("provider-save").click();
@@ -68,24 +93,24 @@ test("discover a gateway catalog, expose two models, and launch with them", asyn
 
   await page.getByText("e2e-fake-upstream").click();
   await expect(page.getByTestId("provider-detail")).toBeVisible();
-  await expect(page.getByTestId("provider-model-summary")).toContainText("2/3 已启用");
+  await expect(page.getByTestId("provider-model-summary")).toContainText("2/5 已启用");
   await expect(page.getByTestId("provider-default-model")).toContainText("e2e/auto");
   // The saved profile never renders the token.
   await expect(page.locator("body")).not.toContainText(token);
   await expect(page.getByTestId("provider-secret")).toContainText("••••qqqq");
 
-  // /test reports the same catalog the probe found.
+  // /test reports the same unioned catalog the probe found.
   await page.getByTestId("provider-test").click();
-  await expect(page.getByTestId("provider-test-result")).toContainText("3 models");
+  await expect(page.getByTestId("provider-test-result")).toContainText("5 models");
   await shot(page, "providers-2-detail-1440.png");
 
   // Editing re-probes with the stored token: no model is newly discovered and
-  // the unticked one stays hidden.
+  // the unticked ones stay hidden.
   await page.getByTestId("provider-edit").click();
-  await expect(page.getByTestId("provider-model-row")).toHaveCount(3);
+  await expect(page.getByTestId("provider-model-row")).toHaveCount(5);
   await expect(plain.getByTestId("provider-model-enabled")).not.toBeChecked();
   await page.getByTestId("provider-discover").click();
-  await expect(page.getByTestId("provider-models-count")).toContainText("2/3 已启用");
+  await expect(page.getByTestId("provider-models-count")).toContainText("2/5 已启用");
   await expect(page.locator('[data-testid=provider-model-row][data-new="1"]')).toHaveCount(0);
   await page.getByRole("button", { name: "取消" }).click();
 

@@ -111,3 +111,41 @@ it("keeps the picker on the enabled catalog when the profile arrives after first
 
   await waitFor(() => expect(optionValues()).toEqual(["e2e/auto", "e2e/fast"]));
 });
+
+/** A gateway serving many prefixes groups the picker into optgroups. */
+const wide: HubProviderRow = {
+  ...structured,
+  models: [
+    { id: "passthrough/auto", enabled: true, label: "Auto", surfaces: ["openai"] },
+    { id: "passthrough/ark/seed", enabled: true, surfaces: ["openai"] },
+    { id: "cursor/gpt-5", enabled: true, surfaces: ["openai"] },
+    { id: "claude-opus-5", enabled: true, surfaces: ["openai", "anthropic"] },
+    { id: "claude-hidden", enabled: false, surfaces: ["anthropic"] },
+  ],
+  defaultModel: "passthrough/auto",
+};
+
+it("groups a wide catalog by id prefix and still offers only enabled models", async () => {
+  vi.spyOn(api, "providerList").mockResolvedValue({ items: [wide] });
+  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  await waitFor(() => expect(screen.getByTestId("new-session-delegation-gateway")).toBeEnabled());
+
+  fireEvent.click(screen.getByTestId("new-session-delegation-gateway"));
+
+  await waitFor(() =>
+    expect(optionValues()).toEqual([
+      "passthrough/auto",
+      "passthrough/ark/seed",
+      "cursor/gpt-5",
+      "claude-opus-5",
+    ]),
+  );
+  const groups = Array.from(
+    screen.getByTestId("new-session-model").querySelectorAll("optgroup"),
+  ).map((g) => (g as HTMLOptGroupElement).label);
+  expect(groups).toEqual(["passthrough/", "cursor/", "claude-"]);
+  // The disabled id is absent from every group, not merely from the first.
+  expect(
+    screen.getByTestId("new-session-model").querySelector('option[value="claude-hidden"]'),
+  ).toBeNull();
+});

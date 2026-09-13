@@ -199,24 +199,30 @@
   gap: 7px;
 }
 
-.permRow,
-.effortRow {
+.permRow {
   display: flex;
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
 }
 
-.permChoice,
-.effortChoice {
+.permChoice {
   flex: none;
   white-space: nowrap;
   min-width: max-content;
 }
 
-.choiceEmber {
-  color: var(--dust);
-  border-color: var(--dust);
+/* effort is the composer's slider card inline, with its caption beside it. */
+.effortRow {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.effortRow > .hint {
+  flex: 1;
+  min-width: 0;
 }
 
 .yoloHead {
@@ -508,8 +514,7 @@
     padding: 0 8px;
   }
 
-  .permChoice,
-  .effortChoice {
+  .permChoice {
     flex: none;
     white-space: nowrap;
     min-width: max-content;

@@ -48,12 +48,25 @@ async function dragSlider(page: Page, at: "start" | "end") {
   const slider = page.getByTestId("effort-slider");
   const box = await slider.boundingBox();
   expect(box).toBeTruthy();
-  const x = at === "end" ? box!.x + box!.width - 3 : box!.x + 3;
+  const x = at === "end" ? box!.x + box!.width - 4 : box!.x + 4;
   const y = box!.y + box!.height / 2;
   await page.mouse.move(x, y);
   await page.mouse.down();
   await page.mouse.move(x, y, { steps: 2 });
   await page.mouse.up();
+}
+
+/** The pill is a thick rounded bar with a large white knob, not a hairline track. */
+async function assertPillGeometry(page: Page) {
+  const pill = await page.getByTestId("effort-track").boundingBox();
+  const knob = await page.getByTestId("effort-knob").boundingBox();
+  expect(pill).toBeTruthy();
+  expect(knob).toBeTruthy();
+  expect(pill!.height).toBeGreaterThanOrEqual(40);
+  expect(knob!.width).toBeGreaterThanOrEqual(34);
+  // The knob stays inside the pill at both ends.
+  expect(knob!.x).toBeGreaterThanOrEqual(pill!.x - 1);
+  expect(knob!.x + knob!.width).toBeLessThanOrEqual(pill!.x + pill!.width + 1);
 }
 
 async function assertSingleLine(chip: Locator) {
@@ -78,7 +91,8 @@ test.describe("composer control bar and effort", () => {
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
     await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
-    await expect(page.getByTestId("model-effort-chip")).toContainText(/think|default|opus|auto/);
+    await expect(page.getByTestId("model-effort-chip")).toContainText(/think|default/);
+    await expect(page.getByTestId("model-effort-chip")).not.toContainText(/opus|sonnet/);
     await expect(page.getByTestId("context-chip")).toBeVisible();
     await expect(page.getByTestId("permission-chip")).toContainText(/询问|可改|全自动|绕过/);
     await expect(page.getByTestId("effort-menu")).toHaveCount(0);
@@ -96,10 +110,16 @@ test.describe("composer control bar and effort", () => {
     const slider = page.getByTestId("effort-slider");
     await expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
     await expect(slider).toHaveAttribute("data-name", /think|default/);
+    await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
     await expect(page.getByTestId("effort-title")).toBeVisible();
-    await expect(page.getByTestId("effort-hint")).toContainText(/默认档|不额外思考|跨文件|最高档/);
+    await expect(page.getByTestId("effort-model")).toBeVisible();
+    // Compact card: no tier list and no model list until the chevron is tapped.
     await expect(page.getByTestId("effort-tier-ultracode")).toHaveCount(0);
-    await expect(menu).toContainText("切换只影响后续回合，不重写已发出的 prompt");
+    await expect(page.getByTestId("model-option-opus")).toHaveCount(0);
+    await assertPillGeometry(page);
+    const card = await menu.boundingBox();
+    expect(card).toBeTruthy();
+    expect(card!.width).toBeLessThanOrEqual(401);
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-effort-menu.png");
     }
@@ -108,6 +128,26 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
     await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
     await expect(slider).toHaveAttribute("data-ember", "1");
+  });
+
+  test("the tier name opens the tier and model list, then returns to the pill", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    await openEffort(page);
+    await page.getByTestId("effort-open-list").click();
+    const panel = page.getByTestId("effort-slider-panel");
+    await expect(panel).toHaveAttribute("data-view", "list");
+    await expect(page.getByTestId("effort-slider")).toHaveCount(0);
+    await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ember", "1");
+    await expect(page.getByTestId("effort-list")).toContainText(/默认档|不额外思考|跨文件|最高档/);
+    await expect(page.getByTestId("effort-menu")).toContainText("切换只影响后续回合，不重写已发出的 prompt");
+    await page.getByTestId("effort-list-back").click();
+    await expect(panel).toHaveAttribute("data-view", "slider");
+    await page.getByTestId("effort-open-list").click();
+    await page.getByTestId("effort-tier-ultracode").click();
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+    await expect(panel).toHaveAttribute("data-view", "slider");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "1");
   });
 
   test("codex and grok popovers use native names", async ({ page }) => {
@@ -264,14 +304,24 @@ test.describe("composer control bar and effort", () => {
         [390, 844, "390"],
       ] as const) {
         await page.setViewportSize({ width, height });
-        await page.keyboard.press("Escape");
-        await openEffort(page);
-        await expect(page.getByTestId("effort-slider")).toBeVisible();
-        await expect(page.getByTestId("effort-knob")).toBeVisible();
-        const box = await page.getByTestId("effort-menu").boundingBox();
-        expect(box).toBeTruthy();
-        expect(box!.width).toBeLessThanOrEqual(width);
-        await shotComposer(page, `composer-slider-1-${theme}-${tag}.png`);
+        // mid = a middle non-top tier, top = the ember tier.
+        for (const [state, keys] of [
+          ["mid", ["Home", "ArrowRight", "ArrowRight"]],
+          ["top", ["End"]],
+        ] as const) {
+          await page.keyboard.press("Escape");
+          await openEffort(page);
+          await page.getByTestId("effort-slider").focus();
+          for (const key of keys) await page.keyboard.press(key);
+          const slider = page.getByTestId("effort-slider");
+          await expect(slider).toHaveAttribute("data-ember", state === "top" ? "1" : "0");
+          await expect(page.getByTestId("effort-knob")).toBeVisible();
+          await assertPillGeometry(page);
+          const box = await page.getByTestId("effort-menu").boundingBox();
+          expect(box).toBeTruthy();
+          expect(box!.width).toBeLessThanOrEqual(Math.min(width, 401));
+          await shotComposer(page, `composer-slider-2-${state}-${theme}-${tag}.png`);
+        }
       }
     }
     await page.setViewportSize({ width: 400, height: 844 });
@@ -280,6 +330,6 @@ test.describe("composer control bar and effort", () => {
     const menu = await page.getByTestId("effort-menu").boundingBox();
     expect(menu).toBeTruthy();
     expect(menu!.width).toBeLessThanOrEqual(400);
-    await expect(page.getByTestId("effort-slider")).toBeVisible();
+    await assertPillGeometry(page);
   });
 });

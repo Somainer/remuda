@@ -17,6 +17,7 @@ import {
   type DelegationId,
 } from "../lib/sessionOptions";
 import { readDeviceSettings } from "../features/settings";
+import { useNewSessionSpaceDefaults } from "../features/spaces/useNewSessionSpaceDefaults";
 import {
   effortAt,
   effortCaps,
@@ -52,7 +53,7 @@ export function NewSessionPage() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const { mobile } = useWorkbenchViewport();
-  const prefs = readNewSessionPrefs();
+  const prefs = { ...readNewSessionPrefs(), ...useNewSessionSpaceDefaults() };
   const device = readDeviceSettings();
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const [prompt, setPrompt] = useState("");

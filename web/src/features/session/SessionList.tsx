@@ -56,7 +56,7 @@ function pendingBadge(kind: string | undefined, title: string | undefined, field
   return null;
 }
 
-export function SessionList({ instances, variant = "full" }: { instances?: Instance[]; variant?: "full" | "compact" }) {
+export function SessionList({ instances, variant = "full", title = "会话", newHref = "/sessions/new" }: { instances?: Instance[]; variant?: "full" | "compact"; title?: string; newHref?: string }) {
   const hub = useHub();
   const location = useLocation();
   const [params, setParams] = useSearchParams();
@@ -65,7 +65,7 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
   const hostFilter = csv(params, "host");
   const workspaceFilter = csv(params, "workspace");
   const kindFilter = csv(params, "kind");
-  const source = (instances ?? hub.instances).filter((i) => i.parent == null);
+  const source = instances ?? hub.instances.filter((i) => i.parent == null);
 
   const filtered = source.filter((instance) => {
     const status = projectStatus(instance);
@@ -75,7 +75,7 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
     if (kindFilter.length && !kindFilter.includes(instance.kind)) return false;
     if (!q) return true;
     const title = hubStore.titleOf(instance.id).toLowerCase();
-    const cwd = hubStore.workspaceOf(instance.workspaceId)?.rootPath.toLowerCase() ?? "";
+    const cwd = hub.workspaces.find((w) => w.id === instance.workspaceId && w.hostId === instance.hostId)?.rootPath.toLowerCase() ?? "";
     const native = instance.nativeRef.sessionId.state === "known" ? instance.nativeRef.sessionId.value.toLowerCase() : "";
     return title.includes(q) || cwd.includes(q) || native.includes(q) || instance.id.toLowerCase().includes(q);
   });
@@ -105,10 +105,10 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
       </p>
     );
   }
-  if (hub.instances.length === 0) {
+  if (source.length === 0) {
     return (
       <p className={css.empty} data-testid="session-list">
-        还没有会话。<Link to="/sessions/new">新建会话</Link>
+        {title} 还没有会话。<Link to={newHref}>新建会话</Link>
       </p>
     );
   }
@@ -122,7 +122,7 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
         </header>
         {filtered.map((instance) => {
           const status = projectStatus(instance);
-          const workspace = hubStore.workspaceOf(instance.workspaceId);
+          const workspace = hub.workspaces.find((w) => w.id === instance.workspaceId && w.hostId === instance.hostId);
           const to = `/s/${instance.id}`;
           const active = location.pathname === to || location.pathname.startsWith(`${to}/`);
           return (
@@ -152,9 +152,9 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
   return (
     <div className={css.root} data-testid="session-list">
       <header className={css.top}>
-        <div className={css.title}>会话</div>
+        <div className={css.title}>{title}</div>
         <div className={css.count}>
-          {source.length} 个实例 · {hub.hosts.length} 台主机
+          {source.length} 个实例 · {new Set(source.map((i) => i.hostId)).size} 台主机
         </div>
         <div className={css.live}>
           <span className={`${css.liveDot} ${live ? "" : css.liveOff}`} />
@@ -163,7 +163,7 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
         <button type="button" className={css.filterBtn} aria-label="筛选">
           筛选{filterCount ? <span className={css.filterCount}>{filterCount}</span> : null}
         </button>
-        <Link className={css.newBtn} to="/sessions/new">
+        <Link className={css.newBtn} to={newHref}>
           ＋ 新建
         </Link>
       </header>
@@ -280,7 +280,7 @@ export function SessionList({ instances, variant = "full" }: { instances?: Insta
               const status = projectStatus(instance);
               const pending = hub.interactions.find((i) => i.instanceId === instance.id && i.state === "pending");
               const to = `/s/${instance.id}`;
-              const workspace = hubStore.workspaceOf(instance.workspaceId);
+              const workspace = hub.workspaces.find((w) => w.id === instance.workspaceId && w.hostId === instance.hostId);
               const badge = pendingBadge(
                 pending?.request.kind,
                 pending && pending.request.kind !== "elicitation" ? pending.request.title : undefined,

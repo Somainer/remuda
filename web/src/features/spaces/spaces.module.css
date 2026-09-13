@@ -1,0 +1,55 @@
+.panel { height: 100%; display: flex; flex-direction: column; min-width: 0; background: var(--ink-0); }
+.panelHead { min-height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 600; gap: 8px; }
+.muted, .groupMeta, .count, .empty, .panelFoot, .tabHint { color: var(--mute); }
+.tool, .disclosure, .spaceSelect, .tabSelect, .tabClose, .drawerOpen, .drawerClose { border: 0; background: transparent; color: var(--paper); }
+.tool { min-width: 28px; min-height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 4px 6px; font-size: 12px; }
+.tool:hover, .sessionRow:hover, .tabClose:hover, .drawerOpen:hover { background: var(--ink-2); }
+.tool:disabled { opacity: .3; cursor: default; }
+.groups { flex: 1; overflow-y: auto; min-height: 0; padding: 8px 0; }
+.group { border-bottom: 1px solid var(--line); padding: 5px 8px 8px; }
+.groupHead { display: flex; min-height: 38px; align-items: stretch; }
+.group[data-active="true"] .groupHead { background: var(--ink-2); box-shadow: inset 2px 0 var(--dust); }
+.disclosure { width: 25px; flex: none; color: var(--mute); }
+.spaceSelect { display: flex; align-items: center; width: 100%; min-width: 0; gap: 10px; text-align: left; padding: 8px; font-weight: 500; }
+.spaceName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.count { font: 10px var(--mono); flex: none; }
+.blocked { color: var(--dust); }
+.groupMeta { font-size: 10px; padding: 4px 8px 2px 25px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.groupTools { display: flex; justify-content: flex-end; gap: 2px; }
+.sessionRow { display: flex; gap: 8px; align-items: center; min-height: 34px; padding: 6px 8px 6px 25px; color: var(--paper); font-size: 12px; }
+.glyph { display: inline-flex; width: 18px; flex: none; align-items: center; justify-content: center; font: 13px var(--mono); color: var(--cold); }
+.initial { width: 100%; text-align: center; font: 12px var(--mono); }
+.panel[data-collapsed="true"] .panelHead { justify-content: center; padding: 6px; }
+.panel[data-collapsed="true"] .group { padding: 4px; }
+.panel[data-collapsed="true"] .spaceSelect { min-height: 44px; padding: 4px; }
+.panelFoot { border-top: 1px solid var(--line); padding: 10px 12px; font: 10px var(--mono); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; }
+.empty { padding: 10px 12px; font-size: 12px; }
+.rename { display: flex; padding: 4px; gap: 4px; }
+.rename input { min-width: 0; width: 100%; padding: 5px; font-size: 12px; }
+.tabBar { display: flex; flex: none; min-width: 0; height: 46px; background: var(--ink-0); border-bottom: 1px solid var(--line); }
+.tabs { display: flex; overflow-x: auto; min-width: 0; scrollbar-width: thin; }
+.tabs > .empty { white-space: nowrap; }
+.tab { display: flex; align-items: stretch; border-right: 1px solid var(--line); flex: none; max-width: 240px; }
+.tab[data-active="true"] { background: var(--ink); box-shadow: inset 0 2px var(--dust); }
+.tabSelect { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0 8px 0 12px; font-size: 12px; }
+.tabTitle { max-width: 152px; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+.tabClose { width: 28px; flex: none; color: var(--mute); }
+.newTab { display: grid; place-items: center; min-width: 44px; flex: none; color: var(--paper); }
+.tabHint { align-self: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0 12px 0 auto; font: 10px var(--mono); }
+.mobileSpaces { display: flex; border-bottom: 1px solid var(--line); background: var(--ink-0); flex: none; min-width: 0; }
+.drawerOpen { width: 44px; flex: none; border-right: 1px solid var(--line); }
+.chips { display: flex; overflow-x: auto; min-width: 0; gap: 6px; padding: 6px; }
+.chip { flex: none; min-height: 32px; border: 1px solid var(--line); border-radius: var(--radius); background: transparent; padding: 4px 10px; color: var(--mute); font-size: 12px; max-width: 210px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip[aria-pressed="true"] { border-color: var(--dust); color: var(--paper); background: var(--ink-2); }
+.drawerBackdrop { position: fixed; inset: 0; z-index: 45; background: var(--scrim); }
+.drawer { width: min(340px, calc(100vw - 44px)); height: 100%; display: flex; flex-direction: column; background: var(--ink-0); border-right: 1px solid var(--line); padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+.drawer > .panel { min-height: 0; }
+.drawerClose { min-height: 44px; flex: none; text-align: right; padding: 8px 16px; }
+@media (max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
+  .tabHint { display: none; }
+  .tabBar { height: 48px; }
+  .tab { max-width: 230px; }
+  .tabClose { width: 44px; }
+  .tabTitle { max-width: 126px; }
+  .drawer .tool, .drawer .disclosure, .drawer .sessionRow { min-height: 44px; }
+}

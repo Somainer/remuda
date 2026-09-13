@@ -43,7 +43,6 @@ export default defineConfig({
         ...process.env,
         VITE_MOCK: "0",
         VITE_HUB_URL: hubUrl,
-        VITE_ACCESS_CODE: "e2e-bootstrap-token",
       },
     },
   ],

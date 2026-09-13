@@ -1,5 +1,6 @@
 import type { CapabilitySnapshot, DriverKind, NativeRef, ProcessRef } from "./nativeRef";
 import type { EntityMeta, Id, Knowledge, Timestamp, U64 } from "./wire";
+import type { RegisteredWorkspace } from "./workspace";
 
 export type Kind = "claude" | "codex" | "grok" | "agy" | "generic" | "terminal";
 
@@ -67,6 +68,8 @@ export type HostCli = {
 };
 
 export type Host = EntityMeta & {
+  workspaces?: RegisteredWorkspace[];
+  workspaceRevision?: number;
   label: string;
   ownerPrincipalId: Id;
   state: "enrolled" | "connecting" | "online" | "offline" | "reconciling" | "retired";

@@ -4,7 +4,8 @@ import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
-import type { Workspace } from "../types/workspace";
+import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
+import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import { api, observationText, type InstanceCreateSpec, type PtyKey, type WorktreeCreateSpec } from "./api";
 import {
   DEFAULT_EFFORT_INDEX,
@@ -102,6 +103,7 @@ class HubStore {
   private subs = new Map<Id, Id>();
   private bootGen = 0;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private stopWorkspaceFollow: (() => void) | null = null;
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -156,14 +158,14 @@ class HubStore {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
         return;
       }
-      const [instances, hosts, workspaces, interactions, devices] = await Promise.all([
+      const [instances, hosts, interactions, devices] = await Promise.all([
         api.instanceList(),
         api.hostList(),
-        api.workspaceList(),
         api.interactionList(),
         api.deviceList().catch(() => ({ items: [] as PairedDevice[] })),
       ]);
       if (gen !== this.bootGen) return;
+      const registeredHosts = mergeHostWorkspaces(hosts.items, this.state.hosts);
       this.emit({
         ready: true,
         authed: true,
@@ -172,10 +174,15 @@ class HubStore {
         session: readSession(),
         devices: devices.items,
         instances: instances.items,
-        hosts: hosts.items,
-        workspaces: workspaces.items,
+        hosts: registeredHosts,
+        workspaces: registeredHosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)),
         interactions,
       });
+      this.stopWorkspaceFollow?.();
+      this.stopWorkspaceFollow = api.hostWorkspaceSubscribe(
+        (snapshot) => this.applyWorkspaceSnapshot(snapshot),
+        () => { void this.refreshHosts().catch(() => undefined); },
+      );
       this.startPoll();
     } catch (err) {
       if (gen !== this.bootGen) return;
@@ -208,6 +215,7 @@ class HubStore {
     this.pollTimer = window.setInterval(() => {
       if (!this.state.authed) return;
       void this.refresh();
+      void this.refreshHosts().catch(() => undefined);
     }, 2000);
   }
 
@@ -217,6 +225,8 @@ class HubStore {
     clearSession();
     dropDeviceCookie();
     api.disconnect();
+    this.stopWorkspaceFollow?.();
+    this.stopWorkspaceFollow = null;
     this.emit({
       authed: false,
       session: null,
@@ -252,9 +262,32 @@ class HubStore {
   }
 
   async refreshHosts() {
-    const hosts = await api.hostList();
-    const workspaces = await api.workspaceList();
-    this.emit({ hosts: hosts.items, workspaces: workspaces.items });
+    const page = await api.hostList();
+    const hosts = mergeHostWorkspaces(page.items, this.state.hosts);
+    this.emit({ hosts, workspaces: hosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)) });
+  }
+
+  private applyWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
+    const host = this.state.hosts.find((row) => row.id === snapshot.hostId);
+    if (!host || snapshot.workspaceRevision < (host.workspaceRevision ?? 0)) return;
+    this.emit({
+      hosts: this.state.hosts.map((row) => row.id === host.id
+        ? { ...row, workspaceRevision: snapshot.workspaceRevision, workspaces: snapshot.workspaces } : row),
+      workspaces: [...this.state.workspaces.filter((row) => row.hostId !== host.id), ...snapshot.workspaces.map(mapWorkspace)],
+    });
+  }
+
+  async registerWorkspace(hostId: Id, path: string) {
+    const page = await api.workspaceRegister(hostId, path);
+    this.applyWorkspaceSnapshot({ hostId, workspaceRevision: page.workspaceRevision ?? 0,
+      workspaces: page.items.map((w) => ({ workspaceId: w.id, hostId: w.hostId, root: w.rootPath })) });
+    return page.items.find((w) => w.id === page.workspaceId || w.rootPath === path);
+  }
+
+  async unregisterWorkspace(hostId: Id, path: string) {
+    const page = await api.workspaceUnregister(hostId, path);
+    this.applyWorkspaceSnapshot({ hostId, workspaceRevision: page.workspaceRevision ?? 0,
+      workspaces: page.items.map((w) => ({ workspaceId: w.id, hostId: w.hostId, root: w.rootPath })) });
   }
 
   async refresh() {
@@ -426,8 +459,7 @@ class HubStore {
 
   async createWorktree(spec: WorktreeCreateSpec) {
     const record = await api.worktreeCreate(spec);
-    const [workspaces] = await Promise.all([api.workspaceList()]);
-    this.emit({ workspaces: workspaces.items });
+    await this.refreshHosts();
     return record;
   }
 

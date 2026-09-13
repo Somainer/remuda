@@ -31,6 +31,8 @@ import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
 import { defaultGatewayProfile, fromHub, type ProviderProfile } from "../features/providers";
 import { api } from "../lib/api";
+import { WorkspaceRegistration } from "../features/workspaces/WorkspaceRegistration";
+import { workspaceCwd } from "../features/workspaces/path";
 import css from "./NewSessionPage.module.css";
 
 type CreateKind = Exclude<Kind, "generic">;
@@ -103,22 +105,16 @@ export function NewSessionPage() {
     }
   }, [pickerHosts, hostId, prefs.hostId]);
 
-  useEffect(() => {
-    const list = hub.workspaces.filter((w) => !hostId || w.hostId === hostId);
-    if (!list.length) return;
-    if (!workspaceId || !list.some((w) => w.id === workspaceId)) setWorkspaceId(list[0].id);
-  }, [hub.workspaces, hostId, workspaceId]);
-
   const host = hub.hosts.find((h) => h.id === hostId);
   const offline = host?.state !== "online" && host?.state !== "enrolled";
-  const hostWorkspaces = hub.workspaces.filter((w) => !hostId || w.hostId === hostId);
+  const hostWorkspaces = hub.workspaces.filter((w) => w.hostId === hostId);
   const workspace = hostWorkspaces.find((w) => w.id === workspaceId) ?? hostWorkspaces[0];
-  const existingCwd = cwdPath.trim() || workspace?.rootPath || "";
+  const existingCwd = workspace ? workspaceCwd(workspace.rootPath, cwdPath) : null;
   const canStart = Boolean(
     hostId &&
       !offline &&
       !busy &&
-      (cwdMode === "existing" ? existingCwd : worktreeName.trim()),
+      workspace && (cwdMode === "existing" ? existingCwd : worktreeName.trim()),
   );
   const hosts = pickerHosts;
   const workspaces = sortRecent(hostWorkspaces, prefs.recentWorkspaceIds);
@@ -161,11 +157,12 @@ export function NewSessionPage() {
           setBusy(true);
           setError(null);
           void (async () => {
-            let cwd = existingCwd;
+            let cwd = existingCwd ?? "";
             let worktree: string | undefined;
             if (cwdMode === "worktree") {
               const created = await hubStore.createWorktree({
                 hostId,
+                workspaceId: workspace?.id,
                 name: worktreeName.trim(),
                 base: "main",
               });
@@ -174,7 +171,7 @@ export function NewSessionPage() {
             }
             const instance = await hubStore.create({
               hostId,
-              workspaceId: (cwd || workspace?.id) as string,
+              workspaceId: workspace?.id,
               kind: activeKind,
               driver,
               model,
@@ -244,7 +241,7 @@ export function NewSessionPage() {
                   className={css.select}
                   data-testid="new-session-host"
                   value={hostId}
-                  onChange={(e) => setHostId(e.target.value)}
+                  onChange={(e) => { setHostId(e.target.value); setCwdPath(""); }}
                 >
                   {hosts.map((h) => (
                     <option key={h.id} value={h.id}>
@@ -259,8 +256,8 @@ export function NewSessionPage() {
                 {hostCli ? ` · ${hostCli}` : ""}
               </span>
             </label>
-            <label className={css.field}>
-              <span className={css.label}>cwd / worktree</span>
+            <div className={css.field}>
+              <span className={css.label}>工作目录</span>
               <div className={css.seg}>
                 <button
                   type="button"
@@ -279,35 +276,42 @@ export function NewSessionPage() {
                   新 worktree from main
                 </button>
               </div>
+              <div className={css.selectWrap}>
+                <select
+                  className={css.select}
+                  data-testid="new-session-workspace"
+                  aria-label="已注册目录"
+                  value={workspace?.id ?? ""}
+                  onChange={(e) => {
+                    setWorkspaceId(e.target.value);
+                    setCwdPath("");
+                  }}
+                >
+                  {!workspaces.length ? <option value="">请选择或添加目录</option> : null}
+                  {workspaces.map((w) => (
+                    <option key={w.id} value={w.id}>
+                      {w.label} · {w.rootPath}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <WorkspaceRegistration key={hostId} hostId={hostId} disabled={!hostId || offline || busy}
+                onRegistered={(added) => { setWorkspaceId(added.id); setCwdPath(""); }} />
               {cwdMode === "existing" ? (
                 <>
-                  <div className={css.selectWrap}>
-                    <select
-                      className={css.select}
-                      data-testid="new-session-workspace"
-                      value={workspace?.id ?? ""}
-                      onChange={(e) => {
-                        setWorkspaceId(e.target.value);
-                        const next = hostWorkspaces.find((w) => w.id === e.target.value);
-                        if (next?.rootPath) setCwdPath(next.rootPath);
-                      }}
-                    >
-                      {workspaces.map((w) => (
-                        <option key={w.id} value={w.id}>
-                          {w.label} · {w.rootPath}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                  <label className={css.label} htmlFor="new-session-subpath">目录内子路径（可选）</label>
                   <div className={css.selectWrap}>
                     <input
+                      id="new-session-subpath"
                       className={css.select}
                       data-testid="new-session-cwd"
-                      placeholder="absolute path on the host"
-                      value={cwdPath || workspace?.rootPath || ""}
+                      placeholder="留空使用目录根路径，例如 src"
+                      value={cwdPath}
+                      disabled={!workspace}
                       onChange={(e) => setCwdPath(e.target.value)}
                     />
                   </div>
+                  {workspace && existingCwd === null ? <p className={css.error} role="alert">请输入所选目录内的相对子路径，不能跳到目录外。</p> : null}
                 </>
               ) : (
                 <div className={css.selectWrap}>
@@ -322,10 +326,10 @@ export function NewSessionPage() {
               )}
               <span className={css.hint}>
                 {cwdMode === "worktree"
-                  ? "POST /v1/worktrees → git worktree add -b wt/<name>/… from main"
-                  : existingCwd || "host directory"}
+                  ? `从所选目录的 main 分支创建独立 worktree${workspace ? ` · ${workspace.rootPath}` : ""}`
+                  : existingCwd || "先添加这台主机上的项目目录"}
               </span>
-            </label>
+            </div>
           </div>
           <div className={css.pair}>
             <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>

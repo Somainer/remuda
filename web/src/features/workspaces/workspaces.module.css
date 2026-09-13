@@ -1,0 +1,83 @@
+.registration,
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.list {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.label,
+.field {
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.input {
+  min-width: 0;
+  min-height: 40px;
+  color: var(--paper);
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 10px;
+  font-family: var(--mono);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.path {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.action {
+  align-self: flex-start;
+  flex: none;
+  min-height: 36px;
+  padding: 0 12px;
+  color: var(--paper);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.action:disabled {
+  opacity: 0.45;
+}
+
+.error {
+  color: var(--dust);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+
+@media (max-width: 767px) {
+  .action,
+  .input {
+    min-height: 44px;
+  }
+
+  .input {
+    font-size: 16px;
+  }
+}

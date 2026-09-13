@@ -202,3 +202,37 @@ Hub↔Node wire round trips, and selected-project worktree dispatch. The schema
 catalog check excludes these operational types alongside the existing `hubnode`
 frames; REST types are described in OpenAPI and the regenerated web API client.
 Cargo dependency manifests/lockfile and the pnpm lockfile were unchanged.
+
+## Coordinator rebase onto `68684d5`
+
+The integration with the daemon access changes retains bounded workspace
+probes before registry canonicalization and cwd admission. Probe failures keep
+their Full Disk Access guidance; failed probes are not followed by an unbounded
+containment retry. Worktree sibling checks distinguish absent directories from
+access failures and resolve symlink boundaries in a killable subprocess.
+
+Host diagnostics now inspect the current registered roots, including multiple
+roots and an empty registry, while retaining guarded configuration preflight.
+Unregistering the initial workspace removes it from diagnostics. Installer
+guidance covers additional `--workspace` flags as well as the primary directory.
+Main's temporary-directory fixtures explicitly permit their own roots and use
+canonical paths. The web retains both workspace management and host diagnostics,
+plus main's message normalization changes.
+
+The earlier native-run evidence above remains tied to its stated executable and
+base. This coordinator rebase uses the requested Rust and web validation gates.
+
+| Rebase check | Result |
+|---|---|
+| `cargo fmt --all` | PASS |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS |
+| `cargo test -p remuda-node -p remuda-hub --locked` | PASS: 244 tests |
+| `cargo test -p remuda --test node_install_cli --locked` | PASS: additional-workspace installer guidance |
+| `pnpm test` | PASS: 169 tests in 46 files |
+| `pnpm build` and `pnpm lint` | PASS; four existing lint warnings |
+| `./scripts/ci/secret-scan.sh` | PASS |
+
+The initial rebased commit exposed an unused cwd resolver under Clippy. Omitted
+cwd requests now use that shared resolver, preserving the final bounded access
+check; explicit cwd requests retain HOME expansion and registry containment.
+The results above include this correction.

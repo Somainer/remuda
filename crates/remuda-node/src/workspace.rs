@@ -518,7 +518,10 @@ impl DevNode {
             .as_ref()
             .map(|path| path_guard::absolutize(Path::new(&selected.root_path), path));
         if cwd.is_none_or(|raw| raw.trim().is_empty()) {
-            return Ok((selected.clone(), PathBuf::from(&selected.root_path)));
+            return Ok((
+                selected.clone(),
+                crate::worktree::resolve_instance_cwd(Path::new(&selected.root_path), None)?,
+            ));
         }
         let candidate = candidate.ok_or_else(|| self.unregistered_cwd("", &workspaces))?;
         // Preserve the bounded probe's access/FDA error before any containment

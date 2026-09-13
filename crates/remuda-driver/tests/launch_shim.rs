@@ -31,7 +31,7 @@ fn harness() -> Harness {
     let overlay = launch.join("settings.json");
     std::fs::create_dir_all(&launch).unwrap();
     std::fs::write(&overlay, r#"{"hooks":{}}"#).unwrap();
-    let set = materialize_shims(&launch, &overlay, "cred-test").unwrap();
+    let set = materialize_shims(&launch, &overlay, "cred-test", false).unwrap();
 
     let real_bin = dir.path().join("realbin");
     std::fs::create_dir_all(&real_bin).unwrap();
@@ -231,7 +231,7 @@ fn a_shim_alone_on_path_exits_rather_than_resolving_to_itself() {
     std::fs::create_dir_all(&launch).unwrap();
     let overlay = launch.join("settings.json");
     std::fs::write(&overlay, "{}").unwrap();
-    let set = materialize_shims(&launch, &overlay, "cred").unwrap();
+    let set = materialize_shims(&launch, &overlay, "cred", false).unwrap();
     let status = run_bounded(
         Command::new(set.bin_dir.join("claude"))
             .env("PATH", set.bin_dir.to_string_lossy().into_owned()),
@@ -287,7 +287,7 @@ fn the_pass_through_shims_reach_their_real_binaries_unchanged() {
     std::fs::create_dir_all(&launch).unwrap();
     let overlay = launch.join("settings.json");
     std::fs::write(&overlay, "{}").unwrap();
-    let set = materialize_shims(&launch, &overlay, "cred").unwrap();
+    let set = materialize_shims(&launch, &overlay, "cred", false).unwrap();
 
     let real = dir.path().join("realbin");
     std::fs::create_dir_all(&real).unwrap();

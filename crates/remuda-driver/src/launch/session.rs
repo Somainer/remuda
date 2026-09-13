@@ -66,6 +66,15 @@ impl HookSession {
         let launch_dir = options.instance_dir.join("launch");
         let socket_path = options.instance_dir.join("hook.sock");
         let credential = mint_credential();
+        // `REMUDA_SHIM=off` is honoured twice: the generated shim reads it at
+        // run time (so a session already under way degrades cleanly), and here
+        // so an operator who set it before the Node started gets no shim
+        // directory at all rather than a dormant one on PATH.
+        let shim_off = crate::launch::shim_disabled(
+            std::env::var(crate::launch::SHIM_DISABLE_ENV)
+                .ok()
+                .as_deref(),
+        );
         let server = HookServer::bind(&socket_path, credential.clone(), Arc::clone(&bus) as _)
             .map_err(|error| {
                 crate::error::DriverError::SettingsIsolationUnavailable(format!(
@@ -79,7 +88,7 @@ impl HookSession {
             tui: options.tui,
             base: options.base_settings.clone(),
         })?;
-        let shims = materialize_shims(&launch_dir, &overlay.path, &credential)?;
+        let shims = materialize_shims(&launch_dir, &overlay.path, &credential, shim_off)?;
         Ok(Self {
             _server: server,
             overlay,

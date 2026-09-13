@@ -45,12 +45,17 @@ pub struct ShimSet {
     pub zdotdir: PathBuf,
     /// Environment the child needs for the shims to work.
     pub env: BTreeMap<String, String>,
+    /// False when `REMUDA_SHIM=off`: nothing is placed on `PATH`.
+    pub enabled: bool,
 }
 
 impl ShimSet {
     /// `PATH` with the shim directory in front of `inherited`.
     #[must_use]
     pub fn path_with(&self, inherited: &str) -> String {
+        if !self.enabled {
+            return inherited.to_owned();
+        }
         let bin = self.bin_dir.to_string_lossy();
         if inherited.is_empty() {
             return bin.into_owned();
@@ -76,10 +81,16 @@ pub fn shim_disabled(value: Option<&str>) -> bool {
 /// `overlay` is the settings file the claude shim injects; `credential` is the
 /// per-instance hook credential, exported into the agent's environment so the
 /// relay can authenticate without it appearing in any command line.
+/// `disabled` reflects `REMUDA_SHIM=off`: the directory and the shadow
+/// `ZDOTDIR` are still generated (so the layout is uniform and a purge has one
+/// thing to remove), but nothing is put on `PATH` and the generated `claude`
+/// is a plain pass-through. The agent then resolves exactly what the user
+/// installed and the signal tier degrades to screen.
 pub fn materialize_shims(
     launch_dir: &Path,
     overlay: &Path,
     credential: &str,
+    disabled: bool,
 ) -> DriverResult<ShimSet> {
     let bin_dir = launch_dir.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
@@ -98,6 +109,18 @@ pub fn materialize_shims(
     }
     let zdotdir = materialize_zdotdir(launch_dir, &bin_dir)?;
     let mut env = BTreeMap::new();
+    if disabled {
+        // No PATH entry and no ZDOTDIR: the child sees the environment it
+        // would have seen without Remuda.
+        env.insert("REMUDA_SHIM".into(), "off".into());
+        return Ok(ShimSet {
+            bin_dir,
+            commands,
+            zdotdir,
+            env,
+            enabled: false,
+        });
+    }
     env.insert("REMUDA_HOOK_CREDENTIAL".into(), credential.to_owned());
     // The shim's own marker, for diagnostics and for a nested agent to notice
     // it is already inside a shimmed session.
@@ -111,6 +134,7 @@ pub fn materialize_shims(
         commands,
         zdotdir,
         env,
+        enabled: true,
     })
 }
 
@@ -371,9 +395,32 @@ mod tests {
     }
 
     #[test]
+    fn shim_off_leaves_the_path_exactly_as_it_was() {
+        // `REMUDA_SHIM=off` is honoured in two places: the generated script
+        // reads it at run time, so a session already under way degrades
+        // cleanly, and the driver reads it here, so an operator who set it
+        // before the Node started gets nothing on PATH at all rather than a
+        // dormant shim directory.
+        let dir = tempfile::tempdir().unwrap();
+        let set =
+            materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", true).unwrap();
+        assert!(!set.enabled);
+        assert_eq!(set.path_with("/usr/bin:/bin"), "/usr/bin:/bin");
+        assert!(
+            !set.env.contains_key("ZDOTDIR"),
+            "a disabled shim must not redirect the shell's rc files"
+        );
+        assert!(
+            !set.env.contains_key("REMUDA_HOOK_CREDENTIAL"),
+            "and must not hand out a credential nothing will use"
+        );
+    }
+
+    #[test]
     fn the_shim_directory_goes_in_front_of_the_inherited_path() {
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         let path = set.path_with("/usr/bin:/bin");
         assert!(
             path.starts_with(&set.bin_dir.to_string_lossy().into_owned()),
@@ -385,7 +432,8 @@ mod tests {
     #[test]
     fn every_shim_is_generated_and_executable_by_its_owner_only() {
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         for command in SHIMMED {
             let path = set.bin_dir.join(command);
             assert!(path.is_file(), "{command} shim missing");
@@ -401,8 +449,13 @@ mod tests {
     #[test]
     fn the_credential_reaches_the_child_through_the_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let set =
-            materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred-x").unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred-x",
+            false,
+        )
+        .unwrap();
         assert_eq!(
             set.env.get("REMUDA_HOOK_CREDENTIAL").map(String::as_str),
             Some("cred-x")
@@ -419,7 +472,8 @@ mod tests {
         // A subprocess would add a pid, break signal delivery and change the
         // foreground process group the promotion poller reads.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         let body = std::fs::read_to_string(set.bin_dir.join("claude")).unwrap();
         assert!(body.contains(r#"exec "$real_path""#), "{body}");
         assert!(
@@ -432,7 +486,8 @@ mod tests {
     fn the_shim_removes_itself_from_path_before_resolving() {
         // Otherwise it finds itself and recurses until the process limit.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         let body = std::fs::read_to_string(set.bin_dir.join("claude")).unwrap();
         assert!(
             body.contains(r#""$shim_dir") IFS=:; continue ;;"#),
@@ -450,7 +505,8 @@ mod tests {
         // unable to recognise itself — which is exactly the case where it then
         // resolves to itself and exec-loops.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         for command in SHIMMED {
             let body = std::fs::read_to_string(set.bin_dir.join(command)).unwrap();
             let invokes_dirname = body
@@ -470,7 +526,8 @@ mod tests {
         // The last line of defence: if resolution is ever wrong, one extra
         // pass-through beats a fork bomb on the machine of whoever typed it.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         for command in SHIMMED {
             let body = std::fs::read_to_string(set.bin_dir.join(command)).unwrap();
             let guard = format!("REMUDA_SHIM_ACTIVE_{}", command.to_ascii_uppercase());
@@ -489,7 +546,8 @@ mod tests {
         // shim to position 22 of 35, so the user's own claude won. Ordering is
         // the fix — their file first, our directory back in front after.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         for name in ZSH_RC_FILES {
             let body = std::fs::read_to_string(set.zdotdir.join(name)).unwrap();
             let sourced = body
@@ -513,7 +571,8 @@ mod tests {
         // the first of our files ever ran — the shim was never re-asserted and
         // PATH stayed at position 22.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         for name in ZSH_RC_FILES {
             let body = std::fs::read_to_string(set.zdotdir.join(name)).unwrap();
             if *name == LAST_ZSH_RC {
@@ -532,7 +591,8 @@ mod tests {
         // So the interactive shell the human ends up in is indistinguishable
         // from the one they would have had.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         let body = std::fs::read_to_string(set.zdotdir.join(LAST_ZSH_RC)).unwrap();
         let reassert = body
             .find(r#"PATH="$__remuda_bin:$__remuda_path""#)
@@ -549,7 +609,8 @@ mod tests {
         // Anything the user's rc sources must see their configuration, not
         // ours, and a nested shell must behave normally.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         let body = std::fs::read_to_string(set.zdotdir.join(".zshrc")).unwrap();
         let saved = body
             .find("__remuda_our_zdotdir=$ZDOTDIR")
@@ -568,7 +629,8 @@ mod tests {
         // A user who sources ~/.zshrc by hand, or a nested login shell, must
         // not accumulate copies of the shim directory.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         let body = std::fs::read_to_string(set.zdotdir.join(".zshrc")).unwrap();
         assert!(
             body.contains(r#"while [ "$__remuda_path" !="#),
@@ -586,7 +648,8 @@ mod tests {
     fn the_shadow_zdotdir_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
+            .unwrap();
         let mode = std::fs::metadata(&set.zdotdir)
             .unwrap()
             .permissions()
@@ -598,8 +661,13 @@ mod tests {
     #[test]
     fn a_path_with_a_quote_cannot_break_out_of_the_shim_body() {
         let dir = tempfile::tempdir().unwrap();
-        let set =
-            materialize_shims(dir.path(), Path::new("/tmp/it's/settings.json"), "cred").unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            Path::new("/tmp/it's/settings.json"),
+            "cred",
+            false,
+        )
+        .unwrap();
         let body = std::fs::read_to_string(set.bin_dir.join("claude")).unwrap();
         assert!(
             body.contains(r"overlay='/tmp/it'\''s/settings.json'"),

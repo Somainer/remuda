@@ -378,6 +378,8 @@ async fn create_fleet(
                 title: body.title.clone(),
                 prompt: body.prompt.clone(),
                 spec: host_spec,
+                operation: "instance.create",
+                idempotency_key: None,
             },
         )
         .await?;

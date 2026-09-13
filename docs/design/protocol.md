@@ -433,6 +433,9 @@ type DriverRecord =
 
 resume 只接受明确 NativeRef，禁止 `--continue` / “最近会话”选择器；原生数据不存在返回 `NATIVE_SESSION_NOT_FOUND`，不自动 start 新 session。不可逆的 process exit 确认之前不 resume。resume 命令只结算 native conversation 的恢复：原生若自行续跑，Node 记录 cause=native-continuation 的新 Run，并只在有明确源 ID 时关联旧 Run；原 prompt 不重投，旧命令不因 resume 成功而 settled。fork 作为可选扩展 `fork(ref, boundary:{type:"latest-terminal"}, newInstanceSpec)`，返回新 Instance 与新 native session，要求来源 Instance 无活 foreground Run、最新 native 回合已结算，且在 owner 内串行检查 expected instance revision。v1 不承诺任意历史 turn 切点；不支持时返回 `CAPABILITY_UNSUPPORTED`，不能复制 UI 文本冒充 fork。
 
+
+**会话续接（D-026）。** 上面这段说的是 driver 层的 resume；面向用户的「继续这段对话」再加一层：每个 Claude 实例把驱动实际上报的 session id 写进 `nativeRef`（claude-print 来自 stream-json `system/init` 映射的 `session` lifecycle，claude-pty 来自 SessionStart hook，并带 `transcriptPath`），create 时按 Instance id 造的占位值只在首次上报前有效。续接**不复活**退出的进程，而是在同一 host / workspace 上新建 Instance：沿用父实例的 provider / permission / model / cwd，由 materializer 发 `--resume <sessionId>`，子实例 `parent` 指向父实例，父子各 journal 一条 lifecycle，旧实例保持 exited。driver kind 可以与父实例不同——`claude-pty` 续一个原本 structured-only 的 session，就是「让这段对话回到终端」。Hub 侧是 `POST /v1/instances/{id}/resume`（Human/Bot；Agent 403），没有上报过 session id 或退出过久都返回 409 并说明原因，而不是开出一个看起来连续、实际为空的新对话。
+
 ### 3.2 能力对象
 
 ~~~typescript

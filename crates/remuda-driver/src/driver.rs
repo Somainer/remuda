@@ -183,4 +183,21 @@ pub trait Driver: Send + Sync {
 
     /// Resume an explicit [`NativeRef`]. Never `--continue`.
     async fn resume(&self, native_ref: NativeRef) -> DriverResult<RunHandle>;
+
+    /// Launch a fresh process that continues `session_id` (`--resume <uuid>`).
+    ///
+    /// [`Self::resume`] needs a driver object that already launched once, so it
+    /// cannot serve D-026, where the resumed conversation belongs to a *new*
+    /// Instance with its own driver. This takes the spec from the caller and
+    /// the session identity from the exited Instance's `nativeRef`.
+    async fn start_resumed(
+        &self,
+        spec: InstanceSpec,
+        session_id: String,
+    ) -> DriverResult<RunHandle> {
+        let _ = (spec, session_id);
+        Err(crate::error::DriverError::CapabilityUnsupported(
+            "start_resumed requires a session-capable driver".into(),
+        ))
+    }
 }

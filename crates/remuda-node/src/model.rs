@@ -112,6 +112,12 @@ pub struct CreateInstanceRequest {
     /// Auth token injected by Hub SecretBroker for this launch only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_auth_token: Option<String>,
+    /// Native session this launch continues with `--resume <uuid>` (D-026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
+    /// Exited Instance this launch continues; recorded as `instance.parent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<InstanceId>,
 }
 
 impl CreateInstanceRequest {
@@ -157,6 +163,21 @@ impl CreateInstanceRequest {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
+        }
+        if self.resume_session_id.is_none() {
+            self.resume_session_id = spec
+                .get("resumeSessionId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+        if self.resumed_from.is_none() {
+            self.resumed_from = spec
+                .get("resumedFrom")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| InstanceId::try_from(value.to_owned()).ok());
         }
     }
 }

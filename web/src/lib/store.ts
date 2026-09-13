@@ -7,7 +7,14 @@ import type { Id } from "../types/wire";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import type { AttachmentRef } from "./attachments";
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
-import { api, observationText, type InstanceCreateSpec, type PtyKey, type WorktreeCreateSpec } from "./api";
+import {
+  api,
+  observationText,
+  type InstanceCreateSpec,
+  type PtyKey,
+  type ResumeMode,
+  type WorktreeCreateSpec,
+} from "./api";
 import {
   DEFAULT_EFFORT_INDEX,
   effortAt,
@@ -500,9 +507,24 @@ class HubStore {
     await Promise.all(instanceIds.map((id) => this.refreshScreen(id)));
   }
 
-  async resume(instanceId: Id) {
-    await api.instanceResume(instanceId);
-    await this.refresh();
+  /**
+   * Continue an exited session on a new instance and return where to navigate.
+   *
+   * The exited instance keeps its history, so the caller must move the view to
+   * the returned id or the user stays on a transcript that cannot accept input
+   * (D-026).
+   */
+  async resume(instanceId: Id, mode: ResumeMode = "structured"): Promise<Id | null> {
+    try {
+      const result = await api.instanceResume(instanceId, mode);
+      await this.refresh();
+      return result.instanceId;
+    } catch (error) {
+      // The Hub's 409 explains *why* (no transcript / too old); showing it is
+      // the difference between a dead button and an answer.
+      this.toast(error instanceof Error ? error.message : "恢复会话失败");
+      return null;
+    }
   }
 
   /**

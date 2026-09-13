@@ -142,6 +142,39 @@ async fn dispatch_hub(
             catch_up(runtime, &created.instance.meta.id).await?;
             Ok(serde_json::to_value(&created)?)
         }
+        // D-026: resume takes the same path as create, with the session to
+        // continue. Without this arm it fell to the catch-all below, which
+        // answered {ok:true} while creating nothing.
+        Some(HubNodeMethod::InstanceResume) => {
+            let mut request = create_from_params(&runtime.node, &params)?;
+            let spec = params.get("spec").unwrap_or(&params);
+            let session_id = params
+                .get("resumeSessionId")
+                .or_else(|| spec.get("resumeSessionId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    NodeError::InvalidRequest("instance.resume requires resumeSessionId".into())
+                })?;
+            request.resume_session_id = Some(session_id.to_owned());
+            if request.resumed_from.is_none() {
+                request.resumed_from = params
+                    .get("resumedFrom")
+                    .or_else(|| spec.get("resumedFrom"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| InstanceId::try_from(value.to_owned()))
+                    .transpose()
+                    .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
+            }
+            if let Some(credential) = &mut request.agent_credential {
+                credential.hub = Some(runtime.hub_url.clone());
+            }
+            let created = runtime.node.create_instance(request).await?;
+            catch_up(runtime, &created.instance.meta.id).await?;
+            Ok(serde_json::to_value(&created)?)
+        }
         Some(HubNodeMethod::InstanceSend) => {
             let (instance_id, result) = send_from_params(&runtime.node, params).await?;
             catch_up(runtime, &instance_id).await?;
@@ -306,6 +339,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         max_budget_usd: None,
         provider_overlay: None,
         provider_auth_token: None,
+        resume_session_id: None,
+        resumed_from: None,
     };
     request.apply_spec_launch_fields(spec);
     Ok(request)

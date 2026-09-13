@@ -16,7 +16,9 @@ import { canShowTerminal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView
 import { ScreenView } from "../features/session/ScreenView";
 import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode } from "../lib/status";
+import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
+import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
@@ -36,6 +38,7 @@ export function SessionPage({
   const [sendingIds, setSendingIds] = useState<string[]>([]);
   const sending = sendingIds.includes(instanceId);
   const setSending = (value: boolean) => setSendingIds((ids) => value ? [...new Set([...ids, instanceId])] : ids.filter((id) => id !== instanceId));
+  const [resuming, setResuming] = useState(false);
   const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
   const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
   const showTerminal = instance ? canShowTerminal(instance) : false;
@@ -89,6 +92,17 @@ export function SessionPage({
   }
 
   const cost = usage && usage.cost.state === "known" ? `$${usage.cost.value.amount}` : "—";
+  const startResume = async (mode: ResumeMode) => {
+    setResuming(true);
+    try {
+      const resumedId = await hubStore.resume(instanceId as Id, mode);
+      // A failed resume already surfaced the Hub's reason as a toast; staying
+      // put keeps the old transcript readable.
+      if (resumedId) navigate(`/s/${resumedId}/${mode === "terminal" ? "tty" : "structured"}`);
+    } finally {
+      setResuming(false);
+    }
+  };
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
   const workspace = space?.name;
@@ -171,14 +185,30 @@ export function SessionPage({
           ) : null}
           {status === "exited" ? (
             canResume ? (
-              <Button
-                variant="primary"
-                onClick={() => {
-                  void hubStore.resume(instance.id);
-                }}
-              >
-                Resume
-              </Button>
+              <span className={session.headRow} data-testid="resume-control">
+                {/* D-026: resume continues the same native session on a NEW
+                    instance, so both targets navigate away from this one. */}
+                <Button
+                  variant="primary"
+                  disabled={resuming}
+                  onClick={() => {
+                    void startResume("structured");
+                  }}
+                >
+                  继续（结构化）
+                </Button>
+                <button
+                  type="button"
+                  className={session.headBtn}
+                  data-testid="resume-terminal"
+                  disabled={resuming}
+                  onClick={() => {
+                    void startResume("terminal");
+                  }}
+                >
+                  在终端中继续
+                </button>
+              </span>
             ) : (
               <Link to={newHref}>开新会话继承 cwd</Link>
             )

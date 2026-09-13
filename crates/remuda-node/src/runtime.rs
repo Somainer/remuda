@@ -327,12 +327,22 @@ impl DevNode {
         }
 
         let instance_id = request.instance_id.clone().unwrap_or_default();
-        let instance = fixture_instance(
+        let mut instance = fixture_instance_with_session(
             instance_id.clone(),
             host_id.clone(),
             workspace_id,
             request.driver,
+            request.resume_session_id.as_deref(),
         )?;
+        // D-026: the exited Instance keeps its history; the resumed one records
+        // where its conversation came from so both ends of the link are durable.
+        if let Some(parent) = request.resumed_from.clone() {
+            instance.parent = Some(remuda_protocol::InstanceParent {
+                instance_id: parent,
+                run_id: remuda_protocol::RunId::new(),
+                command_id: request.command_id.clone().unwrap_or_default(),
+            });
+        }
         let driver = self.inner.drivers.build(
             request.driver,
             DriverLaunch {
@@ -764,6 +774,9 @@ fn spawn_observation_pump(
                 )
             {
                 tracing::warn!(%error, "instance promotion not applied");
+            }
+            if let Some(session) = native_session_evidence(&observation) {
+                record_native_session(store.as_ref(), &instance_id, &session);
             }
             match store.append_driver_observation(&instance_id, observation) {
                 Ok(committed) => {
@@ -1199,6 +1212,91 @@ fn agent_kind(wire: &str) -> Option<AgentKind> {
         "generic" => Some(AgentKind::Generic),
         "terminal" => Some(AgentKind::Terminal),
         _ => None,
+    }
+}
+
+/// Native session identity carried by a driver lifecycle observation (D-026).
+struct NativeSessionEvidence {
+    session_id: String,
+    transcript_path: Option<String>,
+}
+
+/// Read the real Claude session id out of a driver observation.
+///
+/// `claude-print` reports it on the `session` lifecycle mapped from stream-json
+/// `system/init`; `claude-pty` reports it (with the transcript path) from its
+/// `SessionStart` hook. Both are the only proof Remuda has of the identity
+/// `claude --resume` will accept, so `nativeRef` must be corrected from them
+/// instead of keeping the Instance id minted at create time.
+fn native_session_evidence(
+    observation: &remuda_protocol::Observation,
+) -> Option<NativeSessionEvidence> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    // `nativeId` means different things per topic, so match the two events
+    // that actually carry a session: claude-print's `session` lifecycle, and
+    // claude-pty's SessionStart hook. Claude-print also emits hook lifecycles
+    // whose nativeId is a *hook* id — accepting those overwrote the real
+    // session with an id `--resume` rejects.
+    let transcript_path = native
+        .related_ids
+        .get("transcriptPath")
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty());
+    let carries_session = match native.topic {
+        remuda_protocol::LifecycleTopic::Session => native.native_name == "session",
+        remuda_protocol::LifecycleTopic::Hook => {
+            native.native_name == "SessionStart" && transcript_path.is_some()
+        }
+        _ => false,
+    };
+    if !carries_session {
+        return None;
+    }
+    let session_id = match &native.native_id {
+        Knowledge::Known { value } if !value.trim().is_empty() => value.trim().to_owned(),
+        _ => return None,
+    };
+    Some(NativeSessionEvidence {
+        session_id,
+        transcript_path,
+    })
+}
+
+/// Persist observed session identity and journal it once per change.
+fn record_native_session(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    evidence: &NativeSessionEvidence,
+) {
+    let updated = match store.set_native_session(
+        instance_id,
+        &evidence.session_id,
+        evidence.transcript_path.as_deref(),
+    ) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, instance_id = %instance_id.as_id(), "native session record failed");
+            return;
+        }
+    };
+    let state = serde_json::to_value(updated.lifecycle)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "ready".to_owned());
+    if let Err(error) = append_instance_lifecycle(
+        store,
+        instance_id,
+        Some(&state),
+        &state,
+        "native-session-recorded",
+    ) {
+        tracing::warn!(%error, "native session lifecycle append failed");
     }
 }
 
@@ -1681,14 +1779,34 @@ pub(crate) fn fixture_workspace(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn fixture_instance(
     instance_id: InstanceId,
     host_id: HostId,
     workspace_id: WorkspaceId,
     driver: remuda_protocol::DriverKind,
 ) -> Result<Instance, NodeError> {
+    fixture_instance_with_session(instance_id, host_id, workspace_id, driver, None)
+}
+
+/// Build the Instance entity, optionally seeded with the session it resumes.
+///
+/// Before the driver reports its own `session` lifecycle the Node has no proof
+/// of the native identity, so a new Instance records the placeholder below and
+/// [`crate::LocalStore::set_native_session`] corrects it. A resumed Instance
+/// already knows the identity: it is the one being continued (D-026).
+pub(crate) fn fixture_instance_with_session(
+    instance_id: InstanceId,
+    host_id: HostId,
+    workspace_id: WorkspaceId,
+    driver: remuda_protocol::DriverKind,
+    resume_session_id: Option<&str>,
+) -> Result<Instance, NodeError> {
     let now = timestamp_now()?;
-    let native_session_id = instance_id.as_id().to_string();
+    let native_session_id = resume_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| instance_id.as_id().to_string(), str::to_owned);
     Ok(Instance {
         meta: EntityMeta {
             id: instance_id,
@@ -1821,6 +1939,102 @@ mod tests {
     use super::*;
     use crate::{FakeDriver, MemoryStore};
     use std::time::Duration;
+
+    fn native_lifecycle(
+        topic: remuda_protocol::LifecycleTopic,
+        name: &str,
+        native_id: &str,
+        related: &[(&str, &str)],
+    ) -> remuda_protocol::Observation {
+        let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+            remuda_protocol::NativeLifecycle {
+                topic,
+                native_name: name.to_owned(),
+                native_id: Knowledge::Known {
+                    value: native_id.to_owned(),
+                },
+                status: Knowledge::Known {
+                    value: "started".to_owned(),
+                },
+                related_ids: related
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+                data_ref: None,
+                severity: remuda_protocol::Severity::Info,
+                affects_completion: false,
+            },
+        ))));
+        remuda_protocol::Observation {
+            schema_version: remuda_protocol::SchemaVersion,
+            event_id: remuda_protocol::EventId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            instance_id: InstanceId::new(),
+            run_id: None,
+            host_id: HostId::new(),
+            process_generation: U64(1),
+            run_generation: None,
+            seq: U64(1),
+            observed_at: timestamp_now().expect("now"),
+            native_at: unknown("test"),
+            source: crate::driver::runtime_source(
+                &fixture_instance(
+                    InstanceId::new(),
+                    HostId::new(),
+                    WorkspaceId::new(),
+                    remuda_protocol::DriverKind::ClaudePrint,
+                )
+                .expect("fixture instance"),
+                U64(1),
+            ),
+            completeness: Completeness::Structured,
+            raw_ref: None,
+            evidence_event_ids: Vec::new(),
+            body: payload,
+        }
+    }
+
+    /// A live claude-print run emits several hook lifecycles after its session
+    /// event, and `nativeId` there is the *hook* id. Recording one left
+    /// nativeRef holding an id `claude --resume` rejects (D-026).
+    #[test]
+    fn only_session_bearing_lifecycles_are_read_as_the_native_session() {
+        let session = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Session,
+            "session",
+            "2a99b5d4-f182-425f-ab5b-7f3541dee9bc",
+            &[("model", "claude-sonnet")],
+        );
+        let evidence = native_session_evidence(&session).expect("session lifecycle");
+        assert_eq!(evidence.session_id, "2a99b5d4-f182-425f-ab5b-7f3541dee9bc");
+        assert!(evidence.transcript_path.is_none());
+
+        let hook = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Hook,
+            "hook_started",
+            "f121381b-c2c9-47fd-a253-f5efea4e4c94",
+            &[("hookEvent", "SessionStart"), ("hookId", "f121381b")],
+        );
+        assert!(
+            native_session_evidence(&hook).is_none(),
+            "a hook id is not a session id"
+        );
+
+        // claude-pty's own SessionStart hook does carry the session, and proves
+        // it by naming the transcript the session writes to.
+        let pty_hook = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Hook,
+            "SessionStart",
+            "3b7c1f20-0000-4000-8000-00000000aaaa",
+            &[("transcriptPath", "/tmp/session.jsonl")],
+        );
+        let evidence = native_session_evidence(&pty_hook).expect("pty SessionStart");
+        assert_eq!(evidence.session_id, "3b7c1f20-0000-4000-8000-00000000aaaa");
+        assert_eq!(
+            evidence.transcript_path.as_deref(),
+            Some("/tmp/session.jsonl")
+        );
+    }
 
     #[tokio::test]
     async fn driver_panic_is_contained_and_marks_dispatch_unknown() {

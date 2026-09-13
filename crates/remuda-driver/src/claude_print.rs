@@ -603,6 +603,19 @@ impl Driver for ClaudePrintDriver {
         self.launch(spec, SessionAction::Resume { session_id })
             .await
     }
+
+    async fn start_resumed(
+        &self,
+        mut spec: InstanceSpec,
+        session_id: String,
+    ) -> DriverResult<RunHandle> {
+        if session_id.trim().is_empty() {
+            return Err(DriverError::NativeSessionNotFound);
+        }
+        spec.driver = DriverKind::ClaudePrint;
+        self.launch(spec, SessionAction::Resume { session_id })
+            .await
+    }
 }
 
 async fn map_loop(inner: Arc<Inner>, mut outbound: mpsc::Receiver<Outbound>) {

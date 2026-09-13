@@ -37,6 +37,14 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .await?;
             serde_json::to_value(&created).map_err(NodeError::from)
         }
+        // D-026: resume is a create whose spec names the native session to
+        // continue. Falling through to the catch-all below is what made the
+        // web Resume button silently do nothing.
+        "instance.resume" => {
+            let request = resume_from_params(node, &params)?;
+            let created = node.create_instance(request).await?;
+            serde_json::to_value(&created).map_err(NodeError::from)
+        }
         "instance.configure" => {
             let instance_id = instance_id_of(&params)?;
             let result = node
@@ -263,8 +271,41 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         max_budget_usd: None,
         provider_overlay: None,
         provider_auth_token: None,
+        resume_session_id: None,
+        resumed_from: None,
     };
     request.apply_spec_launch_fields(spec);
+    Ok(request)
+}
+
+/// Build the child create request behind `instance.resume` (D-026).
+///
+/// The Hub sends the parent's stored spec plus `resumeSessionId`, so the child
+/// inherits provider, permission, model and cwd; only the driver may differ,
+/// which is what "continue in a terminal" means.
+fn resume_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRequest, NodeError> {
+    let mut request = create_from_params(node, params)?;
+    let spec = params.get("spec").unwrap_or(params);
+    let session_id = params
+        .get("resumeSessionId")
+        .or_else(|| spec.get("resumeSessionId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            NodeError::InvalidRequest("instance.resume requires resumeSessionId".into())
+        })?;
+    request.resume_session_id = Some(session_id.to_owned());
+    if request.resumed_from.is_none() {
+        request.resumed_from = params
+            .get("resumedFrom")
+            .or_else(|| spec.get("resumedFrom"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| InstanceId::try_from(value.to_owned()))
+            .transpose()
+            .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
+    }
     Ok(request)
 }
 

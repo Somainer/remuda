@@ -440,6 +440,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Continue an exited Claude session on a new instance (D-026)
+         * @description Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window.
+         */
+        post: operations["instanceResume"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/interactions": {
         parameters: {
             query?: never;
@@ -929,6 +949,10 @@ export interface components {
             mode?: "native" | "promoted" | null;
             model?: string | null;
             name?: string | null;
+            /** @description Native session id the driver reported; what POST /v1/instances/{id}/resume passes to `claude --resume` (D-026). */
+            readonly nativeSessionId?: string | null;
+            /** @description Native transcript path, when a driver reported one (D-026). */
+            readonly nativeTranscriptPath?: string | null;
             /** @description Immutable creator instance, recorded by the Hub from authenticated identity. */
             readonly parentInstanceId?: string | null;
             /** @description When the terminal was promoted. Absent unless mode is "promoted". */
@@ -936,6 +960,8 @@ export interface components {
             providerProfileId?: string | null;
             providerSource?: string | null;
             providerSourceHint?: string | null;
+            /** @description Exited instance whose conversation this instance continues (D-026). */
+            readonly resumedFrom?: string | null;
             title?: string | null;
             updatedAt?: string;
             workspaceId?: string | null;
@@ -1070,6 +1096,27 @@ export interface components {
                 auth: string;
                 p256dh: string;
             };
+        };
+        ResumeRequest: {
+            /**
+             * @description structured keeps the parent's driver; terminal continues the same native session in claude-pty so the conversation gains a terminal tab.
+             * @default structured
+             * @enum {string}
+             */
+            mode: "structured" | "terminal";
+            /** @description Optional first prompt delivered to the resumed session. */
+            prompt?: string | null;
+        };
+        ResumeResult: {
+            command?: components["schemas"]["CommandRecord"];
+            hostId: string;
+            instance: components["schemas"]["InstanceRecord"];
+            /** @enum {string} */
+            mode: "structured" | "terminal";
+            /** @description True when an earlier resume for this (instance, mode) was reused instead of launching again. */
+            replayed?: boolean;
+        } & {
+            [key: string]: unknown;
         };
         SshHostCreate: {
             label: string;
@@ -1988,6 +2035,48 @@ export interface operations {
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    instanceResume: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResumeRequest"];
+            };
+        };
+        responses: {
+            /** @description Resumed instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResumeResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            /** @description No resumable native transcript, transcript too old, or host offline */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     interactionList: {

@@ -13,6 +13,7 @@ import type {
 import type { Workspace } from "../types/workspace";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import { printCapabilities, ptyCapabilities } from "./capabilities";
+import type { ResumeMode, ResumeResult } from "./api";
 import type { DriverKind } from "../types/nativeRef";
 import { HubHttpError } from "./httpError";
 import { digestPlaceholder, id, now } from "./ids";
@@ -1163,28 +1164,34 @@ export function mockConfigure(
   };
 }
 
-export function mockResume(instanceId: Id): CommandResult {
-  const inst = instances.find((i) => i.id === instanceId);
-  if (!inst) throw new Error("INSTANCE_NOT_FOUND");
-  inst.lifecycle = "ready";
-  inst.activity = known("idle");
-  inst.updatedAt = now();
-  const commandId = id("cmd_");
-  return {
-    command: {
-      ...meta(commandId),
-      commandId,
-      actor: { principalId: id("prn_"), type: "human", deviceId: id("dev_"), instanceId },
-      origin: "ui",
-      operation: "instance.resume",
-      target: { hostId, instanceId, runId: null },
-      payloadDigest: digestPlaceholder(),
-      state: "accepted",
-      dispatch: "intent-durable",
-      resolution: "clear",
-    },
-    relatedCommandIds: [],
-  };
+/**
+ * Resume leaves the exited instance alone and returns a new one that continues
+ * the same native session, mirroring the Hub endpoint (D-026).
+ */
+export function mockResume(instanceId: Id, mode: ResumeMode = "structured"): ResumeResult {
+  const parent = instances.find((i) => i.id === instanceId);
+  if (!parent) throw new Error("INSTANCE_NOT_FOUND");
+  const driver: DriverKind = mode === "terminal" ? "claude-pty" : parent.driver;
+  const existing = instances.find(
+    (i) => i.parent?.instanceId === instanceId && i.driver === driver && i.lifecycle !== "exited",
+  );
+  if (existing) return { instanceId: existing.id, mode, replayed: true };
+  const journalId = id("obj_");
+  const child = instanceBase(id("ins_"), journalId, "ready", known("idle"));
+  child.hostId = parent.hostId;
+  child.workspaceId = parent.workspaceId;
+  child.kind = parent.kind;
+  child.driver = driver;
+  child.cwd = parent.cwd;
+  child.capabilities = driver === "claude-print" ? printCapabilities() : ptyCapabilities(driver);
+  child.nativeRef = { ...parent.nativeRef };
+  child.parent = { instanceId, runId: id("run_"), commandId: id("cmd_") };
+  child.activeRunIds = [];
+  child.updatedAt = now();
+  instances.unshift(child);
+  titles.set(child.id, `${titles.get(instanceId) ?? "会话"}（已恢复）`);
+  journals.set(journalId, []);
+  return { instanceId: child.id, mode, replayed: false };
 }
 
 export function mockClose(instanceId: Id): CommandResult {

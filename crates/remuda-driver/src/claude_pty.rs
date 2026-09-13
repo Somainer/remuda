@@ -666,6 +666,19 @@ impl Driver for ClaudePtyDriver {
         self.launch(spec, SessionAction::Resume { session_id })
             .await
     }
+
+    async fn start_resumed(
+        &self,
+        mut spec: InstanceSpec,
+        session_id: String,
+    ) -> DriverResult<RunHandle> {
+        if session_id.trim().is_empty() {
+            return Err(DriverError::NativeSessionNotFound);
+        }
+        spec.driver = DriverKind::ClaudePty;
+        self.launch(spec, SessionAction::Resume { session_id })
+            .await
+    }
 }
 
 fn require_session_start(live: &PtyLive) -> DriverResult<()> {

@@ -953,3 +953,80 @@ fn unknown_and_mcp_launch_origins_fail_closed() {
     assert_eq!(LaunchOrigin::from(InputOrigin::Bot), LaunchOrigin::Bot);
     assert_eq!(LaunchOrigin::from(InputOrigin::Human), LaunchOrigin::Human);
 }
+
+/// D-026: resuming a session must put the exact native UUID behind `--resume`,
+/// never `--session-id` (which would mint a second conversation) and never
+/// `--continue` (which picks a session by recency rather than identity).
+#[test]
+fn resume_emits_exact_session_id_and_never_continue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "2.1.268 (Claude Code)");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let spec = load_spec();
+    let profile = native_profile();
+    let session = "01993ab0-0000-7000-8000-0000000000aa";
+    let mut request = request(&spec, &profile, &launch, &home, pin_source(&binary));
+    request.session = SessionAction::Resume {
+        session_id: session.into(),
+    };
+    let recipe = materialize(&request).unwrap();
+
+    assert!(
+        recipe
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == session),
+        "argv must resume the exact session: {:?}",
+        recipe.argv
+    );
+    assert!(!recipe.argv.iter().any(|token| token == "--session-id"));
+    assert!(!recipe.argv.iter().any(|token| token == "--continue"));
+    assert_eq!(recipe.session_id.as_deref(), Some(session));
+}
+
+/// A resumed launch keeps the settings surface of a new one, so the continued
+/// conversation runs under the same provider, permission and model selection.
+#[test]
+fn resume_keeps_the_same_launch_surface_as_a_new_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "2.1.268 (Claude Code)");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let spec = load_spec();
+    let profile = native_profile();
+    let pinned = pin_source(&binary);
+
+    let fresh = materialize(&request(
+        &spec,
+        &profile,
+        &tmp.path().join("launch-new"),
+        &home,
+        pinned.clone(),
+    ))
+    .unwrap();
+    let mut resume_request = request(
+        &spec,
+        &profile,
+        &tmp.path().join("launch-resume"),
+        &home,
+        pinned,
+    );
+    resume_request.session = SessionAction::Resume {
+        session_id: "01993ab0-0000-7000-8000-0000000000bb".into(),
+    };
+    let resumed = materialize(&resume_request).unwrap();
+
+    let flags = |argv: &[String]| -> Vec<String> {
+        argv.iter()
+            .filter(|token| {
+                token.starts_with("--") && *token != "--resume" && *token != "--session-id"
+            })
+            .cloned()
+            .collect()
+    };
+    assert_eq!(flags(&fresh.argv), flags(&resumed.argv));
+    assert_eq!(fresh.binary, resumed.binary);
+    assert_eq!(fresh.setting_sources, resumed.setting_sources);
+}

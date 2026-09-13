@@ -110,7 +110,7 @@ tracked PNGs. (Previously both wrote straight into `docs/design/evidence/`.)
 
 ## Tests
 
-- `pnpm --dir web test` — **288 passed, 59 files**. `NewSessionPage.test.tsx`
+- `pnpm --dir web test` — **309 passed, 61 files**. `NewSessionPage.test.tsx`
   adds five: the slider replaces the chips; the harness switch re-snaps
   (claude→codex→grok, names, indices, `data-tiers`); the top tier stays the
   top tier across tables and the draft is dropped with the remount; and the
@@ -125,5 +125,10 @@ tracked PNGs. (Previously both wrote straight into `docs/design/evidence/`.)
   including `terminal` unmounting the card.
 - `composer-effort.spec.ts` — 13 chromium passed, 1 skipped (mobile-only touch
   sizing); its two New Session assertions moved from the chips to the slider.
-- `pnpm --dir web run test:e2e:hub` — live Hub `instance.configure` drag and
-  keyboard, unchanged.
+- `pnpm --dir web run test:e2e:hub` — 11 passed, 1 skipped, on `origin/main`
+  as of `f359e5c`; the live Hub `instance.configure` drag and keyboard test is
+  unchanged and still passes.
+
+A default `test:e2e:hub` still leaves untracked `fake-*.png` under
+`docs/design/evidence/spaces-1/` from `spaces-hub-live.spec.ts` — the same
+opt-in gate would suit it, but it is outside this change.

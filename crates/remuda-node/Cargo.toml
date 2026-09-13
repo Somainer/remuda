@@ -31,6 +31,7 @@ remuda-driver.workspace = true
 remuda-herdr.workspace = true
 remuda-journal.workspace = true
 remuda-protocol.workspace = true
+remuda-signal.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rusqlite.workspace = true
 serde.workspace = true

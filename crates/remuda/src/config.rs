@@ -101,6 +101,10 @@ pub(crate) struct Node {
     pub auto_trust_registered_workspaces: bool,
     #[serde(alias = "promoteTerminalAgents")]
     pub promote_terminal_agents: bool,
+    /// Route harness hooks through a per-instance socket (D-028 §4.2).
+    /// Off by default in P1.
+    #[serde(alias = "ptyHooks")]
+    pub pty_hooks: bool,
     #[serde(alias = "webOrigins")]
     pub web_origins: Vec<String>,
 }
@@ -393,6 +397,7 @@ impl Default for Node {
             workspace_roots: None,
             auto_trust_registered_workspaces: true,
             promote_terminal_agents: true,
+            pty_hooks: false,
             web_origins: vec![
                 "http://localhost:5173".into(),
                 "http://127.0.0.1:5173".into(),
@@ -528,6 +533,13 @@ impl Config {
                 "1" | "true" => true,
                 "0" | "false" => false,
                 _ => bail!("REMUDA_PROMOTE_TERMINAL_AGENTS must be true, false, 1 or 0"),
+            };
+        }
+        if let Some(value) = env_text(env, "REMUDA_PTY_HOOKS")? {
+            self.node.pty_hooks = match value.as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => bail!("REMUDA_PTY_HOOKS must be true, false, 1 or 0"),
             };
         }
         if let Some(value) = env_text(env, "REMUDA_MAX_INSTANCES")? {

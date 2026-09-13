@@ -74,6 +74,13 @@ pub fn hook_agent_pid(native: &NativeLifecycle) -> Option<i32> {
 /// `foreground_pid` is the process *group* leader. A shim that `exec`s (as ours
 /// does) leaves the agent as that leader, so the two are equal; a shim that
 /// spawned a child would not, which is one more reason the shim execs.
+///
+/// TODO(x-promote-bind): once `bind_by_session(pid, session_id,
+/// transcript_path)` lands in `shell_pty/promotion.rs`, the SignalBus should
+/// call it directly instead of the Node re-deriving the match from the
+/// journal. Until then the binding evidence travels in the observation's
+/// `ppid` (see [`session_evidence`]), which is why the relay stamps it on
+/// every event.
 #[must_use]
 pub fn binds_instance(agent_pid: i32, foreground_pid: Option<i32>) -> bool {
     match foreground_pid {

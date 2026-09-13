@@ -6,6 +6,23 @@ import type { Id } from "../../types/wire";
 import { Transcript } from "./Transcript";
 
 describe("Transcript", () => {
+  it("fills an empty completed message from delayed history without remounting its bubble", () => {
+    const base = buildLongObservations({ instanceId: "ins_stream", journalId: "obj_stream", hostId: "hst_1", count: 1 })[0];
+    if (base.kind !== "message") throw new Error("expected a message fixture");
+    const open = { ...base, payload: { ...base.payload, status: "streaming" as const, blocks: [{ type: "text" as const, text: "hello from web hub" }] } };
+    const close = {
+      ...base, eventId: "evt_close", seq: "2",
+      payload: { ...base.payload, messageId: "renamed", operation: "close" as const, revision: "2", baseRevision: "1", blocks: [] },
+    };
+    const { rerender } = render(<Transcript events={[close]} compact={false} />);
+    const bubble = screen.getByTestId("message");
+    expect(bubble).toHaveTextContent("You");
+    rerender(<Transcript events={[close, open]} compact={false} />);
+    expect(screen.getAllByTestId("message")).toHaveLength(1);
+    expect(screen.getByTestId("message")).toBe(bubble);
+    expect(bubble).toHaveTextContent("hello from web hub");
+  });
+
   it("updates the same assistant bubble while stream revisions arrive", () => {
     const base = buildLongObservations({ instanceId: "ins_stream", journalId: "obj_stream", hostId: "hst_1", count: 1 })[0];
     if (base.kind !== "message") throw new Error("expected a message fixture");

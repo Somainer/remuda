@@ -1,13 +1,16 @@
 # Intranet Hub behind the existing Caddy
 
-Status: **HTTPS active; Hub upgraded to `9dd7ec7`; Mac device paired and persistent
-Node enrolled; shell prompt/reply and outbound WSS durable replay passed. Claude
-PTY acceptance is blocked: native startup never reached SessionStart readiness.** Approved Caddy activation is recorded in
-[intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md). The Hub-only
-upgrade preserved data, environment, mounts and Caddy. See
-[intranet-enroll-1.md](../../docs/design/evidence/intranet-enroll-1.md) for build
-identity, pairing, Node isolation, live acceptance and the unexecuted SG/bolt Node
-installation plan.
+Status: **HTTPS active; Hub `9dd7ec7`; persistent Mac Node online with the real
+repository workspace. Shell and Claude PTY PONG/reply/stop acceptance passed;
+workspace lookup and the earlier outbound WSS durable replay are verified.**
+The user granted the Mac daemon's filesystem permission manually before the
+second acceptance run; this run made no System Settings or TCC changes. See
+[intranet-acceptance-2.md](../../docs/design/evidence/intranet-acceptance-2.md)
+for the current workspace and PTY evidence,
+[intranet-enroll-1.md](../../docs/design/evidence/intranet-enroll-1.md) for the
+Hub upgrade, pairing, Node isolation and earlier blocked attempts, and
+[intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md) for approved
+Caddy activation. No SG/bolt Node installation has been performed by these runs.
 
 This is the immediate [D-020](../../docs/design/decisions.md) deployment
 path. Run Hub on the SG host, join its existing `deploy_default` network,

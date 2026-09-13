@@ -36,6 +36,11 @@ const INHERIT: &[&str] = &[
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
     "XDG_DATA_HOME",
+    // Where the user keeps their zsh configuration. The launch shim generates
+    // a shadow ZDOTDIR that sources the user's own rc files, so it has to know
+    // where those are; without this a user who keeps zsh config outside $HOME
+    // would silently get a bare shell (D-028 §4.2).
+    "ZDOTDIR",
 ];
 
 /// Inherited prefixes: locale categories only (`LC_ALL`, `LC_CTYPE`, …).
@@ -155,6 +160,19 @@ mod tests {
         for secret in ["bootstrap-secret", "host-secret", "sk-secret", "aws-secret"] {
             assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
         }
+    }
+
+    #[test]
+    fn the_users_zsh_config_location_is_inherited_so_the_shim_can_source_it() {
+        // The launch shim's shadow ZDOTDIR sources the user's own rc files. If
+        // this name were not inherited, someone who keeps their zsh config
+        // outside $HOME would get a bare shell inside Remuda and nowhere
+        // obvious to look for why.
+        let env = inherit_from(vars(&[("ZDOTDIR", "/home/u/.config/zsh")]));
+        assert_eq!(
+            env.get("ZDOTDIR").map(String::as_str),
+            Some("/home/u/.config/zsh")
+        );
     }
 
     #[test]

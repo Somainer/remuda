@@ -2969,6 +2969,7 @@ dependencies = [
  "remuda-hub-client",
  "remuda-node",
  "remuda-protocol",
+ "remuda-signal",
  "remuda-ssh",
  "serde",
  "serde_json",
@@ -3033,6 +3034,7 @@ dependencies = [
  "remuda-claude-wire",
  "remuda-herdr",
  "remuda-protocol",
+ "remuda-signal",
  "remuda-testing",
  "serde",
  "serde_json",
@@ -3164,6 +3166,7 @@ dependencies = [
  "remuda-hub",
  "remuda-journal",
  "remuda-protocol",
+ "remuda-signal",
  "remuda-testing",
  "reqwest",
  "rusqlite",
@@ -3225,6 +3228,21 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "toml",
+]
+
+[[package]]
+name = "remuda-signal"
+version = "0.1.0"
+dependencies = [
+ "remuda-protocol",
+ "remuda-testing",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

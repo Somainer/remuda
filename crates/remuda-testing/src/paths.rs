@@ -51,6 +51,22 @@ pub fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+/// Hook payloads recorded from a real `claude` run (D-028 §4.2).
+///
+/// One JSON object per line, `{event, ppid, payload}`, in the order a session
+/// emits them. Host paths and session ids are scrubbed; the field *shapes* are
+/// verbatim, which is the part tests depend on.
+pub fn hook_session_fixture() -> &'static str {
+    include_str!("../fixtures/hooks/claude-hook-session.jsonl")
+}
+
+/// Path to the recorded hook session, for tests that want to read it at runtime.
+pub fn hook_session_path() -> PathBuf {
+    fixtures_dir()
+        .join("hooks")
+        .join("claude-hook-session.jsonl")
+}
+
 /// Absolute path to a bundled script JSONL.
 pub fn script_path(kind: ScriptKind) -> PathBuf {
     fixtures_dir()

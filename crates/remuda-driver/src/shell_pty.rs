@@ -77,6 +77,22 @@ pub struct ShellPtyOptions {
     /// Claude config dir used to locate a promoted session's transcript.
     /// Defaults to `$HOME/.claude`.
     pub claude_home: Option<PathBuf>,
+    /// Hook path for this instance (D-028 §4.2), when `REMUDA_PTY_HOOKS` is on.
+    ///
+    /// `None` — the P1 default — means no socket, no overlay and no shim: a
+    /// Node that has not opted in behaves exactly as it did before.
+    pub hooks: Option<HookConfig>,
+}
+
+/// What the driver needs to stand up this instance's hook path.
+#[derive(Debug, Clone)]
+pub struct HookConfig {
+    /// `<data dir>/instances/<id>`, where the socket and launch dir live.
+    pub instance_dir: PathBuf,
+    /// The `remuda` binary the relay runs as.
+    pub relay_binary: PathBuf,
+    /// Renderer pinned for the session (§9.2).
+    pub tui: crate::launch::TuiMode,
 }
 
 impl ShellPtyOptions {
@@ -93,6 +109,7 @@ impl ShellPtyOptions {
             rows: DEFAULT_ROWS,
             promote: false,
             claude_home: None,
+            hooks: None,
         }
     }
 }
@@ -120,6 +137,9 @@ pub struct ShellPtyDriver {
     poller: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
     table: Arc<dyn ProcessTable>,
+    /// Live hook path, when the instance opted in. Dropped on close, which
+    /// unbinds the socket.
+    hooks: Mutex<Option<Arc<crate::launch::HookSession>>>,
     seq: Arc<AtomicU64>,
 }
 
@@ -141,6 +161,7 @@ impl ShellPtyDriver {
             status: Arc::new(std::sync::Mutex::new(None)),
             poller: Mutex::new(None),
             table,
+            hooks: Mutex::new(None),
             seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -152,6 +173,48 @@ impl ShellPtyDriver {
             .lock()
             .ok()
             .and_then(|slot| slot.as_ref().map(|found| found.kind))
+    }
+
+    /// Stand up this instance's hook path, when one was configured.
+    ///
+    /// The [`SignalBus`](remuda_signal::SignalBus) shares the promotion
+    /// poller's `seq` counter and identity, so hook and screen observations
+    /// land in one ordered stream rather than two that have to be interleaved
+    /// after the fact.
+    fn start_hooks(
+        &self,
+        ctx: &promotion::PromoteCtx,
+        events: &mpsc::Sender<remuda_protocol::Observation>,
+    ) -> DriverResult<Option<Arc<crate::launch::HookSession>>> {
+        let Some(config) = self.options.hooks.clone() else {
+            return Ok(None);
+        };
+        let bus = Arc::new(remuda_signal::SignalBus::new(
+            remuda_signal::BusContext {
+                instance_id: ctx.instance_id.clone(),
+                host_id: ctx.host_id.clone(),
+                journal_id: ctx.journal_id.clone(),
+                run_id: ctx.run_id.clone(),
+                driver_kind: DriverKind::ShellPty,
+                adapter_version: crate::capabilities::ADAPTER_VERSION.to_owned(),
+            },
+            events.clone(),
+            Arc::clone(&self.seq),
+        ));
+        Ok(Some(Arc::new(crate::launch::HookSession::start(
+            &crate::launch::HookSessionOptions {
+                instance_dir: config.instance_dir,
+                relay_binary: config.relay_binary,
+                tui: config.tui,
+                base_settings: None,
+            },
+            bus,
+        )?)))
+    }
+
+    /// The native session a hook reported, if `SessionStart` has fired.
+    pub async fn hook_session(&self) -> Option<remuda_signal::SessionBinding> {
+        self.hooks.lock().await.as_ref()?.binding()
     }
 
     async fn state(&self) -> DriverResult<Arc<PtyState>> {
@@ -180,7 +243,13 @@ impl ShellPtyDriver {
                 pixel_height: 0,
             })
             .map_err(pty_err)?;
-        let cmd = build_command(&self.options, cwd)?;
+        // The event channel is created before the child so the hook socket is
+        // already accepting when the shell starts: a human who types `claude`
+        // immediately must not lose their SessionStart to a race.
+        let (tx, rx) = mpsc::channel(256);
+        let hook_ctx = promote_ctx(&self.options, cwd, spec)?;
+        let hooks = self.start_hooks(&hook_ctx, &tx)?;
+        let cmd = build_command(&self.options, cwd, hooks.as_ref())?;
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         let master = pair.master;
@@ -203,26 +272,12 @@ impl ShellPtyDriver {
             .spawn(move || read_pty(pump, reader))
             .map_err(DriverError::Io)?;
         *self.inner.lock().await = Some(Arc::clone(&state));
+        *self.hooks.lock().await = hooks;
         let recipe = shell_recipe(&self.options, cwd)?;
-        let (tx, rx) = mpsc::channel(256);
         if self.options.promote {
-            // Node rebinds instance/journal/host on commit; the driver only
-            // needs locally consistent ids (same contract as claude-pty).
-            let ctx = promotion::PromoteCtx {
-                instance_id: InstanceId::new(),
-                host_id: spec.map_or_else(HostId::new, |spec| spec.host.clone()),
-                journal_id: Id::new("obj")?,
-                run_id: RunId::new(),
-                cwd: PathBuf::from(cwd),
-                claude_home: self
-                    .options
-                    .claude_home
-                    .clone()
-                    .unwrap_or_else(default_claude_home),
-            };
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
-                ctx,
+                hook_ctx,
                 Arc::clone(&self.table),
                 Arc::clone(&self.promoted),
                 Arc::clone(&self.status),
@@ -234,6 +289,30 @@ impl ShellPtyDriver {
         }
         Ok(RunHandle::new(recipe, DriverAck::transport_written(), rx))
     }
+}
+
+/// Identity the promotion poller and the signal bus both stamp Observations
+/// with.
+///
+/// One context for both so hook and screen evidence share a journal, a run and
+/// a sequence counter. Node rebinds instance/journal/host on commit; the driver
+/// only needs locally consistent ids (same contract as claude-pty).
+fn promote_ctx(
+    options: &ShellPtyOptions,
+    cwd: &str,
+    spec: Option<&InstanceSpec>,
+) -> DriverResult<promotion::PromoteCtx> {
+    Ok(promotion::PromoteCtx {
+        instance_id: InstanceId::new(),
+        host_id: spec.map_or_else(HostId::new, |spec| spec.host.clone()),
+        journal_id: Id::new("obj")?,
+        run_id: RunId::new(),
+        cwd: PathBuf::from(cwd),
+        claude_home: options
+            .claude_home
+            .clone()
+            .unwrap_or_else(default_claude_home),
+    })
 }
 
 /// `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
@@ -417,6 +496,10 @@ impl Driver for ShellPtyDriver {
         if let Ok(mut slot) = self.status.lock() {
             *slot = None;
         }
+        // Unbinds the socket and removes the socket file. The overlay and shims
+        // stay for `instance.purge` to remove with the rest of the instance
+        // directory — they are launch audit evidence until then.
+        self.hooks.lock().await.take();
         let Some(state) = self.inner.lock().await.take() else {
             return Ok(DriverAck::not_dispatched());
         };
@@ -438,7 +521,11 @@ fn pty_err(err: impl std::fmt::Display) -> DriverError {
     DriverError::Io(io::Error::other(err.to_string()))
 }
 
-fn build_command(options: &ShellPtyOptions, spec_cwd: &str) -> DriverResult<CommandBuilder> {
+fn build_command(
+    options: &ShellPtyOptions,
+    spec_cwd: &str,
+    hooks: Option<&Arc<crate::launch::HookSession>>,
+) -> DriverResult<CommandBuilder> {
     let cwd = if Path::new(spec_cwd).is_dir() {
         PathBuf::from(spec_cwd)
     } else {
@@ -457,7 +544,8 @@ fn build_command(options: &ShellPtyOptions, spec_cwd: &str) -> DriverResult<Comm
     };
     cmd.cwd(cwd);
     cmd.env_clear();
-    for (key, value) in crate::child_env::base_env() {
+    let base = crate::child_env::base_env();
+    for (key, value) in &base {
         cmd.env(key, value);
     }
     cmd.env("TERM", "xterm-256color");
@@ -469,6 +557,20 @@ fn build_command(options: &ShellPtyOptions, spec_cwd: &str) -> DriverResult<Comm
     }
     if let Some(context) = &options.agent_mcp {
         for (key, value) in context.environment()? {
+            cmd.env(key, value);
+        }
+    }
+    // Last, and deliberately past the allowlist: the shim PATH and the hook
+    // credential are values the *driver computed*, not values it inherited
+    // (D-028 §4.2). The inherit allowlist exists to keep the Node's own
+    // credentials and any `LD_PRELOAD`/proxy/CA injection out of a process the
+    // model can read; it is not the channel for something we minted ourselves.
+    if let Some(session) = hooks {
+        let inherited = base
+            .get("PATH")
+            .cloned()
+            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        for (key, value) in session.child_env(&inherited) {
             cmd.env(key, value);
         }
     }
@@ -630,6 +732,53 @@ mod tests {
         let (body, submit) = prompt_writes("hello\n", true);
         assert_eq!(body, b"hello".to_vec(), "the terminator becomes the submit");
         assert_eq!(submit, Some(b"\r".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_driver_without_hooks_configured_starts_nothing() {
+        // P1 default: a Node that has not set REMUDA_PTY_HOOKS behaves exactly
+        // as it did before — no socket, no overlay, no shim.
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+        let driver = ShellPtyDriver::new(options);
+        driver.spawn().await.expect("spawns");
+        assert!(driver.hook_session().await.is_none());
+        assert!(
+            !dir.path().join("hook.sock").exists(),
+            "no hook path was configured, so none should exist"
+        );
+        let _ = Driver::close(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn a_configured_hook_path_binds_a_socket_the_child_can_reach() {
+        // The seam P2 and P3 read the native session through. Exercised here so
+        // the wiring cannot rot while it has no production caller yet.
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join("instance");
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        let driver = ShellPtyDriver::new(options);
+        driver.spawn().await.expect("spawns");
+        assert!(
+            instance_dir.join("hook.sock").exists(),
+            "socket is listening"
+        );
+        assert!(instance_dir.join("launch/settings.json").is_file());
+        assert!(instance_dir.join("launch/bin/claude").is_file());
+        // Nothing has reported a session yet.
+        assert!(driver.hook_session().await.is_none());
+        let _ = Driver::close(&driver).await;
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "close must unbind the socket"
+        );
     }
 
     #[test]

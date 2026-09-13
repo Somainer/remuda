@@ -1,0 +1,25 @@
+[package]
+name = "remuda-signal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Harness signal adapters: hook socket transport, event decoding, and Observation mapping (D-028 §4.2)."
+
+[lints]
+workspace = true
+
+[dependencies]
+remuda-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+remuda-testing.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

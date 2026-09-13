@@ -20,6 +20,7 @@ mod flags;
 pub mod generic_pty;
 pub mod grok_session;
 pub mod interaction;
+pub mod launch;
 mod materializer;
 mod process;
 mod profile;
@@ -48,6 +49,10 @@ pub use claude_transcript::{TranscriptTail, encode_project_dir, locate_transcrip
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
 pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, KindPreset, WaitUntil, preset_by_id};
+pub use launch::{
+    HOOKS_ENABLE_ENV, HookOverlay, HookSession, HookSessionOptions, OverlayOptions,
+    SHIM_DISABLE_ENV, ShimSet, TuiMode, materialize_overlay, materialize_shims, shim_disabled,
+};
 pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
     materialize_with_token_broker, render_api_key_helper_script,

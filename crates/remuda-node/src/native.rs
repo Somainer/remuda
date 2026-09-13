@@ -52,6 +52,21 @@ pub struct NativeDriverConfig {
     /// Promote a `terminal` instance when a known agent CLI takes the PTY
     /// foreground, and hydrate its transcript (D-025).
     pub promote_terminal_agents: bool,
+    /// Route harness hooks through a per-instance socket (D-028 §4.2).
+    ///
+    /// `REMUDA_PTY_HOOKS`, off by default in P1. When off, no socket is bound,
+    /// no overlay is written and no shim is generated, so a Node that has not
+    /// opted in behaves exactly as it did before.
+    pub pty_hooks: bool,
+    /// The `remuda` binary hooks re-enter as the relay.
+    ///
+    /// `None` — the normal case — resolves this process's own executable at
+    /// launch: it is the binary the Node is already running, so it exists and
+    /// its relay speaks the same wire as the socket it will connect to. Boxed
+    /// because `NativeDriverConfig` is a variant of `LocalDrivers`, and an
+    /// inline `PathBuf` for a field that is almost always absent pushes that
+    /// enum over the size clippy is willing to accept.
+    pub relay_binary: Option<Box<PathBuf>>,
     /// Claude print initialize timeout.
     pub print_handshake_timeout: Duration,
     /// Non-secret development environment forwarded to drivers.
@@ -89,6 +104,8 @@ impl NativeDriverConfig {
                 .is_ok_and(|v| matches!(v.as_str(), "0" | "false")),
             auto_trust_registered_workspaces: true,
             promote_terminal_agents: true,
+            pty_hooks: false,
+            relay_binary: None,
             print_handshake_timeout: Duration::from_secs(30),
             extra_env,
         }
@@ -324,6 +341,20 @@ impl DriverFactory for NativeClaudeFactory {
                 // structured view and composer follow what the human started.
                 options.promote = self.config.promote_terminal_agents;
                 options.claude_home = self.config.claude_native_home.clone();
+                // D-028 §4.2: the hook path only exists when the operator
+                // opted in. Promotion is its precondition — a shell nobody can
+                // start an agent in has nothing to hook.
+                if self.config.pty_hooks && self.config.promote_terminal_agents {
+                    options.hooks = Some(remuda_driver::shell_pty::HookConfig {
+                        instance_dir: instance_dir.clone(),
+                        relay_binary: relay_binary(&self.config)?,
+                        // P1 only runs under a promoted terminal, whose
+                        // renderer is whatever the human chose. Pinning
+                        // `default` here would fight them; P2 takes this from
+                        // the launch request once Remuda owns the launch.
+                        tui: remuda_driver::TuiMode::Fullscreen,
+                    });
+                }
                 Arc::new(ShellPtyDriver::new(options))
             }
             other => {
@@ -347,6 +378,23 @@ impl DriverFactory for NativeClaudeFactory {
             startup_error: std::sync::Mutex::new(None),
         }))
     }
+}
+
+/// The binary a hook re-enters as `remuda hook emit`.
+///
+/// Defaults to this process's own executable: it is the binary the Node is
+/// already running, so it exists and its relay speaks the same wire as the
+/// socket it will connect to. A configured override exists for packaging that
+/// splits them.
+fn relay_binary(config: &NativeDriverConfig) -> Result<PathBuf, DriverError> {
+    if let Some(path) = &config.relay_binary {
+        return Ok(path.as_ref().clone());
+    }
+    std::env::current_exe().map_err(|error| {
+        DriverError::Failed(format!(
+            "cannot locate the remuda binary for hooks: {error}"
+        ))
+    })
 }
 
 fn cwd_is_registered(cwd: &Path, registered_root: &Path) -> bool {

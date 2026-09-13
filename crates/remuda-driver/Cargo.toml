@@ -27,6 +27,7 @@ remuda-acp-wire.workspace = true
 remuda-claude-wire.workspace = true
 remuda-herdr.workspace = true
 remuda-protocol.workspace = true
+remuda-signal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

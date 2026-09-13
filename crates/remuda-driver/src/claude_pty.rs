@@ -104,8 +104,12 @@ pub struct ClaudePtyOptions {
     /// is onboarded already.
     pub seed_onboarding: bool,
     /// Where the host user's Claude configuration lives, as the source of the
-    /// allowlisted flags copied by `seed_onboarding`. `None` skips the copy and
-    /// seeds only `hasCompletedOnboarding`.
+    /// allowlisted flags copied by `seed_onboarding`. Defaults to `None`, which
+    /// seeds only `hasCompletedOnboarding` and reads no file outside the scoped
+    /// directory; the Node opts in with [`HostClaudeConfig::from_env`] so that
+    /// merely constructing a driver never reads the operator's home.
+    ///
+    /// [`HostClaudeConfig::from_env`]: crate::claude_onboarding::HostClaudeConfig::from_env
     pub host_claude_config: Option<crate::claude_onboarding::HostClaudeConfig>,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
@@ -137,7 +141,7 @@ impl ClaudePtyOptions {
             settings_overlay_path: None,
             auto_trust_registered_workspace: false,
             seed_onboarding: true,
-            host_claude_config: crate::claude_onboarding::HostClaudeConfig::from_env(),
+            host_claude_config: None,
         }
     }
 }

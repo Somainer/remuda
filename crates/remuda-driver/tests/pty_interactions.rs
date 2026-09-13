@@ -424,8 +424,6 @@ async fn claude_onboarding_is_detected_answered_and_blocks_prompt_dispatch() {
     );
     options.socket_dir = Some(socket_dir.clone());
     options.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
-    // Never read the developer's real ~/.claude.json from a test.
-    options.host_claude_config = None;
     let driver = ClaudePtyDriver::new(options);
     let mut spec: InstanceSpec =
         serde_json::from_str(include_str!("fixtures/instance-spec.json")).unwrap();

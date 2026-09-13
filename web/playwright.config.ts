@@ -1,5 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const browserChannel = process.env.PW_CHANNEL || "chrome";
+
 export default defineConfig({
   testDir: "./tests/e2e",
   testIgnore: /hub-live\.spec\.ts|hub-security\.spec\.ts|terminal-live\.spec\.ts|pairing\.spec\.ts|providers-discovery\.spec\.ts|pty-toolcalls(-before)?\.spec\.ts/,
@@ -18,7 +20,12 @@ export default defineConfig({
     env: { ...process.env, VITE_MOCK: "1", VITE_DEV_TTY: "1" },
   },
   projects: [
-    { name: "chromium", use: { ...devices["Desktop Chrome"], channel: "chrome" } },
+    {
+      name: "chromium",
+      // Google Chrome by default (matches CI runners); set PW_CHANNEL=chromium to use
+      // Playwright's bundled Chromium on hosts without Chrome (e.g. the remote merge gate).
+      use: { ...devices["Desktop Chrome"], ...(browserChannel === "chromium" ? {} : { channel: browserChannel }) },
+    },
     { name: "mobile-webkit", use: { ...devices["iPhone 13"] } },
   ],
 });

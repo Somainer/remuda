@@ -169,6 +169,9 @@ pub async fn login(
     }
     let token = crate::config::random_token();
     let hash = hash_secret(&token)?;
+    let prefix = crate::auth::token_prefix(&token)
+        .ok_or_else(|| HubError::Internal("generated device token is not indexable".into()))?
+        .to_owned();
     let kind = body.device_kind.unwrap_or_else(|| "human".into());
     if !matches!(kind.as_str(), "human" | "bot") {
         return Err(HubError::BadRequest(
@@ -177,7 +180,7 @@ pub async fn login(
     }
     let device = state
         .store
-        .insert_device_as(body.device_name, hash, token[..16].to_owned(), kind, None)
+        .insert_device_as(body.device_name, hash, prefix, kind, None)
         .await?;
     let cookie = device_cookie(&token, state.config.cookie_secure);
     let body = json!({
@@ -243,7 +246,7 @@ pub async fn list_hosts(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let items: Vec<Value> = crate::placement::hosts_with_live_links(&state)
         .await?
         .iter()
@@ -258,7 +261,7 @@ pub async fn list_instances(
     headers: HeaderMap,
     Query(query): Query<InstanceListQuery>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let mut items = state.store.list_instances(query.host_id).await?;
     if !query.include_history {
         items.retain(|instance| instance.last_error.as_deref() != Some("host-lost"));
@@ -272,7 +275,7 @@ pub async fn get_instance(
     headers: HeaderMap,
     Path(instance_id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
     let instance = state
         .store
         .get_instance(instance_id)
@@ -464,7 +467,7 @@ pub async fn list_worktrees(
     headers: HeaderMap,
     Query(query): Query<WorktreeListQuery>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let host = pick_worktree_host(&state, query.host_id.as_deref()).await?;
     match call_node(
         &state,
@@ -567,7 +570,7 @@ pub async fn get_journal(
     Path(instance_id): Path<String>,
     Query(query): Query<JournalQuery>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
     if state
         .store
         .get_instance(instance_id.clone())

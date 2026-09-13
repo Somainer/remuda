@@ -26,7 +26,7 @@ async fn doctor_host(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     if state.store.get_host(id.clone()).await?.is_none() {
         return Err(HubError::NotFound);
     }
@@ -77,7 +77,7 @@ async fn get_host(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let host = state
         .store
         .get_host(id.clone())

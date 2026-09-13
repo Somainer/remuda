@@ -1059,32 +1059,37 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
             .any(|id| id == child_id)
     );
 
-    let (status, denied_launch) = request(
-        hub.addr,
-        agent,
-        "/v1/instances",
-        Some(json!({"hostId":host,"permissionMode":"bypassPermissions"})),
-        None,
-    )
-    .await;
-    assert_eq!(status, 200, "{denied_launch}");
-    let denied = settled(&node, &denied_launch).await;
-    assert!(
-        serde_json::to_string(&denied.settlement)
-            .unwrap()
-            .contains("not allowed")
-    );
-    assert!(
-        node.launch_recipe(
-            &denied_launch["instance"]["instanceId"]
-                .as_str()
-                .unwrap()
-                .parse()
-                .unwrap()
+    for mode in [
+        "bypassPermissions",
+        "dontAsk",
+        "auto",
+        "acceptEdits",
+        "default",
+        "future",
+    ] {
+        let (status, denied_launch) = request(
+            hub.addr,
+            agent,
+            "/v1/instances",
+            Some(json!({"hostId":host,"permissionMode":mode})),
+            None,
         )
-        .unwrap()
-        .is_none()
-    );
+        .await;
+        assert_eq!(status, 403, "Agent {mode}: {denied_launch}");
+        assert!(
+            denied_launch.get("instance").is_none(),
+            "must reject before indexing or dispatch"
+        );
+        let (status, denied_fleet) = request(
+            hub.addr,
+            agent,
+            "/v1/fleet/instances",
+            Some(json!({"hosts":[host],"spec":{"permissionMode":mode}})),
+            None,
+        )
+        .await;
+        assert_eq!(status, 403, "Agent fleet {mode}: {denied_fleet}");
+    }
 
     let (status, sibling) = request(
         hub.addr,
@@ -1097,6 +1102,63 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     assert_eq!(status, 200, "{sibling}");
     settled(&node, &sibling).await;
     let sibling_id = sibling["instance"]["instanceId"].as_str().unwrap();
+    for owned in [parent_id, child_id] {
+        for suffix in ["", "/journal"] {
+            let route = format!("/v1/instances/{owned}{suffix}");
+            let (status, body) = request(hub.addr, agent, &route, None, None).await;
+            assert_eq!(status, 200, "{route}: {body}");
+        }
+    }
+    for target in [sibling_id, "ins_unrelated"] {
+        for route in [
+            format!("/v1/instances/{target}"),
+            format!("/v1/instances/{target}/journal"),
+            format!("/v1/instances?instanceId={target}"),
+            format!("/v1/interactions?instanceId={target}"),
+            format!("/v1/hosts/{target}"),
+            format!("/v1/hosts/{target}/doctor"),
+            format!("/v1/providers/{target}"),
+            format!("/v1/fleet/{target}"),
+        ] {
+            let (status, body) = request(hub.addr, agent, &route, None, None).await;
+            assert_eq!(status, 403, "{route}: {body}");
+        }
+    }
+    for route in [
+        "/v1/instances",
+        "/v1/hosts",
+        "/v1/devices",
+        "/v1/providers",
+        "/v1/interactions",
+        "/v1/worktrees",
+        "/v1/follow",
+    ] {
+        let (status, body) = request(hub.addr, agent, route, None, None).await;
+        assert_eq!(status, 403, "{route}: {body}");
+    }
+    for route in [
+        format!("/v1/hosts/{host}"),
+        format!("/v1/hosts/{host}/doctor"),
+    ] {
+        assert_eq!(
+            request(hub.addr, agent, &route, None, None).await.0,
+            403,
+            "{route}"
+        );
+    }
+    // Human reads retain access to the same existing sibling.
+    assert_eq!(
+        request(
+            hub.addr,
+            &human,
+            &format!("/v1/instances/{sibling_id}/journal"),
+            None,
+            None
+        )
+        .await
+        .0,
+        200
+    );
     let path = format!("/v1/instances/{sibling_id}/commands");
     let command_id = CommandId::new();
     let send = json!({"commandId":command_id, "operation":"instance.send", "payload":{"instanceId":parent_id,"input":{"text":"approved-cross-send","origin":"human"},"origin":"human"}});

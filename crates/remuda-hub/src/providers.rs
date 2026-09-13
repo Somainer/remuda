@@ -93,7 +93,7 @@ async fn list_providers(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let host_id = query
         .host_id
         .map(|s| s.trim().to_string())
@@ -114,7 +114,7 @@ async fn get_provider(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let profile = state
         .store
         .get_provider(id)

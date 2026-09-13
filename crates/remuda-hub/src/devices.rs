@@ -42,7 +42,7 @@ async fn list_devices(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let items = state.store.list_devices().await?;
     Ok(Json(json!({ "items": items })))
 }

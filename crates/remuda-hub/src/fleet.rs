@@ -1,7 +1,7 @@
 //! Fan-out the same Instance spec across N hosts (D-013).
 
 use crate::AppState;
-use crate::auth::{require_device, require_origin};
+use crate::auth::require_origin;
 use crate::error::HubError;
 use crate::placement::{self, PlaceSpec, Placement};
 use axum::Json;
@@ -348,11 +348,7 @@ async fn create_fleet(
     }
     crate::agent_scope::stamp(&mut spec, &device);
     spec["parentInstanceId"] = json!(device.instance_id);
-    if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human
-        && spec["permissionMode"].is_null()
-    {
-        spec["permissionMode"] = json!("manual");
-    }
+    crate::agent_scope::restrict_permission(&device, &mut spec)?;
     if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
         let mut approval_required = headers.contains_key("x-remuda-require-approval")
             || crate::agent_scope::shell_driver(&driver);
@@ -400,7 +396,7 @@ async fn get_fleet(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
     let Some((spec, members)) = state.store.get_fleet(id.clone()).await? else {
         return Err(HubError::NotFound);
     };

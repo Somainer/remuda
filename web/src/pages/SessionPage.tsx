@@ -362,10 +362,20 @@ export function SessionPage({
           onModel={(next) => {
             void hubStore.setModel(instance.id, next);
           }}
-          onSend={async (text: string) => {
+          onSend={async (text, attachments, staged) => {
             setSending(true);
             try {
-              await hubStore.send(instance.id, text);
+              // D-027: the bubble keeps the local blob URLs so the sent
+              // message shows thumbnails; the Hub does not echo attachments
+              // back onto the journal yet.
+              const previews = (staged ?? [])
+                .filter((item) => item.objectId)
+                .map((item) => ({
+                  objectId: item.objectId as string,
+                  name: item.name,
+                  previewUrl: item.previewUrl,
+                }));
+              await hubStore.send(instance.id, text, attachments ?? [], previews);
             } finally {
               setSending(false);
             }

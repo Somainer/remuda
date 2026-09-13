@@ -1,0 +1,24 @@
+{
+  "info": {
+    "id": "01a09c24-46ef-7a03-9c89-88f1bc00bd0c",
+    "cwd": "/workspace/grok-spike"
+  },
+  "agent_id": "ag1.18d3de61a8c842b9b50bac45fca98b0e",
+  "attempt_id": "at1.1645214612754978b89d79e532654ece",
+  "session_summary": "SPIKE_COMPLETE",
+  "created_at": "2026-09-13T19:00:18.310360Z",
+  "updated_at": "2026-09-13T19:03:37.086570Z",
+  "num_messages": 54,
+  "num_chat_messages": 27,
+  "current_model_id": "spike",
+  "next_trace_turn": 7,
+  "chat_format_version": 1,
+  "request_id": "6e95840b-9483-4976-aa1f-6c3054093786",
+  "grok_home": "/home/dev/.grok",
+  "last_active_at": "2026-09-13T19:03:37.086570Z",
+  "generated_title": "SPIKE_COMPLETE",
+  "agent_name": "grok-build-ask-user",
+  "sandbox_profile": "off",
+  "last_turn_summary": "SPIKE_COMPLETE",
+  "last_turn_summary_prompt_id": "6e95840b-9483-4976-aa1f-6c3054093786"
+}

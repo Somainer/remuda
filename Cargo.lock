@@ -3029,6 +3029,7 @@ dependencies = [
  "chacha20poly1305",
  "portable-pty",
  "rand_core 0.6.4",
+ "remuda-acp-wire",
  "remuda-claude-wire",
  "remuda-herdr",
  "remuda-protocol",

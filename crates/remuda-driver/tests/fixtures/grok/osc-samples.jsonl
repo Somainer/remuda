@@ -1,0 +1,72 @@
+{"byte_offset": 0, "bytes": "\u001b]0;grok\u0007"}
+{"byte_offset": 145157, "bytes": "\u001b]0;⠸ - Waiting for response… - grok\u0007"}
+{"byte_offset": 145198, "bytes": "\u001b]9;4;1;-1\u0007"}
+{"byte_offset": 145209, "bytes": "\u001b]0;⠼ - Waiting for response… - grok\u0007"}
+{"byte_offset": 145425, "bytes": "\u001b]0;⠼ - Waiting for response… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 145980, "bytes": "\u001b]0;⠼ - Writing command… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 146767, "bytes": "\u001b]0;⠼ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 147490, "bytes": "\u001b]0;⠴ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 148655, "bytes": "\u001b]0;⠦ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 153259, "bytes": "\u001b]0;⚠ Action Required - ⠦ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 154055, "bytes": "\u001b]0;⚠ Action Required - ⠧ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 155157, "bytes": "\u001b]0;⚠ Action Required - ⠋ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 156197, "bytes": "\u001b]0;⚠ Action Required - ⠙ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 157326, "bytes": "\u001b]0;⚠ Action Required - ⠹ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 158374, "bytes": "\u001b]0;⚠ Action Required - ⠸ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 159479, "bytes": "\u001b]0;⚠ Action Required - ⠼ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 160569, "bytes": "\u001b]0;⚠ Action Required - ⠴ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 208104, "bytes": "\u001b]0;⠙ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 209093, "bytes": "\u001b]0;⠹ - Write the fixed probe marker in the thro… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 210020, "bytes": "\u001b]0;⠹ - Waiting for response… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 210426, "bytes": "\u001b]0;⠹ - Responding - RUN_TOOL - grok\u0007"}
+{"byte_offset": 210747, "bytes": "\u001b]0;⠸ - Responding - RUN_TOOL - grok\u0007"}
+{"byte_offset": 211458, "bytes": "\u001b]0;⠼ - Responding - RUN_TOOL - grok\u0007"}
+{"byte_offset": 212447, "bytes": "\u001b]0;RUN_TOOL - grok\u0007"}
+{"byte_offset": 212467, "bytes": "\u001b]9;4;0;0\u0007"}
+{"byte_offset": 215602, "bytes": "\u001b]0;⠴ - Waiting for response… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 215727, "bytes": "\u001b]0;⠦ - Waiting for response… - RUN_TOOL - grok\u0007"}
+{"byte_offset": 216289, "bytes": "\u001b]0;⠦ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 217483, "bytes": "\u001b]0;⠧ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 219262, "bytes": "\u001b]0;⠋ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 221020, "bytes": "\u001b]0;⠙ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 222786, "bytes": "\u001b]0;⠹ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 225317, "bytes": "\u001b]0;⠸ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 227032, "bytes": "\u001b]0;⠼ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 229809, "bytes": "\u001b]0;⠴ - Thinking - RUN_TOOL - grok\u0007"}
+{"byte_offset": 298463, "bytes": "\u001b]0;⠴ - Responding - RUN_TOOL - grok\u0007"}
+{"byte_offset": 299405, "bytes": "\u001b]0;⠦ - Responding - RUN_TOOL - grok\u0007"}
+{"byte_offset": 299506, "bytes": "\u001b]0;⠦ - Responding - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 300163, "bytes": "\u001b]0;⠧ - Responding - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 300627, "bytes": "\u001b]0;SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 303257, "bytes": "\u001b]0;⠧ - Waiting for response… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 303326, "bytes": "\u001b]0;⠋ - Waiting for response… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 303947, "bytes": "\u001b]0;⠋ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 305239, "bytes": "\u001b]0;⠙ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 306993, "bytes": "\u001b]0;⠹ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 308820, "bytes": "\u001b]0;⠸ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 310551, "bytes": "\u001b]0;⠼ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 312978, "bytes": "\u001b]0;⠴ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 314780, "bytes": "\u001b]0;⠦ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 316828, "bytes": "\u001b]0;⠧ - Thinking - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 325690, "bytes": "\u001b]0;⠹ - Waiting for response… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 325915, "bytes": "\u001b]0;⠸ - Waiting for response… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 326551, "bytes": "\u001b]0;⠸ - Preparing question… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 327142, "bytes": "\u001b]0;⠸ - Running: ask_user_question - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 327483, "bytes": "\u001b]0;⠼ - Running: ask_user_question - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 327778, "bytes": "\u001b]0;⠼ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 332443, "bytes": "\u001b]0;⠴ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 333308, "bytes": "\u001b]0;⠦ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 334173, "bytes": "\u001b]0;⠧ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 335038, "bytes": "\u001b]0;⠋ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 335838, "bytes": "\u001b]0;⠙ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 336691, "bytes": "\u001b]0;⠹ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 337556, "bytes": "\u001b]0;⠸ - Running: Ask: Choose the probe result. - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 380371, "bytes": "\u001b]0;⠙ - Running post_tool_use hook… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 380634, "bytes": "\u001b]0;⠙ - Waiting for response… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 381255, "bytes": "\u001b]0;⠙ - Responding - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 381600, "bytes": "\u001b]0;⠹ - Responding - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 382420, "bytes": "\u001b]0;⠸ - Responding - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 383224, "bytes": "\u001b]0;⠼ - Responding - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 386821, "bytes": "\u001b]0;⠴ - Waiting for response… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 387003, "bytes": "\u001b]0;⠦ - Waiting for response… - SPIKE_COMPLETE - grok\u0007"}
+{"byte_offset": 415578, "bytes": "\u001b]0;⠋ - Responding - SPIKE_COMPLETE - grok\u0007"}

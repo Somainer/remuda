@@ -40,6 +40,32 @@ function tab(page: Page, instanceId: string) {
     .and(page.locator(`[data-instance-id="${instanceId}"]`));
 }
 
+function closeButton(page: Page, instanceId: string) {
+  return tab(page, instanceId).locator("..").getByTestId("tab-close");
+}
+
+function sidebarSession(page: Page, instanceId: string) {
+  return page.getByTestId("spaces-panel").getByTestId("space-session")
+    .and(page.locator(`[href="/s/${instanceId}"]`));
+}
+
+/**
+ * The first session, stopped so the exited-tab and exited-group paths have a
+ * real subject. The fake Node only acknowledges a close, so it never settles an
+ * exited lifecycle; that mode skips these assertions rather than faking one.
+ */
+async function exitedInstance(page: Page, instanceId: string): Promise<string | undefined> {
+  await page.request.post(`/v1/instances/${instanceId}/commands`, {
+    headers: { Origin: new URL(page.url()).origin },
+    data: { operation: "instance.close", payload: {} },
+  });
+  const settled = await expect.poll(async () => {
+    const record = await page.request.get(`/v1/instances/${instanceId}`);
+    return (await record.json()).lifecycle;
+  }, { timeout: realNode ? 30_000 : 5_000 }).toBe("exited").then(() => true, () => false);
+  return settled ? instanceId : undefined;
+}
+
 function space(page: Page, workspaceId: string) {
   return page.getByTestId("spaces-panel").getByTestId("space-select")
     .and(page.locator(`[data-space-id*='"${workspaceId}"']`));
@@ -232,16 +258,66 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
     await page.setViewportSize({ width: 1440, height: 900 });
     await space(page, primary.id).click();
     await tab(page, second.instanceId).click();
-    const closed = page.waitForResponse((response) => response.request().method() === "POST"
-      && new URL(response.url()).pathname === `/v1/instances/${second.instanceId}/commands`
-      && response.request().postDataJSON().operation === "instance.close");
-    await tab(page, second.instanceId).locator("..").getByRole("button", { name: /^关闭会话 / }).click();
-    expect((await closed).ok()).toBe(true);
+
+    // Dismissing a running tab must not send a close command: the session
+    // keeps running and only this device's tab goes away.
+    const commands: string[] = [];
+    const watchCommands = (request: import("@playwright/test").Request) => {
+      if (request.method() === "POST" && new URL(request.url()).pathname === `/v1/instances/${second.instanceId}/commands`) {
+        commands.push(request.postDataJSON().operation);
+      }
+    };
+    page.on("request", watchCommands);
+    await closeButton(page, second.instanceId).click();
+    await expect(page.getByTestId("tab-close-sheet")).toBeVisible();
+    await page.getByTestId("tab-close-keep").click();
     await expect(tab(page, second.instanceId)).toHaveCount(0);
     await expect(strip.getByRole("tab", { selected: true })).toHaveCount(1);
     await page.reload();
     await expect(tab(page, second.instanceId)).toHaveCount(0);
     await expect(tab(page, first.instanceId)).toBeVisible();
+    expect(commands, "仅关闭标签 must not stop the session").toEqual([]);
+    expect((await (await page.request.get(`/v1/instances/${second.instanceId}`)).json()).lifecycle)
+      .not.toBe("exited");
+
+    // Clicking the dismissed session in the sidebar re-opens its tab.
+    await sidebarSession(page, second.instanceId).click();
+    await expect(tab(page, second.instanceId)).toHaveAttribute("aria-selected", "true");
+
+    // Stopping through the same sheet is a separate, explicit choice.
+    await closeButton(page, second.instanceId).click();
+    const stopped = page.waitForResponse((response) => response.request().method() === "POST"
+      && new URL(response.url()).pathname === `/v1/instances/${second.instanceId}/commands`
+      && response.request().postDataJSON().operation === "instance.close");
+    await page.getByTestId("tab-close-stop").click();
+    expect((await stopped).ok()).toBe(true);
+    page.off("request", watchCommands);
+    await expect(tab(page, second.instanceId)).toHaveCount(0);
+    expect(commands).toEqual(["instance.close"]);
+
+    // An exited tab closes with one click and no sheet at all.
+    const exited = await exitedInstance(page, first.instanceId);
+    if (exited) {
+      await expect(tab(page, exited)).toBeVisible();
+      await closeButton(page, exited).click();
+      await expect(page.getByTestId("tab-close-sheet")).toHaveCount(0);
+      await expect(tab(page, exited)).toHaveCount(0);
+
+      // The sidebar keeps it in its own collapsed 已退出 group.
+      const group = panel.getByTestId("exited-toggle").first();
+      await expect(group).toContainText("已退出");
+      await expect(group).toHaveAttribute("aria-expanded", "false");
+      await group.click();
+      await expect(panel.getByTestId("exited-session").and(page.locator(`[data-instance-id="${exited}"]`))).toBeVisible();
+      await expect(panel.getByTestId("exited-resume").first()).toBeVisible();
+      await panel.getByTestId("exited-delete").first().click();
+      await expect(page.getByTestId("delete-session-sheet")).toContainText("删除会话及其记录？");
+      await page.getByTestId("delete-session-sheet-cancel").click();
+      await expect(page.getByTestId("delete-session-sheet")).toHaveCount(0);
+      // Cancelling leaves the record untouched.
+      expect((await page.request.get(`/v1/instances/${exited}`)).ok()).toBe(true);
+    }
+
     await space(page, secondary.id).click();
     await expect(tab(page, other.instanceId)).toHaveAttribute("aria-selected", "true");
     expect(pageErrors).toEqual([]);

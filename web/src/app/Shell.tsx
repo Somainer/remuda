@@ -129,11 +129,11 @@ export function Shell() {
       </nav>
       {showSidebarList ? (
         <aside className={css.list}>
-          <SpacesPanel spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} collapsed={workbench.prefs.collapsed} onSelect={workbench.select} />
+          <SpacesPanel spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} collapsed={workbench.prefs.collapsed} onSelect={workbench.select} />
         </aside>
       ) : null}
       <main className={css.main}>
-        {onSessions && mobile ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} onSelect={workbench.select} /> : null}
+        {onSessions && mobile ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} onSelect={workbench.select} /> : null}
         {onSessions ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
         {onNew ? <SessionsPage dimmed /> : null}
         <Outlet />

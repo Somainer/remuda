@@ -17,19 +17,29 @@ export type Space = {
   blockedCount: number;
 };
 
+/**
+ * A tab the device dismissed (D-024 addendum). `resurface` re-opens the tab the
+ * next time the session becomes blocked. Dismissing a tab that is blocked right
+ * now clears the flag, so the dismissal is not undone by the same episode;
+ * `rearmDismissed` sets it again once that episode ends.
+ */
+export type DismissedTab = { id: string; resurface: boolean };
+
 export type SpacePrefs = {
   version: 1;
   collapsed: boolean;
   groupCollapsed: Record<string, boolean>;
+  exitedOpen: Record<string, boolean>;
   names: Record<string, string>;
   order: string[];
   selectedSpaceId?: string;
   selectedTabs: Record<string, string>;
-  closedTabs: Record<string, string[]>;
+  closedTabs: Record<string, DismissedTab[]>;
 };
 
 export function defaultSpacePrefs(): SpacePrefs {
-  return { version: 1, collapsed: false, groupCollapsed: {}, names: {}, order: [], selectedTabs: {}, closedTabs: {} };
+  return { version: 1, collapsed: false, groupCollapsed: {}, exitedOpen: {}, names: {}, order: [],
+    selectedTabs: {}, closedTabs: {} };
 }
 
 export function spaceKey(hostId: string, workspaceId: string): string {
@@ -75,9 +85,25 @@ export function buildSpaces(workspaces: Workspace[], instances: Instance[], pref
   });
 }
 
+function dismissedIn(space: Space, prefs: SpacePrefs): Map<string, DismissedTab> {
+  return new Map((prefs.closedTabs[space.id] ?? []).map((entry) => [entry.id, entry]));
+}
+
+/** A dismissed session keeps running; it returns to the strip once it needs a human. */
 export function visibleTabs(space: Space, prefs: SpacePrefs): Instance[] {
-  const closed = new Set(prefs.closedTabs[space.id] ?? []);
-  return space.instances.filter((instance) => !closed.has(instance.id));
+  const dismissed = dismissedIn(space, prefs);
+  return space.instances.filter((instance) => {
+    const entry = dismissed.get(instance.id);
+    return !entry || (entry.resurface && projectStatus(instance) === "blocked");
+  });
+}
+
+/** The sidebar lists live sessions inline and collects exited ones into a group. */
+export function spaceSessions(space: Space): { live: Instance[]; exited: Instance[] } {
+  return {
+    live: space.instances.filter((instance) => projectStatus(instance) !== "exited"),
+    exited: space.instances.filter((instance) => projectStatus(instance) === "exited"),
+  };
 }
 
 export function selectedTab(space: Space, prefs: SpacePrefs): Instance | undefined {
@@ -111,6 +137,24 @@ function stringMap(value: unknown): Record<string, string> {
   ).map(([key, text]) => [key, text.trim()]));
 }
 
+function booleanMap(value: unknown): Record<string, boolean> {
+  return Object.fromEntries(Object.entries(record(value)).filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean"));
+}
+
+/** Reads both the original id list and the dismissal records that replaced it. */
+function dismissedTabs(value: unknown): DismissedTab[] {
+  if (!Array.isArray(value)) return [];
+  const byId = new Map<string, DismissedTab>();
+  for (const item of value) {
+    if (typeof item === "string" && item) byId.set(item, { id: item, resurface: true });
+    else {
+      const row = record(item);
+      if (typeof row.id === "string" && row.id) byId.set(row.id, { id: row.id, resurface: row.resurface !== false });
+    }
+  }
+  return [...byId.values()];
+}
+
 export function parseSpacePrefs(raw: string | null): SpacePrefs {
   try {
     const value = record(JSON.parse(raw ?? "null"));
@@ -118,12 +162,13 @@ export function parseSpacePrefs(raw: string | null): SpacePrefs {
     return {
       version: 1,
       collapsed: value.collapsed === true,
-      groupCollapsed: Object.fromEntries(Object.entries(record(value.groupCollapsed)).filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean")),
+      groupCollapsed: booleanMap(value.groupCollapsed),
+      exitedOpen: booleanMap(value.exitedOpen),
       names: stringMap(value.names),
       order: strings(value.order),
       selectedSpaceId: typeof value.selectedSpaceId === "string" ? value.selectedSpaceId : undefined,
       selectedTabs: stringMap(value.selectedTabs),
-      closedTabs: Object.fromEntries(Object.entries(record(value.closedTabs)).map(([key, item]) => [key, strings(item)])),
+      closedTabs: Object.fromEntries(Object.entries(record(value.closedTabs)).map(([key, item]) => [key, dismissedTabs(item)])),
     };
   } catch {
     return defaultSpacePrefs();
@@ -171,16 +216,29 @@ export function createSpaceStore(storage = browserStorage()) {
       update({ order });
     },
     toggleGroup(spaceId: string) { update({ groupCollapsed: { ...prefs.groupCollapsed, [spaceId]: !prefs.groupCollapsed[spaceId] } }); },
+    toggleExited(spaceId: string) { update({ exitedOpen: { ...prefs.exitedOpen, [spaceId]: !prefs.exitedOpen[spaceId] } }); },
     selectSpace(selectedSpaceId: string) { update({ selectedSpaceId }); },
+    /** Opening a session from the sidebar or a deep link always restores its tab. */
     selectTab(spaceId: string, instanceId: string) {
       update({ selectedSpaceId: spaceId, selectedTabs: { ...prefs.selectedTabs, [spaceId]: instanceId },
-        closedTabs: { ...prefs.closedTabs, [spaceId]: (prefs.closedTabs[spaceId] ?? []).filter((id) => id !== instanceId) } });
+        closedTabs: { ...prefs.closedTabs, [spaceId]: (prefs.closedTabs[spaceId] ?? []).filter((entry) => entry.id !== instanceId) } });
     },
-    /** The caller closes the remote instance before hiding its tab. */
-    closeTab(spaceId: string, instanceId: string) {
+    /**
+     * Hides the tab only. The caller stops the session first when the user
+     * chose to; a dismissal on its own never ends a run.
+     */
+    closeTab(spaceId: string, instanceId: string, resurface = true) {
       const selectedTabs = { ...prefs.selectedTabs };
       if (selectedTabs[spaceId] === instanceId) delete selectedTabs[spaceId];
-      update({ selectedTabs, closedTabs: { ...prefs.closedTabs, [spaceId]: [...new Set([...(prefs.closedTabs[spaceId] ?? []), instanceId])] } });
+      update({ selectedTabs, closedTabs: { ...prefs.closedTabs,
+        [spaceId]: [...(prefs.closedTabs[spaceId] ?? []).filter((entry) => entry.id !== instanceId), { id: instanceId, resurface }] } });
+    },
+    /** Ends a suppressed blocked episode so the next one can re-open the tab. */
+    rearmDismissed(blockedIds: string[]) {
+      const blocked = new Set(blockedIds);
+      const closedTabs = Object.fromEntries(Object.entries(prefs.closedTabs).map(([spaceId, entries]) =>
+        [spaceId, entries.map((entry) => entry.resurface || blocked.has(entry.id) ? entry : { ...entry, resurface: true })]));
+      update({ closedTabs });
     },
   };
 }

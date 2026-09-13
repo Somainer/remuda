@@ -4,7 +4,7 @@ import type { Space, SpacePrefs } from "./store";
 import { SpacesPanel } from "./SpacesPanel";
 import css from "./spaces.module.css";
 
-export function SpacesMobile({ spaces, active, prefs, onSelect }: { spaces: Space[]; active?: Space; prefs: SpacePrefs; onSelect: (space: Space) => void }) {
+export function SpacesMobile({ spaces, active, prefs, instanceId, onSelect }: { spaces: Space[]; active?: Space; prefs: SpacePrefs; instanceId?: string; onSelect: (space: Space) => void }) {
   const [open, setOpen] = useState(false);
   const location = useLocation();
   const route = location.pathname + location.search;
@@ -38,7 +38,7 @@ export function SpacesMobile({ spaces, active, prefs, onSelect }: { spaces: Spac
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
       }}>
         <button type="button" className={css.drawerClose} aria-label="关闭空间面板" onClick={() => setOpen(false)}>关闭 ×</button>
-        <SpacesPanel spaces={spaces} active={active} prefs={prefs} drawer onNavigate={() => setOpen(false)} onSelect={(space) => { onSelect(space); setOpen(false); }} />
+        <SpacesPanel spaces={spaces} active={active} prefs={prefs} instanceId={instanceId} drawer onNavigate={() => setOpen(false)} onSelect={(space) => { onSelect(space); setOpen(false); }} />
       </div>
     </div> : null}
   </>;

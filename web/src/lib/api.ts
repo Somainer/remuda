@@ -16,6 +16,7 @@ import {
   mockConfigure,
   mockCreate,
   mockDb,
+  mockDelete,
   mockDeviceList,
   mockDeviceRevoke,
   mockFleetBroadcast,
@@ -38,6 +39,12 @@ import { parseScreenBody, type ScreenRead } from "./screen";
 import { HubHttpError } from "./httpError";
 import { readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
 import { coerceObservation, coerceObservationList } from "./hubJournal";
+
+/**
+ * `DELETE /v1/instances/{id}`. The Hub record is gone whatever `nodePurge`
+ * says; anything other than `purged` means the Node kept its data directory.
+ */
+export type InstanceDeleted = components["schemas"]["InstanceDeleted"];
 
 export const MOCK = import.meta.env.VITE_MOCK === "1";
 
@@ -385,6 +392,8 @@ export type HubApi = {
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
   instanceResume(instanceId: Id): Promise<CommandResult>;
+  /** `DELETE /v1/instances/{id}`; `force` stops a live Instance first. */
+  instanceDelete(instanceId: Id, force?: boolean): Promise<InstanceDeleted>;
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
@@ -628,6 +637,9 @@ function createMockApi(): HubApi {
     },
     async instanceResume(instanceId) {
       return mockResume(instanceId);
+    },
+    async instanceDelete(instanceId, force) {
+      return mockDelete(instanceId, force);
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode, extras);
@@ -970,6 +982,17 @@ function createLiveApi(): HubApi {
     },
     async instanceResume(instanceId) {
       return command(instanceId, "instance.resume", {});
+    },
+    async instanceDelete(instanceId, force) {
+      // `force=1` is what stops a live Instance — the Hub stops and deletes
+      // together, so the client never closes it separately. A repeated delete
+      // answers 404, which is the session already being gone.
+      try {
+        return await rest<InstanceDeleted>(`/v1/instances/${instanceId}${force ? "?force=1" : ""}`, { method: "DELETE" });
+      } catch (err) {
+        if (err instanceof HubHttpError && err.status === 404) return { deleted: true, instanceId };
+        throw err;
+      }
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return command(instanceId, "instance.configure", {

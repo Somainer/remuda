@@ -5,7 +5,7 @@ import type { Workspace } from "../../types/workspace";
 import { known } from "../../types/wire";
 import {
   buildSpaces, createSpaceStore, defaultSpacePrefs, newSessionPath, OTHER_SPACE, parseSpacePrefs,
-  selectedSpace, selectedTab, spaceKey, SPACES_PREFS_KEY, visibleTabs,
+  selectedSpace, selectedTab, spaceKey, spaceSessions, SPACES_PREFS_KEY, visibleTabs,
 } from "./store";
 
 const alpha = spaceKey("host-a", "workspace-a");
@@ -108,10 +108,17 @@ describe("device space preferences", () => {
       expect(parseSpacePrefs(raw)).toEqual(defaultSpacePrefs());
     }
     const prefs = parseSpacePrefs(JSON.stringify({ version: 1, collapsed: "yes", groupCollapsed: { a: true, b: "false" },
-      names: { a: " A ", b: 4 }, order: ["a", "a", null, 4, "b"], selectedSpaceId: 5,
+      exitedOpen: { a: true, b: 1 }, names: { a: " A ", b: 4 }, order: ["a", "a", null, 4, "b"], selectedSpaceId: 5,
       selectedTabs: { a: "one", b: {} }, closedTabs: { a: ["one", "one", false], b: null } }));
-    expect(prefs).toEqual({ version: 1, collapsed: false, groupCollapsed: { a: true }, names: { a: "A" }, order: ["a", "b"],
-      selectedSpaceId: undefined, selectedTabs: { a: "one" }, closedTabs: { a: ["one"], b: [] } });
+    expect(prefs).toEqual({ version: 1, collapsed: false, groupCollapsed: { a: true }, exitedOpen: { a: true },
+      names: { a: "A" }, order: ["a", "b"], selectedSpaceId: undefined, selectedTabs: { a: "one" },
+      closedTabs: { a: [{ id: "one", resurface: true }], b: [] } });
+    // A device that closed tabs before this release keeps them closed, and its
+    // plain ids adopt the resurface-on-blocked default.
+    const legacy = parseSpacePrefs(JSON.stringify({ version: 1, closedTabs: { a: ["kept"] } }));
+    expect(legacy.closedTabs).toEqual({ a: [{ id: "kept", resurface: true }] });
+    expect(parseSpacePrefs(JSON.stringify({ version: 1, closedTabs: { a: [{ id: "quiet", resurface: false }] } })).closedTabs)
+      .toEqual({ a: [{ id: "quiet", resurface: false }] });
   });
 
   it("continues working if local storage access is denied or quota is exhausted", () => {
@@ -157,6 +164,62 @@ describe("space and tab selection", () => {
     expect(visibleTabs(spaces[0], store.getSnapshot()).map((item) => item.id)).toEqual(["a2"]);
     expect(selectedTab(spaces[0], store.getSnapshot())?.id).toBe("a2");
     expect(visibleTabs(spaces[1], store.getSnapshot()).map((item) => item.id)).toEqual(["b1"]);
+  });
+
+  it("keeps a dismissed running session alive, resurfaces it when blocked and re-arms after the episode", () => {
+    const store = createSpaceStore(localStorage);
+    const running = [instance("a1"), instance("a2", { activity: known("working") })];
+    const spaceOf = (rows: Instance[]) => buildSpaces([workspace()], rows, store.getSnapshot())[0];
+
+    // Dismissing a tab hides it without touching the session itself.
+    store.closeTab(alpha, "a2", true);
+    expect(visibleTabs(spaceOf(running), store.getSnapshot()).map((item) => item.id)).toEqual(["a1"]);
+    expect(spaceSessions(spaceOf(running)).live.map((item) => item.id)).toEqual(["a1", "a2"]);
+
+    // It comes back on its own once that session needs a human.
+    const blocked = [running[0], instance("a2", { activity: known("waiting-interaction") })];
+    expect(visibleTabs(spaceOf(blocked), store.getSnapshot()).map((item) => item.id)).toEqual(["a1", "a2"]);
+
+    // Dismissing it again suppresses only this episode, so it does not bounce back.
+    store.closeTab(alpha, "a2", false);
+    expect(store.getSnapshot().closedTabs[alpha]).toEqual([{ id: "a2", resurface: false }]);
+    expect(visibleTabs(spaceOf(blocked), store.getSnapshot()).map((item) => item.id)).toEqual(["a1"]);
+    store.rearmDismissed(["a2"]);
+    expect(visibleTabs(spaceOf(blocked), store.getSnapshot()).map((item) => item.id)).toEqual(["a1"]);
+
+    // Once the episode ends the next one may re-open the tab again.
+    store.rearmDismissed([]);
+    expect(store.getSnapshot().closedTabs[alpha]).toEqual([{ id: "a2", resurface: true }]);
+    expect(visibleTabs(spaceOf(running), store.getSnapshot()).map((item) => item.id)).toEqual(["a1"]);
+    expect(visibleTabs(spaceOf(blocked), store.getSnapshot()).map((item) => item.id)).toEqual(["a1", "a2"]);
+
+    // Stopping a session dismisses it for good: an exited tab never resurfaces.
+    store.closeTab(alpha, "a2", false);
+    store.rearmDismissed([]);
+    const stopped = [running[0], instance("a2", { lifecycle: "exited" })];
+    expect(visibleTabs(spaceOf(stopped), store.getSnapshot()).map((item) => item.id)).toEqual(["a1"]);
+    // Clicking it in the sidebar re-opens the tab.
+    store.selectTab(alpha, "a2");
+    expect(store.getSnapshot().closedTabs[alpha]).toEqual([]);
+    expect(visibleTabs(spaceOf(stopped), store.getSnapshot()).map((item) => item.id)).toEqual(["a1", "a2"]);
+  });
+
+  it("splits exited sessions into their own group, collapsed until the device opens it", () => {
+    const store = createSpaceStore(localStorage);
+    const sessions = [instance("live"), instance("gone", { lifecycle: "exited" }),
+      instance("failed", { lifecycle: "failed" }), instance("offline", { connectivity: "disconnected" })];
+    const spaces = buildSpaces([workspace()], sessions, store.getSnapshot());
+    const grouped = spaceSessions(spaces[0]);
+    // `unknown` is not a confirmed exit, so a disconnected session stays live.
+    expect(grouped.live.map((item) => item.id)).toEqual(["live", "offline"]);
+    expect(grouped.exited.map((item) => item.id)).toEqual(["failed", "gone"]);
+    // Every session still has a tab; grouping is a sidebar concern only.
+    expect(visibleTabs(spaces[0], store.getSnapshot()).map((item) => item.id)).toEqual(["failed", "gone", "live", "offline"]);
+    expect(store.getSnapshot().exitedOpen[alpha]).toBeUndefined();
+    store.toggleExited(alpha);
+    expect(createSpaceStore(localStorage).getSnapshot().exitedOpen[alpha]).toBe(true);
+    store.toggleExited(alpha);
+    expect(createSpaceStore(localStorage).getSnapshot().exitedOpen[alpha]).toBe(false);
   });
 
   it("prefills host, workspace and cwd from the selected space without leaking another project's defaults", () => {

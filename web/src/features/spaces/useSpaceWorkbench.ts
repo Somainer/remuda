@@ -1,5 +1,7 @@
+import { useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useHub } from "../../lib/store";
+import { projectStatus } from "../../lib/status";
 import { buildSpaces, newSessionPath, selectedSpace, selectedTab, spaceKey, spaceStore, useSpacesPrefs, visibleTabs, type Space } from "./store";
 
 export function useSpaceWorkbench() {
@@ -14,6 +16,14 @@ export function useSpaceWorkbench() {
     ? spaces.find((space) => space.id === spaceKey(params.get("host")!, params.get("workspace")!)) : undefined;
   const active = newSpace ?? selectedSpace(spaces, prefs, instanceId);
   const tabs = active ? visibleTabs(active, prefs) : [];
+
+  // Dismissing a blocked tab suppresses only that episode. Once the session is
+  // no longer blocked, its next blocked episode may re-open the tab again.
+  const blockedKey = hub.instances.filter((instance) => projectStatus(instance) === "blocked").map((instance) => instance.id).sort().join(",");
+  useEffect(() => {
+    spaceStore.rearmDismissed(blockedKey ? blockedKey.split(",") : []);
+  }, [blockedKey]);
+
   const select = (space: Space) => {
     spaceStore.selectSpace(space.id);
     const tab = selectedTab(space, prefs);

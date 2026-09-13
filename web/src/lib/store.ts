@@ -495,6 +495,17 @@ class HubStore {
     await this.refresh();
   }
 
+  /**
+   * Real deletion. `force` is what stops a live Instance — the Hub does the
+   * stop and the delete together, so the caller must not close it first.
+   */
+  async deleteInstance(instanceId: Id, force = false) {
+    const result = await api.instanceDelete(instanceId, force);
+    this.emit({ instances: this.state.instances.filter((row) => row.id !== instanceId) });
+    await this.refresh();
+    return result;
+  }
+
   async configure(
     instanceId: Id,
     permissionMode: string,

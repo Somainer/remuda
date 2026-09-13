@@ -159,7 +159,8 @@ async fn fake_node(
                     "workspaceRevision": 1,
                     "workspaces": workspaces,
                     "labels": { "role": "e2e" },
-                    "maxInstances": 4,
+                    // The shared Hub, slider and spaces scenarios create five instances.
+                    "maxInstances": 8,
                     "cli": [{
                         "kind": "claude",
                         "version": "2.1.268",

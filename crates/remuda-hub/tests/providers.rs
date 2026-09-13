@@ -400,11 +400,9 @@ async fn provider_scope_default_and_host_filter() -> Result<()> {
 }
 
 #[tokio::test]
-async fn missing_provider_defaults_fall_back_to_native_with_persisted_hint() -> Result<()> {
-    use futures::{SinkExt, StreamExt};
+async fn missing_provider_defaults_reject_gateway_and_preserve_native_fallback_hint() -> Result<()>
+{
     use remuda_protocol::HostId;
-    use tokio_tungstenite::tungstenite::Message;
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let (hub, bootstrap, _dir) = boot().await?;
     let cookie = login(hub.addr, &bootstrap).await?;
@@ -430,58 +428,54 @@ async fn missing_provider_defaults_fall_back_to_native_with_persisted_hint() -> 
         if let Some(cli) = cli {
             host["cli"] = cli;
         }
-        let enroll = enroll_token(hub.addr, &cookie).await?;
-        let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-        req.headers_mut()
-            .insert("Authorization", format!("Bearer {enroll}").parse()?);
-        let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
-        node.send(Message::Text(
-            json!({
-                "jsonrpc": "2.0",
-                "id": "hello",
-                "method": "runtime.hello",
-                "params": {
-                    "hostId": host_id.as_id().as_str(),
-                    "nodeVersion": "0.1.0-test",
-                    "label": label,
-                    "host": host
-                }
-            })
-            .to_string()
-            .into(),
-        ))
-        .await?;
-        loop {
-            let message = node.next().await.context("hello")??;
-            if let Message::Text(text) = message {
-                let hello: Value = serde_json::from_str(&text)?;
-                anyhow::ensure!(
-                    hello["result"]["hostId"] == host_id.as_id().as_str(),
-                    "hello {hello}"
-                );
-                break;
-            }
-        }
-        let node_task = tokio::spawn(async move {
-            while let Some(Ok(Message::Text(text))) = node.next().await {
-                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
-                    continue;
-                };
-                if frame.get("method").is_none() {
-                    continue;
-                }
-                let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                let _ = node
-                    .send(Message::Text(
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
-                            .to_string()
-                            .into(),
-                    ))
-                    .await;
-            }
-        });
+        let node_task =
+            connect_provider_test_node(hub.addr, &cookie, host_id.as_id().as_str(), label, host)
+                .await?;
 
-        for delegation in [None, Some("gateway"), Some("direct")] {
+        for gateway in [
+            json!({ "delegation": "gateway", "providerProfileId": "gateway" }),
+            json!({ "providerProfileId": "gateway" }),
+        ] {
+            let mut create = gateway;
+            create["hostId"] = json!(host_id.as_id().as_str());
+            create["kind"] = json!("claude");
+            create["driver"] = json!("claude-print");
+            let (status, _, body) = http(
+                hub.addr,
+                "POST",
+                "/v1/instances",
+                &auth,
+                Some(&create.to_string()),
+            )
+            .await?;
+            assert_eq!(status, 422, "{label}: {body}");
+            let rejected: Value = serde_json::from_str(body.trim())?;
+            assert_eq!(rejected["code"], json!("PROVIDER_NOT_CONFIGURED"));
+            assert_eq!(
+                rejected["reasons"],
+                json!([format!(
+                    "no gateway provider configured for host {}; add a provider or choose native",
+                    host_id.as_id().as_str()
+                )])
+            );
+        }
+        let (status, _, body) = http(
+            hub.addr,
+            "GET",
+            &format!("/v1/instances?hostId={}", host_id.as_id().as_str()),
+            &auth,
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let instances: Value = serde_json::from_str(body.trim())?;
+        assert_eq!(
+            instances["items"],
+            json!([]),
+            "rejected gateway created an instance"
+        );
+
+        for delegation in [None, Some("direct")] {
             let mut create = json!({
                 "hostId": host_id.as_id().as_str(),
                 "kind": "claude",
@@ -535,4 +529,159 @@ async fn missing_provider_defaults_fall_back_to_native_with_persisted_hint() -> 
         node_task.abort();
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn explicit_gateway_placement_skips_hosts_without_a_default_provider() -> Result<()> {
+    use remuda_protocol::HostId;
+
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+    let mut host_ids = [
+        HostId::new().as_id().as_str().to_string(),
+        HostId::new().as_id().as_str().to_string(),
+    ];
+    host_ids.sort();
+    let [missing_host_id, configured_host_id] = host_ids;
+    let host = json!({ "maxInstances": 4, "labels": { "region": "test" } });
+    let missing_node = connect_provider_test_node(
+        hub.addr,
+        &cookie,
+        &missing_host_id,
+        "no-default-provider",
+        host.clone(),
+    )
+    .await?;
+    let configured_node = connect_provider_test_node(
+        hub.addr,
+        &cookie,
+        &configured_host_id,
+        "configured-provider",
+        host,
+    )
+    .await?;
+    let provider = json!({
+        "name": "host-gw",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "authToken": "sk-fake-host-yyyy",
+        "defaultGateway": true,
+        "scope": format!("host:{configured_host_id}")
+    });
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &auth,
+        Some(&provider.to_string()),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let provider: Value = serde_json::from_str(body.trim())?;
+
+    for placement in [
+        json!({ "kind": "any" }),
+        json!({ "kind": "labels", "labels": ["region=test"] }),
+    ] {
+        let create = json!({
+            "placement": placement,
+            "kind": "claude",
+            "driver": "claude-print",
+            "delegation": "gateway",
+            "providerProfileId": "gateway"
+        });
+        let (status, _, body) = http(
+            hub.addr,
+            "POST",
+            "/v1/placement/resolve",
+            &auth,
+            Some(&create.to_string()),
+        )
+        .await?;
+        assert_eq!(status, 200, "{body}");
+        let ranked: Value = serde_json::from_str(body.trim())?;
+        assert_eq!(ranked["hostId"], json!(missing_host_id));
+        assert_eq!(ranked["hosts"].as_array().map(Vec::len), Some(2));
+
+        let (status, _, body) = http(
+            hub.addr,
+            "POST",
+            "/v1/instances",
+            &auth,
+            Some(&create.to_string()),
+        )
+        .await?;
+        assert_eq!(status, 200, "{placement}: {body}");
+        let created: Value = serde_json::from_str(body.trim())?;
+        assert_eq!(created["hostId"], json!(configured_host_id));
+        assert_eq!(created["instance"]["providerProfileId"], provider["id"]);
+        assert_eq!(
+            created["instance"]["providerSource"],
+            json!("host-scoped-default")
+        );
+    }
+    missing_node.abort();
+    configured_node.abort();
+    Ok(())
+}
+
+async fn connect_provider_test_node(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    host_id: &str,
+    label: &str,
+    host: Value,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let enroll = enroll_token(addr, cookie).await?;
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hello",
+            "method": "runtime.hello",
+            "params": {
+                "hostId": host_id,
+                "nodeVersion": "0.1.0-test",
+                "label": label,
+                "host": host
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    loop {
+        let message = node.next().await.context("hello")??;
+        if let Message::Text(text) = message {
+            let hello: Value = serde_json::from_str(&text)?;
+            anyhow::ensure!(hello["result"]["hostId"] == host_id, "hello {hello}");
+            break;
+        }
+    }
+    Ok(tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let _ = node
+                .send(Message::Text(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+        }
+    }))
 }

@@ -317,18 +317,14 @@ pub async fn resolve_and_attach(
     let profiles = state.store.list_providers(None).await?;
     let delegation = spec.get("delegation").and_then(Value::as_str);
     let provider_profile_id = spec.get("providerProfileId").and_then(Value::as_str);
-    match provider_resolve::resolve(ResolveInput {
+    let resolved = provider_resolve::resolve(ResolveInput {
         host,
         profiles: &profiles,
         delegation,
         provider_profile_id,
-    }) {
-        Ok(resolved) => {
-            provider_resolve::apply_to_spec(spec, &resolved);
-            Ok(())
-        }
-        Err(reasons) => Err(provider_resolve::unsatisfiable(reasons)),
-    }
+    })?;
+    provider_resolve::apply_to_spec(spec, &resolved);
+    Ok(())
 }
 
 /// Attach a public overlay snapshot to an instance spec (never the token).

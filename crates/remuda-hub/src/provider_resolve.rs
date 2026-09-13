@@ -152,17 +152,19 @@ pub fn host_reports_native_claude(host: &HostRecord) -> bool {
     })
 }
 
-/// Resolve a Claude launch for one host. Reasons are placement-style strings.
-pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>> {
+/// Resolve a Claude launch, distinguishing missing gateways from placement failures.
+pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, HubError> {
     let host_id = input.host.host_id.as_str();
     let requested = input
         .provider_profile_id
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let delegation = input.delegation.map(str::trim).filter(|s| !s.is_empty());
-    let explicit_gateway = matches!(delegation, Some("gateway" | "direct"));
+    let explicit_gateway =
+        delegation == Some("gateway") || delegation.is_none() && requested == Some("gateway");
+    let explicit_provider = explicit_gateway || delegation == Some("direct");
     let explicit_native = matches!(delegation, Some("none"))
-        || matches!(requested, Some("none" | "native" | "native-login")) && !explicit_gateway;
+        || matches!(requested, Some("none" | "native" | "native-login")) && !explicit_provider;
 
     if let Some(id) = requested.filter(|id| is_real_profile_id(id)) {
         return match find_profile(input.profiles, id) {
@@ -172,11 +174,15 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
                     source: SOURCE_REQUEST,
                 })
             }
-            Some(profile) => Err(vec![format!(
-                "{host_id}: host-scoped profile {} is bound to {}",
-                profile.id, profile.scope
-            )]),
-            None => Err(vec![format!("unknown provider profile {id}")]),
+            Some(profile) => Err(HubError::Unsatisfiable {
+                reasons: vec![format!(
+                    "{host_id}: host-scoped profile {} is bound to {}",
+                    profile.id, profile.scope
+                )],
+            }),
+            None => Err(HubError::Unsatisfiable {
+                reasons: vec![format!("unknown provider profile {id}")],
+            }),
         };
     }
 
@@ -186,7 +192,7 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
         });
     }
 
-    if !explicit_gateway {
+    if !explicit_provider {
         match binding_of(&input.host.provider_binding) {
             Binding::Native => {
                 return Ok(ResolvedProvider::Native {
@@ -201,13 +207,15 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
                             source: SOURCE_HOST_BINDING,
                         })
                     }
-                    Some(profile) => Err(vec![format!(
-                        "{host_id}: host binding profile {} is bound to {}",
-                        profile.id, profile.scope
-                    )]),
-                    None => Err(vec![format!(
-                        "{host_id}: host binding profile {id} is missing"
-                    )]),
+                    Some(profile) => Err(HubError::Unsatisfiable {
+                        reasons: vec![format!(
+                            "{host_id}: host binding profile {} is bound to {}",
+                            profile.id, profile.scope
+                        )],
+                    }),
+                    None => Err(HubError::Unsatisfiable {
+                        reasons: vec![format!("{host_id}: host binding profile {id} is missing")],
+                    }),
                 };
             }
             Binding::Auto => {}
@@ -227,7 +235,14 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
             source: SOURCE_UNIVERSAL_DEFAULT,
         });
     }
-    if !explicit_gateway && host_reports_native_claude(input.host) {
+    if explicit_gateway {
+        return Err(HubError::ProviderNotConfigured {
+            reasons: vec![format!(
+                "no gateway provider configured for host {host_id}; add a provider or choose native"
+            )],
+        });
+    }
+    if !explicit_provider && host_reports_native_claude(input.host) {
         return Ok(ResolvedProvider::Native {
             source: SOURCE_HOST_INVENTORY,
         });
@@ -267,11 +282,6 @@ pub fn apply_to_spec(spec: &mut Value, resolved: &ResolvedProvider) {
             );
         }
     }
-}
-
-/// Map resolve failure onto Hub 422.
-pub fn unsatisfiable(reasons: Vec<String>) -> HubError {
-    HubError::Unsatisfiable { reasons }
 }
 
 fn scope_label(scope: &str) -> &'static str {
@@ -381,7 +391,7 @@ mod tests {
         profiles: &[ProviderRecord],
         delegation: Option<&str>,
         provider_profile_id: Option<&str>,
-    ) -> Result<ResolvedProvider, Vec<String>> {
+    ) -> Result<ResolvedProvider, HubError> {
         resolve(ResolveInput {
             host,
             profiles,
@@ -507,19 +517,33 @@ mod tests {
     }
 
     #[test]
-    fn explicit_gateway_or_direct_uses_native_fallback_without_profile() {
+    fn explicit_gateway_requires_configuration_but_direct_uses_native_fallback() {
         for native in [false, true] {
             let host = host_rec("hst_a", "native", native);
-            for delegation in ["gateway", "direct"] {
-                let got = run(&host, &[], Some(delegation), None).unwrap();
-                assert!(matches!(
-                    got,
-                    ResolvedProvider::Native {
-                        source: SOURCE_NATIVE_FALLBACK
-                    }
-                ));
-                assert!(got.hint().contains("未匹配到默认供应商配置"));
+            for (delegation, requested) in [
+                (Some("gateway"), None),
+                (Some("gateway"), Some("gateway")),
+                (None, Some("gateway")),
+            ] {
+                let err = run(&host, &[], delegation, requested).unwrap_err();
+                let HubError::ProviderNotConfigured { reasons } = err else {
+                    panic!("{err:?}");
+                };
+                assert_eq!(
+                    reasons,
+                    [
+                        "no gateway provider configured for host hst_a; add a provider or choose native"
+                    ]
+                );
             }
+            let got = run(&host, &[], Some("direct"), None).unwrap();
+            assert!(matches!(
+                got,
+                ResolvedProvider::Native {
+                    source: SOURCE_NATIVE_FALLBACK
+                }
+            ));
+            assert!(got.hint().contains("未匹配到默认供应商配置"));
         }
     }
 
@@ -528,9 +552,12 @@ mod tests {
         let host = host_rec("hst_b", "auto", false);
         let profiles = vec![profile("pvp_h", "hosty", "host:hst_a", true)];
         let err = run(&host, &profiles, None, Some("pvp_h")).unwrap_err();
+        let HubError::Unsatisfiable { reasons } = err else {
+            panic!("{err:?}");
+        };
         assert!(
-            err.iter().any(|r| r.contains("bound to host:hst_a")),
-            "{err:?}"
+            reasons.iter().any(|r| r.contains("bound to host:hst_a")),
+            "{reasons:?}"
         );
         assert!(!secret_release_allowed(&profiles[0], "hst_b"));
         assert!(secret_release_allowed(&profiles[0], "hst_a"));

@@ -286,7 +286,19 @@
             }
           },
           "401": { "$ref": "#/components/responses/Error" },
-          "422": { "$ref": "#/components/responses/Error" }
+          "422": {
+            "description": "PLACEMENT_UNSATISFIABLE when host availability or placement constraints cannot be satisfied; PROVIDER_NOT_CONFIGURED when explicit gateway delegation has no matching provider profile. Unspecified or direct delegation may use native authentication without a provider profile.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorBody" },
+                "example": {
+                  "error": "provider not configured",
+                  "code": "PROVIDER_NOT_CONFIGURED",
+                  "reasons": ["no gateway provider configured for host <id>; add a provider or choose native"]
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -891,7 +903,10 @@
         "required": ["error", "code"],
         "properties": {
           "error": { "type": "string" },
-          "code": { "type": "string" },
+          "code": {
+            "type": "string",
+            "description": "Machine-readable error code. Instance creation uses PROVIDER_NOT_CONFIGURED for an explicit gateway request without a matching provider profile and PLACEMENT_UNSATISFIABLE for unsatisfied placement constraints."
+          },
           "reasons": { "type": "array", "items": { "type": "string" } }
         }
       },

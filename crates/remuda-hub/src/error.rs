@@ -39,6 +39,12 @@ pub enum HubError {
         /// Human-readable rejection reasons, one per considered host or rule.
         reasons: Vec<String>,
     },
+    /// An explicit gateway request has no configured provider on eligible hosts.
+    #[error("provider not configured")]
+    ProviderNotConfigured {
+        /// Missing provider configuration and how the caller can fix it.
+        reasons: Vec<String>,
+    },
     /// Targeted host has no live Hub<->Node session.
     #[error("host {host_id} is offline")]
     HostOffline {
@@ -63,7 +69,9 @@ impl HubError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Expired => StatusCode::GONE,
             Self::Superseded { .. } => StatusCode::CONFLICT,
-            Self::Unsatisfiable { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Unsatisfiable { .. } | Self::ProviderNotConfigured { .. } => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             Self::HostOffline { .. } => StatusCode::CONFLICT,
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -79,6 +87,7 @@ impl HubError {
             Self::Expired => "INTERACTION_EXPIRED",
             Self::Superseded { .. } => "INTERACTION_SUPERSEDED",
             Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",
+            Self::ProviderNotConfigured { .. } => "PROVIDER_NOT_CONFIGURED",
             Self::HostOffline { .. } => "HOST_OFFLINE",
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
         }
@@ -92,7 +101,7 @@ impl IntoResponse for HubError {
             "error": self.to_string(),
             "code": self.code(),
         });
-        if let Self::Unsatisfiable { reasons } = &self
+        if let Self::Unsatisfiable { reasons } | Self::ProviderNotConfigured { reasons } = &self
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert("reasons".into(), json!(reasons));

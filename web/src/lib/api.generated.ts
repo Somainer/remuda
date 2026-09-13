@@ -574,6 +574,7 @@ export interface components {
             token: string;
         };
         ErrorBody: {
+            /** @description Machine-readable error code. Instance creation uses PROVIDER_NOT_CONFIGURED for an explicit gateway request without a matching provider profile and PLACEMENT_UNSATISFIABLE for unsatisfied placement constraints. */
             code: string;
             error: string;
             reasons?: string[];
@@ -1486,7 +1487,24 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
-            422: components["responses"]["Error"];
+            /** @description PLACEMENT_UNSATISFIABLE when host availability or placement constraints cannot be satisfied; PROVIDER_NOT_CONFIGURED when explicit gateway delegation has no matching provider profile. Unspecified or direct delegation may use native authentication without a provider profile. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "code": "PROVIDER_NOT_CONFIGURED",
+                     *       "error": "provider not configured",
+                     *       "reasons": [
+                     *         "no gateway provider configured for host <id>; add a provider or choose native"
+                     *       ]
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     instanceGet: {

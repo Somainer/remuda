@@ -322,6 +322,7 @@ pub async fn create_instance(
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
     let hosts = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
     let mut reasons = Vec::new();
+    let mut provider_reasons = Vec::new();
     let mut chosen = None;
     for host in hosts {
         if let Some(obj) = spec.as_object_mut() {
@@ -337,15 +338,28 @@ pub async fn create_instance(
             }) => {
                 reasons.extend(host_reasons);
             }
+            Err(HubError::ProviderNotConfigured {
+                reasons: host_reasons,
+            }) => {
+                provider_reasons.extend(host_reasons);
+            }
             Err(err) => return Err(err),
         }
     }
-    let host = chosen.ok_or(HubError::Unsatisfiable {
-        reasons: if reasons.is_empty() {
-            vec!["placement returned no host".into()]
+    let host = chosen.ok_or_else(|| {
+        if provider_reasons.is_empty() {
+            HubError::Unsatisfiable {
+                reasons: if reasons.is_empty() {
+                    vec!["placement returned no host".into()]
+                } else {
+                    reasons
+                },
+            }
         } else {
-            reasons
-        },
+            HubError::ProviderNotConfigured {
+                reasons: provider_reasons,
+            }
+        }
     })?;
     let (instance, command) = crate::placement::spawn_on_host(
         &state,

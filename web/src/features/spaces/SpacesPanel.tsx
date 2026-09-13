@@ -26,11 +26,20 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
   onNavigate?: () => void; collapsed?: boolean; drawer?: boolean;
 }) {
   const [renaming, setRenaming] = useState<string>();
-  const [deleting, setDeleting] = useState<{ space: Space; instance: Instance }>();
+  // Ids, not the row itself: a session that resumes while the sheet is open
+  // must be offered 停止并删除 rather than the exited-only action.
+  const [deleting, setDeleting] = useState<{ spaceId: string; instanceId: string }>();
   const [busy, setBusy] = useState(false);
+  const target = deleting
+    ? spaces.find((row) => row.id === deleting.spaceId)?.instances.find((row) => row.id === deleting.instanceId)
+    : undefined;
+
+  async function resume(instanceId: string) {
+    try { await hubStore.resume(instanceId); } catch { hubStore.toast("恢复失败，请重试"); }
+  }
 
   /** Stops the session first when asked, then deletes the record for real. */
-  async function remove(space: Space, instance: Instance, stopFirst: boolean) {
+  async function remove(spaceId: string, instance: Instance, stopFirst: boolean) {
     setBusy(true);
     try {
       if (stopFirst) await hubStore.close(instance.id);
@@ -40,7 +49,7 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
       // Until the Hub ships DELETE, the row leaves this device's lists and the
       // record stays on the Hub; say so rather than claiming a deletion.
       if (error instanceof HubHttpError && error.code === DELETE_UNSUPPORTED) {
-        spaceStore.hideSession(space.id, instance.id);
+        spaceStore.hideSession(spaceId, instance.id);
         hubStore.toast("当前 Hub 尚不支持删除，已从本设备列表隐藏");
       } else hubStore.toast("删除失败，请重试");
     } finally {
@@ -89,9 +98,9 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
                 <SessionRow instance={instance} spaceId={space.id} active={instance.id === instanceId} onNavigate={onNavigate} />
                 <div className={css.exitedTools}>
                   <button type="button" className={css.tool} data-testid="exited-resume" aria-label={`恢复 ${hubStore.titleOf(instance.id)}`}
-                    onClick={() => void hubStore.resume(instance.id).catch(() => hubStore.toast("恢复失败，请重试"))}>恢复</button>
+                    onClick={() => { void resume(instance.id); }}>恢复</button>
                   <button type="button" className={css.tool} data-testid="exited-delete" aria-label={`删除 ${hubStore.titleOf(instance.id)}`}
-                    onClick={() => setDeleting({ space, instance })}>删除</button>
+                    onClick={() => setDeleting({ spaceId: space.id, instanceId: instance.id })}>删除</button>
                 </div>
               </div>) : null}
             </div> : null}
@@ -102,11 +111,13 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
       {!spaces.length ? <p className={css.empty}>{collapsed ? "—" : "注册工作区后在这里切换项目"}</p> : null}
     </div>
     {!collapsed ? <footer className={css.panelFoot}>活跃 / 待处理 <span>⌘/Ctrl+[ ] 切换</span></footer> : null}
-    {deleting ? <ActionSheet testId="delete-session-sheet" title="删除会话及其记录？"
-      detail={`「${hubStore.titleOf(deleting.instance.id)}」的记录将被删除，无法恢复。`} busy={busy}
-      onClose={() => { if (!busy) setDeleting(undefined); }}
-      actions={projectStatus(deleting.instance) === "exited"
-        ? [{ id: "delete-session-confirm", label: "删除", tone: "danger", onSelect: () => void remove(deleting.space, deleting.instance, false) }]
-        : [{ id: "delete-session-stop", label: "停止并删除", tone: "danger", onSelect: () => void remove(deleting.space, deleting.instance, true) }]} /> : null}
+    {deleting && target ? <ActionSheet testId="delete-session-sheet" title="删除会话及其记录？"
+      detail={projectStatus(target) === "exited"
+        ? `「${hubStore.titleOf(target.id)}」的记录将被删除，无法恢复。`
+        : `「${hubStore.titleOf(target.id)}」仍在运行，删除前会先停止它。记录将被删除，无法恢复。`}
+      busy={busy} onClose={() => { if (!busy) setDeleting(undefined); }}
+      actions={projectStatus(target) === "exited"
+        ? [{ id: "delete-session-confirm", label: "删除", tone: "danger", onSelect: () => void remove(deleting.spaceId, target, false) }]
+        : [{ id: "delete-session-stop", label: "停止并删除", tone: "danger", onSelect: () => void remove(deleting.spaceId, target, true) }]} /> : null}
   </section>;
 }

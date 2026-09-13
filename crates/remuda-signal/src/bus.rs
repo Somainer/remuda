@@ -1,0 +1,338 @@
+//! [`SignalBus`]: hook events in, [`Observation`]s out (D-028 §4.3, P1).
+//!
+//! The bus owns the stamping (`seq`, ids, source envelope) and the small amount
+//! of state a hook stream needs: which native session this agent reported, and
+//! which pid it reported it from. Classification itself lives in [`crate::map`].
+//!
+//! In P1 the bus never answers a blocking event — every reply is `{}` and the
+//! agent keeps its own prompt on screen. The reply plumbing is real so that P5
+//! is a change of decision, not a change of transport.
+
+use crate::event::{HookEnvelope, HookEvent, HookReply};
+use crate::map::{Mapped, MappedKind, map_event};
+use crate::socket::SignalSink;
+use remuda_protocol::{
+    Completeness, EventId, HostId, Id, InstanceId, Knowledge, NativeRequestKey, Observation,
+    ObservationPayload, ObservationSource, RunId, RuntimeCursor, SchemaVersion, SourceChannel,
+    SourceCursor, SourceDelivery, Timestamp, U64,
+};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::mpsc;
+
+/// Identity every Observation this bus emits is stamped with.
+#[derive(Clone, Debug)]
+pub struct BusContext {
+    /// Owning instance.
+    pub instance_id: InstanceId,
+    /// Owning host.
+    pub host_id: HostId,
+    /// Journal this instance writes to.
+    pub journal_id: Id,
+    /// Current run.
+    pub run_id: RunId,
+    /// Driver this bus is attached to (`shell-pty` in P1).
+    pub driver_kind: remuda_protocol::DriverKind,
+    /// Adapter version recorded in the source envelope.
+    pub adapter_version: String,
+}
+
+/// What the bus learned from a `SessionStart`.
+///
+/// `pid` is the agent process, taken from the relay's parent. The Node binds
+/// a promoted shell-pty instance to this session by matching `pid` against the
+/// PTY's foreground process group leader, which is what makes the binding
+/// deterministic when two terminals each run their own `claude`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionBinding {
+    /// Agent pid that reported this session.
+    pub pid: i32,
+    /// Native session id, for `--resume` (D-026).
+    pub session_id: String,
+    /// Transcript the agent is writing.
+    pub transcript_path: Option<String>,
+}
+
+/// Receives hook events, journals them, answers the agent.
+pub struct SignalBus {
+    context: BusContext,
+    events: mpsc::Sender<Observation>,
+    seq: Arc<AtomicU64>,
+    binding: std::sync::Mutex<Option<SessionBinding>>,
+}
+
+impl SignalBus {
+    /// Build a bus that emits on `events`.
+    #[must_use]
+    pub fn new(
+        context: BusContext,
+        events: mpsc::Sender<Observation>,
+        seq: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            context,
+            events,
+            seq,
+            binding: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The session this bus has seen a `SessionStart` for, if any.
+    #[must_use]
+    pub fn binding(&self) -> Option<SessionBinding> {
+        self.binding.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Handle one authenticated event: journal it, then answer the agent.
+    pub async fn handle(&self, envelope: HookEnvelope) -> HookReply {
+        let event = HookEvent::from_envelope(envelope);
+        let mapped = map_event(&event);
+        if mapped.kind == MappedKind::SessionStarted
+            && let Some(session_id) = mapped.session_id.clone()
+            && let Ok(mut slot) = self.binding.lock()
+        {
+            *slot = Some(SessionBinding {
+                pid: event.ppid,
+                session_id,
+                transcript_path: mapped.transcript_path.clone(),
+            });
+        }
+        if let Err(error) = self.emit(&mapped).await {
+            tracing::debug!(%error, event = %event.name, "hook observation not journaled");
+        }
+        // P1 observes only. Answering `PermissionRequest` is P5; until then the
+        // agent's own dialog stays the single place a decision is made, so
+        // there is never a moment where Remuda thinks it answered and the
+        // agent thinks it did not.
+        HookReply::empty()
+    }
+
+    async fn emit(&self, mapped: &Mapped) -> Result<(), mpsc::error::SendError<Observation>> {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let Some(observation) = self.build(seq, mapped) else {
+            return Ok(());
+        };
+        self.events.send(observation).await
+    }
+
+    fn build(&self, seq: u64, mapped: &Mapped) -> Option<Observation> {
+        let observed_at = now_ts()?;
+        Some(Observation {
+            schema_version: SchemaVersion,
+            event_id: EventId::new(),
+            journal_id: self.context.journal_id.clone(),
+            instance_id: self.context.instance_id.clone(),
+            run_id: Some(self.context.run_id.clone()),
+            host_id: self.context.host_id.clone(),
+            process_generation: U64(1),
+            run_generation: Some(U64(1)),
+            seq: U64(seq),
+            observed_at: observed_at.clone(),
+            // The harness stamps no time of its own on a hook payload; saying
+            // so beats inventing one from our own clock.
+            native_at: Knowledge::Unknown {
+                reason: "not-emitted".into(),
+                evidence_event_ids: Vec::new(),
+            },
+            source: ObservationSource {
+                driver_kind: self.context.driver_kind,
+                driver_version: "shell-pty".into(),
+                adapter_version: self.context.adapter_version.clone(),
+                channel: SourceChannel::Hook,
+                delivery: SourceDelivery::Live,
+                native_session_id: match &mapped.session_id {
+                    Some(value) => Knowledge::Known {
+                        value: value.clone(),
+                    },
+                    None => Knowledge::Unknown {
+                        reason: "not-emitted".into(),
+                        evidence_event_ids: Vec::new(),
+                    },
+                },
+                native_turn_id: Knowledge::NotApplicable,
+                native_agent_id: Knowledge::NotApplicable,
+                native_item_id: Knowledge::NotApplicable,
+                native_event_id: Knowledge::NotApplicable,
+                native_request_id: NativeRequestKey::None,
+                source_cursor: SourceCursor::Runtime(Box::new(RuntimeCursor {
+                    ledger_revision: U64(seq),
+                })),
+            },
+            completeness: mapped.completeness,
+            raw_ref: None,
+            evidence_event_ids: Vec::new(),
+            body: mapped.payload.clone(),
+        })
+    }
+}
+
+impl SignalSink for SignalBus {
+    fn deliver(
+        &self,
+        envelope: HookEnvelope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HookReply> + Send + '_>> {
+        Box::pin(self.handle(envelope))
+    }
+}
+
+/// Millisecond-precision UTC, matching the driver's own stamping.
+fn now_ts() -> Option<Timestamp> {
+    let now = time::OffsetDateTime::now_utc();
+    let date = now.date();
+    let (hour, minute, second) = now.time().as_hms();
+    Timestamp::try_from(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        date.year(),
+        u8::from(date.month()),
+        date.day(),
+        hour,
+        minute,
+        second,
+        now.millisecond(),
+    ))
+    .ok()
+}
+
+/// Completeness every hook observation carries. Exposed so tests elsewhere can
+/// assert the channel/completeness pair without rebuilding a bus.
+pub const HOOK_COMPLETENESS: Completeness = Completeness::Structured;
+
+/// `ObservationPayload` accessor used by the Node's fold; keeps the match on
+/// lifecycle payloads in one place.
+#[must_use]
+pub fn native_lifecycle(payload: &ObservationPayload) -> Option<&remuda_protocol::NativeLifecycle> {
+    let ObservationPayload::Lifecycle(lifecycle) = payload else {
+        return None;
+    };
+    match lifecycle.as_ref() {
+        remuda_protocol::LifecyclePayload::Native(native) => Some(native),
+        remuda_protocol::LifecyclePayload::Entity(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> BusContext {
+        BusContext {
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").unwrap(),
+            run_id: RunId::new(),
+            driver_kind: remuda_protocol::DriverKind::ShellPty,
+            adapter_version: "test".into(),
+        }
+    }
+
+    fn envelope(event: &str, payload: serde_json::Value) -> HookEnvelope {
+        HookEnvelope {
+            credential: "cred".into(),
+            event: event.into(),
+            ppid: 4242,
+            payload,
+        }
+    }
+
+    fn bus() -> (SignalBus, mpsc::Receiver<Observation>) {
+        let (tx, rx) = mpsc::channel(32);
+        (
+            SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0))),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn every_hook_observation_is_stamped_as_the_hook_channel() {
+        let (bus, mut rx) = bus();
+        bus.handle(envelope("Stop", serde_json::json!({}))).await;
+        let observation = rx.recv().await.unwrap();
+        assert_eq!(observation.source.channel, SourceChannel::Hook);
+        assert_eq!(observation.completeness, Completeness::Structured);
+        assert_eq!(observation.source.delivery, SourceDelivery::Live);
+    }
+
+    #[tokio::test]
+    async fn session_start_binds_the_agent_pid_to_its_session() {
+        let (bus, mut rx) = bus();
+        assert_eq!(bus.binding(), None);
+        bus.handle(envelope(
+            "SessionStart",
+            serde_json::json!({
+                "session_id": "0199a1f0-0000-7000-8000-000000000000",
+                "transcript_path": "/w/s.jsonl",
+            }),
+        ))
+        .await;
+        assert_eq!(
+            bus.binding(),
+            Some(SessionBinding {
+                pid: 4242,
+                session_id: "0199a1f0-0000-7000-8000-000000000000".into(),
+                transcript_path: Some("/w/s.jsonl".into()),
+            })
+        );
+        let observation = rx.recv().await.unwrap();
+        assert_eq!(
+            observation.source.native_session_id,
+            Knowledge::Known {
+                value: "0199a1f0-0000-7000-8000-000000000000".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_event_without_a_session_does_not_clear_the_binding() {
+        let (bus, _rx) = bus();
+        bus.handle(envelope(
+            "SessionStart",
+            serde_json::json!({"session_id": "s-1", "transcript_path": "/w/s.jsonl"}),
+        ))
+        .await;
+        bus.handle(envelope("Notification", serde_json::json!({})))
+            .await;
+        assert_eq!(bus.binding().map(|b| b.session_id), Some("s-1".into()));
+    }
+
+    #[tokio::test]
+    async fn sequence_numbers_are_monotonic_across_events() {
+        let (bus, mut rx) = bus();
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            bus.handle(envelope(event, serde_json::json!({}))).await;
+        }
+        let mut seqs = Vec::new();
+        for _ in 0..3 {
+            seqs.push(rx.recv().await.unwrap().seq.0);
+        }
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn p1_never_answers_a_blocking_event() {
+        let (bus, _rx) = bus();
+        for event in ["PermissionRequest", "Elicitation"] {
+            let reply = bus
+                .handle(envelope(event, serde_json::json!({"tool_name": "Write"})))
+                .await;
+            assert_eq!(
+                reply.to_hook_json(),
+                serde_json::json!({}),
+                "{event} must fall back to the agent's own prompt in P1"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_journal_channel_does_not_stall_the_agent() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let bus = SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0)));
+        // The reply still arrives, so the agent is never left waiting on us.
+        assert_eq!(
+            bus.handle(envelope("Stop", serde_json::json!({})))
+                .await
+                .to_hook_json(),
+            serde_json::json!({})
+        );
+    }
+}

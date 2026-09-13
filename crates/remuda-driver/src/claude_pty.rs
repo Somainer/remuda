@@ -1006,19 +1006,12 @@ pub(crate) fn prompt_text(input: &DriverInput) -> DriverResult<String> {
     }
 }
 
+/// Text plus an absolute-path mention per attachment (D-027).
+///
+/// A PTY driver can only type, so an image reaches Claude through its own Read
+/// tool — the design's one verified remote path for the TUI.
 fn blocks_to_text(blocks: &[ContentBlock]) -> DriverResult<String> {
-    let mut out = String::new();
-    for block in blocks {
-        if let ContentBlock::Text(text) = block {
-            out.push_str(&text.text);
-        }
-    }
-    if out.is_empty() {
-        return Err(DriverError::InvalidLaunchSpec(
-            "prompt has no text block".into(),
-        ));
-    }
-    Ok(out)
+    crate::attachment::text_with_path_mentions(blocks)
 }
 
 pub(crate) fn refuse_bare(argv: &[String]) -> DriverResult<()> {
@@ -1489,6 +1482,51 @@ pub(crate) async fn emit_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-027: a PTY driver cannot inline bytes, so an attachment has to reach
+    /// the agent as an absolute path it can open with its own Read tool.
+    #[test]
+    fn a_pty_prompt_mentions_attachment_paths_after_the_text() {
+        use remuda_protocol::{Knowledge, MediaBlock, ResourceBlock, TextBlock};
+        let id = remuda_protocol::Id::new("obj").expect("id");
+        let blocks = vec![
+            ContentBlock::Image(Box::new(MediaBlock {
+                object_id: id.clone(),
+                media_type: "image/png".into(),
+                name: Some("shot.png".into()),
+            })),
+            ContentBlock::Resource(Box::new(ResourceBlock {
+                uri: "file:///data/instances/ins_1/attachments/obj_1.png".into(),
+                media_type: Knowledge::Known {
+                    value: "image/png".into(),
+                },
+                object_id: Some(id),
+            })),
+            ContentBlock::Text(Box::new(TextBlock {
+                text: "what colour is the image?".into(),
+            })),
+        ];
+        let text = blocks_to_text(&blocks).expect("prompt text");
+        assert!(text.starts_with("what colour is the image?"), "{text}");
+        assert!(
+            text.contains("附件: /data/instances/ins_1/attachments/obj_1.png"),
+            "{text}"
+        );
+        assert!(
+            text.contains("请读取"),
+            "the mention must instruct, not merely name the file: {text}"
+        );
+    }
+
+    /// The common text-only prompt is untouched by the attachment path.
+    #[test]
+    fn a_text_only_pty_prompt_is_unchanged() {
+        use remuda_protocol::TextBlock;
+        let blocks = vec![ContentBlock::Text(Box::new(TextBlock {
+            text: "just text".into(),
+        }))];
+        assert_eq!(blocks_to_text(&blocks).expect("text"), "just text");
+    }
 
     #[test]
     fn resume_argv_replaces_session_id_and_never_continue() {

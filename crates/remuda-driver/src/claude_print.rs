@@ -510,9 +510,8 @@ impl Driver for ClaudePrintDriver {
         };
         match input {
             DriverInput::Prompt(prompt) => {
-                let text = prompt_text(&prompt.blocks)?;
                 live.process
-                    .send_user(UserContent::Text(text))
+                    .send_user(prompt_content(&prompt.blocks)?)
                     .await
                     .map_err(map_wire)?;
                 Ok(DriverAck::transport_written())
@@ -1458,6 +1457,65 @@ fn permission_from_answer(
     }
 }
 
+/// Largest total of inlined image bytes on one turn.
+///
+/// The CLI re-compresses above its own internal budget, and a very large
+/// payload is more likely to be refused than answered. Past this the driver
+/// mentions paths instead, which the Read tool can still act on.
+const MAX_INLINE_IMAGE_BYTES: usize = 3_584 * 1024;
+
+/// Build the `user` content for one prompt.
+///
+/// With no attachments this is the plain string it has always been. With
+/// attachments it becomes Anthropic content blocks: each image inlined as
+/// base64, then the text.
+///
+/// Base64 is not a preference. The design verified that a `source.type` of
+/// `file` or a bare path is silently downgraded to text by the CLI, so the
+/// image would be dropped without an error — worse than not sending it.
+fn prompt_content(blocks: &[ContentBlock]) -> DriverResult<UserContent> {
+    let attachments = crate::attachment::attachments_of(blocks);
+    if attachments.is_empty() {
+        return Ok(UserContent::Text(prompt_text(blocks)?));
+    }
+    let mut images = Vec::with_capacity(attachments.len());
+    let mut total = 0usize;
+    for attachment in &attachments {
+        let bytes = attachment.read()?;
+        total = total.saturating_add(bytes.len());
+        if total > MAX_INLINE_IMAGE_BYTES {
+            // Too big to inline: fall back to the path mention so the agent
+            // can still reach the image through its Read tool.
+            tracing::warn!(
+                object_id = %attachment.object_id,
+                total,
+                "attachments exceed the inline budget; sending paths instead"
+            );
+            return Ok(UserContent::Text(
+                crate::attachment::text_with_path_mentions(blocks)?,
+            ));
+        }
+        images.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": attachment.media_type,
+                "data": base64_of(&bytes),
+            },
+        }));
+    }
+    let text = crate::attachment::text_of(blocks);
+    if !text.is_empty() {
+        images.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    Ok(UserContent::Blocks(images))
+}
+
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 fn prompt_text(blocks: &[ContentBlock]) -> DriverResult<String> {
     let mut parts = Vec::new();
     for block in blocks {
@@ -1798,5 +1856,114 @@ pub mod review {
     /// Final argv check for `--bare` / `--no-session-persistence`.
     pub fn refuse_argv(argv: &[String]) -> DriverResult<()> {
         refuse_prohibited_argv(argv)
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use remuda_protocol::{Knowledge, MediaBlock, ResourceBlock, TextBlock};
+
+    /// 1x1 red PNG. Small, real, and enough to prove the bytes round-trip.
+    const RED_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn image_blocks(path: &std::path::Path, text: &str) -> Vec<ContentBlock> {
+        let id = remuda_protocol::Id::new("obj").expect("id");
+        vec![
+            ContentBlock::Image(Box::new(MediaBlock {
+                object_id: id.clone(),
+                media_type: "image/png".into(),
+                name: Some("shot.png".into()),
+            })),
+            ContentBlock::Resource(Box::new(ResourceBlock {
+                uri: format!("file://{}", path.display()),
+                media_type: Knowledge::Known {
+                    value: "image/png".into(),
+                },
+                object_id: Some(id),
+            })),
+            ContentBlock::Text(Box::new(TextBlock { text: text.into() })),
+        ]
+    }
+
+    /// A text-only prompt keeps the plain-string shape the CLI has always got.
+    #[test]
+    fn a_prompt_without_attachments_is_still_sent_as_text() {
+        let blocks = vec![ContentBlock::Text(Box::new(TextBlock {
+            text: "hello".into(),
+        }))];
+        match prompt_content(&blocks).expect("content") {
+            UserContent::Text(text) => assert_eq!(text, "hello"),
+            UserContent::Blocks(blocks) => panic!("expected plain text, got {blocks:?}"),
+        }
+    }
+
+    /// D-027: an attachment becomes a base64 image block ahead of the text.
+    /// Base64 specifically — the design verified that a `file` source or a
+    /// bare path is silently downgraded to text by the CLI.
+    #[test]
+    fn an_attachment_becomes_a_base64_image_block_before_the_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shot.png");
+        std::fs::write(&path, RED_PNG).expect("write png");
+
+        let content =
+            prompt_content(&image_blocks(&path, "what colour is the image?")).expect("content");
+        let UserContent::Blocks(blocks) = content else {
+            panic!("expected content blocks");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], serde_json::json!("image"));
+        assert_eq!(blocks[0]["source"]["type"], serde_json::json!("base64"));
+        assert_eq!(
+            blocks[0]["source"]["media_type"],
+            serde_json::json!("image/png")
+        );
+        let encoded = blocks[0]["source"]["data"].as_str().expect("data");
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("decode"),
+            RED_PNG,
+            "the CLI must receive the exact bytes that were staged"
+        );
+        assert_eq!(blocks[1]["type"], serde_json::json!("text"));
+        assert_eq!(
+            blocks[1]["text"],
+            serde_json::json!("what colour is the image?")
+        );
+    }
+
+    /// Past the inline budget the driver mentions paths instead, so the image
+    /// is still reachable through the Read tool rather than simply dropped.
+    #[test]
+    fn oversized_attachments_fall_back_to_a_path_mention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.png");
+        let mut big = RED_PNG.to_vec();
+        big.resize(MAX_INLINE_IMAGE_BYTES + 1, 0);
+        std::fs::write(&path, &big).expect("write png");
+
+        match prompt_content(&image_blocks(&path, "describe it")).expect("content") {
+            UserContent::Text(text) => {
+                assert!(text.contains("describe it"), "{text}");
+                assert!(text.contains(&path.display().to_string()), "{text}");
+            }
+            UserContent::Blocks(blocks) => panic!("expected a path mention, got {blocks:?}"),
+        }
+    }
+
+    /// A staged file that vanished is an error, not a silently text-only turn.
+    #[test]
+    fn a_missing_attachment_file_fails_the_send() {
+        let blocks = image_blocks(std::path::Path::new("/nonexistent/shot.png"), "hi");
+        assert!(prompt_content(&blocks).is_err());
     }
 }

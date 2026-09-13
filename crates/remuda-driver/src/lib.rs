@@ -5,6 +5,7 @@
 //! [`FakeDriver`] that replays built-in Observations.
 
 pub mod agent_mcp;
+pub mod attachment;
 mod binary;
 mod capabilities;
 pub mod child_env;
@@ -32,6 +33,7 @@ pub mod tty;
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;
 
+pub use attachment::{PromptAttachment, attachments_of, text_with_path_mentions};
 pub use binary::{BinaryPin, default_command, hash_file, pin_binary, resolve_binary};
 pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,

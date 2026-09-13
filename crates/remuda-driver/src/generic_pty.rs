@@ -216,6 +216,9 @@ struct PtyLive {
     client: Client,
     pane_id: String,
     agent_name: String,
+    /// Product id of the preset this pane runs (`claude`, `codex`, `grok`, …).
+    /// Attachment handling differs per product, so the driver has to know.
+    preset_id: &'static str,
     recipe: LaunchRecipe,
     events: mpsc::Sender<Observation>,
     status_task: Option<JoinHandle<()>>,
@@ -568,6 +571,7 @@ impl GenericPtyDriver {
             client,
             pane_id,
             agent_name,
+            preset_id: preset.id,
             recipe: recipe.clone(),
             events: tx,
             status_task: Some(status_task),
@@ -640,11 +644,22 @@ impl Driver for GenericPtyDriver {
             )));
         }
         self.wait_control().await?;
+        let attachments = match &input {
+            DriverInput::Prompt(prompt) => crate::attachment::attachments_of(&prompt.blocks),
+            _ => Vec::new(),
+        };
         let text = prompt_text(&input)?;
         let (client, agent_name) = self.live_client().await?;
         prompt_when_ready(&client, &agent_name, &text).await?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+        // D-027: grok has no remote image input at all — not a flag, not a
+        // content block, not a path its tooling will open. The prompt still
+        // carries the path, but say plainly that this agent will not see the
+        // image, so a wrong answer is not mistaken for a model failure.
+        if !attachments.is_empty() && live.preset_id.eq_ignore_ascii_case("grok") {
+            note_attachments_unreadable(live, &self.seq, attachments.len()).await;
+        }
         let ctx = obs_ctx(
             DriverKind::GenericPty,
             InstanceId::new(),
@@ -924,6 +939,52 @@ fn last_n_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+/// Journal a visible note that this agent cannot read the attached images.
+async fn note_attachments_unreadable(
+    live: &PtyLive,
+    seq: &std::sync::atomic::AtomicU64,
+    count: usize,
+) {
+    let ctx = obs_ctx(
+        DriverKind::GenericPty,
+        InstanceId::new(),
+        HostId::new(),
+        match Id::new("obj") {
+            Ok(id) => id,
+            Err(_) => return,
+        },
+        RunId::new(),
+        live.agent_name.clone(),
+        live.recipe.binary.version.clone(),
+    );
+    let _ = emit_on(
+        &live.events,
+        seq,
+        &ctx,
+        SourceChannel::Herdr,
+        Completeness::Structured,
+        ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+            NativeLifecycle {
+                topic: LifecycleTopic::Turn,
+                native_name: "attachment_unsupported".into(),
+                native_id: Knowledge::Known {
+                    value: live.agent_name.clone(),
+                },
+                status: Knowledge::Known {
+                    value: format!(
+                        "grok cannot read images; {count} attachment(s) were sent as paths only"
+                    ),
+                },
+                related_ids: BTreeMap::new(),
+                data_ref: None,
+                severity: Severity::Warning,
+                affects_completion: false,
+            },
+        )))),
+    )
+    .await;
 }
 
 async fn prompt_when_ready(client: &Client, agent_name: &str, text: &str) -> DriverResult<()> {

@@ -18,5 +18,6 @@ pub fn routes() -> Router<AppState> {
             get(http::get_instance).delete(http::delete_instance),
         )
         .route("/v1/instances/{id}/commands", post(http::post_command))
+        .route("/v1/instances/{id}/resume", post(http::resume_instance))
         .route("/v1/instances/{id}/journal", get(http::get_journal))
 }

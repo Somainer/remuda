@@ -104,6 +104,32 @@ fn default_operation() -> String {
     "instance.send".into()
 }
 
+/// `POST /v1/instances/{id}/resume` body (D-026).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeBody {
+    /// `structured` keeps the parent's driver; `terminal` continues in claude-pty.
+    #[serde(default = "default_resume_mode")]
+    mode: String,
+    /// Optional first prompt for the resumed session.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+fn default_resume_mode() -> String {
+    "structured".into()
+}
+
+/// How long one (instance, mode) resume stays idempotent.
+const RESUME_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Exited instances older than this cannot be resumed.
+///
+/// Claude prunes its own transcripts, and a `--resume` against a pruned
+/// session starts an empty conversation that merely looks continuous. The
+/// cutoff keeps that failure visible instead of silent (D-026).
+const RESUME_MAX_AGE_DAYS: i64 = 30;
+
 /// REST routes (login, hosts, instances, journal). Placement/fleet merge later.
 pub fn routes() -> Router<crate::AppState> {
     Router::new()
@@ -564,12 +590,240 @@ pub async fn create_instance(
             title,
             prompt: body.prompt,
             spec,
+            operation: "instance.create",
+            idempotency_key: None,
         },
     )
     .await?;
     Ok(Json(
         json!({ "instance": instance, "command": command, "hostId": host.host_id }),
     ))
+}
+
+/// `POST /v1/instances/:id/resume` — continue an exited session (D-026).
+///
+/// Resume never revives the exited process. It creates a new Instance on the
+/// same host and workspace whose driver launches `claude --resume <sessionId>`
+/// with the parent's provider, permission and model settings, so the old
+/// instance keeps its history and the new one keeps the conversation.
+pub async fn resume_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+    Json(body): Json<ResumeBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    // Resuming spends host capacity and starts a native process, so it stays a
+    // human/bot action; an Agent asking to resume its own parent would escape
+    // the scope its instance credential was issued for (D-017).
+    crate::agent_scope::require_operator(&state, &headers).await?;
+    let parent = state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let mode = match body.mode.as_str() {
+        "structured" => ResumeMode::Structured,
+        "terminal" => ResumeMode::Terminal,
+        other => {
+            return Err(HubError::BadRequest(format!(
+                "unknown resume mode {other}; expected structured or terminal"
+            )));
+        }
+    };
+    if parent.kind != "claude" {
+        return Err(HubError::Conflict(format!(
+            "resume supports Claude sessions; this one is {}",
+            parent.kind
+        )));
+    }
+    let session_id = parent.native_session_id.clone().ok_or_else(|| {
+        HubError::Conflict(
+            "this session never reported a native session id, so there is no transcript to resume"
+                .into(),
+        )
+    })?;
+    if let Some(age) = resume_age_days(&parent.updated_at)
+        && age > RESUME_MAX_AGE_DAYS
+    {
+        return Err(HubError::Conflict(format!(
+            "session last ran {age} days ago; transcripts older than {RESUME_MAX_AGE_DAYS} days are not resumable"
+        )));
+    }
+    let driver = mode.driver(&parent.driver);
+    let idempotency_key = format!(
+        "resume:{instance_id}:{}:{}",
+        mode.as_str(),
+        resume_window_index()
+    );
+    if let Some(existing) = state
+        .store
+        .find_resume_child(instance_id.clone(), driver.to_string(), session_id.clone())
+        .await?
+    {
+        return Ok(Json(json!({
+            "instance": existing,
+            "hostId": existing.host_id,
+            "mode": mode.as_str(),
+            "replayed": true,
+        })));
+    }
+
+    let mut spec = parent.spec_for_resume();
+    if let Some(object) = spec.as_object_mut() {
+        object.insert("driver".into(), json!(driver));
+        object.insert("resumeSessionId".into(), json!(session_id));
+        object.insert("resumedFrom".into(), json!(instance_id));
+        object.insert("parentInstanceId".into(), json!(instance_id));
+        object.insert("hostId".into(), json!(parent.host_id));
+        object.insert("prompt".into(), json!(body.prompt));
+        // The child reports its own identity; inheriting the parent's would
+        // make a stale id look freshly observed.
+        object.remove("nativeSessionId");
+        object.remove("nativeTranscriptPath");
+    }
+    let host = state
+        .store
+        .get_host(parent.host_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    if state.nodes.kind_of(&host.host_id).await.is_none() {
+        return Err(HubError::HostOffline {
+            host_id: host.host_id.clone(),
+        });
+    }
+    let host = crate::store::Store::with_live_link(host, true);
+    crate::providers::resolve_and_attach(&state, &host, &mut spec).await?;
+
+    let title = parent
+        .title
+        .clone()
+        .map(|title| format!("{title} (resumed)"))
+        .or_else(|| Some("resumed session".to_string()));
+    let (instance, command) = crate::placement::spawn_on_host(
+        &state,
+        &host,
+        crate::placement::SpawnRequest {
+            kind: parent.kind.clone(),
+            driver: driver.to_string(),
+            workspace_id: parent.workspace_id.clone(),
+            title,
+            prompt: body.prompt.clone(),
+            spec,
+            operation: "instance.resume",
+            idempotency_key: Some(idempotency_key),
+        },
+    )
+    .await?;
+    // Both ends of the link are journaled so history shows where a
+    // conversation continued, and where a resumed one came from.
+    let now = crate::config::now_rfc3339();
+    journal_resume_link(
+        &state,
+        &parent.host_id,
+        &instance_id,
+        "resumed-into",
+        &instance.instance_id,
+        &session_id,
+        &now,
+    )
+    .await;
+    journal_resume_link(
+        &state,
+        &parent.host_id,
+        &instance.instance_id,
+        "resumed-from",
+        &instance_id,
+        &session_id,
+        &now,
+    )
+    .await;
+    Ok(Json(json!({
+        "instance": instance,
+        "command": command,
+        "hostId": host.host_id,
+        "mode": mode.as_str(),
+        "replayed": false,
+    })))
+}
+
+/// Which driver a resume target launches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeMode {
+    /// Keep the parent's driver (structured transcript).
+    Structured,
+    /// Continue the same native session inside a real terminal.
+    Terminal,
+}
+
+impl ResumeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Structured => "structured",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    /// Structured keeps whatever the parent used; terminal always needs a PTY.
+    fn driver(self, parent_driver: &str) -> &'static str {
+        match self {
+            Self::Terminal => "claude-pty",
+            Self::Structured if parent_driver == "claude-pty" => "claude-pty",
+            Self::Structured => "claude-print",
+        }
+    }
+}
+
+/// Whole days between `updated_at` and now; `None` when unparseable.
+fn resume_age_days(updated_at: &str) -> Option<i64> {
+    let then = time::OffsetDateTime::parse(updated_at, &time::format_description::well_known::Rfc3339)
+        .ok()?;
+    let seconds = (time::OffsetDateTime::now_utc() - then).whole_seconds();
+    Some(seconds / 86_400)
+}
+
+/// Bucket wall-clock time so a double-click reuses one idempotency key.
+fn resume_window_index() -> u64 {
+    let window = RESUME_IDEMPOTENCY_WINDOW.as_secs().max(1);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() / window)
+        .unwrap_or(0)
+}
+
+/// Journal one side of the parent/child resume link, best effort.
+#[allow(clippy::too_many_arguments)]
+async fn journal_resume_link(
+    state: &AppState,
+    host_id: &str,
+    instance_id: &str,
+    relation: &str,
+    other_instance_id: &str,
+    session_id: &str,
+    now: &str,
+) {
+    let event = json!({
+        "kind": "lifecycle",
+        "observedAt": now,
+        "payload": {
+            "type": "native",
+            "topic": "session",
+            "nativeName": relation,
+            "nativeId": { "state": "known", "value": session_id },
+            "status": { "state": "known", "value": relation },
+            "relatedIds": { "instanceId": other_instance_id },
+            "dataRef": null,
+            "severity": "info",
+            "affectsCompletion": false,
+        },
+    });
+    if let Err(error) = state
+        .store
+        .append_journal(host_id.to_string(), instance_id.to_string(), None, event)
+        .await
+    {
+        tracing::warn!(%error, instance_id, relation, "resume link journal append failed");
+    }
 }
 
 /// `POST /v1/instances/:id/commands`

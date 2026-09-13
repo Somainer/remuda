@@ -275,6 +275,10 @@ pub struct SpawnRequest {
     pub prompt: Option<String>,
     /// Opaque spec JSON stored on the instance.
     pub spec: Value,
+    /// Node RPC to queue (`instance.create`, or `instance.resume` for D-026).
+    pub operation: &'static str,
+    /// Idempotency key so a retried spawn reuses the queued command.
+    pub idempotency_key: Option<String>,
 }
 
 /// Hosts with `online` derived from a live Hub<->Node session, not SQLite state.
@@ -327,9 +331,9 @@ pub async fn spawn_on_host(
             None,
             Some(instance.instance_id.clone()),
             host.host_id.clone(),
-            "instance.create".into(),
+            request.operation.to_owned(),
             payload,
-            None,
+            request.idempotency_key,
         )
         .await?;
     let command = crate::http::forward_if_online(state, command, true).await?;

@@ -273,6 +273,15 @@ pub struct InstanceRecord {
         rename = "effortIndex"
     )]
     pub effort_index: Option<u32>,
+    /// Native session id reported by the driver, resumable with `--resume` (D-026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    /// Native transcript path, when a driver reported one (D-026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_transcript_path: Option<String>,
+    /// Exited instance whose conversation this one continues (D-026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
     /// Journal id (`obj_…`).
     pub journal_id: String,
     /// Durable seq as decimal string.
@@ -294,6 +303,35 @@ pub struct InstanceRecord {
         rename = "promotedAt"
     )]
     pub promoted_at: Option<String>,
+}
+
+impl InstanceRecord {
+    /// Launch spec a resumed child inherits from this instance (D-026).
+    ///
+    /// Everything that decides *how* the native process runs is kept, so the
+    /// continued conversation talks to the same provider under the same
+    /// permissions; runtime observations and the child's own identity are not.
+    pub fn spec_for_resume(&self) -> Value {
+        let mut spec = json!({
+            "kind": self.kind,
+            "driver": self.driver,
+            "workspaceId": self.workspace_id,
+            "cwd": self.cwd,
+            "model": self.model,
+            "delegation": self.delegation,
+            "providerProfileId": self.provider_profile_id,
+        });
+        if let Some(object) = spec.as_object_mut() {
+            if let Some(name) = &self.effort_name {
+                object.insert("effortName".into(), json!(name));
+            }
+            if let Some(index) = self.effort_index {
+                object.insert("effortIndex".into(), json!(index));
+            }
+            object.retain(|_, value| !value.is_null());
+        }
+        spec
+    }
 }
 
 /// Command ledger row (three-state).
@@ -1456,6 +1494,50 @@ impl Store {
         .await
     }
 
+    /// Find an existing child that already resumes `session_id` on `driver`.
+    ///
+    /// Resume is retried by impatient clicks and by clients replaying a failed
+    /// request, and each retry would otherwise launch another native process
+    /// against the same conversation (D-026).
+    pub async fn find_resume_child(
+        &self,
+        parent_instance_id: String,
+        driver: String,
+        session_id: String,
+    ) -> Result<Option<InstanceRecord>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM instances
+                 WHERE driver = ?1 AND lifecycle NOT IN ('exited', 'failed')
+                 ORDER BY created_at DESC",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(params![driver], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            for id in ids {
+                let Some(record) = load_instance(conn, &id)? else {
+                    continue;
+                };
+                if record.resumed_from.as_deref() != Some(parent_instance_id.as_str()) {
+                    continue;
+                }
+                let raw: String = conn.query_row(
+                    "SELECT spec_json FROM instances WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                let spec: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+                if spec.get("resumeSessionId").and_then(Value::as_str) == Some(session_id.as_str())
+                {
+                    return Ok(Some(record));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
     /// Ensure an instance row exists so Node can append journal before HTTP create.
     pub async fn ensure_instance(
         &self,
@@ -1790,6 +1872,7 @@ impl Store {
                 params![instance_id, seq, event_id, event.to_string(), now],
             )?;
             apply_instance_projection(conn, &instance_id, &event, seq, &now)?;
+            apply_native_session_projection(conn, &instance_id, &event, &now)?;
             apply_command_projection(conn, &host_id, &instance_id, &event, &now)?;
             apply_interaction_event(conn, &host_id, &instance_id, &event)?;
             apply_instance_lifecycle(conn, &instance_id, &event)?;
@@ -2766,6 +2849,107 @@ fn apply_instance_projection(
         )?;
     }
     Ok(())
+}
+
+/// Mirror the native session identity a Node reported onto the instance spec.
+///
+/// Resume needs the id `claude --resume` accepts, and the Hub only ever sees
+/// Node journals. The driver reports it on a `session` (claude-print) or
+/// `SessionStart` hook (claude-pty) native lifecycle, and the Node also
+/// restates it on the Instance entity it journals (D-026).
+fn apply_native_session_projection(
+    conn: &Connection,
+    instance_id: &str,
+    event: &Value,
+    now: &str,
+) -> Result<(), StoreError> {
+    let Some((session_id, transcript_path)) = native_session_from_event(event) else {
+        return Ok(());
+    };
+    let raw: String = match conn
+        .query_row(
+            "SELECT spec_json FROM instances WHERE id = ?1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        Some(raw) => raw,
+        None => return Ok(()),
+    };
+    let mut spec: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+    let Some(object) = spec.as_object_mut() else {
+        return Ok(());
+    };
+    let known_session = object
+        .get("nativeSessionId")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == session_id);
+    let known_transcript = match transcript_path.as_deref() {
+        None => true,
+        Some(path) => object
+            .get("nativeTranscriptPath")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == path),
+    };
+    if known_session && known_transcript {
+        return Ok(());
+    }
+    object.insert("nativeSessionId".into(), json!(session_id));
+    if let Some(path) = transcript_path {
+        object.insert("nativeTranscriptPath".into(), json!(path));
+    }
+    conn.execute(
+        "UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
+        params![spec.to_string(), now, instance_id],
+    )?;
+    Ok(())
+}
+
+/// Session id + transcript path carried by one mirrored journal event.
+fn native_session_from_event(event: &Value) -> Option<(String, Option<String>)> {
+    if event.get("kind").and_then(Value::as_str) != Some("lifecycle") {
+        return None;
+    }
+    let payload = event.get("payload")?;
+    match payload.get("type").and_then(Value::as_str) {
+        Some("native") => {
+            let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
+            if topic != "session" && topic != "hook" {
+                return None;
+            }
+            let session = payload
+                .pointer("/nativeId/value")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let transcript = payload
+                .pointer("/relatedIds/transcriptPath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Some((session.to_string(), transcript))
+        }
+        Some("entity") => {
+            if payload.get("entityType").and_then(Value::as_str) != Some("instance") {
+                return None;
+            }
+            let session = payload
+                .pointer("/entity/nativeRef/sessionId/value")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let transcript = payload
+                .pointer("/entity/nativeRef/transcript/value/sourcePath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Some((session.to_string(), transcript))
+        }
+        _ => None,
+    }
 }
 
 fn apply_command_projection(
@@ -4079,6 +4263,21 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 model,
                 effort_name,
                 effort_index,
+                native_session_id: spec
+                    .get("nativeSessionId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                native_transcript_path: spec
+                    .get("nativeTranscriptPath")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                resumed_from: spec
+                    .get("resumedFrom")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
                 journal_id: row.get(9)?,
                 durable_seq: durable.to_string(),
                 created_at: row.get(11)?,

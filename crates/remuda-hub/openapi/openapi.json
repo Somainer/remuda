@@ -578,6 +578,42 @@
         }
       }
     },
+    "/v1/instances/{id}/resume": {
+      "post": {
+        "tags": ["instances"],
+        "operationId": "instanceResume",
+        "summary": "Continue an exited Claude session on a new instance (D-026)",
+        "description": "Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdPath" },
+          { "$ref": "#/components/parameters/CallerInstance" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/ResumeRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resumed instance",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ResumeResult" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": {
+            "description": "No resumable native transcript, transcript too old, or host offline",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } }
+            }
+          }
+        }
+      }
+    },
     "/v1/instances/{id}/journal": {
       "get": {
         "tags": ["instances"],
@@ -1587,6 +1623,37 @@
           "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" }
         }
       },
+      "ResumeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["structured", "terminal"],
+            "default": "structured",
+            "description": "structured keeps the parent's driver; terminal continues the same native session in claude-pty so the conversation gains a terminal tab."
+          },
+          "prompt": {
+            "type": ["string", "null"],
+            "description": "Optional first prompt delivered to the resumed session."
+          }
+        }
+      },
+      "ResumeResult": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["instance", "hostId", "mode"],
+        "properties": {
+          "instance": { "$ref": "#/components/schemas/InstanceRecord" },
+          "command": { "$ref": "#/components/schemas/CommandRecord" },
+          "hostId": { "type": "string" },
+          "mode": { "type": "string", "enum": ["structured", "terminal"] },
+          "replayed": {
+            "type": "boolean",
+            "description": "True when an earlier resume for this (instance, mode) was reused instead of launching again."
+          }
+        }
+      },
       "InstanceRecord": {
         "type": "object",
         "additionalProperties": true,
@@ -1641,6 +1708,21 @@
           "promotedAt": {
             "type": ["string", "null"],
             "description": "When the terminal was promoted. Absent unless mode is \"promoted\"."
+          },
+          "nativeSessionId": {
+            "type": ["string", "null"],
+            "readOnly": true,
+            "description": "Native session id the driver reported; what POST /v1/instances/{id}/resume passes to `claude --resume` (D-026)."
+          },
+          "nativeTranscriptPath": {
+            "type": ["string", "null"],
+            "readOnly": true,
+            "description": "Native transcript path, when a driver reported one (D-026)."
+          },
+          "resumedFrom": {
+            "type": ["string", "null"],
+            "readOnly": true,
+            "description": "Exited instance whose conversation this instance continues (D-026)."
           },
           "journalId": { "type": "string" },
           "durableSeq": { "type": "string" },

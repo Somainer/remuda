@@ -13,6 +13,7 @@ pub mod claude_bg;
 pub mod claude_print;
 pub mod claude_pty;
 pub mod claude_transcript;
+pub mod codex_rollout;
 mod driver;
 mod error;
 mod flags;

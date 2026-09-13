@@ -138,7 +138,7 @@ describe("Composer shortcuts", () => {
     await user.click(screen.getByTestId("model-effort-chip"));
     const slider = screen.getByTestId("effort-slider");
     const track = screen.getByTestId("effort-track");
-    // 400px pill; the knob centre travels between x=22 and x=378.
+    // 400px pill; the knob centre travels between x=18 and x=382 (KNOB_INSET).
     vi.spyOn(track, "getBoundingClientRect").mockReturnValue({
       x: 0,
       y: 0,

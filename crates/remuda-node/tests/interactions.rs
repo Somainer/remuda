@@ -87,8 +87,7 @@ async fn fake_can_use_tool_answered_via_hub_http() {
         .await
         .expect("hub");
     let node = DevNode::new(
-        &DevServerConfig::loopback(0)
-            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        &DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
@@ -270,7 +269,7 @@ async fn pty_approval_hub_cas_settlement_and_restart_do_not_replay() {
     let store = Arc::new(MemoryStore::open_journaled(&node_path, 128).unwrap());
     let mut node_config = DevServerConfig::loopback(0);
     node_config.workspace_root = dir.path().to_path_buf();
-    node_config.workspace_roots = Some(vec![std::env::temp_dir()]);
+    node_config.workspace_roots = Some(remuda_testing::test_workspace_roots!());
     let node = DevNode::with_parts(
         &node_config,
         store.clone(),

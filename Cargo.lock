@@ -2971,6 +2971,7 @@ dependencies = [
  "remuda-protocol",
  "remuda-signal",
  "remuda-ssh",
+ "remuda-testing",
  "serde",
  "serde_json",
  "tempfile",

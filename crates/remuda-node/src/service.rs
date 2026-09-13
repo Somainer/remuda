@@ -172,7 +172,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("data dir");
         let running = serve(ServeConfig::fake(
             DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
             data_dir.path().to_path_buf(),
         ))
         .await
@@ -196,7 +196,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("data dir");
         let config = ServeConfig::fake(
             DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
             data_dir.path().to_path_buf(),
         );
         let first = compose(&config).expect("first Node").host().meta.id;

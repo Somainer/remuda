@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, sync::Arc};
 fn config(root: &std::path::Path) -> DevServerConfig {
     let mut config = DevServerConfig::loopback(0);
     config.workspace_root = root.join("workspace");
-    config.workspace_roots = Some(vec![std::env::temp_dir()]);
+    config.workspace_roots = Some(remuda_testing::test_workspace_roots!());
     std::fs::create_dir_all(&config.workspace_root).expect("workspace");
     config
 }

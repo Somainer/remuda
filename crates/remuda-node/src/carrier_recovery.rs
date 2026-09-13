@@ -320,8 +320,9 @@ mod tests {
             // The advertised workspace root stays the default "." — the crate
             // directory the harness runs in — so pin the allowlist there rather
             // than inheriting the $HOME default a /tmp checkout falls outside of.
+            // The shared helper also covers the temp dir, so fixtures resolve.
             &DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
             store,
             DriverRegistry::with_fake().expect("fake registry"),
         )

@@ -86,7 +86,7 @@ fn fixture() -> Result<Fixture> {
     let node = compose(&ServeConfig::fake(
         DevServerConfig::loopback(0)
             .with_workspace_root(workspace)
-            .with_workspace_roots(vec![std::env::temp_dir()]),
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
         data_dir.clone(),
     ))?;
     Ok(Fixture {

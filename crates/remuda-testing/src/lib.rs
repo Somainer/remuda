@@ -15,6 +15,7 @@ mod flags;
 mod paths;
 mod script;
 mod stub;
+mod workspace_roots;
 
 pub use bin_locator::{
     cargo_bin_exe, cargo_target_dir, ensure_workspace_bin, env_bin_override, fallback_bin_path,
@@ -36,6 +37,7 @@ pub use paths::{
 };
 pub use script::{load_script, load_script_from_env};
 pub use stub::install_executable;
+pub use workspace_roots::test_workspace_roots;
 
 /// Directory containing captured Claude / Codex / grok / agy samples.
 pub fn captured_samples_dir() -> std::path::PathBuf {

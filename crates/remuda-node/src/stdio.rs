@@ -675,7 +675,7 @@ mod tests {
         };
         let node = compose(&ServeConfig::fake(
             DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
             opts.data_dir.clone(),
         ))
         .expect("compose");

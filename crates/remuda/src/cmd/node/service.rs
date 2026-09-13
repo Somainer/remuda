@@ -589,7 +589,7 @@ mod tests {
         let node = remuda_node::DevNode::new(
             &remuda_node::DevServerConfig::loopback(0)
                 .with_workspace_root(fixture.path().to_path_buf())
-                .with_workspace_roots(vec![std::env::temp_dir()]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
         )
         .unwrap();
         let server = tokio::spawn(async move {

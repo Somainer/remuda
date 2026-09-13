@@ -123,7 +123,7 @@ fn native_fixture(path: &Path) -> (ServeConfig, std::path::PathBuf, std::path::P
     let config = ServeConfig {
         http: DevServerConfig::loopback(0)
             .with_workspace_root(path.to_path_buf())
-            .with_workspace_roots(vec![std::env::temp_dir()]),
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
         data_dir: path.to_path_buf(),
         drivers: LocalDrivers::Native(native),
     };
@@ -237,7 +237,7 @@ fn journal_complete(node: &DevNode, instance: &InstanceId) -> bool {
 async fn controller_takeover_fences_old_bridge_and_outbound_waits_until_detach() {
     let dir = tempfile::tempdir().unwrap();
     let node = compose(&ServeConfig::fake(
-        DevServerConfig::loopback(0).with_workspace_roots(vec![std::env::temp_dir()]),
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
         dir.path().to_path_buf(),
     ))
     .unwrap();
@@ -286,7 +286,7 @@ async fn controller_takeover_fences_old_bridge_and_outbound_waits_until_detach()
 async fn stalled_reply_pipe_does_not_block_replacement_controller() {
     let dir = tempfile::tempdir().unwrap();
     let node = compose(&ServeConfig::fake(
-        DevServerConfig::loopback(0).with_workspace_roots(vec![std::env::temp_dir()]),
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
         dir.path().to_path_buf(),
     ))
     .unwrap();

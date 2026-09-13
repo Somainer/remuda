@@ -174,8 +174,7 @@ async fn wait_for_settled(address: SocketAddr, command_id: &str) -> Value {
 #[tokio::test]
 async fn create_send_follow_cancel_and_reconnect_catch_up_without_duplicates() {
     let server = spawn_server(
-        DevServerConfig::loopback(0)
-            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .await;
     let fixture = include_str!("fixtures/create-instance.json");
@@ -289,7 +288,7 @@ async fn access_code_cookie_and_exact_origin_are_enforced() {
         .expect("access code")
         .with_allowed_origins(vec!["http://localhost:5173".to_owned()])
         .expect("origin")
-        .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]);
+        .with_workspace_roots(remuda_testing::test_workspace_roots!());
     let server = spawn_server(config).await;
 
     let missing = http_json(server.address, "GET", "/healthz", None, &[]).await;
@@ -347,8 +346,7 @@ async fn access_code_cookie_and_exact_origin_are_enforced() {
 #[tokio::test]
 async fn interaction_response_uses_the_bounded_instance_command_queue() {
     let server = spawn_server(
-        DevServerConfig::loopback(0)
-            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .await;
     let created = http_json(
@@ -392,8 +390,7 @@ async fn interaction_response_uses_the_bounded_instance_command_queue() {
 #[tokio::test]
 async fn one_follow_socket_multiplexes_two_instances() {
     let server = spawn_server(
-        DevServerConfig::loopback(0)
-            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .await;
     let fixture = include_str!("fixtures/create-instance.json");
@@ -472,8 +469,7 @@ async fn one_follow_socket_multiplexes_two_instances() {
 #[tokio::test]
 async fn web_jsonrpc_shape_can_create_and_follow_a_live_fixture() {
     let server = spawn_server(
-        DevServerConfig::loopback(0)
-            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .await;
     let (mut client, _) = connect_async(format!("ws://{}/v1/client", server.address))
@@ -571,8 +567,7 @@ async fn web_jsonrpc_shape_can_create_and_follow_a_live_fixture() {
 #[tokio::test]
 async fn tty_endpoint_emits_protocol_v1_binary_fixture() {
     let server = spawn_server(
-        DevServerConfig::loopback(0)
-            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .await;
     let body = serde_json::json!({

@@ -9,9 +9,15 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static PIN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Re-probes of the original path before its bytes are copied elsewhere.
+const ETXTBSY_REPROBES: u32 = 6;
+
+/// Base delay between re-probes; the nth wait is `n` times this.
+const ETXTBSY_BACKOFF: Duration = Duration::from_millis(2);
 
 /// Pinned native executable recorded in a [`crate::LaunchRecipe`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,43 +33,16 @@ pub struct BinaryPin {
 
 /// Resolve `command` on `PATH` or accept an absolute path, then pin it.
 ///
-/// If `--version` fails with `ETXTBSY` (the file is still mapped or open for
-/// write), the bytes are copied to a unique sibling path and that copy is
+/// `ETXTBSY` has two causes and only one of them justifies a copy. A sibling
+/// thread that forked between our `open(O_WRONLY)` and its `exec` holds a
+/// write handle for microseconds, so the probe is retried on the original path
+/// first — otherwise two pins of the same file would disagree on `abs_path`.
+/// Only a writer that survives every re-probe (a real mapped or open-for-write
+/// inode) makes the bytes get copied to a unique sibling path, and that copy is
 /// pinned instead of overwriting the busy inode.
 pub fn pin_binary(command: impl AsRef<Path>) -> DriverResult<BinaryPin> {
     let original = resolve_binary(command)?;
-    let mut path = original.clone();
-    let mut last_busy = None;
-    let mut version = None;
-    for _ in 0..8 {
-        match read_version(&path) {
-            Ok(line) => {
-                version = Some(line);
-                break;
-            }
-            Err(DriverError::Io(err)) if is_etxtbsy(&err) => {
-                last_busy = Some(err);
-                path = copy_to_fresh_path(&original)?;
-                tracing::warn!(
-                    src = %original.display(),
-                    dest = %path.display(),
-                    "pin_binary copied binary to a fresh path after ETXTBSY"
-                );
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    let version = version.ok_or_else(|| {
-        DriverError::Io(last_busy.unwrap_or_else(|| {
-            io::Error::new(
-                ErrorKind::ExecutableFileBusy,
-                format!(
-                    "pin_binary: {} still busy after copying to a fresh path",
-                    original.display()
-                ),
-            )
-        }))
-    })?;
+    let (path, version) = probe_version(&original)?;
     let path = path.canonicalize().unwrap_or(path);
     let sha256 = hash_file(&path)?;
     tracing::info!(
@@ -77,6 +56,48 @@ pub fn pin_binary(command: impl AsRef<Path>) -> DriverResult<BinaryPin> {
         version,
         sha256,
     })
+}
+
+/// Read `--version`, preferring `original` and falling back to a fresh copy.
+///
+/// Returns the path that actually answered, which is what gets pinned.
+fn probe_version(original: &Path) -> DriverResult<(PathBuf, String)> {
+    let mut last_busy = None;
+    for attempt in 0..=ETXTBSY_REPROBES {
+        match read_version(original) {
+            Ok(line) => return Ok((original.to_path_buf(), line)),
+            Err(DriverError::Io(err)) if is_etxtbsy(&err) => {
+                last_busy = Some(err);
+                // A fork window closes on its own; a real writer does not.
+                if attempt < ETXTBSY_REPROBES {
+                    std::thread::sleep(ETXTBSY_BACKOFF * (attempt + 1));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    for _ in 0..4 {
+        let copy = copy_to_fresh_path(original)?;
+        tracing::warn!(
+            src = %original.display(),
+            dest = %copy.display(),
+            "pin_binary copied binary to a fresh path after persistent ETXTBSY"
+        );
+        match read_version(&copy) {
+            Ok(line) => return Ok((copy, line)),
+            Err(DriverError::Io(err)) if is_etxtbsy(&err) => last_busy = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(DriverError::Io(last_busy.unwrap_or_else(|| {
+        io::Error::new(
+            ErrorKind::ExecutableFileBusy,
+            format!(
+                "pin_binary: {} still busy after copying to a fresh path",
+                original.display()
+            ),
+        )
+    })))
 }
 
 /// Resolve a command name or path to a canonical absolute file.
@@ -304,5 +325,45 @@ mod tests {
         );
         assert_eq!(pin.version, "stub-busy (test)");
         assert!(pinned.is_file());
+    }
+
+    /// A writer that closes mid-probe is the fork window between a sibling
+    /// thread's `open(O_WRONLY)` and its `exec`. Pinning must wait it out and
+    /// keep the original path, or two pins of one file disagree on `abs_path`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_is_idempotent_when_a_transient_writer_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_stub(dir.path(), "stub-transient (test)");
+        let writer = OpenOptions::new().write(true).open(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(8));
+            drop(writer);
+        });
+        let first = pin_binary(&path).unwrap();
+        handle.join().unwrap();
+        let second = pin_binary(&path).unwrap();
+        assert_eq!(first, second, "transient ETXTBSY must not fork the path");
+        assert_eq!(
+            PathBuf::from(&first.abs_path),
+            path.canonicalize().unwrap(),
+            "a writer that closes must not trigger a copy"
+        );
+    }
+
+    /// Concurrent pins of one file must agree — the CI failure mode.
+    #[test]
+    fn concurrent_pins_of_one_binary_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_stub(dir.path(), "stub-parallel (test)");
+        let pins: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| pin_binary(&path).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for pin in &pins {
+            assert_eq!(pin, &pins[0], "concurrent pins must be identical");
+        }
     }
 }

@@ -77,9 +77,10 @@ impl Driver for FakePty {
 fn node(kind: DriverKind, capacity: usize) -> (DevNode, Arc<FakePty>) {
     let mut config = crate::DevServerConfig::loopback(0);
     config.instance_queue_capacity = capacity;
-    // Tests run with the crate directory as cwd; pin the allowed root there so
-    // they do not implicitly depend on the checkout living under $HOME.
-    config.workspace_roots = Some(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]);
+    // Tests run with the crate directory as cwd; the shared helper allows that
+    // plus the temp dir, so they do not implicitly depend on the checkout
+    // living under $HOME.
+    config.workspace_roots = Some(remuda_testing::test_workspace_roots!());
     let driver = Arc::new(FakePty {
         kind,
         ready: AtomicBool::new(false),

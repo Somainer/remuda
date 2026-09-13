@@ -504,7 +504,7 @@ mod tests {
     async fn shutdown_reaches_the_driver_and_waits_for_close_settlement() {
         let node = DevNode::new(
             &remuda_node::DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
         )
         .expect("fake node");
         let request = serde_json::from_str(r#"{"prompt":"synthetic shutdown fixture"}"#)

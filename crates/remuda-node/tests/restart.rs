@@ -14,7 +14,7 @@ use std::time::Duration;
 fn loopback_config(root: &std::path::Path) -> DevServerConfig {
     let mut http = DevServerConfig::loopback(0);
     http.workspace_root = root.join("workspace");
-    http.workspace_roots = Some(vec![std::env::temp_dir()]);
+    http.workspace_roots = Some(remuda_testing::test_workspace_roots!());
     std::fs::create_dir_all(&http.workspace_root).expect("workspace");
     http
 }

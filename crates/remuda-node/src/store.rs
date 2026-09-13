@@ -80,6 +80,17 @@ pub trait LocalStore: Send + Sync {
         instance_id: &InstanceId,
         last_error: &str,
     ) -> Result<Instance, NodeError>;
+    /// Record the native session identity a driver observed (D-026).
+    ///
+    /// Returns the revised Instance when anything changed; `None` when the
+    /// observation repeated what `nativeRef` already held, so callers do not
+    /// journal a redundant lifecycle event.
+    fn set_native_session(
+        &self,
+        instance_id: &InstanceId,
+        session_id: &str,
+        transcript_path: Option<&str>,
+    ) -> Result<Option<Instance>, NodeError>;
     /// Atomically insert a command, returning false for a matching idempotent replay.
     fn insert_command(&self, instance_id: &InstanceId, command: Command)
     -> Result<bool, NodeError>;
@@ -588,6 +599,66 @@ impl LocalStore for MemoryStore {
             entities.put_instance(&instance)?;
         }
         Ok(instance)
+    }
+
+    fn set_native_session(
+        &self,
+        instance_id: &InstanceId,
+        session_id: &str,
+        transcript_path: Option<&str>,
+    ) -> Result<Option<Instance>, NodeError> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(None);
+        }
+        let transcript_path = transcript_path
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        let now = timestamp_now()?;
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let record = state
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        let native = &mut record.instance.native_ref;
+        let session_known = matches!(
+            &native.session_id,
+            Knowledge::Known { value } if value == session_id
+        );
+        let claude_known = native
+            .claude
+            .as_ref()
+            .is_some_and(|claude| claude.session_id == session_id);
+        let transcript_known = match (transcript_path, &native.transcript) {
+            (None, _) => true,
+            (Some(path), Knowledge::Known { value }) => value.source_path == path,
+            (Some(_), _) => false,
+        };
+        if session_known && claude_known && transcript_known {
+            return Ok(None);
+        }
+        native.session_id = Knowledge::Known {
+            value: session_id.to_owned(),
+        };
+        native.claude = Some(remuda_protocol::ClaudeRef {
+            session_id: session_id.to_owned(),
+        });
+        if let Some(path) = transcript_path {
+            native.transcript = Knowledge::Known {
+                value: remuda_protocol::TranscriptRef {
+                    object_id: remuda_protocol::Id::new("obj")?,
+                    source_path: path.to_owned(),
+                },
+            };
+        }
+        record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
+        record.instance.meta.updated_at = now;
+        let instance = record.instance.clone();
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&instance)?;
+        }
+        Ok(Some(instance))
     }
 
     fn insert_command(

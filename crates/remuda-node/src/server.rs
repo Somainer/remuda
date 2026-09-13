@@ -866,6 +866,39 @@ async fn dispatch_rpc(
             }
             serde_json::to_value(node.create_instance(request).await?).map_err(NodeError::from)
         }
+        // D-026: same create path, with the native session to continue.
+        "instance.resume" => {
+            let mut request: CreateInstanceRequest = serde_json::from_value(
+                params
+                    .get("spec")
+                    .cloned()
+                    .unwrap_or_else(|| params.clone()),
+            )?;
+            if request.resume_session_id.is_none() {
+                request.resume_session_id = params
+                    .get("resumeSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+            }
+            if request.resume_session_id.is_none() {
+                return Err(NodeError::InvalidRequest(
+                    "instance.resume requires resumeSessionId".to_owned(),
+                ));
+            }
+            if request.resumed_from.is_none()
+                && let Some(raw_id) = params.get("resumedFrom").and_then(Value::as_str)
+            {
+                request.resumed_from = Some(InstanceId::from_str(raw_id)?);
+            }
+            if request.instance_id.is_none()
+                && let Some(raw_id) = params.get("instanceId").and_then(Value::as_str)
+            {
+                request.instance_id = Some(InstanceId::from_str(raw_id)?);
+            }
+            serde_json::to_value(node.create_instance(request).await?).map_err(NodeError::from)
+        }
         "instance.configure" => {
             crate::transport::hubnode::dispatch_method(node, method, params).await
         }

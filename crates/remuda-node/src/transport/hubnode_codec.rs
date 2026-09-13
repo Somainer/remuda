@@ -317,6 +317,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             max_budget_usd: None,
             provider_overlay: None,
             provider_auth_token: None,
+            resume_session_id: None,
+            resumed_from: None,
         },
     };
     request.apply_spec_launch_fields(&spec);

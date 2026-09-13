@@ -41,6 +41,8 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         max_budget_usd: None,
         provider_overlay: None,
         provider_auth_token: None,
+        resume_session_id: None,
+        resumed_from: None,
     }
 }
 

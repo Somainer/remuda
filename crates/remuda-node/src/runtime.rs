@@ -327,12 +327,22 @@ impl DevNode {
         }
 
         let instance_id = request.instance_id.clone().unwrap_or_default();
-        let instance = fixture_instance(
+        let mut instance = fixture_instance_with_session(
             instance_id.clone(),
             host_id.clone(),
             workspace_id,
             request.driver,
+            request.resume_session_id.as_deref(),
         )?;
+        // D-026: the exited Instance keeps its history; the resumed one records
+        // where its conversation came from so both ends of the link are durable.
+        if let Some(parent) = request.resumed_from.clone() {
+            instance.parent = Some(remuda_protocol::InstanceParent {
+                instance_id: parent,
+                run_id: remuda_protocol::RunId::new(),
+                command_id: request.command_id.clone().unwrap_or_default(),
+            });
+        }
         let driver = self.inner.drivers.build(
             request.driver,
             DriverLaunch {
@@ -764,6 +774,9 @@ fn spawn_observation_pump(
                 )
             {
                 tracing::warn!(%error, "instance promotion not applied");
+            }
+            if let Some(session) = native_session_evidence(&observation) {
+                record_native_session(store.as_ref(), &instance_id, &session);
             }
             match store.append_driver_observation(&instance_id, observation) {
                 Ok(committed) => {
@@ -1199,6 +1212,81 @@ fn agent_kind(wire: &str) -> Option<AgentKind> {
         "generic" => Some(AgentKind::Generic),
         "terminal" => Some(AgentKind::Terminal),
         _ => None,
+    }
+}
+
+/// Native session identity carried by a driver lifecycle observation (D-026).
+struct NativeSessionEvidence {
+    session_id: String,
+    transcript_path: Option<String>,
+}
+
+/// Read the real Claude session id out of a driver observation.
+///
+/// `claude-print` reports it on the `session` lifecycle mapped from stream-json
+/// `system/init`; `claude-pty` reports it (with the transcript path) from its
+/// `SessionStart` hook. Both are the only proof Remuda has of the identity
+/// `claude --resume` will accept, so `nativeRef` must be corrected from them
+/// instead of keeping the Instance id minted at create time.
+fn native_session_evidence(
+    observation: &remuda_protocol::Observation,
+) -> Option<NativeSessionEvidence> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    if !matches!(
+        native.topic,
+        remuda_protocol::LifecycleTopic::Session | remuda_protocol::LifecycleTopic::Hook
+    ) {
+        return None;
+    }
+    let session_id = match &native.native_id {
+        Knowledge::Known { value } if !value.trim().is_empty() => value.trim().to_owned(),
+        _ => return None,
+    };
+    Some(NativeSessionEvidence {
+        session_id,
+        transcript_path: native
+            .related_ids
+            .get("transcriptPath")
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty()),
+    })
+}
+
+/// Persist observed session identity and journal it once per change.
+fn record_native_session(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    evidence: &NativeSessionEvidence,
+) {
+    let updated = match store.set_native_session(
+        instance_id,
+        &evidence.session_id,
+        evidence.transcript_path.as_deref(),
+    ) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, instance_id = %instance_id.as_id(), "native session record failed");
+            return;
+        }
+    };
+    let state = serde_json::to_value(updated.lifecycle)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "ready".to_owned());
+    if let Err(error) = append_instance_lifecycle(
+        store,
+        instance_id,
+        Some(&state),
+        &state,
+        "native-session-recorded",
+    ) {
+        tracing::warn!(%error, "native session lifecycle append failed");
     }
 }
 
@@ -1681,14 +1769,34 @@ pub(crate) fn fixture_workspace(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn fixture_instance(
     instance_id: InstanceId,
     host_id: HostId,
     workspace_id: WorkspaceId,
     driver: remuda_protocol::DriverKind,
 ) -> Result<Instance, NodeError> {
+    fixture_instance_with_session(instance_id, host_id, workspace_id, driver, None)
+}
+
+/// Build the Instance entity, optionally seeded with the session it resumes.
+///
+/// Before the driver reports its own `session` lifecycle the Node has no proof
+/// of the native identity, so a new Instance records the placeholder below and
+/// [`crate::LocalStore::set_native_session`] corrects it. A resumed Instance
+/// already knows the identity: it is the one being continued (D-026).
+pub(crate) fn fixture_instance_with_session(
+    instance_id: InstanceId,
+    host_id: HostId,
+    workspace_id: WorkspaceId,
+    driver: remuda_protocol::DriverKind,
+    resume_session_id: Option<&str>,
+) -> Result<Instance, NodeError> {
     let now = timestamp_now()?;
-    let native_session_id = instance_id.as_id().to_string();
+    let native_session_id = resume_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| instance_id.as_id().to_string(), str::to_owned);
     Ok(Instance {
         meta: EntityMeta {
             id: instance_id,

@@ -336,6 +336,13 @@ impl DriverFactory for NativeClaudeFactory {
             kind: self.kind,
             native,
             spec,
+            resume_session_id: launch
+                .request
+                .resume_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
             recipe: std::sync::Mutex::new(None),
             startup_error: std::sync::Mutex::new(None),
         }))
@@ -369,6 +376,8 @@ struct NativeAdapter {
     kind: DriverKind,
     native: Arc<dyn NativeDriver>,
     spec: InstanceSpec,
+    /// Native session continued by this launch (`claude --resume <uuid>`; D-026).
+    resume_session_id: Option<String>,
     recipe: std::sync::Mutex<Option<remuda_driver::LaunchRecipe>>,
     startup_error: std::sync::Mutex<Option<String>>,
 }
@@ -388,11 +397,20 @@ impl Driver for NativeAdapter {
 
     fn start(&self) -> DriverStartFuture<'_> {
         Box::pin(async move {
-            let handle = self
-                .native
-                .start(self.spec.clone())
-                .await
-                .map_err(map_driver_error)?;
+            let handle = match self.resume_session_id.clone() {
+                // A resumed Instance is a new Instance on the same host and
+                // workspace; only its native conversation is inherited (D-026).
+                Some(session_id) => self
+                    .native
+                    .start_resumed(self.spec.clone(), session_id)
+                    .await
+                    .map_err(map_driver_error)?,
+                None => self
+                    .native
+                    .start(self.spec.clone())
+                    .await
+                    .map_err(map_driver_error)?,
+            };
             if let Ok(mut slot) = self.recipe.lock() {
                 *slot = Some(handle.recipe().clone());
             }
@@ -1037,6 +1055,8 @@ mod tests {
                 max_budget_usd: None,
                 provider_overlay: None,
                 provider_auth_token: None,
+                resume_session_id: None,
+                resumed_from: None,
             };
             let driver = registry
                 .build(
@@ -1155,6 +1175,8 @@ mod tests {
             max_budget_usd: None,
             provider_overlay: None,
             provider_auth_token: None,
+            resume_session_id: None,
+            resumed_from: None,
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -1199,6 +1221,8 @@ mod tests {
             max_budget_usd: None,
             provider_overlay: None,
             provider_auth_token: None,
+            resume_session_id: None,
+            resumed_from: None,
         };
         registry
             .build(
@@ -1246,6 +1270,8 @@ mod tests {
             max_budget_usd: None,
             provider_overlay: None,
             provider_auth_token: None,
+            resume_session_id: None,
+            resumed_from: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -1301,6 +1327,8 @@ mod tests {
                 "scope": "host:hst_other"
             })),
             provider_auth_token: Some("sk-fake-host-scoped".into()),
+            resume_session_id: None,
+            resumed_from: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,

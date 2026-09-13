@@ -291,8 +291,16 @@ main    test result: FAILED. 124 passed; 2 failed;  （remuda-node --lib）
 
 **未交付，留给后续期**：
 
-- §10 的 TOML 规则表引擎。本期只把匹配器搬进一个地方并给了 `flat()` /
-  `bottom_non_empty_lines()` 这些 region 原语；规则仍是硬编码短语，P7 再换表。
-- grok / agy 的屏幕签名覆盖率仍然为零（风险表第 12 项），本期未动。
+- **把 `remuda-screen` 的网格接到 `remuda-rules` 的引擎上**。本分支 rebase 时，主干
+  已经并入了 §10 的规则表引擎（`crates/remuda-rules`，从 herdr 0.9.0 提取的 TOML
+  清单 + evaluator）。两者是互补的、而且接口正好对得上——`remuda-rules` 的
+  `Screen::new(rows).with_cursor(..).with_osc_title(..).with_osc_progress(..)
+  .with_cols(..)` 要的每一项，`ScreenGrid` 都有（`lines` / `cursor` / `osc.title` /
+  `osc.progress`，宽度取自 `Emulator::size()`）。**目前还没有任何 carrier 接上
+  引擎**（`git grep remuda_rules crates/remuda-{driver,node}` 为空），本期也未接：
+  接线会改动签名的判定来源，超出「P0 零行为变更」的范围，属 P7。
+  接上之前，`signature.rs` 里仍是硬编码短语。
+- grok / agy 的屏幕签名覆盖率仍然为零（风险表第 12 项），本期未动。规则表已带
+  两家的清单，所以缺的只是上一条的接线。
 - `?1049` 之外的 alt-screen 细节（如 `?47` / `?1047`）未处理：三家 harness 都用
   `?1049`，需要时再补。

@@ -7,7 +7,7 @@ import { StateDot } from "../../components/StateDot";
 import { formatListTime, shortId } from "../../lib/format";
 import { nativeShort, projectStatus, uiMode } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
-import { isEmberName } from "./effort";
+import { isEmberEffort } from "./effort";
 import css from "./SessionList.module.css";
 
 const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] = [
@@ -334,7 +334,7 @@ export function SessionList({ instances, variant = "full", title = "会话", new
                       <span>· {instance.driver}</span>
                       {(() => {
                         const effort = hubStore.effortOf(instance.id, instance.kind);
-                        const ember = isEmberName(instance.kind, effort.name);
+                        const ember = isEmberEffort(instance.kind, effort.index, effort.ultracode);
                         return (
                           <>
                             <span className={css.sep}>·</span>

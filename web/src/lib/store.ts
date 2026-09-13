@@ -19,6 +19,7 @@ import {
   DEFAULT_EFFORT_INDEX,
   effortAt,
   effortFromRecord,
+  effortWireName,
   mapEffort,
   type EffortKind,
   type EffortSelection,
@@ -418,8 +419,11 @@ class HubStore {
     const result = await api.instanceCreate(spec);
     const createdId = result.instance.id;
     const kind = spec.kind as EffortKind;
-    const effort = effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX);
-    if (spec.effortName) effort.name = spec.effortName;
+    const effort =
+      spec.effortName != null
+        ? effortFromRecord(kind, spec.effortName, spec.effortIndex) ??
+          effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX)
+        : effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX);
     this.emit({
       instances: [result.instance, ...this.state.instances.filter((i) => i.id !== createdId)],
       permissionMode: { ...this.state.permissionMode, [createdId]: spec.permissionMode },
@@ -543,7 +547,12 @@ class HubStore {
     permissionMode: string,
     extras?: { model?: string; effort?: EffortSelection },
   ) {
-    await api.instanceConfigure(instanceId, permissionMode, extras);
+    // The wire stores an opaque {name,index}; ultracode rides the legacy
+    // "ultracode" name until x-p1-proto lands the {name,ultracode} shape.
+    const wireExtras = extras?.effort
+      ? { ...extras, effort: { name: effortWireName(extras.effort), index: extras.effort.index } }
+      : extras;
+    await api.instanceConfigure(instanceId, permissionMode, wireExtras);
     this.emit({
       permissionMode: { ...this.state.permissionMode, [instanceId]: permissionMode },
       ...(extras?.effort ? { effort: { ...this.state.effort, [instanceId]: extras.effort } } : {}),

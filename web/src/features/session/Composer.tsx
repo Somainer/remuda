@@ -5,10 +5,13 @@ import { composing } from "../../lib/viewport";
 import { AttachButtons, AttachmentChips } from "./AttachmentChips";
 import { EffortSlider } from "./EffortSlider";
 import {
+  defaultEffortIndex,
+  effortAt,
   effortCaps,
   effortTable,
+  effortWireName,
   harnessMeta,
-  isEmberTier,
+  isEmberEffort,
   mapEffort,
   type EffortKind,
   type EffortSelection,
@@ -65,11 +68,12 @@ export function Composer({
   const harness = kind;
 
   const caps = effortCaps(harness);
-  const incoming = effort ?? { index: 1, name: "think", kind: (kind as EffortKind) || "claude" };
+  const incoming = effort ?? effortAt((kind as EffortKind) || "claude", defaultEffortIndex(harness));
   const currentEffort =
     incoming.kind === harness ? incoming : mapEffort(incoming, (harness as EffortKind) || "claude");
   const table = effortTable(harness);
-  const ember = isEmberTier(harness, currentEffort.index);
+  const ultraOn = currentEffort.ultracode === true;
+  const ember = isEmberEffort(harness, currentEffort.index, ultraOn);
   const effortLocked = Boolean(effortDisabled) || !onEffort || table.length === 0;
   const permLabel = PERMISSION_OPTIONS.find((m) => m.id === permissionMode)?.label ?? permissionMode;
 
@@ -134,15 +138,19 @@ export function Composer({
   };
 
   const harnessChip = harnessMeta(harness);
+  // The chip names the tier (xhigh under ultracode); the form's data-effort
+  // carries the wire name so an ultracode selection round-trips.
   const effortChipLabel = currentEffort.name;
+  const effortWire = effortWireName(currentEffort);
 
   return (
     <form
       ref={rootRef}
       data-testid="composer"
       data-harness={harness}
-      data-effort={currentEffort.name}
+      data-effort={effortWire}
       data-effort-index={String(currentEffort.index)}
+      data-ultracode={ultraOn ? "1" : "0"}
       data-model={model}
       className={css.composerRoot}
       onSubmit={(e) => {
@@ -285,6 +293,7 @@ export function Composer({
             model={caps.model ? model : undefined}
             models={caps.model ? models : undefined}
             index={currentEffort.index}
+            ultracode={ultraOn}
             disabled={effortLocked}
             onChange={(next) => onEffort?.(next)}
             onModel={caps.model ? onModel : undefined}

@@ -31,7 +31,7 @@ describe("Composer shortcuts", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("renders collapsed chips and lists the claude effort table", async () => {
+  it("renders collapsed chips and lists the five real Claude levels", async () => {
     const user = userEvent.setup();
     const onEffort = vi.fn();
     render(
@@ -41,32 +41,37 @@ describe("Composer shortcuts", () => {
         onSend={vi.fn()}
         kind="claude"
         model="opus"
-        effort={effortAt("claude", 1)}
+        effort={effortAt("claude", 2)}
         contextLabel="74%"
         onEffort={onEffort}
         onPermission={vi.fn()}
       />,
     );
     expect(screen.getByTestId("harness-chip")).toHaveTextContent(/Claude/);
-    expect(screen.getByTestId("model-effort-chip")).toHaveTextContent("think");
+    expect(screen.getByTestId("model-effort-chip")).toHaveTextContent("high");
     expect(screen.getByTestId("model-effort-chip")).not.toHaveTextContent("opus");
     expect(screen.getByTestId("context-chip")).toHaveTextContent("74%");
     expect(screen.getByTestId("permission-chip")).toHaveTextContent(/询问/);
     await user.click(screen.getByTestId("model-effort-chip"));
-    // Row 1 lightning + tier + reset, row 2 model, then the pill. No tier list, no model list.
+    // Row 1 lightning + tier + ultracode + reset, row 2 model, then the pill. No tier list, no model list.
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
-    expect(screen.queryByTestId("effort-tier-default")).toBeNull();
+    expect(screen.queryByTestId("effort-tier-low")).toBeNull();
     expect(screen.queryByTestId("model-option-opus")).toBeNull();
     const slider = screen.getByTestId("effort-slider");
-    expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
-    expect(slider).toHaveAttribute("data-name", "think");
-    expect(slider).toHaveAttribute("aria-valuetext", "think");
-    expect(screen.getByTestId("effort-title")).toHaveTextContent("think");
+    expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+    expect(slider).toHaveAttribute("data-name", "high");
+    expect(slider).toHaveAttribute("data-ultracode", "0");
+    expect(slider).toHaveAttribute("aria-valuetext", "high");
+    expect(screen.getByTestId("effort-title")).toHaveTextContent("high");
     expect(screen.getByTestId("effort-model")).toHaveTextContent("opus");
     expect(screen.getByTestId("effort-knob")).toBeInTheDocument();
+    // The ultracode toggle is present in the card header and starts off.
+    const ultra = screen.getByTestId("effort-ultracode");
+    expect(ultra).toHaveAttribute("data-on", "0");
+    expect(ultra).toHaveAttribute("aria-pressed", "false");
     slider.focus();
     await user.keyboard("{End}");
-    expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "ultracode", kind: "claude" });
+    expect(onEffort).toHaveBeenCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
   });
 
   it("the tier name opens a list of tiers and models, and picking one closes it", async () => {
@@ -80,7 +85,7 @@ describe("Composer shortcuts", () => {
         onSend={vi.fn()}
         kind="claude"
         model="opus"
-        effort={effortAt("claude", 1)}
+        effort={effortAt("claude", 2)}
         onEffort={onEffort}
         onModel={onModel}
       />,
@@ -89,20 +94,22 @@ describe("Composer shortcuts", () => {
     await user.click(screen.getByTestId("effort-open-list"));
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "list");
     expect(screen.queryByTestId("effort-slider")).toBeNull();
-    expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ember", "1");
-    expect(screen.getByTestId("effort-tier-think")).toHaveAttribute("data-selected", "1");
-    expect(screen.getByTestId("effort-list")).toHaveTextContent("跨文件重构、长任务");
+    // max is the ember row now; ultracode is not in the tier list.
+    expect(screen.getByTestId("effort-tier-max")).toHaveAttribute("data-ember", "1");
+    expect(screen.queryByTestId("effort-tier-ultracode")).toBeNull();
+    expect(screen.getByTestId("effort-tier-high")).toHaveAttribute("data-selected", "1");
+    expect(screen.getByTestId("effort-list")).toHaveTextContent("跨文件 · 长任务");
     await user.click(screen.getByTestId("model-option-sonnet"));
     expect(onModel).toHaveBeenCalledWith("sonnet");
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
 
     await user.click(screen.getByTestId("effort-open-list"));
-    await user.click(screen.getByTestId("effort-tier-think-hard"));
-    expect(onEffort).toHaveBeenCalledWith({ index: 2, name: "think-hard", kind: "claude" });
+    await user.click(screen.getByTestId("effort-tier-xhigh"));
+    expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "xhigh", kind: "claude", ultracode: false });
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
   });
 
-  it("the top tier turns the pill and the tier name ember", async () => {
+  it("turns the pill and the tier name ember on the max tier", async () => {
     const user = userEvent.setup();
     render(
       <Composer
@@ -111,7 +118,7 @@ describe("Composer shortcuts", () => {
         onSend={vi.fn()}
         kind="claude"
         model="opus"
-        effort={effortAt("claude", 3)}
+        effort={effortAt("claude", 4)}
         onEffort={vi.fn()}
       />,
     );
@@ -121,7 +128,54 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
   });
 
-  it("snaps a pointer drag to the nearest native tier", async () => {
+  it("plain xhigh is not ember; ultracode locks xhigh and plays ember", async () => {
+    const user = userEvent.setup();
+    const onEffort = vi.fn();
+    const { rerender } = render(
+      <Composer
+        instanceId="ins_ultra"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 3)}
+        onEffort={onEffort}
+      />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    const slider = screen.getByTestId("effort-slider");
+    expect(slider).toHaveAttribute("data-name", "xhigh");
+    expect(slider).toHaveAttribute("data-ember", "0");
+    expect(slider).toHaveAttribute("data-ultracode", "0");
+
+    // Toggle ultracode on: selection locks to xhigh + ultracode and ember plays.
+    await user.click(screen.getByTestId("effort-ultracode"));
+    expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "xhigh", kind: "claude", ultracode: true });
+
+    rerender(
+      <Composer
+        instanceId="ins_ultra"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 3, true)}
+        onEffort={onEffort}
+      />,
+    );
+    expect(slider).toHaveAttribute("data-name", "xhigh");
+    expect(slider).toHaveAttribute("data-ultracode", "1");
+    expect(slider).toHaveAttribute("data-ember", "1");
+    expect(screen.getByTestId("effort-ultracode")).toHaveAttribute("data-on", "1");
+    // The track no longer takes tier input while locked.
+    expect(slider).toHaveAttribute("aria-disabled", "true");
+    slider.focus();
+    await user.keyboard("{End}");
+    // No new tier event from the locked track; the last call is the toggle's.
+    expect(onEffort).toHaveBeenCalledTimes(1);
+  });
+
+  it("snaps a pointer drag to the nearest of the five native tiers", async () => {
     const user = userEvent.setup();
     const onEffort = vi.fn();
     render(
@@ -131,7 +185,7 @@ describe("Composer shortcuts", () => {
         onSend={vi.fn()}
         kind="claude"
         model="opus"
-        effort={effortAt("claude", 1)}
+        effort={effortAt("claude", 2)}
         onEffort={onEffort}
       />,
     );
@@ -154,13 +208,13 @@ describe("Composer shortcuts", () => {
     });
     fireEvent.pointerDown(slider, { clientX: 396, pointerId: 1, button: 0 });
     fireEvent.pointerUp(slider, { clientX: 396, pointerId: 1, button: 0 });
-    expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "ultracode", kind: "claude" });
+    expect(onEffort).toHaveBeenCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
 
     onEffort.mockClear();
-    // Dead-centre lands on the middle stop, not on an edge.
-    fireEvent.pointerDown(slider, { clientX: 200, pointerId: 2, button: 0 });
-    fireEvent.pointerUp(slider, { clientX: 200, pointerId: 2, button: 0 });
-    expect(onEffort).toHaveBeenCalledWith({ index: 2, name: "think-hard", kind: "claude" });
+    // Three-quarters in lands on the fourth stop (xhigh), not on an edge.
+    fireEvent.pointerDown(slider, { clientX: 291, pointerId: 2, button: 0 });
+    fireEvent.pointerUp(slider, { clientX: 291, pointerId: 2, button: 0 });
+    expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "xhigh", kind: "claude", ultracode: false });
   });
 
   it("Home/End and reset land on the table edges and default", async () => {
@@ -195,6 +249,7 @@ describe("Composer shortcuts", () => {
       />,
     );
     await user.click(screen.getByTestId("effort-reset"));
+    // Claude high (midpoint) maps by nearest position onto grok's middle tier.
     expect(onEffort).toHaveBeenCalledWith({ index: 1, name: "standard", kind: "grok" });
   });
 
@@ -207,7 +262,7 @@ describe("Composer shortcuts", () => {
         mobile={false}
         onSend={vi.fn()}
         kind="claude"
-        effort={effortAt("claude", 1)}
+        effort={effortAt("claude", 2)}
         onEffort={onEffort}
         effortDisabled
       />,
@@ -221,7 +276,7 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("effort-reset")).toBeDisabled();
   });
 
-  it("lists the native codex table for a codex session", async () => {
+  it("lists the native codex table for a codex session and hides ultracode", async () => {
     const user = userEvent.setup();
     render(
       <Composer
@@ -236,6 +291,7 @@ describe("Composer shortcuts", () => {
     );
     await user.click(screen.getByTestId("model-effort-chip"));
     expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,ultra");
+    expect(screen.queryByTestId("effort-ultracode")).toBeNull();
   });
 
   it("shows the harness as a static label inside a session, with no menu", async () => {
@@ -270,7 +326,7 @@ describe("Composer shortcuts", () => {
         onSend={vi.fn()}
         kind="claude"
         model="opus"
-        effort={effortAt("claude", 1)}
+        effort={effortAt("claude", 2)}
       />,
     );
     const chip = screen.getByTestId("harness-chip");

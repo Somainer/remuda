@@ -120,6 +120,17 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
 
   await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Status and close are distinct: the tab strip carries exactly one × per tab
+  // (close), and the status indicator is never one.
+  await space(page, "sfe-root").click();
+  const firstTab = strip.getByRole("tab").first();
+  await firstTab.click();
+  const tabRow = strip.locator('[data-active="true"]');
+  expect(await tabRow.getByTestId("tab-close").count()).toBe(1);
+  expect(await tabRow.innerText()).not.toContain("×");
+  await expect(tabRow.getByTestId("tab-close")).toHaveAccessibleName(/^关闭标签 /);
+
   await space(page, "x-codexdrv").click();
   await panel.getByRole("button", { name: "重命名", exact: true }).click();
   await panel.getByRole("textbox", { name: "空间名称" }).fill("Code review");

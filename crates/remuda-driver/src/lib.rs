@@ -18,6 +18,7 @@ mod driver;
 mod error;
 mod flags;
 pub mod generic_pty;
+pub mod grok_session;
 pub mod interaction;
 mod materializer;
 mod process;

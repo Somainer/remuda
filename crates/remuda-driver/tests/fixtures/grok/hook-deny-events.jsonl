@@ -1,0 +1,13 @@
+{"ts":"2026-09-13T18:57:51.352Z","type":"turn_started","session_id":"01a09c22-07fe-7621-9f9b-9a89db950608","turn_number":0,"model_id":"spike","yolo_mode":true,"conversation_message_count":3,"session_relationship":"primary","schema_version":"1.0"}
+{"ts":"2026-09-13T18:57:51.535Z","type":"loop_started","loop_index":0}
+{"ts":"2026-09-13T18:57:51.562Z","type":"phase_changed","phase":"waiting_for_model"}
+{"ts":"2026-09-13T18:57:51.565Z","type":"first_token"}
+{"ts":"2026-09-13T18:57:51.565Z","type":"phase_changed","phase":"streaming_reasoning"}
+{"ts":"2026-09-13T18:57:51.566Z","type":"phase_changed","phase":"tool_execution"}
+{"ts":"2026-09-13T18:57:51.566Z","type":"tool_started","tool_name":"run_terminal_command"}
+{"ts":"2026-09-13T18:57:51.688Z","type":"loop_started","loop_index":1}
+{"ts":"2026-09-13T18:57:51.688Z","type":"phase_changed","phase":"waiting_for_model"}
+{"ts":"2026-09-13T18:57:51.693Z","type":"first_token"}
+{"ts":"2026-09-13T18:57:51.696Z","type":"phase_changed","phase":"streaming_reasoning"}
+{"ts":"2026-09-13T18:57:51.697Z","type":"phase_changed","phase":"streaming_text"}
+{"ts":"2026-09-13T18:57:51.863Z","type":"turn_ended","outcome":"completed"}

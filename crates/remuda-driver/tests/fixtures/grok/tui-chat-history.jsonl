@@ -1,0 +1,27 @@
+{"type":"system","content":"[REDACTED injected context; native record retained]"}
+{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: macos\nShell: /bin/zsh\nWorkspace Path: /workspace/grok-spike\nToday's date: 2026-09-14\nNote: Prefer using relative paths over absolute paths as tool call args when possible.\n</user_info>"}]}
+{"type":"user","content":[{"type":"text","text":"[REDACTED injected context]"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"[REDACTED injected context]"}],"synthetic_reason":"system_reminder"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nRUN_TOOL\n</user_query>"}],"prompt_index":0}
+{"type":"reasoning","id":"","summary":[{"type":"summary_text","text":"Checking the probe."}]}
+{"type":"assistant","content":"","tool_calls":[{"id":"call-spike-1789326032369250000","name":"run_terminal_command","arguments":"{\"command\": \"printf SPIKE_TOOL_OK > spike-result.txt\", \"description\": \"Write the fixed probe marker in the throwaway directory.\"}"}],"model_id":"spike"}
+{"type":"tool_result","tool_call_id":"call-spike-1789326032369250000","content":"exit: 0\n"}
+{"type":"reasoning","id":"","summary":[{"type":"summary_text","text":"Checking the probe."}]}
+{"type":"assistant","content":"SPIKE_COMPLETE","model_id":"spike"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nSLOW_QUEUE\n</user_query>"}],"prompt_index":1}
+{"type":"reasoning","id":"","summary":[{"type":"summary_text","text":"Checking the probe."}]}
+{"type":"assistant","content":"SPIKE_COMPLETE","model_id":"spike"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nQUEUED_FOLLOWUP\n</user_query>"}],"prompt_index":2}
+{"type":"reasoning","id":"","summary":[{"type":"summary_text","text":"Checking the probe."}]}
+{"type":"assistant","content":"SPIKE_COMPLETE","model_id":"spike"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nSLOW_INTERRUPT\n</user_query>"}],"prompt_index":3}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nQUESTION\n</user_query>"}],"prior_turn_interrupt":"mid_turn_abort","prompt_index":4}
+{"type":"reasoning","id":"","summary":[{"type":"summary_text","text":"Checking the probe."}]}
+{"type":"assistant","content":"","tool_calls":[{"id":"call-spike-1789326112818929000","name":"ask_user_question","arguments":"{\"questions\": [{\"question\": \"Choose the probe result.\", \"options\": [{\"label\": \"Alpha\", \"description\": \"Record Alpha.\"}, {\"label\": \"Beta\", \"description\": \"Record Beta.\"}]}]}"}],"model_id":"spike"}
+{"type":"tool_result","tool_call_id":"call-spike-1789326112818929000","content":"User has answered your questions: \"Choose the probe result.\"=\"Alpha\". You can now continue with the user's answers in mind."}
+{"type":"reasoning","id":"","summary":[{"type":"summary_text","text":"Checking the probe."}]}
+{"type":"assistant","content":"SPIKE_COMPLETE","model_id":"spike"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nSLOW_SENDNOW\n</user_query>"}],"prompt_index":5}
+{"type":"user","content":[{"type":"text","text":"The user sent a message while you were working:\n<user_query>\nNOW_FOLLOWUP\n</user_query>\nMake sure to complete any unfinished tasks from previous turns."}],"prompt_index":6}
+{"type":"reasoning","id":"","summary":[{"type":"summary_text","text":"Checking the probe."}]}
+{"type":"assistant","content":"SPIKE_COMPLETE","model_id":"spike"}

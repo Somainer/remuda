@@ -25,6 +25,14 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+/// How long one connection may take to send its request line.
+///
+/// A hook writes its payload immediately; a peer that connects and then says
+/// nothing is either wedged or hostile, and either way must not hold a task
+/// and an fd for the life of the instance. Generous enough that a large
+/// `PostToolBatch` over a loaded machine is never cut off.
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Largest hook request accepted, in bytes.
 ///
 /// A `PostToolBatch` carrying several tool responses is the realistic maximum
@@ -132,7 +140,9 @@ async fn serve_one(
     // allocate. One byte over the cap is enough to tell that it was exceeded.
     let mut reader = BufReader::new(reader.take((MAX_REQUEST + 1) as u64));
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
+    let read = tokio::time::timeout(READ_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .map_err(|_| SocketError::Protocol("request timed out".into()))??;
     if read > MAX_REQUEST {
         return Err(SocketError::Protocol("request exceeds the size cap".into()));
     }
@@ -147,6 +157,7 @@ async fn serve_one(
         let mut payload = serde_json::to_vec(&HookReply::empty().to_hook_json())?;
         payload.push(b'\n');
         writer.write_all(&payload).await?;
+        writer.flush().await?;
         return Err(SocketError::Unauthorized);
     }
     let reply = sink.deliver(envelope).await;
@@ -405,6 +416,31 @@ mod tests {
             serde_json::json!({}),
             "a stalled Node must not stall the agent"
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_connects_and_says_nothing_does_not_hold_a_task_forever() {
+        // Otherwise a wedged hook leaks a task and an fd for the life of the
+        // instance. Uses tokio's clock so the test does not wait 30s.
+        tokio::time::pause();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hook.sock");
+        let recorder = Arc::new(Recorder::default());
+        let server =
+            HookServer::bind(&socket, "cred-a".into(), Arc::new(Arc::clone(&recorder))).unwrap();
+        let stream = tokio::net::UnixStream::connect(server.path())
+            .await
+            .unwrap();
+        tokio::time::advance(READ_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        // The silent peer never reached the sink, and the server is still
+        // serving: a bad connection must not take the socket down with it.
+        assert!(recorder.seen.lock().unwrap().is_empty());
+        drop(stream);
+        tokio::time::resume();
+        let reply = send_event(server.path(), &envelope("cred-a", "Stop"), WAIT).await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+        assert_eq!(recorder.seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

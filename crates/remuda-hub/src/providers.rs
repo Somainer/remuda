@@ -669,13 +669,87 @@ fn models_url(base_url: &str) -> String {
     }
 }
 
-/// Probe `{baseUrl}/v1/models` and normalize the catalog. Shared by `/test`
-/// and `/discover` so both report the same shape and the same timeouts.
+/// Probe both gateway listings and union the result. Shared by `/test` and
+/// `/discover` so both report the same shape and the same timeouts.
+///
+/// A gateway may serve a different catalog per header: astergate answers a
+/// plain `Authorization: Bearer` GET with its full OpenAI-style list but
+/// returns only six `claude-*` ids once `anthropic-version` is set. Probing one
+/// surface therefore under-reports, so both run and the ids are unioned, each
+/// tagged with the listing it came from.
 async fn probe_models(
     base_url: &str,
     extra_headers: &BTreeMap<String, String>,
     token: Option<&str>,
 ) -> Value {
+    let (openai, anthropic) = tokio::join!(
+        probe_surface(
+            base_url,
+            extra_headers,
+            token,
+            provider_models::SURFACE_OPENAI
+        ),
+        probe_surface(
+            base_url,
+            extra_headers,
+            token,
+            provider_models::SURFACE_ANTHROPIC
+        ),
+    );
+    // Prefer whichever surface answered; a gateway that speaks only one still
+    // reports that one's catalog and its status.
+    let primary = if openai.ok { &openai } else { &anthropic };
+    let models = provider_models::union_catalogs(openai.models.clone(), anthropic.models.clone());
+    let reachable = openai.reachable || anthropic.reachable;
+    let ok = openai.ok || anthropic.ok;
+    let status = primary.status;
+    let latency = openai.latency.max(anthropic.latency);
+    let message = if ok {
+        let surfaces = match (openai.ok, anthropic.ok) {
+            (true, true) => "openai+anthropic",
+            (true, false) => "openai",
+            _ => "anthropic",
+        };
+        if models.is_empty() {
+            format!("reachable ({}); no models listed", status.unwrap_or(200))
+        } else {
+            format!(
+                "reachable ({}); {} models via {surfaces}",
+                status.unwrap_or(200),
+                models.len()
+            )
+        }
+    } else {
+        primary.message.clone()
+    };
+    json!({
+        "ok": ok,
+        "reachable": reachable,
+        "status": status,
+        "latencyMs": latency,
+        "message": message,
+        "models": models.iter().map(ProviderModel::to_json).collect::<Vec<_>>(),
+    })
+}
+
+/// One listing's outcome.
+struct SurfaceProbe {
+    ok: bool,
+    reachable: bool,
+    status: Option<u16>,
+    latency: u64,
+    message: String,
+    models: Vec<ProviderModel>,
+}
+
+/// `GET {baseUrl}/v1/models` on one surface. `anthropic` adds the
+/// `anthropic-version` header; `openai` sends only the bearer credentials.
+async fn probe_surface(
+    base_url: &str,
+    extra_headers: &BTreeMap<String, String>,
+    token: Option<&str>,
+    surface: &str,
+) -> SurfaceProbe {
     let url = models_url(base_url);
     let started = Instant::now();
     let client = match reqwest::Client::builder()
@@ -686,22 +760,24 @@ async fn probe_models(
     {
         Ok(client) => client,
         Err(err) => {
-            return json!({
-                "ok": false,
-                "reachable": false,
-                "status": null,
-                "latencyMs": 0,
-                "message": format!("unreachable: {err}"),
-                "models": [],
-            });
+            return SurfaceProbe {
+                ok: false,
+                reachable: false,
+                status: None,
+                latency: 0,
+                message: format!("unreachable: {err}"),
+                models: Vec::new(),
+            };
         }
     };
     let mut request = client.get(&url);
     if let Some(token) = token.filter(|s| !s.is_empty()) {
         request = request
             .header("Authorization", format!("Bearer {token}"))
-            .header("x-api-key", token)
-            .header("anthropic-version", "2023-06-01");
+            .header("x-api-key", token);
+        if surface == provider_models::SURFACE_ANTHROPIC {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
     }
     for (name, value) in extra_headers {
         request = request.header(name, value);
@@ -711,9 +787,12 @@ async fn probe_models(
             let latency = started.elapsed().as_millis() as u64;
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            let models = provider_models::normalize_catalog(&body);
-            let reachable = true;
             let ok = (200..300).contains(&status);
+            let models = if ok {
+                provider_models::tag_surface(provider_models::normalize_catalog(&body), surface)
+            } else {
+                Vec::new()
+            };
             let message = if ok {
                 if models.is_empty() {
                     format!("reachable ({status}); no models listed")
@@ -725,14 +804,14 @@ async fn probe_models(
             } else {
                 format!("reachable but HTTP {status}")
             };
-            json!({
-                "ok": ok,
-                "reachable": reachable,
-                "status": status,
-                "latencyMs": latency,
-                "message": message,
-                "models": models.iter().map(ProviderModel::to_json).collect::<Vec<_>>(),
-            })
+            SurfaceProbe {
+                ok,
+                reachable: true,
+                status: Some(status),
+                latency,
+                message,
+                models,
+            }
         }
         Err(err) => {
             let latency = started.elapsed().as_millis() as u64;
@@ -743,14 +822,14 @@ async fn probe_models(
             } else {
                 sanitize_probe_error(&err, token)
             };
-            json!({
-                "ok": false,
-                "reachable": false,
-                "status": null,
-                "latencyMs": latency,
-                "message": format!("unreachable: {reason}"),
-                "models": [],
-            })
+            SurfaceProbe {
+                ok: false,
+                reachable: false,
+                status: None,
+                latency,
+                message: format!("unreachable: {reason}"),
+                models: Vec::new(),
+            }
         }
     }
 }

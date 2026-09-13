@@ -64,3 +64,129 @@ test.describe("structured session M0-13", () => {
     await expect(page.getByText("补一条").first()).toBeVisible();
   });
 });
+
+test.describe("session chrome: view switch, locked harness, files route", () => {
+  test("terminal sessions get one segmented switch, structured-only get none", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "Grok 会话").click();
+    const sw = page.getByTestId("view-switch");
+    await expect(sw).toHaveCount(1);
+    await expect(sw).toHaveAttribute("role", "radiogroup");
+    await expect(sw.getByRole("radio")).toHaveCount(2);
+    await expect(page.getByTestId("view-switch-tty")).toHaveAttribute("aria-checked", "true");
+
+    await page.getByTestId("view-switch-structured").click();
+    await expect(page).toHaveURL(/\/structured$/);
+    await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
+    await expect(page.getByTestId("view-switch-structured")).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByTestId("view-switch-tty")).toHaveAttribute("aria-checked", "false");
+
+    // The choice is remembered for this instance on the bare /s/:id route.
+    const url = new URL(page.url());
+    await page.goto(url.pathname.replace(/\/structured$/, ""));
+    await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
+
+    // claude-print is structured-only: no switch at all.
+    await page.goto("/sessions");
+    await row(page, "看 TaskManager spill").click();
+    await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
+    await expect(page.getByTestId("view-switch")).toHaveCount(0);
+  });
+
+  test("the segmented switch moves with the keyboard", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "Grok 会话").click();
+    await page.getByTestId("view-switch-tty").focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(page).toHaveURL(/\/structured$/);
+    await expect(page.getByTestId("view-switch-structured")).toHaveAttribute("aria-checked", "true");
+    await page.keyboard.press("ArrowLeft");
+    await expect(page).toHaveURL(/\/tty$/);
+  });
+
+  test("the composer shows no harness menu inside a session", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    const chip = page.getByTestId("harness-chip");
+    await expect(chip).toBeVisible();
+    await expect(chip).toHaveAttribute("data-readonly", "1");
+    await expect(chip).toContainText(/Claude/);
+    await chip.click();
+    await expect(page.getByTestId("harness-menu")).toHaveCount(0);
+    await expect(page.getByTestId("harness-option-codex")).toHaveCount(0);
+  });
+
+  test("文件 is a toggle and the files route goes back to the session", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    const files = page.getByTestId("files-toggle");
+    await expect(files).toHaveAttribute("aria-pressed", "false");
+
+    await files.click();
+    await expect(page).toHaveURL(/\/files$/);
+    await expect(page.getByTestId("files-pane")).toBeVisible();
+    // The session header survives the route.
+    await expect(page.getByTestId("session-page")).toBeVisible();
+    await expect(page.getByTestId("session-meta")).toBeVisible();
+    await expect(page.getByTestId("files-toggle")).toHaveAttribute("aria-pressed", "true");
+
+    // 1: the in-page back affordance.
+    await page.getByTestId("files-back").click();
+    await expect(page).not.toHaveURL(/\/files$/);
+    await expect(page.getByTestId("transcript")).toBeVisible();
+
+    // 2: the header control is a toggle.
+    await page.getByTestId("files-toggle").click();
+    await expect(page).toHaveURL(/\/files$/);
+    await page.getByTestId("files-toggle").click();
+    await expect(page).not.toHaveURL(/\/files$/);
+
+    // 3: browser back.
+    await page.getByTestId("files-toggle").click();
+    await expect(page).toHaveURL(/\/files$/);
+    await page.goBack();
+    await expect(page).not.toHaveURL(/\/files$/);
+    await expect(page.getByTestId("transcript")).toBeVisible();
+
+    // 4: Esc.
+    await page.getByTestId("files-toggle").click();
+    await expect(page).toHaveURL(/\/files$/);
+    await expect(page.getByTestId("files-pane")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page).not.toHaveURL(/\/files$/);
+    await expect(page.getByTestId("transcript")).toBeVisible();
+  });
+
+  test("deep-linking straight to the files route keeps the session context", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    const id = new URL(page.url()).pathname.split("/")[2];
+    await page.goto(`/s/${id}/files`);
+    await expect(page.getByTestId("session-page")).toBeVisible();
+    await expect(page.getByTestId("files-pane")).toBeVisible();
+    await expect(page.getByTestId("session-meta")).toBeVisible();
+    await expect(page.getByTestId("files-back")).toBeVisible();
+    await page.getByTestId("files-back").click();
+    await expect(page).toHaveURL(new RegExp(`/s/${id}/structured$`));
+    await expect(page.getByTestId("transcript")).toBeVisible();
+  });
+});
+
+test("the files route still has a back affordance at phone width", async ({ page }) => {
+  await page.setViewportSize({ width: 400, height: 844 });
+  await page.goto("/sessions");
+  await row(page, "空闲会话").click();
+  const id = new URL(page.url()).pathname.split("/")[2];
+  await page.goto(`/s/${id}/files`);
+  await expect(page.getByTestId("files-pane")).toBeVisible();
+  await expect(page.getByTestId("session-meta")).toBeVisible();
+  const back = page.getByTestId("files-back");
+  await expect(back).toBeVisible();
+  const box = await back.boundingBox();
+  expect(box).toBeTruthy();
+  expect(box!.height).toBeGreaterThanOrEqual(32);
+  await back.click();
+  await expect(page).toHaveURL(new RegExp(`/s/${id}/structured$`));
+});

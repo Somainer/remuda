@@ -150,47 +150,30 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "1");
   });
 
-  test("codex and grok popovers use native names", async ({ page }) => {
+  test("grok session lists the native grok effort table", async ({ page }) => {
     await page.goto("/sessions");
-    await row(page, "空闲会话").click();
-    await page.getByTestId("harness-chip").click();
-    await expect(page.getByTestId("harness-menu")).toBeVisible();
-    if (test.info().project.name === "chromium") {
-      await shot(page, "composer-1-harness-menu.png");
-    }
-    const grok = page.getByTestId("harness-option-grok");
-    if ((await grok.getAttribute("data-installed")) === "1") {
-      await grok.click();
-      await openEffort(page);
-      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "quick,standard,max");
-      await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("data-tiers", /think/);
-    }
-    await page.keyboard.press("Escape");
-    await page.getByTestId("harness-chip").click();
-    const codex = page.getByTestId("harness-option-codex");
-    if ((await codex.getAttribute("data-installed")) === "1") {
-      await codex.click();
-      await openEffort(page);
-      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,ultra");
-    } else {
-      await expect(codex).toContainText("+");
-    }
+    await row(page, "Grok 会话").click();
+    await page.getByTestId("view-switch-structured").click();
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-harness", "grok");
+    await openEffort(page);
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "quick,standard,max");
+    await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("data-tiers", /think/);
   });
 
-  test("switching harness remaps the tier by index", async ({ page }) => {
+  test("an existing session shows the harness as a label, not a menu", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
-    await openEffort(page);
-    await page.getByTestId("effort-slider").focus();
-    await page.keyboard.press("End");
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
-    await page.getByTestId("harness-chip").click();
-    const grok = page.getByTestId("harness-option-grok");
-    test.skip((await grok.getAttribute("data-installed")) !== "1", "grok not installed on this host");
-    await grok.click();
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-harness", "grok");
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
-    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+    const chip = page.getByTestId("harness-chip");
+    await expect(chip).toHaveAttribute("data-readonly", "1");
+    await expect(chip).toContainText(/Claude/);
+    await chip.click();
+    await expect(page.getByTestId("harness-menu")).toHaveCount(0);
+    await expect(page.getByTestId("harness-option-codex")).toHaveCount(0);
+    await expect(page.getByTestId("harness-option-terminal")).toHaveCount(0);
+    // New Session still picks the harness.
+    await page.goto("/sessions/new");
+    await expect(page.getByTestId("new-session-kind-codex")).toBeVisible();
+    await expect(page.getByTestId("new-session-kind-terminal")).toBeVisible();
   });
 
   test("approval card and expanded effort menu do not overlap", async ({ page }) => {
@@ -278,11 +261,11 @@ test.describe("composer control bar and effort", () => {
     await page.goto("/sessions");
     await row(page, "Grok 会话").click();
     await expect(page.getByTestId("session-page")).toBeVisible();
-    const structured = page.getByRole("link", { name: "结构" });
+    const structured = page.getByTestId("view-switch-structured");
     await expect(structured).toBeVisible();
     await structured.click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
-    await expect(page.getByTestId("harness-chip")).toBeVisible();
+    await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
     await expect(page.getByTestId("model-effort-chip")).toBeVisible();
     await expect(page.getByTestId("context-chip")).toBeVisible();
     await expect(page.getByTestId("permission-chip")).toHaveAttribute("data-readonly", "1");

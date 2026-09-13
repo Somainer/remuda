@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Link, Navigate, useNavigate, useParams } from "react-router-dom";
+import { useEffect, useLayoutEffect, useState } from "react";
+import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
 import { Button } from "../components/Button";
@@ -8,18 +8,18 @@ import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
-import { useHostViews } from "../features/hosts";
 import { Transcript } from "../features/session/Transcript";
 import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { canShowTerminal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
+import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
-import ui from "../styles/ui.module.css";
+import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import session from "../features/session/session.module.css";
 
 export function SessionPage({
@@ -31,23 +31,46 @@ export function SessionPage({
   const hub = useHub();
   const { active: space, newHref } = useSpaceWorkbench();
   const navigate = useNavigate();
+  const location = useLocation();
   const { mobile, offsetTop } = useWorkbenchViewport();
   const [sendingIds, setSendingIds] = useState<string[]>([]);
   const sending = sendingIds.includes(instanceId);
   const setSending = (value: boolean) => setSendingIds((ids) => value ? [...new Set([...ids, instanceId])] : ids.filter((id) => id !== instanceId));
   const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
-  const hostViews = useHostViews(hub.hosts, hub.instances);
   const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
+  const showTerminal = instance ? canShowTerminal(instance) : false;
+  const remembered = showTerminal ? readSessionView(instanceId) : null;
+  const baseView: SessionView = showTerminal ? (remembered ?? "tty") : "structured";
+  const backTo = `/s/${instanceId}/${baseView}`;
 
   useEffect(() => {
     if (instanceId && !isTtyLabFixtureId(instanceId)) void hubStore.follow(instanceId);
   }, [instanceId]);
 
+  useEffect(() => {
+    if (instanceId && (view === "tty" || view === "structured")) writeSessionView(instanceId, view);
+  }, [instanceId, view]);
+
+  // Esc backs out of the full-screen files route. Armed in a layout effect so it is
+  // live as soon as the route commits, and in the capture phase so it still fires
+  // when focus sits on a control that swallows the bubble.
+  useLayoutEffect(() => {
+    if (view !== "files") return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // An open composer popover eats the first Esc.
+      if (document.querySelector("[data-testid$='-menu']")) return;
+      navigate(backTo, { replace: true });
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [view, backTo, navigate]);
+
   const events = hub.events[instanceId] ?? [];
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
   const status = instance ? projectStatus(instance) : "unknown";
-  const showTerminal = instance ? canShowTerminal(instance) : false;
-  const resolvedView = view === "auto" ? (showTerminal ? "tty" : "structured") : view;
+  const resolvedView =
+    view === "auto" ? (showTerminal ? (remembered ?? "tty") : "structured") : view;
   const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
   const usageEvent = events.findLast((e) => e.kind === "usage");
@@ -110,17 +133,10 @@ export function SessionPage({
           ) : null}
           <span className={session.spacer} />
           {showTerminal ? (
-            <span className={ui.row}>
-              <Link to={`/s/${instance.id}/tty`} aria-current={resolvedView === "tty" ? "page" : undefined}>
-                终端
-              </Link>
-              <Link
-                to={`/s/${instance.id}/structured`}
-                aria-current={resolvedView === "structured" ? "page" : undefined}
-              >
-                结构
-              </Link>
-            </span>
+            <ViewSwitch
+              value={resolvedView === "tty" ? "tty" : "structured"}
+              onChange={(next) => navigate(`/s/${instance.id}/${next}`)}
+            />
           ) : null}
           <button
             type="button"
@@ -131,12 +147,24 @@ export function SessionPage({
           >
             {hub.compact ? "Compact" : "Full"}
           </button>
-          {resolvedView === "structured" ? (
+          {resolvedView === "structured" || resolvedView === "files" || resolvedView === "events" ? (
             <>
-              <button type="button" className={`${session.headBtn} ${session.deskOnly}`} onClick={() => navigate(`/s/${instance.id}/files`)}>
+              <button
+                type="button"
+                className={`${resolvedView === "files" ? session.headBtnActive : session.headBtn} ${session.deskOnly}`}
+                data-testid="files-toggle"
+                aria-pressed={resolvedView === "files"}
+                onClick={() => navigate(resolvedView === "files" ? backTo : `/s/${instance.id}/files`)}
+              >
                 文件
               </button>
-              <button type="button" className={session.headBtn} onClick={() => navigate(`/s/${instance.id}/events`)}>
+              <button
+                type="button"
+                className={resolvedView === "events" ? session.headBtnActive : session.headBtn}
+                data-testid="events-toggle"
+                aria-pressed={resolvedView === "events"}
+                onClick={() => navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`)}
+              >
                 原始事件
               </button>
             </>
@@ -220,7 +248,21 @@ export function SessionPage({
         {resolvedView === "events" ? (
           <RawEvents events={events} />
         ) : resolvedView === "files" ? (
-          <p style={{ padding: 16, color: "var(--mute)" }}>文件 / diff 栏占位。空间不够时走这条全屏路由。</p>
+          <div className={session.filesPane} data-testid="files-pane">
+            <button
+              type="button"
+              className={session.filesBack}
+              data-testid="files-back"
+              onClick={() => {
+                if (location.key !== "default") navigate(-1);
+                else navigate(backTo, { replace: true });
+              }}
+            >
+              ← 返回会话
+            </button>
+            <p className={session.filesHint}>文件 / diff 栏占位。空间不够时走这条全屏路由。</p>
+            <p className={session.filesHint}>按 Esc 或点上面的按钮回到会话。</p>
+          </div>
         ) : resolvedView === "tty" ? (
           <TerminalView
             instance={instance}
@@ -306,8 +348,6 @@ export function SessionPage({
             const pct = contextPercent(usage, instance.kind);
             return pct == null ? null : `${pct}%`;
           })()}
-          hostLabel={hubStore.hostName(instance.hostId)}
-          hostCli={hostViews.find((h) => h.id === instance.hostId)?.cli ?? []}
           onPermission={
             genericPty
               ? undefined

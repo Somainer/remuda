@@ -132,7 +132,7 @@ SessionStart gate and user-dialog waiting remain intact.
 
 The patched binary ran as PID **81724**, PPID **1**, without a controlling
 terminal, under the owned Interactive LaunchAgent. The final production code
-was rebased on `63c63bb` before building; the later Clippy correction changed
+was rebased on `2f569cb6b2c7f59a603181c0a0fee9936ac3aadc` before building; the later Clippy correction changed
 only two test permission literals.
 
 | Check through the owned Hub API | Result |

@@ -10,6 +10,7 @@ export const PERMISSION_OPTIONS = [
 export type PermissionModeId = (typeof PERMISSION_OPTIONS)[number]["id"];
 
 export const DELEGATION_OPTIONS = [
+  { id: "host", label: "跟随主机" },
   { id: "none", label: "原生登录态 (none)" },
   { id: "gateway", label: "网关 (gateway)" },
 ] as const;
@@ -49,11 +50,14 @@ export function normalizePermissionMode(value: string | undefined): PermissionMo
 }
 
 export function normalizeDelegation(value: string | undefined): DelegationId {
-  return value === "gateway" ? "gateway" : "none";
+  if (value === "gateway") return "gateway";
+  if (value === "none") return "none";
+  return "host";
 }
 
-/** Profile id sent on create. Wire uses none | gateway; never an astergate-specific name. */
-export function providerProfileForDelegation(delegation: DelegationId, defaultGatewayId?: string): string {
+/** Profile id sent on create. Omitted when following the host binding. */
+export function providerProfileForDelegation(delegation: DelegationId, defaultGatewayId?: string): string | undefined {
+  if (delegation === "host") return undefined;
   if (delegation === "gateway") return defaultGatewayId || "gateway";
   return "none";
 }
@@ -79,4 +83,57 @@ export function claudeProviderHint(
   const auth = claudeHostAuth(cli);
   if (auth === "gateway-native" || auth === "logged_in") return null;
   return "此主机未配置 Claude 登录/网关，请选择 Provider";
+}
+
+export type ProviderHintProfile = {
+  id: string;
+  name: string;
+  scope: string;
+  defaultGateway: boolean;
+  kind?: string;
+};
+
+/** Hub-side waterfall preview for New Session. */
+export function providerLaunchHint(input: {
+  kind: string;
+  binding?: string;
+  cli?: Array<{ kind?: string; auth?: string; nativeGateway?: boolean }>;
+  profiles: ProviderHintProfile[];
+  delegation: DelegationId;
+  explicitProfileId?: string;
+}): string | null {
+  if (input.kind !== "claude") return null;
+  const realId = input.explicitProfileId?.trim();
+  if (
+    realId &&
+    !["none", "native", "native-login", "gateway", "direct", "auto", "host"].includes(realId)
+  ) {
+    const profile = input.profiles.find((p) => p.id === realId);
+    return profileHint(profile) ?? `将使用 ${realId}`;
+  }
+  if (input.delegation === "none") return "使用主机原生登录";
+  const skipNative = input.delegation === "gateway";
+  if (!skipNative) {
+    const binding = (input.binding ?? "auto").trim();
+    if (binding === "native") return "使用主机原生登录";
+    if (binding.startsWith("profile:")) {
+      const id = binding.slice("profile:".length);
+      const profile = input.profiles.find((p) => p.id === id);
+      return profileHint(profile) ?? `将使用 ${id}`;
+    }
+  }
+  const hostScoped = input.profiles.find((p) => p.defaultGateway && p.scope.startsWith("host:"));
+  if (hostScoped) return profileHint(hostScoped);
+  const universal = input.profiles.find((p) => p.defaultGateway && (p.scope === "universal" || !p.scope));
+  if (universal) return profileHint(universal);
+  if (!skipNative && (claudeHostAuth(input.cli) === "logged_in" || claudeHostAuth(input.cli) === "gateway-native")) {
+    return "使用主机原生登录";
+  }
+  return claudeProviderHint(input.kind, input.cli);
+}
+
+function profileHint(profile: ProviderHintProfile | undefined): string | null {
+  if (!profile) return null;
+  const label = profile.scope.startsWith("host:") ? "host" : "universal";
+  return `将使用 ${profile.name} (${label})`;
 }

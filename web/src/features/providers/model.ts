@@ -28,6 +28,8 @@ export type ProviderProfile = {
   models: string[];
   defaultModel: string | null;
   defaultGateway: boolean;
+  /** `universal` or `host:<hostId>`. */
+  scope: string;
   headers: Record<string, string>;
   lastError: string | null;
   rotationOwner: "native" | "gateway" | "runtime";
@@ -46,6 +48,7 @@ export type ProviderCreate = {
   headers?: Record<string, string>;
   authToken: string;
   defaultGateway?: boolean;
+  scope?: string;
 };
 
 export type ProviderPatch = {
@@ -57,6 +60,7 @@ export type ProviderPatch = {
   headers?: Record<string, string>;
   authToken?: string;
   defaultGateway?: boolean;
+  scope?: string;
 };
 
 export type ProviderTestResult = {
@@ -97,6 +101,7 @@ export const NATIVE_PROFILE: ProviderProfile = {
   models: [],
   defaultModel: null,
   defaultGateway: false,
+  scope: "universal",
   headers: {},
   lastError: null,
   rotationOwner: "native",
@@ -149,6 +154,7 @@ type HubProvider = {
   defaultModel?: string | null;
   headers?: Record<string, string>;
   defaultGateway?: boolean;
+  scope?: string;
   revision?: string;
   secret?: { present?: boolean; last4?: string | null; fingerprint?: string | null };
   health?: ProviderHealth | null;
@@ -177,6 +183,7 @@ export function fromHub(row: HubProvider): ProviderProfile {
     models: row.models ?? [],
     defaultModel: row.defaultModel ?? null,
     defaultGateway: Boolean(row.defaultGateway),
+    scope: row.scope && row.scope.length ? row.scope : "universal",
     headers: row.headers ?? {},
     lastError: row.health && !row.health.ok ? row.health.message ?? null : null,
     rotationOwner: kind === "direct" ? "runtime" : "gateway",

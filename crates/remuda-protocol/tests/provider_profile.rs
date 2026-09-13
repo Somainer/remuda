@@ -30,6 +30,7 @@ fn provider_overlay_spec_has_no_secret_field() {
         base_url: String::new(),
         model: "claude-sonnet".into(),
         headers: Default::default(),
+        scope: "universal".into(),
     };
     let value = serde_json::to_value(&spec).unwrap();
     assert_eq!(value["kind"], json!("direct"));

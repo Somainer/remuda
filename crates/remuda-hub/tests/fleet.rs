@@ -206,6 +206,7 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
     let body = json!({
         "placement": { "kind": "labels", "labels": ["region=sg"] },
         "driver": "claude-print",
+        "delegation": "none",
         "prompt": "sg only"
     })
     .to_string();
@@ -234,19 +235,22 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
     let body = json!({
         "placement": { "kind": "any" },
         "driver": "claude-print",
-        "delegation": "gateway"
+        "delegation": "none"
     })
     .to_string();
     let (status, _, created) = http(hub.addr, "POST", "/v1/instances", &auth, Some(&body)).await?;
     assert_eq!(status, 200, "{created}");
     let created: Value = serde_json::from_str(created.trim())?;
-    assert_eq!(created["hostId"], json!(sg_id));
+    assert!(
+        created["hostId"] == json!(sg_id) || created["hostId"] == json!(cn_id),
+        "{created}"
+    );
 
     cn_ws.close(None).await.ok();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let body = json!({
-        "spec": { "driver": "claude-print", "kind": "claude" },
+        "spec": { "driver": "claude-print", "kind": "claude", "delegation": "none" },
         "hosts": [sg_id, cn_id]
     })
     .to_string();
@@ -267,7 +271,7 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
     .await?;
 
     let body = json!({
-        "spec": { "driver": "claude-print", "kind": "claude", "prompt": "fleet" },
+        "spec": { "driver": "claude-print", "kind": "claude", "delegation": "none", "prompt": "fleet" },
         "hosts": [sg_id, cn_id]
     })
     .to_string();
@@ -384,7 +388,9 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
     // Two instances on sg (claude, codex) and one on cn (claude).
     let mut made = Vec::new();
     for (host, kind) in [(&sg_id, "claude"), (&sg_id, "codex"), (&cn_id, "claude")] {
-        let body = json!({ "hostId": host, "kind": kind, "driver": "claude-print" }).to_string();
+        let body =
+            json!({ "hostId": host, "kind": kind, "driver": "claude-print", "delegation": "none" })
+                .to_string();
         let (status, _, created) =
             http(hub.addr, "POST", "/v1/instances", &auth, Some(&body)).await?;
         assert_eq!(status, 200, "{created}");

@@ -102,6 +102,7 @@ async fn fake_can_use_tool_answered_via_hub_http() {
     let create = json!({
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "prompt": "can_use_tool"
     })
     .to_string();
@@ -283,7 +284,7 @@ async fn pty_approval_hub_cas_settlement_and_restart_do_not_replay() {
     .unwrap();
     let _link = link;
     let cookie = login(hub.addr, &hub.bootstrap_token).await;
-    let (status, body) = http(hub.addr, "POST", "/v1/instances", &[("Cookie", &cookie)], Some(&json!({"hostId":host,"kind":"claude","driver":"generic-pty","cwd":dir.path(),"prompt":""}).to_string())).await;
+    let (status, body) = http(hub.addr, "POST", "/v1/instances", &[("Cookie", &cookie)], Some(&json!({"hostId":host,"kind":"claude","driver":"generic-pty","delegation":"none","cwd":dir.path(),"prompt":""}).to_string())).await;
     assert_eq!(status, 200, "{body}");
     let created: Value = serde_json::from_str(&body).unwrap();
     let instance = created["instance"]["instanceId"]

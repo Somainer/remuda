@@ -317,20 +317,36 @@ pub async fn create_instance(
             obj.insert("effort".into(), effort.clone());
         }
     }
-    crate::providers::attach_provider_to_spec(&state, &mut spec).await?;
     let placement =
         crate::placement::Placement::from_value(body.placement.as_ref(), body.host_id.as_deref())?;
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
-    let host = crate::placement::pick_hosts(&state, &placement, &place_spec)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(HubError::Unsatisfiable {
-            reasons: vec!["placement returned no host".into()],
-        })?;
-    if let Some(obj) = spec.as_object_mut() {
-        obj.insert("hostId".into(), json!(host.host_id));
+    let hosts = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
+    let mut reasons = Vec::new();
+    let mut chosen = None;
+    for host in hosts {
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("hostId".into(), json!(host.host_id));
+        }
+        match crate::providers::resolve_and_attach(&state, &host, &mut spec).await {
+            Ok(()) => {
+                chosen = Some(host);
+                break;
+            }
+            Err(HubError::Unsatisfiable {
+                reasons: host_reasons,
+            }) => {
+                reasons.extend(host_reasons);
+            }
+            Err(err) => return Err(err),
+        }
     }
+    let host = chosen.ok_or(HubError::Unsatisfiable {
+        reasons: if reasons.is_empty() {
+            vec!["placement returned no host".into()]
+        } else {
+            reasons
+        },
+    })?;
     let (instance, command) = crate::placement::spawn_on_host(
         &state,
         &host,
@@ -554,7 +570,7 @@ pub(crate) async fn forward_if_online(
         .ok_or_else(|| HubError::BadRequest("command payload must be an object".into()))?;
     object.insert("commandId".into(), json!(command.command_id));
     if command.operation == "instance.create" {
-        params = crate::providers::with_launch_secret(state, params).await?;
+        params = crate::providers::with_launch_secret(state, &command.host_id, params).await?;
     }
     match state
         .nodes
@@ -573,6 +589,14 @@ pub(crate) async fn forward_if_online(
                 .await?;
             schedule_create_settlement_watch(state, &accepted);
             Ok(accepted)
+        }
+        Ok(Some(response)) if response.get("error").is_some() => {
+            tracing::warn!(
+                command_id = %command.command_id,
+                response = %response,
+                "node did not durably accept command; will not resend"
+            );
+            fail_unaccepted_create(state, &command, node_rpc_error_message(&response)).await
         }
         Ok(Some(response)) => {
             tracing::warn!(
@@ -603,6 +627,42 @@ pub(crate) async fn forward_if_online(
                 .ok_or(HubError::NotFound)
         }
     }
+}
+
+async fn fail_unaccepted_create(
+    state: &AppState,
+    command: &CommandRecord,
+    message: String,
+) -> Result<CommandRecord, HubError> {
+    if command.operation == "instance.create"
+        && let Some(instance_id) = command.instance_id.clone()
+    {
+        state
+            .store
+            .fail_instance(instance_id, message.clone())
+            .await?;
+        return Err(HubError::BadRequest(message));
+    }
+    state
+        .store
+        .get_command(command.command_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)
+}
+
+fn node_rpc_error_message(response: &Value) -> String {
+    response
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            response
+                .pointer("/error/data/message")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("node did not accept instance.create")
+        .trim()
+        .trim_start_matches("invalid request: ")
+        .to_string()
 }
 
 fn node_accepted(response: &Value, command_id: &str) -> bool {

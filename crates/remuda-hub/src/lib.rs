@@ -22,6 +22,7 @@ mod interactions;
 mod inventory;
 mod maintenance;
 mod placement;
+mod provider_resolve;
 mod providers;
 mod proxy;
 mod push_http;

@@ -114,6 +114,7 @@ function mapHostCli(raw: { kind?: unknown; version?: unknown; path?: unknown; au
     path: typeof raw.path === "string" ? raw.path : undefined,
     auth,
     nativeGateway: nativeGateway || auth === "gateway-native" ? true : undefined,
+    installed: "installed" in raw && raw.installed === false ? false : true,
   };
 }
 
@@ -162,6 +163,7 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
     online: h.online,
     ssh: h.ssh ?? undefined,
     lastError: h.lastError ?? undefined,
+    providerBinding: typeof h.providerBinding === "string" && h.providerBinding ? h.providerBinding : "auto",
   };
 }
 
@@ -175,6 +177,8 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     name?: string | null;
     delegation?: string | null;
     providerProfileId?: string | null;
+    providerSource?: string | null;
+    providerSourceHint?: string | null;
     model?: string | null;
     effortName?: string | null;
     effortIndex?: number | null;
@@ -222,6 +226,10 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     delegation: typeof rec.delegation === "string" ? rec.delegation : extra.delegation ?? null,
     providerProfileId:
       typeof rec.providerProfileId === "string" ? rec.providerProfileId : extra.providerProfileId ?? null,
+    providerSource:
+      typeof rec.providerSource === "string" ? rec.providerSource : extra.providerSource ?? null,
+    providerSourceHint:
+      typeof rec.providerSourceHint === "string" ? rec.providerSourceHint : extra.providerSourceHint ?? null,
     model: typeof extra.model === "string" ? extra.model : null,
     effortName: typeof extra.effortName === "string" ? extra.effortName : null,
     effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
@@ -279,7 +287,7 @@ export type InstanceCreateSpec = {
   kind: "claude" | "codex" | "grok" | "agy" | "terminal";
   driver: "claude-print" | "claude-pty" | "claude-bg" | "generic-pty" | "shell-pty";
   model: string;
-  providerProfileId: string;
+  providerProfileId?: string;
   permissionMode: string;
   delegation?: "none" | "gateway";
   prompt: string;
@@ -333,6 +341,7 @@ export type HubProviderRow = {
   defaultModel?: string | null;
   headers?: Record<string, string>;
   defaultGateway: boolean;
+  scope?: string;
   revision: string;
   secret: { present: boolean; last4?: string | null; fingerprint?: string | null };
   health?: { ok: boolean; checkedAt?: string | null; message?: string | null; status?: number | null; latencyMs?: number | null } | null;
@@ -375,8 +384,9 @@ export type HubApi = {
   hostRemove(hostId: Id): Promise<void>;
   hostList(): Promise<Page<Host>>;
   hostGet(hostId: Id): Promise<Host>;
+  hostPatch(hostId: Id, body: { name?: string; labels?: string[]; maxInstances?: number; providerBinding?: string }): Promise<Host>;
   workspaceList(hostId?: Id): Promise<Page<Workspace>>;
-  providerList(): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
+  providerList(q?: { hostId?: string }): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
   providerGet(id: string): Promise<HubProviderRow>;
   providerCreate(body: ProviderCreate): Promise<HubProviderRow>;
   providerPatch(id: string, body: ProviderPatch): Promise<HubProviderRow>;
@@ -472,6 +482,7 @@ function seedMockProviders(): HubProviderRow[] {
     defaultModel: p.defaultModel,
     headers: p.headers,
     defaultGateway: p.defaultGateway,
+    scope: p.scope,
     revision: "1",
     secret: { present: p.secret.present, last4: p.secret.last4, fingerprint: p.secret.fingerprint },
     health: p.health,
@@ -634,8 +645,22 @@ function createMockApi(): HubApi {
       if (!found) throw new Error("HOST_NOT_FOUND");
       return found;
     },
-    async providerList() {
-      return { items: mockProviders.slice(), nextCursor: null };
+    async hostPatch(hostId, body) {
+      const found = mockDb.hosts.find((h) => h.id === hostId);
+      if (!found) throw new Error("HOST_NOT_FOUND");
+      if (body.name) found.label = body.name;
+      if (body.labels) found.labels = body.labels;
+      if (body.maxInstances != null) found.maxInstances = body.maxInstances;
+      if (body.providerBinding) found.providerBinding = body.providerBinding;
+      return found;
+    },
+    async providerList(q) {
+      const items = mockProviders.filter((p) => {
+        if (!q?.hostId) return true;
+        const scope = p.scope ?? "universal";
+        return scope === "universal" || scope === `host:${q.hostId}`;
+      });
+      return { items, nextCursor: null };
     },
     async providerGet(providerId) {
       const found = mockProviders.find((p) => p.id === providerId);
@@ -655,6 +680,7 @@ function createMockApi(): HubApi {
         defaultModel: body.defaultModel ?? body.models[0] ?? null,
         headers: body.headers ?? {},
         defaultGateway: Boolean(body.defaultGateway && body.kind === "gateway"),
+        scope: body.scope ?? "universal",
         revision: "1",
         secret: { present: true, last4: fp.last4, fingerprint: fp.fingerprint },
         health: null,
@@ -679,6 +705,7 @@ function createMockApi(): HubApi {
         defaultModel: body.defaultModel === undefined ? prev.defaultModel : body.defaultModel,
         headers: body.headers ?? prev.headers,
         defaultGateway: body.defaultGateway ?? prev.defaultGateway,
+        scope: body.scope ?? prev.scope,
         revision: String(Number(prev.revision) + 1),
         secret: fp ? { present: true, last4: fp.last4, fingerprint: fp.fingerprint } : prev.secret,
         updatedAt: now(),
@@ -862,7 +889,7 @@ function createLiveApi(): HubApi {
         model: spec.model,
         providerProfileId: spec.providerProfileId,
         permissionMode: spec.permissionMode,
-        delegation: spec.delegation ?? "none",
+        delegation: spec.delegation,
         prompt: spec.prompt,
         name: spec.name,
         title: spec.name ?? spec.prompt.slice(0, 80),
@@ -988,8 +1015,19 @@ function createLiveApi(): HubApi {
       hosts.set(host.id, host);
       return host;
     },
-    async providerList() {
-      return rest<{ items: HubProviderRow[]; nextCursor?: string | null }>("/v1/providers");
+    async hostPatch(hostId, body) {
+      const host = mapHost(
+        await rest<HubJson<"/v1/hosts/{id}", "patch">>(`/v1/hosts/${encodeURIComponent(hostId)}`, {
+          method: "PATCH",
+          body: JSON.stringify(body),
+        }),
+      );
+      hosts.set(host.id, host);
+      return host;
+    },
+    async providerList(q) {
+      const suffix = q?.hostId ? `?hostId=${encodeURIComponent(q.hostId)}` : "";
+      return rest<{ items: HubProviderRow[]; nextCursor?: string | null }>(`/v1/providers${suffix}`);
     },
     async providerGet(providerId) {
       return rest<HubProviderRow>(`/v1/providers/${providerId}`);

@@ -274,6 +274,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         settings_overlay_path: None,
         claude_config_dir: None,
         max_budget_usd: None,
+        provider_overlay: None,
+        provider_auth_token: None,
     };
     request.apply_spec_launch_fields(spec);
     Ok(request)
@@ -865,7 +867,7 @@ mod tests {
                     "providerProfileId": "gateway",
                     "permissionMode": "bypassPermissions",
                     "delegation": "gateway",
-                    "settingsOverlayPath": "~/.claude/settings.relay.json",
+                    "settingsOverlayPath": "/tmp/remuda-settings.overlay.json",
                     "claudeConfigDir": "/tmp/remuda-claude-home",
                     "maxBudgetUsd": 0.3
                 },
@@ -877,7 +879,7 @@ mod tests {
         assert_eq!(request.provider_profile_id, "gateway");
         assert_eq!(
             request.settings_overlay_path.as_deref(),
-            Some("~/.claude/settings.relay.json")
+            Some("/tmp/remuda-settings.overlay.json")
         );
         assert_eq!(
             request.claude_config_dir.as_deref(),

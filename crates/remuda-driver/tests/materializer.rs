@@ -551,7 +551,7 @@ fn gateway_overlay_config_dir_and_budget_are_emitted() {
     let launch = tmp.path().join("launch");
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let overlay = tmp.path().join("settings.relay.json");
+    let overlay = tmp.path().join("settings.overlay.json");
     fs::write(
         &overlay,
         r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"secret-token-must-not-appear"}}"#,
@@ -635,7 +635,7 @@ fn pty_and_bg_recipes_accept_user_overlay() {
     let launch = tmp.path().join("launch");
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let overlay = tmp.path().join("settings.relay.json");
+    let overlay = tmp.path().join("settings.overlay.json");
     fs::write(&overlay, r#"{"model":"passthrough/example-model"}"#).unwrap();
     for driver in [DriverKind::ClaudePty, DriverKind::ClaudeBg] {
         let mut spec = load_spec();

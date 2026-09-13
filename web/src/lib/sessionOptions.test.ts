@@ -10,6 +10,7 @@ import {
   claudeProviderHint,
   normalizeDelegation,
   normalizePermissionMode,
+  providerLaunchHint,
   providerProfileForDelegation,
 } from "./sessionOptions";
 
@@ -24,16 +25,19 @@ describe("sessionOptions", () => {
     expect(YOLO_HINT).toMatch(/审批/);
   });
 
-  it("defaults delegation to native none, not a named gateway vendor", () => {
-    expect(normalizeDelegation(undefined)).toBe("none");
+  it("defaults create to follow-host, not a named gateway vendor", () => {
+    expect(normalizeDelegation(undefined)).toBe("host");
     expect(normalizeDelegation("gateway")).toBe("gateway");
+    expect(normalizeDelegation("none")).toBe("none");
+    expect(providerProfileForDelegation("host")).toBeUndefined();
     expect(providerProfileForDelegation("none")).toBe("none");
     expect(providerProfileForDelegation("gateway")).toBe("gateway");
     expect(providerProfileForDelegation("gateway", "pvp_01993ab0-0000-7000-8000-000000000010")).toBe(
       "pvp_01993ab0-0000-7000-8000-000000000010",
     );
-    expect(DELEGATION_OPTIONS.map((o) => o.id)).toEqual(["none", "gateway"]);
+    expect(DELEGATION_OPTIONS.map((o) => o.id)).toEqual(["host", "none", "gateway"]);
     expect(DELEGATION_OPTIONS.some((o) => /astergate/i.test(o.label))).toBe(false);
+    expect(DELEGATION_OPTIONS.map((o) => o.label).join(" ")).not.toContain("自动");
   });
 
   it("hints when the host has no Claude login or native gateway", () => {
@@ -45,6 +49,37 @@ describe("sessionOptions", () => {
     );
     expect(claudeProviderHint("claude", [{ kind: "claude", auth: "logged_in" }])).toBeNull();
     expect(claudeProviderHint("codex", [{ kind: "claude", auth: "logged_out" }])).toBeNull();
+  });
+
+  it("previews Hub resolution as a New Session hint", () => {
+    const uni = { id: "pvp_u", name: "uni-gw", scope: "universal", defaultGateway: true };
+    expect(
+      providerLaunchHint({
+        kind: "claude",
+        binding: "auto",
+        cli: [{ kind: "claude", auth: "logged_out" }],
+        profiles: [uni],
+        delegation: "host",
+      }),
+    ).toBe("将使用 uni-gw (universal)");
+    expect(
+      providerLaunchHint({
+        kind: "claude",
+        binding: "native",
+        cli: [{ kind: "claude", auth: "logged_out" }],
+        profiles: [uni],
+        delegation: "host",
+      }),
+    ).toBe("使用主机原生登录");
+    expect(
+      providerLaunchHint({
+        kind: "claude",
+        binding: "auto",
+        cli: [{ kind: "claude", auth: "logged_out" }],
+        profiles: [],
+        delegation: "host",
+      }),
+    ).toBe("此主机未配置 Claude 登录/网关，请选择 Provider");
   });
 
   it("exposes generic-pty yolo preset flags as a hint", () => {

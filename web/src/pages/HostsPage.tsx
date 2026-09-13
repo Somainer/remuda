@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AddHostForm,
+  HostProviderBinding,
   cliSummary,
   hostRegistry,
   installedCli,
@@ -9,6 +10,7 @@ import {
   useHostViews,
   type HostView,
 } from "../features/hosts";
+import { fromHub, type ProviderProfile } from "../features/providers";
 import { hubStore, useHub } from "../lib/store";
 import { api } from "../lib/api";
 import ui from "../styles/ui.module.css";
@@ -123,6 +125,15 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label:
   const [label, setLabel] = useState(host.label);
   const [labelDraft, setLabelDraft] = useState(host.labels.join(", "));
   const [maxInstances, setMaxInstances] = useState(String(host.maxInstances));
+  const [profiles, setProfiles] = useState<ProviderProfile[]>([]);
+  const [bindingError, setBindingError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void api
+      .providerList({ hostId: host.id })
+      .then((page) => setProfiles(page.items.map(fromHub)))
+      .catch(() => setProfiles([]));
+  }, [host.id]);
 
   return (
     <div className={css.board} data-testid="host-detail">
@@ -195,8 +206,12 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label:
                 <span className={css.cliPath}>{cli.path}</span>
                 <span className={css.cliVer}>{cli.version}</span>
                 <span className={css.cliAuth}>
-                  <span className={cli.auth === "logged_in" ? css.dotAuth : css.dotUnknown} />
+                  <span className={cli.auth === "logged_in" || cli.auth === "gateway-native" ? css.dotAuth : css.dotUnknown} />
                   {cli.auth}
+                </span>
+                <span className={css.cliVer} data-testid="host-cli-flags">
+                  {cli.installed === false ? "未安装" : "已安装"}
+                  {cli.kind === "claude" ? ` · nativeGateway ${cli.nativeGateway || cli.auth === "gateway-native" ? "true" : "false"}` : ""}
                 </span>
               </div>
             ))}
@@ -226,6 +241,18 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label:
             标签（逗号分隔）
             <input className={ui.input} value={labelDraft} data-testid="host-labels-edit" onChange={(e) => setLabelDraft(e.target.value)} />
           </label>
+          <HostProviderBinding
+            binding={host.providerBinding ?? "auto"}
+            profiles={profiles.map((p) => ({ id: p.id, name: p.name, scope: p.scope }))}
+            onChange={(providerBinding) => {
+              setBindingError(null);
+              hostRegistry.patch(host.id, { providerBinding });
+              void api.hostPatch(host.id, { providerBinding }).catch((error: unknown) => {
+                setBindingError(error instanceof Error ? error.message : "绑定失败");
+              });
+            }}
+          />
+          {bindingError ? <p role="alert" className={css.sshError}>{bindingError}</p> : null}
           <label className={ui.field}>
             maxInstances
             <input

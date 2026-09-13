@@ -16,6 +16,7 @@ import {
 import { ProviderForm } from "../features/providers/ProviderForm";
 import css from "../features/providers/providers.module.css";
 import { api } from "../lib/api";
+import type { Host } from "../types/instance";
 
 function healthDot(ok: boolean | undefined) {
   return <span className={`${css.dot} ${ok === false ? css.dotOff : ""}`} aria-hidden />;
@@ -23,6 +24,7 @@ function healthDot(ok: boolean | undefined) {
 
 function useProviderList() {
   const [items, setItems] = useState<ProviderProfile[]>([NATIVE_PROFILE]);
+  const [hosts, setHosts] = useState<{ id: string; label: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const reload = () => {
     void api
@@ -36,12 +38,16 @@ function useProviderList() {
   };
   useEffect(() => {
     reload();
+    void api
+      .hostList()
+      .then((page) => setHosts(page.items.map((h: Host) => ({ id: h.id, label: h.label }))))
+      .catch(() => setHosts([]));
   }, []);
-  return { items, error, reload };
+  return { items, hosts, error, reload };
 }
 
 export function ProvidersPage() {
-  const { items, error, reload } = useProviderList();
+  const { items, hosts, error, reload } = useProviderList();
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -74,6 +80,7 @@ export function ProvidersPage() {
               {healthDot(p.health?.ok ?? true)}
               <span className={css.id}>{p.name || p.profileId}</span>
               {p.defaultGateway ? <span className={css.badge}>默认网关</span> : null}
+              {p.scope?.startsWith("host:") ? <span className={css.badge}>host</span> : null}
               <span className={css.proto}>{p.protocol}</span>
             </div>
             <div className={css.grid}>
@@ -118,6 +125,7 @@ export function ProvidersPage() {
         <ProviderForm
           busy={busy}
           error={formError}
+          hosts={hosts}
           onCancel={() => setCreating(false)}
           onSubmit={(body) => {
             setBusy(true);
@@ -148,6 +156,14 @@ export function ProviderDetailPage() {
   const [rotating, setRotating] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [test, setTest] = useState<ProviderTestResult | null>(null);
+  const [hosts, setHosts] = useState<{ id: string; label: string }[]>([]);
+
+  useEffect(() => {
+    void api
+      .hostList()
+      .then((page) => setHosts(page.items.map((h: Host) => ({ id: h.id, label: h.label }))))
+      .catch(() => setHosts([]));
+  }, []);
 
   useEffect(() => {
     if (!profileId || profileId === "none") {
@@ -184,6 +200,7 @@ export function ProviderDetailPage() {
           models: body.models,
           defaultModel: body.defaultModel ?? null,
           defaultGateway: body.defaultGateway,
+          scope: body.scope,
           ...(body.authToken ? { authToken: body.authToken } : {}),
         };
     void api
@@ -217,6 +234,8 @@ export function ProviderDetailPage() {
           <div className={css.grid}>
             <div className={css.label}>baseUrl</div>
             <div className={css.value}>{p.baseUrl ?? "—"}</div>
+            <div className={css.label}>scope</div>
+            <div className={css.value}>{p.scope || "universal"}</div>
             <div className={css.label}>健康</div>
             <div className={css.value} data-testid="provider-health">
               {healthLine(p.health)}
@@ -339,6 +358,7 @@ export function ProviderDetailPage() {
           initial={p}
           busy={busy}
           error={formError}
+          hosts={hosts}
           onCancel={() => setEditing(false)}
           onSubmit={(body) => save(body, false)}
         />

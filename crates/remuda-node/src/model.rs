@@ -97,6 +97,12 @@ pub struct CreateInstanceRequest {
         deserialize_with = "deserialize_opt_stringish"
     )]
     pub max_budget_usd: Option<String>,
+    /// Public overlay snapshot from Hub (no token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_overlay: Option<serde_json::Value>,
+    /// Auth token injected by Hub SecretBroker for this launch only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_auth_token: Option<String>,
 }
 
 impl CreateInstanceRequest {
@@ -132,6 +138,16 @@ impl CreateInstanceRequest {
         }
         if self.max_budget_usd.is_none() {
             self.max_budget_usd = stringish(spec.get("maxBudgetUsd"));
+        }
+        if self.provider_overlay.is_none() {
+            self.provider_overlay = spec.get("providerOverlay").cloned();
+        }
+        if self.provider_auth_token.is_none() {
+            self.provider_auth_token = spec
+                .get("providerAuthToken")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
         }
     }
 }

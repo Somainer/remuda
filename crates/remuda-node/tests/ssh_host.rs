@@ -158,7 +158,7 @@ async fn actual_stdio_node_upload_dispatch_and_stop() {
     wait_host(&hub, &token, id, |host| host["online"] == true).await;
     assert!(remote.join("remuda").is_file());
     assert!(!remote.join("codex/auth.json").exists());
-    let (status, created)=request(hub.addr,"POST","/v1/instances",&token,json!({"hostId":id,"kind":"claude","driver":"claude-print","prompt":"Reply OK","model":"fake"})).await;
+    let (status, created)=request(hub.addr,"POST","/v1/instances",&token,json!({"hostId":id,"kind":"claude","driver":"claude-print","delegation":"none","prompt":"Reply OK","model":"fake"})).await;
     assert_eq!(status, 200, "{created}");
     assert_eq!(created["hostId"], id);
     assert_eq!(created["command"]["state"], "accepted", "{created}");

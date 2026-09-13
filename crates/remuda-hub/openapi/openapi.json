@@ -679,6 +679,15 @@
         "tags": ["providers"],
         "operationId": "providerList",
         "summary": "List provider profiles (secret never returned)",
+        "parameters": [
+          {
+            "name": "hostId",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "When set, returns universal profiles plus host-scoped profiles for this host."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Provider page",
@@ -967,6 +976,7 @@
           "defaultModel": { "type": ["string", "null"] },
           "headers": { "type": "object", "additionalProperties": { "type": "string" } },
           "defaultGateway": { "type": "boolean" },
+          "scope": { "type": "string", "description": "universal or host:<hostId>" },
           "revision": { "type": "string" },
           "secret": { "$ref": "#/components/schemas/ProviderSecretView" },
           "health": { "oneOf": [{ "$ref": "#/components/schemas/ProviderHealth" }, { "type": "null" }] },
@@ -993,7 +1003,8 @@
           "defaultModel": { "type": "string" },
           "headers": { "type": "object", "additionalProperties": { "type": "string" } },
           "authToken": { "type": "string" },
-          "defaultGateway": { "type": "boolean" }
+          "defaultGateway": { "type": "boolean" },
+          "scope": { "type": "string", "description": "universal or host:<hostId>" }
         }
       },
       "ProviderPatch": {
@@ -1006,7 +1017,8 @@
           "defaultModel": { "type": ["string", "null"] },
           "headers": { "type": "object", "additionalProperties": { "type": "string" } },
           "authToken": { "type": "string", "description": "Rotate the stored token." },
-          "defaultGateway": { "type": "boolean" }
+          "defaultGateway": { "type": "boolean" },
+          "scope": { "type": "string", "description": "universal or host:<hostId>" }
         }
       },
       "ProviderTestResult": {
@@ -1096,7 +1108,8 @@
           "maxInstances": { "type": "integer" },
           "instanceCount": { "type": "integer" },
           "transport": { "type": "string" },
-          "hostname": { "type": ["string", "null"] }
+          "hostname": { "type": ["string", "null"] },
+          "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" }
         }
       },
       "HostPage": {
@@ -1112,7 +1125,8 @@
         "properties": {
           "name": { "type": "string" },
           "labels": { "type": "array", "items": { "type": "string" } },
-          "maxInstances": { "type": "integer" }
+          "maxInstances": { "type": "integer" },
+          "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" }
         }
       },
       "InstanceRecord": {
@@ -1151,6 +1165,8 @@
           "cwd": { "type": ["string", "null"] },
           "delegation": { "type": ["string", "null"] },
           "providerProfileId": { "type": ["string", "null"] },
+          "providerSource": { "type": ["string", "null"] },
+          "providerSourceHint": { "type": ["string", "null"] },
           "model": { "type": ["string", "null"] },
           "effortName": { "type": ["string", "null"] },
           "effortIndex": { "type": ["integer", "null"] },

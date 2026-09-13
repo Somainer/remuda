@@ -4,17 +4,26 @@ import ui from "../../styles/ui.module.css";
 import css from "./providers.module.css";
 import { parseModels, type ProviderCreate, type ProviderProfile } from "./model";
 
+type HostOption = { id: string; label: string };
+
 type Props = {
   initial?: ProviderProfile;
   rotateOnly?: boolean;
   busy?: boolean;
   error?: string | null;
+  hosts?: HostOption[];
   onSubmit: (body: ProviderCreate) => void;
   onCancel: () => void;
 };
 
-export function ProviderForm({ initial, rotateOnly, busy, error, onSubmit, onCancel }: Props) {
+function scopeParts(scope: string | undefined): { kind: "universal" | "host"; hostId: string } {
+  if (scope?.startsWith("host:")) return { kind: "host", hostId: scope.slice("host:".length) };
+  return { kind: "universal", hostId: "" };
+}
+
+export function ProviderForm({ initial, rotateOnly, busy, error, hosts = [], onSubmit, onCancel }: Props) {
   const editing = Boolean(initial && initial.kind !== "native");
+  const initialScope = scopeParts(initial?.scope);
   const [name, setName] = useState(initial?.name ?? "");
   const [kind, setKind] = useState<"gateway" | "direct">(initial?.kind === "direct" ? "direct" : "gateway");
   const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? "");
@@ -22,8 +31,14 @@ export function ProviderForm({ initial, rotateOnly, busy, error, onSubmit, onCan
   const [models, setModels] = useState((initial?.models ?? []).join("\n"));
   const [defaultModel, setDefaultModel] = useState(initial?.defaultModel ?? "");
   const [defaultGateway, setDefaultGateway] = useState(initial?.defaultGateway ?? true);
+  const [scopeKind, setScopeKind] = useState<"universal" | "host">(initialScope.kind);
+  const [scopeHostId, setScopeHostId] = useState(initialScope.hostId || hosts[0]?.id || "");
   const tokenRequired = !editing || rotateOnly;
-  const canSave = name.trim() && (kind === "direct" || baseUrl.trim()) && (!tokenRequired || authToken.trim());
+  const canSave =
+    name.trim() &&
+    (kind === "direct" || baseUrl.trim()) &&
+    (!tokenRequired || authToken.trim()) &&
+    (scopeKind !== "host" || Boolean(scopeHostId));
 
   return (
     <form
@@ -41,6 +56,7 @@ export function ProviderForm({ initial, rotateOnly, busy, error, onSubmit, onCan
           defaultModel: defaultModel.trim() || list[0],
           authToken: authToken.trim(),
           defaultGateway: kind === "gateway" && defaultGateway,
+          scope: scopeKind === "host" && scopeHostId ? `host:${scopeHostId}` : "universal",
         });
       }}
     >
@@ -114,6 +130,47 @@ export function ProviderForm({ initial, rotateOnly, busy, error, onSubmit, onCan
             默认模型
             <input className={ui.input} data-testid="provider-default-model" value={defaultModel} onChange={(e) => setDefaultModel(e.target.value)} />
           </label>
+          <fieldset className={ui.field} style={{ border: 0, padding: 0, margin: 0 }}>
+            <legend>范围</legend>
+            <div className={css.seg}>
+              <button
+                type="button"
+                className={`${css.choice} ${scopeKind === "universal" ? css.choiceOn : ""}`}
+                data-testid="provider-scope-universal"
+                onClick={() => setScopeKind("universal")}
+              >
+                全局
+              </button>
+              <button
+                type="button"
+                className={`${css.choice} ${scopeKind === "host" ? css.choiceOn : ""}`}
+                data-testid="provider-scope-host"
+                onClick={() => {
+                  setScopeKind("host");
+                  if (!scopeHostId && hosts[0]) setScopeHostId(hosts[0].id);
+                }}
+              >
+                仅此主机
+              </button>
+            </div>
+          </fieldset>
+          {scopeKind === "host" ? (
+            <label className={ui.field}>
+              主机
+              <select
+                className={ui.input}
+                data-testid="provider-scope-host-id"
+                value={scopeHostId}
+                onChange={(e) => setScopeHostId(e.target.value)}
+              >
+                {hosts.map((host) => (
+                  <option key={host.id} value={host.id}>
+                    {host.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           {kind === "gateway" ? (
             <label className={css.toggleRow}>
               <input
@@ -122,7 +179,7 @@ export function ProviderForm({ initial, rotateOnly, busy, error, onSubmit, onCan
                 checked={defaultGateway}
                 onChange={(e) => setDefaultGateway(e.target.checked)}
               />
-              设为默认网关（新建会话 gateway 选项使用）
+              设为该范围的默认网关
             </label>
           ) : null}
         </>

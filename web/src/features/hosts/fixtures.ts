@@ -34,6 +34,7 @@ export const HOST_FIXTURES: HostView[] = [
     labels: ["region:sg", "herdr", "gateway"],
     maxInstances: 8,
     instanceCount: 4,
+    providerBinding: "auto",
     herdr: { version: "0.4.0", socket: "/tmp/herdr.sock" },
   },
   {
@@ -50,6 +51,7 @@ export const HOST_FIXTURES: HostView[] = [
     labels: ["region:cn", "herdr"],
     maxInstances: 4,
     instanceCount: 1,
+    providerBinding: "auto",
   },
   {
     id: "hst_01993ab0-0000-7000-8000-00000000b003" as Id,
@@ -63,6 +65,7 @@ export const HOST_FIXTURES: HostView[] = [
     labels: ["local"],
     maxInstances: 2,
     instanceCount: 0,
+    providerBinding: "auto",
   },
   {
     id: "hst_01993ab0-0000-7000-8000-00000000b004" as Id,
@@ -76,5 +79,6 @@ export const HOST_FIXTURES: HostView[] = [
     labels: ["region:cn"],
     maxInstances: 2,
     instanceCount: 1,
+    providerBinding: "auto",
   },
 ];

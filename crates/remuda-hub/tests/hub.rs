@@ -271,6 +271,7 @@ async fn instance_configure_is_journaled_and_persisted() -> Result<()> {
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "model": "haiku",
         "prompt": "configure-me",
         "effort": { "index": 1, "name": "think", "kind": "claude" }
@@ -626,6 +627,7 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "prompt": "hi"
     })
     .to_string();
@@ -931,6 +933,7 @@ async fn follow_uses_cookie_or_header_and_never_query_token() -> Result<()> {
         "hostId": host_id.as_id().as_str(),
         "kind": "claude",
         "driver": "claude-print",
+        "delegation": "none",
         "prompt": "token-follow"
     })
     .to_string();
@@ -1074,8 +1077,7 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
         "kind": "claude",
         "driver": "claude-print",
         "providerProfileId": "gateway",
-        "delegation": "gateway",
-        "settingsOverlayPath": "~/.claude/settings.relay.json",
+        "delegation": "none",
         "maxBudgetUsd": "0.3",
         "permissionMode": "bypassPermissions",
         "prompt": "persist-delegation"
@@ -1091,8 +1093,9 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
     .await?;
     assert_eq!(status, 200, "{body}");
     let body: Value = serde_json::from_str(body.trim())?;
-    assert_eq!(body["instance"]["delegation"], json!("gateway"));
-    assert_eq!(body["instance"]["providerProfileId"], json!("gateway"));
+    assert_eq!(body["instance"]["delegation"], json!("none"));
+    assert_eq!(body["instance"]["providerProfileId"], json!("none"));
+    assert_eq!(body["instance"]["providerSource"], json!("request"));
     let instance_id = body["instance"]["instanceId"]
         .as_str()
         .context("instanceId")?
@@ -1108,8 +1111,8 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
     .await?;
     assert_eq!(status, 200, "{got}");
     let got: Value = serde_json::from_str(got.trim())?;
-    assert_eq!(got["delegation"], json!("gateway"));
-    assert_eq!(got["providerProfileId"], json!("gateway"));
+    assert_eq!(got["delegation"], json!("none"));
+    assert_eq!(got["providerProfileId"], json!("none"));
 
     let (status, _, listed) = http(
         hub.addr,
@@ -1126,8 +1129,112 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
         .and_then(|items| items.first())
         .cloned()
         .context("listed instance")?;
-    assert_eq!(item["delegation"], json!("gateway"));
-    assert_eq!(item["providerProfileId"], json!("gateway"));
+    assert_eq!(item["delegation"], json!("none"));
+    assert_eq!(item["providerProfileId"], json!("none"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_instance_fails_when_node_rejects_cwd() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "runtime.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "label": "local-development"
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let _ = node
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": "invalid request: cwd must resolve inside the registered workspace or a worktree beside it: /private/tmp resolves outside /tmp/workspace"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+        }
+    });
+
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "permissionMode": "manual",
+        "delegation": "none",
+        "cwd": "/tmp",
+        "prompt": "Use Bash to write a file"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 400, "{body}");
+    let body: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(body["code"], json!("BAD_REQUEST"));
+    let message = body["error"].as_str().unwrap_or("");
+    assert!(
+        message.contains("cwd must resolve inside the registered workspace"),
+        "{message}"
+    );
+
+    let (status, _, listed) = http(
+        hub.addr,
+        "GET",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(listed.trim())?;
+    let item = listed["items"]
+        .as_array()
+        .and_then(|items| items.first())
+        .cloned()
+        .context("listed instance")?;
+    assert_eq!(item["lifecycle"], json!("failed"), "{item}");
+    assert_eq!(item["durableSeq"], json!("0"), "{item}");
+    let last_error = item["lastError"].as_str().unwrap_or("");
+    assert!(
+        last_error.contains("cwd must resolve inside the registered workspace"),
+        "{last_error}"
+    );
     Ok(())
 }
 

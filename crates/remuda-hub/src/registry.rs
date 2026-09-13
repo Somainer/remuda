@@ -4,6 +4,7 @@ use crate::AppState;
 use crate::auth::{require_device, require_origin};
 use crate::error::HubError;
 use crate::inventory;
+use crate::provider_resolve;
 use crate::store::HostRecord;
 use axum::Json;
 use axum::Router;
@@ -42,6 +43,8 @@ struct PatchHostBody {
     labels: Option<Value>,
     #[serde(default)]
     max_instances: Option<i64>,
+    #[serde(default)]
+    provider_binding: Option<String>,
 }
 
 pub(crate) fn host_view(host: &HostRecord) -> Value {
@@ -65,6 +68,7 @@ pub(crate) fn host_view(host: &HostRecord) -> Value {
         "hostname": host.hostname,
         "ssh": host.ssh,
         "lastError": host.last_error,
+        "providerBinding": host.provider_binding,
     })
 }
 
@@ -100,13 +104,37 @@ async fn patch_host(
         .labels
         .as_ref()
         .and_then(|value| inventory::from_node_params(&json!({ "labels": value })).labels);
+    let provider_binding = match body.provider_binding.as_deref() {
+        Some(raw) => Some(validate_binding(&state, &id, raw).await?),
+        None => None,
+    };
     let host = state
         .store
-        .patch_host(id, body.name, labels, body.max_instances)
+        .patch_host(id, body.name, labels, body.max_instances, provider_binding)
         .await
         .map_err(crate::http::map_store)?;
     let live = state.nodes.kind_of(&host.host_id).await.is_some();
     Ok(Json(host_view(&crate::store::Store::with_live_link(
         host, live,
     ))))
+}
+
+async fn validate_binding(state: &AppState, host_id: &str, raw: &str) -> Result<String, HubError> {
+    let binding = provider_resolve::normalize_binding(raw).map_err(HubError::BadRequest)?;
+    if let Some(profile_id) = binding.strip_prefix("profile:") {
+        let profile = state
+            .store
+            .get_provider(profile_id.to_string())
+            .await?
+            .ok_or_else(|| {
+                HubError::BadRequest(format!("unknown provider profile {profile_id}"))
+            })?;
+        if !provider_resolve::profile_allowed_on_host(&profile.scope, host_id) {
+            return Err(HubError::BadRequest(format!(
+                "profile {profile_id} is scoped to {}",
+                profile.scope
+            )));
+        }
+    }
+    Ok(binding)
 }

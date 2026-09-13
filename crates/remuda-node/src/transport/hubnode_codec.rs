@@ -299,6 +299,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             settings_overlay_path: None,
             claude_config_dir: None,
             max_budget_usd: None,
+            provider_overlay: None,
+            provider_auth_token: None,
         },
     };
     request.apply_spec_launch_fields(&spec);

@@ -417,6 +417,15 @@ impl DevNode {
         }
     }
 
+    /// Carrier supervisor for Instance workers, when this Node owns a Herdr
+    /// session. A fake-driver Node has no carrier to recover.
+    fn carrier_supervisor(&self) -> Option<crate::carrier_recovery::CarrierSupervisor> {
+        self.inner
+            .herdr_config
+            .as_ref()
+            .map(|_| crate::carrier_recovery::CarrierSupervisor::new(&self.inner))
+    }
+
     /// Node data directory, when one is configured.
     fn data_dir(&self) -> Option<std::path::PathBuf> {
         if let Ok(slot) = self.inner.attachment_root.read()
@@ -643,6 +652,7 @@ impl DevNode {
         let tty = self.inner.tty.clone();
         let data_dir = self.data_dir();
         let worker_instance = instance_id.clone();
+        let carrier = self.carrier_supervisor();
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(materialize_instance(
@@ -655,6 +665,7 @@ impl DevNode {
                 create_command,
                 initial_prompt,
                 data_dir,
+                carrier,
             ))
             .catch_unwind()
             .await;
@@ -699,10 +710,18 @@ impl DevNode {
         let interactions = Arc::clone(&self.inner.interactions);
         let data_dir = self.data_dir();
         let id = instance_id.clone();
+        let carrier = self.carrier_supervisor();
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
-            if let Err(error) =
-                instance_worker(store.clone(), id.clone(), driver, receiver, interactions).await
+            if let Err(error) = instance_worker(
+                store.clone(),
+                id.clone(),
+                driver,
+                receiver,
+                interactions,
+                carrier,
+            )
+            .await
             {
                 tracing::error!(%error, "adopted instance task exited");
                 record_task_exit(store.as_ref(), &id, "driver-task-exited");
@@ -809,10 +828,12 @@ async fn materialize_instance(
     initial_prompt: String,
     // Node data dir, so this worker can drop its attachments on the way out.
     data_dir: Option<std::path::PathBuf>,
+    carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
 ) -> Result<(), NodeError> {
     let observations = match driver.start().await {
         Ok(observations) => observations,
         Err(error) => {
+            notify_carrier(carrier.as_ref(), &error);
             reject_materialization(
                 store.as_ref(),
                 &instance_id,
@@ -886,6 +907,7 @@ async fn materialize_instance(
             receiver,
             interactions,
             Some((create_command, initial_prompt)),
+            carrier,
         )
         .await;
         tty.stop(&instance_id).await;
@@ -911,11 +933,20 @@ async fn materialize_instance(
                 close_after: false,
             },
             Arc::clone(&interactions),
+            carrier.clone(),
         )
         .await?;
     }
 
-    let result = instance_worker(store, instance_id.clone(), driver, receiver, interactions).await;
+    let result = instance_worker(
+        store,
+        instance_id.clone(),
+        driver,
+        receiver,
+        interactions,
+        carrier,
+    )
+    .await;
     tty.stop(&instance_id).await;
     drop_attachments(data_dir.as_deref(), &instance_id);
     result
@@ -975,9 +1006,19 @@ async fn instance_worker(
     driver: Arc<dyn Driver>,
     mut receiver: mpsc::Receiver<QueuedCommand>,
     interactions: Arc<InteractionRuntime>,
+    carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
 ) -> Result<(), NodeError> {
     if pty_queue::is_pty(driver.kind()) {
-        return pty_queue::run(store, instance_id, driver, receiver, interactions, None).await;
+        return pty_queue::run(
+            store,
+            instance_id,
+            driver,
+            receiver,
+            interactions,
+            None,
+            carrier,
+        )
+        .await;
     }
     while let Some(queued) = receiver.recv().await {
         let close_after = queued.close_after;
@@ -987,6 +1028,7 @@ async fn instance_worker(
             Arc::clone(&driver),
             queued,
             Arc::clone(&interactions),
+            carrier.clone(),
         )
         .await?;
         if close_after {
@@ -1002,6 +1044,7 @@ async fn execute_queued(
     driver: Arc<dyn Driver>,
     queued: QueuedCommand,
     interactions: Arc<InteractionRuntime>,
+    carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
 ) -> Result<(), NodeError> {
     let mut command = store.get_command(&queued.command_id)?;
     if let DriverRequest::Send { prompt, .. } = &queued.request {
@@ -1019,6 +1062,7 @@ async fn execute_queued(
             crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?,
         )?;
         if let Err(error) = driver.wait_control().await {
+            notify_carrier(carrier.as_ref(), &error);
             let diagnostic = DriverEmission::NativeLifecycle {
                 name: "control-wait".to_owned(),
                 status: error.to_string(),
@@ -1080,6 +1124,9 @@ async fn execute_queued(
             )?;
         }
         Err(error) => {
+            // A lost carrier is the Node's problem to fix, not the command's.
+            // Recovery runs in the background; this command still settles now.
+            notify_carrier(carrier.as_ref(), &error);
             let diagnostic = DriverEmission::NativeLifecycle {
                 name: "fake-driver-error".to_owned(),
                 status: error.to_string(),
@@ -1104,6 +1151,17 @@ async fn execute_queued(
     }
     store.save_command(command.clone())?;
     append_command_lifecycle(store.as_ref(), instance_id, &command, "settled")
+}
+
+/// Ask the Node to restart a lost Herdr session server, if that is what this
+/// error means. Never blocks the command that hit it.
+fn notify_carrier(
+    carrier: Option<&crate::carrier_recovery::CarrierSupervisor>,
+    error: &crate::DriverError,
+) {
+    if let Some(carrier) = carrier {
+        carrier.on_driver_error(error);
+    }
 }
 
 fn finish_instance_operation(

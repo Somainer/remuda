@@ -1513,6 +1513,9 @@ pub(crate) fn map_herdr(err: remuda_herdr::Error) -> DriverError {
         } if matches!(code.as_str(), "agent_not_ready" | "agent_blocked") => {
             DriverError::ControlUnavailable
         }
+        // Keep the herdr wording intact: the Node reads it to tell a lost
+        // carrier (restartable) from an agent that simply refused the work.
+        other if other.is_transient_carrier() => DriverError::CarrierUnavailable(other.to_string()),
         other => DriverError::InvalidLaunchSpec(other.to_string()),
     }
 }

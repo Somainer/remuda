@@ -10,16 +10,18 @@
 mod client;
 mod error;
 mod events;
+mod retry;
 mod rpc;
 mod server;
 mod terminal;
 mod types;
 
 pub use client::{Client, EventStream, default_api_socket, herdr_config_dir, session_sockets};
-pub use error::Error;
+pub use error::{Error, SERVER_UNAVAILABLE};
 pub use events::{Event, EventKind, EventsSubscribeParams, Subscription, normalize_event_name};
+pub use retry::{DEFAULT_MAX_WAIT, RetryPolicy, WaitOutcome};
 pub use rpc::{Incoming, RpcErrorBody, RpcRequest, parse_line};
-pub use server::HerdrServer;
+pub use server::{EnsureOptions, HerdrServer};
 pub use terminal::{
     TerminalCommand, TerminalEnvelope, TerminalFrame, TerminalMode, TerminalObserver, TerminalOpen,
     parse_terminal_line,

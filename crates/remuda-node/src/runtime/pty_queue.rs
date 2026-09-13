@@ -29,6 +29,7 @@ pub(super) async fn run(
     mut receiver: mpsc::Receiver<QueuedCommand>,
     interactions: Arc<InteractionRuntime>,
     create: Option<(Command, String)>,
+    carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
 ) -> Result<(), NodeError> {
     let capacity = receiver.max_capacity();
     let mut pending = VecDeque::new();
@@ -68,7 +69,7 @@ pub(super) async fn run(
                     if matches!(queued.request, DriverRequest::Cancel | DriverRequest::Close) {
                         interrupt_pending(store.as_ref(), &instance_id, &mut pending, "queued input cancelled")?;
                     }
-                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone()).await?;
+                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone()).await?;
                     if close_after && store.get_instance(&instance_id)?.lifecycle == InstanceLifecycle::Exited {
                         receiver.close();
                         while let Some(queued) = receiver.recv().await {
@@ -88,7 +89,7 @@ pub(super) async fn run(
                     continue;
                 }
                 if let Some(prompt) = pending.front_mut()
-                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt).await?
+                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt, carrier.as_ref()).await?
                 {
                     pending.pop_front();
                 }
@@ -164,6 +165,7 @@ async fn deliver(
     driver: &dyn Driver,
     interactions: &InteractionRuntime,
     prompt: &mut PendingPrompt,
+    carrier: Option<&crate::carrier_recovery::CarrierSupervisor>,
 ) -> Result<bool, NodeError> {
     // Cancelling a readiness probe cannot submit input. Never time out or replay send().
     let execution =
@@ -218,6 +220,9 @@ async fn deliver(
         }
         Err(error) => {
             // A failed/uncertain send is never replayed and does not invalidate a live PTY.
+            // A carrier loss is the exception worth acting on: the session
+            // server, not this prompt, is what needs restarting.
+            super::notify_carrier(carrier, &error);
             update_message(store, instance_id, prompt, ContentStatus::Interrupted)?;
             let diagnostic = DriverEmission::NativeLifecycle {
                 name: "pty-prompt-error".into(),

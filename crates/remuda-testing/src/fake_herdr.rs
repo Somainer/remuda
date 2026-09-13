@@ -91,6 +91,15 @@ pub struct FakeHerdrOptions {
     pub frames: PathBuf,
     /// Deterministic delay before replying to `agent.start`.
     pub agent_start_delay: Duration,
+    /// Answer this many non-`ping` requests with `server_unavailable` before
+    /// behaving normally.
+    ///
+    /// Models herdr's real shutdown window, where `ping` keeps succeeding
+    /// while every other method is refused.
+    pub unavailable_calls: usize,
+    /// Unlink the socket and stop serving once the shutdown window ends,
+    /// modelling a server that actually exits.
+    pub exit_after_unavailable: bool,
 }
 
 impl FakeHerdrOptions {
@@ -101,6 +110,8 @@ impl FakeHerdrOptions {
             script: FakeHerdrScript::Ok,
             frames: herdr_frames_path(),
             agent_start_delay: Duration::ZERO,
+            unavailable_calls: 0,
+            exit_after_unavailable: false,
         }
     }
 
@@ -108,6 +119,22 @@ impl FakeHerdrOptions {
     #[must_use]
     pub fn with_agent_start_delay(mut self, delay: Duration) -> Self {
         self.agent_start_delay = delay;
+        self
+    }
+
+    /// Refuse the first `calls` non-`ping` requests with `server_unavailable`,
+    /// exactly as herdr 0.9.0 does while shutting down.
+    #[must_use]
+    pub fn shutting_down_for(mut self, calls: usize) -> Self {
+        self.unavailable_calls = calls;
+        self
+    }
+
+    /// After the shutdown window, unlink the socket and stop accepting, so a
+    /// caller sees the predecessor genuinely exit.
+    #[must_use]
+    pub fn exiting_after_shutdown(mut self) -> Self {
+        self.exit_after_unavailable = true;
         self
     }
 }
@@ -244,8 +271,11 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(Cli::Help);
     }
+    // `HERDR_SOCKET_PATH` is what `HerdrServer::ensure` exports when it spawns
+    // a server, so honouring it lets the fake stand in for `herdr server`.
     let mut socket = std::env::var("FAKE_HERDR_SOCKET")
         .ok()
+        .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("fake-herdr.sock"));
     let mut script = FakeHerdrScript::Ok;
@@ -255,6 +285,12 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .unwrap_or_else(herdr_frames_path);
     let mut cols: u16 = 80;
     let mut rows: u16 = 24;
+    let mut unavailable_calls: usize = std::env::var("FAKE_HERDR_UNAVAILABLE_CALLS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut exit_after_unavailable = std::env::var("FAKE_HERDR_EXIT_AFTER_UNAVAILABLE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -297,6 +333,15 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
                     .parse()
                     .map_err(|_| FakeHerdrError::Args("bad --rows".into()))?;
             }
+            "--unavailable-calls" => {
+                i += 1;
+                unavailable_calls = args
+                    .get(i)
+                    .ok_or_else(|| FakeHerdrError::Args("missing --unavailable-calls".into()))?
+                    .parse()
+                    .map_err(|_| FakeHerdrError::Args("bad --unavailable-calls".into()))?;
+            }
+            "--exit-after-unavailable" => exit_after_unavailable = true,
             "--session" | "--takeover" => {
                 if args[i] == "--session" {
                     i += 1;
@@ -312,12 +357,19 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
     if positional.first().map(String::as_str) == Some("terminal") {
         return Ok(Cli::Observe { frames, cols, rows });
     }
-    if positional.first().map(String::as_str) == Some("serve") || positional.is_empty() {
+    // `serve` is the fake's own spelling; `server` is what herdr's CLI uses and
+    // therefore what `HerdrServer::ensure` passes.
+    if matches!(
+        positional.first().map(String::as_str),
+        Some("serve") | Some("server") | None
+    ) {
         return Ok(Cli::Serve(FakeHerdrOptions {
             socket,
             script,
             frames,
             agent_start_delay: Duration::ZERO,
+            unavailable_calls,
+            exit_after_unavailable,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -375,7 +427,10 @@ async fn serve(
     let state = Arc::new(Mutex::new(State::new(
         options.script,
         options.agent_start_delay,
+        options.unavailable_calls,
+        options.exit_after_unavailable,
     )));
+    let (exit_tx, mut exit_rx) = watch::channel(false);
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -383,11 +438,19 @@ async fn serve(
                     break;
                 }
             }
+            // The scripted shutdown window closed: unlink and stop accepting,
+            // exactly as a real herdr server does on its way out.
+            _ = exit_rx.changed() => {
+                if *exit_rx.borrow() {
+                    break;
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let state = Arc::clone(&state);
+                let exit_tx = exit_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_conn(stream, state).await {
+                    if let Err(err) = handle_conn(stream, state, exit_tx).await {
                         tracing::debug!(error = %err, "fake-herdr connection ended");
                     }
                 });
@@ -401,6 +464,10 @@ async fn serve(
 struct State {
     script: FakeHerdrScript,
     agent_start_delay: Duration,
+    /// Remaining non-`ping` requests to refuse with `server_unavailable`.
+    unavailable_calls: usize,
+    /// Stop serving once the shutdown window closes.
+    exit_after_unavailable: bool,
     next_ws: u32,
     next_tab: u32,
     next_pane: u32,
@@ -416,10 +483,17 @@ struct State {
 }
 
 impl State {
-    fn new(script: FakeHerdrScript, agent_start_delay: Duration) -> Self {
+    fn new(
+        script: FakeHerdrScript,
+        agent_start_delay: Duration,
+        unavailable_calls: usize,
+        exit_after_unavailable: bool,
+    ) -> Self {
         Self {
             script,
             agent_start_delay,
+            unavailable_calls,
+            exit_after_unavailable,
             next_ws: 1,
             next_tab: 1,
             next_pane: 1,
@@ -470,7 +544,11 @@ fn request_id(id: &Value) -> String {
         .unwrap_or_default()
 }
 
-async fn handle_conn(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<(), FakeHerdrError> {
+async fn handle_conn(
+    stream: UnixStream,
+    state: Arc<Mutex<State>>,
+    exit_tx: watch::Sender<bool>,
+) -> Result<(), FakeHerdrError> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
@@ -478,6 +556,30 @@ async fn handle_conn(stream: UnixStream, state: Arc<Mutex<State>>) -> Result<(),
             continue;
         }
         let req: WireRequest = serde_json::from_str(&line)?;
+        // Shutdown window: `ping` still answers (herdr 0.9.0 behaviour), every
+        // other method is refused, so a caller probing with `ping` alone is
+        // fooled into thinking the server is healthy.
+        if req.method != "ping" {
+            let refuse = {
+                let mut st = lock_state(&state)?;
+                if st.unavailable_calls > 0 {
+                    st.unavailable_calls -= 1;
+                    if st.unavailable_calls == 0 && st.exit_after_unavailable {
+                        let _ = exit_tx.send(true);
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if refuse {
+                let body =
+                    error_reply(&req, "server_unavailable", "server is shutting down".into());
+                writer.write_all(body.as_bytes()).await?;
+                writer.flush().await?;
+                continue;
+            }
+        }
         if req.method == "events.subscribe" {
             handle_subscribe(&req, &mut writer, &state).await?;
             return Ok(());

@@ -46,6 +46,14 @@ pub enum DriverError {
     /// No live driver handle is available for control.
     #[error("control unavailable")]
     ControlUnavailable,
+    /// The PTY carrier (Herdr session server) refused the call because it is
+    /// shutting down, or its socket has gone.
+    ///
+    /// Distinct from [`Self::ControlUnavailable`], which means the *agent* is
+    /// not ready: this one is fixed by restarting the carrier, and the request
+    /// it names was never dispatched.
+    #[error("carrier unavailable: {0}")]
+    CarrierUnavailable(String),
     /// Isolated settings could not be written.
     #[error("settings isolation unavailable: {0}")]
     SettingsIsolationUnavailable(String),
@@ -79,7 +87,7 @@ impl DriverError {
             Self::BinaryChanged(_) => ErrorCode::BinaryChanged,
             Self::NativeSessionNotFound => ErrorCode::NativeSessionNotFound,
             Self::AttachWouldWake => ErrorCode::AttachWouldWake,
-            Self::ControlUnavailable => ErrorCode::ControlUnavailable,
+            Self::ControlUnavailable | Self::CarrierUnavailable(_) => ErrorCode::ControlUnavailable,
             Self::SettingsIsolationUnavailable(_) => ErrorCode::SettingsIsolationUnavailable,
             Self::BinaryNotFound(_) => ErrorCode::InvalidLaunchSpec,
             Self::Io(_) | Self::Json(_) | Self::Protocol(_) => ErrorCode::NativeProtocolError,

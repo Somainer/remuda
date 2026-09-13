@@ -24,9 +24,21 @@ pub enum Error {
         message: String,
     },
     /// The Unix socket closed before a matching response arrived.
+    ///
+    /// The request was already written, so its outcome is **unknown** and it
+    /// must not be retried blindly.
     #[error("herdr disconnected ({socket})")]
     Disconnected {
         /// Socket path that closed.
+        socket: PathBuf,
+    },
+    /// The socket could not be dialed at all (missing, refused, or unlinked
+    /// by a server that just exited).
+    ///
+    /// Nothing was written, so the request is safe to retry.
+    #[error("herdr unreachable ({socket})")]
+    Unreachable {
+        /// Socket path that could not be dialed.
         socket: PathBuf,
     },
     /// Request exceeded the client timeout.
@@ -81,10 +93,54 @@ pub enum Error {
     ReadOnlyTerminal,
 }
 
+/// Herdr's error code for a server that is winding down and refuses work.
+///
+/// Observed on herdr 0.9.0 between `server.stop` (or `SIGTERM`) and process
+/// exit: `ping` still answers, every other method returns this.
+pub const SERVER_UNAVAILABLE: &str = "server_unavailable";
+
 impl Error {
     /// True when the socket went away or the peer closed the stream.
     #[must_use]
     pub fn is_disconnect(&self) -> bool {
-        matches!(self, Self::Disconnected { .. } | Self::Io(_))
+        matches!(
+            self,
+            Self::Disconnected { .. } | Self::Unreachable { .. } | Self::Io(_)
+        )
+    }
+
+    /// True when the server accepted the connection but refused the request
+    /// because it is shutting down.
+    ///
+    /// Herdr answers `ping` throughout this window, so this is the only
+    /// reliable way to tell a live server from a dying one.
+    #[must_use]
+    pub fn is_server_unavailable(&self) -> bool {
+        match self {
+            Self::Api { code, message, .. } => {
+                code == SERVER_UNAVAILABLE || message.contains("server is shutting down")
+            }
+            _ => false,
+        }
+    }
+
+    /// True when a server restart can still resolve this and the request is
+    /// safe to send again: the server refused it because it is shutting down,
+    /// or the socket could not be dialed at all.
+    ///
+    /// Both cases prove the request was **not** dispatched. [`Self::Disconnected`]
+    /// and [`Self::Timeout`] are deliberately excluded — they leave the
+    /// outcome unknown, and replaying a prompt is worse than reporting it.
+    #[must_use]
+    pub fn is_transient_carrier(&self) -> bool {
+        match self {
+            Self::Api { .. } => self.is_server_unavailable(),
+            Self::Unreachable { .. } => true,
+            Self::Io(error) => matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ),
+            _ => false,
+        }
     }
 }

@@ -6,6 +6,7 @@ members = [
     "crates/remuda-codex-wire",
     "crates/remuda-acp-wire",
     "crates/remuda-herdr",
+    "crates/remuda-screen",
     "crates/remuda-driver",
     "crates/remuda-signal",
     "crates/remuda-journal",
@@ -55,6 +56,7 @@ remuda-claude-wire = { path = "crates/remuda-claude-wire" }
 remuda-acp-wire = { path = "crates/remuda-acp-wire" }
 remuda-codex-wire = { path = "crates/remuda-codex-wire" }
 remuda-herdr = { path = "crates/remuda-herdr" }
+remuda-screen = { path = "crates/remuda-screen" }
 remuda-driver = { path = "crates/remuda-driver" }
 remuda-signal = { path = "crates/remuda-signal" }
 remuda-journal = { path = "crates/remuda-journal" }

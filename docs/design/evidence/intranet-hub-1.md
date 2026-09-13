@@ -1,13 +1,16 @@
-# Intranet Hub 1 — staged, awaiting Caddy restart approval
+# Intranet Hub 1 — activated after approval
 
-Status: **BLOCKED awaiting-caddy-restart-approval**. Target URL (redacted):
-`https://remuda.<zone>`. Checked on 2026-09-13 Asia/Shanghai.
+Status: **activated; gateway and Hub HTTPS verified**. Target URL (redacted):
+`https://remuda.<zone>`. Approved activation completed on 2026-09-13 Asia/Shanghai;
+the [appended activation record](#approved-activation--2026-09-13) supersedes the
+historical staging status below. Browser login and Node acceptance remain pending.
 
-The latest coordinator instruction supersedes the earlier rollout instruction:
+At initial staging, the coordinator instruction superseded the rollout instruction:
 keep the Hub internally reachable, restore the active Caddy configuration, stage
 a reviewable import/admin change, and wait for explicit restart approval.
-**No restart or recreation of `deploy-caddy-1` was executed.** `apply` and
-`rollback` below have not been executed against the live container.
+**No restart or recreation of `deploy-caddy-1` was executed during that staging
+phase.** At that point, `apply` and `rollback` below had not been executed against
+the live container. The following sections preserve that earlier evidence.
 
 ## Executed and independently checked
 
@@ -120,7 +123,7 @@ Signal behavior was checked against [Caddy's official signal documentation](http
 A concurrent read-only probe during the temporary activation returned HTTPS 200,
 `{"ok":true}`, and curl certificate verification result 0; Caddy also logged
 successful certificate issuance. The later restoration/staged-only checks above
-are the final state. This transient HTTPS success is not final enablement, browser
+were the final state of the staging phase. This transient HTTPS success is not final enablement, browser
 login or Node acceptance.
 
 ## Validation and work deferred until approval
@@ -145,3 +148,126 @@ limitation, not proof of runtime execution capability.
 The public VPS variant remains under `deploy/public`; its Compose and shell
 checks passed. Its internal-CA CI smoke job was authored but not run locally after
 the priority change. No public VPS or tunnel software was deployed.
+
+## Approved activation — 2026-09-13
+
+The coordinator relayed explicit user approval for the complete prepared change:
+append the Remuda import, change global admin to `localhost:2019`, restart
+`deploy-caddy-1`, and automatically restore/restart the baseline if activation
+failed. This run completed successfully; automatic rollback was not invoked.
+No existing gateway site content was edited and no container was recreated.
+
+The worktree was switched to `wt/c-deploy/intranet-activate` from fetched,
+rewritten `origin/main` at `c121ae33e02fa7699002c6f9394f5197729869a1` before
+activation. The staged script still matched the reviewed SHA-256
+`d57c22f42c90880990b9248604a0589265013871327115ec01d595ca68ee9ea1`.
+This was activation of the existing `remuda-hub:e3a4133` image, not a new image
+build or a claim that the running Hub tracks current main.
+
+### Preconditions and commands
+
+- Kerberos/GSSAPI SSH to `<sg-host>` succeeded without an authentication bypass.
+- The user confirmed the private A record existed. A read-only `dig` from the
+  Mac independently returned one A answer for `remuda.<zone>`, matching the
+  reviewed SG host private address. No DNS record was created or changed.
+- The live Caddyfile hash, container start time and staged include hash matched
+  the private reviewed settings. No prior approved-apply backup existed.
+- Fresh `prepare` succeeded and validated the candidate while leaving the active
+  Caddyfile unchanged. Gateway readiness passed before and after preparation.
+
+Executed in order on `<sg-host>`:
+
+```bash
+cd ~/astergate/deploy
+python3 remuda-caddy-change.py prepare --settings .remuda-caddy-change.json
+python3 remuda-caddy-change.py apply --settings .remuda-caddy-change.json
+```
+
+`prepare` reported:
+
+```text
+Prepared and validated; active Caddyfile unchanged; no restart executed
+```
+
+`apply` exited 0 and reported:
+
+```text
+Apply complete: gateway readiness unchanged and Hub HTTPS health verified
+```
+
+### Exact active-file change
+
+The saved `Caddyfile.pre-remuda-approved` is byte-for-byte the reviewed baseline.
+The final active file exactly equals the prepared candidate. This zero-context
+pre/post diff contains the entire change; unchanged gateway site text is omitted.
+There are no credential values or private hostnames in these changed lines.
+
+```diff
+--- Caddyfile.before
++++ Caddyfile.after
+@@ -10 +10 @@
+-	admin off
++	admin localhost:2019
+@@ -89,0 +90,2 @@
++
++import /config/remuda/Caddyfile.d/*.caddy
+```
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Active file before / saved rollback baseline | `e8269d4937a623a37796d79b2e83ec947a724ca054839fac09a5eea2e37f4f6f` |
+| Active file after | `410e9f3917a33a3c8ce4f4e8396c04aa5bd7042991a5dd6282342704055ec95c` |
+| Reviewed include / persistent `/config` include | `6fbd17192ffb77c924bef0553fad6ccda06ab3572f46b4789a225482f58b677b` |
+
+### Restart timing and gateway interruption
+
+All timestamps in this table are UTC; the activation took place at approximately
+15:22:47–15:22:52 Asia/Shanghai on 2026-09-13.
+
+| Observation | Timestamp / result |
+| --- | --- |
+| Caddy container created | `2026-09-12T09:30:40.243751993Z` |
+| Previous Caddy `StartedAt` | `2026-09-12T09:30:46.724846208Z` |
+| Approved apply invoked from Mac | `2026-09-13T07:22:47.191111Z` |
+| Previous process `FinishedAt` | `2026-09-13T07:22:48.007154788Z` |
+| Restarted Caddy `StartedAt` | `2026-09-13T07:22:48.883647901Z` |
+| Apply completed successfully | `2026-09-13T07:22:51.986297Z` |
+| Container identity | Same ID as the initial inspection; running after restart |
+
+A concurrent Mac HTTPS probe checked the gateway readiness endpoint, HTTP status,
+certificate result and expected body hash, waiting 200 ms between requests with a
+2-second request timeout. It recorded 24 requests: 21 successful and 3 failed
+(two curl exit 7 connection failures and one curl exit 35 TLS handshake failure;
+all three had HTTP status `000`).
+
+The first failed request began at `07:22:48.195404Z`; the last began at
+`07:22:48.693100Z`. The next successful request began at `07:22:49.105214Z`.
+The interval from the first failed request start to the successful recovery
+response was **1.068 seconds**. The surrounding successful probe requests bracket
+that observed outage within **1.334 seconds**. Docker's process finish/start
+interval was **0.876 seconds**. These are sampled readiness measurements and
+process timestamps; they do not measure recovery of every existing agent stream.
+
+### Post-activation acceptance
+
+Independent requests from the Mac used `curl -q --noproxy '*'` with normal
+certificate verification, no insecure option, and explicit HTTP-status and
+`ssl_verify_result` capture. Disabling curl's configuration file made these
+checks independent of local curl defaults.
+
+| Check | Post-activation result |
+| --- | --- |
+| Gateway HTTPS `/health/ready` | HTTP 200, curl exit 0, `ssl_verify_result=0` |
+| Gateway body SHA-256 before and after | `753df501bf8ea6b776ec3e620d66f4b95d69345b546eb3ab2157df501bf4450e` |
+| `https://remuda.<zone>/healthz` | HTTP 200, curl exit 0, `ssl_verify_result=0`, body `{"ok":true}` |
+| Hub health body SHA-256 | `4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93` |
+| Caddy-to-Hub internal health | `docker exec deploy-caddy-1 wget -qO- http://remuda-hub:8080/healthz` returned `{"ok":true}` |
+| Admin API | Container-loopback request to `http://127.0.0.1:2019/config/admin/` returned `{"listen":"localhost:2019"}`; no host port 2019 published |
+| Trusted proxy | Hub's exact proxy allowlist still matches the current Caddy address on `deploy_default` |
+| Public origin | Existing Hub HTTPS public origin matches the verified Remuda health URL |
+| Hub container | Healthy; existing image `remuda-hub:e3a4133` retained |
+| Recovery state | Baseline backup and recovery state saved; rollback not needed |
+
+The Remuda import and loopback admin setting are now active. Browser login, Mac
+Node enrollment, SG Node installation and inventory acceptance remain separate
+pending work; no success for those checks is inferred from this HTTPS activation.

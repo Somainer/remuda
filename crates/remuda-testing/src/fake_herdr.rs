@@ -873,7 +873,9 @@ fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static 
         .or_else(|| st.panes.keys().next().map(String::as_str))
         .ok_or(("invalid_request", "missing pane_id".into()))?
         .to_string();
-    let foreground_processes = if st.shell_panes.contains(&pane_id) {
+    let foreground_processes = if st.shell_panes.contains(&pane_id)
+        || !st.agents.values().any(|agent| agent.pane_id == pane_id)
+    {
         vec![PaneProcessInfoProcess {
             pid: 4242,
             name: "zsh".into(),
@@ -900,6 +902,7 @@ fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static 
         process_info: Some(PaneProcessInfo {
             pane_id,
             shell_pid: Some(4242),
+            foreground_process_group_id: foreground_processes.first().map(|process| process.pid),
             foreground_processes,
         }),
     })

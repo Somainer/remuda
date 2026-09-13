@@ -20,6 +20,7 @@ mod materializer;
 mod process;
 mod profile;
 mod pty_interaction;
+mod pty_launch;
 mod pty_resource;
 mod recipe;
 mod secrets;

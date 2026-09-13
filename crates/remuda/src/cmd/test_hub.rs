@@ -73,6 +73,7 @@ async fn handle_conn(
     let bytes = payload.to_string();
     let reason = match status {
         200 => "OK",
+        403 => "Forbidden",
         404 => "Not Found",
         401 => "Unauthorized",
         _ => "Error",
@@ -93,6 +94,15 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
         ("GET", "/v1/instances/ins_test") => {
             (200, route("GET", "/v1/instances", "").1["items"][0].clone())
         }
+        ("GET", "/v1/attachments") => (
+            200,
+            json!({
+                "instanceId": "ins_test",
+                "items": [attachment("obj_png", "image/png", 168),
+                          attachment("obj_txt", "text/plain", 11)],
+            }),
+        ),
+        ("GET", path) if path.starts_with("/v1/attachments/") => attachment_content(path),
         ("POST", "/v1/login") => (
             200,
             json!({ "deviceId": "dev_1", "token": "device-token", "name": "remuda-cli" }),
@@ -240,6 +250,54 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
         }
         _ => (404, json!({ "code": "NOT_FOUND", "error": "not found" })),
     }
+}
+
+/// D-028 §4.5 staged attachment metadata, as `GET /v1/attachments` returns it.
+fn attachment(object_id: &str, media_type: &str, size: u64) -> Value {
+    json!({
+        "objectId": object_id,
+        "instanceId": "ins_test",
+        "mediaType": media_type,
+        "name": format!("{object_id}.bin"),
+        "size": size,
+        "digest": "0".repeat(64),
+        "expiresAt": "2126-01-01T00:00:00.000Z",
+    })
+}
+
+/// `GET /v1/attachments/{objectId}/content` for the fixture objects.
+///
+/// `obj_other` belongs to a different session, so the mock answers 403 exactly
+/// as the Hub does — the wrong-session path is a real HTTP refusal, not a
+/// client-side guess.
+fn attachment_content(path: &str) -> (u16, Value) {
+    use base64::Engine as _;
+    let object_id = path
+        .strip_prefix("/v1/attachments/")
+        .and_then(|rest| rest.strip_suffix("/content"))
+        .unwrap_or_default();
+    let base64 = base64::engine::general_purpose::STANDARD;
+    // A 1x1 red PNG signature plus filler; the Hub sniffed the type already.
+    let (media_type, size, data) = match object_id {
+        "obj_png" => ("image/png", 168, base64.encode(png_fixture())),
+        "obj_txt" => ("text/plain", 11, base64.encode("hello agent")),
+        "obj_pdf" => ("application/pdf", 512, base64.encode("%PDF-1.7 fake")),
+        "obj_big" => ("image/png", 3_584 * 1024 + 1, base64.encode(png_fixture())),
+        "obj_other" => {
+            return (403, json!({"code":"FORBIDDEN", "error":"forbidden"}));
+        }
+        _ => return (404, json!({"code":"NOT_FOUND", "error":"not found"})),
+    };
+    let mut body = attachment(object_id, media_type, size);
+    body["encoding"] = json!("base64");
+    body["data"] = json!(data);
+    (200, body)
+}
+
+fn png_fixture() -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(168, 0x5A);
+    bytes
 }
 
 async fn read_http(stream: &mut TcpStream) -> std::io::Result<Option<(String, String, String)>> {

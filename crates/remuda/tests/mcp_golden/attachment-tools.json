@@ -1,0 +1,31 @@
+[
+  {
+    "description": "Fetch one attachment staged for this session by objectId. Images come back as an image content block you can see directly; text comes back as text. Other media types are refused with their size and type.",
+    "inputSchema": {
+      "properties": {
+        "objectId": {
+          "description": "`obj_…` id, as named in the prompt's attachment mention or by remuda_attachments_list.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "objectId"
+      ],
+      "type": "object"
+    },
+    "name": "remuda_attachment"
+  },
+  {
+    "description": "List attachments staged for this session (objectId, mediaType, size). Call this to discover what `remuda_attachment` can fetch.",
+    "inputSchema": {
+      "properties": {
+        "instanceId": {
+          "description": "Session to list. Omit inside an agent session: it defaults to your own, and naming another session is refused.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "remuda_attachments_list"
+  }
+]

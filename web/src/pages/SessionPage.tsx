@@ -15,7 +15,7 @@ import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { canShowTerminal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
-import { nativeShort, isGenericPty, projectStatus, uiMode } from "../lib/status";
+import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
@@ -72,6 +72,7 @@ export function SessionPage({
   const title = hubStore.titleOf(instance.id);
   const structuredOnly = uiMode(instance) === "structured-only";
   const genericPty = isGenericPty(instance);
+  const promoted = isPromoted(instance);
   const activity = instance.activity.state === "known" ? instance.activity.value : instance.activity.state;
 
   return (
@@ -82,6 +83,8 @@ export function SessionPage({
       data-lifecycle={instance.lifecycle}
       data-activity={activity}
       data-driver={instance.driver}
+      data-kind={instance.kind}
+      data-mode={instance.mode ?? "native"}
       data-view={resolvedView}
       data-journal={journalStatus}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
@@ -98,6 +101,13 @@ export function SessionPage({
             <StateDot status={status} />
             {status}
           </span>
+          {promoted ? (
+            <span className={session.status} data-testid="promoted-badge" title={
+              instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
+            }>
+              {instance.kind} · promoted
+            </span>
+          ) : null}
           <span className={session.spacer} />
           {showTerminal ? (
             <span className={ui.row}>
@@ -160,7 +170,9 @@ export function SessionPage({
         <div className={session.meta} data-testid="session-meta">
           <span className={session.metaHost}>{hubStore.hostName(instance.hostId)}</span>
           <span className={session.dotSep}>·</span>
-          <span>{instance.driver}</span>
+          <span data-testid="session-driver">
+            {promoted ? `${instance.driver} · promoted` : instance.driver}
+          </span>
           <span className={session.dotSep}>·</span>
           <span data-testid="session-delegation">{instance.delegation ?? "none"}</span>
           <span className={session.dotSep}>·</span>

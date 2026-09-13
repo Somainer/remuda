@@ -1530,6 +1530,15 @@
           "model": { "type": ["string", "null"] },
           "effortName": { "type": ["string", "null"] },
           "effortIndex": { "type": ["integer", "null"] },
+          "mode": {
+            "type": ["string", "null"],
+            "enum": ["native", "promoted", null],
+            "description": "How this instance reached its kind. \"promoted\" means a terminal instance had a known agent CLI take over its PTY foreground (D-025); the driver stays shell-pty."
+          },
+          "promotedAt": {
+            "type": ["string", "null"],
+            "description": "When the terminal was promoted. Absent unless mode is \"promoted\"."
+          },
           "journalId": { "type": "string" },
           "durableSeq": { "type": "string" },
           "createdAt": { "type": "string" },

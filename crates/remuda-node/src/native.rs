@@ -49,6 +49,9 @@ pub struct NativeDriverConfig {
     pub herdr_orphan_sweep: bool,
     /// Automatically accept the exact Claude folder-trust dialog for registered workspaces.
     pub auto_trust_registered_workspaces: bool,
+    /// Promote a `terminal` instance when a known agent CLI takes the PTY
+    /// foreground, and hydrate its transcript (D-025).
+    pub promote_terminal_agents: bool,
     /// Claude print initialize timeout.
     pub print_handshake_timeout: Duration,
     /// Non-secret development environment forwarded to drivers.
@@ -85,6 +88,7 @@ impl NativeDriverConfig {
             herdr_orphan_sweep: !std::env::var("REMUDA_HERDR_ORPHAN_SWEEP")
                 .is_ok_and(|v| matches!(v.as_str(), "0" | "false")),
             auto_trust_registered_workspaces: true,
+            promote_terminal_agents: true,
             print_handshake_timeout: Duration::from_secs(30),
             extra_env,
         }
@@ -316,6 +320,10 @@ impl DriverFactory for NativeClaudeFactory {
                 options.extra_env = crate::origin::instance_env(&self.config.extra_env);
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.args = launch.request.args.clone();
+                // D-025: watch for an agent CLI taking the foreground so the
+                // structured view and composer follow what the human started.
+                options.promote = self.config.promote_terminal_agents;
+                options.claude_home = self.config.claude_native_home.clone();
                 Arc::new(ShellPtyDriver::new(options))
             }
             other => {

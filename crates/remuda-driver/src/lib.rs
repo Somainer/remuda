@@ -11,6 +11,7 @@ pub mod child_env;
 pub mod claude_bg;
 pub mod claude_print;
 pub mod claude_pty;
+pub mod claude_transcript;
 mod driver;
 mod error;
 mod flags;
@@ -19,6 +20,7 @@ pub mod interaction;
 mod materializer;
 mod process;
 mod profile;
+pub mod promote;
 mod pty_interaction;
 mod pty_launch;
 mod pty_resource;
@@ -35,7 +37,9 @@ pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
 };
 pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
+pub use claude_print::TranscriptMapper;
 pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
+pub use claude_transcript::{TranscriptTail, encode_project_dir, locate_transcript, project_dir};
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
 pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, KindPreset, WaitUntil, preset_by_id};
@@ -48,6 +52,9 @@ pub use profile::{
     ClaudeProviderOverlay, Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind,
     ProviderProfile, Secret, SecretBroker, SecretRef, SecretRefPolicy,
     claude_provider_settings_json, write_claude_provider_overlay,
+};
+pub use promote::{
+    AGENT_TABLE, AgentSignature, Detected, ProcessRow, ProcessTable, SystemProcessTable,
 };
 pub use pty_resource::{PtyResource, PtyResourceStore};
 pub use recipe::{

@@ -483,3 +483,160 @@ async fn pty_create_stays_accepted_with_a_queued_prompt_and_native_dialog() -> R
     hub.shutdown().await;
     Ok(())
 }
+
+/// D-025: a terminal instance whose PTY foreground becomes `claude` must show
+/// up as a promoted Claude session on the Hub, and fall back on demotion. The
+/// driver never changes — only `kind`, `mode` and `promotedAt`.
+#[tokio::test]
+async fn journal_replay_promotes_and_demotes_a_terminal_instance() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &bootstrap).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut node, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req)).await??;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hello",
+            "method": "node.hello",
+            "params": { "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+
+    let instance_id = InstanceId::new();
+    let ins = instance_id.as_id().as_str();
+    append(
+        &mut node,
+        "p0",
+        ins,
+        json!({
+            "kind": "lifecycle",
+            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+        }),
+    )
+    .await?;
+    let view = get_instance(addr, &cookie, ins).await?;
+    assert!(
+        view["mode"].is_null() || view["mode"] == json!("native"),
+        "an untouched instance is not promoted: {view}"
+    );
+
+    // The human typed `claude`; the driver journals the detection, then the
+    // promotion. Only the second one moves the entity.
+    append(
+        &mut node,
+        "p1",
+        ins,
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native",
+                "nativeName": "agent_detected",
+                "status": { "state": "known", "value": "agent detected: claude" },
+                "relatedIds": { "kind": "claude", "pid": "4242" },
+                "severity": "info"
+            }
+        }),
+    )
+    .await?;
+    let view = get_instance(addr, &cookie, ins).await?;
+    assert_eq!(
+        view["kind"], "claude",
+        "the create-time kind is claude in this fixture: {view}"
+    );
+    assert!(
+        view["mode"].is_null() || view["mode"] == json!("native"),
+        "the diagnostic alone must not promote: {view}"
+    );
+
+    append(
+        &mut node,
+        "p2",
+        ins,
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native",
+                "nativeName": "agent_promoted",
+                "status": { "state": "known", "value": "claude" },
+                "relatedIds": {
+                    "kind": "claude",
+                    "mode": "promoted",
+                    "promotedAt": "2026-09-13T10:00:00.000Z",
+                    "sessionId": "11111111-2222-4333-8444-555555555555"
+                },
+                "severity": "info"
+            }
+        }),
+    )
+    .await?;
+    let view = get_instance(addr, &cookie, ins).await?;
+    assert_eq!(view["kind"], "claude", "{view}");
+    assert_eq!(view["mode"], "promoted", "{view}");
+    assert_eq!(view["promotedAt"], "2026-09-13T10:00:00.000Z", "{view}");
+    assert_eq!(
+        view["lifecycle"], "running",
+        "promotion is not a lifecycle change: {view}"
+    );
+
+    // The list view the session picker reads must agree with the detail.
+    let (status, _, listed) = http(
+        addr,
+        "GET",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(listed.trim())?;
+    assert_eq!(listed["items"][0]["kind"], "claude", "{listed}");
+    assert_eq!(listed["items"][0]["mode"], "promoted", "{listed}");
+
+    // `/exit` in the terminal: back to a plain shell, promotedAt cleared.
+    append(
+        &mut node,
+        "p3",
+        ins,
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native",
+                "nativeName": "agent_demoted",
+                "status": { "state": "known", "value": "terminal" },
+                "relatedIds": {
+                    "kind": "terminal",
+                    "mode": "native",
+                    "previousKind": "claude"
+                },
+                "severity": "info"
+            }
+        }),
+    )
+    .await?;
+    let view = get_instance(addr, &cookie, ins).await?;
+    assert_eq!(view["kind"], "terminal", "{view}");
+    assert_eq!(view["mode"], "native", "{view}");
+    assert!(view["promotedAt"].is_null(), "{view}");
+    assert_eq!(
+        view["lifecycle"], "running",
+        "demotion is not a close: {view}"
+    );
+
+    node.close(None).await?;
+    hub.shutdown().await;
+    Ok(())
+}

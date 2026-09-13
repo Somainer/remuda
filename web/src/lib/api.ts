@@ -186,6 +186,8 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     model?: string | null;
     effortName?: string | null;
     effortIndex?: number | null;
+    mode?: string | null;
+    promotedAt?: string | null;
   };
   return {
     id,
@@ -237,6 +239,8 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     model: typeof extra.model === "string" ? extra.model : null,
     effortName: typeof extra.effortName === "string" ? extra.effortName : null,
     effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
+    mode: extra.mode === "promoted" || extra.mode === "native" ? extra.mode : null,
+    promotedAt: typeof extra.promotedAt === "string" ? extra.promotedAt : null,
   };
 }
 

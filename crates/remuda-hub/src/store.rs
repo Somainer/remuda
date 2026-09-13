@@ -240,6 +240,16 @@ pub struct InstanceRecord {
     /// Last native/driver error when lifecycle is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// `native` or `promoted` — how this instance reached its `kind` (D-025).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// When a terminal was promoted to an agent.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "promotedAt"
+    )]
+    pub promoted_at: Option<String>,
 }
 
 /// Command ledger row (three-state).
@@ -2094,6 +2104,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "TEXT NOT NULL DEFAULT 'universal'",
     )?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
+    ensure_column(&conn, "instances", "mode", "TEXT")?;
+    ensure_column(&conn, "instances", "promoted_at", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
@@ -2144,11 +2156,41 @@ fn apply_instance_projection(
         }
     }
     if kind == "lifecycle" && payload_type == "native" {
-        let native_name = payload
+        // D-025: a promoted terminal changes kind/mode on the Hub row too, so
+        // the session list and header follow the agent the human started.
+        let name = payload
             .get("nativeName")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_ascii_lowercase();
+            .unwrap_or("");
+        if matches!(name, "agent_promoted" | "agent_demoted") {
+            let related = payload.get("relatedIds");
+            let promoted_kind = related
+                .and_then(|ids| ids.get("kind"))
+                .and_then(Value::as_str);
+            let mode = related
+                .and_then(|ids| ids.get("mode"))
+                .and_then(Value::as_str)
+                .unwrap_or(if name == "agent_promoted" {
+                    "promoted"
+                } else {
+                    "native"
+                });
+            let promoted_at = (name == "agent_promoted")
+                .then(|| {
+                    related
+                        .and_then(|ids| ids.get("promotedAt"))
+                        .and_then(Value::as_str)
+                })
+                .flatten();
+            if let Some(promoted_kind) = promoted_kind {
+                conn.execute(
+                    "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3, updated_at = ?4
+                     WHERE id = ?5",
+                    params![promoted_kind, mode, promoted_at, now, instance_id],
+                )?;
+            }
+        }
+        let native_name = name.to_ascii_lowercase();
         let severity = payload
             .get("severity")
             .and_then(Value::as_str)
@@ -3024,7 +3066,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
 fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, StoreError> {
     conn.query_row(
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
-                title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error
+                title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
+                mode, promoted_at
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -3110,6 +3153,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
                 last_error: row.get(14)?,
+                mode: row.get(15)?,
+                promoted_at: row.get(16)?,
             })
         },
     )

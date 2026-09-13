@@ -5056,6 +5056,17 @@
           "$ref": "#/$defs/InstanceLifecycle",
           "description": "`lifecycle`; protocol §2.3."
         },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`mode`; protocol §2.3. How this Instance arrived at its current `kind`."
+        },
         "nativeRef": {
           "$ref": "#/$defs/NativeRef",
           "description": "`native_ref`; protocol §2.3."
@@ -5082,6 +5093,17 @@
         "processRef": {
           "$ref": "#/$defs/ProcessRef",
           "description": "`process_ref`; protocol §2.3."
+        },
+        "promotedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`promoted_at`; protocol §2.3. Set only while `mode` is\n[`InstanceMode::Promoted`] (D-025)."
         },
         "revision": {
           "$ref": "#/$defs/U64",
@@ -5420,6 +5442,21 @@
         "limit"
       ],
       "type": "object"
+    },
+    "InstanceMode": {
+      "description": "InstanceMode wire values; `protocol.md` §2.3.",
+      "oneOf": [
+        {
+          "const": "native",
+          "description": "Wire value `native`.",
+          "type": "string"
+        },
+        {
+          "const": "promoted",
+          "description": "Wire value `promoted`.",
+          "type": "string"
+        }
+      ]
     },
     "InstanceOpenTerminalParams": {
       "additionalProperties": false,

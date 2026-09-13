@@ -1105,11 +1105,13 @@ export type Instance = ({
   "lastError"?: (string | null);
   "launchId": Knowledge15;
   "lifecycle": InstanceLifecycle;
+  "mode"?: (InstanceMode | (null));
   "nativeRef": NativeRef;
   "ownerFence": U64;
   "ownership": Ownership;
   "parent": (InstanceParent | (null));
   "processRef": ProcessRef;
+  "promotedAt"?: (Timestamp | (null));
   "revision": U64;
   "specRevision": U64;
   "updatedAt": Timestamp;
@@ -1188,6 +1190,9 @@ export type InstanceListParams = ({
   "workspaceId"?: (WorkspaceId | (null));
   [key: string]: unknown;
 });
+
+/** InstanceMode wire values; `protocol.md` §2.3. */
+export type InstanceMode = ("native" | "promoted");
 
 /** Explicit human request to create a Claude background attach pane; §7.2. */
 export type InstanceOpenTerminalParams = ({

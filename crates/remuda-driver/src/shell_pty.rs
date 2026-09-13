@@ -1,26 +1,49 @@
 //! Login `$SHELL` in a portable-pty (kind `terminal`, driver `shell-pty`).
+//!
+//! The shell itself has no agent semantics, but a human can start one inside it.
+//! [`promotion`] watches the PTY's foreground process group and, when a known
+//! agent CLI takes it over, promotes the instance (D-025): `kind` becomes that
+//! agent, the driver stays `shell-pty`, and for Claude the native transcript is
+//! tailed so the structured view is the real conversation rather than a screen
+//! scrape.
 
 use crate::binary::{BinaryPin, pin_binary};
 use crate::capabilities::capability_snapshot;
 use crate::driver::{Driver, DriverAck, RunHandle};
 use crate::error::{DriverError, DriverResult};
 use crate::profile::{Delegation, ProviderKind};
+use crate::promote::{Detected, ProcessTable, ScreenStatus, SystemProcessTable};
 use crate::recipe::{LaunchAudit, LaunchRecipe, RecipePermission, RecipeProvider};
 use crate::tty::{LocalPty, TTY_SNAPSHOT_MAX, TtyBridge, logical_keys_to_bytes};
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use remuda_protocol::{
-    ApprovalAuthority, BoolLiteral, DriverInput, DriverKind, Id, InputDelivery, InstanceSpec, U64,
+    AgentKind, ApprovalAuthority, BoolLiteral, DriverInput, DriverKind, HostId, Id, InputDelivery,
+    InstanceId, InstanceSpec, RunId, U64,
 };
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::task::JoinHandle;
+
+mod promotion;
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+
+/// How often the promotion poller samples the foreground process group.
+/// Detection is then visible within ~2 poll intervals (D-025 budget: ~2 s).
+const PROMOTE_POLL: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Gap between a promoted prompt's body and its Enter.
+///
+/// The TUI debounces its composer input; an Enter that arrives before it has
+/// settled is dropped along with the body. 120 ms was measured as too short
+/// against a live Claude TUI and 500 ms as reliable (terminal-promote-1).
+const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Resolve `$SHELL`, falling back to `/bin/sh`.
 #[must_use]
@@ -48,6 +71,12 @@ pub struct ShellPtyOptions {
     pub cols: u16,
     /// Initial rows.
     pub rows: u16,
+    /// Watch the foreground process group and promote on a known agent CLI
+    /// (D-025). Off by default so unit tests get a plain shell.
+    pub promote: bool,
+    /// Claude config dir used to locate a promoted session's transcript.
+    /// Defaults to `$HOME/.claude`.
+    pub claude_home: Option<PathBuf>,
 }
 
 impl ShellPtyOptions {
@@ -62,6 +91,8 @@ impl ShellPtyOptions {
             agent_mcp: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
+            promote: false,
+            claude_home: None,
         }
     }
 }
@@ -77,20 +108,50 @@ struct PtyState {
     closed: AtomicBool,
 }
 
-/// Plain login shell in a PTY. No agent detection.
+/// Login shell in a PTY, with optional agent promotion (D-025).
 pub struct ShellPtyDriver {
     options: ShellPtyOptions,
     inner: Mutex<Option<Arc<PtyState>>>,
+    /// Set by the poller while a known agent CLI holds the foreground.
+    promoted: Arc<std::sync::Mutex<Option<Detected>>>,
+    /// Screen-derived readiness of that agent, when promoted.
+    status: Arc<std::sync::Mutex<Option<ScreenStatus>>>,
+    /// Promotion poller, stopped on close.
+    poller: Mutex<Option<JoinHandle<()>>>,
+    /// Process table behind detection; a fixture in tests.
+    table: Arc<dyn ProcessTable>,
+    seq: Arc<AtomicU64>,
 }
 
 impl ShellPtyDriver {
     /// Build an unstarted driver.
     #[must_use]
     pub fn new(options: ShellPtyOptions) -> Self {
+        Self::with_process_table(options, Arc::new(SystemProcessTable))
+    }
+
+    /// Build a driver whose promotion detection reads `table` instead of the
+    /// host process table. Tests drive detection from a fixture this way.
+    #[must_use]
+    pub fn with_process_table(options: ShellPtyOptions, table: Arc<dyn ProcessTable>) -> Self {
         Self {
             options,
             inner: Mutex::new(None),
+            promoted: Arc::new(std::sync::Mutex::new(None)),
+            status: Arc::new(std::sync::Mutex::new(None)),
+            poller: Mutex::new(None),
+            table,
+            seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Currently promoted agent kind, if the PTY's foreground is an agent CLI.
+    #[must_use]
+    pub fn promoted_kind(&self) -> Option<AgentKind> {
+        self.promoted
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|found| found.kind))
     }
 
     async fn state(&self) -> DriverResult<Arc<PtyState>> {
@@ -103,10 +164,11 @@ impl ShellPtyDriver {
 
     /// Spawn the PTY without an [`InstanceSpec`] (Node fake registry / tests).
     pub async fn spawn(&self) -> DriverResult<RunHandle> {
-        self.spawn_at(&self.options.cwd.to_string_lossy()).await
+        let cwd = self.options.cwd.to_string_lossy().into_owned();
+        self.spawn_at(&cwd, None).await
     }
 
-    async fn spawn_at(&self, cwd: &str) -> DriverResult<RunHandle> {
+    async fn spawn_at(&self, cwd: &str, spec: Option<&InstanceSpec>) -> DriverResult<RunHandle> {
         let cols = self.options.cols.max(1);
         let rows = self.options.rows.max(1);
         let pty_system = NativePtySystem::default();
@@ -142,10 +204,45 @@ impl ShellPtyDriver {
             .map_err(DriverError::Io)?;
         *self.inner.lock().await = Some(Arc::clone(&state));
         let recipe = shell_recipe(&self.options, cwd)?;
-        let (tx, rx) = mpsc::channel(8);
-        drop(tx);
+        let (tx, rx) = mpsc::channel(256);
+        if self.options.promote {
+            // Node rebinds instance/journal/host on commit; the driver only
+            // needs locally consistent ids (same contract as claude-pty).
+            let ctx = promotion::PromoteCtx {
+                instance_id: InstanceId::new(),
+                host_id: spec.map_or_else(HostId::new, |spec| spec.host.clone()),
+                journal_id: Id::new("obj")?,
+                run_id: RunId::new(),
+                cwd: PathBuf::from(cwd),
+                claude_home: self
+                    .options
+                    .claude_home
+                    .clone()
+                    .unwrap_or_else(default_claude_home),
+            };
+            *self.poller.lock().await = Some(promotion::spawn(
+                Arc::clone(&state),
+                ctx,
+                Arc::clone(&self.table),
+                Arc::clone(&self.promoted),
+                Arc::clone(&self.status),
+                tx,
+                Arc::clone(&self.seq),
+            ));
+        } else {
+            drop(tx);
+        }
         Ok(RunHandle::new(recipe, DriverAck::transport_written(), rx))
     }
+}
+
+/// `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
+fn default_claude_home() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .unwrap_or_else(|| PathBuf::from(".claude"))
 }
 
 #[async_trait]
@@ -210,7 +307,24 @@ impl Driver for ShellPtyDriver {
                 "ShellPtyDriver requires driverKind shell-pty".into(),
             ));
         }
-        self.spawn_at(&spec.cwd).await
+        self.spawn_at(&spec.cwd.clone(), Some(&spec)).await
+    }
+
+    /// A plain shell always takes bytes. A promoted agent TUI only takes a
+    /// prompt when its screen says it is idle: typing into a running turn or a
+    /// native dialog would be swallowed or would answer the dialog by accident,
+    /// so the D-022 queue holds the prompt until the screen is ready.
+    async fn wait_control(&self) -> DriverResult<()> {
+        let _ = self.state().await?;
+        if self.promoted_kind().is_none() {
+            return Ok(());
+        }
+        match self.status.lock().ok().and_then(|slot| *slot) {
+            Some(ScreenStatus::Idle) => Ok(()),
+            // Booting, working, or blocked: not ready, and never a reason to
+            // tear down a healthy PTY.
+            _ => Err(DriverError::ControlUnavailable),
+        }
     }
 
     async fn attach(&self, _native_ref: remuda_protocol::NativeRef) -> DriverResult<DriverAck> {
@@ -235,11 +349,17 @@ impl Driver for ShellPtyDriver {
                 ));
             }
         };
-        let mut bytes = text.into_bytes();
-        if !bytes.ends_with(b"\r") && !bytes.ends_with(b"\n") {
-            bytes.push(b'\r');
-        }
-        self.write_tty(&bytes).await
+        let promoted = self.promoted_kind().is_some();
+        let (body, submit) = prompt_writes(&text, promoted);
+        self.write_tty(&body).await?;
+        let Some(submit) = submit else {
+            return Ok(DriverAck::transport_written());
+        };
+        // A promoted agent TUI reads its composer and its Enter as two separate
+        // reads: a single write carrying both is accepted as bytes but never
+        // submitted. Verified against a live Claude TUI (terminal-promote-1).
+        tokio::time::sleep(SUBMIT_DELAY).await;
+        self.write_tty(&submit).await
     }
 
     async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
@@ -276,6 +396,15 @@ impl Driver for ShellPtyDriver {
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
+        if let Some(poller) = self.poller.lock().await.take() {
+            poller.abort();
+        }
+        if let Ok(mut slot) = self.promoted.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.status.lock() {
+            *slot = None;
+        }
         let Some(state) = self.inner.lock().await.take() else {
             return Ok(DriverAck::not_dispatched());
         };
@@ -416,5 +545,72 @@ fn argv_redacted(args: &[String], shell: &Path) -> Vec<String> {
         vec![shell.to_string_lossy().into_owned(), "-l".into()]
     } else {
         args.to_vec()
+    }
+}
+
+/// Encode a prompt for the PTY as (body, optional separate submit).
+///
+/// A plain shell takes one write: the text with a trailing `\r`, as before.
+/// A promoted agent TUI takes two — the composer body, then the Enter — because
+/// it consumes its input line and its submit key as separate reads. Multi-line
+/// bodies are bracketed-paste wrapped so the TUI treats them as one paste
+/// rather than one submit per line.
+fn prompt_writes(text: &str, promoted: bool) -> (Vec<u8>, Option<Vec<u8>>) {
+    if !promoted {
+        let mut bytes = text.as_bytes().to_vec();
+        if !bytes.ends_with(b"\r") && !bytes.ends_with(b"\n") {
+            bytes.push(b'\r');
+        }
+        return (bytes, None);
+    }
+    let body = text.trim_end_matches(['\r', '\n']);
+    let multiline = body.contains('\n') || body.contains('\r');
+    let mut bytes = Vec::with_capacity(body.len() + 16);
+    if multiline {
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(body.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        bytes.extend_from_slice(body.as_bytes());
+    }
+    (bytes, Some(vec![b'\r']))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_shell_prompt_is_one_write_of_text_plus_a_carriage_return() {
+        assert_eq!(prompt_writes("ls -la", false), (b"ls -la\r".to_vec(), None));
+        // An explicit terminator is not doubled.
+        assert_eq!(prompt_writes("ls\n", false), (b"ls\n".to_vec(), None));
+    }
+
+    #[test]
+    fn a_promoted_prompt_sends_its_enter_as_a_separate_write() {
+        // A live Claude TUI accepts "text\r" as bytes but never submits it; the
+        // Enter has to arrive as its own read (terminal-promote-1).
+        let (body, submit) = prompt_writes("hello", true);
+        assert_eq!(body, b"hello".to_vec());
+        assert_eq!(submit, Some(b"\r".to_vec()));
+    }
+
+    #[test]
+    fn a_promoted_multiline_prompt_is_bracketed_so_the_tui_sees_one_paste() {
+        let (body, submit) = prompt_writes("first\nsecond", true);
+        assert_eq!(
+            body,
+            b"\x1b[200~first\nsecond\x1b[201~".to_vec(),
+            "multi-line prompts must not submit once per line"
+        );
+        assert_eq!(submit, Some(b"\r".to_vec()));
+    }
+
+    #[test]
+    fn a_trailing_newline_in_a_promoted_prompt_does_not_double_submit() {
+        let (body, submit) = prompt_writes("hello\n", true);
+        assert_eq!(body, b"hello".to_vec(), "the terminator becomes the submit");
+        assert_eq!(submit, Some(b"\r".to_vec()));
     }
 }

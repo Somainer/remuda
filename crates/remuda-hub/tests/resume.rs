@@ -26,6 +26,25 @@ fn session_started(session_id: &str, transcript: &str) -> Value {
     })
 }
 
+/// claude-print also emits hook lifecycles whose `nativeId` is a hook id, not
+/// a session. Treating one as a session records an id `--resume` rejects.
+fn hook_started(hook_id: &str) -> Value {
+    json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "topic": "hook",
+            "nativeName": "hook_started",
+            "nativeId": { "state": "known", "value": hook_id },
+            "status": { "state": "known", "value": "started" },
+            "relatedIds": { "hookEvent": "SessionStart", "hookId": hook_id },
+            "dataRef": null,
+            "severity": "info",
+            "affectsCompletion": false
+        }
+    })
+}
+
 fn exited() -> Value {
     json!({
         "kind": "lifecycle",
@@ -129,6 +148,11 @@ async fn resume_creates_a_linked_child_on_both_targets_and_refuses_agents() -> R
 
     let session = "01993ab0-0000-7000-8000-0000000000cc";
     append_tx.send((parent.clone(), session_started(session, "/tmp/t.jsonl")))?;
+    // Hook lifecycles arrive after the session one and must not overwrite it.
+    append_tx.send((
+        parent.clone(),
+        hook_started("f121381b-c2c9-47fd-a253-f5efea4e4c94"),
+    ))?;
     append_tx.send((parent.clone(), exited()))?;
     let view = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

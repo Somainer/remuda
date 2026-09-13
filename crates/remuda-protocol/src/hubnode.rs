@@ -36,6 +36,8 @@ pub const METHOD_WORKSPACE_REGISTER: &str = "workspace.register";
 pub const METHOD_WORKSPACE_UNREGISTER: &str = "workspace.unregister";
 /// Create an Instance on the Node.
 pub const METHOD_INSTANCE_CREATE: &str = "instance.create";
+/// Continue an exited Instance's native session on a new Instance (D-026).
+pub const METHOD_INSTANCE_RESUME: &str = "instance.resume";
 /// Submit a prompt to an Instance.
 pub const METHOD_INSTANCE_SEND: &str = "instance.send";
 /// Switch model / effort on a live Instance.
@@ -134,6 +136,8 @@ pub enum HubNodeMethod {
     WorkspaceUnregister,
     /// [`METHOD_INSTANCE_CREATE`].
     InstanceCreate,
+    /// [`METHOD_INSTANCE_RESUME`].
+    InstanceResume,
     /// [`METHOD_INSTANCE_SEND`].
     InstanceSend,
     /// [`METHOD_INSTANCE_CONFIGURE`].
@@ -655,6 +659,7 @@ impl HubNodeMethod {
             Self::WorkspaceRegister => METHOD_WORKSPACE_REGISTER,
             Self::WorkspaceUnregister => METHOD_WORKSPACE_UNREGISTER,
             Self::InstanceCreate => METHOD_INSTANCE_CREATE,
+            Self::InstanceResume => METHOD_INSTANCE_RESUME,
             Self::InstanceSend => METHOD_INSTANCE_SEND,
             Self::InstanceConfigure => METHOD_INSTANCE_CONFIGURE,
             Self::InstanceCancel => METHOD_INSTANCE_CANCEL,
@@ -682,6 +687,7 @@ impl HubNodeMethod {
             METHOD_WORKSPACE_REGISTER => Self::WorkspaceRegister,
             METHOD_WORKSPACE_UNREGISTER => Self::WorkspaceUnregister,
             METHOD_INSTANCE_CREATE => Self::InstanceCreate,
+            METHOD_INSTANCE_RESUME => Self::InstanceResume,
             METHOD_INSTANCE_SEND => Self::InstanceSend,
             METHOD_INSTANCE_CONFIGURE => Self::InstanceConfigure,
             METHOD_INSTANCE_CANCEL => Self::InstanceCancel,

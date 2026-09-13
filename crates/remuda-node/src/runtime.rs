@@ -1237,10 +1237,24 @@ fn native_session_evidence(
     let LifecyclePayload::Native(native) = payload.as_ref() else {
         return None;
     };
-    if !matches!(
-        native.topic,
-        remuda_protocol::LifecycleTopic::Session | remuda_protocol::LifecycleTopic::Hook
-    ) {
+    // `nativeId` means different things per topic, so match the two events
+    // that actually carry a session: claude-print's `session` lifecycle, and
+    // claude-pty's SessionStart hook. Claude-print also emits hook lifecycles
+    // whose nativeId is a *hook* id — accepting those overwrote the real
+    // session with an id `--resume` rejects.
+    let transcript_path = native
+        .related_ids
+        .get("transcriptPath")
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty());
+    let carries_session = match native.topic {
+        remuda_protocol::LifecycleTopic::Session => native.native_name == "session",
+        remuda_protocol::LifecycleTopic::Hook => {
+            native.native_name == "SessionStart" && transcript_path.is_some()
+        }
+        _ => false,
+    };
+    if !carries_session {
         return None;
     }
     let session_id = match &native.native_id {
@@ -1249,11 +1263,7 @@ fn native_session_evidence(
     };
     Some(NativeSessionEvidence {
         session_id,
-        transcript_path: native
-            .related_ids
-            .get("transcriptPath")
-            .map(|path| path.trim().to_owned())
-            .filter(|path| !path.is_empty()),
+        transcript_path,
     })
 }
 
@@ -1929,6 +1939,102 @@ mod tests {
     use super::*;
     use crate::{FakeDriver, MemoryStore};
     use std::time::Duration;
+
+    fn native_lifecycle(
+        topic: remuda_protocol::LifecycleTopic,
+        name: &str,
+        native_id: &str,
+        related: &[(&str, &str)],
+    ) -> remuda_protocol::Observation {
+        let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+            remuda_protocol::NativeLifecycle {
+                topic,
+                native_name: name.to_owned(),
+                native_id: Knowledge::Known {
+                    value: native_id.to_owned(),
+                },
+                status: Knowledge::Known {
+                    value: "started".to_owned(),
+                },
+                related_ids: related
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+                data_ref: None,
+                severity: remuda_protocol::Severity::Info,
+                affects_completion: false,
+            },
+        ))));
+        remuda_protocol::Observation {
+            schema_version: remuda_protocol::SchemaVersion,
+            event_id: remuda_protocol::EventId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            instance_id: InstanceId::new(),
+            run_id: None,
+            host_id: HostId::new(),
+            process_generation: U64(1),
+            run_generation: None,
+            seq: U64(1),
+            observed_at: timestamp_now().expect("now"),
+            native_at: unknown("test"),
+            source: crate::driver::runtime_source(
+                &fixture_instance(
+                    InstanceId::new(),
+                    HostId::new(),
+                    WorkspaceId::new(),
+                    remuda_protocol::DriverKind::ClaudePrint,
+                )
+                .expect("fixture instance"),
+                U64(1),
+            ),
+            completeness: Completeness::Structured,
+            raw_ref: None,
+            evidence_event_ids: Vec::new(),
+            body: payload,
+        }
+    }
+
+    /// A live claude-print run emits several hook lifecycles after its session
+    /// event, and `nativeId` there is the *hook* id. Recording one left
+    /// nativeRef holding an id `claude --resume` rejects (D-026).
+    #[test]
+    fn only_session_bearing_lifecycles_are_read_as_the_native_session() {
+        let session = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Session,
+            "session",
+            "2a99b5d4-f182-425f-ab5b-7f3541dee9bc",
+            &[("model", "claude-sonnet")],
+        );
+        let evidence = native_session_evidence(&session).expect("session lifecycle");
+        assert_eq!(evidence.session_id, "2a99b5d4-f182-425f-ab5b-7f3541dee9bc");
+        assert!(evidence.transcript_path.is_none());
+
+        let hook = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Hook,
+            "hook_started",
+            "f121381b-c2c9-47fd-a253-f5efea4e4c94",
+            &[("hookEvent", "SessionStart"), ("hookId", "f121381b")],
+        );
+        assert!(
+            native_session_evidence(&hook).is_none(),
+            "a hook id is not a session id"
+        );
+
+        // claude-pty's own SessionStart hook does carry the session, and proves
+        // it by naming the transcript the session writes to.
+        let pty_hook = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Hook,
+            "SessionStart",
+            "3b7c1f20-0000-4000-8000-00000000aaaa",
+            &[("transcriptPath", "/tmp/session.jsonl")],
+        );
+        let evidence = native_session_evidence(&pty_hook).expect("pty SessionStart");
+        assert_eq!(evidence.session_id, "3b7c1f20-0000-4000-8000-00000000aaaa");
+        assert_eq!(
+            evidence.transcript_path.as_deref(),
+            Some("/tmp/session.jsonl")
+        );
+    }
 
     #[tokio::test]
     async fn driver_panic_is_contained_and_marks_dispatch_unknown() {

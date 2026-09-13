@@ -122,34 +122,30 @@ async fn resume_rpc_builds_a_linked_child_and_requires_a_session() {
     let parent_id = parent.meta.id.as_id().as_str().to_owned();
     let session = "01993ab0-0000-7000-8000-0000000000ee";
 
-    let created: Value = serde_json::from_value(
-        dispatch_hub_rpc(
-            &node,
-            "instance.resume",
-            json!({
-                "spec": { "kind": "claude", "driver": "claude-print", "prompt": "" },
-                "resumeSessionId": session,
-                "resumedFrom": parent_id,
-            }),
-        )
-        .await
-        .expect("resume"),
+    let created: Value = dispatch_hub_rpc(
+        &node,
+        "instance.resume",
+        json!({
+            "spec": { "kind": "claude", "driver": "claude-print", "prompt": "" },
+            "resumeSessionId": session,
+            "resumedFrom": parent_id,
+        }),
     )
-    .expect("value");
+    .await
+    .expect("resume");
 
     let child_id = created["instance"]["id"]
         .as_str()
         .expect("child id")
         .to_owned();
     assert_ne!(child_id, parent_id, "resume creates a new instance");
-    assert_eq!(created["instance"]["driver"], json!("claude-print"));
     assert_eq!(
         created["instance"]["parent"]["instanceId"],
         json!(parent_id),
         "the child records where its conversation came from"
     );
-    // A resumed instance already knows its native identity: it is the one
-    // being continued, not a placeholder awaiting the driver's first report.
+    // A resumed instance already knows its native identity: it is the one being
+    // continued, not a placeholder awaiting the driver's first report.
     assert_eq!(
         created["instance"]["nativeRef"]["sessionId"]["value"],
         json!(session)

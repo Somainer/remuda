@@ -2915,7 +2915,24 @@ fn native_session_from_event(event: &Value) -> Option<(String, Option<String>)> 
     match payload.get("type").and_then(Value::as_str) {
         Some("native") => {
             let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
-            if topic != "session" && topic != "hook" {
+            let name = payload
+                .get("nativeName")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let transcript = payload
+                .pointer("/relatedIds/transcriptPath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            // `nativeId` is only a session on these two events; claude-print's
+            // hook lifecycles put a hook id there (D-026).
+            let carries_session = match topic {
+                "session" => name == "session",
+                "hook" => name == "SessionStart" && transcript.is_some(),
+                _ => false,
+            };
+            if !carries_session {
                 return None;
             }
             let session = payload
@@ -2923,12 +2940,6 @@ fn native_session_from_event(event: &Value) -> Option<(String, Option<String>)> 
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?;
-            let transcript = payload
-                .pointer("/relatedIds/transcriptPath")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
             Some((session.to_string(), transcript))
         }
         Some("entity") => {

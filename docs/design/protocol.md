@@ -209,6 +209,7 @@ stateDiagram-v2
 | `journalId` / `durableSeq` | `Id` / `U64` | instance journal；换进程不重置 seq |
 | `exit` | `Knowledge<{code: number\|null, signal: string\|null, observedAt: Timestamp}>` | 只能由 owner/supervisor 的退出证据赋值 |
 | `lastError?` | `string` | 可省略的 driver/原生诊断文本，通常随 `lifecycle=failed` 写入；只是展示用摘要，不是状态、不是终态证据，也不能替代 `exit` 或 Run 的 `terminalEvidence` |
+| `mode?` / `promotedAt?` | `native\|promoted` / `Timestamp` | 该 Instance 如何到达当前 `kind`。`promoted` 表示 `terminal` + `shell-pty` 实例的 PTY 前台被已知 agent CLI 接管（D-025）：`kind` 改为该 agent，`driver` 仍是 `shell-pty`，`promotedAt` 记录检测时刻。降级回 `terminal` 时 `mode` 复位为 `native` 且清空 `promotedAt`。只有 driver 的 `agent_promoted` / `agent_demoted` native lifecycle 能改这两个字段，同名 `agent_detected` diagnostic 只进 journal |
 
 ~~~mermaid
 stateDiagram-v2
@@ -481,6 +482,8 @@ CapabilitySnapshot 的 adapterTransport 必填，Rust print 与 SDK sidecar、sp
 | `agy-print` / 1.2.1 | S* `--conversation`，store 可用 | N v1；持续 stdin 的语义 U | N live；新进程 `--model` 与 resume 兼容性 U | U，help 未建立 | N Claude Workflow；agy task/subagent schema U | U，工具存在不证明输出协议 | N | U，不能把 Gemini hooks 表当 agy 已验证协议 |
 | `generic-pty` / binary pin | N 默认；产品专用恢复由新 driver 声明 | N | N 语义 API；允许人控键盘 | N | N | N 语义 artifact；普通文件浏览另计 | S* 自有 PTY 或已验证 carrier | N 默认；自定义探针须另建版本化 adapter |
 | `shell-pty` / login `$SHELL` | N | N | N | N | N | N | S* portable-pty；kind=`terminal`；无法识别的 agent CLI 的 fallback | N |
+
+`shell-pty` 另有 **terminal → agent promotion**（D-025）：轮询 PTY 前台进程组，已知 agent CLI 接管时把实例 promote 成该 kind（`driver` 不变，见 §2.3 `mode`），Claude 另按 SessionStart 同款 transcript 路径水合结构化消息。promote 不改变本行的能力矩阵——resume/steer 等仍是 `N`，能力来自 PTY 而非语义 API。
 
 依据：agent-protocols §2–5、§9、Claude control-plane、Codex schema、Grok 专项实测、hooks-integrations。Grok 的 plan、Codex collab 与 runtime child 不能用 `engine=claude-workflow`。claude-pty 无法自动回答的提示继续留在原生 TUI，不以降级 print 代替。
 

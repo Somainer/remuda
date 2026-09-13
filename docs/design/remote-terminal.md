@@ -94,3 +94,125 @@ All three hit the same PTY write with `acceptance.scope = tty-bytes`. ACK does n
 ### Mobile constraints
 
 xterm.js on a phone still emits the same byte sequences (including SGR mouse when tracking is on). The backend must not special-case mobile. Fit/IME/touch scrolling stay in the web client (`docs/design/plan-phase0.md` M3-02). Keep payloads small: one keystroke or one mouse report per input frame, under `maxTtyInputBytes`. Visual viewport and software keyboard do not change cols/rows until the client sends `tty.resize`.
+
+---
+
+## Terminal → agent promotion
+
+**Decision:** [D-025](./decisions.md). **Evidence:** [terminal-promote-1.md](./evidence/terminal-promote-1.md).
+
+A `terminal` / `shell-pty` instance is a login `$SHELL`. When the human types
+`claude` in it, the session is an agent session in every way that matters — but
+the instance kind, the 结构 tab and the composer still say "terminal". Promotion
+closes that gap without a second driver: the PTY, the TTY bridge, the ring
+buffer and the follow socket are untouched; only the *interpretation* changes.
+
+### Detection
+
+A poller inside `shell-pty` samples the live PTY roughly every second:
+
+1. `tcgetpgrp(master_fd)` — the foreground process group of the PTY. This is the
+   kernel's own answer to "what is the user talking to right now", so it follows
+   job control (`ctrl+z`, `fg`, a pipeline) with no heuristics.
+2. For every pid in that group, read the process name and argv
+   (`ps -o pid=,comm=,args= -g <pgid>`).
+3. Match against a small table of known agent CLIs. The first match wins.
+
+| kind | matches | transcript hydration |
+| --- | --- | --- |
+| `claude` | `claude`, `claude-code` | yes (MVP) |
+| `codex` | `codex` | no — detection + kind switch only |
+| `grok` | `grok` | no |
+| `agy` | `agy` | no |
+
+The shell itself (`zsh`, `bash`, `sh`, `fish`, …) and the usual non-agent
+foreground commands are ignored. `tcgetpgrp` failing (no controlling terminal
+yet, a platform without it) is not an error: the poller falls back to a screen
+signature over the ring buffer, which is weaker and only ever used as a
+fallback. Detection latency is bounded by the poll interval, so a fresh `claude`
+is visible within ~2 s.
+
+### Promotion
+
+On the first match the driver emits, in order:
+
+1. a native diagnostic `agent detected: claude` (topic `diagnostic`, severity
+   `info`), carrying `kind`, `pid` and — when known — the native session id;
+2. an `agent_promoted` lifecycle whose `relatedIds` hold `kind`, `mode`
+   (`promoted`), `promotedAt` and the session id.
+
+Node folds the second into the Instance row: `kind` becomes the detected agent,
+`driver` **stays** `shell-pty`, and two new fields appear —
+
+| field | values | meaning |
+| --- | --- | --- |
+| `mode` | `native` \| `promoted` | `native` = the instance was created as this kind; `promoted` = a terminal became one |
+| `promotedAt` | `Timestamp?` | when detection fired; absent on `native` |
+
+`mode` is on `Instance` in `remuda-protocol`, mirrored through the Hub
+instance row and the OpenAPI `Instance` schema, and read by the web client.
+It is deliberately *not* a new `DriverKind`: the launch recipe, the capability
+snapshot and the TTY contract above are all still `shell-pty`'s.
+
+Promotion is idempotent. A second match for the same kind and pgid emits
+nothing. A different agent in the same terminal (exit `claude`, run `codex`)
+demotes and re-promotes, so the journal always has a matched pair.
+
+### Demotion
+
+When the foreground process group no longer holds the agent — `/exit`, `ctrl+d`,
+a crash — the driver emits `agent detected: none` plus an `agent_demoted`
+lifecycle, and Node restores `kind: terminal`, `mode: native`, clearing
+`promotedAt`. Transcript tailing stops. The PTY and the terminal tab keep
+working exactly as before: demotion is not a close.
+
+### Structured messages
+
+Promotion alone gives status and a kind. The 结构 tab needs the conversation,
+and a native `claude` TUI does not speak stream-json. It does, however, write
+the same transcript the SessionStart hook reports for `claude-pty`
+([pty-trust-1.md](./evidence/pty-trust-1.md)):
+`~/.claude/projects/<cwd with every '/' and '.' replaced by '-'>/<session>.jsonl`.
+
+Locating the session:
+
+1. If argv carried `--session-id <uuid>` or `--resume <uuid>`, that is the
+   session, no guessing.
+2. Otherwise: the newest `*.jsonl` under the encoded projects dir for the
+   instance's cwd whose mtime is at or after the detection instant. A file that
+   predates detection belongs to an earlier session and is never adopted.
+
+A tailer then follows that file from byte 0, parses each line, and maps the
+`user` / `assistant` records through the **existing** claude transcript mapper
+(`claude_print::review::map_stdout_json`, the same one `claude-print` uses for
+its stdout frames) into `message` / `thought` / `toolCall` observations with the
+usual open→append→close mutations. Non-message records (`mode`, `atis-latch`,
+`file-history-snapshot`, hook attachments) are skipped rather than journaled as
+opaque noise. Truncation or rotation of the file resets the tailer to 0.
+
+Observations from this path carry `channel: transcript` and
+`completeness: structured` — they are the native record, not a screen scrape,
+which is what makes the 结构 tab trustworthy here.
+
+### Input
+
+The composer switches from a terminal to a prompt box on a promoted instance.
+`instance.send` on a promoted `shell-pty` writes the prompt to the PTY as text
+followed by `\r`, bracketed-paste-wrapped (`ESC[200~` … `ESC[201~`) when the
+text spans lines, so the TUI receives it as one paste and not as N submits. The
+D-022 queue applies unchanged: while the screen heuristics report `blocked`, the
+prompt waits rather than being typed into a dialog.
+
+The terminal tab keeps full raw-byte input the whole time. Promotion adds a way
+to talk to the agent; it never takes the keyboard away.
+
+### Web
+
+- **Header** shows the promoted kind and a `promoted` marker next to the driver,
+  so `terminal` → `claude · shell-pty · promoted` is visible without opening the
+  instance detail.
+- **结构 tab** renders the hydrated transcript through the normal `Transcript`
+  component instead of `ScreenView`. A promoted instance with no transcript yet
+  shows the screen snapshot until the first message lands.
+- **Composer** switches to agent mode (prompt box, permission/model chips) while
+  the 终端 tab continues to speak the binary TTY contract above.

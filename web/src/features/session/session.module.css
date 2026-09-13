@@ -602,6 +602,8 @@
 
 .chipModel {
   color: var(--paper);
+  min-width: 76px;
+  text-align: center;
 }
 
 .barSpacer {
@@ -647,6 +649,13 @@
   bottom: calc(100% + 8px);
 }
 
+/* Compact Codex-style effort card: fixed ~400px, never wider than the composer. */
+.popoverCard {
+  width: min(400px, 100%);
+  padding: 0;
+  box-shadow: 0 8px 24px var(--scrim);
+}
+
 .menuHead {
   padding: 5px 12px 8px;
   font-family: var(--mono);
@@ -663,12 +672,6 @@
   font-size: 10.5px;
   color: var(--mute);
   line-height: 1.5;
-}
-
-.menuSection {
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 6px;
-  margin-bottom: 4px;
 }
 
 .effortRow,
@@ -736,26 +739,36 @@
   flex: 1;
 }
 
-.effortSlider {
-  padding: 4px 12px 8px;
+.effortCard {
+  /* Knob face reads as the palette's "white": cream on night, paper-white on ledger. */
+  --knob-face: var(--paper);
+  --knob-edge: rgba(12, 15, 20, 0.3);
+  --knob-size: 40px;
+  --pill: 44px;
+  --brand: var(--cold);
+  padding: 12px 12px 14px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 2px;
   min-width: 0;
 }
 
+:global([data-theme="ledger"]) .effortCard {
+  --knob-face: #ffffff;
+  --knob-edge: rgba(30, 42, 50, 0.2);
+}
+
 .effortHead {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 6px;
 }
 
 .effortBolt {
-  width: 18px;
-  height: 18px;
-  color: var(--cold);
-  flex: none;
-  margin-top: 3px;
+  width: 28px;
+  height: 28px;
+  color: var(--mute);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -765,38 +778,46 @@
   color: var(--dust);
 }
 
-.effortHeadText {
-  flex: 1;
+.effortTitleBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
   min-width: 0;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--brand);
 }
 
 .effortTitle {
   font-family: var(--mono);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
-  line-height: 1.2;
-  color: var(--paper);
-}
-
-.effortTitleEmber {
-  color: var(--dust);
-}
-
-.effortModel {
-  margin-top: 2px;
-  font-size: 12px;
-  color: var(--mute);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.effortReset {
-  width: 32px;
-  height: 32px;
-  min-width: 32px;
-  min-height: 32px;
+.effortTitleEmber {
+  --brand: var(--dust);
+}
+
+.effortChevron {
+  display: inline-flex;
+  opacity: 0.8;
+  flex: none;
+}
+
+.effortIconBtn {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
   border: 0;
+  border-radius: var(--radius);
   background: transparent;
   color: var(--mute);
   display: inline-flex;
@@ -806,23 +827,35 @@
   flex: none;
 }
 
-.effortReset:hover:not(:disabled) {
+.effortIconBtn:hover:not(:disabled) {
   color: var(--paper);
 }
 
-.effortReset:disabled {
-  opacity: 0.35;
+.effortIconBtn:disabled {
+  opacity: 0.32;
   cursor: default;
 }
 
+.effortModel {
+  text-align: center;
+  font-size: 12px;
+  color: var(--mute);
+  line-height: 1.4;
+  min-height: 17px;
+  padding: 0 28px 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .effortHit {
-  height: 44px;
+  height: var(--pill);
   display: flex;
   align-items: center;
-  padding: 0 11px;
   touch-action: none;
   cursor: pointer;
   user-select: none;
+  border-radius: 999px;
 }
 
 .effortHit[aria-disabled="true"] {
@@ -830,53 +863,129 @@
   cursor: not-allowed;
 }
 
+.effortHit:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* Thick pill. The knob centre travels between --knob and 100% - --knob. */
 .effortTrack {
   position: relative;
   flex: 1;
-  height: 8px;
+  height: var(--pill);
   border-radius: 999px;
+  min-width: 0;
+}
+
+.effortClip {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
   background: var(--ink);
-  border: 1px solid var(--line);
-  overflow: visible;
+  box-shadow: inset 0 0 0 1px var(--line);
+  overflow: hidden;
 }
 
 .effortFill {
-  height: 100%;
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: calc(var(--knob, 22px) + var(--pos, 0) * (100% - var(--knob, 22px) * 2));
   border-radius: 999px;
-  background: linear-gradient(90deg, var(--cold), var(--mute), var(--dust));
+  background: var(--brand);
   pointer-events: none;
 }
 
 .effortFillEmber {
-  background: linear-gradient(90deg, var(--cold), var(--dust), #e8b15a);
-  background-size: 200% 100%;
-  animation: ember 2.8s linear infinite;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--dust) 58%, var(--ink)) 0%,
+    var(--dust) 52%,
+    color-mix(in srgb, var(--dust) 72%, #f2c882) 100%
+  );
+}
+
+/* Amber embers: small soft dots at varying opacity, only on the top tier. */
+.effortSparkle {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background-image:
+    radial-gradient(circle 1.7px at 13% 30%, rgba(255, 243, 222, 0.9), transparent 100%),
+    radial-gradient(circle 1.1px at 21% 66%, rgba(255, 238, 212, 0.55), transparent 100%),
+    radial-gradient(circle 1.4px at 34% 41%, rgba(255, 241, 218, 0.75), transparent 100%),
+    radial-gradient(circle 1px at 44% 74%, rgba(255, 236, 206, 0.45), transparent 100%),
+    radial-gradient(circle 1.8px at 55% 27%, rgba(255, 246, 228, 0.85), transparent 100%),
+    radial-gradient(circle 1.2px at 63% 61%, rgba(255, 239, 214, 0.6), transparent 100%),
+    radial-gradient(circle 1.5px at 74% 36%, rgba(255, 244, 224, 0.7), transparent 100%),
+    radial-gradient(circle 1px at 86% 68%, rgba(255, 237, 210, 0.5), transparent 100%),
+    radial-gradient(circle 1.6px at 93% 44%, rgba(255, 245, 226, 0.8), transparent 100%);
+  animation: shimmer 5s ease-in-out infinite;
+}
+
+.effortDot {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--knob, 22px) + var(--dot, 0) * (100% - var(--knob, 22px) * 2));
+  width: 5px;
+  height: 5px;
+  margin: -2.5px 0 0 -2.5px;
+  border-radius: 50%;
+  background: var(--mute);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+/* Dots under the fill read as knocked-out, not painted on. */
+.effortDotOn {
+  background: var(--knob-face);
+  opacity: 0.5;
 }
 
 .effortKnob {
   position: absolute;
   top: 50%;
-  width: 18px;
-  height: 18px;
+  left: calc(var(--knob, 22px) + var(--pos, 0) * (100% - var(--knob, 22px) * 2));
+  width: var(--knob-size);
+  height: var(--knob-size);
   border-radius: 50%;
-  background: var(--paper);
-  border: 1px solid var(--line);
+  background: var(--knob-face);
   transform: translate(-50%, -50%);
   pointer-events: none;
-  box-sizing: border-box;
+  box-shadow:
+    0 1px 2px var(--knob-edge),
+    0 4px 12px var(--knob-edge);
 }
 
-.effortKnobEmber {
-  background: var(--dust);
-  border-color: var(--dust);
-  box-shadow: 0 0 10px 2px rgba(201, 132, 42, 0.45);
+.effortListHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 4px;
 }
 
-.effortHint {
-  font-size: 12px;
-  color: var(--mute);
-  line-height: 1.4;
+.effortListTitle {
   font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--mute);
+  padding: 6px 4px 2px;
+}
+
+.effortListBody {
+  display: flex;
+  flex-direction: column;
+  margin: 0 -12px;
+}
+
+@keyframes shimmer {
+  0%,
+  100% {
+    opacity: 0.72;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 @keyframes ember {
@@ -947,13 +1056,8 @@
   .emberSpark,
   .emberSpark2,
   .emberSpark3,
-  .effortFillEmber,
-  .effortKnobEmber {
+  .effortSparkle {
     animation: none !important;
-  }
-
-  .effortKnobEmber {
-    box-shadow: none;
   }
 }
 
@@ -1173,7 +1277,7 @@
     height: 32px;
   }
 
-  .effortReset {
+  .effortIconBtn {
     width: 44px;
     height: 44px;
     min-width: 44px;

@@ -46,20 +46,77 @@ describe("Composer shortcuts", () => {
       />,
     );
     expect(screen.getByTestId("harness-chip")).toHaveTextContent(/Claude/);
-    expect(screen.getByTestId("model-effort-chip")).toHaveTextContent(/opus think/);
+    expect(screen.getByTestId("model-effort-chip")).toHaveTextContent("think");
+    expect(screen.getByTestId("model-effort-chip")).not.toHaveTextContent("opus");
     expect(screen.getByTestId("context-chip")).toHaveTextContent("74%");
     expect(screen.getByTestId("permission-chip")).toHaveTextContent(/询问/);
     await user.click(screen.getByTestId("model-effort-chip"));
-    expect(screen.getByTestId("effort-menu")).toHaveTextContent("切换只影响后续回合，不重写已发出的 prompt");
+    // Row 1 lightning + tier + reset, row 2 model, then the pill. No tier list, no model list.
+    expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
     expect(screen.queryByTestId("effort-tier-default")).toBeNull();
+    expect(screen.queryByTestId("model-option-opus")).toBeNull();
     const slider = screen.getByTestId("effort-slider");
     expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
     expect(slider).toHaveAttribute("data-name", "think");
+    expect(slider).toHaveAttribute("aria-valuetext", "think");
     expect(screen.getByTestId("effort-title")).toHaveTextContent("think");
-    expect(screen.getByTestId("effort-hint")).toHaveTextContent("think · 默认档");
+    expect(screen.getByTestId("effort-model")).toHaveTextContent("opus");
+    expect(screen.getByTestId("effort-knob")).toBeInTheDocument();
     slider.focus();
     await user.keyboard("{End}");
     expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "ultracode", kind: "claude" });
+  });
+
+  it("the tier name opens a list of tiers and models, and picking one closes it", async () => {
+    const user = userEvent.setup();
+    const onEffort = vi.fn();
+    const onModel = vi.fn();
+    render(
+      <Composer
+        instanceId="ins_list"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 1)}
+        onEffort={onEffort}
+        onModel={onModel}
+      />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    await user.click(screen.getByTestId("effort-open-list"));
+    expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "list");
+    expect(screen.queryByTestId("effort-slider")).toBeNull();
+    expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ember", "1");
+    expect(screen.getByTestId("effort-tier-think")).toHaveAttribute("data-selected", "1");
+    expect(screen.getByTestId("effort-list")).toHaveTextContent("跨文件重构、长任务");
+    await user.click(screen.getByTestId("model-option-sonnet"));
+    expect(onModel).toHaveBeenCalledWith("sonnet");
+    expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
+
+    await user.click(screen.getByTestId("effort-open-list"));
+    await user.click(screen.getByTestId("effort-tier-think-hard"));
+    expect(onEffort).toHaveBeenCalledWith({ index: 2, name: "think-hard", kind: "claude" });
+    expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
+  });
+
+  it("the top tier turns the pill and the tier name ember", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_ember"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 3)}
+        onEffort={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-ember", "1");
+    expect(screen.getByTestId("effort-title")).toHaveAttribute("data-ember", "1");
+    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
   });
 
   it("snaps a pointer drag to the nearest native tier", async () => {
@@ -78,24 +135,30 @@ describe("Composer shortcuts", () => {
     );
     await user.click(screen.getByTestId("model-effort-chip"));
     const slider = screen.getByTestId("effort-slider");
-    const inner = slider.querySelector("div");
-    if (!(inner instanceof HTMLDivElement)) throw new Error("missing track");
-    vi.spyOn(inner, "getBoundingClientRect").mockReturnValue({
-      x: 11,
-      y: 18,
-      left: 11,
-      top: 18,
-      right: 289,
-      bottom: 26,
-      width: 278,
-      height: 8,
+    const track = screen.getByTestId("effort-track");
+    // 400px pill; the knob centre travels between x=22 and x=378.
+    vi.spyOn(track, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 400,
+      bottom: 44,
+      width: 400,
+      height: 44,
       toJSON() {
         return {};
       },
     });
-    fireEvent.pointerDown(slider, { clientX: 280, pointerId: 1, button: 0 });
-    fireEvent.pointerUp(slider, { clientX: 280, pointerId: 1, button: 0 });
+    fireEvent.pointerDown(slider, { clientX: 396, pointerId: 1, button: 0 });
+    fireEvent.pointerUp(slider, { clientX: 396, pointerId: 1, button: 0 });
     expect(onEffort).toHaveBeenCalledWith({ index: 3, name: "ultracode", kind: "claude" });
+
+    onEffort.mockClear();
+    // Dead-centre lands on the middle stop, not on an edge.
+    fireEvent.pointerDown(slider, { clientX: 200, pointerId: 2, button: 0 });
+    fireEvent.pointerUp(slider, { clientX: 200, pointerId: 2, button: 0 });
+    expect(onEffort).toHaveBeenCalledWith({ index: 2, name: "think-hard", kind: "claude" });
   });
 
   it("Home/End and reset land on the table edges and default", async () => {

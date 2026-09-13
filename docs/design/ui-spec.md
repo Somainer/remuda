@@ -316,7 +316,13 @@ Diff 三分态文案：**拟修改** / **已写入** / **结果未知**。未知
 - 桌面：Enter 发送（IME composing / keyCode 229 / key=Process 时忽略，抄 herdrx `Composer.tsx` `composing()`）。Shift+Enter 换行。
 - 手机：发送按钮；Enter 换行。不要抢中文候选。
 - 权限芯片显示当前 `permissionMode`（dontAsk/acceptEdits/manual…），点开改本会话（发 Command，不是只改本地 chip）。
-- Effort：收起为 compact `模型+档位 ▾` 触发器。展开 popover 顶栏是闪电图标 + 大号档名（最高档 ember 琥珀）+ 型号 + 复位；下方一条宽渐变轨道和可拖圆钮，吸附 harness 原生档（claude `default/think/think-hard/ultracode`，codex `low/medium/high/ultra`，grok `quick/standard/max`），并显示档名与一行说明。←/→/Home/End 与 44px 触控。变更走 `instance.configure`（journal + persist）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
+- Effort：收起为 compact 触发器，只显示**档名**（`ultracode ▾`），宽度固定不顶布局。点开是一张 ~400px 的 card popover，钉在触发器上方：
+  - 第 1 行 grid：左闪电图标 · 中间品牌色档名 + `›`（点开档位/模型列表）· 右复位图标。第 2 行居中 muted 型号。
+  - 下方一条 44px 高的圆角 pill：左侧已填部分是品牌实色（`--cold`），右侧未填是中性 surface；每个档位一个小圆点 marker，两侧都看得见；钮是 40px 白圆 + 柔和投影，拖动吸附到点上。钮心行程内缩半个钮宽，钮不会溢出 pill。
+  - 最高档：整条 pill 换 Night Corral ember 琥珀渐变 + 细碎 ember 星点（不同透明度的柔光小点），档名转琥珀。动效只有一层 5s 呼吸 shimmer，`prefers-reduced-motion` 下关掉。
+  - 吸附 harness 原生档（claude `default/think/think-hard/ultracode`，codex `low/medium/high/ultra`，grok `quick/standard/max`）。`role=slider`，`aria-valuetext` = 档名。←/→/Home/End、触摸拖动、44px 触控。
+  - `›` 展开的列表里才有档位说明和模型选择（`‹` 返回 pill）；pill 视图本身不列模型。
+  - 变更走 `instance.configure`（journal + persist）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
 - 本地草稿按 `instanceId` 存（herdrx `composerDrafts`）；未 accepted 的乐观气泡可撤回。
 
 **状态清单**

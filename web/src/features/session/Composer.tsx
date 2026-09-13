@@ -5,15 +5,12 @@ import { composing } from "../../lib/viewport";
 import type { HostCli } from "../hosts";
 import { EffortSlider } from "./EffortSlider";
 import {
-  EFFORT_MENU_FOOTER,
   effortCaps,
   effortTable,
   HARNESS_META,
   harnessMeta,
   isEmberTier,
   mapEffort,
-  modelsFor,
-  shortModel,
   type EffortKind,
   type EffortSelection,
 } from "./effort";
@@ -79,7 +76,6 @@ export function Composer({
   const ember = isEmberTier(harness, currentEffort.index);
   const effortLocked = Boolean(effortDisabled) || !onEffort || table.length === 0;
   const permLabel = PERMISSION_OPTIONS.find((m) => m.id === permissionMode)?.label ?? permissionMode;
-  const modelList = modelsFor(harness, models ?? [model]);
   const installed = new Set(hostCli.filter((c) => c.path || c.version).map((c) => c.kind));
   if (!installed.size) installed.add("claude");
   installed.add(String(kind));
@@ -146,9 +142,7 @@ export function Composer({
   };
 
   const harnessChip = harnessMeta(harness);
-  const effortChipLabel = caps.model
-    ? `${shortModel(model)} ${currentEffort.name}`
-    : currentEffort.name;
+  const effortChipLabel = currentEffort.name;
 
   return (
     <form
@@ -300,37 +294,19 @@ export function Composer({
       {menu === "effort" ? (
         <div
           ref={menuRef}
-          className={`${css.popover} ${placement === "up" ? css.popoverUp : ""}`}
+          className={`${css.popover} ${css.popoverCard} ${placement === "up" ? css.popoverUp : ""}`}
           data-testid="effort-menu"
           data-placement={placement}
         >
-          {caps.model ? (
-            <div className={css.menuSection} data-testid="model-menu">
-              {modelList.map((id) => (
-                <button
-                  key={id}
-                  type="button"
-                  className={`${css.effortRow} ${model === id || shortModel(model) === shortModel(id) ? css.effortOn : ""}`}
-                  data-testid={`model-option-${shortModel(id)}`}
-                  onClick={() => {
-                    onModel?.(id);
-                    setMenu(null);
-                  }}
-                >
-                  <span className={css.radio} />
-                  <span className={css.effortName}>{shortModel(id)}</span>
-                </button>
-              ))}
-            </div>
-          ) : null}
           <EffortSlider
             kind={harness}
             model={caps.model ? model : undefined}
+            models={caps.model ? models : undefined}
             index={currentEffort.index}
             disabled={effortLocked}
             onChange={(next) => onEffort?.(next)}
+            onModel={caps.model ? onModel : undefined}
           />
-          <div className={css.menuFoot}>{EFFORT_MENU_FOOTER}</div>
         </div>
       ) : null}
       {menu === "permission" ? (

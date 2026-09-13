@@ -237,7 +237,46 @@ P0 的验收是「抽取零行为变更」。三层证据：
 
 ---
 
-## 5 本期交付与未交付
+## 5 检查项结果与一处环境性失败
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 通过 |
+| `cargo test --workspace --locked` | 见下 |
+| `pnpm test`（web） | 310 passed / 61 files |
+| `pnpm run test:e2e:hub` | 11 passed，退出码 0；未改动任何**已跟踪**文件 |
+| `./scripts/ci/secret-scan.sh` | pass |
+| `pnpm --dir web run gen:api` | 无 diff（本改动不触及 Hub REST OpenAPI 面） |
+
+**`cargo test --workspace` 在本机有 2 个失败，与本改动无关**，已用同一台机器上
+`origin/main`（`7cecd44`）的干净 worktree 做对照，**两边逐字相同**：
+
+```
+branch  test result: FAILED. 124 passed; 2 failed;  （remuda-node --lib）
+main    test result: FAILED. 124 passed; 2 failed;  （remuda-node --lib）
+
+    native::tests::registry_constructs_all_three_native_claude_drivers
+    stdio::tests::composed_stdio_dispatches_create_and_streams_journal
+```
+
+失败原因由错误文本直接给出，是 macOS 的**完全磁盘访问权限**拒绝读取 `~/.claude`：
+
+> `workspace /Users/…/.claude is inaccessible: access probe timed out; macOS may
+> have denied access; grant Full Disk Access to … in System Settings`
+
+两个测试单独跑都通过（`registry_constructs_all_three_native_claude_drivers` 单跑
+4.40 s 通过）。修它需要改 macOS 系统设置，这是本 worker 明令禁止的操作，故**未修，
+如实记录**。本改动新增的 48 个 Rust 测试与 6 个 web 测试全部通过。
+
+> 另有一次早先的整跑里 `cmd::dispatcher::tests::recorded_inbound_restarts_…` 失败
+> 两次、每次断言点不同（一次启动超时、一次 drain 断言），单跑 8/8 通过；该测试源码
+> 自带的注释即写明「under load the accepted prompt could then never be dispatched」。
+> 判定为并行负载下的既有 flake，非本改动引入。
+
+---
+
+## 6 本期交付与未交付
 
 **交付**（§13 P0）：
 

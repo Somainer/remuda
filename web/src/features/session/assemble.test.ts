@@ -67,6 +67,68 @@ function message(seq: number, text: string, extra: Partial<MessagePayload> = {})
 }
 
 describe("assembleTranscript", () => {
+  it("reconstructs every arrival order of open, targeted append, and empty close", () => {
+    const open = message(1, "hello");
+    const append = message(2, " world");
+    const close = message(3, "", { operation: "close", blocks: [], status: "complete" });
+    const orders = [
+      [open, append, close], [open, close, append], [append, open, close],
+      [append, close, open], [close, open, append], [close, append, open],
+    ];
+    for (const events of orders) {
+      expect(assembleTranscript(events)).toMatchObject([
+        { id: "message", text: "hello world", status: "complete" },
+      ]);
+      expect(assembleTranscript([...events, append, open, close])).toEqual(assembleTranscript(events));
+    }
+  });
+
+  it.each(["append", "replace", "close"] as const)("renders a first %s without requiring an open", (operation) => {
+    expect(assembleTranscript([message(8, "available text", { operation, status: "complete" })]))
+      .toMatchObject([{ text: "available text", status: "complete" }]);
+  });
+
+  it("shows the latest available suffix until its exact prefix arrives", () => {
+    const open = message(1, "a");
+    const second = message(2, "b");
+    const third = message(3, "c");
+    expect(assembleTranscript([third])).toMatchObject([{ text: "c" }]);
+    expect(assembleTranscript([third, open])).toMatchObject([{ text: "c" }]);
+    expect(assembleTranscript([open, third])).toMatchObject([{ text: "c" }]);
+    expect(assembleTranscript([open, third, second])).toMatchObject([{ text: "abc" }]);
+  });
+
+  it("keeps a retained suffix at its target block for subsequent appends", () => {
+    const open = message(1, "", { blocks: [{ type: "text", text: "Header" }, { type: "text", text: "a" }] });
+    const second = message(2, "b", { targetBlock: 1 });
+    const third = message(3, "c", { targetBlock: 1 });
+    const fourth = message(4, "d", { targetBlock: 1 });
+    expect(assembleTranscript([fourth, third, open])).toMatchObject([{ text: "cd" }]);
+    expect(assembleTranscript([fourth, third, open, second])).toMatchObject([{ text: "Header\nabcd" }]);
+  });
+
+  it("prefers equal-revision completion without replaying a duplicate delta", () => {
+    const open = message(1, "hello");
+    const append = message(2, " world");
+    const close = message(3, "", { revision: "2", operation: "close", blocks: [], status: "complete" });
+    expect(assembleTranscript([close, append, open, append]))
+      .toMatchObject([{ text: "hello world", status: "complete" }]);
+    const snapshot = message(4, "final", { revision: "1", operation: "replace", status: "complete" });
+    for (const events of [[open, snapshot], [snapshot, open]]) {
+      expect(assembleTranscript(events)).toMatchObject([{ text: "final", status: "complete" }]);
+    }
+    const completedAppend = message(4, " world", { revision: "2", status: "complete" });
+    expect(assembleTranscript([completedAppend, append, open]))
+      .toMatchObject([{ text: "hello world", status: "complete" }]);
+  });
+
+  it("keeps the highest u64 snapshot when older revisions arrive later", () => {
+    const newest = message(3, "newest", { revision: "18446744073709551615", operation: "close", status: "complete" });
+    const previous = message(2, "older", { revision: "18446744073709551614", operation: "replace" });
+    expect(assembleTranscript([newest, message(1, "oldest"), previous, newest]))
+      .toMatchObject([{ text: "newest", status: "complete" }]);
+  });
+
   it("keeps one bubble through targeted deltas, replay, and complete snapshots", () => {
     const events = [
       message(1, "", { blocks: [{ type: "text", text: "Header" }, { type: "text", text: "我" }] }),
@@ -81,7 +143,7 @@ describe("assembleTranscript", () => {
     expect(assembleTranscript(events)).toMatchObject([{ id: "message", text: "Header\n我先看看仓库。", status: "complete" }]);
   });
 
-  it("uses node identity as a fallback, rejects missing delta bases, and accepts empty replacement", () => {
+  it("uses node identity as a fallback, recovers snapshots across gaps, and accepts empty replacement", () => {
     expect(assembleTranscript([
       message(1, "first"),
       message(3, "missing-base"),

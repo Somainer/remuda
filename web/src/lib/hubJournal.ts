@@ -6,6 +6,30 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
+function messagePayload(value: unknown, eventId: Id): Record<string, unknown> {
+  const payload = asRecord(value) ?? {};
+  const identity = (value: unknown) => typeof value === "string" && value.length > 0 ? value : null;
+  const messageId = identity(payload.messageId) ?? identity(payload.nodeId) ?? eventId;
+  const operation = payload.operation;
+  // Older Hub journals (including the fake Node) store only { role, text }.
+  // Give each such event its own identity while keeping protocol mutations intact.
+  return {
+    ...payload,
+    messageId,
+    nodeId: identity(payload.nodeId) ?? messageId,
+    revision: typeof payload.revision === "string" && /^\d+$/.test(payload.revision) ? payload.revision : "1",
+    baseRevision: payload.baseRevision ?? null,
+    operation: operation === "append" || operation === "replace" || operation === "close" ? operation : "open",
+    role: payload.role ?? "assistant",
+    phase: payload.phase ?? (payload.role === "user" ? "input" : "final"),
+    status: payload.status ?? "complete",
+    blocks: Array.isArray(payload.blocks) ? payload.blocks : typeof payload.text === "string" ? [{ type: "text", text: payload.text }] : [],
+    targetBlock: payload.targetBlock ?? null,
+    parentToolCallId: payload.parentToolCallId ?? null,
+    nativeOrigin: payload.nativeOrigin ?? unknownKnowledge("legacy journal message"),
+  };
+}
+
 const STUB_SOURCE: Observation["source"] = {
   driverKind: "claude-print",
   driverVersion: "hub",
@@ -47,7 +71,7 @@ export function coerceObservation(raw: unknown, journalId: Id, instanceId: Id, f
     completeness: (typeof inner.completeness === "string" ? inner.completeness : "structured") as Observation["completeness"],
     rawRef: null,
     evidenceEventIds: [],
-    payload,
+    payload: kind === "message" ? messagePayload(payload, eventId) : payload,
   } as unknown as Observation;
 }
 

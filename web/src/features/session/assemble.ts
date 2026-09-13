@@ -67,9 +67,9 @@ function messageBlocks(current: ContentBlock[], next: ContentBlock[], operation:
   if (operation !== "append") return next;
   if (target === null) return current.concat(next);
   const block = current[target];
-  if (block?.type !== "text" || next.some((delta) => delta.type !== "text")) return current;
+  if ((block && block.type !== "text") || next.some((delta) => delta.type !== "text")) return current;
   const blocks = current.slice();
-  blocks[target] = { type: "text", text: block.text + next.map((delta) => delta.type === "text" ? delta.text : "").join("") };
+  blocks[target] = { type: "text", text: (block?.text ?? "") + next.map((delta) => delta.type === "text" ? delta.text : "").join("") };
   return blocks;
 }
 
@@ -77,8 +77,62 @@ function blocksText(blocks: ContentBlock[]): string {
   return blocks.flatMap((block) => block.type === "text" && block.text ? [block.text] : []).join("\n");
 }
 
+type MessageEvent = Extract<Observation, { kind: "message" }>;
+type MessageNode = Extract<TranscriptNode, { type: "message" }>;
+
+function compareMessages(a: MessageEvent, b: MessageEvent): number {
+  const left = BigInt(a.payload.revision);
+  const right = BigInt(b.payload.revision);
+  if (left !== right) return left < right ? -1 : 1;
+  // Some older producers close at the same revision. Apply their completion
+  // after the content, while duplicate appends still apply only once.
+  const operations = { open: 0, append: 1, replace: 2, close: 3 };
+  const status = { queued: 0, unknown: 1, streaming: 2, interrupted: 3, complete: 4 };
+  const rank = status[a.payload.status] - status[b.payload.status]
+    || operations[a.payload.operation] - operations[b.payload.operation];
+  if (rank) return rank;
+  return BigInt(a.seq) < BigInt(b.seq) ? -1 : BigInt(a.seq) > BigInt(b.seq) ? 1 : 0;
+}
+
+/** Rebuild each message in revision order; keep its first transcript position. */
+function assembleMessages(events: Observation[]): Map<MessageEvent, MessageNode> {
+  const identities = new Map<string, MessageEvent[]>();
+  for (const ev of events) {
+    if (ev.kind !== "message") continue;
+    const group = identities.get(`message:${ev.payload.messageId}`) ?? identities.get(`node:${ev.payload.nodeId}`) ?? [];
+    group.push(ev);
+    identities.set(`message:${ev.payload.messageId}`, group);
+    identities.set(`node:${ev.payload.nodeId}`, group);
+  }
+  const messages = new Map<MessageEvent, MessageNode>();
+  for (const group of new Set(identities.values())) {
+    let mutation: NodeMutation | undefined;
+    let blocks: ContentBlock[] = [];
+    let node: MessageNode | undefined;
+    for (const ev of group.slice().sort(compareMessages)) {
+      const payload = ev.payload;
+      if (node && mutation?.revision === payload.revision && payload.operation === "append") {
+        node.status = payload.status;
+        continue;
+      }
+      // A retained suffix can start with any operation. Later history fills in
+      // its prefix on the next assembly. Never attach a delta to a wrong base:
+      // show its available suffix until the missing revisions arrive.
+      const hasBase = mutation && (payload.operation !== "append" || payload.baseRevision === mutation.revision);
+      blocks = messageBlocks(hasBase ? blocks : [], payload.blocks, payload.operation, payload.targetBlock);
+      node ??= { type: "message", id: group[0].payload.messageId, role: payload.role, text: "", status: payload.status };
+      node.text = blocksText(blocks);
+      node.role = payload.role;
+      node.status = payload.status;
+      mutation = payload;
+    }
+    if (node) messages.set(group[0], node);
+  }
+  return messages;
+}
+
 export function assembleTranscript(events: Observation[], bubbles: LocalBubble[] = []): TranscriptNode[] {
-  const messages = new Map<string, { mutation: NodeMutation; blocks: ContentBlock[]; node: Extract<TranscriptNode, { type: "message" }> }>();
+  const messages = assembleMessages(events);
   const thoughts = new Map<string, { mutation: NodeMutation; node: Extract<TranscriptNode, { type: "thought" }> }>();
   const tools = new Map<string, ToolNode>();
   const workflows = new Map<
@@ -95,20 +149,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
 
   for (const ev of events) {
     if (ev.kind === "message") {
-      const payload = ev.payload;
-      const existing = messages.get(`message:${payload.messageId}`) ?? messages.get(`node:${payload.nodeId}`);
-      if (!newerMutation(payload, existing?.mutation)) continue;
-      const blocks = existing ? messageBlocks(existing.blocks, payload.blocks, payload.operation, payload.targetBlock) : payload.blocks;
-      const node = existing?.node ?? { type: "message" as const, id: payload.messageId, role: payload.role, text: "", status: payload.status };
-      node.text = blocksText(blocks);
-      node.role = payload.role;
-      node.status = payload.status;
-      const current = existing ?? { mutation: payload, blocks, node };
-      current.mutation = payload;
-      current.blocks = blocks;
-      messages.set(`message:${payload.messageId}`, current);
-      messages.set(`node:${payload.nodeId}`, current);
-      if (!existing) nodes.push(node);
+      const node = messages.get(ev);
+      if (node) nodes.push(node);
+      messages.delete(ev);
       continue;
     }
     if (ev.kind === "thought") {

@@ -65,10 +65,10 @@ reason to reject, and no gate catches it. Command surface, exit codes, and
 report fields are in [`skills/remuda/SKILL.md`](../../skills/remuda/SKILL.md)
 and [`dogfood.md`](./dogfood.md).
 
-The gate itself is defined once, in
-[`scripts/ci/gate.sh`](../../scripts/ci/gate.sh), and shared with CI — so a
-local gate pass and a CI pass mean the same thing. Order, with only
-`cargo-test` retrying (once):
+The shared build and test checks are defined in
+[`scripts/ci/gate.sh`](../../scripts/ci/gate.sh). `remuda merge --gate` also
+mirrors CI's generated OpenAPI client check in its `gen-api-current` step.
+Order, with only `cargo-test` retrying (once):
 
 ```text
 ./scripts/ci/secret-scan.sh
@@ -76,11 +76,30 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-pnpm install --frozen-lockfile / pnpm build / pnpm test   # web/ only
+pnpm install --frozen-lockfile / pnpm build / pnpm test   # selected web checks
+pnpm run test:e2e:hub                                    # when selected
+pnpm --dir web run gen:api                              # gen-api-current
+verify-tree                                            # merged HEAD and tree unchanged
 ```
 
+Web checks, including `gen-api-current`, run when the merge changes `crates/`
+or `web/`, or when `--web` or `--web-e2e` selects them. Otherwise they are
+skipped, except that authentication-sensitive changes can select the web
+and live Hub checks automatically.
+
+`gen-api-current` runs in the isolated merged worktree after the selected
+web steps. It checks `git status --porcelain` for
+`web/src/lib/api.generated.ts`, the exact generated path checked by
+[CI](../../.github/workflows/ci.yml), and fails with the changed file list
+when regeneration changes that path. It restores the generated file with
+`git checkout -- web/src/lib/api.generated.ts` before returning, preserving
+the tree for `verify-tree`. The `--json` report includes `gen-api-current`
+in `steps` with its name, status, and `durationMs`, including when skipped.
+
 Run `./scripts/ci/gate.sh --list` to print the plan as JSON without running
-it. To change what the gate checks, edit that file — not a copy here.
+the shared checks; use `remuda merge <branch> --dry-run --json` for the full
+merge plan. Edit the shared script for shared checks, and keep the generated
+client check in `crates/remuda/src/cmd/merge.rs` aligned with CI.
 
 Doing it by hand (no `remuda` binary, or a merge needing conflict
 resolution): merge into a staging branch rather than `main`, run the gate

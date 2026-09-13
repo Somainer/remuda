@@ -229,6 +229,13 @@ exec "$real_path" "$@"
 /// Files a zsh shadow `ZDOTDIR` needs, in the order zsh reads them.
 const ZSH_RC_FILES: &[&str] = &[".zshenv", ".zprofile", ".zshrc", ".zlogin"];
 
+/// The last file zsh reads during startup.
+///
+/// Only this one restores the user's own `ZDOTDIR`. Restoring it earlier would
+/// send zsh to `$HOME` for every remaining startup file, so only the first of
+/// ours would ever run — which is exactly the bug the live run found.
+const LAST_ZSH_RC: &str = ".zlogin";
+
 /// Generate a shadow `ZDOTDIR` that re-asserts the shim after the user's rc.
 ///
 /// Putting the shim directory on the child's `PATH` is not enough for a login
@@ -261,23 +268,34 @@ pub fn materialize_zdotdir(launch_dir: &Path, bin_dir: &Path) -> DriverResult<Pa
 }
 
 /// One shadow rc file.
+///
+/// The last file in the sequence hands `ZDOTDIR` back to the user, so the
+/// interactive shell the human ends up in reports their own value rather than
+/// ours. Every earlier file keeps it pointed here, because zsh re-reads it
+/// before each startup file.
 fn zsh_rc(name: &str, bin_dir: &Path) -> String {
     format!(
         r#"# Remuda per-session shell integration (D-028 §4.2). Generated; not the
 # user's file. It sources their real {name} and then puts the Remuda shim
 # directory back at the front of PATH, because a login profile that prepends
 # to PATH would otherwise bury it.
+# Source the user's own file with ZDOTDIR temporarily set to theirs, so
+# anything it reads sees their configuration and not ours — then put ours back.
+# ZDOTDIR must stay pointed here for the whole startup sequence: zsh re-reads
+# it before each of .zshenv, .zprofile, .zshrc and .zlogin, and restoring it
+# permanently in the first file would mean only that file ever ran.
+__remuda_our_zdotdir=$ZDOTDIR
 if [ -n "${{REMUDA_USER_ZDOTDIR:-}}" ]; then
     ZDOTDIR=$REMUDA_USER_ZDOTDIR
 else
     unset ZDOTDIR
 fi
-
-# The user's own file, with ZDOTDIR already restored so anything it sources
-# sees their configuration and not ours.
 __remuda_user_rc=${{ZDOTDIR:-$HOME}}/{name}
 [ -r "$__remuda_user_rc" ] && . "$__remuda_user_rc"
 unset __remuda_user_rc
+ZDOTDIR=$__remuda_our_zdotdir
+export ZDOTDIR
+unset __remuda_our_zdotdir
 
 # Re-assert the shim, dropping any earlier copy first so that re-sourcing an
 # rc — by hand, or from a nested login shell — cannot grow PATH without bound.
@@ -297,9 +315,26 @@ else
 fi
 export PATH
 unset __remuda_bin __remuda_path
-"#,
+{handback}"#,
         name = name,
         bin = single_quote(&bin_dir.to_string_lossy()),
+        handback = if name == LAST_ZSH_RC {
+            // Startup is over: give the interactive shell the user's own
+            // ZDOTDIR so `echo $ZDOTDIR` reports what they configured, and a
+            // shell they start by hand reads their files and not ours.
+            r#"
+# Last file zsh reads. Hand ZDOTDIR back so the interactive shell the human
+# ends up in is indistinguishable from the one they would have had.
+if [ -n "${REMUDA_USER_ZDOTDIR:-}" ]; then
+    ZDOTDIR=$REMUDA_USER_ZDOTDIR
+    export ZDOTDIR
+else
+    unset ZDOTDIR
+fi
+"#
+        } else {
+            ""
+        },
     )
 }
 
@@ -472,15 +507,56 @@ mod tests {
     }
 
     #[test]
+    fn every_startup_file_except_the_last_keeps_zdotdir_pointed_at_us() {
+        // The live run's second bug: .zshenv restored the user's ZDOTDIR
+        // permanently, so zsh read .zprofile and .zshrc from $HOME and only
+        // the first of our files ever ran — the shim was never re-asserted and
+        // PATH stayed at position 22.
+        let dir = tempfile::tempdir().unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        for name in ZSH_RC_FILES {
+            let body = std::fs::read_to_string(set.zdotdir.join(name)).unwrap();
+            if *name == LAST_ZSH_RC {
+                continue;
+            }
+            assert!(
+                body.contains("ZDOTDIR=$__remuda_our_zdotdir"),
+                "{name} must leave ZDOTDIR pointed here, or zsh reads the rest \
+                 of its startup files from $HOME: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_startup_file_hands_zdotdir_back_to_the_user() {
+        // So the interactive shell the human ends up in is indistinguishable
+        // from the one they would have had.
+        let dir = tempfile::tempdir().unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let body = std::fs::read_to_string(set.zdotdir.join(LAST_ZSH_RC)).unwrap();
+        let reassert = body
+            .find(r#"PATH="$__remuda_bin:$__remuda_path""#)
+            .expect("re-asserts");
+        let handback = body.rfind("# Last file zsh reads").expect("hands back");
+        assert!(
+            reassert < handback,
+            "the hand-back must come after the shim is in place: {body}"
+        );
+    }
+
+    #[test]
     fn the_shadow_zdotdir_restores_the_users_own_zdotdir_first() {
         // Anything the user's rc sources must see their configuration, not
         // ours, and a nested shell must behave normally.
         let dir = tempfile::tempdir().unwrap();
         let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
         let body = std::fs::read_to_string(set.zdotdir.join(".zshrc")).unwrap();
+        let saved = body
+            .find("__remuda_our_zdotdir=$ZDOTDIR")
+            .expect("saves ours before swapping");
         let restored = body.find("ZDOTDIR=$REMUDA_USER_ZDOTDIR").expect("restores");
         let sourced = body.find(". \"$__remuda_user_rc\"").expect("sources");
-        assert!(restored < sourced, "{body}");
+        assert!(saved < restored && restored < sourced, "{body}");
         assert!(
             body.contains("unset ZDOTDIR"),
             "a user with no ZDOTDIR of their own must end up with none set"

@@ -1212,14 +1212,22 @@ export function mockClose(instanceId: Id): CommandResult {
   };
 }
 
-/** Mirrors the Hub's real delete: the record and its journal are gone for good. */
-export function mockDelete(instanceId: Id): void {
+/**
+ * Mirrors the Hub's real delete: a live Instance is refused with 409 unless
+ * `force` stops it first, a repeated delete is 404-idempotent, and the record
+ * and its journal are gone for good.
+ */
+export function mockDelete(instanceId: Id, force = false): { deleted: true; instanceId: Id; nodePurge: "purged" } {
   const index = instances.findIndex((i) => i.id === instanceId);
-  if (index < 0) return;
+  if (index < 0) return { deleted: true, instanceId, nodePurge: "purged" };
+  const live = instances[index].lifecycle !== "exited" && instances[index].lifecycle !== "failed";
+  if (live && !force) throw new HubHttpError(409, "INSTANCE_LIVE", "INSTANCE_LIVE");
+  if (live) mockClose(instanceId);
   const [removed] = instances.splice(index, 1);
   journals.delete(removed.journalId);
   titles.delete(instanceId);
   summaries.delete(instanceId);
+  return { deleted: true, instanceId, nodePurge: "purged" };
 }
 
 export function mockCreate(prompt: string, extras?: { hostId?: Id; workspaceId?: Id; driver?: Instance["driver"]; kind?: Instance["kind"] }): Instance {

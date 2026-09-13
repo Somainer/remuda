@@ -12,26 +12,35 @@ Addresses two pieces of user feedback on the D-024 strip: the active tab and the
 - **Sidebar active states.** The current space and the current session both carry the brand left bar, tinted ground and bold title.
 - **Exited group.** Each space gets 「已退出 (n)」, collapsed by default, with 恢复 (existing `hubStore.resume`) and 删除 (`DELETE /v1/instances/{id}`, confirmation 「删除会话及其记录？」; a running session is offered 停止并删除 instead).
 
-## The delete route is not yet available
+## Delete is wired to the real endpoint
 
-`DELETE /v1/instances/{id}` is being added by worker x-ttyhub. The Hub does not serve its OpenAPI document at runtime — `crates/remuda-hub/openapi/openapi.json` is a build artifact and `/v1/instances/{id}` currently lists `get` only — so the route is feature-detected by calling it: a `405`/`501` is mapped to `DELETE_UNSUPPORTED` and falls back to hiding the row from this device's lists, with the toast 「当前 Hub 尚不支持删除，已从本设备列表隐藏」. **The record still exists on the Hub in that path and the UI does not claim otherwise.** A `404` is treated as already deleted. Once the route lands, no client change is needed; the unit test that fakes a `405` will then cover only the legacy path.
+`DELETE /v1/instances/{id}` landed on `wt/x-ttyhub/tty-relay-hardening` (`8896fc7`) while this work was in progress, and 删除 / 停止并删除 call it directly:
+
+- A terminal-state session deletes outright.
+- A live session is refused with `409` unless `?force=1`, which makes the **Hub** stop it and then delete it. 停止并删除 therefore sends that one request; the client deliberately does **not** close the session itself first, which would be a second, racing stop.
+- A repeated delete answers `404`, so the client treats it as an idempotent success rather than an error.
+- The response's `nodePurge` reports the Node side only. The Hub record is deleted whatever it says, so anything other than `purged` produces 「已删除会话；该主机数据待其上线后清理」 instead of a bare success.
+
+The `405`/`501` → `DELETE_UNSUPPORTED` fallback is kept for a Hub that predates the route: it hides the row from this device and says 「当前 Hub 尚不支持删除，已从本设备列表隐藏」. **The record still exists on the Hub in that path and the UI does not claim otherwise.** That fallback can be dropped once every deployed Hub carries the route.
 
 The delete target is held as `{spaceId, instanceId}` and re-resolved from current props each render, so a session that resumes while the sheet is open is offered 停止并删除 rather than the exited-only action.
+
+This branch contains no Rust change; the endpoint itself is x-ttyhub's, and the mock adapter mirrors its contract (409 on live without force, 404-idempotent) so the client paths are exercised without it.
 
 ## Verification
 
 | Check | Result / boundary |
 | --- | --- |
-| `pnpm test` (web unit) | PASS: 241 tests in 54 files |
+| `pnpm test` (web unit) | PASS: 242 tests in 54 files |
 | Dismiss/resurface and exited grouping unit tests | PASS: 13 store tests, including legacy `closedTabs` migration, blocked-episode suppression and re-arming, and the hide fallback |
 | `SpaceTabs` component tests | PASS: 6 tests — exited tab closes with no sheet and no command; 仅关闭标签 sends no close; cancel is inert; dismissed tab returns on blocked; plus the three pre-existing async-close cases |
-| `SpacesPanel` component tests | PASS: 5 tests — default-collapsed group, resume, confirm-before-delete, the 405 fallback message, and stop-first for a running target |
-| Mutation checks | Each new assertion was re-run against a deliberately broken implementation (resurface disabled, exited routed through the sheet, 仅关闭 wired to stop, fallback claiming success, group defaulting open) and failed in every case |
+| `SpacesPanel` component tests | PASS: 6 tests — default-collapsed group, resume, confirm-before-delete, the 405 fallback message, `force=1` for a live target with no separate close, and the non-`purged` `nodePurge` message |
+| Mutation checks | Each new assertion was re-run against a deliberately broken implementation (resurface disabled, exited routed through the sheet, 仅关闭 wired to stop, fallback claiming success, group defaulting open, `force` dropped, `nodePurge` ignored) and failed in every case |
 | `pnpm lint` | PASS: 4 pre-existing warnings in hosts/providers/NewSession, none in spaces |
 | `pnpm exec tsc -b` | PASS |
 | `./scripts/ci/secret-scan.sh` | PASS |
 | Tab-semantics browser run (mock fixture) | PASS: 2 tests, desktop 1440×900 and phone 400×860, both themes |
-| Full Hub suite `pnpm run test:e2e:hub` | See the run below |
+| Full Hub suite `pnpm run test:e2e:hub` | PASS: 8 passed in 1.3m (standalone Hub + fake Node), including the extended spaces scenario |
 
 The phone assertions run under Playwright touch emulation (`hasTouch`/`isMobile`), because only that makes `(pointer: coarse)` and `(hover: none)` match — the media queries the hover-free close affordance depends on. The test asserts this is in effect before relying on it. An earlier revision captured the phone screenshots without emulation and produced files byte-identical to the desktop-media ones; every published PNG is now distinct. The focus-ring case likewise reaches the close control with a real `Tab` press, since programmatic `.focus()` does not satisfy `:focus-visible`, and asserts a non-zero outline rather than only a screenshot.
 
@@ -64,7 +73,7 @@ pnpm exec playwright test -c playwright.tabs.config.ts   # evidence screenshots,
 pnpm test                                                 # unit suite
 ```
 
-The Hub suite is unchanged in shape; `web/tests/e2e/spaces-hub-live.spec.ts` gained the dismiss-without-stopping, exited-tab-close and exited-group assertions and runs the same way as in [spaces-1.md](./spaces-1.md).
+The Hub suite is unchanged in shape; `web/tests/e2e/spaces-hub-live.spec.ts` gained the dismiss-without-stopping, exited-tab-close and exited-group assertions and runs the same way as in [spaces-1.md](./spaces-1.md). It passed in the standalone mode (disposable Hub + fake Node). The exited-tab and exited-group assertions there are conditional: the fake Node acknowledges a close without settling an `exited` lifecycle, so that mode skips them rather than asserting against a state it cannot produce; they run against a real Node. The Hub suite was run once, at the end, as required.
 
 ## Scope
 

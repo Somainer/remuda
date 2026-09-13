@@ -38,16 +38,20 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
     try { await hubStore.resume(instanceId); } catch { hubStore.toast("恢复失败，请重试"); }
   }
 
-  /** Stops the session first when asked, then deletes the record for real. */
-  async function remove(spaceId: string, instance: Instance, stopFirst: boolean) {
+  /**
+   * Deletes the record for real. `force` is how a live session is stopped: the
+   * Hub stops and deletes together, so this must not close it separately.
+   */
+  async function remove(spaceId: string, instance: Instance, force: boolean) {
     setBusy(true);
     try {
-      if (stopFirst) await hubStore.close(instance.id);
-      await hubStore.deleteInstance(instance.id);
-      hubStore.toast("已删除会话");
+      const result = await hubStore.deleteInstance(instance.id, force);
+      // The Hub record is gone either way; only the Node's own data may remain.
+      hubStore.toast(result.nodePurge && result.nodePurge !== "purged"
+        ? "已删除会话；该主机数据待其上线后清理" : "已删除会话");
     } catch (error) {
-      // Until the Hub ships DELETE, the row leaves this device's lists and the
-      // record stays on the Hub; say so rather than claiming a deletion.
+      // On a Hub that predates the route the row leaves this device's lists and
+      // the record stays on the Hub; say so rather than claiming a deletion.
       if (error instanceof HubHttpError && error.code === DELETE_UNSUPPORTED) {
         spaceStore.hideSession(spaceId, instance.id);
         hubStore.toast("当前 Hub 尚不支持删除，已从本设备列表隐藏");

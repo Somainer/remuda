@@ -12,8 +12,8 @@ import { SpacesPanel } from "./SpacesPanel";
 import { spaceKey, spaceStore, SPACES_PREFS_KEY, type Space } from "./store";
 
 vi.mock("../../lib/store", () => ({
-  hubStore: { close: vi.fn(), deleteInstance: vi.fn(), resume: vi.fn(), toast: vi.fn(),
-    titleOf: (id: string) => id, hostName: () => "host-a" },
+  hubStore: { close: vi.fn(), deleteInstance: vi.fn().mockResolvedValue({ deleted: true, instanceId: "gone", nodePurge: "purged" }),
+    resume: vi.fn(), toast: vi.fn(), titleOf: (id: string) => id, hostName: () => "host-a" },
 }));
 
 const alpha = spaceKey("host-a", "workspace-a");
@@ -36,6 +36,7 @@ function renderPanel(instanceId?: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(hubStore.deleteInstance).mockResolvedValue({ deleted: true, instanceId: "gone", nodePurge: "purged" });
   localStorage.removeItem(SPACES_PREFS_KEY);
   spaceStore.reload();
 });
@@ -80,8 +81,8 @@ describe("SpacesPanel exited sessions", () => {
 
     await user.click(screen.getByTestId("exited-delete"));
     await user.click(screen.getByTestId("delete-session-confirm"));
-    expect(hubStore.deleteInstance).toHaveBeenCalledWith("gone");
-    // An exited session has nothing left to stop.
+    // An exited session needs no force, and nothing is closed separately.
+    expect(hubStore.deleteInstance).toHaveBeenCalledWith("gone", false);
     expect(hubStore.close).not.toHaveBeenCalled();
     await waitFor(() => expect(hubStore.toast).toHaveBeenCalledWith("已删除会话"));
     expect(spaceStore.getSnapshot().hiddenSessions[alpha] ?? []).toEqual([]);
@@ -101,6 +102,19 @@ describe("SpacesPanel exited sessions", () => {
     expect(hubStore.toast).not.toHaveBeenCalledWith("已删除会话");
   });
 
+  it("does not claim the host data is gone when the Node could not purge it", async () => {
+    const user = userEvent.setup();
+    vi.mocked(hubStore.deleteInstance).mockResolvedValueOnce({ deleted: true, instanceId: "gone", nodePurge: "node-offline" });
+    spaceStore.toggleExited(alpha);
+    renderPanel();
+    await user.click(screen.getByTestId("exited-delete"));
+    await user.click(screen.getByTestId("delete-session-confirm"));
+
+    // The Hub record is deleted either way; only the host copy is pending.
+    await waitFor(() => expect(hubStore.toast).toHaveBeenCalledWith("已删除会话；该主机数据待其上线后清理"));
+    expect(spaceStore.getSnapshot().hiddenSessions[alpha] ?? []).toEqual([]);
+  });
+
   it("stops a running session before deleting it", async () => {
     const user = userEvent.setup();
     // A session that resumes while the sheet is open must be offered the
@@ -115,7 +129,8 @@ describe("SpacesPanel exited sessions", () => {
 
     expect(screen.queryByTestId("delete-session-confirm")).not.toBeInTheDocument();
     await user.click(screen.getByTestId("delete-session-stop"));
-    expect(hubStore.close).toHaveBeenCalledWith("gone");
-    await waitFor(() => expect(hubStore.deleteInstance).toHaveBeenCalledWith("gone"));
+    // The Hub stops and deletes in one call, so the client must not close first.
+    await waitFor(() => expect(hubStore.deleteInstance).toHaveBeenCalledWith("gone", true));
+    expect(hubStore.close).not.toHaveBeenCalled();
   });
 });

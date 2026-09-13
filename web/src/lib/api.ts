@@ -43,6 +43,16 @@ import { coerceObservation, coerceObservationList } from "./hubJournal";
 /** Error code the instance-delete probe raises when the Hub has no DELETE route yet. */
 export const DELETE_UNSUPPORTED = "DELETE_UNSUPPORTED";
 
+/**
+ * `DELETE /v1/instances/{id}`. The Hub record is gone whatever `nodePurge`
+ * says; anything other than `purged` means the Node kept its data directory.
+ */
+export type InstanceDeleted = {
+  deleted: boolean;
+  instanceId: string;
+  nodePurge?: "purged" | "node-offline" | "node-rejected" | "purge-failed";
+};
+
 export const MOCK = import.meta.env.VITE_MOCK === "1";
 
 /** 200-JSON for a documented Hub REST operation. */
@@ -389,8 +399,11 @@ export type HubApi = {
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
   instanceResume(instanceId: Id): Promise<CommandResult>;
-  /** `DELETE /v1/instances/{id}`. Rejects with `DELETE_UNSUPPORTED` on a Hub without the route. */
-  instanceDelete(instanceId: Id): Promise<void>;
+  /**
+   * `DELETE /v1/instances/{id}`; `force` stops a live Instance first. Rejects
+   * with `DELETE_UNSUPPORTED` on a Hub that predates the route.
+   */
+  instanceDelete(instanceId: Id, force?: boolean): Promise<InstanceDeleted>;
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
@@ -635,8 +648,8 @@ function createMockApi(): HubApi {
     async instanceResume(instanceId) {
       return mockResume(instanceId);
     },
-    async instanceDelete(instanceId) {
-      mockDelete(instanceId);
+    async instanceDelete(instanceId, force) {
+      return mockDelete(instanceId, force);
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode, extras);
@@ -980,15 +993,16 @@ function createLiveApi(): HubApi {
     async instanceResume(instanceId) {
       return command(instanceId, "instance.resume", {});
     },
-    async instanceDelete(instanceId) {
-      // The Hub does not publish its OpenAPI document at runtime, so the route
-      // is probed directly: a Hub whose `/v1/instances/{id}` still only serves
-      // GET answers 405, and the caller falls back to hiding the row. A 404 is
-      // the session already being gone, which satisfies the delete.
+    async instanceDelete(instanceId, force) {
+      // The Hub answers 404 for a repeated delete, so the call is idempotent
+      // and needs no special case here. A Hub that predates the route serves
+      // only GET on this path and answers 405; the caller then falls back to
+      // hiding the row. `force=1` is what stops a live Instance — the client
+      // never has to close it separately.
       try {
-        await rest<void>(`/v1/instances/${instanceId}`, { method: "DELETE" });
+        return await rest<InstanceDeleted>(`/v1/instances/${instanceId}${force ? "?force=1" : ""}`, { method: "DELETE" });
       } catch (err) {
-        if (err instanceof HubHttpError && err.status === 404) return;
+        if (err instanceof HubHttpError && err.status === 404) return { deleted: true, instanceId };
         if (err instanceof HubHttpError && (err.status === 405 || err.status === 501)) {
           throw new HubHttpError(err.status, DELETE_UNSUPPORTED, err.message, err.reasons);
         }

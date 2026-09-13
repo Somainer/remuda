@@ -18,9 +18,10 @@ export type Space = {
 };
 
 /**
- * A tab the device dismissed. `resurface` re-opens the tab the next time the
- * session needs a human (D-024 addendum); it is cleared while the dismissal
- * happens during the blocked episode it would otherwise re-open immediately.
+ * A tab the device dismissed (D-024 addendum). `resurface` re-opens the tab the
+ * next time the session becomes blocked. Dismissing a tab that is blocked right
+ * now clears the flag, so the dismissal is not undone by the same episode;
+ * `rearmDismissed` sets it again once that episode ends.
  */
 export type DismissedTab = { id: string; resurface: boolean };
 
@@ -89,7 +90,7 @@ function dismissedIn(space: Space, prefs: SpacePrefs): Map<string, DismissedTab>
   return new Map((prefs.closedTabs[space.id] ?? []).map((entry) => [entry.id, entry]));
 }
 
-/** Sessions the device removed from this space's list because no delete endpoint answered. */
+/** Sessions hidden by the delete fallback, used while the Hub has no DELETE route. */
 function hiddenIn(space: Space, prefs: SpacePrefs): Set<string> {
   return new Set(prefs.hiddenSessions[space.id] ?? []);
 }

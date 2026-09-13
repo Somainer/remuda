@@ -88,6 +88,7 @@ async fn fake_herdr_start_prompt_idle_close() {
         agent_start_timeout_ms: 5_000,
         inherit_default_config: false,
         settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
     });
 
     let mut handle = driver.start(spec(&cwd)).await.expect("start");
@@ -110,6 +111,36 @@ async fn fake_herdr_start_prompt_idle_close() {
         .expect("lifecycle timeout")
         .expect("lifecycle event");
     assert!(matches!(first.body, ObservationPayload::Lifecycle(_)));
+
+    // Herdr's idle alone is insufficient: the real Claude trust transition can
+    // report idle before the prompt composer exists. Simulate the native hook.
+    assert!(matches!(
+        driver.wait_control().await,
+        Err(remuda_driver::DriverError::ControlUnavailable)
+    ));
+    assert!(matches!(
+        driver
+            .send(prompt("not dispatched before SessionStart"))
+            .await,
+        Err(remuda_driver::DriverError::ControlUnavailable)
+    ));
+    fs::write(
+        launch.join("session-meta.json"),
+        serde_json::json!({
+            "session_id": "fixture-session",
+            "transcript_path": launch.join("transcript.jsonl"),
+            "hook_event_name": "SessionStart",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while driver.wait_control().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
 
     driver
         .send(prompt("Reply with exactly OK"))
@@ -202,6 +233,7 @@ async fn live_claude_pty_haiku_once() {
         agent_start_timeout_ms: 180_000,
         inherit_default_config: false,
         settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
     });
     let mut spec = spec(&cwd);
     spec.model_id = Some("haiku".into());

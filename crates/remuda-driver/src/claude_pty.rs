@@ -96,6 +96,8 @@ pub struct ClaudePtyOptions {
     /// Let Claude resolve its default config directory instead of exporting
     /// `CLAUDE_CONFIG_DIR`.
     pub inherit_default_config: bool,
+    /// Node verified that cwd belongs to a registered workspace and enabled automatic trust.
+    pub auto_trust_registered_workspace: bool,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
 }
@@ -124,6 +126,7 @@ impl ClaudePtyOptions {
             agent_start_timeout_ms: 120_000,
             inherit_default_config: false,
             settings_overlay_path: None,
+            auto_trust_registered_workspace: false,
         }
     }
 }
@@ -132,7 +135,6 @@ struct PtyLive {
     ctx: crate::claude_pty::ObsCtx,
     client: Client,
     pane_id: String,
-    agent_name: String,
     recipe: LaunchRecipe,
     instance_id: InstanceId,
     host_id: HostId,
@@ -234,6 +236,12 @@ impl ClaudePtyDriver {
         apply_tty_bypass_flag(&mut recipe);
         refuse_bare(&recipe.argv)?;
         recipe = inject_session_start_hook(&mut recipe, &self.options.launch_dir)?;
+        // A previous run's hook file cannot prove this carrier finished startup.
+        match std::fs::remove_file(self.options.launch_dir.join("session-meta.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         apply_tty_bypass_flag(&mut recipe);
         refuse_bare(&recipe.argv)?;
         *self.last_recipe.lock().await = Some(recipe.clone());
@@ -383,6 +391,7 @@ impl ClaudePtyDriver {
             ctx.clone(),
             tx.clone(),
             Arc::clone(&self.seq),
+            self.options.auto_trust_registered_workspace,
         );
         let interaction_task = interactions.spawn();
         let status_task = spawn_status_pump(stream, pane_id.clone(), Arc::clone(&interactions));
@@ -400,7 +409,6 @@ impl ClaudePtyDriver {
             ctx,
             client,
             pane_id,
-            agent_name,
             recipe: recipe.clone(),
             instance_id,
             host_id: spec.host.clone(),
@@ -462,6 +470,16 @@ impl Driver for ClaudePtyDriver {
         }
     }
 
+    async fn wait_control(&self) -> DriverResult<()> {
+        let inner = self.inner.lock().await;
+        let live = inner
+            .as_ref()
+            .filter(|live| !live.closed)
+            .ok_or(DriverError::ControlUnavailable)?;
+        require_session_start(live)?;
+        crate::pty_interaction::prompt_ready(&live.client, &live.pane_id).await
+    }
+
     async fn attach(&self, native_ref: NativeRef) -> DriverResult<DriverAck> {
         let mut inner = self.inner.lock().await;
         let live = inner.as_mut().ok_or(DriverError::NativeSessionNotFound)?;
@@ -521,9 +539,11 @@ impl Driver for ClaudePtyDriver {
         if live.closed {
             return Err(DriverError::ControlUnavailable);
         }
+        require_session_start(live)?;
+        crate::pty_interaction::prompt_ready(&live.client, &live.pane_id).await?;
         live.client
             .agent_prompt(AgentPromptParams {
-                target: live.agent_name.clone(),
+                target: live.pane_id.clone(),
                 text,
                 wait: None,
             })
@@ -648,6 +668,21 @@ impl Driver for ClaudePtyDriver {
     }
 }
 
+fn require_session_start(live: &PtyLive) -> DriverResult<()> {
+    // Herdr can report a transient idle immediately after folder trust, before
+    // Claude has mounted its prompt composer. Its own SessionStart hook fences startup.
+    if live
+        .transcript_path
+        .lock()
+        .ok()
+        .is_some_and(|slot| slot.is_some())
+    {
+        Ok(())
+    } else {
+        Err(DriverError::ControlUnavailable)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ObsCtx {
     pub(crate) driver: DriverKind,
@@ -693,8 +728,9 @@ fn spawn_hook_watch(
     transcript_slot: Arc<std::sync::Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Live Claude startup (trust UI + SessionStart) can exceed 10s.
-        for _ in 0..900 {
+        // A user-owned startup dialog may remain pending indefinitely. Close
+        // aborts this watcher; elapsed time must not make queued input unrecoverable.
+        while !tx.is_closed() {
             if let Ok(body) = tokio::fs::read_to_string(&path).await
                 && let Ok(value) = serde_json::from_str::<Value>(&body)
             {
@@ -706,10 +742,9 @@ fn spawn_hook_watch(
                     .get("transcript_path")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if !transcript.is_empty()
-                    && let Ok(mut slot) = transcript_slot.lock()
-                {
-                    *slot = Some(transcript.to_string());
+                if transcript.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
                 }
                 let mut related = BTreeMap::new();
                 if !transcript.is_empty() {
@@ -731,7 +766,7 @@ fn spawn_hook_watch(
                         affects_completion: false,
                     }),
                 )));
-                let _ = emit_obs(
+                if emit_obs(
                     &tx,
                     &seq,
                     &ctx,
@@ -739,7 +774,12 @@ fn spawn_hook_watch(
                     Completeness::Structured,
                     payload,
                 )
-                .await;
+                .await
+                .is_ok()
+                    && let Ok(mut slot) = transcript_slot.lock()
+                {
+                    *slot = Some(transcript.to_string());
+                }
                 return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1373,7 +1413,9 @@ pub(crate) fn map_herdr(err: remuda_herdr::Error) -> DriverError {
         ),
         remuda_herdr::Error::Api {
             code, message: _, ..
-        } if code == "agent_not_ready" => DriverError::ControlUnavailable,
+        } if matches!(code.as_str(), "agent_not_ready" | "agent_blocked") => {
+            DriverError::ControlUnavailable
+        }
         other => DriverError::InvalidLaunchSpec(other.to_string()),
     }
 }

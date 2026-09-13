@@ -191,6 +191,7 @@ fn daemon_config(config: &Config) -> Result<PathBuf> {
     #[derive(serde::Serialize)]
     struct PersistedNode<'a> {
         workspace: &'a Path,
+        auto_trust_registered_workspaces: bool,
         labels: &'a BTreeMap<String, String>,
         max_instances: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,6 +214,7 @@ fn daemon_config(config: &Config) -> Result<PathBuf> {
         shutdown_timeout_secs: config.shutdown_timeout_secs,
         node: PersistedNode {
             workspace: &config.node.workspace,
+            auto_trust_registered_workspaces: config.node.auto_trust_registered_workspaces,
             labels: &config.node.labels,
             max_instances: config.node.max_instances,
             hub_url: config.node.hub_url.as_deref(),

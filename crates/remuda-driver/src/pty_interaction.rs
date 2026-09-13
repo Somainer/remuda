@@ -58,6 +58,7 @@ struct State {
     pending: Option<Pending>,
     status: Option<AgentStatus>,
     closed: bool,
+    trust_attempted: bool,
 }
 
 pub(crate) struct PtyInteractions {
@@ -68,6 +69,7 @@ pub(crate) struct PtyInteractions {
     tx: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     state: Mutex<State>,
+    auto_trust_registered_workspace: bool,
 }
 
 impl PtyInteractions {
@@ -84,6 +86,7 @@ impl PtyInteractions {
         ctx: ObsCtx,
         tx: mpsc::Sender<Observation>,
         seq: Arc<AtomicU64>,
+        auto_trust_registered_workspace: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             client,
@@ -92,6 +95,7 @@ impl PtyInteractions {
             tx,
             seq,
             state: Mutex::new(State::default()),
+            auto_trust_registered_workspace,
         })
     }
 
@@ -219,6 +223,46 @@ impl PtyInteractions {
             state_change_seq: info.state_change_seq,
             attempted: false,
         });
+        if self.auto_trust_registered_workspace
+            && self.ctx.driver == DriverKind::ClaudePty
+            && !state.trust_attempted
+            && !screen_truncated
+            && let Some(pending) = state.pending.as_mut()
+            && pending.interaction.answerable
+            && let Some(keys) = trust_dialog_keys(&pending.screen)
+        {
+            // One automatic attempt per carrier, even if an ACK is lost and the
+            // screen changes. Only observed native clearing resolves the dialog.
+            state.trust_attempted = true;
+            let result = self.commit_answer(pending, keys).await;
+            self.emit(ObservationPayload::Lifecycle(Box::new(
+                LifecyclePayload::Native(Box::new(NativeLifecycle {
+                    topic: LifecycleTopic::Diagnostic,
+                    native_name: "trust-dialog".into(),
+                    native_id: Knowledge::Known {
+                        value: self.target.clone(),
+                    },
+                    status: Knowledge::Known {
+                        value: if result.is_ok() {
+                            "trust-dialog auto-accepted (registered workspace)"
+                        } else {
+                            "trust-dialog automatic answer delivery unknown; not replayed"
+                        }
+                        .into(),
+                    },
+                    related_ids: BTreeMap::new(),
+                    data_ref: None,
+                    severity: if result.is_ok() {
+                        Severity::Info
+                    } else {
+                        Severity::Warning
+                    },
+                    affects_completion: false,
+                })),
+            )))
+            .await?;
+            result?;
+        }
         Ok(())
     }
 
@@ -321,6 +365,14 @@ impl PtyInteractions {
             return Err(invalid("PTY screen unavailable or truncated"));
         }
         let keys = answer_keys(pending, &answer)?;
+        self.commit_answer(pending, keys).await
+    }
+
+    async fn commit_answer(
+        &self,
+        pending: &mut Pending,
+        keys: Vec<String>,
+    ) -> DriverResult<DriverAck> {
         // Mark before I/O: even a lost RPC ACK must never replay Enter.
         pending.attempted = true;
         let result = self.write(keys).await;
@@ -375,6 +427,64 @@ impl PtyInteractions {
 
 fn invalid(message: &str) -> DriverError {
     DriverError::InvalidLaunchSpec(message.into())
+}
+
+/// Prompt readiness is a pre-dispatch query. A busy/blocked pane is safe to queue.
+pub(crate) async fn prompt_ready(client: &Client, target: &str) -> DriverResult<()> {
+    let agent = client.agent_get(target).await.map_err(map_herdr)?.agent;
+    if !matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done)
+        || !agent.interactive_ready
+    {
+        return Err(DriverError::ControlUnavailable);
+    }
+    Ok(())
+}
+
+/// Only Claude's exact folder question with both known choices and one cursor.
+fn trust_dialog_keys(screen: &str) -> Option<Vec<String>> {
+    let normalized = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !normalized.contains("Quick safety check:")
+        || !normalized.contains("Is this a project you created or one you trust?")
+    {
+        return None;
+    }
+    let mut choices = Vec::new();
+    let mut selected = None;
+    for line in screen.lines() {
+        let line = line.trim();
+        let marked = line.starts_with(['❯', '›', '>']);
+        let label = line.trim_start_matches(['❯', '›', '>']).trim();
+        // Numbered versions of the same Claude menu use the same cursor keys.
+        let label = label
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start_matches(['.', ')'])
+            .trim();
+        if matches!(label, "No, exit" | "Yes, I trust this folder") {
+            if marked && selected.replace(choices.len()).is_some() {
+                return None;
+            }
+            choices.push(label);
+        } else if marked {
+            return None;
+        }
+    }
+    if choices.len() != 2 || choices[0] == choices[1] {
+        return None;
+    }
+    let selected = selected?;
+    let yes = choices
+        .iter()
+        .position(|label| *label == "Yes, I trust this folder")?;
+    let mut keys = vec![
+        if yes < selected {
+            "up".into()
+        } else {
+            "down".into()
+        };
+        yes.abs_diff(selected)
+    ];
+    keys.push("enter".into());
+    Some(keys)
 }
 
 fn answer_keys(pending: &Pending, answer: &InteractionAnswer) -> DriverResult<Vec<String>> {
@@ -653,6 +763,7 @@ mod tests {
                 ctx(),
                 tx,
                 Arc::new(AtomicU64::new(0)),
+                false,
             );
             let screen = "Continue? [y/n]";
             let (interaction, keys) = screen_request(&interactions.ctx, screen).unwrap();
@@ -686,6 +797,27 @@ mod tests {
             assert!(interactions.send_keys(vec!["enter".into()]).await.is_err());
         }
     }
+    #[test]
+    fn exact_trust_dialog_requires_unambiguous_selected_menu() {
+        let title = "Quick safety check: Is this a project you created or one you trust?";
+        assert_eq!(
+            trust_dialog_keys(&format!("{title}\n❯ No, exit\nYes, I trust this folder")),
+            Some(vec!["down".into(), "enter".into()])
+        );
+        assert_eq!(
+            trust_dialog_keys(&format!("{title}\n❯ Yes, I trust this folder\nNo, exit")),
+            Some(vec!["enter".into()])
+        );
+        for screen in [
+            "Do you trust this command?\n❯ No, exit\nYes, I trust this folder".to_owned(),
+            format!("{title}\nNo, exit\nYes, I trust this folder"),
+            format!("{title}\n❯ No, exit\n❯ Yes, I trust this folder"),
+            format!("{title}\n❯ No, exit\nYes, I trust this folder\nNo, exit"),
+        ] {
+            assert!(trust_dialog_keys(&screen).is_none());
+        }
+    }
+
     #[test]
     fn bounded_excerpt_is_utf8_safe_and_disables_truncated_reply() {
         assert!(

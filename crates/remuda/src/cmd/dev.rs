@@ -131,6 +131,7 @@ pub(crate) async fn run(
         .with_access_code(running_hub.bootstrap_token.clone())?;
     node_config.bind_addr = config.node.listen;
     let mut native = NativeDriverConfig::new(config.data_dir.join("node"));
+    native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
     native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
     if let Some(binary) = resolve_claude_binary() {
         tracing::info!(path = %binary.display(), "using Claude binary from PATH");

@@ -34,6 +34,8 @@ pub struct DriverLaunch {
     pub request: crate::CreateInstanceRequest,
     /// Absolute workspace root selected by the local registry.
     pub workspace_root: PathBuf,
+    /// Registered Node workspace boundary, before resolving an instance cwd.
+    pub registered_workspace_root: PathBuf,
 }
 
 /// One operation delivered to an instance-local driver task.
@@ -135,6 +137,9 @@ impl DriverEmission {
 /// Driver-side failure contained to one instance worker.
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
+    /// Native input was not dispatched because its control is not ready.
+    #[error("control unavailable")]
+    ControlUnavailable,
     /// The request is not supported by this adapter.
     #[error("unsupported driver request: {0}")]
     Unsupported(String),

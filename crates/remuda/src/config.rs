@@ -24,7 +24,7 @@
 //! MAX_INSTANCES, PROVIDER_PROFILES (JSON object), SHUTDOWN_TIMEOUT_SECS,
 //! BOOTSTRAP_TOKEN, WEB_PASSWORD_FILE, COOKIE_SECURE, WEB_ROOT,
 //! ALLOWED_ORIGINS, WEB_ORIGINS (JSON arrays), COMMAND_ACCEPT_TIMEOUT_MS, and
-//! CREATE_SETTLE_TIMEOUT_MS, all prefixed `REMUDA_`.
+//! CREATE_SETTLE_TIMEOUT_MS, AUTO_TRUST_REGISTERED_WORKSPACES, all prefixed `REMUDA_`.
 //! Direct token environment variables take precedence over token-file variables.
 
 use anyhow::{Context, bail, ensure};
@@ -91,6 +91,8 @@ pub(crate) struct Node {
     #[serde(alias = "herdrSocket")]
     pub herdr_socket: Option<PathBuf>,
     pub workspace: PathBuf,
+    #[serde(alias = "autoTrustRegisteredWorkspaces")]
+    pub auto_trust_registered_workspaces: bool,
     #[serde(alias = "webOrigins")]
     pub web_origins: Vec<String>,
 }
@@ -379,6 +381,7 @@ impl Default for Node {
             max_instances: 8,
             herdr_socket: None,
             workspace: ".".into(),
+            auto_trust_registered_workspaces: true,
             web_origins: vec![
                 "http://localhost:5173".into(),
                 "http://127.0.0.1:5173".into(),
@@ -481,6 +484,13 @@ impl Config {
         }
         if let Some(value) = env_text(env, "REMUDA_HUB_URL")? {
             self.node.hub_url = Some(value);
+        }
+        if let Some(value) = env_text(env, "REMUDA_AUTO_TRUST_REGISTERED_WORKSPACES")? {
+            self.node.auto_trust_registered_workspaces = match value.as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => bail!("REMUDA_AUTO_TRUST_REGISTERED_WORKSPACES must be true, false, 1 or 0"),
+            };
         }
         if let Some(value) = env_text(env, "REMUDA_MAX_INSTANCES")? {
             self.node.max_instances = parse_env(&value, "REMUDA_MAX_INSTANCES")?;
@@ -805,6 +815,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn auto_trust_registered_workspaces_defaults_and_overrides() {
+        assert!(Config::default().node.auto_trust_registered_workspaces);
+        let fixture = Fixture::new("[node]\nauto_trust_registered_workspaces = false\n");
+        assert!(
+            !fixture
+                .load(&[])
+                .unwrap()
+                .node
+                .auto_trust_registered_workspaces
+        );
+        assert!(
+            fixture
+                .load(&[("REMUDA_AUTO_TRUST_REGISTERED_WORKSPACES", "true")])
+                .unwrap()
+                .node
+                .auto_trust_registered_workspaces
+        );
+        assert!(
+            fixture
+                .load(&[("REMUDA_AUTO_TRUST_REGISTERED_WORKSPACES", "invalid")])
+                .is_err()
+        );
     }
 
     #[test]

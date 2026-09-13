@@ -16,6 +16,7 @@ use tokio::sync::watch;
 pub(super) async fn run(config: Config, args: Args, mut shutdown: Shutdown) -> Result<()> {
     let listener = remuda_node::bind_daemon(&config.data_dir).await?;
     let mut native = remuda_node::NativeDriverConfig::new(config.data_dir.clone());
+    native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
     native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
     native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
     std::fs::create_dir_all(&config.node.workspace)?;

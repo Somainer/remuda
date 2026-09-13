@@ -438,6 +438,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
         agent_start_timeout_ms: 5_000,
         inherit_default_config: false,
         settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
     });
 
     let mut spec = pty_spec(&cwd, "opus-review");

@@ -2577,6 +2577,11 @@
       "description": "ContentStatus wire values; `protocol.md` §5.2.",
       "oneOf": [
         {
+          "const": "queued",
+          "description": "Wire value `queued`.",
+          "type": "string"
+        },
+        {
           "const": "streaming",
           "description": "Wire value `streaming`.",
           "type": "string"

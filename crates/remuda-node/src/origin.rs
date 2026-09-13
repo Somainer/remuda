@@ -139,6 +139,7 @@ mod tests {
                 .unwrap(),
                 request: serde_json::from_value(json!({"agentCredential":credential})).unwrap(),
                 workspace_root: ".".into(),
+                registered_workspace_root: ".".into(),
             };
             let env = instance_env(&launch, &inherited);
             assert_eq!(env["REMUDA_BOOTSTRAP_TOKEN"], "");

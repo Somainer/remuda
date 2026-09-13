@@ -186,6 +186,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
         agent_start_timeout_ms: 180_000,
         inherit_default_config: false,
         settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
     });
 
     let t0 = Instant::now();

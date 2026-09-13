@@ -351,7 +351,7 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
 }
 
 #[tokio::test]
-async fn fake_herdr_send_before_start_waits_for_control() {
+async fn fake_herdr_send_before_start_defers_without_blocking_control() {
     let tmp = tempfile::tempdir().unwrap();
     let socket_dir = tmp.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
@@ -378,19 +378,24 @@ async fn fake_herdr_send_before_start_waits_for_control() {
     }));
     fs::create_dir_all(tmp.path().join("home")).unwrap();
 
-    let pending = {
-        let driver = Arc::clone(&driver);
-        tokio::spawn(async move { driver.send(prompt("print DONE")).await })
-    };
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    let unavailable = tokio::time::timeout(
+        Duration::from_millis(100),
+        driver.send(prompt("print DONE")),
+    )
+    .await
+    .expect("readiness never waits for startup");
+    assert!(matches!(
+        unavailable,
+        Err(remuda_driver::DriverError::ControlUnavailable)
+    ));
     driver
         .start(spec(&cwd, AgentKind::Codex))
         .await
         .expect("start");
-    pending
+    driver
+        .send(prompt("print DONE"))
         .await
-        .expect("join")
-        .expect("queued send delivered after control ready");
+        .expect("caller can deliver queued input after control becomes ready");
     driver.close().await.expect("stop");
 }
 

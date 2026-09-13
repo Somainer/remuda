@@ -1,11 +1,13 @@
 # Intranet Hub behind the existing Caddy
 
-Status: **activated after explicit Caddy restart approval on 2026-09-13**.
-The approved apply completed without rollback. Gateway readiness retained its
-reviewed response hash, and Hub HTTPS `/healthz` returned 200 with certificate
-verification passing. See the [activation evidence](../../docs/design/evidence/intranet-hub-1.md#approved-activation--2026-09-13).
-Browser login and Node acceptance remain pending; earlier staging probes are
-historical and do not establish those checks.
+Status: **HTTPS activated; Mac device paired; Node enrollment blocked by the
+deployed Hub's missing D-018 endpoint**. Approved Caddy activation is recorded in
+[intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md). API pairing and
+the cookie session passed, but authenticated `POST /v1/hosts/enroll-token`
+returned HTTP 405. A compatible Hub upgrade is required before installing the
+Mac daemon. See [intranet-enroll-1.md](../../docs/design/evidence/intranet-enroll-1.md)
+for the isolation fix, pending PTY/reconnect acceptance and SG/bolt installation
+plan. No remote Node installation was performed in this milestone.
 
 This is the immediate [D-020](../../docs/design/decisions.md) deployment
 path. Run Hub on the SG host, join its existing `deploy_default` network,
@@ -98,8 +100,8 @@ the first-login access code at `/data00/remuda/secrets/access-code`, mode
 0600; read it privately to log in. A logged-in browser can
 generate a phone pairing code in Settings; the phone uses `/login?pair`.
 Subsequent Node acceptance is pending. Follow [NODES.md](../public/NODES.md)
-for the current outbound carrier and
-the future daemon installer. Store provider gateway configuration on the
+for the outbound carrier and D-019 daemon installer, which requires a compatible
+Hub upgrade. Store provider gateway configuration on the
 Node that reaches it; the Hub does not proxy provider requests. The inspected
 remote PATH lacks native agent CLIs and Herdr. Node enrollment can report
 these missing tools; an online Node does not establish session execution

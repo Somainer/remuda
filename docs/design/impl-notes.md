@@ -1101,3 +1101,13 @@ change are prepared. The active Caddyfile is restored, with no Caddy restart
 or recreation executed. Live apply/rollback and browser/Node acceptance await
 explicit approval. See [intranet-hub-1](evidence/intranet-hub-1.md) for artifact
 identity, guard checks and exact commands. Status: `BLOCKED awaiting-caddy-restart-approval`.
+
+### 2026-09-13 — Intranet Mac enrollment blocked by deployed Hub version
+
+Device pairing and the cookie session on `https://remuda.<zone>` passed, including
+one-time pairing-code reuse rejection. Authenticated `POST /v1/hosts/enroll-token`
+returned HTTP 405: the deployed `remuda-hub:e3a4133` predates D-018. No Node daemon
+was installed and no SG/bolt persistent change was made under this milestone.
+The Mac Herdr default isolation fix and remaining acceptance/remote install plan
+are recorded in [intranet-enroll-1.md](./evidence/intranet-enroll-1.md).
+An approved compatible Hub upgrade is required before enrollment can continue.

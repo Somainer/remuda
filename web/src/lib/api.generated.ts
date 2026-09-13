@@ -507,6 +507,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/objects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stage one image for a later instance.send (D-027)
+         * @description Raw image bytes with a Content-Type. Human or Bot devices only; an Agent-origin caller is refused. The media type is sniffed from the bytes and must agree with the declared Content-Type. Limits: 5 MiB per attachment, 64 MiB staged per instance, 4 attachments per send.
+         */
+        post: operations["objectUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/objects/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read staged attachment bytes
+         * @description Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance — a Node cannot read another host's attachments — or as a Human/Bot device. Expired objects read as 404.
+         */
+        get: operations["objectRead"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/placement/resolve": {
         parameters: {
             query?: never;
@@ -602,6 +642,19 @@ export interface components {
             code: "HUMAN_APPROVAL_REQUIRED";
             error: string;
             interactionId: string;
+        };
+        /** @description Staged attachment metadata (D-027). The media type and name are the Hub's own: the type is sniffed from the bytes and the name is derived as <objectId>.<ext>, so a caller-supplied filename never survives. */
+        AttachmentUpload: {
+            /** @description Lowercase hex SHA-256 of the stored bytes. */
+            digest: string;
+            /** @description RFC3339. Staging is lazily expired, not swept by a job. */
+            expiresAt: string;
+            instanceId: string;
+            /** @enum {string} */
+            mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+            name: string;
+            objectId: string;
+            size: number;
         };
         CallerContext: {
             /** @description Direct children created by this instance; descendants do not inherit scope. */
@@ -2033,6 +2086,68 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    objectUpload: {
+        parameters: {
+            query: {
+                /** @description Instance this attachment is staged for; it also scopes who may read it back. */
+                instanceId: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "image/gif": string;
+                "image/jpeg": string;
+                "image/png": string;
+                "image/webp": string;
+            };
+        };
+        responses: {
+            /** @description Staged object metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentUpload"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    objectRead: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Raw image bytes, served as an attachment with nosniff */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/gif": string;
+                    "image/jpeg": string;
+                    "image/png": string;
+                    "image/webp": string;
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     placementResolve: {

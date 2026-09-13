@@ -26,7 +26,7 @@ pub enum ResolvedProvider {
     /// Hub-stored profile delivered through SecretBroker.
     Profile {
         /// Registry row (token stays in the vault).
-        profile: ProviderRecord,
+        profile: Box<ProviderRecord>,
         /// Waterfall step that selected this profile.
         source: &'static str,
     },
@@ -163,7 +163,7 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
         return match find_profile(input.profiles, id) {
             Some(profile) if profile_allowed_on_host(&profile.scope, host_id) => {
                 Ok(ResolvedProvider::Profile {
-                    profile: profile.clone(),
+                    profile: Box::new(profile.clone()),
                     source: SOURCE_REQUEST,
                 })
             }
@@ -193,7 +193,7 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
                 return match find_profile(input.profiles, &id) {
                     Some(profile) if profile_allowed_on_host(&profile.scope, host_id) => {
                         Ok(ResolvedProvider::Profile {
-                            profile: profile.clone(),
+                            profile: Box::new(profile.clone()),
                             source: SOURCE_HOST_BINDING,
                         })
                     }
@@ -213,7 +213,7 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
     let host_scope = format!("host:{host_id}");
     if let Some(profile) = default_gateway_in(input.profiles, &host_scope) {
         return Ok(ResolvedProvider::Profile {
-            profile: profile.clone(),
+            profile: Box::new(profile.clone()),
             source: SOURCE_HOST_SCOPED_DEFAULT,
         });
     }
@@ -223,7 +223,7 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
 
     if let Some(profile) = default_gateway_in(input.profiles, "universal") {
         return Ok(ResolvedProvider::Profile {
-            profile: profile.clone(),
+            profile: Box::new(profile.clone()),
             source: SOURCE_UNIVERSAL_DEFAULT,
         });
     }
@@ -520,7 +520,7 @@ mod tests {
         };
         assert_eq!(native.hint(), "使用主机原生登录");
         let profile = ResolvedProvider::Profile {
-            profile: profile("pvp_u", "uni-gw", "universal", true),
+            profile: Box::new(profile("pvp_u", "uni-gw", "universal", true)),
             source: SOURCE_UNIVERSAL_DEFAULT,
         };
         assert_eq!(profile.hint(), "将使用 uni-gw (universal)");

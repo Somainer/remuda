@@ -21,6 +21,20 @@ vibe-kanban
   inbound notifications and server→client requests onto an mpsc stream;
   NDJSON line cap; skip empty/`#` lines; no vibe-kanban executor callbacks.
 
+Herdr agent-detection manifests
+  Copyright 2026 the herdr authors
+  License: Apache-2.0
+  Source: herdr 0.9.0 macOS binary; the manifests are compiled into `.rodata`
+  and are also published at https://herdr.dev/agent-detection/index.toml
+  Lifted path: herdr `src/detect/manifest.rs` bundled manifests (data only)
+  Local path: crates/remuda-rules/rules/*.toml
+  Header: provenance banner at each file start (herdr version, declared
+  manifest version / min_engine_version / updated_at)
+  Modifications: none — the TOML below each banner is byte-for-byte upstream
+  text. Extracted with crates/remuda-rules/scripts/extract-herdr-rules.py.
+  No herdr *code* was copied: crates/remuda-rules/src is an original engine
+  written against the data table (D-028 §10).
+
 -------------------------------------------------------------------------------
 Apache-2.0 (not copied; protocol cross-check only)
 
@@ -40,8 +54,9 @@ vibe-kanban ACP executor
 
 Herdr
   Calling a local `herdr` binary over a Unix socket is not a code lift.
-  `crates/remuda-herdr` is an original client. `herdr/src/detect` is not
-  vendored.
+  `crates/remuda-herdr` is an original client. No `herdr/src/detect` *code* is
+  vendored; its agent-detection TOML data table is, under
+  `crates/remuda-rules/rules/` — see the Apache-2.0 (copied) block above.
 
 -------------------------------------------------------------------------------
 MIT (algorithms rewritten, not imported)

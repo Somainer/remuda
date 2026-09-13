@@ -10,6 +10,7 @@ members = [
     "crates/remuda-journal",
     "crates/remuda-push",
     "crates/remuda-node",
+    "crates/remuda-rules",
     "crates/remuda-ssh",
     "crates/remuda-hub",
     "crates/remuda-feishu",
@@ -56,6 +57,7 @@ remuda-herdr = { path = "crates/remuda-herdr" }
 remuda-driver = { path = "crates/remuda-driver" }
 remuda-journal = { path = "crates/remuda-journal" }
 remuda-push = { path = "crates/remuda-push" }
+remuda-rules = { path = "crates/remuda-rules" }
 remuda-node = { path = "crates/remuda-node" }
 remuda-ssh = { path = "crates/remuda-ssh" }
 remuda-hub = { path = "crates/remuda-hub" }

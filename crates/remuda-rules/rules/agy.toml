@@ -1,0 +1,48 @@
+# Agent-detection rule manifest for `agy`, extracted verbatim from the
+# herdr 0.9.0 binary (herdr-macos) — see D-028 §10.
+#
+# Upstream: herdr, Copyright 2026 the herdr authors, Apache-2.0.
+# This file is a copied third-party asset; see the repo NOTICE. Do not hand
+# edit — regenerate with crates/remuda-rules/scripts/extract-herdr-rules.py
+# when the pinned herdr binary moves, then re-run the crate tests.
+#
+# Declared versions:
+#   version = "2026.06.24.1"
+#   min_engine_version = 1
+#   updated_at = "2026-06-24T00:00:00Z"
+#   aliases = ["antigravity", "antigravity-cli"]
+#
+# Everything below this banner is byte-for-byte upstream text.
+id = "agy"
+version = "2026.06.24.1"
+min_engine_version = 1
+updated_at = "2026-06-24T00:00:00Z"
+aliases = ["antigravity", "antigravity-cli"]
+
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 300
+region = "whole_recent"
+visible_blocker = true
+contains = ["requesting permission for:"]
+any = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["tab amend", "edit command"] },
+]
+
+[[rules]]
+id = "spinner_working"
+state = "working"
+priority = 100
+region = "whole_recent"
+visible_working = true
+line_regex = ['^\s*[\u2800-\u28FF]+\s+\p{Alphabetic}+\w*ing\b']
+
+[[rules]]
+id = "background_tasks_working"
+state = "working"
+priority = 90
+region = "bottom_non_empty_lines(5)"
+visible_working = true
+line_regex = ['(?i)·\s*[1-9][0-9]*\s+task']

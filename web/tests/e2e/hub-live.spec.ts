@@ -90,6 +90,49 @@ test("paste an image: it stages on the Hub and its metadata reaches the Node", a
   await page.getByTestId("new-session-start").click();
   await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
   await expect(page.getByTestId("session-page")).toBeVisible();
+
+  // The fake Node raises an approval on every create, and a pending one holds
+  // this instance's composer disabled. Answer exactly this instance's
+  // approvals through the API: the UI rows are all labelled alike, so picking
+  // the right one by text is not reliable here.
+  const instanceId = new URL(page.url()).pathname.split("/").pop() as string;
+  await expect
+    .poll(
+      async () =>
+        await page.evaluate(async (id) => {
+          const list = await fetch("/v1/interactions", { credentials: "include" });
+          const body = (await list.json()) as {
+            items?: {
+              id: string;
+              instanceId?: string;
+              state?: string;
+              request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
+            }[];
+          };
+          const mine = (body.items ?? []).filter(
+            (item) => item.instanceId === id && item.state === "pending",
+          );
+          for (const item of mine) {
+            const optionId = item.request?.options?.[0]?.id;
+            if (!optionId) continue;
+            await fetch(`/v1/interactions/${item.id}/answer`, {
+              method: "POST",
+              credentials: "include",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                answer: {
+                  kind: "approval",
+                  optionId,
+                  inputDigest: item.request?.inputDigest ?? "",
+                },
+              }),
+            });
+          }
+          return mine.length;
+        }, instanceId),
+      { timeout: 20_000 },
+    )
+    .toBe(0);
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
 
   // A real 1x1 red PNG, pasted the way a browser delivers one.

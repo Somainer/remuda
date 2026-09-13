@@ -25,6 +25,8 @@ async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
       workspace.rootPath = `/home/dev/projects/${workspace.rootPath.split("/").pop()}`;
       workspace.canonicalRoot = { state: "known", value: workspace.rootPath };
     });
+    // Host labels reach the sidebar through hub.hosts, so reload those too.
+    await hubStore.refreshHosts();
     await hubStore.refresh();
     return labels;
   });
@@ -65,9 +67,19 @@ test("status and close are distinct, dismissal keeps sessions running, and exite
   await screenshot(page, "desktop-dark", "night");
   await screenshot(page, "desktop-light", "ledger");
 
-  // Keyboard focus on the close control stays visible.
-  await active.getByTestId("tab-close").focus();
-  await expect(active.getByTestId("tab-close")).toBeFocused();
+  // Keyboard focus must be visible. Programmatic focus does not satisfy
+  // :focus-visible, so reach the control the way a keyboard user does.
+  await active.getByTestId("session-tab").focus();
+  await page.keyboard.press("Tab");
+  const closeControl = active.getByTestId("tab-close");
+  await expect(closeControl).toBeFocused();
+  const ring = await closeControl.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { matches: element.matches(":focus-visible"), width: style.outlineWidth, style: style.outlineStyle };
+  });
+  expect(ring.matches, "the close control must show a :focus-visible ring").toBe(true);
+  expect(ring.style).not.toBe("none");
+  expect(parseFloat(ring.width)).toBeGreaterThan(0);
   await screenshot(page, "desktop-close-focus-dark", "night");
 
   // Closing a running tab asks first and never stops the session silently.
@@ -106,27 +118,57 @@ test("status and close are distinct, dismissal keeps sessions running, and exite
   await screenshot(page, "desktop-delete-sheet-dark", "night");
   await page.getByTestId("delete-session-sheet-cancel").click();
   await expect(page.getByTestId("delete-session-sheet")).toHaveCount(0);
-
-  // 400px: the same semantics, with the close control revealed by a long press.
-  await page.setViewportSize({ width: 400, height: 860 });
-  await expect(page.getByTestId("spaces-chips")).toBeVisible();
-  await screenshot(page, "phone-dark", "night");
-  await screenshot(page, "phone-light", "ledger");
-  const phoneTab = strip.locator('[data-active="true"]');
-  await phoneTab.dispatchEvent("touchstart", { touches: [{ clientX: 40, clientY: 20 }] });
-  await expect(phoneTab).toHaveAttribute("data-revealed", "true", { timeout: 3000 });
-  await phoneTab.dispatchEvent("touchend", { touches: [] });
-  await screenshot(page, "phone-close-revealed-dark", "night");
-  await phoneTab.getByTestId("tab-close").click();
-  await expect(page.getByTestId("tab-close-sheet")).toBeVisible();
-  await screenshot(page, "phone-close-sheet-dark", "night");
-  await screenshot(page, "phone-close-sheet-light", "ledger");
-  await page.getByTestId("tab-close-sheet-cancel").click();
-  await page.getByTestId("spaces-drawer-open").click();
-  await expect(page.getByTestId("spaces-drawer")).toBeVisible();
-  await screenshot(page, "phone-drawer-dark", "night");
-
-  const dimensions = await page.evaluate(() => ({ width: window.innerWidth, content: document.documentElement.scrollWidth }));
-  expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
   expect(errors).toEqual([]);
+});
+
+test.describe("phone", () => {
+  // Touch emulation is what makes (pointer: coarse) / (hover: none) match, so
+  // the hover-free close affordance is exercised as a phone really sees it.
+  test.use({ hasTouch: true, isMobile: true });
+
+  test("a long press reveals close on a phone, and the sheet fits 400px", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.setViewportSize({ width: 400, height: 860 });
+    await page.goto("/sessions");
+    const strip = page.getByTestId("space-tabs");
+    expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches),
+      "the phone run must match the coarse-pointer rules").toBe(true);
+    await strip.getByRole("tab").first().click();
+
+    await expect(page.getByTestId("spaces-chips")).toBeVisible();
+    const phoneTab = strip.locator('[data-active="true"]');
+    const close = phoneTab.getByTestId("tab-close");
+
+    // Without a hover to reveal it, × must not sit next to the status shape.
+    await expect(phoneTab).not.toHaveAttribute("data-revealed", "true");
+    expect(await close.evaluate((element) => getComputedStyle(element).opacity)).toBe("0");
+    await screenshot(page, "phone-dark", "night");
+    await screenshot(page, "phone-light", "ledger");
+
+    // A long press reveals it, through real touch input rather than synthetic
+    // events, so the same gesture a phone sends is what is tested.
+    const box = await phoneTab.boundingBox();
+    expect(box).not.toBeNull();
+    await page.touchscreen.tap(box!.x + 20, box!.y + box!.height / 2);
+    await phoneTab.dispatchEvent("touchstart", {
+      touches: [{ identifier: 1, clientX: box!.x + 20, clientY: box!.y + box!.height / 2 }],
+    });
+    await expect(phoneTab).toHaveAttribute("data-revealed", "true", { timeout: 3000 });
+    await phoneTab.dispatchEvent("touchend", { touches: [], changedTouches: [] });
+    expect(await close.evaluate((element) => getComputedStyle(element).opacity)).toBe("1");
+    await screenshot(page, "phone-close-revealed-dark", "night");
+    await phoneTab.getByTestId("tab-close").click();
+    await expect(page.getByTestId("tab-close-sheet")).toBeVisible();
+    await screenshot(page, "phone-close-sheet-dark", "night");
+    await screenshot(page, "phone-close-sheet-light", "ledger");
+    await page.getByTestId("tab-close-sheet-cancel").click();
+    await page.getByTestId("spaces-drawer-open").click();
+    await expect(page.getByTestId("spaces-drawer")).toBeVisible();
+    await screenshot(page, "phone-drawer-dark", "night");
+
+    const dimensions = await page.evaluate(() => ({ width: window.innerWidth, content: document.documentElement.scrollWidth }));
+    expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
+    expect(errors).toEqual([]);
+  });
 });

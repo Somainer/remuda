@@ -129,6 +129,41 @@ fn banner_detection_is_unchanged_through_the_adapter() {
 }
 
 #[test]
+fn stripping_ansi_before_the_trust_dialog_parser_changes_nothing_on_its_real_input() {
+    // The driver adapter routes the trust dialog through `ScreenGrid::from_raw`,
+    // which strips ANSI — the pre-extraction parser did not. That is only safe
+    // because the sole caller reads the herdr screen with `strip_ansi: true`,
+    // so there is nothing left to strip. Pin the equivalence on that input, and
+    // record what the extra strip would do on input that still carries escapes:
+    // it makes the parser *more* permissive, never less, so it can no more
+    // fabricate an auto-trust than it could before.
+    let plain = "Quick safety check: Is this a project you created or one you trust?\n                 ❯ No, exit\nYes, I trust this folder";
+    assert_eq!(
+        remuda_screen::trust_dialog_keys(&ScreenGrid::from_raw(plain)),
+        Some(vec!["down".to_owned(), "enter".to_owned()]),
+        "already-stripped input — the real caller's shape — must parse as before"
+    );
+    // Same dialog with colour still on it: it now matches, where the raw-line
+    // parser would have failed the `matches!(label, …)` comparison.
+    let coloured = "\u{1b}[1mQuick safety check:\u{1b}[0m Is this a project you created or one you trust?\n                    ❯ No, exit\n\u{1b}[32mYes, I trust this folder\u{1b}[0m";
+    assert_eq!(
+        remuda_screen::trust_dialog_keys(&ScreenGrid::from_raw(coloured)),
+        Some(vec!["down".to_owned(), "enter".to_owned()])
+    );
+    // The D-022 guard that matters is unchanged: anything but this exact
+    // dialog, with exactly one cursor, still refuses to answer itself.
+    for rejected in [
+        "\u{1b}[1mQuick safety check:\u{1b}[0m Is this a project you created or one you trust?\n❯ No, exit\n❯ Yes, I trust this folder",
+        "\u{1b}[1mDo you trust this command?\u{1b}[0m\n❯ No, exit\nYes, I trust this folder",
+    ] {
+        assert!(
+            remuda_screen::trust_dialog_keys(&ScreenGrid::from_raw(rejected)).is_none(),
+            "{rejected:?}"
+        );
+    }
+}
+
+#[test]
 fn the_re_exported_strip_ansi_is_the_same_function() {
     assert_eq!(strip_ansi("\u{1b}[1;31mred\u{1b}[0m text"), "red text");
     assert_eq!(

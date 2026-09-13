@@ -317,7 +317,11 @@ mod tests {
 
     fn node(store: Arc<MemoryStore>, config: NativeDriverConfig) -> DevNode {
         DevNode::with_parts(
-            &DevServerConfig::loopback(0),
+            // The advertised workspace root stays the default "." — the crate
+            // directory the harness runs in — so pin the allowlist there rather
+            // than inheriting the $HOME default a /tmp checkout falls outside of.
+            &DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
             store,
             DriverRegistry::with_fake().expect("fake registry"),
         )

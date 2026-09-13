@@ -23,6 +23,7 @@ const IDLE_TTL: Duration = Duration::from_secs(600);
 enum Endpoint {
     Login,
     Pair,
+    PasskeyRegister,
 }
 
 struct Bucket {
@@ -106,8 +107,12 @@ pub(crate) async fn limit_auth_attempts(
     next: Next,
 ) -> Response {
     let endpoint = match (request.method(), request.uri().path()) {
-        (&Method::POST, "/v1/login") => Endpoint::Login,
+        (&Method::POST, "/v1/login")
+        | (&Method::POST, "/v1/auth/passkeys/login/start")
+        | (&Method::POST, "/v1/auth/passkeys/login/finish") => Endpoint::Login,
         (&Method::POST, "/v1/devices/pair") => Endpoint::Pair,
+        (&Method::POST, "/v1/auth/passkeys/register/start")
+        | (&Method::POST, "/v1/auth/passkeys/register/finish") => Endpoint::PasskeyRegister,
         _ => return next.run(request).await,
     };
     let admitted = request
@@ -143,6 +148,7 @@ mod tests {
         assert!(!limits.admit(peer, Endpoint::Login, now));
         assert!(!limits.admit("::ffff:127.0.0.1".parse().unwrap(), Endpoint::Login, now));
         assert!(limits.admit(peer, Endpoint::Pair, now));
+        assert!(limits.admit(peer, Endpoint::PasskeyRegister, now));
         assert!(limits.admit("127.0.0.2".parse().unwrap(), Endpoint::Login, now));
         assert!(!limits.admit(peer, Endpoint::Login, now + Duration::from_secs(9)));
         assert!(limits.admit(peer, Endpoint::Login, now + Duration::from_secs(10)));

@@ -25,6 +25,7 @@ mod interactions;
 mod inventory;
 mod maintenance;
 mod objects;
+mod passkeys;
 mod placement;
 mod provider_models;
 mod provider_resolve;
@@ -83,6 +84,8 @@ pub struct AppState {
     blocked: BlockedWatch,
     auth_limits: rate_limit::AuthRateLimits,
     agent_approvals: agent_approvals::AgentApprovals,
+    /// Process-local, single-use WebAuthn ceremony challenges (D-029).
+    challenges: passkeys::ChallengeStore,
 }
 
 /// A bound Hub that shuts down when dropped.
@@ -254,6 +257,7 @@ async fn spawn_inner(
         blocked: BlockedWatch::default(),
         auth_limits: rate_limit::AuthRateLimits::default(),
         agent_approvals: agent_approvals::AgentApprovals::new()?,
+        challenges: passkeys::ChallengeStore::default(),
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
@@ -343,6 +347,7 @@ pub fn router(state: AppState) -> Router {
         .merge(placement::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
+        .merge(passkeys::routes())
         .merge(providers::routes())
         .merge(agent_scope::routes())
         .merge(objects::routes())

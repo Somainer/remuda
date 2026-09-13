@@ -17,7 +17,8 @@
     { "name": "providers" },
     { "name": "objects" },
     { "name": "push" },
-    { "name": "realtime" }
+    { "name": "realtime" },
+    { "name": "passkeys" }
   ],
   "paths": {
     "/v1/hosts/ssh": {
@@ -977,6 +978,169 @@
             }
           },
           "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/passkeys/register/start": {
+      "post": {
+        "tags": ["passkeys"],
+        "operationId": "passkeyRegisterStart",
+        "summary": "Begin a passkey registration ceremony (requires a paired device)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyRegisterStart" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Registration challenge envelope",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyChallenge" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/passkeys/register/finish": {
+      "post": {
+        "tags": ["passkeys"],
+        "operationId": "passkeyRegisterFinish",
+        "summary": "Complete a passkey registration with the authenticator attestation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyRegisterFinish" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored passkey",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Passkey" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/passkeys/login/start": {
+      "post": {
+        "tags": ["passkeys"],
+        "operationId": "passkeyLoginStart",
+        "summary": "Begin a discoverable passkey login ceremony",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyLoginStart" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Authentication challenge envelope",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyChallenge" } }
+            }
+          },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/passkeys/login/finish": {
+      "post": {
+        "tags": ["passkeys"],
+        "operationId": "passkeyLoginFinish",
+        "summary": "Complete a passkey login; mints the same device cookie as POST /v1/login",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyLoginFinish" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "New device session",
+            "headers": {
+              "Set-Cookie": {
+                "schema": { "type": "string" },
+                "description": "remuda_device; HttpOnly; SameSite=Strict"
+              }
+            },
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/DeviceSession" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/passkeys": {
+      "get": {
+        "tags": ["passkeys"],
+        "operationId": "passkeyList",
+        "summary": "List registered passkeys (requires a paired device)",
+        "responses": {
+          "200": {
+            "description": "Passkeys",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyPage" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/auth/passkeys/{id}": {
+      "patch": {
+        "tags": ["passkeys"],
+        "operationId": "passkeyRename",
+        "summary": "Rename a passkey",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/PasskeyRename" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Renamed passkey",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Passkey" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "tags": ["passkeys"],
+        "operationId": "passkeyDelete",
+        "summary": "Delete a passkey",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok"],
+                  "properties": { "ok": { "type": "boolean" } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -2171,6 +2335,85 @@
               }
             }
           }
+        }
+      },
+      "PasskeyRegisterStart": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "description": "Human label, e.g. browser/OS name." }
+        }
+      },
+      "PasskeyRegisterFinish": {
+        "type": "object",
+        "required": ["challengeId", "attestation"],
+        "properties": {
+          "challengeId": { "type": "string" },
+          "attestation": {
+            "type": "object",
+            "description": "AuthenticatorAttestationResponse PublicKeyCredential as produced by navigator.credentials.create; rawId and response fields are base64url.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "PasskeyLoginStart": {
+        "type": "object",
+        "properties": {
+          "mediation": {
+            "type": "string",
+            "enum": ["conditional"],
+            "description": "Set to conditional for WebAuthn conditional mediation (autofill); omit for the platform picker."
+          }
+        }
+      },
+      "PasskeyLoginFinish": {
+        "type": "object",
+        "required": ["challengeId", "assertion"],
+        "properties": {
+          "challengeId": { "type": "string" },
+          "assertion": {
+            "type": "object",
+            "description": "AuthenticatorAssertionResponse PublicKeyCredential as produced by navigator.credentials.get; rawId and response fields are base64url.",
+            "additionalProperties": true
+          },
+          "deviceName": { "type": "string" }
+        }
+      },
+      "PasskeyRename": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" }
+        }
+      },
+      "PasskeyChallenge": {
+        "type": "object",
+        "required": ["challengeId", "options"],
+        "properties": {
+          "challengeId": { "type": "string", "description": "Single-use, 120s server ceremony token." },
+          "options": {
+            "type": "object",
+            "description": "WebAuthn options object (PublicKeyCredentialCreationOptions for register, PublicKeyCredentialRequestOptions for login).",
+            "additionalProperties": true
+          }
+        }
+      },
+      "Passkey": {
+        "type": "object",
+        "required": ["id", "name", "createdAt", "thisDevice"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "lastUsedAt": { "type": ["string", "null"], "format": "date-time" },
+          "thisDevice": { "type": "boolean", "description": "Whether this passkey was registered from the device making the request." }
+        }
+      },
+      "PasskeyPage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Passkey" } }
         }
       },
       "PushSubscribe": {

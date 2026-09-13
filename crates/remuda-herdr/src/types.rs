@@ -638,6 +638,9 @@ pub struct PaneProcessInfo {
     /// Shell pid.
     #[serde(default)]
     pub shell_pid: Option<u32>,
+    /// Foreground process group; a ready shell owns its own group.
+    #[serde(default)]
+    pub foreground_process_group_id: Option<u32>,
     /// Foreground processes.
     #[serde(default)]
     pub foreground_processes: Vec<PaneProcessInfoProcess>,

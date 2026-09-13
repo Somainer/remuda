@@ -23,7 +23,7 @@ pub(crate) async fn start_agent(
     client: &Client,
     params: remuda_herdr::AgentStartParams,
 ) -> DriverResult<remuda_herdr::AgentStarted> {
-    match client.agent_start(params.clone()).await {
+    match crate::pty_launch::start_agent(client, params.clone()).await {
         Ok(started) => Ok(started),
         Err(error @ remuda_herdr::Error::Api { .. }) => {
             if let remuda_herdr::Error::Api { code, .. } = &error

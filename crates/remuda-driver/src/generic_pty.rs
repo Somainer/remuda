@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -435,7 +435,6 @@ impl GenericPtyDriver {
         self.resources
             .record(&client, &session_name, &created, &pane_id)
             .await?;
-        wait_shell_prompt(&client, &pane_id).await;
         let started = crate::pty_interaction::start_agent(
             &client,
             AgentStartParams {
@@ -968,29 +967,6 @@ pub fn line_matches(screen: &str, pattern: &str) -> bool {
             line.contains(body)
         }
     })
-}
-
-async fn wait_shell_prompt(client: &Client, pane_id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline {
-        if let Ok(read) = client
-            .pane_read(PaneReadParams {
-                pane_id: pane_id.to_owned(),
-                source: ReadSource::RecentUnwrapped,
-                lines: Some(20),
-                format: ReadFormat::Text,
-                strip_ansi: true,
-            })
-            .await
-        {
-            let text = read.text();
-            if text.contains('➜') || text.contains('$') || text.contains('%') || text.contains('>')
-            {
-                return;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
 }
 
 async fn emit_startup_failure(

@@ -7,8 +7,125 @@ import { readAccessCode, writeAccessCode } from "../lib/accessCode";
 import { clipboardIo } from "../lib/clipboard";
 import { MORE_NAV } from "../lib/nav";
 import { readPushStatus, subscribePush, unsubscribePush, type PushStatus } from "../lib/push";
+import { defaultPasskeyName, passkeyErrorText } from "../lib/passkeys";
 import { hubStore, useHub } from "../lib/store";
 import { LoginPage } from "./LoginPage";
+
+function formatPasskeyTime(iso: string | null | undefined): string {
+  if (!iso) return "从未使用";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "—";
+  return new Date(t).toLocaleString([], {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function PasskeysSection() {
+  const hub = useHub();
+  const [name, setName] = useState(() => defaultPasskeyName());
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const supported = hubStore.passkeysSupported();
+
+  const run = (action: () => Promise<unknown>) => {
+    setBusy(true);
+    setError(null);
+    void action()
+      .catch((err: unknown) => setError(passkeyErrorText(err)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <section className={css.section} data-testid="settings-passkeys">
+      <div className={css.label}>Passkeys</div>
+      <p className={css.hint}>
+        用 Passkey 免访问码登录。Passkey 与来源绑定：内网地址与本地回环地址是两套凭据，需要分别注册。
+      </p>
+      {supported ? (
+        <>
+          <label className={css.field}>
+            名称
+            <input
+              className={css.input}
+              data-testid="settings-passkey-name"
+              value={name}
+              maxLength={64}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </label>
+          <div className={css.row}>
+            <button
+              type="button"
+              className={css.action}
+              data-testid="settings-passkey-add"
+              disabled={busy}
+              onClick={() =>
+                run(async () => {
+                  const saved = await hubStore.addPasskey(name.trim() || defaultPasskeyName());
+                  setName(saved.name);
+                })
+              }
+            >
+              添加 Passkey
+            </button>
+          </div>
+        </>
+      ) : (
+        <p className={css.hint} data-testid="settings-passkey-unsupported">
+          当前环境不支持注册 Passkey（非安全来源或浏览器过旧）。
+        </p>
+      )}
+      {error ? (
+        <p className={css.hint} data-testid="settings-passkey-error">
+          {error}
+        </p>
+      ) : null}
+      {hub.passkeys.map((passkey) => (
+        <div key={passkey.id} className={css.deviceRow} data-testid="settings-passkey-row">
+          <div className={css.deviceName}>
+            {passkey.name}
+            {passkey.thisDevice ? <span className={css.you}> 本机</span> : null}
+            <div className={css.deviceId}>
+              创建 {formatPasskeyTime(passkey.createdAt)} · 最近使用 {formatPasskeyTime(passkey.lastUsedAt)}
+            </div>
+          </div>
+          <button
+            type="button"
+            className={css.action}
+            data-testid="settings-passkey-rename"
+            disabled={busy}
+            onClick={() => {
+              const next = window.prompt("Passkey 名称", passkey.name);
+              if (next && next.trim() && next.trim() !== passkey.name) {
+                run(() => hubStore.renamePasskey(passkey.id, next.trim()));
+              }
+            }}
+          >
+            重命名
+          </button>
+          <button
+            type="button"
+            className={`${css.action} ${css.danger}`}
+            data-testid="settings-passkey-delete"
+            disabled={busy}
+            onClick={() => {
+              if (window.confirm(`删除 Passkey「${passkey.name}」？仍可用访问码重新登录。`)) {
+                run(() => hubStore.deletePasskey(passkey.id));
+              }
+            }}
+          >
+            删除
+          </button>
+        </div>
+      ))}
+    </section>
+  );
+}
 
 const PERMS: { id: PermissionDefault; label: string }[] = [
   { id: "manual", label: "询问" },
@@ -136,6 +253,8 @@ export function SettingsPage() {
             </div>
           ) : null}
         </section>
+
+        <PasskeysSection />
 
         <section className={css.section}>
           <div className={css.label}>推送</div>

@@ -17,7 +17,15 @@ import type { ResumeMode, ResumeResult } from "./api";
 import type { DriverKind } from "../types/nativeRef";
 import { HubHttpError } from "./httpError";
 import { digestPlaceholder, id, now } from "./ids";
-import { MOCK_BOOTSTRAP_TOKEN, type DeviceSession, type PairCode, type PairedDevice } from "./session";
+import { MOCK_BOOTSTRAP_TOKEN, readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
+
+export type MockPasskey = {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  thisDevice: boolean;
+};
 import { thisDeviceId } from "./interactionStatus";
 import { LONG_EVENT_COUNT, LONG_SESSION_TITLE, buildLongObservations } from "../fixtures/session/longEvents";
 
@@ -1301,6 +1309,7 @@ type MockPairRow = { code: string; expiresAt: string; used: boolean };
 
 const DEVICES_KEY = "runtime.mock-devices";
 const CODES_KEY = "runtime.mock-pair-codes";
+const PASSKEYS_KEY = "runtime.mock-passkeys";
 const PAIR_ALPH = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 function readJson<T>(key: string, fallback: T): T {
@@ -1328,10 +1337,15 @@ function mockPairCodes(): MockPairRow[] {
   return readJson<MockPairRow[]>(CODES_KEY, []);
 }
 
+function mockPasskeys(): MockPasskey[] {
+  return readJson<MockPasskey[]>(PASSKEYS_KEY, []);
+}
+
 export function resetMockAuth(): void {
   try {
     localStorage.removeItem(DEVICES_KEY);
     localStorage.removeItem(CODES_KEY);
+    localStorage.removeItem(PASSKEYS_KEY);
   } catch {
     /* ignore */
   }
@@ -1392,6 +1406,119 @@ export function mockDeviceRevoke(token: string | undefined, deviceId: string): {
   const next = mockDevices().filter((d) => d.id !== deviceId);
   if (next.length === mockDevices().length) throw new HubHttpError(404, "NOT_FOUND", "NOT_FOUND");
   writeJson(DEVICES_KEY, next);
+  return { ok: true };
+}
+
+
+type MockPasskeyEnvelope = { challengeId: string; options: Record<string, unknown> };
+
+function mockChallengeId(): string {
+  const rand = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  return `chal_${rand}`;
+}
+
+function mockRelyingPartyId(): string {
+  try {
+    return window.location.hostname || "localhost";
+  } catch {
+    return "localhost";
+  }
+}
+
+function randomB64Url(bytes: number): string {
+  const data = new Uint8Array(bytes);
+  crypto.getRandomValues(data);
+  let binary = "";
+  for (const byte of data) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+let pendingPasskeyName = "Passkey";
+
+export function mockPasskeyRegisterStart(name: string): MockPasskeyEnvelope {
+  requireMockDevice(readSession()?.token);
+  pendingPasskeyName = name.trim() || "Passkey";
+  return {
+    challengeId: mockChallengeId(),
+    options: {
+      publicKey: {
+        challenge: randomB64Url(32),
+        rp: { name: "Remuda", id: mockRelyingPartyId() },
+        user: { id: randomB64Url(16), name: "operator", displayName: "Remuda Operator" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+        authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "required" },
+        timeout: 60000,
+        attestation: "none",
+        excludeCredentials: [],
+      },
+    },
+  };
+}
+
+export function mockPasskeyRegisterFinish(createdBy: string): MockPasskey {
+  requireMockDevice(readSession()?.token);
+  const record: MockPasskey = {
+    id: id("psk_"),
+    name: pendingPasskeyName,
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+    thisDevice: true,
+  };
+  void createdBy;
+  writeJson(PASSKEYS_KEY, [record, ...mockPasskeys()]);
+  return record;
+}
+
+export function mockPasskeyLoginStart(mediation?: string): MockPasskeyEnvelope {
+  const options: Record<string, unknown> = {
+    publicKey: {
+      challenge: randomB64Url(32),
+      rpId: mockRelyingPartyId(),
+      allowCredentials: [],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  };
+  if (mediation === "conditional") options.mediation = "conditional";
+  return { challengeId: mockChallengeId(), options };
+}
+
+export function mockPasskeyLoginFinish(deviceName: string | undefined, passkeyId?: string): DeviceSession {
+  const token = mockAuthId("tok_");
+  const passkey = passkeyId ? mockPasskeys().find((row) => row.id === passkeyId) : mockPasskeys()[0];
+  const fallback = passkey?.name ?? "passkey";
+  const device: MockDevice = { id: mockAuthId("dev_"), name: deviceName?.trim() || fallback, token };
+  writeJson(DEVICES_KEY, [...mockDevices(), device]);
+  if (passkey) {
+    writeJson(
+      PASSKEYS_KEY,
+      mockPasskeys().map((row) => (row.id === passkey.id ? { ...row, lastUsedAt: new Date().toISOString() } : row)),
+    );
+  }
+  return { deviceId: device.id, token, name: device.name };
+}
+
+export function mockPasskeyList(token: string | undefined): { items: MockPasskey[] } {
+  requireMockDevice(token);
+  return { items: mockPasskeys().map((row) => ({ ...row, thisDevice: false })) };
+}
+
+export function mockPasskeyRename(token: string | undefined, passkeyId: string, name: string): MockPasskey {
+  requireMockDevice(token);
+  const rows = mockPasskeys();
+  const found = rows.find((row) => row.id === passkeyId);
+  if (!found) throw new HubHttpError(404, "NOT_FOUND", "NOT_FOUND");
+  const updated = { ...found, name };
+  writeJson(PASSKEYS_KEY, rows.map((row) => (row.id === passkeyId ? updated : row)));
+  return { ...updated, thisDevice: false };
+}
+
+export function mockPasskeyDelete(token: string | undefined, passkeyId: string): { ok: boolean } {
+  requireMockDevice(token);
+  const rows = mockPasskeys();
+  const next = rows.filter((row) => row.id !== passkeyId);
+  if (next.length === rows.length) throw new HubHttpError(404, "NOT_FOUND", "NOT_FOUND");
+  writeJson(PASSKEYS_KEY, next);
   return { ok: true };
 }
 

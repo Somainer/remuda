@@ -33,6 +33,13 @@ import {
   mockPage,
   mockPairCode,
   mockPairRedeem,
+  mockPasskeyDelete,
+  mockPasskeyList,
+  mockPasskeyLoginFinish,
+  mockPasskeyLoginStart,
+  mockPasskeyRegisterFinish,
+  mockPasskeyRegisterStart,
+  mockPasskeyRename,
   mockReadJournal,
   mockRespond,
   mockResume,
@@ -391,6 +398,26 @@ export type FleetBroadcastResult = HubJson<"/v1/fleet/broadcast", "post">;
 /** One instance's outcome inside a broadcast. */
 export type FleetBroadcastEntry = NonNullable<FleetBroadcastResult["results"]>[number];
 
+/** A registered passkey (`GET /v1/auth/passkeys` item). */
+export type PasskeyView = components["schemas"]["Passkey"];
+
+/** `{ challengeId, options }` envelope for a register/login ceremony. */
+export type PasskeyEnvelope = { challengeId: string; options: Record<string, unknown> };
+
+/** Browser attestation/assertion credential bodies for finish calls. */
+export type PasskeyAttestationBody = {
+  id: string;
+  rawId: string;
+  type: string;
+  response: { attestationObject: string; clientDataJSON: string; transports?: string[] };
+};
+export type PasskeyAssertionBody = {
+  id: string;
+  rawId: string;
+  type: string;
+  response: { authenticatorData: string; clientDataJSON: string; signature: string; userHandle: string | null };
+};
+
 export type HubApi = {
   mock: boolean;
   login(bootstrapToken: string, deviceName: string): Promise<DeviceSession>;
@@ -398,6 +425,13 @@ export type HubApi = {
   pairCode(): Promise<PairCode>;
   deviceList(): Promise<{ items: PairedDevice[] }>;
   deviceRevoke(deviceId: string): Promise<{ ok: boolean }>;
+  passkeyRegisterStart(name: string): Promise<PasskeyEnvelope>;
+  passkeyRegisterFinish(challengeId: string, attestation: PasskeyAttestationBody): Promise<PasskeyView>;
+  passkeyLoginStart(mediation?: "conditional"): Promise<PasskeyEnvelope>;
+  passkeyLoginFinish(challengeId: string, assertion: PasskeyAssertionBody, deviceName?: string): Promise<DeviceSession>;
+  passkeyList(): Promise<{ items: PasskeyView[] }>;
+  passkeyRename(passkeyId: string, name: string): Promise<PasskeyView>;
+  passkeyDelete(passkeyId: string): Promise<{ ok: boolean }>;
   hasDeviceSession(): boolean;
   hello(): Promise<HelloResult>;
   instanceList(q?: { hostId?: string; workspaceId?: string; kind?: string }): Promise<Page<Instance>>;
@@ -574,6 +608,32 @@ function createMockApi(): HubApi {
     },
     async deviceRevoke(deviceId) {
       return mockDeviceRevoke(readSession()?.token, deviceId);
+    },
+    async passkeyRegisterStart(name) {
+      return mockPasskeyRegisterStart(name);
+    },
+    async passkeyRegisterFinish(challengeId, attestation) {
+      void challengeId;
+      void attestation;
+      const session = readSession();
+      return mockPasskeyRegisterFinish(session?.deviceId ?? "dev_mock");
+    },
+    async passkeyLoginStart(mediation) {
+      return mockPasskeyLoginStart(mediation);
+    },
+    async passkeyLoginFinish(challengeId, assertion, deviceName) {
+      void challengeId;
+      void assertion;
+      return mockPasskeyLoginFinish(deviceName);
+    },
+    async passkeyList() {
+      return mockPasskeyList(readSession()?.token);
+    },
+    async passkeyRename(passkeyId, name) {
+      return mockPasskeyRename(readSession()?.token, passkeyId, name);
+    },
+    async passkeyDelete(passkeyId) {
+      return mockPasskeyDelete(readSession()?.token, passkeyId);
     },
     hasDeviceSession() {
       return true;
@@ -958,6 +1018,45 @@ function createLiveApi(): HubApi {
     },
     async deviceRevoke(deviceId) {
       return rest<HubJson<"/v1/devices/{id}", "delete">>(`/v1/devices/${deviceId}`, { method: "DELETE" });
+    },
+    async passkeyRegisterStart(name) {
+      return rest<HubJson<"/v1/auth/passkeys/register/start", "post">>(
+        "/v1/auth/passkeys/register/start",
+        { method: "POST", body: JSON.stringify({ name }) },
+      ) as Promise<PasskeyEnvelope>;
+    },
+    async passkeyRegisterFinish(challengeId, attestation) {
+      return rest<HubJson<"/v1/auth/passkeys/register/finish", "post">>(
+        "/v1/auth/passkeys/register/finish",
+        { method: "POST", body: JSON.stringify({ challengeId, attestation }) },
+      );
+    },
+    async passkeyLoginStart(mediation) {
+      const body = mediation ? JSON.stringify({ mediation }) : "{}";
+      return rest<HubJson<"/v1/auth/passkeys/login/start", "post">>(
+        "/v1/auth/passkeys/login/start",
+        { method: "POST", body },
+      ) as Promise<PasskeyEnvelope>;
+    },
+    async passkeyLoginFinish(challengeId, assertion, deviceName) {
+      return rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
+        "/v1/auth/passkeys/login/finish",
+        { method: "POST", body: JSON.stringify({ challengeId, assertion, deviceName }) },
+      );
+    },
+    async passkeyList() {
+      return rest<HubJson<"/v1/auth/passkeys", "get">>("/v1/auth/passkeys");
+    },
+    async passkeyRename(passkeyId, name) {
+      return rest<HubJson<"/v1/auth/passkeys/{id}", "patch">>(`/v1/auth/passkeys/${passkeyId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name }),
+      });
+    },
+    async passkeyDelete(passkeyId) {
+      return rest<HubJson<"/v1/auth/passkeys/{id}", "delete">>(`/v1/auth/passkeys/${passkeyId}`, {
+        method: "DELETE",
+      });
     },
     hasDeviceSession() {
       // Persisted metadata is only a UI hint; the Hub validates the cookie.

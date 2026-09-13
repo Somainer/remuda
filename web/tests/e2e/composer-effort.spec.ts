@@ -3,19 +3,28 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence");
+const here = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * A default run must not rewrite tracked files, so shots land in the
+ * gitignored `test-results/`. Re-capture the committed evidence with
+ * REMUDA_EVIDENCE=1.
+ */
+const evidence = process.env.REMUDA_EVIDENCE === "1";
+const shotDir = evidence
+  ? path.join(here, "../../../docs/design/evidence")
+  : path.join(here, "../../test-results/composer-effort");
 
 function row(page: Page, text: string) {
   return page.getByTestId("session-row").filter({ hasText: text }).first();
 }
 
 async function shot(page: Page, name: string) {
-  await mkdir(evidence, { recursive: true });
-  await page.screenshot({ path: path.join(evidence, name), animations: "disabled" });
+  await mkdir(shotDir, { recursive: true });
+  await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
 async function shotComposer(page: Page, name: string) {
-  await mkdir(evidence, { recursive: true });
+  await mkdir(shotDir, { recursive: true });
   const composer = page.getByTestId("composer");
   const menu = page.getByTestId("effort-menu");
   await expect(menu).toBeVisible();
@@ -29,7 +38,7 @@ async function shotComposer(page: Page, name: string) {
   const right = Math.min(viewport.width, Math.ceil(Math.max(a!.x + a!.width, b!.x + b!.width)));
   const bottom = Math.min(viewport.height, Math.ceil(Math.max(a!.y + a!.height, b!.y + b!.height)));
   await page.screenshot({
-    path: path.join(evidence, name),
+    path: path.join(shotDir, name),
     animations: "disabled",
     clip: { x, y, width: Math.max(1, right - x), height: Math.max(1, bottom - y) },
   });
@@ -269,8 +278,12 @@ test.describe("composer control bar and effort", () => {
       expect(ackBox).toBeTruthy();
       expect(ackBox!.y).toBeGreaterThanOrEqual(yoloBox!.y - 2);
       expect(ackBox!.y + ackBox!.height).toBeLessThanOrEqual(yoloBox!.y + yoloBox!.height + 2);
-      await expect(page.getByTestId("new-session-effort-think")).toBeVisible();
-      await expect(page.getByTestId("new-session-effort-ultracode")).toHaveAttribute("data-ember", "1");
+      // effort is the composer's slider inline, sized to the sheet's column.
+      await expect(page.getByTestId("new-session-effort-slider")).toBeVisible();
+      await expect(page.getByTestId("new-session-effort-title")).toHaveText("think");
+      const card = await page.getByTestId("new-session-effort-slider-panel").boundingBox();
+      expect(card).toBeTruthy();
+      expect(card!.width).toBeLessThanOrEqual(Math.min(width, 401));
       if (test.info().project.name === "chromium") {
         await shot(page, `composer-1-new-session-${width}.png`);
       }
@@ -283,10 +296,15 @@ test.describe("composer control bar and effort", () => {
     await page.getByTestId("settings-effort-ultracode").click();
     await expect(page.getByTestId("settings-effort-ultracode")).toHaveAttribute("data-selected", "1");
     await page.goto("/sessions/new");
-    await expect(page.getByTestId("new-session-effort-ultracode")).toHaveAttribute("data-selected", "1");
+    const slider = page.getByTestId("new-session-effort-slider");
+    await expect(slider).toHaveAttribute("data-name", "ultracode");
+    await expect(slider).toHaveAttribute("data-ember", "1");
+    // Switching the harness re-snaps onto the new native table, ember to ember.
     await page.getByTestId("new-session-kind-grok").click();
-    await expect(page.getByTestId("new-session-effort-max")).toHaveAttribute("data-selected", "1");
-    await expect(page.getByTestId("new-session-effort-max")).toHaveAttribute("data-ember", "1");
+    await expect(slider).toHaveAttribute("data-tiers", "quick,standard,max");
+    await expect(slider).toHaveAttribute("data-name", "max");
+    await expect(slider).toHaveAttribute("data-ember", "1");
+    await expect(page.getByTestId("new-session-effort-title")).toHaveText("max");
   });
 
   test("effort selection persists after reload", async ({ page }) => {

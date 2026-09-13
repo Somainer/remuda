@@ -208,8 +208,8 @@ cargo test --workspace --locked                              见下（本改动�
 ./scripts/ci/secret-scan.sh                                  secret-scan: pass
 ```
 
-`cargo test --workspace` 在本机当前负载下有 **1 个与本改动无关的既有不稳定用例**
-会偶发失败，在 `remuda-node --lib` 的这两个之间跳：
+`cargo test --workspace` 在本机当前负载下有 **2 个与本改动无关的既有用例**
+会失败（`remuda-node --lib`）：
 
 ```
 native::tests::registry_constructs_all_three_native_claude_drivers
@@ -221,15 +221,25 @@ stdio::tests::composed_stdio_dispatches_create_and_streams_journal
 
 判定为环境问题，不是本改动引入的，依据三条：
 
-1. **同样的用例在未改动的 `0e1e7fc` 上也失败。** 把父提交 checkout 到
-   `$HOME` 下（避开 `workspace_roots` 干扰）跑 `-p remuda-node --lib`，
-   失败的就是上面**同一对**用例。
-2. **不确定性**：同一棵树连跑多次，失败的用例在这两个之间漂移，
-   `--test-threads=1` 也照样失败——是 deadline 输给机器负载，不是逻辑错。
-3. **成因明确**：`registry_…` 会用 3s 预算（`PROBE_TIMEOUT`）去探真实的
-   `~/.claude`，而这台机器上它有 **5.6 GB / 16639 个文件**；
-   跑测试时 `load average ≈ 26`，同机还有别的 worktree 在跑
-   `cargo test --workspace` 和 `remuda dev`。
+1. **未改动的 `origin/main`（`b902d38`）跑同样两个用例，同样失败、同样报错。**
+   把 `origin/main` 单独 checkout 到 `$HOME` 下（避开 `workspace_roots` 干扰）：
+
+   ```
+   $ cd ~/x-nh-base2 && cargo test -p remuda-node --lib -- \
+       native::tests::registry_constructs_all_three_native_claude_drivers \
+       stdio::tests::composed_stdio_dispatches_create_and_streams_journal
+   … hello deadline: Elapsed(())
+   test result: FAILED. 0 passed; 2 failed; … finished in 55.47s
+   ```
+
+   本分支同样两个用例的失败信息逐字相同。
+2. **随负载变化**：`load average ≈ 26` 时只有 1 个失败且在两者之间漂移，
+   升到 ≈ 59 时两个都失败；`--test-threads=1` 也照样失败——
+   是 deadline 输给机器负载，不是逻辑错。
+3. **成因明确**：`registry_…` 用 3s 预算（`PROBE_TIMEOUT`）去探真实的
+   `~/.claude`，这台机器上它有 **5.6 GB / 16639 个文件**；
+   `composed_stdio_…` 也是等一个握手 deadline。跑测试时同机还有别的
+   worktree 在跑 `cargo test --workspace` 和 `remuda dev`。
 
 本改动自己新增和触及的用例（`remuda-herdr` 全部、`remuda-node`
 `carrier_recovery` / `reclaim` / `runtime::pty_queue`）在每一次运行中都是通过的。

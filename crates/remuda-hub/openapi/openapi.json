@@ -498,6 +498,34 @@
           "401": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" }
         }
+      },
+      "delete": {
+        "tags": ["instances"],
+        "operationId": "instanceDelete",
+        "summary": "Permanently delete a session",
+        "description": "Removes the Hub record (journal, commands, interactions, fleet membership) and asks the owning Node to purge its per-instance data directory. The agent's own native transcripts under the user's home are never touched. Human and Bot devices only; agents receive 403. A live Instance is refused with 409 unless `force=1`, which stops it and settles it as `exited` first. A repeated delete returns 404, so the call is idempotent.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdPath" },
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "description": "`force=1` stops a live Instance before deleting it.",
+            "schema": { "type": "integer", "enum": [1] }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Instance deleted",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/InstanceDeleted" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
       }
     },
     "/v1/instances/{id}/mcp-token": {
@@ -1170,6 +1198,19 @@
         "properties": {
           "token": { "type": "string", "description": "Bearer credential; keep secret and do not journal it." },
           "origin": { "type": "string", "const": "agent" }
+        }
+      },
+      "InstanceDeleted": {
+        "type": "object",
+        "required": ["deleted", "instanceId"],
+        "properties": {
+          "deleted": { "type": "boolean", "const": true },
+          "instanceId": { "type": "string" },
+          "nodePurge": {
+            "type": "string",
+            "enum": ["purged", "node-offline", "node-rejected", "purge-failed"],
+            "description": "Outcome of the Node `instance.purge` call; the Hub record is deleted either way."
+          }
         }
       },
       "AgentApprovalRequired": {

@@ -192,15 +192,66 @@ The Hub deliberately still does nothing when an epoch changes and the hello
 carries **no** `instances` key at all: a stateless Node must not wipe rows it
 simply never enumerates.
 
+## Session deletion (`DELETE /v1/instances/{id}`)
+
+Separate run on the same isolated Hub 60480 + Node, one `shell-pty` session
+(`ins_01a09add-a94a-7329-b0bd-36ac2e1725cf`), still `running` at the start.
+
+| Call | Result |
+| --- | --- |
+| `DELETE` with an agent credential (its own instance) | **403** |
+| `DELETE` unauthenticated | **401** |
+| `DELETE` while running, no force | **409** `instance is running; stop it first or retry with ?force=1` — and `GET` still **200** |
+| `DELETE ?force=1` | **200** `{"deleted":true,"nodePurge":"purged"}` |
+| `GET` after delete | **404** |
+| `DELETE` again | **404** (idempotent) |
+
+Store state afterwards — Hub:
+
+```text
+instances: 0 row(s)   journal: 0 row(s)   commands: 0 row(s)   interactions: 0 row(s)
+audit: instance.delete device dev_01a09add…
+       {"forced":true,"hostId":"hst_01a09add-…","lifecycle":"running","nodePurge":"purged"}
+```
+
+Node (`node.sqlite`), after `instance.purge`:
+
+```text
+node instances: 0 row(s)   node commands: 0 row(s)   node recipes: 0 row(s)
+instances/<id> directory: removed
+```
+
+`~/.claude` and `~/.codex` are still present: the purge removes only the Node's
+own `<data_dir>/instances/<id>`, never the agent's native transcripts.
+
+### Two bugs this run found
+
+1. **The deleted row came back.** The `instance.close` issued by `force=1` was
+   still draining, and its next `journal.append` hit `ensure_instance`, which
+   recreated the row — `GET` returned 200 after a successful delete. Deleting
+   now writes a tombstone (`deleted_instances`) that `ensure_instance` refuses,
+   so a late Node event cannot resurrect a deleted session. The repeated
+   `DELETE` also returned 409 instead of 404 for the same reason.
+2. **The Node reported a purge it never performed.** Both runtime dispatchers
+   (`runtime_wss.rs`, `runtime_link.rs`) end in a `_ => Ok(json!({"ok": true}))`
+   catch-all, so `instance.purge` was answered "fine" while nothing was removed
+   — the Hub logged `nodePurge: purged` with the data directory still on disk.
+   Both now handle the method explicitly. The Node also waits (up to 5 s) for a
+   just-closed driver to finish exiting before removing the directory, instead
+   of refusing a purge that is milliseconds early.
+
+Neither was reachable from the unit tests, which stub the Node: only the live
+run surfaced them.
+
 ## Automated coverage
 
-`crates/remuda-hub/tests/tty_relay.rs` (7 tests) and the new
+`crates/remuda-hub/tests/tty_relay.rs` (11 tests, four of them deletion) and the new
 `crates/remuda-hub/src/store.rs` unit tests cover the same ground without a
 live Node. Both B2 and B3 tests were verified to fail when their fix is reverted
 (host-scoped lookup forced to `None`; cached fallback returned early).
 
 ```text
-cargo test -p remuda-hub --test tty_relay   → 7 passed
+cargo test -p remuda-hub --test tty_relay   → 11 passed
 cargo test -p remuda-hub --lib              → 53 passed
 cargo test --workspace --locked             → all suites pass
 ```

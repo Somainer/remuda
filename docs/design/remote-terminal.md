@@ -130,6 +130,39 @@ A terminal is an Instance, so it is subject to the host's `maxInstances` ceiling
 
 The operator ceiling is set with `PATCH /v1/hosts/{id} {"maxInstances": N}`. It is stored separately from the value a Node advertises in its inventory, so neither a `node.hello`/heartbeat nor a Hub restart resets it.
 
+### Deleting a session
+
+`DELETE /v1/instances/{id}` permanently removes a session. Human and Bot
+devices only — agents receive `403`, including for their own instance, so an
+agent can never erase its own trail.
+
+| Condition | Result |
+| --- | --- |
+| lifecycle `exited` / `failed` / `closed` | deleted |
+| still live, no `force` | `409`, nothing removed |
+| still live, `?force=1` | stopped (settled `exited`, `lastError: deleted-by-operator`) then deleted |
+| already deleted | `404` — a repeated `DELETE` is idempotent |
+
+What is removed:
+
+- **Hub**: the instance row, its journal, queued commands, interactions, and
+  fleet membership. Leaving any of them behind would resurrect the session in a
+  list view or keep a command queued against an id that no longer exists.
+- **Node**, via `instance.purge`: its own instance/command/recipe rows and the
+  per-instance data directory (`<data_dir>/instances/<id>`: launch artifacts,
+  overlays, pty logs).
+- **Never**: the agent's own native transcripts under the user's home
+  (`~/.claude`, `~/.codex`, …). Deleting a Remuda session must not delete the
+  user's own agent history.
+
+A Node that is offline or rejects the purge does not block the delete — the Hub
+row is what the user asked to remove, and the response reports which happened
+in `nodePurge` (`purged` / `node-offline` / `node-rejected` / `purge-failed`).
+
+Because the delete removes the journal, the record of *who* deleted it goes to
+the Hub's `audit_log` table instead: device id, action `instance.delete`,
+subject, and whether it was forced.
+
 ### Lost instances after a Node restart
 
 A Node restart loses every in-memory instance while the Hub still holds `running` rows for them. Those rows never settle, never release their slot, and a later stop hangs. Three mechanisms close that:

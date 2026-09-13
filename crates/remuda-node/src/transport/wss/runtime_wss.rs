@@ -179,6 +179,19 @@ async fn dispatch_hub(
         Some(HubNodeMethod::TtyResize | HubNodeMethod::TtyAttach) => {
             crate::transport::hubnode::dispatch_method(&runtime.node, method, params).await
         }
+        _ if method == "instance.purge" => {
+            // Must be explicit: the catch-all below answers `{"ok": true}`,
+            // which would report a successful purge while removing nothing.
+            let instance_id = params
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    NodeError::InvalidRequest("instance.purge requires instanceId".into())
+                })?;
+            let instance_id = InstanceId::try_from(instance_id.to_owned())
+                .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
+            runtime.node.purge_instance(&instance_id).await
+        }
         _ if method == "instance.close" => {
             let (instance_id, result) = close_from_params(&runtime.node, params).await?;
             catch_up(runtime, &instance_id).await?;

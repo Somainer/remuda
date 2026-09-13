@@ -198,6 +198,74 @@ impl DevNode {
         self.inner.store.get_instance(instance_id)
     }
 
+    /// Remove every Node-owned trace of a stopped Instance.
+    ///
+    /// Deletes the Node's own rows (instance, commands, launch recipe) and the
+    /// per-instance data directory holding launch artifacts and PTY logs. It
+    /// refuses while the Instance is still live, so a purge can never race a
+    /// running driver.
+    ///
+    /// The agent's own native transcripts live under the user's home
+    /// (`~/.claude`, `~/.codex`, …), outside the Node data directory, and are
+    /// deliberately never touched: deleting a Remuda session must not delete
+    /// the user's own agent history.
+    pub async fn purge_instance(&self, instance_id: &InstanceId) -> Result<Value, NodeError> {
+        // A delete usually arrives right behind `instance.close`, so give the
+        // driver a moment to finish exiting rather than refusing a purge that
+        // is only milliseconds early.
+        for _ in 0..50 {
+            match self.inner.store.get_instance(instance_id) {
+                Ok(instance)
+                    if matches!(
+                        instance.lifecycle,
+                        InstanceLifecycle::Exited | InstanceLifecycle::Failed
+                    ) =>
+                {
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                Err(_) => break,
+            }
+        }
+        if let Ok(instance) = self.inner.store.get_instance(instance_id)
+            && !matches!(
+                instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            )
+        {
+            let state = serde_json::to_value(instance.lifecycle)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "live".to_owned());
+            return Err(NodeError::Conflict(format!(
+                "instance is {state}; stop it before purging"
+            )));
+        }
+        let removed = self.inner.store.remove_instance(instance_id)?;
+        let mut directory_removed = false;
+        if let Some(config) = &self.inner.herdr_config {
+            let dir = config
+                .data_dir
+                .join("instances")
+                .join(instance_id.as_id().as_str());
+            // `instances/<id>` is Node-owned: launch recipes, overlays, pty
+            // logs. Never a path the user chose.
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => directory_removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(NodeError::Driver(format!(
+                        "purge could not remove the instance directory: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "purged": removed,
+            "directoryRemoved": directory_removed,
+        }))
+    }
+
     /// Catalog of git worktrees under the first registered workspace root.
     pub fn list_worktrees(&self) -> Result<Value, NodeError> {
         self.worktree_rpc("worktree.list", &serde_json::json!({}))

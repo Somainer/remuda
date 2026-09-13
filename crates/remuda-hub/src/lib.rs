@@ -94,6 +94,12 @@ pub struct RunningHub {
 }
 
 impl RunningHub {
+    /// Borrow this Hub's store (audit queries, support tooling, tests).
+    #[must_use]
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into

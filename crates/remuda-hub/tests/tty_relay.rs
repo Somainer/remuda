@@ -568,10 +568,9 @@ async fn max_instances_override_and_reconciliation_survive_a_hub_restart() -> Re
     let data_dir = dir.path().join("data");
     let host_id = HostId::new();
     let stale = InstanceId::new();
-    let bootstrap;
 
     let hub = spawn(HubConfig::for_test(data_dir.clone())).await?;
-    bootstrap = hub.bootstrap_token.clone();
+    let bootstrap = hub.bootstrap_token.clone();
     let cookie = login(hub.addr, &bootstrap).await?;
     let enroll = enroll_token(hub.addr, &cookie).await?;
     let (mut node, node_token) =
@@ -827,5 +826,345 @@ async fn unacknowledged_creates_expire_and_release_the_placement_cap() -> Result
         "a host wedged by an expired create must accept a new one: {status} {body}"
     );
     deaf.abort();
+    Ok(())
+}
+
+/// Mint an agent-scoped credential for an instance (Human origin only).
+async fn agent_token(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    instance_id: &InstanceId,
+) -> Result<String> {
+    let (status, _, body) = http(
+        addr,
+        "POST",
+        &format!("/v1/instances/{}/mcp-token", instance_id.as_id().as_str()),
+        &[("Cookie", cookie)],
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "mcp-token {status} {body}");
+    serde_json::from_str::<Value>(body.trim())?["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("agent token")
+}
+
+/// Answer the Node side of a delete: accept `instance.purge`, and optionally
+/// `instance.close` for the force path. Reports what it saw.
+fn spawn_delete_responder(mut node: Ws) -> tokio::task::JoinHandle<(bool, bool)> {
+    tokio::spawn(async move {
+        let (mut saw_close, mut saw_purge) = (false, false);
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while tokio::time::Instant::now() < deadline && !saw_purge {
+            let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout(Duration::from_millis(300), node.next()).await
+            else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let id = value.get("id").cloned().unwrap_or(Value::Null);
+            match value.get("method").and_then(Value::as_str) {
+                Some("instance.close") => {
+                    saw_close = true;
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "command": { "state": "accepted" } }
+                    });
+                    let _ = node.send(Message::Text(reply.to_string().into())).await;
+                }
+                Some("instance.purge") => {
+                    saw_purge = true;
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "purged": true, "directoryRemoved": true }
+                    });
+                    let _ = node.send(Message::Text(reply.to_string().into())).await;
+                }
+                _ => {}
+            }
+        }
+        (saw_close, saw_purge)
+    })
+}
+
+/// A stopped session deletes, takes its journal with it, leaves an audit row,
+/// and a repeated delete is a 404 rather than an error the UI must special-case.
+#[tokio::test]
+async fn deleting_a_stopped_instance_removes_it_and_is_idempotent() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, _) = node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &instance_id, "seed").await?;
+    // Stop it the ordinary way so the delete takes the non-force path.
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "exit",
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id.as_id().as_str(),
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": { "type": "entity", "entityType": "instance", "state": "exited" }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    anyhow::ensure!(recv_json(&mut node).await?.get("result").is_some());
+
+    let responder = spawn_delete_responder(node);
+    let id = instance_id.as_id().as_str();
+    let (status, _, body) = http(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "delete {status} {body}");
+    let deleted: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(deleted["deleted"], json!(true));
+    assert_eq!(deleted["instanceId"], json!(id));
+    assert_eq!(
+        deleted["nodePurge"],
+        json!("purged"),
+        "the node must be asked to purge its own copy: {deleted}"
+    );
+    let (_, saw_purge) = tokio::time::timeout(TIMEOUT, responder).await??;
+    anyhow::ensure!(saw_purge, "hub did not send instance.purge");
+
+    // The row, and its journal, are gone.
+    let (status, _, _) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "the instance must be gone");
+    let (status, _, journal) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{id}/journal"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    if status == 200 {
+        let value: Value = serde_json::from_str(journal.trim())?;
+        assert_eq!(
+            value["events"].as_array().map(Vec::len).unwrap_or(0),
+            0,
+            "journal rows must be deleted with the instance: {value}"
+        );
+    }
+
+    // Idempotent: the second delete is a plain 404.
+    let (status, _, _) = http(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "a repeated delete must be idempotent");
+
+    // The audit row outlives the journal it describes.
+    let audit = hub
+        .store()
+        .context("hub store")?
+        .audit_for(id.to_string())
+        .await?;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0]["action"], json!("instance.delete"));
+    assert_eq!(audit[0]["detail"]["forced"], json!(false));
+    anyhow::ensure!(
+        audit[0]["deviceId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "the audit row must name the device: {audit:?}"
+    );
+    Ok(())
+}
+
+/// A live session is refused without `force=1`, and stopped-then-deleted with it.
+#[tokio::test]
+async fn deleting_a_live_instance_requires_force_and_settles_it_first() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, _) = node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &instance_id, "seed").await?;
+    let id = instance_id.as_id().as_str();
+
+    let (status, _, body) = http(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(
+        status, 409,
+        "a running instance must not be deleted: {body}"
+    );
+    anyhow::ensure!(body.contains("force=1"), "{body}");
+    let (status, _, _) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "the refused delete must not remove anything");
+
+    let responder = spawn_delete_responder(node);
+    let (status, _, body) = http(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/instances/{id}?force=1"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "force delete {status} {body}");
+    let (saw_close, saw_purge) = tokio::time::timeout(TIMEOUT, responder).await??;
+    anyhow::ensure!(saw_close, "force must stop the instance before deleting");
+    anyhow::ensure!(saw_purge, "force must still purge the node copy");
+
+    let (status, _, _) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404);
+    let audit = hub
+        .store()
+        .context("hub store")?
+        .audit_for(id.to_string())
+        .await?;
+    assert_eq!(audit[0]["detail"]["forced"], json!(true), "{audit:?}");
+    Ok(())
+}
+
+/// Deletion is an operator action: an agent credential cannot call it.
+#[tokio::test]
+async fn agents_cannot_delete_instances() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, _) = node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &instance_id, "seed").await?;
+    let id = instance_id.as_id().as_str();
+    let token = agent_token(hub.addr, &cookie, &instance_id).await?;
+
+    // Even for its own instance, and even with force.
+    for path in [
+        format!("/v1/instances/{id}"),
+        format!("/v1/instances/{id}?force=1"),
+    ] {
+        let (status, _, body) = http(
+            hub.addr,
+            "DELETE",
+            &path,
+            &[("Authorization", format!("Bearer {token}").as_str())],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 403, "agents must not delete sessions: {body}");
+    }
+
+    // Unauthenticated is refused too, and nothing was removed.
+    let (status, _, _) = http(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/instances/{id}"),
+        &[],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 401);
+    let (status, _, _) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(
+        status, 200,
+        "a refused delete must leave the instance alone"
+    );
+    Ok(())
+}
+
+/// A Node that is offline must not block the delete: the Hub row is what the
+/// user asked to remove, and the Node reconciles on reconnect.
+#[tokio::test]
+async fn deleting_with_the_node_offline_still_removes_the_hub_record() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, _) = node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &instance_id, "seed").await?;
+    node.close(None).await?;
+    drop(node);
+    let id = instance_id.as_id().as_str();
+
+    let (status, _, body) = http(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/instances/{id}?force=1"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "delete with node offline {status} {body}");
+    let deleted: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(deleted["nodePurge"], json!("node-offline"), "{deleted}");
+
+    let (status, _, _) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404);
     Ok(())
 }

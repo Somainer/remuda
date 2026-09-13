@@ -82,6 +82,12 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .await?;
             serde_json::to_value(&result).map_err(NodeError::from)
         }
+        "instance.purge" => {
+            // Must be explicit: the catch-all below answers `{"ok": true}`,
+            // which would report a successful purge while removing nothing.
+            let instance_id = instance_id_of(&params)?;
+            node.purge_instance(&instance_id).await
+        }
         "instance.cancel" => {
             let instance_id = instance_id_of(&params)?;
             let result = node

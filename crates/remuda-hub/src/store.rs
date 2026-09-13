@@ -830,6 +830,112 @@ impl Store {
         }).await
     }
 
+    /// Record an operator action that outlives the entity it acted on.
+    ///
+    /// Deleting a session removes its journal, so the record of *who* deleted
+    /// it has to live somewhere else. This table is that somewhere.
+    pub async fn append_audit(
+        &self,
+        device_id: String,
+        action: String,
+        subject: Option<String>,
+        detail: Value,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO audit_log (device_id, action, subject, detail_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    device_id,
+                    action,
+                    subject,
+                    detail.to_string(),
+                    now_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Audit rows for one subject, oldest first (tests and support queries).
+    pub async fn audit_for(&self, subject: String) -> Result<Vec<Value>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT device_id, action, subject, detail_json, created_at
+                 FROM audit_log WHERE subject = ?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![subject], |row| {
+                    Ok(json!({
+                        "deviceId": row.get::<_, String>(0)?,
+                        "action": row.get::<_, String>(1)?,
+                        "subject": row.get::<_, Option<String>>(2)?,
+                        "detail": serde_json::from_str::<Value>(&row.get::<_, String>(3)?)
+                            .unwrap_or(Value::Null),
+                        "createdAt": row.get::<_, String>(4)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Permanently delete an Instance and everything the Hub keeps for it.
+    ///
+    /// Only a stopped Instance can be deleted; the caller is responsible for
+    /// stopping it first (`force`). Returns `false` when the row is already
+    /// gone, which is what makes `DELETE` idempotent, and an
+    /// [`StoreError::Id`] naming the lifecycle when it is still live.
+    ///
+    /// Journal rows, queued commands, interactions, and fleet membership go
+    /// with it: leaving any of them behind would resurrect the session in a
+    /// list view or keep a command queued against an id that no longer exists.
+    pub async fn delete_instance(&self, instance_id: String) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            let Some(instance) = load_instance(conn, &instance_id)? else {
+                return Ok(false);
+            };
+            if !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") {
+                return Err(StoreError::Id(format!(
+                    "instance is {}; stop it before deleting",
+                    instance.lifecycle
+                )));
+            }
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM journal WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM commands WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM interactions WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM fleet_members WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
+            // Tombstone: a Node command that is still draining will keep
+            // appending journal events for this id, and `ensure_instance`
+            // would happily recreate the row. A deleted session must stay
+            // deleted, so the id is refused from here on.
+            tx.execute(
+                "INSERT OR REPLACE INTO deleted_instances (instance_id, deleted_at)
+                 VALUES (?1, ?2)",
+                params![&instance_id, now_rfc3339()],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+    }
+
     /// Append a Hub-authored terminal diagnostic to an instance journal.
     ///
     /// Only for instances the Node has abandoned (epoch changed, create never
@@ -1190,6 +1296,11 @@ impl Store {
         instance_id: String,
     ) -> Result<InstanceRecord, StoreError> {
         self.run(move |conn| {
+            if is_deleted_instance(conn, &instance_id)? {
+                return Err(StoreError::Id(format!(
+                    "instance {instance_id} was deleted"
+                )));
+            }
             if let Some(existing) = load_instance(conn, &instance_id)? {
                 if existing.host_id != host_id {
                     return Err(StoreError::Id("instance belongs to another host".into()));
@@ -2235,6 +2346,19 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             observed_at TEXT NOT NULL,
             PRIMARY KEY (instance_id, seq)
         );
+        CREATE TABLE IF NOT EXISTS deleted_instances (
+            instance_id TEXT PRIMARY KEY,
+            deleted_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            subject TEXT,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS audit_log_subject ON audit_log(subject);
         CREATE TABLE IF NOT EXISTS fleets (
             id TEXT PRIMARY KEY,
             spec_json TEXT NOT NULL,
@@ -2554,6 +2678,18 @@ where
         return Ok(None);
     }
     Ok(Some(id))
+}
+
+/// True when this instance id has been deleted and must never come back.
+fn is_deleted_instance(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM deleted_instances WHERE instance_id = ?1",
+            params![instance_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn ensure_column(

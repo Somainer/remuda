@@ -50,6 +50,11 @@ pub trait LocalStore: Send + Sync {
     fn list_instances(&self) -> Result<Vec<Instance>, NodeError>;
     /// Read one Instance.
     fn get_instance(&self, instance_id: &InstanceId) -> Result<Instance, NodeError>;
+    /// Remove an Instance and its Node-owned rows; `false` when unknown.
+    ///
+    /// Only for an Instance that has already stopped. The agent's own native
+    /// transcripts are outside the Node data dir and are never touched.
+    fn remove_instance(&self, instance_id: &InstanceId) -> Result<bool, NodeError>;
     /// Change lifecycle/activity and return the revised Instance.
     fn set_instance_state(
         &self,
@@ -462,6 +467,22 @@ impl LocalStore for MemoryStore {
             .get(instance_id)
             .map(|record| record.instance.clone())
             .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))
+    }
+
+    fn remove_instance(&self, instance_id: &InstanceId) -> Result<bool, NodeError> {
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let Some(record) = state.instances.remove(instance_id) else {
+            return Ok(false);
+        };
+        for command_id in &record.command_ids {
+            state.commands.remove(command_id);
+        }
+        state.journal_instances.remove(&record.instance.journal_id);
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.remove_instance(instance_id)?;
+        }
+        Ok(true)
     }
 
     fn set_instance_state(

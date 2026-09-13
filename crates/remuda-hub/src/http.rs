@@ -287,6 +287,178 @@ pub async fn get_instance(
     ))
 }
 
+#[derive(Deserialize)]
+pub struct DeleteInstanceQuery {
+    /// `force=1` stops a live Instance first instead of refusing.
+    #[serde(default)]
+    force: Option<u8>,
+}
+
+/// `DELETE /v1/instances/:id` — permanently remove a session.
+///
+/// Human and Bot devices only (the agent-route middleware already refuses
+/// agents, and `require_operator` refuses them again at the handler).
+/// A live Instance is refused with `409` unless `?force=1`, which stops it and
+/// settles it as `exited` before removal. Deleting an Instance that is already
+/// gone returns `404`, so a repeated `DELETE` is idempotent rather than an
+/// error the UI has to special-case.
+///
+/// Removal covers the Hub's own record — journal, commands, interactions,
+/// fleet membership — and asks the owning Node to purge its per-instance data
+/// directory (launch artifacts, pty logs). The agent's native transcripts
+/// under the user's home are never touched.
+pub async fn delete_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+    Query(query): Query<DeleteInstanceQuery>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = crate::agent_scope::require_operator(&state, &headers).await?;
+    let instance = state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let force = query.force == Some(1);
+    let live = !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed");
+
+    if live {
+        if !force {
+            return Err(HubError::Conflict(format!(
+                "instance is {}; stop it first or retry with ?force=1",
+                instance.lifecycle
+            )));
+        }
+        stop_before_delete(&state, &instance).await?;
+    }
+
+    // Ask the Node to drop its own copy first. A Node that is offline or has
+    // never heard of the instance must not block the delete: the Hub row is
+    // what the user asked to remove, and the Node reconciles on reconnect.
+    let purge = match state
+        .nodes
+        .call(
+            &instance.host_id,
+            "instance.purge",
+            json!({ "instanceId": instance_id }),
+            // The Node waits for a just-closed driver to finish exiting before
+            // it can remove the directory, so allow more than an RPC round trip.
+            Duration::from_secs(10),
+        )
+        .await
+    {
+        Ok(Some(response)) if response.get("error").is_some() => {
+            tracing::warn!(
+                %instance_id,
+                host_id = %instance.host_id,
+                response = %response,
+                "node rejected instance.purge; deleting the hub record anyway"
+            );
+            "node-rejected"
+        }
+        Ok(Some(_)) => "purged",
+        Ok(None) => {
+            tracing::info!(
+                %instance_id,
+                host_id = %instance.host_id,
+                "node offline at delete; its instance directory is purged on reconnect"
+            );
+            "node-offline"
+        }
+        Err(error) => {
+            tracing::warn!(
+                %instance_id,
+                host_id = %instance.host_id,
+                %error,
+                "instance.purge failed; deleting the hub record anyway"
+            );
+            "purge-failed"
+        }
+    };
+
+    // The audit row outlives the journal it describes, so write it first.
+    state
+        .store
+        .append_audit(
+            device.id.clone(),
+            "instance.delete".into(),
+            Some(instance_id.clone()),
+            json!({
+                "hostId": instance.host_id,
+                "lifecycle": instance.lifecycle,
+                "forced": force,
+                "nodePurge": purge,
+            }),
+        )
+        .await
+        .map_err(map_store)?;
+
+    let deleted = state
+        .store
+        .delete_instance(instance_id.clone())
+        .await
+        .map_err(map_store)?;
+    if !deleted {
+        return Err(HubError::NotFound);
+    }
+    tracing::info!(%instance_id, device_id = %device.id, forced = force, "instance deleted");
+    Ok(Json(json!({
+        "deleted": true,
+        "instanceId": instance_id,
+        "nodePurge": purge,
+    })))
+}
+
+/// Stop a live Instance so it can be deleted, settling it as `exited`.
+///
+/// Best effort by design: a Node that is gone can never answer, and refusing
+/// to delete in that case is exactly the wedge this endpoint exists to clear.
+/// The row is projected to `exited` either way.
+async fn stop_before_delete(
+    state: &AppState,
+    instance: &crate::store::InstanceRecord,
+) -> Result<(), HubError> {
+    let (command, created) = state
+        .store
+        .queue_command(
+            None,
+            Some(instance.instance_id.clone()),
+            instance.host_id.clone(),
+            "instance.close".into(),
+            json!({ "instanceId": instance.instance_id, "origin": "human" }),
+            None,
+        )
+        .await
+        .map_err(map_store)?;
+    if created {
+        let live = state.nodes.kind_of(&instance.host_id).await.is_some();
+        // A close the Node refuses or never receives must not fail the delete.
+        if let Err(error) = forward_if_online(state, command, live).await {
+            tracing::warn!(
+                instance_id = %instance.instance_id,
+                %error,
+                "close before delete did not settle; deleting anyway"
+            );
+        }
+    }
+    if state
+        .store
+        .settle_instance_exited(instance.instance_id.clone(), "deleted-by-operator".into())
+        .await
+        .map_err(map_store)?
+    {
+        crate::ws::publish_hub_diagnostic(
+            state,
+            &instance.instance_id,
+            "deleted_by_operator",
+            "instance stopped for deletion",
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// `POST /v1/instances` — index + forward `instance.create` when the Node is online.
 pub async fn create_instance(
     State(state): State<AppState>,

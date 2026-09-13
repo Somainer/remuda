@@ -144,8 +144,8 @@ async function closeCreatedSessions(page: Page, instanceIds: string[]) {
   expect(outcomes.filter((result) => result.status === "rejected"), "Every owned real shell session must exit").toEqual([]);
 }
 
-async function screenshot(page: Page, name: string, theme: "night" | "ledger", live = true) {
-  if (realNode && live) {
+async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
+  if (realNode) {
     await expect(page.locator("[data-tty-lab='1']")).toHaveAttribute("data-tty-status", "live", { timeout: 30_000 });
     await expect(page.locator("[data-tty-ready]")).toHaveAttribute("data-tty-ready", "1");
     await expect(page.getByTestId("tty-ansi-preview")).toContainText("SPACE_CWD=", { timeout: 20_000 });
@@ -270,7 +270,6 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
     page.on("request", watchCommands);
     await closeButton(page, second.instanceId).click();
     await expect(page.getByTestId("tab-close-sheet")).toBeVisible();
-    await screenshot(page, "desktop-close-sheet-dark.png", "night");
     await page.getByTestId("tab-close-keep").click();
     await expect(tab(page, second.instanceId)).toHaveCount(0);
     await expect(strip.getByRole("tab", { selected: true })).toHaveCount(1);
@@ -310,7 +309,6 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
       await expect(group).toHaveAttribute("aria-expanded", "false");
       await group.click();
       await expect(panel.getByTestId("exited-session").and(page.locator(`[data-instance-id="${exited}"]`))).toBeVisible();
-      await screenshot(page, "desktop-exited-group-dark.png", "night", false);
       await expect(panel.getByTestId("exited-resume").first()).toBeVisible();
       await panel.getByTestId("exited-delete").first().click();
       await expect(page.getByTestId("delete-session-sheet")).toContainText("删除会话及其记录？");

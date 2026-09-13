@@ -7,6 +7,7 @@
 
 use crate::binary::{BinaryPin, hash_bytes, pin_binary};
 use crate::capabilities::{ADAPTER_VERSION, capability_snapshot};
+use crate::claude_print::TranscriptMapper;
 use crate::driver::{Driver, DriverAck, RunHandle};
 use crate::error::{DriverError, DriverResult};
 use crate::materializer::{
@@ -150,6 +151,7 @@ struct PtyLive {
     interactions: Arc<PtyInteractions>,
     interaction_task: JoinHandle<()>,
     hook_task: Option<JoinHandle<()>>,
+    transcript_task: Option<JoinHandle<()>>,
     tty_task: Option<JoinHandle<()>>,
     closed: bool,
 }
@@ -404,6 +406,14 @@ impl ClaudePtyDriver {
             Arc::clone(&self.seq),
             Arc::clone(&transcript_path),
         );
+        // The TUI's tool calls exist only in the native transcript; follow it as
+        // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
+        let transcript_task = spawn_transcript_pump(
+            Arc::clone(&transcript_path),
+            tx.clone(),
+            ctx.clone(),
+            Arc::clone(&self.seq),
+        );
 
         *self.inner.lock().await = Some(PtyLive {
             ctx,
@@ -424,6 +434,7 @@ impl ClaudePtyDriver {
             interactions,
             interaction_task,
             hook_task: Some(hook_task),
+            transcript_task: Some(transcript_task),
             tty_task: None,
             closed: false,
         });
@@ -621,6 +632,9 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.hook_task.take() {
             task.abort();
         }
+        if let Some(task) = live.transcript_task.take() {
+            task.abort();
+        }
         if let Some(task) = live.tty_task.take() {
             task.abort();
         }
@@ -796,6 +810,83 @@ fn spawn_hook_watch(
                 return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+}
+
+/// Poll interval for the native transcript, matching the hook watcher's cadence.
+const TRANSCRIPT_POLL: Duration = Duration::from_millis(300);
+
+/// Follow the native transcript and map it into structured Observations.
+///
+/// The TUI does not speak stream-json, so its `tool_use` / `tool_result` blocks
+/// only ever exist in `~/.claude/projects/<encoded cwd>/<session>.jsonl`. The
+/// SessionStart hook names that file; without this pump the 结构 view sees the
+/// prompt the Node queued and nothing the agent actually did.
+fn spawn_transcript_pump(
+    transcript_slot: Arc<std::sync::Mutex<Option<String>>>,
+    tx: mpsc::Sender<Observation>,
+    ctx: ObsCtx,
+    seq: Arc<AtomicU64>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
+            None;
+        while !tx.is_closed() {
+            if hydrator.is_none() {
+                let path = transcript_slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_file());
+                if let Some(path) = path {
+                    info!(session = %ctx.session_id, "hydrating claude-pty from native transcript");
+                    hydrator = Some((
+                        crate::claude_transcript::TranscriptTail::new(path),
+                        TranscriptMapper::new(
+                            ctx.driver,
+                            ctx.instance_id.clone(),
+                            ctx.run_id.clone(),
+                            ctx.journal_id.clone(),
+                            ctx.host_id.clone(),
+                            ctx.session_id.clone(),
+                            ctx.pin_version.clone(),
+                        ),
+                    ));
+                }
+            }
+            if let Some((tail, mapper)) = hydrator.as_mut() {
+                // A read error is transient (the file is being appended to);
+                // the next tick retries from the same offset.
+                let lines = tail.poll().unwrap_or_default();
+                for line in lines {
+                    let mapped = match mapper.map_line(&line) {
+                        Ok(mapped) => mapped,
+                        Err(error) => {
+                            tracing::debug!(%error, "transcript line did not map");
+                            continue;
+                        }
+                    };
+                    for observation in mapped {
+                        if emit_obs(
+                            &tx,
+                            &seq,
+                            &ctx,
+                            SourceChannel::Transcript,
+                            observation.completeness,
+                            observation.body,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(TRANSCRIPT_POLL).await;
         }
     })
 }

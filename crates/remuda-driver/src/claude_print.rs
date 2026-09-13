@@ -836,79 +836,111 @@ fn map_init(mapper: &mut Mapper, init: &SystemInit) -> DriverResult<Vec<Observat
     )?])
 }
 
+/// One `user` message observation carrying `text`.
+fn user_text_message(
+    mapper: &mut Mapper,
+    uuid: Option<&str>,
+    text: String,
+) -> DriverResult<Observation> {
+    let key = uuid.map(ToOwned::to_owned).unwrap_or_else(|| "user".into());
+    let (id, rev, op) = mapper.ids.message(&key)?;
+    mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::Message(Box::new(MessagePayload {
+            mutation: NodeMutation {
+                node_id: id.clone(),
+                revision: rev,
+                operation: op,
+                base_revision: None,
+            },
+            message_id: id,
+            role: MessageRole::User,
+            phase: MessagePhase::Input,
+            blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
+            target_block: None,
+            parent_tool_call_id: None,
+            native_origin: known_or_unknown(uuid),
+            status: ContentStatus::Complete,
+        })),
+    )
+}
+
 fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observation>> {
     let mut out = Vec::new();
     match &msg.message.content {
         UserContent::Text(text) => {
-            let key = msg.uuid.clone().unwrap_or_else(|| "user".into());
-            let (id, rev, op) = mapper.ids.message(&key)?;
-            out.push(mapper.observation(
-                Completeness::Structured,
-                NativeRequestKey::None,
-                ObservationPayload::Message(Box::new(MessagePayload {
-                    mutation: NodeMutation {
-                        node_id: id.clone(),
-                        revision: rev,
-                        operation: op,
-                        base_revision: None,
-                    },
-                    message_id: id,
-                    role: MessageRole::User,
-                    phase: MessagePhase::Input,
-                    blocks: vec![ContentBlock::Text(Box::new(TextBlock {
-                        text: text.clone(),
-                    }))],
-                    target_block: None,
-                    parent_tool_call_id: None,
-                    native_origin: known_or_unknown(msg.uuid.as_deref()),
-                    status: ContentStatus::Complete,
-                })),
+            out.push(user_text_message(
+                mapper,
+                msg.uuid.as_deref(),
+                text.clone(),
             )?);
         }
         UserContent::Blocks(blocks) => {
+            // A user array is usually tool results, but Claude also records
+            // plain text there — interrupt notices most visibly. Dropping those
+            // loses the reason a turn stopped.
+            let mut texts = Vec::new();
             for block in blocks {
-                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                    let tool_use_id = block
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let id = mapper.ids.tool(tool_use_id)?;
-                    let (result_id, revision, operation) =
-                        mapper.ids.message(&format!("tool-result:{tool_use_id}"))?;
-                    let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                    let text = match block.get("content") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(other) => other.to_string(),
-                        None => String::new(),
-                    };
-                    out.push(mapper.observation(
-                        Completeness::Structured,
-                        NativeRequestKey::None,
-                        ObservationPayload::ToolResult(Box::new(ToolResultPayload {
-                            mutation: NodeMutation {
-                                node_id: result_id,
-                                revision,
-                                operation: if operation == MutationOperation::Open {
-                                    operation
-                                } else {
-                                    MutationOperation::Replace
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            texts.push(text.to_owned());
+                        }
+                    }
+                    Some("tool_result") => {
+                        let tool_use_id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let id = mapper.ids.tool(tool_use_id)?;
+                        let (result_id, revision, operation) =
+                            mapper.ids.message(&format!("tool-result:{tool_use_id}"))?;
+                        let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                        let text = match block.get("content") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => String::new(),
+                        };
+                        out.push(mapper.observation(
+                            Completeness::Structured,
+                            NativeRequestKey::None,
+                            ObservationPayload::ToolResult(Box::new(ToolResultPayload {
+                                mutation: NodeMutation {
+                                    node_id: result_id,
+                                    revision,
+                                    operation: if operation == MutationOperation::Open {
+                                        operation
+                                    } else {
+                                        MutationOperation::Replace
+                                    },
+                                    base_revision: (revision.0 > 1).then_some(U64(revision.0 - 1)),
                                 },
-                                base_revision: (revision.0 > 1).then_some(U64(revision.0 - 1)),
-                            },
-                            tool_call_id: id,
-                            stage: ResultStage::Final,
-                            outcome: if is_error {
-                                ToolOutcome::Failed
-                            } else {
-                                ToolOutcome::Succeeded
-                            },
-                            blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
-                            structured_result: Knowledge::NotApplicable,
-                            exit_code: Knowledge::NotApplicable,
-                            changes: Vec::new(),
-                        })),
-                    )?);
+                                tool_call_id: id,
+                                stage: ResultStage::Final,
+                                outcome: if is_error {
+                                    ToolOutcome::Failed
+                                } else {
+                                    ToolOutcome::Succeeded
+                                },
+                                blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
+                                structured_result: Knowledge::NotApplicable,
+                                exit_code: Knowledge::NotApplicable,
+                                changes: Vec::new(),
+                            })),
+                        )?);
+                    }
+                    _ => {}
                 }
+            }
+            if !texts.is_empty() {
+                out.push(user_text_message(
+                    mapper,
+                    msg.uuid.as_deref(),
+                    texts.join("\n"),
+                )?);
             }
         }
     }

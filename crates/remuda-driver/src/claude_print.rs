@@ -137,6 +137,11 @@ struct Mapper {
     host_id: HostId,
     session_id: String,
     pin: BinaryPin,
+    /// Driver stamped on every Observation. `claude-print` for the live reader;
+    /// `shell-pty` when a promoted terminal replays the same records (D-025).
+    driver_kind: DriverKind,
+    /// Source channel for the same reason: `stdout` live, `transcript` on replay.
+    channel: SourceChannel,
 }
 
 #[derive(Default)]
@@ -224,6 +229,8 @@ impl ClaudePrintDriver {
                         version: String::new(),
                         sha256: dummy_digest(),
                     },
+                    driver_kind: DriverKind::ClaudePrint,
+                    channel: SourceChannel::Stdout,
                 }),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
@@ -323,6 +330,8 @@ impl ClaudePrintDriver {
                 host_id: spec.host.clone(),
                 session_id: session_id.clone(),
                 pin: recipe.binary.clone(),
+                driver_kind: DriverKind::ClaudePrint,
+                channel: SourceChannel::Stdout,
             };
         }
         *self.inner.policy.lock().await = policy;
@@ -1108,10 +1117,10 @@ impl Mapper {
             observed_at: now()?,
             native_at: unknown("not-emitted"),
             source: ObservationSource {
-                driver_kind: DriverKind::ClaudePrint,
+                driver_kind: self.driver_kind,
                 driver_version: self.pin.version.clone(),
                 adapter_version: ADAPTER_VERSION.into(),
-                channel: SourceChannel::Stdout,
+                channel: self.channel,
                 delivery: SourceDelivery::Live,
                 native_session_id: Knowledge::Known {
                     value: self.session_id.clone(),
@@ -1639,6 +1648,109 @@ fn workflow_state(status: &str) -> WorkflowState {
     }
 }
 
+/// Maps Claude transcript (`.jsonl`) records into Observations.
+///
+/// The transcript on disk holds the same `user` / `assistant` records the
+/// stream-json stdout carries, so a promoted `shell-pty` terminal (D-025) can
+/// hydrate a structured view through exactly this mapper rather than a second
+/// parser. Records that are not conversation content (`mode`, `atis-latch`,
+/// `file-history-snapshot`, hook attachments, …) map to nothing.
+pub struct TranscriptMapper {
+    mapper: Mapper,
+}
+
+impl TranscriptMapper {
+    /// Build a mapper that stamps Observations for `instance_id` on `driver`.
+    pub fn new(
+        driver: DriverKind,
+        instance_id: InstanceId,
+        run_id: RunId,
+        journal_id: Id,
+        host_id: HostId,
+        session_id: String,
+        binary_version: String,
+    ) -> Self {
+        Self {
+            mapper: Mapper {
+                stream: stream::StreamState::default(),
+                ids: NativeIds::default(),
+                seq: 0,
+                instance_id,
+                run_id,
+                journal_id,
+                host_id,
+                session_id,
+                pin: BinaryPin {
+                    abs_path: String::new(),
+                    version: binary_version,
+                    sha256: dummy_digest(),
+                },
+                driver_kind: driver,
+                channel: SourceChannel::Transcript,
+            },
+        }
+    }
+
+    /// Map one transcript line. Blank lines and undecodable JSON yield nothing:
+    /// a partially written tail is normal while the file is being appended to.
+    pub fn map_line(&mut self, line: &str) -> DriverResult<Vec<Observation>> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return Ok(Vec::new());
+        };
+        self.map_record(value)
+    }
+
+    /// Map one decoded transcript record.
+    pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        // Only conversation records reach the transcript mapper. Everything
+        // else in the file is Claude's own bookkeeping and is not journaled.
+        if !matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) {
+            return Ok(Vec::new());
+        }
+        // A sidechain record belongs to a sub-agent's own transcript view; the
+        // main conversation is what the 结构 tab renders.
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return Ok(Vec::new());
+        }
+        if let Some(session) = value.get("sessionId").and_then(Value::as_str)
+            && !session.is_empty()
+        {
+            self.mapper.session_id = session.to_owned();
+        }
+        // Transcript records nest the wire frame under `message`; lift it so the
+        // stdout mapper sees the shape it already knows.
+        let Some(message) = value.get("message").cloned() else {
+            return Ok(Vec::new());
+        };
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".into(), value["type"].clone());
+        frame.insert("message".into(), message);
+        for key in ["uuid", "parentToolUseId", "sessionId"] {
+            if let Some(found) = value.get(key) {
+                let wire = if key == "sessionId" {
+                    "session_id"
+                } else if key == "parentToolUseId" {
+                    "parent_tool_use_id"
+                } else {
+                    key
+                };
+                frame.insert(wire.into(), found.clone());
+            }
+        }
+        map_outbound(
+            &mut self.mapper,
+            &Outbound::from_value(Value::Object(frame)),
+        )
+    }
+}
+
 /// Mapping / gating helpers used by `tests/claude_print_review.rs`.
 #[doc(hidden)]
 pub mod review {
@@ -1661,6 +1773,8 @@ pub mod review {
                 version: "review".into(),
                 sha256: dummy_digest(),
             },
+            driver_kind: DriverKind::ClaudePrint,
+            channel: SourceChannel::Stdout,
         };
         map_outbound(&mut mapper, &frame)
     }

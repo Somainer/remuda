@@ -17,6 +17,8 @@ fn mapper() -> Mapper {
             version: "fixture".into(),
             sha256: dummy_digest(),
         },
+        driver_kind: DriverKind::ClaudePrint,
+        channel: SourceChannel::Stdout,
     }
 }
 

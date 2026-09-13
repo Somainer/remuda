@@ -3,9 +3,9 @@ import { readDraft, writeDraft } from "../../lib/drafts";
 import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
 import type { HostCli } from "../hosts";
+import { EffortSlider } from "./EffortSlider";
 import {
   EFFORT_MENU_FOOTER,
-  EFFORT_MENU_HEADER,
   effortCaps,
   effortTable,
   HARNESS_META,
@@ -40,6 +40,7 @@ export function Composer({
   contextLabel,
   hostLabel,
   hostCli = [],
+  effortDisabled,
 }: {
   instanceId: string;
   mobile: boolean;
@@ -58,6 +59,8 @@ export function Composer({
   contextLabel?: string | null;
   hostLabel?: string;
   hostCli?: HostCli[];
+  /** True when the session cannot take instance.configure (exited / observed-only). */
+  effortDisabled?: boolean;
 }) {
   const [text, setText] = useState(() => readDraft(instanceId));
   const [harnessOverride, setHarnessOverride] = useState<string | null>(null);
@@ -74,6 +77,7 @@ export function Composer({
     incoming.kind === harness ? incoming : mapEffort(incoming, (harness as EffortKind) || "claude");
   const table = effortTable(harness);
   const ember = isEmberTier(harness, currentEffort.index);
+  const effortLocked = Boolean(effortDisabled) || !onEffort || table.length === 0;
   const permLabel = PERMISSION_OPTIONS.find((m) => m.id === permissionMode)?.label ?? permissionMode;
   const modelList = modelsFor(harness, models ?? [model]);
   const installed = new Set(hostCli.filter((c) => c.path || c.version).map((c) => c.kind));
@@ -138,12 +142,6 @@ export function Composer({
     const mapped = mapEffort({ ...currentEffort, kind: (currentEffort.kind || harness) as EffortKind }, next);
     onHarness?.(next);
     onEffort?.(mapped);
-    setMenu(null);
-  };
-
-  const pickEffort = (index: number) => {
-    const next = { index, name: table[index]?.name ?? "default", kind: (harness as EffortKind) || "claude" };
-    onEffort?.(next);
     setMenu(null);
   };
 
@@ -213,6 +211,8 @@ export function Composer({
             data-testid="model-effort-chip"
             data-ember={ember ? "1" : "0"}
             aria-expanded={menu === "effort"}
+            aria-haspopup="dialog"
+            aria-label={`Select effort, ${effortChipLabel}`}
             onClick={() => toggle("effort")}
           >
             {ember ? (
@@ -323,25 +323,13 @@ export function Composer({
               ))}
             </div>
           ) : null}
-          <div className={css.menuHead}>{EFFORT_MENU_HEADER}</div>
-          {table.map((tier, index) => {
-            const on = currentEffort.index === index;
-            const top = isEmberTier(harness, index);
-            return (
-              <button
-                key={tier.name}
-                type="button"
-                className={`${css.effortRow} ${on ? css.effortOn : ""} ${top ? css.ember : ""}`}
-                data-testid={`effort-tier-${tier.name}`}
-                data-ember={top ? "1" : "0"}
-                onClick={() => pickEffort(index)}
-              >
-                <span className={`${css.radio} ${on ? css.radioOn : ""}`} />
-                <span className={css.effortName}>{tier.name}</span>
-                <span className={css.effortDesc}>{tier.description}</span>
-              </button>
-            );
-          })}
+          <EffortSlider
+            kind={harness}
+            model={caps.model ? model : undefined}
+            index={currentEffort.index}
+            disabled={effortLocked}
+            onChange={(next) => onEffort?.(next)}
+          />
           <div className={css.menuFoot}>{EFFORT_MENU_FOOTER}</div>
         </div>
       ) : null}

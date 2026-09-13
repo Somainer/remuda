@@ -302,6 +302,7 @@ Diff 三分态文案：**拟修改** / **已写入** / **结果未知**。未知
 - 桌面：Enter 发送（IME composing / keyCode 229 / key=Process 时忽略，抄 herdrx `Composer.tsx` `composing()`）。Shift+Enter 换行。
 - 手机：发送按钮；Enter 换行。不要抢中文候选。
 - 权限芯片显示当前 `permissionMode`（dontAsk/acceptEdits/manual…），点开改本会话（发 Command，不是只改本地 chip）。
+- Effort：收起为 compact `模型+档位 ▾` 触发器。展开 popover 顶栏是闪电图标 + 大号档名（最高档 ember 琥珀）+ 型号 + 复位；下方一条宽渐变轨道和可拖圆钮，吸附 harness 原生档（claude `default/think/think-hard/ultracode`，codex `low/medium/high/ultra`，grok `quick/standard/max`），并显示档名与一行说明。←/→/Home/End 与 44px 触控。变更走 `instance.configure`（journal + persist）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。
 - 本地草稿按 `instanceId` 存（herdrx `composerDrafts`）；未 accepted 的乐观气泡可撤回。
 
 **状态清单**

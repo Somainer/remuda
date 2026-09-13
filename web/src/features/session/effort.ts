@@ -56,6 +56,43 @@ export function clampEffortIndex(index: number, length: number): number {
   return Math.max(0, Math.min(Math.round(index), length - 1));
 }
 
+/** 0..1 position of a snapped index on a discrete track. A single-tier table sits at the ember end. */
+export function effortRatio(index: number, length: number): number {
+  if (length <= 1) return length === 1 ? 1 : 0;
+  return clampEffortIndex(index, length) / (length - 1);
+}
+
+/** Snap a 0..1 track position onto the nearest native tier index. */
+export function snapEffortIndex(ratio: number, length: number): number {
+  if (length <= 1) return 0;
+  if (!Number.isFinite(ratio)) return 0;
+  const t = Math.max(0, Math.min(1, ratio));
+  return Math.round(t * (length - 1));
+}
+
+export function effortIndexFromClientX(
+  clientX: number,
+  track: { left: number; width: number },
+  length: number,
+): number {
+  if (track.width <= 0) return 0;
+  return snapEffortIndex((clientX - track.left) / track.width, length);
+}
+
+/** Discrete slider keys. Returns null when the event is not an effort key. */
+export function keyboardEffortIndex(current: number, key: string, length: number): number | null {
+  if (length <= 0) return 0;
+  if (key === "ArrowLeft" || key === "ArrowDown") return clampEffortIndex(current - 1, length);
+  if (key === "ArrowRight" || key === "ArrowUp") return clampEffortIndex(current + 1, length);
+  if (key === "Home") return 0;
+  if (key === "End") return length - 1;
+  return null;
+}
+
+export function defaultEffortIndex(kind: EffortKind | string): number {
+  return clampEffortIndex(DEFAULT_EFFORT_INDEX, effortTable(kind).length);
+}
+
 /** Map a stored index onto another table. Top tier always lands on the new top (ember) tier. */
 export function mapEffortIndex(fromIndex: number, fromLen: number, toLen: number): number {
   if (toLen <= 0) return 0;

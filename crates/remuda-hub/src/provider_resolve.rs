@@ -14,6 +14,8 @@ pub const SOURCE_HOST_SCOPED_DEFAULT: &str = "host-scoped-default";
 pub const SOURCE_UNIVERSAL_DEFAULT: &str = "universal-default";
 /// Host CLI inventory reported a native login or gateway.
 pub const SOURCE_HOST_INVENTORY: &str = "host-inventory";
+/// No default profile matched; let the host determine whether native auth works.
+pub const SOURCE_NATIVE_FALLBACK: &str = "native-fallback";
 
 /// Chosen Claude provider for one host.
 #[derive(Clone, Debug)]
@@ -43,6 +45,9 @@ impl ResolvedProvider {
     /// Operator-facing line for Session header / New Session hint.
     pub fn hint(&self) -> String {
         match self {
+            Self::Native {
+                source: SOURCE_NATIVE_FALLBACK,
+            } => "未匹配到默认供应商配置，将尝试使用主机原生认证；认证是否可用由主机确认".into(),
             Self::Native { .. } => "使用主机原生登录".into(),
             Self::Profile { profile, .. } => {
                 let label = scope_label(&profile.scope);
@@ -181,7 +186,6 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
         });
     }
 
-    let mut reasons = Vec::new();
     if !explicit_gateway {
         match binding_of(&input.host.provider_binding) {
             Binding::Native => {
@@ -217,34 +221,21 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, Vec<String>>
             source: SOURCE_HOST_SCOPED_DEFAULT,
         });
     }
-    reasons.push(format!(
-        "{host_id}: no host-scoped default provider for {host_scope}"
-    ));
-
     if let Some(profile) = default_gateway_in(input.profiles, "universal") {
         return Ok(ResolvedProvider::Profile {
             profile: Box::new(profile.clone()),
             source: SOURCE_UNIVERSAL_DEFAULT,
         });
     }
-    reasons.push(format!("{host_id}: no universal default provider"));
-
-    if !explicit_gateway {
-        if host_reports_native_claude(input.host) {
-            return Ok(ResolvedProvider::Native {
-                source: SOURCE_HOST_INVENTORY,
-            });
-        }
-        reasons.push(format!(
-            "{host_id}: host does not report a native Claude login/gateway"
-        ));
-    } else {
-        reasons.push(format!(
-            "{host_id}: request asked for gateway; native login is not a fallback"
-        ));
+    if !explicit_gateway && host_reports_native_claude(input.host) {
+        return Ok(ResolvedProvider::Native {
+            source: SOURCE_HOST_INVENTORY,
+        });
     }
 
-    Err(reasons)
+    Ok(ResolvedProvider::Native {
+        source: SOURCE_NATIVE_FALLBACK,
+    })
 }
 
 /// Write the chosen source onto the instance spec (never the token).
@@ -466,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn universal_default_then_inventory_then_422() {
+    fn universal_default_then_inventory_then_native_fallback() {
         let host = host_rec("hst_a", "auto", false);
         let uni = vec![profile("pvp_u", "uni", "universal", true)];
         match run(&host, &uni, None, None).unwrap() {
@@ -481,23 +472,55 @@ mod tests {
             ResolvedProvider::Native { source } => assert_eq!(source, SOURCE_HOST_INVENTORY),
             other => panic!("{other:?}"),
         }
-        let err = run(&host, &[], None, None).unwrap_err();
-        assert!(
-            err.iter()
-                .any(|r| r.contains("does not report a native Claude")),
-            "{err:?}"
-        );
+        let unmatched = vec![
+            profile("pvp_other", "other-host", "host:hst_b", true),
+            profile("pvp_nondefault", "nondefault", "universal", false),
+        ];
+        for cli in [
+            Value::Null,
+            json!([]),
+            json!([{ "kind": "claude", "installed": true }]),
+            json!([{ "kind": "claude", "auth": "unknown", "installed": true }]),
+            host.cli.clone(),
+        ] {
+            let mut host = host.clone();
+            host.cli = cli;
+            for profiles in [&[][..], unmatched.as_slice()] {
+                let got = run(&host, profiles, None, None).unwrap();
+                assert!(matches!(
+                    got,
+                    ResolvedProvider::Native {
+                        source: SOURCE_NATIVE_FALLBACK
+                    }
+                ));
+                let mut spec = json!({"kind": "claude"});
+                apply_to_spec(&mut spec, &got);
+                assert_eq!(spec["delegation"], "none");
+                assert_eq!(spec["providerProfileId"], "none");
+                assert_eq!(spec["providerSource"], "native-fallback");
+                assert_eq!(
+                    spec["providerSourceHint"],
+                    "未匹配到默认供应商配置，将尝试使用主机原生认证；认证是否可用由主机确认"
+                );
+            }
+        }
     }
 
     #[test]
-    fn explicit_gateway_skips_native_and_422s_without_profile() {
-        let host = host_rec("hst_a", "native", true);
-        let err = run(&host, &[], Some("gateway"), None).unwrap_err();
-        assert!(
-            err.iter()
-                .any(|r| r.contains("native login is not a fallback")),
-            "{err:?}"
-        );
+    fn explicit_gateway_or_direct_uses_native_fallback_without_profile() {
+        for native in [false, true] {
+            let host = host_rec("hst_a", "native", native);
+            for delegation in ["gateway", "direct"] {
+                let got = run(&host, &[], Some(delegation), None).unwrap();
+                assert!(matches!(
+                    got,
+                    ResolvedProvider::Native {
+                        source: SOURCE_NATIVE_FALLBACK
+                    }
+                ));
+                assert!(got.hint().contains("未匹配到默认供应商配置"));
+            }
+        }
     }
 
     #[test]

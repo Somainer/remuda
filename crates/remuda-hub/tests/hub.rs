@@ -1137,13 +1137,11 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
 #[tokio::test]
 async fn create_instance_fails_when_node_rejects_cwd() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
-    let (cookie, _) = login(hub.addr, &bootstrap).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
 
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
     let host_id = HostId::new();
     node.send(Message::Text(

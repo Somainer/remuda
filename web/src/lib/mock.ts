@@ -1212,6 +1212,16 @@ export function mockClose(instanceId: Id): CommandResult {
   };
 }
 
+/** Mirrors the Hub's real delete: the record and its journal are gone for good. */
+export function mockDelete(instanceId: Id): void {
+  const index = instances.findIndex((i) => i.id === instanceId);
+  if (index < 0) return;
+  const [removed] = instances.splice(index, 1);
+  journals.delete(removed.journalId);
+  titles.delete(instanceId);
+  summaries.delete(instanceId);
+}
+
 export function mockCreate(prompt: string, extras?: { hostId?: Id; workspaceId?: Id; driver?: Instance["driver"]; kind?: Instance["kind"] }): Instance {
   const journalId = id("obj_");
   const ins = instanceBase(id("ins_"), journalId, "starting", unknownKnowledge("starting"));

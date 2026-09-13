@@ -24,8 +24,16 @@ const spaces: Space[] = [
       lifecycle: "ready", connectivity: "connected", activity: known("idle") })) },
   { id: beta, hostId: "host-a", workspaceId: "workspace-b", name: "beta", liveCount: 1, blockedCount: 0,
     instances: [{ ...mockDb.instances[0], id: "b1", hostId: "host-a", workspaceId: "workspace-b",
-      lifecycle: "ready", connectivity: "connected", activity: known("idle") }] },
+      lifecycle: "ready", connectivity: "connected", activity: known("idle") },
+    { ...mockDb.instances[0], id: "b-exited", hostId: "host-a", workspaceId: "workspace-b",
+      lifecycle: "exited", connectivity: "connected", activity: known("idle") }] },
 ];
+
+/** The strip asks before stopping anything; take the "stop and close" branch. */
+async function stopAndClose(user: ReturnType<typeof userEvent.setup>, title: string) {
+  await user.click(screen.getByRole("button", { name: `关闭标签 ${title}` }));
+  await user.click(screen.getByTestId("tab-close-stop"));
+}
 
 function deferredClose() {
   let resolve!: () => void;
@@ -85,9 +93,9 @@ describe("SpaceTabs asynchronous closure", () => {
     const user = userEvent.setup();
     const pending = deferredClose();
     renderWorkbench();
-    await user.click(screen.getByRole("button", { name: "关闭会话 a1" }));
+    await stopAndClose(user, "a1");
     expect(hubStore.close).toHaveBeenCalledWith("a1");
-    expect(screen.getByRole("button", { name: "关闭会话 a1" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "关闭标签 a1" })).toBeDisabled();
     const otherProject = screen.getByRole("button", { name: "切换 beta" });
     await user.click(otherProject);
     expect(screen.getByRole("tab", { name: /b1/ })).toHaveAttribute("aria-selected", "true");
@@ -95,7 +103,8 @@ describe("SpaceTabs asynchronous closure", () => {
     await act(async () => { pending.resolve(); });
 
     expect(screen.getByTestId("current-route")).toHaveTextContent("/s/b1");
-    expect(spaceStore.getSnapshot()).toMatchObject({ selectedSpaceId: beta, selectedTabs: { [beta]: "b1" }, closedTabs: { [alpha]: ["a1"] } });
+    expect(spaceStore.getSnapshot()).toMatchObject({ selectedSpaceId: beta, selectedTabs: { [beta]: "b1" },
+      closedTabs: { [alpha]: [{ id: "a1", resurface: false }] } });
     expect(otherProject).toHaveFocus();
     expect(hubStore.toast).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "切换 alpha" }));
@@ -107,22 +116,67 @@ describe("SpaceTabs asynchronous closure", () => {
     const user = userEvent.setup();
     const pending = deferredClose();
     renderWorkbench();
-    await user.click(screen.getByRole("button", { name: "关闭会话 a1" }));
+    await stopAndClose(user, "a1");
 
     await act(async () => { pending.reject(new Error("node unavailable")); });
 
-    expect(hubStore.toast).toHaveBeenCalledWith("关闭失败，请重试");
+    expect(hubStore.toast).toHaveBeenCalledWith("停止失败，请重试");
     expect(screen.getByTestId("current-route")).toHaveTextContent("/s/a1");
     expect(screen.getByRole("tab", { name: /a1/ })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("button", { name: "关闭会话 a1" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "关闭标签 a1" })).toBeEnabled();
     expect(spaceStore.getSnapshot().closedTabs[alpha] ?? []).toEqual([]);
+  });
+
+  it("removes an exited tab without asking and without stopping anything", async () => {
+    const user = userEvent.setup();
+    render(<MemoryRouter initialEntries={["/s/b-exited"]}><Workbench /></MemoryRouter>);
+    await user.click(screen.getByRole("button", { name: "关闭标签 b-exited" }));
+
+    // An exited session has nothing to stop, so no sheet and no close command.
+    expect(screen.queryByTestId("tab-close-sheet")).not.toBeInTheDocument();
+    expect(hubStore.close).not.toHaveBeenCalled();
+    expect(screen.queryByRole("tab", { name: /b-exited/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId("current-route")).toHaveTextContent("/s/b1");
+  });
+
+  it("keeps a running session alive when the user only dismisses its tab, and cancels leave everything", async () => {
+    const user = userEvent.setup();
+    renderWorkbench();
+    await user.click(screen.getByRole("button", { name: "关闭标签 a1" }));
+    await user.click(screen.getByTestId("tab-close-sheet-cancel"));
+    expect(screen.getByRole("tab", { name: /a1/ })).toHaveAttribute("aria-selected", "true");
+    expect(spaceStore.getSnapshot().closedTabs[alpha] ?? []).toEqual([]);
+
+    await user.click(screen.getByRole("button", { name: "关闭标签 a1" }));
+    await user.click(screen.getByTestId("tab-close-keep"));
+
+    expect(hubStore.close).not.toHaveBeenCalled();
+    // The tab is gone but the dismissal is armed to bring it back when blocked.
+    expect(spaceStore.getSnapshot().closedTabs[alpha]).toEqual([{ id: "a1", resurface: true }]);
+    expect(screen.queryByRole("tab", { name: /a1/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId("current-route")).toHaveTextContent("/s/a2");
+  });
+
+  it("brings a dismissed tab back once its session needs a human", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderWorkbench();
+    await user.click(screen.getByRole("button", { name: "关闭标签 a1" }));
+    await user.click(screen.getByTestId("tab-close-keep"));
+    expect(screen.queryByRole("tab", { name: /a1/ })).not.toBeInTheDocument();
+
+    act(() => { spaces[0].instances[0].activity = known("waiting-interaction"); });
+    rerender(<MemoryRouter initialEntries={["/s/a2"]}><Workbench /></MemoryRouter>);
+
+    expect(screen.getByRole("tab", { name: /a1/ })).toBeInTheDocument();
+    spaces[0].instances[0].activity = known("idle");
   });
 
   it("focuses the successor tab after a keyboard-initiated close", async () => {
     const user = userEvent.setup();
     const pending = deferredClose();
     renderWorkbench();
-    screen.getByRole("button", { name: "关闭会话 a1" }).focus();
+    screen.getByRole("button", { name: "关闭标签 a1" }).focus();
+    await user.keyboard("{Enter}");
     await user.keyboard("{Enter}");
 
     await act(async () => { pending.resolve(); });

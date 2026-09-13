@@ -8,7 +8,10 @@
 .groups { flex: 1; overflow-y: auto; min-height: 0; padding: 8px 0; }
 .group { border-bottom: 1px solid var(--line); padding: 5px 8px 8px; }
 .groupHead { display: flex; min-height: 38px; align-items: stretch; }
-.group[data-active="true"] .groupHead { background: var(--ink-2); box-shadow: inset 2px 0 var(--dust); }
+/* The current space and the current session both carry the brand bar, a tinted
+   ground and a bold title, so neither can be mistaken for an inactive row. */
+.group[data-active="true"] .groupHead { background: var(--ink-2); box-shadow: inset 3px 0 var(--dust); }
+.group[data-active="true"] .spaceSelect { font-weight: 700; }
 .disclosure { width: 25px; flex: none; color: var(--mute); }
 .spaceSelect { display: flex; align-items: center; width: 100%; min-width: 0; gap: 10px; text-align: left; padding: 8px; font-weight: 500; }
 .spaceName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
@@ -16,7 +19,15 @@
 .blocked { color: var(--dust); }
 .groupMeta { font-size: 10px; padding: 4px 8px 2px 25px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .groupTools { display: flex; justify-content: flex-end; gap: 2px; }
-.sessionRow { display: flex; gap: 8px; align-items: center; min-height: 34px; padding: 6px 8px 6px 25px; color: var(--paper); font-size: 12px; }
+.sessionRow { display: flex; gap: 8px; align-items: center; min-height: 34px; padding: 6px 8px 6px 25px; color: var(--paper); font-size: 12px; box-shadow: inset 3px 0 transparent; }
+.sessionRow[data-active="true"] { background: var(--ink-2); box-shadow: inset 3px 0 var(--dust); color: var(--paper); font-weight: 700; }
+.exitedGroup { padding-left: 17px; }
+.exitedHead { display: flex; align-items: center; gap: 4px; width: 100%; min-height: 30px; padding: 4px 8px; border: 0; background: transparent; color: var(--mute); font-size: 11px; text-align: left; }
+.exitedHead:hover { color: var(--paper); }
+.exitedRow { display: flex; align-items: center; gap: 4px; }
+.exitedRow .sessionRow { flex: 1; min-width: 0; padding-left: 8px; color: var(--mute); }
+.exitedRow .sessionRow[data-active="true"] { color: var(--paper); }
+.exitedTools { display: flex; flex: none; gap: 2px; }
 .glyph { display: inline-flex; width: 18px; flex: none; align-items: center; justify-content: center; font: 13px var(--mono); color: var(--cold); }
 .initial { width: 100%; text-align: center; font: 12px var(--mono); }
 .panel[data-collapsed="true"] .panelHead { justify-content: center; padding: 6px; }
@@ -30,10 +41,24 @@
 .tabs { display: flex; overflow-x: auto; min-width: 0; scrollbar-width: thin; }
 .tabs > .empty { white-space: nowrap; }
 .tab { display: flex; align-items: stretch; border-right: 1px solid var(--line); flex: none; max-width: 240px; }
-.tab[data-active="true"] { background: var(--ink); box-shadow: inset 0 2px var(--dust); }
+/* The active tab reads through its brand underline, tint and weight, not through
+   colour alone; both themes keep the underline against the strip background. */
+.tab[data-active="true"] { background: var(--ink); box-shadow: inset 0 -3px var(--dust); }
+.tab[data-active="true"] .tabTitle { color: var(--paper); font-weight: 700; }
+.tab:not([data-active="true"]) .tabTitle { color: var(--mute); }
 .tabSelect { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0 8px 0 12px; font-size: 12px; }
 .tabTitle { max-width: 152px; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
-.tabClose { width: 28px; flex: none; color: var(--mute); }
+/* × means "close tab" and nothing else. Desktop shows it on hover or on the
+   active tab; a phone reveals it with a long press or a swipe. */
+.tabClose { width: 28px; flex: none; color: var(--mute); font: 13px var(--mono); }
+.tabClose:hover, .tabClose:focus-visible { color: var(--paper); }
+@media (hover: hover) and (pointer: fine) {
+  .tab:not([data-active="true"]):not(:hover):not(:focus-within) .tabClose { opacity: 0; pointer-events: none; }
+}
+@media (hover: none), (pointer: coarse) {
+  .tab:not([data-revealed="true"]) .tabClose { opacity: 0; pointer-events: none; }
+  .tab[data-revealed="true"] .tabClose { opacity: 1; background: var(--ink-2); }
+}
 .newTab { display: grid; place-items: center; min-width: 44px; flex: none; color: var(--paper); }
 .tabHint { align-self: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0 12px 0 auto; font: 10px var(--mono); }
 .mobileSpaces { display: flex; border-bottom: 1px solid var(--line); background: var(--ink-0); flex: none; min-width: 0; }
@@ -51,5 +76,18 @@
   .tab { max-width: 230px; }
   .tabClose { width: 44px; }
   .tabTitle { max-width: 126px; }
-  .drawer .tool, .drawer .disclosure, .drawer .sessionRow { min-height: 44px; }
+  .drawer .tool, .drawer .disclosure, .drawer .sessionRow, .drawer .exitedHead { min-height: 44px; }
 }
+
+.sheetBackdrop { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: var(--scrim); }
+.sheet { width: min(420px, calc(100% - 24px)); margin-bottom: calc(24px + env(safe-area-inset-bottom, 0px)); padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--ink-2); }
+.sheetTitle { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: var(--paper); }
+.sheetDetail { margin: 0 0 14px; font-size: 12px; color: var(--mute); }
+.sheetActions { display: flex; flex-direction: column; gap: 8px; }
+.sheetButton { min-height: 40px; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: transparent; color: var(--paper); font-size: 13px; }
+.sheetButton:hover:not(:disabled) { background: var(--ink-1); }
+.sheetButton:disabled { opacity: .5; }
+.sheetPrimary { border-color: var(--dust); background: var(--dust); color: var(--on-dust); }
+.sheetPrimary:hover:not(:disabled) { background: var(--dust); filter: brightness(1.08); }
+.sheetDanger { border-color: var(--danger); color: var(--danger); }
+.sheetDanger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 16%, transparent); }

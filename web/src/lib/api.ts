@@ -16,6 +16,7 @@ import {
   mockConfigure,
   mockCreate,
   mockDb,
+  mockDelete,
   mockDeviceList,
   mockDeviceRevoke,
   mockFleetBroadcast,
@@ -38,6 +39,9 @@ import { parseScreenBody, type ScreenRead } from "./screen";
 import { HubHttpError } from "./httpError";
 import { readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
 import { coerceObservation, coerceObservationList } from "./hubJournal";
+
+/** Error code the instance-delete probe raises when the Hub has no DELETE route yet. */
+export const DELETE_UNSUPPORTED = "DELETE_UNSUPPORTED";
 
 export const MOCK = import.meta.env.VITE_MOCK === "1";
 
@@ -385,6 +389,8 @@ export type HubApi = {
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
   instanceResume(instanceId: Id): Promise<CommandResult>;
+  /** `DELETE /v1/instances/{id}`. Rejects with `DELETE_UNSUPPORTED` on a Hub without the route. */
+  instanceDelete(instanceId: Id): Promise<void>;
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
   interactionList(q?: { instanceId?: Id; state?: string }): Promise<Interaction[]>;
   interactionGet(interactionId: Id): Promise<Interaction>;
@@ -628,6 +634,9 @@ function createMockApi(): HubApi {
     },
     async instanceResume(instanceId) {
       return mockResume(instanceId);
+    },
+    async instanceDelete(instanceId) {
+      mockDelete(instanceId);
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return mockConfigure(instanceId, extras?.permissionMode ?? permissionMode, extras);
@@ -970,6 +979,21 @@ function createLiveApi(): HubApi {
     },
     async instanceResume(instanceId) {
       return command(instanceId, "instance.resume", {});
+    },
+    async instanceDelete(instanceId) {
+      // The Hub does not publish its OpenAPI document at runtime, so the route
+      // is probed directly: a Hub whose `/v1/instances/{id}` still only serves
+      // GET answers 405, and the caller falls back to hiding the row. A 404 is
+      // the session already being gone, which satisfies the delete.
+      try {
+        await rest<void>(`/v1/instances/${instanceId}`, { method: "DELETE" });
+      } catch (err) {
+        if (err instanceof HubHttpError && err.status === 404) return;
+        if (err instanceof HubHttpError && (err.status === 405 || err.status === 501)) {
+          throw new HubHttpError(err.status, DELETE_UNSUPPORTED, err.message, err.reasons);
+        }
+        throw err;
+      }
     },
     async instanceConfigure(instanceId, permissionMode, extras) {
       return command(instanceId, "instance.configure", {

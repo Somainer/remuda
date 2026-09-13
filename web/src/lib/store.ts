@@ -495,6 +495,13 @@ class HubStore {
     await this.refresh();
   }
 
+  /** Real deletion. Rejects with `DELETE_UNSUPPORTED` while the Hub route is missing. */
+  async deleteInstance(instanceId: Id) {
+    await api.instanceDelete(instanceId);
+    this.emit({ instances: this.state.instances.filter((row) => row.id !== instanceId) });
+    await this.refresh();
+  }
+
   async configure(
     instanceId: Id,
     permissionMode: string,

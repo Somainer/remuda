@@ -68,24 +68,43 @@ function ResetIcon() {
   );
 }
 
+/**
+ * The one effort slider. The composer mounts it inside a popover; New Session
+ * mounts the same card inline (`variant="inline"`), so the two surfaces share
+ * this component rather than each growing their own tier picker.
+ *
+ * `idPrefix` renames every `data-testid` it emits (`<prefix>-slider`,
+ * `-track`, `-knob`, ...) so two mounts can be addressed apart. The composer
+ * keeps the default `effort`, i.e. its ids are unchanged.
+ */
 export function EffortSlider({
   kind,
   model,
   models,
   index,
   disabled,
+  variant = "popover",
+  idPrefix = "effort",
+  footer = EFFORT_MENU_FOOTER,
   onChange,
   onModel,
 }: {
   kind: EffortKind | string;
-  /** Undefined when the harness has no model axis (agy). */
+  /** Undefined when the harness has no model axis (agy), or when the page owns its own model field. */
   model?: string;
   models?: string[];
   index: number;
   disabled?: boolean;
+  /** `popover` is the composer's framed menu; `inline` frames the card itself. */
+  variant?: "popover" | "inline";
+  idPrefix?: string;
+  /** Caption under the tier list. New Session says what the value is written into. */
+  footer?: string;
   onChange: (next: EffortSelection) => void;
   onModel?: (model: string) => void;
 }) {
+  const tid = (suffix: string) => `${idPrefix}-${suffix}`;
+  const frame = `${css.effortCard} ${variant === "inline" ? css.effortInline : ""}`;
   const table = effortTable(kind);
   const trackRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef(false);
@@ -162,12 +181,12 @@ export function EffortSlider({
 
   if (list) {
     return (
-      <div className={css.effortCard} data-testid="effort-slider-panel" data-view="list">
+      <div className={frame} data-testid={tid("slider-panel")} data-view="list">
         <div className={css.effortListHead}>
           <button
             type="button"
             className={css.effortIconBtn}
-            data-testid="effort-list-back"
+            data-testid={tid("list-back")}
             aria-label="返回滑杆"
             onClick={() => setList(false)}
           >
@@ -175,13 +194,13 @@ export function EffortSlider({
           </button>
           <span className={css.effortListTitle}>档位</span>
         </div>
-        <div className={css.effortListBody} data-testid="effort-list">
+        <div className={css.effortListBody} data-testid={tid("list")}>
           {table.map((tier, i) => (
             <button
               key={tier.name}
               type="button"
               className={`${css.effortRow} ${i === shown ? css.effortOn : ""}`}
-              data-testid={`effort-tier-${tier.name}`}
+              data-testid={tid(`tier-${tier.name}`)}
               data-selected={i === shown ? "1" : "0"}
               data-ember={i === table.length - 1 ? "1" : "0"}
               disabled={locked}
@@ -215,13 +234,13 @@ export function EffortSlider({
             </>
           ) : null}
         </div>
-        <div className={css.menuFoot}>{EFFORT_MENU_FOOTER}</div>
+        {footer ? <div className={css.menuFoot}>{footer}</div> : null}
       </div>
     );
   }
 
   return (
-    <div className={css.effortCard} data-testid="effort-slider-panel" data-view="slider" data-disabled={locked ? "1" : "0"}>
+    <div className={frame} data-testid={tid("slider-panel")} data-view="slider" data-disabled={locked ? "1" : "0"}>
       <div className={css.effortHead}>
         <span className={`${css.effortBolt} ${ember ? css.effortBoltEmber : ""}`} aria-hidden="true">
           <BoltIcon />
@@ -229,12 +248,12 @@ export function EffortSlider({
         <button
           type="button"
           className={`${css.effortTitleBtn} ${ember ? css.effortTitleEmber : ""}`}
-          data-testid="effort-open-list"
+          data-testid={tid("open-list")}
           aria-label={`${current?.name ?? "effort"}，展开档位与模型`}
           aria-expanded={false}
           onClick={() => setList(true)}
         >
-          <span className={css.effortTitle} data-testid="effort-title" data-ember={ember ? "1" : "0"}>
+          <span className={css.effortTitle} data-testid={tid("title")} data-ember={ember ? "1" : "0"}>
             {current?.name ?? "effort"}
           </span>
           <span className={css.effortChevron}>
@@ -244,7 +263,7 @@ export function EffortSlider({
         <button
           type="button"
           className={css.effortIconBtn}
-          data-testid="effort-reset"
+          data-testid={tid("reset")}
           aria-label="复位到默认档"
           disabled={locked || shown === fallback}
           onClick={() => {
@@ -255,12 +274,12 @@ export function EffortSlider({
           <ResetIcon />
         </button>
       </div>
-      <div className={css.effortModel} data-testid="effort-model">
+      <div className={css.effortModel} data-testid={tid("model")}>
         {modelLabel || current?.description || ""}
       </div>
       <div
         className={css.effortHit}
-        data-testid="effort-slider"
+        data-testid={tid("slider")}
         data-index={String(shown)}
         data-name={current?.name ?? ""}
         data-ember={ember ? "1" : "0"}
@@ -282,17 +301,17 @@ export function EffortSlider({
         <div
           ref={trackRef}
           className={css.effortTrack}
-          data-testid="effort-track"
+          data-testid={tid("track")}
           style={{ ["--pos" as string]: String(ratio), ["--knob" as string]: `${KNOB_INSET}px` }}
         >
           {/* Clipped layer: the pill's own paint. The knob sits outside it so its shadow shows. */}
           <span className={css.effortClip} aria-hidden="true">
             <span
               className={`${css.effortFill} ${ember ? css.effortFillEmber : ""}`}
-              data-testid="effort-fill"
+              data-testid={tid("fill")}
             >
               {ember ? (
-                <span className={css.effortEmbers} data-testid="effort-embers">
+                <span className={css.effortEmbers} data-testid={tid("embers")}>
                   <span className={css.effortEmberGlow} />
                   <span className={`${css.effortEmberLayer} ${css.effortEmberBack}`} />
                   <span className={`${css.effortEmberLayer} ${css.effortEmberMid}`} />
@@ -309,7 +328,7 @@ export function EffortSlider({
             ))}
           </span>
           {ember ? <span className={css.effortKnobGlow} aria-hidden="true" /> : null}
-          <span className={css.effortKnob} data-testid="effort-knob" />
+          <span className={css.effortKnob} data-testid={tid("knob")} />
         </div>
       </div>
     </div>

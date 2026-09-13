@@ -829,6 +829,20 @@
   --knob-edge: rgba(30, 42, 50, 0.2);
 }
 
+/*
+ * Inline variant: the same card, framed by itself instead of by a popover, so
+ * New Session can mount it in the sheet's flow. 400px is the sheet's column
+ * width; the popover keeps its 300px via .popoverCard.
+ */
+.effortInline {
+  width: min(400px, 100%);
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 8px 12px 12px;
+}
+
 .effortHead {
   display: grid;
   grid-template-columns: 26px minmax(0, 1fr) 26px;

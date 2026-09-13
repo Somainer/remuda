@@ -21,12 +21,11 @@ import { useNewSessionSpaceDefaults } from "../features/spaces/useNewSessionSpac
 import {
   effortAt,
   effortCaps,
-  effortTable,
-  isEmberTier,
   mapEffort,
   type EffortKind,
   type EffortSelection,
 } from "../features/session/effort";
+import { EffortSlider } from "../features/session/EffortSlider";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
@@ -42,6 +41,9 @@ import { api } from "../lib/api";
 import { WorkspaceRegistration } from "../features/workspaces/WorkspaceRegistration";
 import { workspaceCwd } from "../features/workspaces/path";
 import css from "./NewSessionPage.module.css";
+
+/** New Session writes the tier into the spec; the session can still change it later. */
+const EFFORT_SPEC_HINT = "写进 InstanceSpec，会话内可再改";
 
 type CreateKind = Exclude<Kind, "generic">;
 type CwdMode = "existing" | "worktree";
@@ -483,27 +485,32 @@ export function NewSessionPage() {
             ) : null}
           </fieldset>
           {effortCaps(activeKind).effort ? (
-            <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }} data-testid="new-session-effort">
+            <fieldset
+              className={css.field}
+              style={{ border: 0, padding: 0, margin: 0 }}
+              data-testid="new-session-effort"
+              data-harness={activeKind}
+              data-effort={sessionEffort.name}
+            >
               <legend className={css.label}>effort</legend>
-              <div className={`${css.seg} ${css.effortRow}`}>
-                {effortTable(activeKind).map((tier, index) => {
-                  const on = sessionEffort.index === index;
-                  const top = isEmberTier(activeKind, index);
-                  return (
-                    <button
-                      key={tier.name}
-                      type="button"
-                      className={`${css.choice} ${css.effortChoice} ${on ? css.choiceOn : ""} ${top ? css.choiceEmber : ""}`}
-                      data-testid={`new-session-effort-${tier.name}`}
-                      data-ember={top ? "1" : "0"}
-                      data-selected={on ? "1" : "0"}
-                      onClick={() => setEffort(effortAt(activeKind as EffortKind, index))}
-                    >
-                      {tier.name}
-                    </button>
-                  );
-                })}
-                <span className={css.hint}>写进 InstanceSpec，会话内可再改</span>
+              <div className={css.effortRow}>
+                {/*
+                 * The composer's slider, inline. Remounting on the harness
+                 * drops the drag draft, so the card re-snaps onto the new
+                 * table's tier instead of showing the one the pointer left
+                 * behind. The model axis is the page's own field above, so the
+                 * card's hint line stays on the tier description.
+                 */}
+                <EffortSlider
+                  key={activeKind}
+                  kind={activeKind}
+                  index={sessionEffort.index}
+                  variant="inline"
+                  idPrefix="new-session-effort"
+                  footer={EFFORT_SPEC_HINT}
+                  onChange={(next) => setEffort(next)}
+                />
+                <span className={css.hint}>{EFFORT_SPEC_HINT}</span>
               </div>
             </fieldset>
           ) : null}

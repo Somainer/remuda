@@ -22,7 +22,20 @@ import { bytesFromBase64, toBytes } from "./ids";
 export type TtyStatus = "connecting" | "live" | "reconnecting" | "failed";
 
 export type TtyHandlers = {
-  onFrame: (payload: Uint8Array, offset: bigint, streamId: string, reset: boolean) => void;
+  /**
+   * `replay` marks bytes the hub re-sent from the PTY ring buffer (attach
+   * snapshot, reconnect backfill) rather than output the process just
+   * produced. The emulator must not answer terminal queries found in those
+   * bytes — the app that asked is long gone and the reply would land on
+   * whatever is at the prompt now.
+   */
+  onFrame: (
+    payload: Uint8Array,
+    offset: bigint,
+    streamId: string,
+    reset: boolean,
+    replay: boolean,
+  ) => void;
   onStatus: (status: TtyStatus, message?: string) => void;
   onSnapshot?: () => void;
 };
@@ -88,7 +101,7 @@ function openReplaySession(handlers: TtyHandlers): TtySession {
     const decoded = decodeTtyBinaryFrame(frame);
     if (!decoded.ok) return;
     handlers.onSnapshot?.();
-    handlers.onFrame(decoded.frame.payload, decoded.frame.offset, streamId, true);
+    handlers.onFrame(decoded.frame.payload, decoded.frame.offset, streamId, true, true);
     offset += BigInt(decoded.frame.payload.byteLength);
     status = "live";
     handlers.onStatus("live");
@@ -170,6 +183,11 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
   let inputTimer = 0;
   let backoff = RECONNECT_MIN_MS;
   let resetNext = true;
+  // The attach snapshot is replayed history. The hub sends it as an ordinary
+  // binary frame — indistinguishable on the wire — so the client tracks the
+  // boundary itself: the first delivery after an attach/reset is the replay,
+  // everything after it is live. Reconnects and gaps re-arm it.
+  let replayNext = true;
   const inputQueue: Uint8Array[] = [];
   let lastCols = 80;
   let lastRows = 24;
@@ -186,8 +204,10 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
 
   const deliverOutput = (payload: Uint8Array, offset: bigint, id: string) => {
     const reset = resetNext;
+    const replay = replayNext;
     resetNext = false;
-    handlers.onFrame(payload, offset, id, reset);
+    replayNext = false;
+    handlers.onFrame(payload, offset, id, reset, replay);
   };
 
   const handleBinary = (buffer: ArrayBuffer) => {
@@ -213,6 +233,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     if (type === "snapshot" || type === "tty.snapshot") {
       sawSnapshot = true;
       resetNext = true;
+      replayNext = true;
       handlers.onSnapshot?.();
       const sid = extractStreamId(msg);
       if (sid) setStream(sid);
@@ -226,6 +247,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     }
     if (type === "gap") {
       resetNext = true;
+      replayNext = true;
       handlers.onStatus("reconnecting", "gap");
       return;
     }
@@ -283,6 +305,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     if (closed) return;
     handlers.onStatus(sawSnapshot ? "reconnecting" : "connecting");
     resetNext = true;
+    replayNext = true;
     const ws = new WebSocket(followTtyUrl(instance.id));
     ws.binaryType = "arraybuffer";
     socket = ws;

@@ -264,6 +264,162 @@ test.describe("live remote terminal", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
   });
 
+  test("replayed history does not answer terminal queries at the prompt", async ({ page }) => {
+    // Count what the page actually writes to the PTY. Screen text alone cannot
+    // tell "the query bytes are in the scrollback, as history" from "the
+    // emulator just answered them again" — only an outbound channel-3 frame
+    // proves the leak, and on the pre-fix tree this records the CPR reply
+    // `ESC[2;1R` being typed into the shell.
+    await page.addInitScript(() => {
+      const w = window as unknown as { __ttySent?: string[] };
+      w.__ttySent = [];
+      const send = WebSocket.prototype.send;
+      WebSocket.prototype.send = function (data: unknown) {
+        if (data instanceof ArrayBuffer) {
+          const view = new Uint8Array(data);
+          // 32-byte binary header; channel 3 is TTY input.
+          if (view[1] === 3) {
+            w.__ttySent!.push(String.fromCharCode(...view.slice(32)));
+          }
+        }
+        // eslint-disable-next-line prefer-rest-params
+        return send.apply(this, arguments as never);
+      };
+    });
+    await login(page);
+    const id = await startTerminal(page);
+    const lab = page.locator("[data-tty-lab='1']");
+    await focusTerminal(page);
+
+    // Put a query-heavy history into the PTY ring buffer, the way a TUI does on
+    // startup: CPR, DA1, DA2, OSC 10/11 colours, DECRQM. Then leave the app, so
+    // nothing is left to consume the answers.
+    await page.keyboard.type(
+      "printf '\\033[6n\\033[c\\033[>c\\033]10;?\\007\\033]11;?\\007\\033[?2026$p'",
+    );
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(1200);
+    await page.keyboard.press("Control+c");
+    await page.waitForTimeout(300);
+
+    // Clear the screen so anything appearing afterwards came from the replay.
+    await page.keyboard.type("clear");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(600);
+
+    // Anything sent from here on is the emulator re-answering history.
+    await page.evaluate(() => {
+      (window as unknown as { __ttySent: string[] }).__ttySent = [];
+    });
+
+    // Force the hub to replay the ring buffer: reconnect, then a full re-attach
+    // through a client-side navigation away and back.
+    await page.evaluate(() => window.__ttyLab?.disconnect());
+    await expect(lab).toHaveAttribute("data-tty-status", "live", { timeout: 30_000 });
+    await page.waitForTimeout(1000);
+    await page.goto(`/s/${id}/structured`);
+    await page.waitForTimeout(600);
+    await page.goto(`/s/${id}/tty`);
+    await expect(lab).toHaveAttribute("data-tty-status", "live", { timeout: 30_000 });
+    await page.waitForTimeout(1500);
+
+    // Nothing at all should have gone to the PTY during the replay.
+    const sent = await page.evaluate(() => (window as unknown as { __ttySent: string[] }).__ttySent);
+    expect(sent.join("")).toBe("");
+
+    // And the shell must not have been fed junk it could not run.
+    const screen = await page.evaluate(() => {
+      const term = document.querySelector("[data-tty-lab='1'] .xterm-screen");
+      return term?.textContent ?? "";
+    });
+    expect(screen).not.toMatch(/command not found/);
+    await page.screenshot({ path: path.join(dir, "terminal-3-replay-clean.png"), animations: "disabled" });
+  });
+
+  test("fullscreen fits the container without a refresh", async ({ page }) => {
+    await login(page);
+    await startTerminal(page);
+    const lab = page.locator("[data-tty-lab='1']");
+    await focusTerminal(page);
+
+    // Start a full-screen TUI first, so the fullscreen transition happens with
+    // an alt-screen app painting — the case that rendered wrong until reload.
+    await page.keyboard.type("printf '\\033[?1049h'; top -l 0 2>/dev/null || vi");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(1200);
+
+    await page.getByTestId("tty-fullscreen").click();
+    await expect(lab).toHaveAttribute("data-tty-fullscreen", "1");
+    await page.waitForTimeout(1200);
+
+    // The reported grid must match the painted one and fill the container.
+    const geo = await page.evaluate(() => {
+      const el = document.querySelector("[data-tty-lab='1']")!;
+      const host = el.querySelector("[role='region']")!.firstElementChild as HTMLElement;
+      const screen = host.querySelector<HTMLElement>(".xterm-screen")!;
+      const style = window.getComputedStyle(host);
+      const padY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+      const padX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+      return {
+        rows: Number(el.getAttribute("data-tty-rows")),
+        cols: Number(el.getAttribute("data-tty-cols")),
+        renderedRows: host.querySelectorAll(".xterm-rows > div").length,
+        screenH: screen.getBoundingClientRect().height,
+        screenW: screen.getBoundingClientRect().width,
+        boxH: host.clientHeight - padY,
+        boxW: host.clientWidth - padX,
+        viewportOverflow: (() => {
+          const vp = el.querySelector<HTMLElement>("[role='region']")!;
+          return vp.scrollHeight - vp.clientHeight;
+        })(),
+      };
+    });
+
+    // The grid must fill the fullscreen box, not sit in a short band inside it.
+    expect(geo.screenH).toBeLessThanOrEqual(geo.boxH + 1);
+    expect(geo.screenH).toBeGreaterThan(geo.boxH * 0.9);
+    expect(geo.screenW).toBeLessThanOrEqual(geo.boxW + 1);
+    expect(geo.viewportOverflow).toBe(0);
+    // The reported geometry must be the painted geometry (the DOM renderer
+    // reports rows; webgl paints to a canvas and reports none).
+    if (geo.renderedRows > 0) expect(geo.renderedRows).toBe(geo.rows);
+    // Sanity: a 1440x900 fullscreen window is far taller than the 27 rows the
+    // bug produced.
+    expect(geo.rows).toBeGreaterThan(30);
+    await page.screenshot({ path: path.join(dir, "terminal-3-fullscreen.png"), animations: "disabled" });
+
+    await page.getByTestId("tty-fullscreen").click();
+    await expect(lab).toHaveAttribute("data-tty-fullscreen", "0");
+    await page.keyboard.press("q");
+    await page.keyboard.press("Control+c");
+  });
+
+  test("直连 hides the local input dock entirely", async ({ page }) => {
+    await login(page);
+    await startTerminal(page);
+    const lab = page.locator("[data-tty-lab='1']");
+
+    // 直连: no dock at all, and no reserved strip under the terminal.
+    await expect(lab).toHaveAttribute("data-tty-io", "raw");
+    await expect(page.getByTestId("tty-dock")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "发送" })).toHaveCount(0);
+    await expect(page.getByLabel("本地输入")).toHaveCount(0);
+    await page.screenshot({ path: path.join(dir, "terminal-3-direct-no-dock.png"), animations: "disabled" });
+
+    // 本地输入: the real input comes back, enabled.
+    await page.getByRole("button", { name: "本地输入" }).click();
+    await expect(lab).toHaveAttribute("data-tty-io", "keys");
+    const dock = page.getByTestId("tty-dock");
+    await expect(dock).toBeVisible();
+    const field = page.getByLabel("本地输入");
+    await expect(field).toBeVisible();
+    await expect(field).toBeEnabled();
+    await page.screenshot({ path: path.join(dir, "terminal-3-keys-dock.png"), animations: "disabled" });
+
+    await page.getByRole("button", { name: "直连" }).click();
+    await expect(page.getByTestId("tty-dock")).toHaveCount(0);
+  });
+
   test("grok pty session defaults to the terminal tab", async ({ page }) => {
     await login(page);
     await page.goto("/sessions/new");

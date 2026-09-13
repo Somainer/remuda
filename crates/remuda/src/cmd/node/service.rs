@@ -586,7 +586,12 @@ mod tests {
         // The socket exists throughout initialization but is not yet serving.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ready.is_finished());
-        let node = remuda_node::DevNode::new(&remuda_node::DevServerConfig::loopback(0)).unwrap();
+        let node = remuda_node::DevNode::new(
+            &remuda_node::DevServerConfig::loopback(0)
+                .with_workspace_root(fixture.path().to_path_buf())
+                .with_workspace_roots(vec![std::env::temp_dir()]),
+        )
+        .unwrap();
         let server = tokio::spawn(async move {
             remuda_node::run_daemon_runtime_listener(
                 node,

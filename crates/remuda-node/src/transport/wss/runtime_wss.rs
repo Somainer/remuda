@@ -829,7 +829,8 @@ mod tests {
     async fn failed_final_event_replays_from_confirmed_watermark_without_new_broadcast() {
         let dir = tempfile::tempdir().expect("data directory");
         let node = crate::compose(&crate::ServeConfig::fake(
-            DevServerConfig::loopback(0),
+            DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
             dir.path().to_path_buf(),
         ))
         .expect("node");
@@ -909,7 +910,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_params_preserve_native_model_permission_and_allowlisted_args() {
-        let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+        let node = DevNode::new(
+            &DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        )
+        .expect("node");
         let request = create_from_params(
             &node,
             &json!({
@@ -935,7 +940,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_params_preserve_gateway_overlay_config_dir_and_budget() {
-        let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+        let node = DevNode::new(
+            &DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        )
+        .expect("node");
         let request = create_from_params(
             &node,
             &json!({
@@ -971,7 +980,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_params_reject_non_string_native_args() {
-        let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+        let node = DevNode::new(
+            &DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        )
+        .expect("node");
         let error = create_from_params(
             &node,
             &json!({ "spec": { "args": ["--max-budget-usd", 0.3] } }),

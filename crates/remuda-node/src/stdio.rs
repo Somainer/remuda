@@ -674,7 +674,8 @@ mod tests {
             ..StdioOptions::default()
         };
         let node = compose(&ServeConfig::fake(
-            DevServerConfig::loopback(0),
+            DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
             opts.data_dir.clone(),
         ))
         .expect("compose");

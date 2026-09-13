@@ -86,7 +86,11 @@ async fn fake_can_use_tool_answered_via_hub_http() {
     let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
         .await
         .expect("hub");
-    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+    )
+    .expect("node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id);
     let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config))

@@ -237,7 +237,7 @@ fn journal_complete(node: &DevNode, instance: &InstanceId) -> bool {
 async fn controller_takeover_fences_old_bridge_and_outbound_waits_until_detach() {
     let dir = tempfile::tempdir().unwrap();
     let node = compose(&ServeConfig::fake(
-        DevServerConfig::loopback(0),
+        DevServerConfig::loopback(0).with_workspace_roots(vec![std::env::temp_dir()]),
         dir.path().to_path_buf(),
     ))
     .unwrap();
@@ -286,7 +286,7 @@ async fn controller_takeover_fences_old_bridge_and_outbound_waits_until_detach()
 async fn stalled_reply_pipe_does_not_block_replacement_controller() {
     let dir = tempfile::tempdir().unwrap();
     let node = compose(&ServeConfig::fake(
-        DevServerConfig::loopback(0),
+        DevServerConfig::loopback(0).with_workspace_roots(vec![std::env::temp_dir()]),
         dir.path().to_path_buf(),
     ))
     .unwrap();

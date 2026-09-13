@@ -1,6 +1,6 @@
 # D-024 addendum · Tab semantics: status, close, dismissal and exited sessions
 
-2026-09-13 · `wt/x-tabs/tab-semantics` · rebased onto `e711c00`
+2026-09-13 · `wt/x-tabs/tab-semantics` · rebased onto `288fde4`
 
 Addresses two pieces of user feedback on the D-024 strip: the active tab and the active sidebar item were not distinguishable enough, and the exited-status glyph and the close button were both `×` sitting side by side.
 

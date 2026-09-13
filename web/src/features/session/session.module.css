@@ -716,9 +716,9 @@
   bottom: calc(100% + 8px);
 }
 
-/* Compact Codex-style effort card: fixed ~400px, never wider than the composer. */
+/* Compact Codex-style effort card: ~300px, never wider than the composer. */
 .popoverCard {
-  width: min(400px, 100%);
+  width: min(300px, 100%);
   padding: 0;
   box-shadow: 0 8px 24px var(--scrim);
 }
@@ -810,13 +810,17 @@
   /* Knob face reads as the palette's "white": cream on night, paper-white on ledger. */
   --knob-face: var(--paper);
   --knob-edge: rgba(12, 15, 20, 0.3);
-  --knob-size: 40px;
-  --pill: 44px;
+  /*
+   * --knob is half the knob, fed in inline from KNOB_INSET in EffortSlider.tsx:
+   * it is both the knob's radius and the inset its centre travels within.
+   */
+  --pill: 40px;
+  --knob-size: 36px;
   --brand: var(--cold);
-  padding: 12px 12px 14px;
+  padding: 8px 10px 10px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
@@ -827,14 +831,14 @@
 
 .effortHead {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) 28px;
+  grid-template-columns: 26px minmax(0, 1fr) 26px;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 
 .effortBolt {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   color: var(--mute);
   display: inline-flex;
   align-items: center;
@@ -860,7 +864,7 @@
 
 .effortTitle {
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: 18px;
   font-weight: 600;
   line-height: 1.25;
   letter-spacing: -0.01em;
@@ -880,9 +884,10 @@
 }
 
 .effortIconBtn {
-  width: 28px;
-  height: 28px;
-  min-width: 28px;
+  position: relative;
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
   border: 0;
   border-radius: var(--radius);
   background: transparent;
@@ -905,18 +910,18 @@
 
 .effortModel {
   text-align: center;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--mute);
   line-height: 1.4;
-  min-height: 17px;
-  padding: 0 28px 6px;
+  min-height: 18px;
+  padding: 0 26px 7px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .effortHit {
-  height: var(--pill);
+  min-height: var(--pill);
   display: flex;
   align-items: center;
   touch-action: none;
@@ -953,10 +958,17 @@
   overflow: hidden;
 }
 
+/*
+ * Width = knob centre + knob radius. The fill therefore runs under the knob to
+ * its far edge instead of stopping at its centre, so no dark track is left
+ * beside or beneath the thumb. Both ends work out: at the first stop the fill
+ * is exactly one knob wide, at the last it is exactly the track wide, and in
+ * between its rounded cap is the pill's own radius, hidden under the knob.
+ */
 .effortFill {
   position: absolute;
   inset: 0 auto 0 0;
-  width: calc(var(--knob, 22px) + var(--pos, 0) * (100% - var(--knob, 22px) * 2));
+  width: calc(var(--knob, 18px) * 2 + var(--pos, 0) * (100% - var(--knob, 18px) * 2));
   border-radius: 999px;
   background: var(--brand);
   pointer-events: none;
@@ -971,29 +983,120 @@
   );
 }
 
-/* Amber embers: small soft dots at varying opacity, only on the top tier. */
-.effortSparkle {
+/*
+ * Top tier only: three spark layers drifting across the amber gradient at
+ * different speeds, plus a breathing warm wash — so the pill reads as live
+ * embers rather than a texture. Each layer is one painted element animated on
+ * transform and opacity alone: no layout, no repaint, no per-spark nodes, no
+ * JS. The popover unmounts when it closes, so nothing animates behind a closed
+ * card; prefers-reduced-motion keeps the still field and drops the motion.
+ */
+.effortEmbers {
   position: absolute;
   inset: 0;
   border-radius: inherit;
+  overflow: hidden;
   pointer-events: none;
+}
+
+/* Warm wash over the gradient, pulsing on opacity only. */
+.effortEmberGlow {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    ellipse 70% 140% at 50% 50%,
+    rgba(255, 206, 138, 0.45) 0%,
+    rgba(255, 176, 96, 0.18) 55%,
+    transparent 100%
+  );
+  will-change: opacity;
+  animation: emberGlow 4.5s ease-in-out infinite;
+}
+
+/*
+ * Each layer paints two pill-widths of sparks and slides by exactly half its
+ * own width, so the pattern wraps seamlessly. Sparks span the whole tile, so
+ * the field stays evenly covered as it drifts.
+ */
+.effortEmberLayer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 200%;
+  background-repeat: repeat-x;
+  background-size: 50% 100%;
+  will-change: transform, opacity;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+/* Far layer: small, dim, slowest. */
+.effortEmberBack {
   background-image:
-    radial-gradient(circle 1.7px at 13% 30%, rgba(255, 243, 222, 0.9), transparent 100%),
-    radial-gradient(circle 1.1px at 21% 66%, rgba(255, 238, 212, 0.55), transparent 100%),
-    radial-gradient(circle 1.4px at 34% 41%, rgba(255, 241, 218, 0.75), transparent 100%),
-    radial-gradient(circle 1px at 44% 74%, rgba(255, 236, 206, 0.45), transparent 100%),
-    radial-gradient(circle 1.8px at 55% 27%, rgba(255, 246, 228, 0.85), transparent 100%),
-    radial-gradient(circle 1.2px at 63% 61%, rgba(255, 239, 214, 0.6), transparent 100%),
-    radial-gradient(circle 1.5px at 74% 36%, rgba(255, 244, 224, 0.7), transparent 100%),
-    radial-gradient(circle 1px at 86% 68%, rgba(255, 237, 210, 0.5), transparent 100%),
-    radial-gradient(circle 1.6px at 93% 44%, rgba(255, 245, 226, 0.8), transparent 100%);
-  animation: shimmer 5s ease-in-out infinite;
+    radial-gradient(circle 1px at 4% 68%, rgba(255, 236, 206, 0.5), transparent 100%),
+    radial-gradient(circle 1.2px at 19% 31%, rgba(255, 240, 214, 0.55), transparent 100%),
+    radial-gradient(circle 1px at 33% 77%, rgba(255, 234, 202, 0.45), transparent 100%),
+    radial-gradient(circle 1.1px at 48% 44%, rgba(255, 238, 210, 0.5), transparent 100%),
+    radial-gradient(circle 1px at 62% 71%, rgba(255, 235, 204, 0.45), transparent 100%),
+    radial-gradient(circle 1.2px at 78% 35%, rgba(255, 240, 214, 0.55), transparent 100%),
+    radial-gradient(circle 1px at 91% 62%, rgba(255, 236, 206, 0.48), transparent 100%);
+  animation-name: emberDrift, emberTwinkleSlow;
+  animation-duration: 19s, 6.5s;
+}
+
+/* Middle layer: mid size, mid speed, counter-drifting so the field has depth. */
+.effortEmberMid {
+  background-image:
+    radial-gradient(circle 1.5px at 8% 38%, rgba(255, 243, 222, 0.75), transparent 100%),
+    radial-gradient(circle 1.3px at 22% 72%, rgba(255, 239, 214, 0.65), transparent 100%),
+    radial-gradient(circle 1.6px at 37% 26%, rgba(255, 245, 226, 0.8), transparent 100%),
+    radial-gradient(circle 1.2px at 53% 63%, rgba(255, 237, 208, 0.6), transparent 100%),
+    radial-gradient(circle 1.5px at 68% 33%, rgba(255, 243, 222, 0.72), transparent 100%),
+    radial-gradient(circle 1.3px at 84% 69%, rgba(255, 239, 214, 0.62), transparent 100%),
+    radial-gradient(circle 1.4px at 96% 42%, rgba(255, 241, 218, 0.7), transparent 100%);
+  animation-name: emberDriftBack, emberTwinkle;
+  animation-duration: 13s, 4.2s;
+}
+
+/* Near layer: largest and brightest, fastest drift, quickest twinkle. */
+.effortEmberFront {
+  background-image:
+    radial-gradient(circle 2px at 11% 56%, rgba(255, 248, 232, 0.95), transparent 100%),
+    radial-gradient(circle 1.7px at 26% 23%, rgba(255, 244, 224, 0.85), transparent 100%),
+    radial-gradient(circle 1.4px at 43% 80%, rgba(255, 241, 218, 0.7), transparent 100%),
+    radial-gradient(circle 1.9px at 58% 40%, rgba(255, 247, 230, 0.9), transparent 100%),
+    radial-gradient(circle 1.5px at 73% 74%, rgba(255, 243, 222, 0.75), transparent 100%),
+    radial-gradient(circle 2px at 88% 29%, rgba(255, 248, 232, 0.92), transparent 100%);
+  animation-name: emberDrift, emberTwinkleFast;
+  animation-duration: 8.5s, 2.8s;
+}
+
+/* Soft amber halo behind the knob, breathing in step with the pill's wash. */
+.effortKnobGlow {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--knob, 18px) + var(--pos, 0) * (100% - var(--knob, 18px) * 2));
+  width: calc(var(--knob-size) + 18px);
+  height: calc(var(--knob-size) + 18px);
+  border-radius: 50%;
+  /* Base centring must live here too: knobBreath is dropped under reduced motion. */
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  background: radial-gradient(
+    circle,
+    rgba(255, 214, 148, 0.55) 0%,
+    rgba(255, 190, 110, 0.28) 45%,
+    transparent 72%
+  );
+  will-change: transform, opacity;
+  animation: knobBreath 3.4s ease-in-out infinite;
 }
 
 .effortDot {
   position: absolute;
   top: 50%;
-  left: calc(var(--knob, 22px) + var(--dot, 0) * (100% - var(--knob, 22px) * 2));
+  left: calc(var(--knob, 18px) + var(--dot, 0) * (100% - var(--knob, 18px) * 2));
   width: 5px;
   height: 5px;
   margin: -2.5px 0 0 -2.5px;
@@ -1012,7 +1115,7 @@
 .effortKnob {
   position: absolute;
   top: 50%;
-  left: calc(var(--knob, 22px) + var(--pos, 0) * (100% - var(--knob, 22px) * 2));
+  left: calc(var(--knob, 18px) + var(--pos, 0) * (100% - var(--knob, 18px) * 2));
   width: var(--knob-size);
   height: var(--knob-size);
   border-radius: 50%;
@@ -1045,13 +1148,80 @@
   margin: 0 -12px;
 }
 
-@keyframes shimmer {
+/* Ember motion: transform + opacity only, so every layer stays on the compositor. */
+@keyframes emberDrift {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+@keyframes emberDriftBack {
+  from {
+    transform: translate3d(-50%, 0, 0);
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes emberTwinkleSlow {
   0%,
   100% {
-    opacity: 0.72;
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+@keyframes emberTwinkle {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  40% {
+    opacity: 0.5;
+  }
+  70% {
+    opacity: 1;
+  }
+}
+
+@keyframes emberTwinkleFast {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  35% {
+    opacity: 0.55;
+  }
+  60% {
+    opacity: 0.95;
+  }
+}
+
+@keyframes emberGlow {
+  0%,
+  100% {
+    opacity: 0.45;
   }
   50% {
     opacity: 1;
+  }
+}
+
+@keyframes knobBreath {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: translate(-50%, -50%) scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.06);
   }
 }
 
@@ -1064,13 +1234,14 @@
   }
 }
 
-@keyframes halo {
+/* Chip-scale twin of knobBreath: glow only, no ring that pushes at the layout. */
+@keyframes emberChipGlow {
   0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(201, 132, 42, 0.5), 0 0 10px 2px rgba(201, 132, 42, 0.35);
+    box-shadow: 0 0 6px 0 rgba(201, 132, 42, 0.25), inset 0 0 6px -2px rgba(255, 190, 110, 0.2);
   }
   50% {
-    box-shadow: 0 0 0 8px rgba(201, 132, 42, 0), 0 0 16px 4px rgba(201, 132, 42, 0.5);
+    box-shadow: 0 0 13px 2px rgba(201, 132, 42, 0.5), inset 0 0 10px -1px rgba(255, 198, 124, 0.35);
   }
 }
 
@@ -1088,12 +1259,17 @@
   }
 }
 
+/*
+ * Collapsed trigger in the top tier: the same amber breath as the card's knob
+ * halo, at chip scale — a slow warm sweep plus a soft outer glow. Subtle on
+ * purpose; the pill is where the ember effect belongs.
+ */
 .ember {
   color: var(--dust);
   border-color: var(--dust);
   background-image: linear-gradient(90deg, transparent, rgba(201, 132, 42, 0.18), transparent);
   background-size: 200% 100%;
-  animation: ember 2.8s linear infinite, halo 2.2s ease-in-out infinite;
+  animation: ember 4.5s linear infinite, emberChipGlow 3.4s ease-in-out infinite;
 }
 
 .emberSpark {
@@ -1123,8 +1299,21 @@
   .emberSpark,
   .emberSpark2,
   .emberSpark3,
-  .effortSparkle {
+  .effortEmbers,
+  .effortEmberGlow,
+  .effortEmberLayer,
+  .effortKnobGlow,
+  .effortTriggerGlow {
     animation: none !important;
+  }
+
+  /* Still frame: the spark field and both glows stay, the motion goes. */
+  .effortEmberGlow {
+    opacity: 0.7;
+  }
+
+  .effortKnobGlow {
+    opacity: 0.8;
   }
 }
 
@@ -1344,10 +1533,27 @@
     height: 32px;
   }
 
-  .effortIconBtn {
+  /*
+   * Touch targets stay >= 44px through hit area, never visual size: the pill
+   * keeps its 40px look and gains invisible padding; the icon buttons keep
+   * their 26px glyph box and grow via an absolutely-positioned ::after.
+   */
+  .effortHit {
+    min-height: 48px;
+    padding: 4px 0;
+  }
+
+  .effortIconBtn::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
     width: 44px;
     height: 44px;
-    min-width: 44px;
+    transform: translate(-50%, -50%);
+  }
+
+  .effortTitleBtn {
     min-height: 44px;
   }
 

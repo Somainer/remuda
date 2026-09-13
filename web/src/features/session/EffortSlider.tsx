@@ -15,8 +15,13 @@ import {
 } from "./effort";
 import css from "./session.module.css";
 
-/** Half the knob, in px. The knob centre travels inside the pill by this much on each side. */
-const KNOB_INSET = 22;
+/**
+ * Half the knob, in px — keep in step with `--knob-size` in session.module.css,
+ * which reads it back as `--knob`. It is both the knob's radius and the inset
+ * its centre travels within, so pointer aim, knob position and the brand fill
+ * (which runs to `centre + this`, hiding its cap under the knob) share a scale.
+ */
+const KNOB_INSET = 18;
 
 function BoltIcon() {
   return (
@@ -282,8 +287,18 @@ export function EffortSlider({
         >
           {/* Clipped layer: the pill's own paint. The knob sits outside it so its shadow shows. */}
           <span className={css.effortClip} aria-hidden="true">
-            <span className={`${css.effortFill} ${ember ? css.effortFillEmber : ""}`}>
-              {ember ? <span className={css.effortSparkle} /> : null}
+            <span
+              className={`${css.effortFill} ${ember ? css.effortFillEmber : ""}`}
+              data-testid="effort-fill"
+            >
+              {ember ? (
+                <span className={css.effortEmbers} data-testid="effort-embers">
+                  <span className={css.effortEmberGlow} />
+                  <span className={`${css.effortEmberLayer} ${css.effortEmberBack}`} />
+                  <span className={`${css.effortEmberLayer} ${css.effortEmberMid}`} />
+                  <span className={`${css.effortEmberLayer} ${css.effortEmberFront}`} />
+                </span>
+              ) : null}
             </span>
             {table.map((tier, i) => (
               <span
@@ -293,6 +308,7 @@ export function EffortSlider({
               />
             ))}
           </span>
+          {ember ? <span className={css.effortKnobGlow} aria-hidden="true" /> : null}
           <span className={css.effortKnob} data-testid="effort-knob" />
         </div>
       </div>

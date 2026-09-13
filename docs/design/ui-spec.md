@@ -319,10 +319,12 @@ Diff 三分态文案：**拟修改** / **已写入** / **结果未知**。未知
 - 桌面：Enter 发送（IME composing / keyCode 229 / key=Process 时忽略，抄 herdrx `Composer.tsx` `composing()`）。Shift+Enter 换行。
 - 手机：发送按钮；Enter 换行。不要抢中文候选。
 - 权限芯片显示当前 `permissionMode`（dontAsk/acceptEdits/manual…），点开改本会话（发 Command，不是只改本地 chip）。
-- Effort：收起为 compact 触发器，只显示**档名**（`ultracode ▾`），宽度固定不顶布局。点开是一张 ~400px 的 card popover，钉在触发器上方：
-  - 第 1 行 grid：左闪电图标 · 中间品牌色档名 + `›`（点开档位/模型列表）· 右复位图标。第 2 行居中 muted 型号。
-  - 下方一条 44px 高的圆角 pill：左侧已填部分是品牌实色（`--cold`），右侧未填是中性 surface；每个档位一个小圆点 marker，两侧都看得见；钮是 40px 白圆 + 柔和投影，拖动吸附到点上。钮心行程内缩半个钮宽，钮不会溢出 pill。
-  - 最高档：整条 pill 换 Night Corral ember 琥珀渐变 + 细碎 ember 星点（不同透明度的柔光小点），档名转琥珀。动效只有一层 5s 呼吸 shimmer，`prefers-reduced-motion` 下关掉。
+- Effort：收起为 compact 触发器，只显示**档名**（`ultracode ▾`），宽度固定不顶布局。点开是一张 ~300px 的 card popover，钉在触发器上方：
+  - 第 1 行 grid：左闪电图标 · 中间品牌色档名（18px）+ `›`（点开档位/模型列表）· 右复位图标。第 2 行居中 muted 型号（13px）。
+  - 下方一条 40px 高的圆角 pill：左侧已填部分是品牌实色（`--cold`），右侧未填是中性 surface；每个档位一个小圆点 marker，两侧都看得见；钮是 36px 白圆 + 柔和投影，拖动吸附到点上。钮心行程内缩半个钮宽（`--knob` = 18px），钮不会溢出 pill。
+  - **填充必须压到钮下**：fill 宽 = 钮心 + 钮半径（`--knob * 2 + pos * (100% - --knob * 2)`），fill 右端正好落在钮右缘、圆头藏在钮底下，钮左侧和钮下不留暗轨；第一档 fill 正好一个钮宽，同样不留缝。
+  - 手机上触控 ≥ 44px 只靠**热区**，不靠视觉尺寸：pill 仍是 40px，外面套 48px 热区；图标按钮保持 26px 字形，用 44×44 的 `::after` 扩大命中面。
+  - 最高档：整条 pill 换 Night Corral ember 琥珀渐变，上面叠一层暖光 + 三层疏密不同的 ember 星点，各自以不同速度横向漂移（其中一层反向）并各自闪烁，钮带一圈呼吸的琥珀光晕；收起态触发器同频率轻微发光。只用 transform / opacity，不触发布局；popover 关闭即卸载，`prefers-reduced-motion` 下全部停成静帧。
   - 吸附 harness 原生档（claude `default/think/think-hard/ultracode`，codex `low/medium/high/ultra`，grok `quick/standard/max`）。`role=slider`，`aria-valuetext` = 档名。←/→/Home/End、触摸拖动、44px 触控。
   - `›` 展开的列表里才有档位说明和模型选择（`‹` 返回 pill）；pill 视图本身不列模型。
   - 变更走 `instance.configure`（journal + persist）。无档位或会话不可配置时禁用。不用档位芯片作第二套控件。

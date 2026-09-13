@@ -56,17 +56,60 @@ async function dragSlider(page: Page, at: "start" | "end") {
   await page.mouse.up();
 }
 
-/** The pill is a thick rounded bar with a large white knob, not a hairline track. */
+/** The pill is a compact rounded bar with a large white knob, not a hairline track. */
 async function assertPillGeometry(page: Page) {
   const pill = await page.getByTestId("effort-track").boundingBox();
   const knob = await page.getByTestId("effort-knob").boundingBox();
   expect(pill).toBeTruthy();
   expect(knob).toBeTruthy();
-  expect(pill!.height).toBeGreaterThanOrEqual(40);
-  expect(knob!.width).toBeGreaterThanOrEqual(34);
+  // Reference proportions: ~40px track, ~36px knob. Shrunk from slider 2's 44/40.
+  expect(pill!.height).toBeGreaterThanOrEqual(36);
+  expect(pill!.height).toBeLessThanOrEqual(42);
+  expect(knob!.width).toBeGreaterThanOrEqual(32);
+  expect(knob!.width).toBeLessThanOrEqual(38);
   // The knob stays inside the pill at both ends.
   expect(knob!.x).toBeGreaterThanOrEqual(pill!.x - 1);
   expect(knob!.x + knob!.width).toBeLessThanOrEqual(pill!.x + pill!.width + 1);
+}
+
+/**
+ * The brand fill must reach the knob's far edge, so no dark track shows to the
+ * left of or under the thumb — the defect this pass fixes. Checked by pixel,
+ * at the pill's vertical middle, just inside the knob's leading edge.
+ */
+async function assertFillReachesKnob(page: Page) {
+  const pill = await page.getByTestId("effort-track").boundingBox();
+  const knob = await page.getByTestId("effort-knob").boundingBox();
+  expect(pill).toBeTruthy();
+  expect(knob).toBeTruthy();
+  const fill = await page.getByTestId("effort-fill").boundingBox();
+  expect(fill).toBeTruthy();
+  // The fill's right edge is at or past the knob's right edge (within a rounding px).
+  expect(fill!.x + fill!.width).toBeGreaterThanOrEqual(knob!.x + knob!.width - 1);
+  // ...and it starts at the pill's left edge, so the run is unbroken.
+  expect(fill!.x).toBeLessThanOrEqual(pill!.x + 1);
+}
+
+/** Touch targets are >= 44px through hit area even though the pill is 40px tall. */
+async function assertTouchTargets(page: Page) {
+  const hit = await page.getByTestId("effort-slider").boundingBox();
+  expect(hit).toBeTruthy();
+  expect(hit!.height).toBeGreaterThanOrEqual(44);
+  for (const id of ["effort-reset", "effort-open-list"] as const) {
+    const target = page.getByTestId(id);
+    const reach = await target.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const after = getComputedStyle(el, "::after");
+      const w = parseFloat(after.width);
+      const h = parseFloat(after.height);
+      return {
+        width: Math.max(rect.width, Number.isFinite(w) ? w : 0),
+        height: Math.max(rect.height, Number.isFinite(h) ? h : 0),
+      };
+    });
+    expect(reach.width).toBeGreaterThanOrEqual(44);
+    expect(reach.height).toBeGreaterThanOrEqual(44);
+  }
 }
 
 async function assertSingleLine(chip: Locator) {
@@ -119,7 +162,8 @@ test.describe("composer control bar and effort", () => {
     await assertPillGeometry(page);
     const card = await menu.boundingBox();
     expect(card).toBeTruthy();
-    expect(card!.width).toBeLessThanOrEqual(401);
+    expect(card!.width).toBeLessThanOrEqual(301);
+    await assertFillReachesKnob(page);
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-effort-menu.png");
     }
@@ -272,6 +316,69 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("permission-chip")).toContainText(/always-approve/);
   });
 
+  test("the brand fill reaches the knob at every stop, ember layers only on top", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    await openEffort(page);
+    const slider = page.getByTestId("effort-slider");
+    await slider.focus();
+    // Walk every stop from the first, where the fill is at its shortest.
+    await page.keyboard.press("Home");
+    await expect(slider).toHaveAttribute("data-index", "0");
+    await assertFillReachesKnob(page);
+    await expect(page.getByTestId("effort-embers")).toHaveCount(0);
+    for (const index of ["1", "2", "3"] as const) {
+      await page.keyboard.press("ArrowRight");
+      await expect(slider).toHaveAttribute("data-index", index);
+      await assertFillReachesKnob(page);
+    }
+    // Top tier: a glow wash plus three drifting spark layers over the gradient.
+    await expect(slider).toHaveAttribute("data-ember", "1");
+    const embers = page.getByTestId("effort-embers");
+    await expect(embers).toBeVisible();
+    await expect(embers.locator("span")).toHaveCount(4);
+    const motion = await embers.locator("span").evaluateAll((nodes) =>
+      nodes.map((node) => {
+        const style = getComputedStyle(node);
+        return { duration: style.animationDuration, name: style.animationName };
+      }),
+    );
+    // Three spark layers at three different speeds is what gives the field depth.
+    const drifting = motion.filter((m) => m.name.includes("emberDrift"));
+    expect(drifting).toHaveLength(3);
+    expect(new Set(drifting.map((m) => m.duration)).size).toBe(3);
+    // Motion is transform/opacity only — nothing here animates layout.
+    for (const m of motion) expect(m.name).not.toMatch(/width|height|left|top|margin/);
+    await expect(page.getByTestId("effort-knob")).toBeVisible();
+  });
+
+  test("touch targets stay >= 44px while the pill stays 40px", async ({ page }) => {
+    test.skip(test.info().project.name !== "mobile-webkit", "touch sizing is the mobile breakpoint");
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    await openEffort(page);
+    await assertPillGeometry(page);
+    await assertTouchTargets(page);
+  });
+
+  test("reduced motion drops the ember animation but keeps the tier", async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    await openEffort(page);
+    await page.getByTestId("effort-slider").focus();
+    await page.keyboard.press("End");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "1");
+    const embers = page.getByTestId("effort-embers");
+    await expect(embers).toBeVisible();
+    const names = await embers.evaluate((el) => {
+      const own = getComputedStyle(el).animationName;
+      const layers = [...el.querySelectorAll("span")].map((n) => getComputedStyle(n).animationName);
+      return [own, ...layers];
+    });
+    for (const name of names) expect(name).toBe("none");
+  });
+
   test("effort slider evidence: night/ledger at 1440 and 390", async ({ page }, info) => {
     test.skip(info.project.name !== "chromium", "evidence shots from chromium only");
     await page.emulateMedia({ reducedMotion: "reduce" });
@@ -302,8 +409,9 @@ test.describe("composer control bar and effort", () => {
           await assertPillGeometry(page);
           const box = await page.getByTestId("effort-menu").boundingBox();
           expect(box).toBeTruthy();
-          expect(box!.width).toBeLessThanOrEqual(Math.min(width, 401));
-          await shotComposer(page, `composer-slider-2-${state}-${theme}-${tag}.png`);
+          expect(box!.width).toBeLessThanOrEqual(Math.min(width, 301));
+          await assertFillReachesKnob(page);
+          await shotComposer(page, `composer-slider-3-${state}-${theme}-${tag}.png`);
         }
       }
     }
@@ -314,5 +422,6 @@ test.describe("composer control bar and effort", () => {
     expect(menu).toBeTruthy();
     expect(menu!.width).toBeLessThanOrEqual(400);
     await assertPillGeometry(page);
+    await assertFillReachesKnob(page);
   });
 });

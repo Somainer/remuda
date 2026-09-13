@@ -41,6 +41,8 @@ pub struct ShimSet {
     pub bin_dir: PathBuf,
     /// Commands that were generated.
     pub commands: Vec<String>,
+    /// Shadow `ZDOTDIR` that re-asserts the shim after the user's zsh rc.
+    pub zdotdir: PathBuf,
     /// Environment the child needs for the shims to work.
     pub env: BTreeMap<String, String>,
 }
@@ -94,15 +96,20 @@ pub fn materialize_shims(
         set_mode(&path, 0o700)?;
         commands.push((*command).to_owned());
     }
+    let zdotdir = materialize_zdotdir(launch_dir, &bin_dir)?;
     let mut env = BTreeMap::new();
     env.insert("REMUDA_HOOK_CREDENTIAL".into(), credential.to_owned());
-    // The shim's own marker. A nested agent — one the outer agent starts —
-    // reads the same PATH, and the shim uses this to avoid re-adding flags
-    // that are already on the command line.
+    // The shim's own marker, for diagnostics and for a nested agent to notice
+    // it is already inside a shimmed session.
     env.insert("REMUDA_SHIM_DIR".into(), bin_dir.to_string_lossy().into());
+    // zsh reads its rc files from ZDOTDIR. Ours source the user's and then put
+    // the shim back in front; REMUDA_USER_ZDOTDIR carries where theirs live so
+    // nothing they configured is lost. See `materialize_zdotdir`.
+    env.insert("ZDOTDIR".into(), zdotdir.to_string_lossy().into());
     Ok(ShimSet {
         bin_dir,
         commands,
+        zdotdir,
         env,
     })
 }
@@ -216,6 +223,83 @@ fn passthrough_shim(command: &str) -> String {
 exec "$real_path" "$@"
 "#,
         resolver = resolver(command),
+    )
+}
+
+/// Files a zsh shadow `ZDOTDIR` needs, in the order zsh reads them.
+const ZSH_RC_FILES: &[&str] = &[".zshenv", ".zprofile", ".zshrc", ".zlogin"];
+
+/// Generate a shadow `ZDOTDIR` that re-asserts the shim after the user's rc.
+///
+/// Putting the shim directory on the child's `PATH` is not enough for a login
+/// shell. `~/.zprofile` and `~/.zshrc` routinely *prepend* to `PATH` (every
+/// version manager does), so by the time the human has a prompt our entry has
+/// been pushed down the list and their own `claude` wins. Measured on a real
+/// run: the shim landed at position 22 of 35.
+///
+/// The fix is ordering, not force. Each generated file sources the user's real
+/// one first — so their environment is exactly what they configured — and then
+/// puts the shim back in front. `ZDOTDIR` is restored to their own value
+/// before any of that runs, so a nested shell behaves normally and nothing the
+/// user sources can tell the difference.
+///
+/// zsh only. bash's login sequence has no equivalent single hook (`--rcfile`
+/// does not apply to login shells and `BASH_ENV` is denied as a code-execution
+/// vector), so a bash login shell keeps the plain `PATH` injection and
+/// degrades to whatever position its profile leaves us in.
+pub fn materialize_zdotdir(launch_dir: &Path, bin_dir: &Path) -> DriverResult<PathBuf> {
+    let dir = launch_dir.join("zdotdir");
+    std::fs::create_dir_all(&dir)?;
+    set_mode(&dir, 0o700)?;
+    for name in ZSH_RC_FILES {
+        let body = zsh_rc(name, bin_dir);
+        let path = dir.join(name);
+        std::fs::write(&path, body)?;
+        set_mode(&path, 0o600)?;
+    }
+    Ok(dir)
+}
+
+/// One shadow rc file.
+fn zsh_rc(name: &str, bin_dir: &Path) -> String {
+    format!(
+        r#"# Remuda per-session shell integration (D-028 §4.2). Generated; not the
+# user's file. It sources their real {name} and then puts the Remuda shim
+# directory back at the front of PATH, because a login profile that prepends
+# to PATH would otherwise bury it.
+if [ -n "${{REMUDA_USER_ZDOTDIR:-}}" ]; then
+    ZDOTDIR=$REMUDA_USER_ZDOTDIR
+else
+    unset ZDOTDIR
+fi
+
+# The user's own file, with ZDOTDIR already restored so anything it sources
+# sees their configuration and not ours.
+__remuda_user_rc=${{ZDOTDIR:-$HOME}}/{name}
+[ -r "$__remuda_user_rc" ] && . "$__remuda_user_rc"
+unset __remuda_user_rc
+
+# Re-assert the shim, dropping any earlier copy first so that re-sourcing an
+# rc — by hand, or from a nested login shell — cannot grow PATH without bound.
+# Done with parameter expansion rather than external commands: this runs before
+# the user's PATH is necessarily usable.
+__remuda_bin={bin}
+__remuda_path=":$PATH:"
+while [ "$__remuda_path" != "${{__remuda_path#*:$__remuda_bin:}}" ]; do
+    __remuda_path="${{__remuda_path%%:$__remuda_bin:*}}:${{__remuda_path#*:$__remuda_bin:}}"
+done
+__remuda_path="${{__remuda_path#:}}"
+__remuda_path="${{__remuda_path%:}}"
+if [ -n "$__remuda_path" ]; then
+    PATH="$__remuda_bin:$__remuda_path"
+else
+    PATH="$__remuda_bin"
+fi
+export PATH
+unset __remuda_bin __remuda_path
+"#,
+        name = name,
+        bin = single_quote(&bin_dir.to_string_lossy()),
     )
 }
 
@@ -361,6 +445,78 @@ mod tests {
                 "{command} must pass through on re-entry: {body}"
             );
         }
+    }
+
+    #[test]
+    fn the_shadow_zdotdir_sources_the_users_rc_before_re_asserting_the_shim() {
+        // PATH injection alone is not enough for a login shell: ~/.zprofile and
+        // ~/.zshrc routinely prepend to PATH, and on a real run that pushed the
+        // shim to position 22 of 35, so the user's own claude won. Ordering is
+        // the fix — their file first, our directory back in front after.
+        let dir = tempfile::tempdir().unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        for name in ZSH_RC_FILES {
+            let body = std::fs::read_to_string(set.zdotdir.join(name)).unwrap();
+            let sourced = body
+                .find(". \"$__remuda_user_rc\"")
+                .expect("sources the user rc");
+            let reasserted = body
+                .find(r#"PATH="$__remuda_bin:$__remuda_path""#)
+                .expect("re-asserts the shim");
+            assert!(
+                sourced < reasserted,
+                "{name} must re-assert the shim *after* the user's rc, or the \
+                 profile's own prepends bury it again"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shadow_zdotdir_restores_the_users_own_zdotdir_first() {
+        // Anything the user's rc sources must see their configuration, not
+        // ours, and a nested shell must behave normally.
+        let dir = tempfile::tempdir().unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let body = std::fs::read_to_string(set.zdotdir.join(".zshrc")).unwrap();
+        let restored = body.find("ZDOTDIR=$REMUDA_USER_ZDOTDIR").expect("restores");
+        let sourced = body.find(". \"$__remuda_user_rc\"").expect("sources");
+        assert!(restored < sourced, "{body}");
+        assert!(
+            body.contains("unset ZDOTDIR"),
+            "a user with no ZDOTDIR of their own must end up with none set"
+        );
+    }
+
+    #[test]
+    fn re_sourcing_an_rc_does_not_grow_path_without_bound() {
+        // A user who sources ~/.zshrc by hand, or a nested login shell, must
+        // not accumulate copies of the shim directory.
+        let dir = tempfile::tempdir().unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let body = std::fs::read_to_string(set.zdotdir.join(".zshrc")).unwrap();
+        assert!(
+            body.contains(r#"while [ "$__remuda_path" !="#),
+            "an existing entry must be stripped before re-adding it: {body}"
+        );
+        assert!(
+            !body.contains("| grep ") && !body.contains("| paste "),
+            "the rc runs before the user's PATH is necessarily usable, so it \
+             must not depend on external commands: {body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_shadow_zdotdir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred").unwrap();
+        let mode = std::fs::metadata(&set.zdotdir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

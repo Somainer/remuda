@@ -104,8 +104,27 @@ impl HookSession {
     /// credentials out of a process the model can read.
     #[must_use]
     pub fn child_env(&self, inherited_path: &str) -> BTreeMap<String, String> {
+        self.child_env_with(inherited_path, std::env::var("ZDOTDIR").ok().as_deref())
+    }
+
+    /// [`child_env`](Self::child_env) over an explicit inherited `ZDOTDIR`, so
+    /// tests do not have to mutate the real process environment.
+    ///
+    /// The user's own `ZDOTDIR` is carried through as `REMUDA_USER_ZDOTDIR`
+    /// rather than dropped: our shadow rc files source theirs by that path, so
+    /// somebody who keeps their zsh configuration outside `$HOME` still gets
+    /// exactly the shell they configured.
+    #[must_use]
+    pub fn child_env_with(
+        &self,
+        inherited_path: &str,
+        user_zdotdir: Option<&str>,
+    ) -> BTreeMap<String, String> {
         let mut env = self.shims.env.clone();
         env.insert("PATH".into(), self.shims.path_with(inherited_path));
+        if let Some(value) = user_zdotdir.map(str::trim).filter(|v| !v.is_empty()) {
+            env.insert("REMUDA_USER_ZDOTDIR".into(), value.to_owned());
+        }
         env
     }
 

@@ -1913,8 +1913,8 @@ pub(crate) fn fixture_instance_with_session(
             },
             transcript: unknown("fake-driver-no-transcript"),
             signal_tier: None,
-        capabilities: Vec::new(),
-        codex: None,
+            capabilities: Vec::new(),
+            codex: None,
             acp: None,
             claude: Some(ClaudeRef {
                 session_id: native_session_id,

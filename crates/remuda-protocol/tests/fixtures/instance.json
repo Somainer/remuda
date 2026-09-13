@@ -76,6 +76,20 @@
         "prerequisites": [],
         "evidence": []
       },
+      "queue": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "insufficient-evidence",
+        "prerequisites": [],
+        "evidence": []
+      },
+      "interrupt": {
+        "state": "unknown",
+        "scope": [],
+        "reasonCode": "insufficient-evidence",
+        "prerequisites": [],
+        "evidence": []
+      },
       "model-switch": {
         "state": "unknown",
         "scope": [],

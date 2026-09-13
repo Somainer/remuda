@@ -45,8 +45,8 @@ const SCREEN_SNAPSHOT_LINES: usize = 80;
 // the native carrier reads the same copy. Re-exported here because
 // `generic_pty::{KindPreset, PRESETS, preset_by_id, preset_for_spec}` is the
 // spelling the rest of the tree already uses.
-pub use crate::presets::{KindPreset, PRESETS, preset_by_id, preset_for_spec};
 use crate::presets::merge_yolo_argv;
+pub use crate::presets::{KindPreset, PRESETS, preset_by_id, preset_for_spec};
 
 /// Wait target for [`GenericPtyDriver::wait`].
 #[derive(Debug, Clone, PartialEq, Eq)]

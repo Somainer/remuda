@@ -310,3 +310,177 @@ fn cap(kind: DriverKind, name: CapabilityName) -> Capability {
         evidence,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remuda_protocol::{AgentKind, HostId, RuntimeCapability};
+
+    fn native_ref(tier: Option<SignalTier>, entries: Vec<RuntimeCapability>) -> NativeRef {
+        NativeRef {
+            host_id: HostId::new(),
+            native_store_id: Id::new("obj").unwrap(),
+            kind: AgentKind::Claude,
+            session_id: Knowledge::Unknown {
+                reason: "test".into(),
+                evidence_event_ids: vec![],
+            },
+            transcript: Knowledge::Unknown {
+                reason: "test".into(),
+                evidence_event_ids: vec![],
+            },
+            signal_tier: tier,
+            capabilities: entries,
+            codex: None,
+            acp: None,
+            claude: None,
+            claude_bg: None,
+            agy: None,
+            herdr: None,
+        }
+    }
+
+    fn entry(name: CapabilityName, state: CapabilityState) -> RuntimeCapability {
+        RuntimeCapability {
+            name,
+            state,
+            tier: SignalTier::Hook,
+            reason_code: "measured".into(),
+        }
+    }
+
+    /// D-028 §4.3: with nothing reported, the static matrix is unchanged. This
+    /// is the fallback the whole override path rests on.
+    #[test]
+    fn no_runtime_report_leaves_the_static_matrix_alone() {
+        for kind in [DriverKind::ShellPty, DriverKind::ClaudePrint] {
+            assert_eq!(
+                capability_set_with_runtime(kind, None),
+                capability_set(kind),
+                "{kind:?}"
+            );
+            // An empty report is the same as no report: a NativeRef that
+            // simply has not been filled in yet must not look like a session
+            // claiming it reached no signal tier at all.
+            assert_eq!(
+                capability_set_with_runtime(kind, Some(&native_ref(None, vec![]))),
+                capability_set(kind),
+                "{kind:?} empty"
+            );
+        }
+    }
+
+    /// The structural point of the whole change: a promoted shell-pty session
+    /// can report capabilities its DriverKind says it does not have.
+    #[test]
+    fn a_signal_tier_lifts_shell_pty_above_its_static_row() {
+        let stat = capability_set(DriverKind::ShellPty);
+        assert_eq!(stat.hooks.state, CapabilityState::Unsupported);
+        assert_eq!(stat.resume.state, CapabilityState::Unsupported);
+
+        let hooked = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(Some(SignalTier::Hook), vec![])),
+        );
+        assert_eq!(hooked.hooks.state, CapabilityState::Supported);
+        assert_eq!(hooked.resume.state, CapabilityState::Supported);
+        assert_eq!(
+            hooked.interactive_approval.state,
+            CapabilityState::Supported
+        );
+        assert_eq!(hooked.hooks.reason_code, "signal-tier-hook");
+        // tty-attach was already supported and stays so: the tier adds, it
+        // does not reset the row.
+        assert_eq!(hooked.tty_attach.state, CapabilityState::Supported);
+
+        // File tail proves identity and turn boundaries but cannot block the
+        // agent for a verdict, so it must not claim interactive-approval.
+        let tailed = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(Some(SignalTier::File), vec![])),
+        );
+        assert_eq!(tailed.resume.state, CapabilityState::Supported);
+        assert_eq!(
+            tailed.interactive_approval.state,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(tailed.hooks.state, CapabilityState::Unsupported);
+
+        // Screen and OSC prove neither; they are the floor for a reason.
+        for tier in [SignalTier::Osc, SignalTier::Screen, SignalTier::None] {
+            let floor = capability_set_with_runtime(
+                DriverKind::ShellPty,
+                Some(&native_ref(Some(tier), vec![])),
+            );
+            assert_eq!(floor, capability_set(DriverKind::ShellPty), "{tier:?}");
+        }
+    }
+
+    /// An explicit entry beats the tier default, in **both** directions. A
+    /// session that measured a capability as absent must be able to say so,
+    /// or "runtime override" would only ever be able to add optimism.
+    #[test]
+    fn explicit_entries_win_over_the_tier_and_may_lower_a_capability() {
+        let downgraded = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(
+                Some(SignalTier::Hook),
+                vec![entry(
+                    CapabilityName::InteractiveApproval,
+                    CapabilityState::Unsupported,
+                )],
+            )),
+        );
+        assert_eq!(
+            downgraded.interactive_approval.state,
+            CapabilityState::Unsupported
+        );
+        // Its neighbours from the same tier are untouched.
+        assert_eq!(downgraded.hooks.state, CapabilityState::Supported);
+
+        // And an entry can override a statically-supported cell downwards.
+        let print = capability_set_with_runtime(
+            DriverKind::ClaudePrint,
+            Some(&native_ref(
+                None,
+                vec![entry(CapabilityName::Resume, CapabilityState::Unknown)],
+            )),
+        );
+        assert_eq!(
+            capability_set(DriverKind::ClaudePrint).resume.state,
+            CapabilityState::Supported
+        );
+        assert_eq!(print.resume.state, CapabilityState::Unknown);
+        assert_eq!(print.resume.reason_code, "measured");
+    }
+
+    /// §6: no driver claims queue/interrupt in this task. They are unmeasured
+    /// (§14 risks 6 and 7), and `unknown` is what unmeasured means.
+    #[test]
+    fn queue_and_interrupt_are_unknown_for_every_driver() {
+        for kind in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ClaudeBg,
+            DriverKind::CodexAppserver,
+            DriverKind::GrokAcp,
+            DriverKind::AgyPrint,
+            DriverKind::GenericPty,
+            DriverKind::ShellPty,
+        ] {
+            let set = capability_set(kind);
+            assert_eq!(set.queue.state, CapabilityState::Unknown, "{kind:?} queue");
+            assert_eq!(
+                set.interrupt.state,
+                CapabilityState::Unknown,
+                "{kind:?} interrupt"
+            );
+        }
+        // steer on a PTY carrier is unknown too: whether typing into a busy
+        // agent TUI steers or queues has not been measured on any harness.
+        assert_eq!(
+            capability_set(DriverKind::ShellPty).steer.state,
+            CapabilityState::Unknown
+        );
+    }
+}

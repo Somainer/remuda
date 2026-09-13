@@ -63,13 +63,13 @@ pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
     materialize_with_token_broker, render_api_key_helper_script,
 };
+pub use presets::{KindPreset, PRESETS, merge_yolo_argv, preset_by_id, preset_for_spec};
 pub use process::current_process_identity;
 pub use profile::{
     ClaudeProviderOverlay, Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind,
     ProviderProfile, Secret, SecretBroker, SecretRef, SecretRefPolicy,
     claude_provider_settings_json, write_claude_provider_overlay,
 };
-pub use presets::{KindPreset, PRESETS, merge_yolo_argv, preset_by_id, preset_for_spec};
 pub use promote::{
     AGENT_TABLE, AgentSignature, Detected, ProcessRow, ProcessTable, SystemProcessTable,
 };

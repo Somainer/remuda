@@ -245,13 +245,15 @@ fn materialize_inner(
             };
             argv = claude_argv(
                 request.spec.driver,
-                &permission,
-                &setting_sources,
-                settings_path.as_deref(),
-                &model,
-                request.spec.effort,
-                &request.session,
-                &extras,
+                &ClaudeArgv {
+                    permission: &permission,
+                    setting_sources: &setting_sources,
+                    settings_path: settings_path.as_deref(),
+                    model: &model,
+                    effort: request.spec.effort,
+                    session: &request.session,
+                    extras: &extras,
+                },
             )?;
             input_delivery = match request.spec.driver {
                 DriverKind::ClaudePrint => InputDelivery::Stdio,
@@ -555,7 +557,12 @@ fn materialize_shell_pty_agent(
     );
 
     if let Some(name) = preset.home_env {
-        push_env(&mut env_allowlist, name, EnvAllowlistSource::NativeHome, None);
+        push_env(
+            &mut env_allowlist,
+            name,
+            EnvAllowlistSource::NativeHome,
+            None,
+        );
     }
     collect_spec_env(request.spec, request.profile.delegation, &mut env_allowlist)?;
 
@@ -982,16 +989,27 @@ fn maybe_write_api_key_helper(
     Ok(Some(path))
 }
 
-fn claude_argv(
-    driver: DriverKind,
-    permission: &RecipePermission,
-    setting_sources: &[String],
-    settings_path: Option<&Path>,
-    model: &str,
+/// Everything `claude_argv` needs beyond the driver kind.
+struct ClaudeArgv<'a> {
+    permission: &'a RecipePermission,
+    setting_sources: &'a [String],
+    settings_path: Option<&'a Path>,
+    model: &'a str,
     effort: Option<remuda_protocol::EffortSelection>,
-    session: &SessionAction,
-    extras: &[String],
-) -> DriverResult<Vec<String>> {
+    session: &'a SessionAction,
+    extras: &'a [String],
+}
+
+fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<String>> {
+    let ClaudeArgv {
+        permission,
+        setting_sources,
+        settings_path,
+        model,
+        effort,
+        session,
+        extras,
+    } = *inputs;
     let mut argv = Vec::new();
     match driver {
         DriverKind::ClaudePrint => {

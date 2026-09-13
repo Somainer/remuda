@@ -1030,3 +1030,263 @@ fn resume_keeps_the_same_launch_surface_as_a_new_session() {
     assert_eq!(fresh.binary, resumed.binary);
     assert_eq!(fresh.setting_sources, resumed.setting_sources);
 }
+
+/// D-028 §5.1 / §9.1: an agent CLI in a Remuda-owned native PTY.
+///
+/// These assert argv per kind, because §5.1 step 3 is explicitly "argv comes
+/// from the recipe, not from passing `launch.request.args` through", and
+/// because the four harnesses differ in ways (settings flag, config-home env,
+/// yolo spelling) that a single generic path would flatten.
+mod shell_pty_agent {
+    use super::*;
+    use remuda_protocol::{AgentKind, EffortName, EffortSelection};
+
+    fn agent_spec(kind: AgentKind) -> InstanceSpec {
+        let mut spec = load_spec();
+        spec.kind = kind;
+        spec.driver = DriverKind::ShellPty;
+        spec
+    }
+
+    fn recipe(spec: &InstanceSpec, tmp: &Path, origin: LaunchOrigin) -> LaunchRecipe {
+        let binary = stub_binary(tmp, "1.0.0");
+        let home = tmp.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let mut request = request(
+            spec,
+            // A native login, so no provider overlay is injected and the argv
+            // under test is only what the recipe itself contributes.
+            Box::leak(Box::new(native_profile())),
+            &tmp.join(format!("launch-{:?}", spec.kind)),
+            &home,
+            pin_source(&binary),
+        );
+        request.origin = origin;
+        materialize(&request).unwrap()
+    }
+
+    #[test]
+    fn every_agent_kind_materializes_on_shell_pty() {
+        let tmp = tempfile::tempdir().unwrap();
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Grok,
+            AgentKind::Agy,
+        ] {
+            let recipe = recipe(&agent_spec(kind), tmp.path(), LaunchOrigin::Human);
+            assert_eq!(recipe.driver, DriverKind::ShellPty, "{kind:?}");
+            // §5.1 step 4: a real audit record, not the old stub's empty
+            // allowlist and hardcoded provider.
+            assert_eq!(
+                recipe.audit.redacted_argv, recipe.argv,
+                "{kind:?}: nothing to redact, but the audit must still record argv"
+            );
+            assert_eq!(recipe.provider.profile_id, recipe.provider.profile_id);
+            // No prompt or positional argument ever reaches argv.
+            assert!(
+                recipe.argv.iter().all(|token| token.starts_with('-')
+                    || recipe
+                        .argv
+                        .iter()
+                        .position(|t| t == token)
+                        .is_some_and(|i| i > 0 && recipe.argv[i - 1].starts_with('-'))),
+                "{kind:?}: {:?}",
+                recipe.argv
+            );
+        }
+    }
+
+    /// Only claude takes the `--settings` overlay on argv; codex and grok
+    /// redirect a config home by env instead (§5.1 recipe table).
+    #[test]
+    fn settings_flag_and_config_home_follow_the_per_kind_recipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = recipe(
+            &agent_spec(AgentKind::Claude),
+            tmp.path(),
+            LaunchOrigin::Human,
+        );
+        assert!(claude.argv.iter().any(|t| t == "--setting-sources"));
+        assert_eq!(claude.setting_sources, ["user", "project", "local"]);
+
+        for (kind, env) in [
+            (AgentKind::Codex, "CODEX_HOME"),
+            (AgentKind::Grok, "GROK_HOME"),
+        ] {
+            let recipe = recipe(&agent_spec(kind), tmp.path(), LaunchOrigin::Human);
+            assert!(
+                !recipe.argv.iter().any(|t| t == "--setting-sources"),
+                "{kind:?} has no Claude settings flag"
+            );
+            assert!(
+                recipe.audit.env_names.iter().any(|name| name == env),
+                "{kind:?} must allowlist {env}: {:?}",
+                recipe.audit.env_names
+            );
+        }
+    }
+
+    /// §9.1: `--effort <level>`, `--effort ultracode` when the flag is set,
+    /// and nothing at all when no effort was requested.
+    #[test]
+    fn effort_becomes_one_flag_or_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let value_after = |argv: &[String], flag: &str| -> Option<String> {
+            argv.iter()
+                .position(|token| token == flag)
+                .and_then(|index| argv.get(index + 1))
+                .cloned()
+        };
+
+        let mut spec = agent_spec(AgentKind::Claude);
+        assert_eq!(spec.effort, None);
+        let plain = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+        assert!(
+            !plain.argv.iter().any(|t| t == "--effort"),
+            "absent effort means the harness decides: {:?}",
+            plain.argv
+        );
+
+        for (name, expected) in [
+            (EffortName::Low, "low"),
+            (EffortName::Medium, "medium"),
+            (EffortName::High, "high"),
+            (EffortName::Xhigh, "xhigh"),
+            (EffortName::Max, "max"),
+        ] {
+            spec.effort = Some(EffortSelection {
+                name,
+                ultracode: false,
+            });
+            let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+            assert_eq!(
+                value_after(&recipe.argv, "--effort").as_deref(),
+                Some(expected),
+                "{name:?}"
+            );
+        }
+
+        // ultracode replaces the level on the flag: the native flag takes one
+        // value, and `--effort ultracode` is the measured spelling.
+        spec.effort = Some(EffortSelection {
+            name: EffortName::Xhigh,
+            ultracode: true,
+        });
+        let ultra = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+        assert_eq!(
+            value_after(&ultra.argv, "--effort").as_deref(),
+            Some("ultracode")
+        );
+        assert_eq!(
+            ultra.argv.iter().filter(|t| *t == "--effort").count(),
+            1,
+            "one flag, never a level plus a boolean"
+        );
+    }
+
+    /// D-011 / D-017 survive the move out of the herdr driver: yolo argv needs
+    /// an explicit bypass request *and* a non-agent origin.
+    #[test]
+    fn yolo_argv_still_requires_bypass_and_a_non_agent_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bypass = |mode| {
+            let mut spec = agent_spec(AgentKind::Codex);
+            spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
+                mode,
+                interaction: ClaudeInteractionMode::NativeTty,
+            }));
+            spec
+        };
+        let flag = "--dangerously-bypass-approvals-and-sandbox";
+
+        let asked = recipe(
+            &bypass(ClaudePermissionMode::BypassPermissions),
+            tmp.path(),
+            LaunchOrigin::Human,
+        );
+        assert!(asked.argv.iter().any(|token| token == flag));
+
+        let not_asked = recipe(
+            &bypass(ClaudePermissionMode::Manual),
+            tmp.path(),
+            LaunchOrigin::Human,
+        );
+        assert!(!not_asked.argv.iter().any(|token| token == flag));
+
+        // An agent asking for bypass is refused before argv is built at all.
+        let error = {
+            let spec = bypass(ClaudePermissionMode::BypassPermissions);
+            let binary = stub_binary(tmp.path(), "1.0.0");
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            let profile = native_profile();
+            let mut request = request(
+                &spec,
+                &profile,
+                &tmp.path().join("launch-agent"),
+                &home,
+                pin_source(&binary),
+            );
+            request.origin = LaunchOrigin::Agent;
+            materialize(&request).unwrap_err()
+        };
+        assert!(matches!(error, DriverError::BypassNotAllowedForBot));
+    }
+
+    /// A `terminal` kind on the same driver is still a login shell, not an
+    /// agent: the two arms are chosen by kind, and both stay reachable.
+    #[test]
+    fn terminal_kind_keeps_the_login_shell_arm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = load_spec();
+        spec.kind = AgentKind::Terminal;
+        spec.driver = DriverKind::ShellPty;
+        let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+        // A login shell gets no agent argv at all — no `--setting-sources`,
+        // no `--effort`, nothing from a per-kind recipe.
+        assert!(recipe.argv.is_empty(), "{:?}", recipe.argv);
+        assert!(recipe.materialized_files.is_empty());
+    }
+
+    /// §5.1: flag validation now applies to the native path too. It used to be
+    /// reachable only through the materializer, which shell-pty bypassed.
+    #[test]
+    fn flag_validation_applies_and_rejects_a_legacy_effort_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = agent_spec(AgentKind::Claude);
+        spec.args = vec!["--effort".into(), "think".into()];
+        let binary = stub_binary(tmp.path(), "1.0.0");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let profile = native_profile();
+        let error = materialize(&request(
+            &spec,
+            &profile,
+            &tmp.path().join("launch-bad-effort"),
+            &home,
+            pin_source(&binary),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(error, DriverError::InvalidLaunchSpec(ref message) if message.contains("--effort")),
+            "{error:?}"
+        );
+
+        // A banned flag is refused on this path as well.
+        let mut spec = agent_spec(AgentKind::Claude);
+        spec.args = vec!["--bare".into()];
+        let error = materialize(&request(
+            &spec,
+            &profile,
+            &tmp.path().join("launch-bare"),
+            &home,
+            pin_source(&binary),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(error, DriverError::NativeFeatureDisabled(_)),
+            "{error:?}"
+        );
+    }
+}

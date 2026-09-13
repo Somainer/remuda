@@ -12,6 +12,7 @@ import {
   normalizeModels,
   parseModels,
   redactSecretRef,
+  resolveGatewayModel,
   shouldAvoidUnhealthy,
 } from "./model";
 
@@ -127,5 +128,50 @@ describe("structured model catalog", () => {
     expect(contextChip(512)).toBe("512");
     expect(contextChip(null)).toBeNull();
     expect(contextChip(0)).toBeNull();
+  });
+});
+
+/**
+ * New Session must offer exactly the enabled catalog. Both wire shapes reach
+ * the picker: the structured entries the Hub stores today and the legacy bare
+ * id list a not-yet-rewritten row still serves.
+ */
+describe("resolveGatewayModel", () => {
+  const structured = normalizeModels([
+    { id: "e2e/auto", enabled: true, label: "E2E Auto" },
+    { id: "e2e/fast", enabled: true },
+    { id: "e2e/plain", enabled: false },
+  ]);
+  const legacy = normalizeModels(["e2e/auto", "e2e/fast"]);
+
+  it("keeps a current model the catalog still exposes", () => {
+    expect(resolveGatewayModel(structured, "e2e/auto", "e2e/fast")).toBe("e2e/fast");
+    expect(resolveGatewayModel(legacy, "e2e/auto", "e2e/fast")).toBe("e2e/fast");
+  });
+
+  it("replaces a disabled model with the profile default", () => {
+    expect(resolveGatewayModel(structured, "e2e/auto", "e2e/plain")).toBe("e2e/auto");
+  });
+
+  it("replaces a model absent from the catalog with the profile default", () => {
+    expect(resolveGatewayModel(structured, "e2e/auto", "passthrough/auto")).toBe("e2e/auto");
+    expect(resolveGatewayModel(legacy, "e2e/auto", "passthrough/auto")).toBe("e2e/auto");
+  });
+
+  it("falls back to the first enabled model when the default is unusable", () => {
+    // A default naming a disabled model must not be resurrected.
+    expect(resolveGatewayModel(structured, "e2e/plain", "gone")).toBe("e2e/auto");
+    expect(resolveGatewayModel(structured, null, "gone")).toBe("e2e/auto");
+  });
+
+  it("returns null when the profile exposes nothing, leaving the free-text box", () => {
+    expect(resolveGatewayModel([], "e2e/auto", "gone")).toBeNull();
+    expect(
+      resolveGatewayModel(normalizeModels([{ id: "e2e/plain", enabled: false }]), null, "x"),
+    ).toBeNull();
+  });
+
+  it("treats a legacy bare id list as fully enabled", () => {
+    expect(enabledModels(legacy).map((m) => m.id)).toEqual(["e2e/auto", "e2e/fast"]);
   });
 });

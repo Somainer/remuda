@@ -193,6 +193,25 @@ export function enabledModels(models: ProviderModel[]): ProviderModel[] {
 }
 
 /**
+ * The model a gateway session must run: the operator's current choice when the
+ * catalog still exposes it, else the profile default, else the first enabled
+ * entry. `null` when the profile exposes nothing, which leaves the free-text
+ * box in place. A model the catalog hides is never carried over — that is what
+ * kept a disabled model in the New Session picker.
+ */
+export function resolveGatewayModel(
+  models: ProviderModel[],
+  defaultModel: string | null | undefined,
+  current: string,
+): string | null {
+  const enabled = enabledModels(models);
+  if (!enabled.length) return null;
+  if (enabled.some((m) => m.id === current)) return current;
+  if (defaultModel && enabled.some((m) => m.id === defaultModel)) return defaultModel;
+  return enabled[0].id;
+}
+
+/**
  * Fold a discovery result into the current list.
  *
  * Saved entries keep their `enabled` choice and gain freshly reported

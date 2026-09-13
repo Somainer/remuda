@@ -89,9 +89,22 @@ test("discover a gateway catalog, expose two models, and launch with them", asyn
   await expect(page.locator('[data-testid=provider-model-row][data-new="1"]')).toHaveCount(0);
   await page.getByRole("button", { name: "取消" }).click();
 
-  // New Session offers exactly the enabled models.
+  // New Session offers exactly the enabled models. Wait for the picker's own
+  // GET /v1/providers to land and assert it carries the post-save catalog, so
+  // the picker assertions never race a slower runner's in-flight fetch.
+  const listed = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/v1/providers" &&
+      response.request().method() === "GET",
+  );
   await page.goto("/sessions/new");
   await expect(page.getByTestId("new-session-sheet")).toBeVisible();
+  const profiles = (await (await listed).json()) as {
+    items: { name: string; models: { id: string; enabled: boolean }[] }[];
+  };
+  const saved = profiles.items.find((item) => item.name === "e2e-fake-upstream");
+  // The list endpoint must carry the post-save catalog, not a pre-save one.
+  expect(saved?.models.filter((m) => m.enabled).map((m) => m.id)).toEqual(["e2e/auto", "e2e/fast"]);
   await page.getByTestId("new-session-delegation-gateway").click();
   await expect(page.getByTestId("new-session-gateway-profile")).toContainText("e2e-fake-upstream");
   const picker = page.getByTestId("new-session-model");

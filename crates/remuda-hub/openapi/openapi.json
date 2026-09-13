@@ -699,6 +699,68 @@
         }
       }
     },
+    "/v1/attachments": {
+      "get": {
+        "tags": ["objects"],
+        "operationId": "attachmentList",
+        "summary": "List a session's live attachments (D-028 §4.5)",
+        "description": "Discovery for the in-session MCP tool `remuda_attachments_list`. An instance-bound credential reads its own session and may omit `instanceId`; naming a different session is 403. A Human/Bot device must name one. Expired objects are filtered out.",
+        "parameters": [
+          {
+            "name": "instanceId",
+            "in": "query",
+            "required": false,
+            "description": "Session to enumerate. Required for operator devices; for an instance credential it may only be that instance's own id.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Live attachments for the session",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AttachmentPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/attachments/{objectId}/content": {
+      "get": {
+        "tags": ["objects"],
+        "operationId": "attachmentContent",
+        "summary": "Read one attachment as base64 for an MCP content block (D-028 §4.5)",
+        "description": "Backs the in-session MCP tool `remuda_attachment`. Unlike `GET /v1/objects/{id}`, this route admits the instance credential the MCP server runs with, and pins the read to that credential's own session — not a child's, not a parent's. Bytes come back base64 in JSON because the caller is building an MCP content block. Attachments over 3670016 bytes (3.5 MiB, mirroring the claude-print inline budget) are refused with RESOURCE_LIMIT naming the size and media type. Expired objects read as 404.",
+        "parameters": [
+          {
+            "name": "objectId",
+            "in": "path",
+            "required": true,
+            "description": "`obj_…` from the staging upload.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Attachment metadata plus base64 bytes",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AttachmentContent" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/worktrees": {
       "get": {
         "tags": ["worktrees"],
@@ -1872,6 +1934,64 @@
           "command": { "$ref": "#/components/schemas/CommandRecord" },
           "hostId": { "type": "string" }
         }
+      },
+      "AttachmentRef": {
+        "type": "object",
+        "description": "One staged attachment as the in-session MCP tools see it (D-028 §4.5). Metadata only; `AttachmentContent` adds the bytes.",
+        "required": [
+          "objectId",
+          "instanceId",
+          "mediaType",
+          "name",
+          "size",
+          "digest",
+          "expiresAt"
+        ],
+        "properties": {
+          "objectId": { "type": "string" },
+          "instanceId": {
+            "type": "string",
+            "description": "Session this attachment is staged for; also the read-authorization key."
+          },
+          "mediaType": { "type": "string" },
+          "name": {
+            "type": "string",
+            "description": "Derived `<objectId>.<ext>`; a caller-supplied filename never survives."
+          },
+          "size": { "type": "integer" },
+          "digest": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 of the stored bytes."
+          },
+          "expiresAt": { "type": "string" }
+        }
+      },
+      "AttachmentPage": {
+        "type": "object",
+        "required": ["instanceId", "items"],
+        "properties": {
+          "instanceId": { "type": "string" },
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AttachmentRef" }
+          }
+        }
+      },
+      "AttachmentContent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/AttachmentRef" },
+          {
+            "type": "object",
+            "required": ["encoding", "data"],
+            "properties": {
+              "encoding": { "type": "string", "const": "base64" },
+              "data": {
+                "type": "string",
+                "description": "Standard base64 of the stored bytes, ready for an MCP image or text content block."
+              }
+            }
+          }
+        ]
       },
       "AttachmentUpload": {
         "type": "object",

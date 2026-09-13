@@ -12,6 +12,7 @@
 pub mod agent_approvals;
 mod agent_scope;
 mod alerts;
+mod attachments;
 mod auth;
 mod config;
 mod devices;
@@ -345,6 +346,7 @@ pub fn router(state: AppState) -> Router {
         .merge(providers::routes())
         .merge(agent_scope::routes())
         .merge(objects::routes())
+        .merge(attachments::routes())
         .merge(workspaces::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

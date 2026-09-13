@@ -123,6 +123,19 @@ which is why D-022's handling alone could not rescue the instance.
    `SessionStart` hook proves the session is real, so no later model output
    can be mistaken for a wizard.
 
+### A. One interaction worth naming
+
+`generic-pty` only pins `CLAUDE_CONFIG_DIR` when the native home already has
+a login, because an unauthenticated isolated directory makes Claude 2.1 report
+"Not logged in" even when the host user is authenticated. That test was the
+*presence of `.claude.json`* — which seeding now creates. A config directory
+shared by the two drivers would therefore have looked logged-in while holding
+nothing but onboarding flags. The check is now credential evidence
+(`has_login_material`: `.credentials.json`, or an account field such as
+`oauthAccount` / `userID` / `customApiKeyResponses` in the global config), and
+a test asserts a freshly seeded directory is **not** mistaken for a logged-in
+one.
+
 ### A. Tests
 
 `fake-herdr` gained an `onboarding` script that reports the agent **idle and

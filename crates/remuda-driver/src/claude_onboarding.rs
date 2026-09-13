@@ -250,6 +250,26 @@ fn set_mode(path: &Path, mode: u32) -> DriverResult<()> {
     Ok(())
 }
 
+/// Does this config directory carry evidence of a Claude login?
+///
+/// A caller that pins `CLAUDE_CONFIG_DIR` must not point the CLI at a
+/// directory with no credentials: Claude 2.1 then reports "Not logged in"
+/// even when the host user is authenticated. The presence of `.claude.json`
+/// alone does **not** answer this — [`seed_scoped_config`] writes that file
+/// with onboarding flags and no credentials whatsoever — so look for the
+/// credential file, or for the account fields a real login leaves behind.
+#[must_use]
+pub fn has_login_material(config_dir: &Path) -> bool {
+    if config_dir.join(".credentials.json").is_file() {
+        return true;
+    }
+    read_object(&config_dir.join(".claude.json")).is_some_and(|config| {
+        ["oauthAccount", "userID", "customApiKeyResponses"]
+            .iter()
+            .any(|key| config.get(*key).is_some_and(|value| !value.is_null()))
+    })
+}
+
 /// A recognised Claude Code startup screen that is not the prompt composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupDialog {
@@ -388,6 +408,28 @@ mod tests {
             Value::Bool(true)
         );
         assert!(seed_scoped_config(&scoped, None).unwrap().is_noop());
+    }
+
+    #[test]
+    fn a_seeded_config_dir_is_not_mistaken_for_a_logged_in_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let scoped = dir.path().join("native-home");
+        assert!(!has_login_material(&scoped), "empty dir");
+        seed_scoped_config(&scoped, None).unwrap();
+        assert!(
+            !has_login_material(&scoped),
+            "seeding writes onboarding flags, never credentials"
+        );
+        write(
+            &scoped.join(".claude.json"),
+            serde_json::json!({"hasCompletedOnboarding": true, "oauthAccount": {"a": 1}}),
+        );
+        assert!(has_login_material(&scoped), "an account field is a login");
+
+        let credentials = dir.path().join("with-credentials");
+        std::fs::create_dir_all(&credentials).unwrap();
+        std::fs::write(credentials.join(".credentials.json"), "{}").unwrap();
+        assert!(has_login_material(&credentials));
     }
 
     #[test]

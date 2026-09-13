@@ -42,6 +42,8 @@ pub struct ShellPtyOptions {
     pub args: Vec<String>,
     /// Extra non-secret environment.
     pub extra_env: std::collections::BTreeMap<String, String>,
+    /// Authenticated instance context, injected only after environment filtering.
+    pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// Initial columns.
     pub cols: u16,
     /// Initial rows.
@@ -57,6 +59,7 @@ impl ShellPtyOptions {
             shell: default_shell(),
             args: Vec::new(),
             extra_env: std::collections::BTreeMap::new(),
+            agent_mcp: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
         }
@@ -312,10 +315,21 @@ fn build_command(options: &ShellPtyOptions, spec_cwd: &str) -> DriverResult<Comm
         cmd
     };
     cmd.cwd(cwd);
+    cmd.env_clear();
+    for (key, value) in crate::child_env::base_env() {
+        cmd.env(key, value);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     for (key, value) in &options.extra_env {
-        cmd.env(key, value);
+        if !crate::child_env::is_denied(key) {
+            cmd.env(key, value);
+        }
+    }
+    if let Some(context) = &options.agent_mcp {
+        for (key, value) in context.environment()? {
+            cmd.env(key, value);
+        }
     }
     Ok(cmd)
 }

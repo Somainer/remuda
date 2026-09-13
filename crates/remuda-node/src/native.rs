@@ -233,7 +233,7 @@ impl DriverFactory for NativeClaudeFactory {
         let native: Arc<dyn NativeDriver> = match self.kind {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin;
                 options.handshake_timeout = self.config.print_handshake_timeout;
@@ -243,7 +243,7 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ClaudePty => {
                 let mut options = ClaudePtyOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
@@ -259,7 +259,7 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ClaudeBg => {
                 let mut options = ClaudeBgOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
@@ -271,7 +271,7 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::GenericPty => {
                 let mut options = GenericPtyOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
@@ -281,7 +281,8 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ShellPty => {
                 let mut options = ShellPtyOptions::login(launch.workspace_root.clone());
-                options.extra_env = crate::origin::instance_env(&launch, &self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
+                options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.args = launch.request.args.clone();
                 Arc::new(ShellPtyDriver::new(options))
             }

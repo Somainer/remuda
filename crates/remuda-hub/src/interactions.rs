@@ -1,7 +1,7 @@
 //! HTTP surface for pending Interactions and first-answer-wins respond.
 
 use crate::AppState;
-use crate::auth::{require_device, require_origin};
+use crate::auth::require_origin;
 use crate::error::HubError;
 use axum::Json;
 use axum::Router;
@@ -48,7 +48,7 @@ pub async fn list_interactions(
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, HubError> {
-    require_device(&state.store, &headers).await?;
+    let device = crate::agent_scope::require_operator(&state, &headers).await?;
     let mut items: Vec<Value> = state
         .store
         .list_interactions(
@@ -64,7 +64,7 @@ pub async fn list_interactions(
     items.extend(
         state
             .agent_approvals
-            .list()
+            .list(&device)
             .await
             .into_iter()
             .filter(|item| {

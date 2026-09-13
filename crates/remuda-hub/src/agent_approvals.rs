@@ -31,8 +31,6 @@ pub struct ApprovalCaller {
 enum GrantState {
     Pending,
     Allowed,
-    Denied,
-    Consumed,
 }
 
 struct Grant {
@@ -57,18 +55,16 @@ impl InteractionOwner for ApprovalOwner {
     ) -> Result<(), BrokerError> {
         let mut grants = self.grants.lock().await;
         let grant = grants.get_mut(&id).ok_or(BrokerError::NotFound)?;
-        grant.state = if matches!(answer, InteractionAnswer::Approval(ref a) if a.option_id == "allow-once" && a.input_digest == grant.digest)
+        if matches!(answer, InteractionAnswer::Approval(ref a) if a.option_id == "allow-once" && a.input_digest == grant.digest)
         {
-            GrantState::Allowed
+            grant.state = GrantState::Allowed;
         } else {
-            GrantState::Denied
-        };
+            grants.remove(&id);
+        }
         Ok(())
     }
     async fn deny_or_cancel(&self, id: InteractionId) -> Result<(), BrokerError> {
-        if let Some(grant) = self.grants.lock().await.get_mut(&id) {
-            grant.state = GrantState::Denied;
-        }
+        self.grants.lock().await.remove(&id);
         Ok(())
     }
 }
@@ -114,7 +110,8 @@ impl AgentApprovals {
             {
                 return Err(HubError::Forbidden);
             }
-            grant.state = GrantState::Consumed;
+            // An absent id remains forbidden on replay and occupies no capacity.
+            grants.remove(&id);
             return Ok(());
         }
         if let Some((id, _)) = grants.iter().find(|(_, grant)| {
@@ -126,7 +123,12 @@ impl AgentApprovals {
                 interaction_id: id.as_id().as_str().to_string(),
             });
         }
-        if grants.len() >= 1024 {
+        if grants
+            .values()
+            .filter(|grant| grant.state == GrantState::Pending)
+            .count()
+            >= 1024
+        {
             return Err(HubError::BadRequest(
                 "too many pending agent approvals".into(),
             ));
@@ -212,13 +214,19 @@ impl AgentApprovals {
         })
     }
 
-    pub async fn list(&self) -> Vec<Value> {
+    pub async fn list(&self, device: &crate::store::Device) -> Vec<Value> {
         self.broker.sweep_expired().await;
         self.grants
             .lock()
             .await
             .values()
             .filter(|g| g.state == GrantState::Pending && g.expires > Instant::now())
+            .filter(|g| {
+                crate::agent_scope::origin(device) != remuda_protocol::InputOrigin::Agent
+                    || (g.caller.device_id == device.id
+                        && device.instance_id.as_deref()
+                            == Some(g.caller.instance_id.as_id().as_str()))
+            })
             .map(|g| g.view.clone())
             .collect()
     }
@@ -272,6 +280,79 @@ fn broker_error(error: BrokerError) -> HubError {
 mod tests {
     use super::*;
 
+    fn device(caller: &ApprovalCaller) -> crate::store::Device {
+        crate::store::Device {
+            id: caller.device_id.clone(),
+            name: "instance".into(),
+            kind: "agent".into(),
+            instance_id: Some(caller.instance_id.as_id().as_str().into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_grants_release_capacity_and_pending_lists_are_caller_scoped() {
+        let approvals = AgentApprovals::new().unwrap();
+        let caller = ApprovalCaller {
+            device_id: "agent-a".into(),
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+        };
+        let mut other = caller.clone();
+        other.device_id = "agent-b".into();
+        assert!(matches!(
+            approvals
+                .require(&HeaderMap::new(), &other, json!({"target":"private-b"}))
+                .await,
+            Err(HubError::ApprovalRequired { .. })
+        ));
+        assert!(approvals.list(&device(&caller)).await.is_empty());
+        assert_eq!(approvals.list(&device(&other)).await.len(), 1);
+        // Complete more than the pending cap within one TTL. Closed grants
+        // must not prevent the next legitimate human approval from opening.
+        for n in 0..1025 {
+            let request = json!({"target":"a", "n":n});
+            let HubError::ApprovalRequired { interaction_id } = approvals
+                .require(&HeaderMap::new(), &caller, request.clone())
+                .await
+                .unwrap_err()
+            else {
+                panic!("closed grants exhausted pending capacity");
+            };
+            let pending = approvals.list(&device(&caller)).await;
+            assert_eq!(pending.len(), 1);
+            let id: InteractionId = interaction_id.parse().unwrap();
+            let allow = n % 2 == 0;
+            let answer = serde_json::from_value(json!({"kind":"approval",
+                "optionId":if allow {"allow-once"} else {"deny"},
+                "inputDigest":pending[0]["request"]["inputDigest"]}))
+            .unwrap();
+            approvals
+                .answer(&id, answer, Id::new("dev").unwrap(), CommandId::new())
+                .await
+                .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-remuda-approval-id", id.as_id().as_str().parse().unwrap());
+            if allow {
+                approvals
+                    .require(&headers, &caller, request.clone())
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                approvals.require(&headers, &caller, request).await,
+                Err(HubError::Forbidden)
+            ));
+            assert!(approvals.list(&device(&caller)).await.is_empty());
+        }
+        let operator = crate::store::Device {
+            id: "operator".into(),
+            name: "human".into(),
+            kind: "human".into(),
+            instance_id: None,
+        };
+        assert_eq!(approvals.list(&operator).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn approval_binds_caller_and_exact_action_and_is_consumed_once() {
         let approvals = AgentApprovals::new().unwrap();
@@ -288,7 +369,7 @@ mod tests {
         else {
             panic!("unapproved action must open an Interaction")
         };
-        let pending = approvals.list().await;
+        let pending = approvals.list(&device(&caller)).await;
         let id: InteractionId = interaction_id.parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-remuda-approval-id", id.as_id().as_str().parse().unwrap());
@@ -342,6 +423,7 @@ mod tests {
             .await
             .unwrap();
         assert!(approvals.require(&headers, &caller, request).await.is_err());
-        assert!(approvals.list().await.is_empty());
+        assert!(approvals.list(&device(&caller)).await.is_empty());
+        assert!(approvals.grants.lock().await.is_empty());
     }
 }

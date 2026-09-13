@@ -1,6 +1,8 @@
 //! Loopback Hub HTTP used by control-plane unit tests.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,6 +14,7 @@ pub(crate) struct MockHub {
     /// Listen address (`127.0.0.1:ephemeral`).
     pub addr: SocketAddr,
     handle: JoinHandle<()>,
+    pub requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl Drop for MockHub {
@@ -21,31 +24,52 @@ impl Drop for MockHub {
 }
 
 pub(crate) async fn spawn_mock_hub() -> MockHub {
+    spawn_mock_hub_as(json!({"origin":"human", "children":[]})).await
+}
+
+pub(crate) async fn spawn_mock_hub_as(caller: Value) -> MockHub {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock hub");
     let addr = listener.local_addr().expect("local addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            let caller = caller.clone();
+            let recorded = recorded.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_conn(stream).await {
+                if let Err(err) = handle_conn(stream, &caller, &recorded).await {
                     tracing::debug!(error = %err, "mock hub connection");
                 }
             });
         }
     });
-    MockHub { addr, handle }
+    MockHub {
+        addr,
+        handle,
+        requests,
+    }
 }
 
-async fn handle_conn(mut stream: TcpStream) -> std::io::Result<()> {
+async fn handle_conn(
+    mut stream: TcpStream,
+    caller: &Value,
+    requests: &Mutex<Vec<String>>,
+) -> std::io::Result<()> {
     let Some((method, path, body)) = read_http(&mut stream).await? else {
         return Ok(());
     };
     let path_only = path.split('?').next().unwrap_or(&path);
-    let (status, payload) = route(&method, path_only, &body);
+    requests.lock().await.push(format!("{method} {path_only}"));
+    let (status, payload) = if method == "GET" && path_only == "/v1/caller" {
+        (200, caller.clone())
+    } else {
+        route(&method, path_only, &body)
+    };
     let bytes = payload.to_string();
     let reason = match status {
         200 => "OK",
@@ -66,6 +90,9 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
     match (method, path) {
         ("GET", "/v1/caller") => (200, json!({"origin":"human", "children":[]})),
         ("GET", "/healthz") => (200, json!({ "ok": true })),
+        ("GET", "/v1/instances/ins_test") => {
+            (200, route("GET", "/v1/instances", "").1["items"][0].clone())
+        }
         ("POST", "/v1/login") => (
             200,
             json!({ "deviceId": "dev_1", "token": "device-token", "name": "remuda-cli" }),

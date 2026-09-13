@@ -23,6 +23,7 @@ pub(super) fn tools() -> Vec<Tool> {
             }),
             |_client, args| {
                 Box::pin(async move {
+                    worktree::require_operator_environment()?;
                     let name = required_str(&args, "name")?;
                     let base = opt_str(&args, "base").unwrap_or("main");
                     reject_removed_args(&args, &["path", "repo"])?;
@@ -47,6 +48,7 @@ pub(super) fn tools() -> Vec<Tool> {
             }}),
             |_client, args| {
                 Box::pin(async move {
+                    worktree::require_operator_environment()?;
                     // `repo` is not accepted: it would let an agent operate on
                     // a repository other than this server's (M4). The name is
                     // resolved against the local catalog.
@@ -67,4 +69,52 @@ pub(super) fn tools() -> Vec<Tool> {
             },
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn direct_handlers_refuse_an_instance_environment() {
+        // Re-exec avoids mutating this parallel test process's environment.
+        if std::env::var_os("REMUDA_REVIEW_WORKTREE_TEST").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cmd::mcp::worktree::tests::direct_handlers_refuse_an_instance_environment",
+                    "--nocapture",
+                ])
+                .env("REMUDA_REVIEW_WORKTREE_TEST", "1")
+                .env("REMUDA_INSTANCE_ID", "ins_agent")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let client =
+            crate::cmd::hub_client::connect_for_test("http://127.0.0.1:1".into(), "fixture".into())
+                .unwrap();
+        for tool in super::tools() {
+            // Invoke the handler directly: no scoped_client preflight or Hub.
+            let result = tool
+                .call(&client, serde_json::json!({"name":"sibling","force":true}))
+                .await;
+            assert_eq!(result["isError"], true, "{result}");
+            assert!(
+                result.to_string().contains("REMUDA_INSTANCE_ID is set"),
+                "{result}"
+            );
+        }
+        assert!(
+            crate::cmd::worktree::ensure("sibling", None)
+                .unwrap_err()
+                .to_string()
+                .contains("REMUDA_INSTANCE_ID is set")
+        );
+    }
 }

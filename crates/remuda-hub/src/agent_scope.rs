@@ -64,12 +64,38 @@ pub async fn owns(state: &AppState, device: &Device, target: &str) -> Result<boo
     let Some(caller) = device.instance_id.as_deref() else {
         return Ok(false);
     };
-    let instance = state
-        .store
-        .get_instance(target.into())
-        .await?
-        .ok_or(HubError::NotFound)?;
+    let Some(instance) = state.store.get_instance(target.into()).await? else {
+        return Ok(false);
+    };
     Ok(caller == target || instance.parent_instance_id.as_deref() == Some(caller))
+}
+
+/// Fleet-wide metadata is available only to operator devices.
+pub async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<Device, HubError> {
+    let device = caller(state, headers).await?;
+    if origin(&device) == InputOrigin::Agent {
+        return Err(HubError::Forbidden);
+    }
+    Ok(device)
+}
+
+/// Repeat the middleware ownership check at the instance read boundary.
+pub async fn require_instance_read(
+    state: &AppState,
+    headers: &HeaderMap,
+    instance_id: &str,
+) -> Result<(), HubError> {
+    let device = caller(state, headers).await?;
+    if origin(&device) == InputOrigin::Agent && !owns(state, &device, instance_id).await? {
+        return Err(HubError::Forbidden);
+    }
+    Ok(())
+}
+
+fn read_target(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/v1/instances/")?;
+    let id = rest.strip_suffix("/journal").unwrap_or(rest);
+    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<bool, HubError> {
@@ -84,6 +110,19 @@ pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<
     Ok(instance.host_id == host)
 }
 
+/// Agent launches retain only manual or plan permissions on every create path.
+pub fn restrict_permission(device: &Device, spec: &mut Value) -> Result<(), HubError> {
+    if origin(device) != remuda_protocol::InputOrigin::Human && spec["permissionMode"].is_null() {
+        spec["permissionMode"] = json!("manual");
+    }
+    if origin(device) == InputOrigin::Agent
+        && !matches!(spec["permissionMode"].as_str(), Some("manual" | "plan"))
+    {
+        return Err(HubError::Forbidden);
+    }
+    Ok(())
+}
+
 pub async fn prepare_create(
     state: &AppState,
     headers: &HeaderMap,
@@ -94,9 +133,7 @@ pub async fn prepare_create(
 ) -> Result<(), HubError> {
     stamp(spec, device);
     spec["parentInstanceId"] = json!(device.instance_id);
-    if origin(device) != remuda_protocol::InputOrigin::Human && spec["permissionMode"].is_null() {
-        spec["permissionMode"] = json!("manual");
-    }
+    restrict_permission(device, spec)?;
     if origin(device) == remuda_protocol::InputOrigin::Agent
         && (!same_host(state, device, host).await?
             || shell_driver(driver)
@@ -286,11 +323,14 @@ pub async fn instance_token(
 ) -> Result<String, HubError> {
     let token = crate::config::random_token();
     let hash = auth::hash_secret(&token)?;
+    let prefix = auth::token_prefix(&token)
+        .ok_or_else(|| HubError::Internal("generated device token is not indexable".into()))?
+        .to_owned();
     store
         .insert_device_as(
             format!("instance:{instance_id}"),
             hash,
-            token[..16].to_owned(),
+            prefix,
             "agent".into(),
             Some(instance_id),
         )
@@ -313,7 +353,12 @@ pub async fn restrict_agent_routes(
     {
         let device = caller(&state, request.headers()).await?;
         if origin(&device) == InputOrigin::Agent {
-            let read = request.method() == axum::http::Method::GET && path != "/v1/follow";
+            let read = request.method() == axum::http::Method::GET
+                && (path == "/v1/caller"
+                    || match read_target(path) {
+                        Some(id) => owns(&state, &device, id).await?,
+                        None => false,
+                    });
             let write = request.method() == axum::http::Method::POST
                 && (path == "/v1/instances"
                     || path == "/v1/fleet/instances"

@@ -45,6 +45,62 @@ fn create(repo: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn agent_cli_cannot_create_remove_prune_or_ensure_worktrees() {
+    let (keep, repo) = fixture();
+    let tree = result(worktree(&repo, &["create", "worker"]));
+    let path = Path::new(tree["path"].as_str().unwrap());
+    std::fs::write(path.join("unfinished.txt"), "preserve dirty work").unwrap();
+    let catalog_path = repo.join(".git/remuda-worktrees.json");
+    let catalog = std::fs::read(&catalog_path).unwrap();
+    for identity in ["ins_agent", ""] {
+        for args in [
+            vec!["worktree", "create", "intruder"],
+            vec!["worktree", "rm", "worker", "--force"],
+            vec!["worktree", "prune"],
+            vec![
+                "instance",
+                "create",
+                "--worktree",
+                "worker",
+                "--hub",
+                "http://127.0.0.1:1",
+                "--token",
+                "fixture",
+            ],
+            vec![
+                "instance",
+                "create",
+                "--worktree",
+                "intruder",
+                "--hub",
+                "http://127.0.0.1:1",
+                "--token",
+                "fixture",
+            ],
+        ] {
+            let output = Command::new(bin())
+                .current_dir(&repo)
+                .args(&args)
+                .env("REMUDA_INSTANCE_ID", identity)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("REMUDA_INSTANCE_ID is set"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&catalog_path).unwrap(), catalog);
+            assert_eq!(
+                std::fs::read_to_string(path.join("unfinished.txt")).unwrap(),
+                "preserve dirty work"
+            );
+            assert!(!keep.path().join("remuda-wt/intruder").exists());
+        }
+    }
+}
+
+#[test]
 fn worktree_create_adds_branch_and_prints_json() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = init_repo(dir.path());

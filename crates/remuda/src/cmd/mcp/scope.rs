@@ -96,6 +96,13 @@ pub(super) fn mcp_requires_approval(
         bail!("Agent MCP caller requires an instance-bound credential and a registered host");
     }
     match name {
+        "remuda_instance_list" | "remuda_fleet_send" => Ok(false),
+        "remuda_instance_read" | "remuda_instance_wait" => {
+            if !caller.owns(required_str(args, "instanceId")?) {
+                bail!("{name} is limited to this Agent instance and its direct children");
+            }
+            Ok(false)
+        }
         "remuda_instance_keys" | "remuda_fleet_keys" => Ok(true),
         "remuda_instance_send" | "remuda_instance_stop" | "remuda_instance_rm" => {
             Ok(!caller.owns(required_str(args, "instanceId")?))
@@ -112,7 +119,7 @@ pub(super) fn mcp_requires_approval(
             bail!("{name} requires a Human/Bot coordinator device")
         }
         "remuda_instance_respond" => bail!("an Agent instance cannot answer approval Interactions"),
-        _ => Ok(false),
+        _ => bail!("{name} is unavailable to Agent instances"),
     }
 }
 
@@ -127,6 +134,84 @@ mod scope_tests {
             instance_id: Some("self".into()),
             host_id: Some("host-a".into()),
             children: vec!["child".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_tools_cannot_reach_unowned_reads_or_fleet_broadcast() {
+        let mock = crate::cmd::test_hub::spawn_mock_hub_as(
+            json!({"origin":"agent", "instanceId":"ins_test", "hostId":"hst_1", "children":[]}),
+        )
+        .await;
+        let client = crate::cmd::hub_client::connect_for_test(
+            format!("http://{}", mock.addr),
+            "fixture".into(),
+        )
+        .unwrap();
+        for (name, args) in [
+            (
+                "remuda_fleet_send",
+                json!({"all":true,"confirm":true,"text":"forbidden"}),
+            ),
+            (
+                "remuda_fleet_keys",
+                json!({"all":true,"confirm":true,"keys":["enter"]}),
+            ),
+            ("remuda_instance_read", json!({"instanceId":"sibling"})),
+            ("remuda_instance_wait", json!({"instanceId":"sibling"})),
+            ("remuda_doctor", json!({"host":"hst_1"})),
+            ("remuda_worktree_rm", json!({"name":"sibling","force":true})),
+            ("remuda_worktree_create", json!({"name":"sibling"})),
+        ] {
+            let response = super::super::handle_rpc(
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":name,"arguments":args}}),
+                &client,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["result"]["isError"], true, "{name}: {response}");
+        }
+        assert!(
+            mock.requests
+                .lock()
+                .await
+                .iter()
+                .all(|request| request == "GET /v1/caller")
+        );
+        let listed = crate::cmd::instance::list_instances(&client, None)
+            .await
+            .unwrap();
+        assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+        for name in ["remuda_instance_read", "remuda_instance_wait"] {
+            let response = super::super::handle_rpc(
+                &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":name,"arguments":{"instanceId":"ins_test","until":"idle"}}}),
+                &client,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["result"]["isError"], false, "{response}");
+        }
+        assert!(mock.requests.lock().await.iter().all(|request| matches!(
+            request.as_str(),
+            "GET /v1/caller" | "GET /v1/instances/ins_test" | "GET /v1/instances/ins_test/journal"
+        )));
+    }
+
+    #[test]
+    fn agent_reads_are_limited_to_self_and_direct_children() {
+        for tool in ["remuda_instance_read", "remuda_instance_wait"] {
+            for target in ["self", "child"] {
+                assert!(
+                    !mcp_requires_approval(&agent(), tool, &json!({"instanceId":target})).unwrap()
+                );
+            }
+            for target in ["sibling", "parent", "grandchild"] {
+                assert!(
+                    mcp_requires_approval(&agent(), tool, &json!({"instanceId":target})).is_err()
+                );
+            }
         }
     }
 

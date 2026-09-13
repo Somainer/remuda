@@ -8,6 +8,9 @@ use std::{collections::VecDeque, time::Duration};
 struct PendingPrompt {
     command_id: CommandId,
     prompt: String,
+    /// Already on disk when the prompt was queued (D-027); a PTY agent reads
+    /// these by path once the prompt is finally typed.
+    attachments: Vec<crate::attachments::MaterializedAttachment>,
     origin: remuda_protocol::InputOrigin,
     message: Box<MessagePayload>,
 }
@@ -36,6 +39,8 @@ pub(super) async fn run(
                 &instance_id,
                 command.command_id.clone(),
                 prompt,
+                // The create prompt stages no attachments (D-027).
+                Vec::new(),
                 crate::origin::input_origin(command.origin),
             )?);
         }
@@ -51,12 +56,12 @@ pub(super) async fn run(
                     interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance worker closed")?;
                     return Err(NodeError::DriverUnavailable);
                 };
-                if let DriverRequest::Send { prompt, origin } = queued.request {
+                if let DriverRequest::Send { prompt, attachments, origin } = queued.request {
                     if pending.len() == capacity {
                         let command = store.get_command(&queued.command_id)?;
                         reject_before_dispatch(store.as_ref(), &instance_id, command, "instance-queue-full")?;
                     } else {
-                        pending.push_back(enqueue(store.as_ref(), &instance_id, queued.command_id, prompt, origin)?);
+                        pending.push_back(enqueue(store.as_ref(), &instance_id, queued.command_id, prompt, attachments, origin)?);
                     }
                 } else {
                     let close_after = queued.close_after;
@@ -97,6 +102,7 @@ fn enqueue(
     instance_id: &InstanceId,
     command_id: CommandId,
     prompt: String,
+    attachments: Vec<crate::attachments::MaterializedAttachment>,
     origin: remuda_protocol::InputOrigin,
 ) -> Result<PendingPrompt, NodeError> {
     let ObservationPayload::Message(mut message) =
@@ -115,6 +121,7 @@ fn enqueue(
     Ok(PendingPrompt {
         command_id,
         prompt,
+        attachments,
         origin,
         message,
     })
@@ -177,6 +184,7 @@ async fn deliver(
                 driver
                     .execute(DriverRequest::Send {
                         prompt: prompt.prompt.clone(),
+                        attachments: prompt.attachments.clone(),
                         origin: prompt.origin,
                     })
                     .await

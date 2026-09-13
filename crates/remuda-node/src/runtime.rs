@@ -42,6 +42,13 @@ pub(crate) struct DevNodeInner {
     pub(crate) stopping: std::sync::atomic::AtomicBool,
     pub(crate) mutations: RwLock<()>,
     pub(crate) herdr_config: Option<crate::NativeDriverConfig>,
+    /// Where staged attachment bytes are pulled from (D-027). `None` on a Node
+    /// with no Hub link, where a send carrying attachments is refused rather
+    /// than silently downgraded to text.
+    pub(crate) objects: std::sync::RwLock<Option<Arc<dyn crate::attachments::ObjectSource>>>,
+    /// Root for materialized attachments. Set by `compose` from the Node data
+    /// dir; `None` on an in-memory Node, where attachments are refused.
+    pub(crate) attachment_root: std::sync::RwLock<Option<std::path::PathBuf>>,
     queue_capacity: usize,
     host: Host,
     workspace: Workspace,
@@ -115,6 +122,8 @@ impl DevNode {
                 stopping: Default::default(),
                 mutations: Default::default(),
                 herdr_config: None,
+                objects: std::sync::RwLock::new(None),
+                attachment_root: std::sync::RwLock::new(None),
                 queue_capacity: config.instance_queue_capacity,
                 host,
                 workspace,
@@ -378,6 +387,67 @@ impl DevNode {
         Ok(CreateInstanceResponse { command, instance })
     }
 
+    /// Point this Node at the Hub's attachment store (D-027).
+    ///
+    /// Set once the outbound link knows its Hub URL and host token. Until it
+    /// is set, a send that carries attachments is refused.
+    pub fn set_object_source(&self, source: Arc<dyn crate::attachments::ObjectSource>) {
+        if let Ok(mut slot) = self.inner.objects.write() {
+            *slot = Some(source);
+        }
+    }
+
+    /// Root under which this Node materializes attachments (D-027).
+    ///
+    /// Explicitly configured rather than inferred, so the fake-driver Node
+    /// used by tests and `--stdio` can have one too.
+    pub fn set_attachment_root(&self, root: std::path::PathBuf) {
+        if let Ok(mut slot) = self.inner.attachment_root.write() {
+            *slot = Some(root);
+        }
+    }
+
+    /// Node data directory, when one is configured.
+    fn data_dir(&self) -> Option<std::path::PathBuf> {
+        if let Ok(slot) = self.inner.attachment_root.read()
+            && let Some(root) = slot.clone()
+        {
+            return Some(root);
+        }
+        self.inner
+            .herdr_config
+            .as_ref()
+            .map(|config| config.data_dir.clone())
+    }
+
+    /// Fetch and write this send's attachments, if it has any.
+    async fn materialize_attachments(
+        &self,
+        instance_id: &InstanceId,
+        request: &InstanceCommandRequest,
+    ) -> Result<Vec<crate::attachments::MaterializedAttachment>, NodeError> {
+        if request.attachments.is_empty() || request.operation != CommandAction::Send {
+            return Ok(Vec::new());
+        }
+        let source = self
+            .inner
+            .objects
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(|| {
+                NodeError::InvalidRequest(
+                    "this Node has no Hub attachment source; send without attachments".into(),
+                )
+            })?;
+        let data_dir = self.data_dir().ok_or_else(|| {
+            NodeError::InvalidRequest(
+                "attachments need a Node data directory; none is configured".into(),
+            )
+        })?;
+        crate::attachments::materialize(&source, &data_dir, instance_id, &request.attachments).await
+    }
+
     /// Submit send/cancel/respond/close through an Instance's bounded queue.
     pub async fn submit_command(
         &self,
@@ -393,7 +463,11 @@ impl DevNode {
             return Err(NodeError::InvalidRequest("Node is shutting down".into()));
         }
         let instance = self.inner.store.get_instance(instance_id)?;
-        let (operation, driver_request, close_after) = command_parts(&request)?;
+        // D-027: pull attachment bytes before the command is queued, so a
+        // failure surfaces as a rejected send rather than as an agent
+        // answering a question about an image it never received.
+        let attachments = self.materialize_attachments(instance_id, &request).await?;
+        let (operation, driver_request, close_after) = command_parts(&request, attachments)?;
         let command_id = request.command_id.clone().unwrap_or_default();
         let mut command = new_command(
             command_id.clone(),
@@ -557,6 +631,7 @@ impl DevNode {
         let store = self.inner.store.clone();
         let interactions = Arc::clone(&self.inner.interactions);
         let tty = self.inner.tty.clone();
+        let data_dir = self.data_dir();
         let worker_instance = instance_id.clone();
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
@@ -569,6 +644,7 @@ impl DevNode {
                 tty,
                 create_command,
                 initial_prompt,
+                data_dir,
             ))
             .catch_unwind()
             .await;
@@ -611,6 +687,7 @@ impl DevNode {
             .await;
         let store = self.inner.store.clone();
         let interactions = Arc::clone(&self.inner.interactions);
+        let data_dir = self.data_dir();
         let id = instance_id.clone();
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
@@ -620,6 +697,7 @@ impl DevNode {
                 tracing::error!(%error, "adopted instance task exited");
                 record_task_exit(store.as_ref(), &id, "driver-task-exited");
             }
+            drop_attachments(data_dir.as_deref(), &id);
             if store
                 .get_instance(&id)
                 .is_ok_and(|instance| instance.lifecycle == InstanceLifecycle::Exited)
@@ -716,6 +794,8 @@ async fn materialize_instance(
     tty: TtyRegistry,
     mut create_command: Command,
     initial_prompt: String,
+    // Node data dir, so this worker can drop its attachments on the way out.
+    data_dir: Option<std::path::PathBuf>,
 ) -> Result<(), NodeError> {
     let observations = match driver.start().await {
         Ok(observations) => observations,
@@ -796,6 +876,7 @@ async fn materialize_instance(
         )
         .await;
         tty.stop(&instance_id).await;
+        drop_attachments(data_dir.as_deref(), &instance_id);
         return result;
     }
     if initial_prompt.is_empty() {
@@ -809,6 +890,9 @@ async fn materialize_instance(
                 command_id: create_command.command_id.clone(),
                 request: DriverRequest::Send {
                     prompt: initial_prompt,
+                    // `instance.create` stages no attachments; the first image
+                    // arrives on a later send.
+                    attachments: Vec::new(),
                     origin: crate::origin::input_origin(create_command.origin),
                 },
                 close_after: false,
@@ -820,7 +904,24 @@ async fn materialize_instance(
 
     let result = instance_worker(store, instance_id.clone(), driver, receiver, interactions).await;
     tty.stop(&instance_id).await;
+    drop_attachments(data_dir.as_deref(), &instance_id);
     result
+}
+
+/// Remove an instance's materialized attachments once its worker is done
+/// (D-027). Best effort: a failure here must not mask the worker's own result,
+/// and `sweep_attachment_orphans` catches whatever a hard kill leaves behind.
+fn drop_attachments(data_dir: Option<&std::path::Path>, instance_id: &InstanceId) {
+    let Some(data_dir) = data_dir else {
+        return;
+    };
+    if let Err(error) = crate::attachments::cleanup(data_dir, instance_id) {
+        tracing::warn!(
+            instance_id = %instance_id.as_id(),
+            %error,
+            "could not remove instance attachments"
+        );
+    }
 }
 
 async fn reject_materialization(
@@ -1131,6 +1232,7 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
 
 fn command_parts(
     request: &InstanceCommandRequest,
+    attachments: Vec<crate::attachments::MaterializedAttachment>,
 ) -> Result<(CommandOperation, DriverRequest, bool), NodeError> {
     match request.operation {
         CommandAction::Send => {
@@ -1143,6 +1245,7 @@ fn command_parts(
                 CommandOperation::InstanceSend,
                 DriverRequest::Send {
                     prompt,
+                    attachments,
                     origin: request.origin,
                 },
                 false,

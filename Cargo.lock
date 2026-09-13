@@ -3163,6 +3163,7 @@ dependencies = [
  "remuda-journal",
  "remuda-protocol",
  "remuda-testing",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

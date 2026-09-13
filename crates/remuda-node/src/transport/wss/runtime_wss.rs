@@ -333,6 +333,10 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
         .as_ref()
         .and_then(|parsed| parsed.run_id.as_deref())
         .and_then(|raw: &str| remuda_protocol::RunId::try_from(raw.to_owned()).ok());
+    let attachments = parsed
+        .as_ref()
+        .map(InstanceSendParams::attachments)
+        .unwrap_or_default();
     let result = node
         .submit_command(
             &instance_id,
@@ -341,6 +345,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 command_id,
                 operation: CommandAction::Send,
                 prompt: Some(prompt),
+                attachments,
                 run_id,
                 interaction_id: None,
                 answer: None,
@@ -381,6 +386,7 @@ async fn cancel_from_params(
                 command_id,
                 operation: CommandAction::Cancel,
                 prompt: None,
+                attachments: Vec::new(),
                 run_id,
                 interaction_id: None,
                 answer: None,
@@ -417,6 +423,7 @@ async fn close_from_params(
                 command_id,
                 operation: CommandAction::Close,
                 prompt: None,
+                attachments: Vec::new(),
                 run_id: None,
                 interaction_id: None,
                 answer: None,
@@ -478,6 +485,7 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 command_id,
                 operation: CommandAction::WriteTty,
                 prompt: None,
+                attachments: Vec::new(),
                 run_id: None,
                 interaction_id: None,
                 answer: None,
@@ -526,6 +534,7 @@ async fn respond_from_params(
                 command_id,
                 operation: CommandAction::RespondInteraction,
                 prompt: None,
+                attachments: Vec::new(),
                 run_id: None,
                 interaction_id,
                 answer: Some(answer),

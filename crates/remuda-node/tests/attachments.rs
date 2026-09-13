@@ -1,0 +1,397 @@
+//! D-027: the Node pulls staged attachment bytes, writes them privately next
+//! to the instance, and removes them when the instance is gone.
+
+use anyhow::{Context, Result};
+use remuda_node::{
+    DevNode, DevServerConfig, MaterializedAttachment, ObjectSource, ServeConfig, compose,
+};
+use remuda_protocol::InstanceId;
+use remuda_protocol::hubnode::AttachmentRef;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+fn png(len: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(len.max(bytes.len()), 0x42);
+    bytes
+}
+
+/// Stands in for the Hub's `GET /v1/objects/{id}`.
+#[derive(Debug, Default)]
+struct FakeObjects {
+    bodies: Mutex<BTreeMap<String, Vec<u8>>>,
+    fetches: AtomicUsize,
+    fail: Mutex<Option<String>>,
+}
+
+impl FakeObjects {
+    fn with(entries: &[(&str, Vec<u8>)]) -> Arc<Self> {
+        let source = Arc::new(Self::default());
+        let mut bodies = source.bodies.lock().expect("lock");
+        for (id, body) in entries {
+            bodies.insert((*id).to_owned(), body.clone());
+        }
+        drop(bodies);
+        source
+    }
+}
+
+impl ObjectSource for FakeObjects {
+    fn fetch(
+        &self,
+        object_id: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, remuda_node::NodeError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if let Some(message) = self.fail.lock().expect("lock").clone() {
+                return Err(remuda_node::NodeError::InvalidRequest(message));
+            }
+            self.bodies
+                .lock()
+                .expect("lock")
+                .get(&object_id)
+                .cloned()
+                .ok_or_else(|| {
+                    remuda_node::NodeError::InvalidRequest(format!("no such object {object_id}"))
+                })
+        })
+    }
+}
+
+fn attachment(object_id: &str, media_type: &str) -> AttachmentRef {
+    AttachmentRef {
+        object_id: object_id.to_owned(),
+        media_type: media_type.to_owned(),
+        name: Some(format!("{object_id}.png")),
+        size: None,
+    }
+}
+
+struct Fixture {
+    node: DevNode,
+    data_dir: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn fixture() -> Result<Fixture> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("node-data");
+    std::fs::create_dir_all(&data_dir)?;
+    let node = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0),
+        data_dir.clone(),
+    ))?;
+    Ok(Fixture {
+        node,
+        data_dir,
+        _dir: dir,
+    })
+}
+
+async fn create_instance(node: &DevNode) -> Result<InstanceId> {
+    let request = serde_json::from_value(json!({
+        "origin": "human",
+        "kind": "claude",
+        "driver": "claude-print",
+        "prompt": "",
+    }))?;
+    let created = node.create_instance(request).await?;
+    Ok(created.instance.meta.id)
+}
+
+async fn send(
+    node: &DevNode,
+    instance: &InstanceId,
+    attachments: Vec<AttachmentRef>,
+) -> Result<Value> {
+    let mut request: remuda_node::InstanceCommandRequest = serde_json::from_value(json!({
+        "origin": "human",
+        "operation": "send",
+        "prompt": "what colour is the image?",
+    }))?;
+    request.attachments = attachments;
+    let result = node.submit_command(instance, request).await?;
+    Ok(serde_json::to_value(result)?)
+}
+
+/// The happy path: bytes land under the instance, named from the object id.
+#[tokio::test]
+async fn a_send_pulls_its_attachments_to_the_instance_directory() -> Result<()> {
+    let fixture = fixture()?;
+    let objects = FakeObjects::with(&[("obj_red", png(512)), ("obj_blue", png(256))]);
+    fixture.node.set_object_source(objects.clone());
+    let instance = create_instance(&fixture.node).await?;
+
+    send(
+        &fixture.node,
+        &instance,
+        vec![
+            attachment("obj_red", "image/png"),
+            attachment("obj_blue", "image/jpeg"),
+        ],
+    )
+    .await?;
+
+    let dir = remuda_node::attachments_dir(&fixture.data_dir, &instance);
+    let red = dir.join("obj_red.png");
+    // The extension follows the media type, not the sender's claimed name.
+    let blue = dir.join("obj_blue.jpg");
+    assert!(red.is_file(), "missing {}", red.display());
+    assert!(blue.is_file(), "missing {}", blue.display());
+    assert_eq!(std::fs::read(&red)?.len(), 512);
+    assert_eq!(std::fs::read(&blue)?.len(), 256);
+    assert_eq!(objects.fetches.load(Ordering::SeqCst), 2);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&red)?.permissions().mode() & 0o777,
+            0o600,
+            "an attachment must not be world readable"
+        );
+        assert_eq!(
+            std::fs::metadata(&dir)?.permissions().mode() & 0o777,
+            0o700,
+            "the attachments directory must not be world readable"
+        );
+    }
+    Ok(())
+}
+
+/// A failed pull must fail the send. Degrading to a text-only prompt would
+/// leave the agent answering about an image it never got.
+#[tokio::test]
+async fn a_failed_pull_rejects_the_whole_send() -> Result<()> {
+    let fixture = fixture()?;
+    let objects = FakeObjects::with(&[("obj_present", png(64))]);
+    fixture.node.set_object_source(objects.clone());
+    let instance = create_instance(&fixture.node).await?;
+
+    let error = send(
+        &fixture.node,
+        &instance,
+        vec![attachment("obj_missing", "image/png")],
+    )
+    .await
+    .expect_err("a missing object must fail the send");
+    assert!(
+        error.to_string().contains("obj_missing"),
+        "{error} should name the object"
+    );
+
+    *objects.fail.lock().expect("lock") = Some("hub unreachable".into());
+    let error = send(
+        &fixture.node,
+        &instance,
+        vec![attachment("obj_present", "image/png")],
+    )
+    .await
+    .expect_err("an unreachable Hub must fail the send");
+    assert!(error.to_string().contains("hub unreachable"), "{error}");
+
+    // Nothing partial is left behind for the caller to trip over.
+    let dir = remuda_node::attachments_dir(&fixture.data_dir, &instance);
+    let staged = std::fs::read_dir(&dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(staged, 0, "a failed send must not leave a partial file");
+    Ok(())
+}
+
+/// Unsupported types never reach the disk, even if a Hub somehow offered one.
+#[tokio::test]
+async fn unsupported_media_types_are_refused_before_any_fetch() -> Result<()> {
+    let fixture = fixture()?;
+    let objects = FakeObjects::with(&[("obj_doc", b"%PDF-1.7".to_vec())]);
+    fixture.node.set_object_source(objects.clone());
+    let instance = create_instance(&fixture.node).await?;
+
+    let error = send(
+        &fixture.node,
+        &instance,
+        vec![attachment("obj_doc", "application/pdf")],
+    )
+    .await
+    .expect_err("pdf is not in the allowlist");
+    assert!(
+        error.to_string().contains("unsupported media type"),
+        "{error}"
+    );
+    assert_eq!(
+        objects.fetches.load(Ordering::SeqCst),
+        0,
+        "the type is checked before the bytes are pulled"
+    );
+    Ok(())
+}
+
+/// Without a Hub link there is nowhere to pull from, so the send is refused
+/// rather than quietly stripped of its images.
+#[tokio::test]
+async fn a_node_with_no_object_source_refuses_attachments_but_still_sends_text() -> Result<()> {
+    let fixture = fixture()?;
+    let instance = create_instance(&fixture.node).await?;
+
+    let error = send(
+        &fixture.node,
+        &instance,
+        vec![attachment("obj_x", "image/png")],
+    )
+    .await
+    .expect_err("no source means no attachments");
+    assert!(error.to_string().contains("attachment source"), "{error}");
+
+    // A text-only send on the same instance is unaffected.
+    send(&fixture.node, &instance, Vec::new()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn more_attachments_than_the_cap_are_refused() -> Result<()> {
+    let fixture = fixture()?;
+    let entries: Vec<(String, Vec<u8>)> = (0..5)
+        .map(|index| (format!("obj_{index}"), png(32)))
+        .collect();
+    let borrowed: Vec<(&str, Vec<u8>)> = entries
+        .iter()
+        .map(|(id, body)| (id.as_str(), body.clone()))
+        .collect();
+    fixture.node.set_object_source(FakeObjects::with(&borrowed));
+    let instance = create_instance(&fixture.node).await?;
+
+    let refs: Vec<AttachmentRef> = entries
+        .iter()
+        .map(|(id, _)| attachment(id, "image/png"))
+        .collect();
+    let error = send(&fixture.node, &instance, refs)
+        .await
+        .expect_err("five attachments exceed the per-message cap");
+    assert!(error.to_string().contains("per-message limit"), "{error}");
+    Ok(())
+}
+
+/// Closing an instance takes its attachments with it.
+#[tokio::test]
+async fn closing_an_instance_removes_its_attachments() -> Result<()> {
+    let fixture = fixture()?;
+    fixture
+        .node
+        .set_object_source(FakeObjects::with(&[("obj_keep", png(128))]));
+    let instance = create_instance(&fixture.node).await?;
+    send(
+        &fixture.node,
+        &instance,
+        vec![attachment("obj_keep", "image/png")],
+    )
+    .await?;
+
+    let dir = remuda_node::attachments_dir(&fixture.data_dir, &instance);
+    assert!(dir.join("obj_keep.png").is_file());
+
+    let close: remuda_node::InstanceCommandRequest = serde_json::from_value(json!({
+        "origin": "human",
+        "operation": "close",
+    }))?;
+    fixture.node.submit_command(&instance, close).await?;
+
+    // The worker removes the directory as it unwinds.
+    for _ in 0..100 {
+        if !dir.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !dir.exists(),
+        "a closed instance must not leave attachments at {}",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// A hard kill leaves directories behind; the sweeper is what reclaims them.
+#[test]
+fn the_sweeper_removes_directories_for_instances_that_are_gone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().to_path_buf();
+    let live = InstanceId::new();
+    let dead = InstanceId::new();
+    for id in [&live, &dead] {
+        let attachments = remuda_node::attachments_dir(&data_dir, id);
+        std::fs::create_dir_all(&attachments)?;
+        std::fs::write(attachments.join("obj_a.png"), png(16))?;
+    }
+
+    let mut keep = std::collections::BTreeSet::new();
+    keep.insert(live.as_id().as_str().to_owned());
+    let removed = remuda_node::sweep_attachment_orphans(&data_dir, &keep)?;
+    assert_eq!(removed, 1);
+    assert!(remuda_node::attachments_dir(&data_dir, &live).is_dir());
+    assert!(!remuda_node::attachments_dir(&data_dir, &dead).is_dir());
+
+    // Re-running is a no-op rather than an error.
+    assert_eq!(remuda_node::sweep_attachment_orphans(&data_dir, &keep)?, 0);
+    Ok(())
+}
+
+/// Paths are always rebuilt from the object id, so a returned path cannot
+/// escape the instance directory.
+#[tokio::test]
+async fn a_traversal_shaped_object_id_never_becomes_a_path() -> Result<()> {
+    let fixture = fixture()?;
+    fixture
+        .node
+        .set_object_source(FakeObjects::with(&[("../../escape", png(16))]));
+    let instance = create_instance(&fixture.node).await?;
+
+    let error = send(
+        &fixture.node,
+        &instance,
+        vec![attachment("../../escape", "image/png")],
+    )
+    .await
+    .expect_err("a traversal id is not a bare identifier");
+    assert!(error.to_string().contains("bare identifier"), "{error}");
+    assert!(
+        !fixture
+            .data_dir
+            .parent()
+            .map(|p| p.join("escape.png").exists())
+            .unwrap_or(false),
+        "nothing may be written outside the instance directory"
+    );
+    Ok(())
+}
+
+/// Every materialized attachment reports the path the drivers will use.
+#[tokio::test]
+async fn materialized_paths_are_absolute_and_inside_the_instance_directory() -> Result<()> {
+    let fixture = fixture()?;
+    let source: Arc<dyn ObjectSource> = FakeObjects::with(&[("obj_one", png(48))]);
+    let instance = InstanceId::new();
+    let materialized: Vec<MaterializedAttachment> = remuda_node::materialize_attachments(
+        &source,
+        &fixture.data_dir,
+        &instance,
+        &[attachment("obj_one", "image/png")],
+    )
+    .await?;
+    let first = materialized.first().context("one attachment")?;
+    assert_eq!(first.object_id, "obj_one");
+    assert_eq!(first.media_type, "image/png");
+    assert_eq!(first.byte_len, 48);
+    assert!(first.path.is_absolute() || first.path.starts_with(&fixture.data_dir));
+    assert!(
+        first
+            .path
+            .starts_with(remuda_node::attachments_dir(&fixture.data_dir, &instance)),
+        "{} must live under the instance directory",
+        first.path.display()
+    );
+    Ok(())
+}

@@ -45,6 +45,9 @@ pub enum DriverRequest {
     Send {
         /// Plain development prompt.
         prompt: String,
+        /// Attachments already pulled to this host's disk (D-027). Empty for
+        /// a text-only send, which is every send from an older client.
+        attachments: Vec<crate::attachments::MaterializedAttachment>,
         /// Who submitted this input, independent of the instance's creator.
         origin: remuda_protocol::InputOrigin,
     },

@@ -225,6 +225,10 @@ pub struct InstanceCommandRequest {
     /// Prompt text for `send`.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Attachment metadata for `send` (D-027). The bytes are pulled from the
+    /// Hub and written to disk before the command reaches a driver.
+    #[serde(default)]
+    pub attachments: Vec<remuda_protocol::hubnode::AttachmentRef>,
     /// Optional Run identity carried by cancel requests.
     #[serde(default)]
     pub run_id: Option<RunId>,

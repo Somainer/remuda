@@ -36,7 +36,7 @@ impl Driver for FakePty {
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
         Box::pin(async move {
             match request {
-                DriverRequest::Send { prompt, origin } => {
+                DriverRequest::Send { prompt, origin, .. } => {
                     self.attempts.fetch_add(1, Ordering::SeqCst);
                     if self.race_unavailable.swap(false, Ordering::SeqCst) {
                         self.ready.store(false, Ordering::SeqCst);

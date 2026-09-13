@@ -49,6 +49,15 @@ const RESERVED: &[&str] = &[
 /// Extra flags `spec.args` may append after the template.
 const EXTRA_ALLOWLIST: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-config", "name"];
 
+/// Values `--effort` accepts: the five D-028 §9.1 levels plus `ultracode`.
+///
+/// The legacy tier names (`default` / `think` / `think-hard`) are normalized
+/// to levels by [`remuda_protocol::EffortSelection`] *before* argv is built,
+/// so reaching this allowlist with one of them means a caller hand-wrote a
+/// flag that the binary would reject. Refuse it here, where the error names
+/// the flag, instead of at launch where it is a startup crash.
+const EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
+
 /// Env names that disable native features. A spec may set these to a falsy
 /// value; anything truthy is refused. The full denylist is
 /// [`crate::child_env::is_denied`].
@@ -98,6 +107,15 @@ pub(crate) fn validate_spec_args(
                 return Err(DriverError::NativeFeatureDisabled(
                     "empty --setting-sources is prohibited".into(),
                 ));
+            }
+        }
+        if key == "effort" {
+            let value = flag.value.as_deref().unwrap_or_default().trim();
+            if !EFFORT_VALUES.contains(&value) {
+                return Err(DriverError::InvalidLaunchSpec(format!(
+                    "--effort {value} is not one of {}",
+                    EFFORT_VALUES.join(" / ")
+                )));
             }
         }
     }
@@ -261,5 +279,36 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_spec_args(DriverKind::ClaudePrint, &["--bare".into()]).is_err());
+    }
+
+    #[test]
+    fn effort_values_are_the_five_levels_plus_ultracode() {
+        for value in ["low", "medium", "high", "xhigh", "max", "ultracode"] {
+            assert!(
+                validate_spec_args(
+                    DriverKind::ShellPty,
+                    &["--effort".into(), value.to_string()]
+                )
+                .is_ok(),
+                "{value}"
+            );
+            assert!(
+                validate_spec_args(DriverKind::ShellPty, &[format!("--effort={value}")]).is_ok(),
+                "{value}="
+            );
+        }
+        // D-028 §9.1 retires the legacy tier names. They are normalized to
+        // levels before argv is built, so one arriving here is a bug worth an
+        // error rather than a flag the binary would reject at startup.
+        for value in ["think", "think-hard", "default", "ultra", ""] {
+            assert!(
+                validate_spec_args(
+                    DriverKind::ShellPty,
+                    &["--effort".into(), value.to_string()]
+                )
+                .is_err(),
+                "{value}"
+            );
+        }
     }
 }

@@ -88,6 +88,25 @@ pub struct ClaudeBgRef {
     pub job_id: String,
 }
 
+/// One capability this live session actually reached, with the tier that
+/// proves it; `protocol.md` §1.3 (D-028 §4.3).
+///
+/// A runtime entry outranks the static `DriverKind` matrix for the same name.
+/// It carries its own `state`, so a session may report a capability as
+/// `unknown` just as truthfully as `supported`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCapability {
+    /// Which capability this entry overrides.
+    pub name: CapabilityName,
+    /// Observed state. `unknown` is honest and stays callable-refusing.
+    pub state: CapabilityState,
+    /// Signal tier that produced the observation.
+    pub tier: SignalTier,
+    /// Stable machine-readable cause (`hook-socket-open`, `no-adapter`, …).
+    pub reason_code: String,
+}
+
 /// NativeRef; `protocol.md` §1.3.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +121,18 @@ pub struct NativeRef {
     pub session_id: Knowledge<String>,
     /// `transcript`; protocol §1.3.
     pub transcript: Knowledge<TranscriptRef>,
+    /// Highest signal layer this session actually reached; §1.3 (D-028 §4.3).
+    ///
+    /// Absent on pre-D-028 payloads and on drivers that never report one.
+    /// Absent is not [`SignalTier::None`]: it means "nobody said", so
+    /// [`crate::CapabilitySet`] falls back to the static driver matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_tier: Option<SignalTier>,
+    /// Capabilities this session reports at runtime; §1.3 (D-028 §4.3).
+    ///
+    /// Empty or absent means "no runtime report"; the static matrix stands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<RuntimeCapability>,
     /// `codex`; protocol §1.3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexRef>,

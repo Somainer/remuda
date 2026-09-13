@@ -33,7 +33,29 @@ pub struct Capability {
     pub evidence: Vec<CapabilityEvidence>,
 }
 
+impl Capability {
+    /// A truthful `unknown` capability: no evidence either way; §3.2.
+    ///
+    /// This is the fill-in for a capability a peer's payload does not mention,
+    /// and the honest default for anything unverified (D-028 §6). `unknown` is
+    /// never `false`: calling it returns `CAPABILITY_UNKNOWN`.
+    pub fn unverified() -> Self {
+        Self {
+            state: CapabilityState::Unknown,
+            scope: vec![],
+            reason_code: "insufficient-evidence".into(),
+            prerequisites: vec![],
+            evidence: vec![],
+        }
+    }
+}
+
 /// Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid.
+///
+/// D-028 §6 added `queue` / `interrupt` alongside `steer`. They are
+/// `#[serde(default)]` to an `unknown` [`Capability`] so a snapshot written by
+/// a pre-D-028 peer still parses; "absent" is read as "not verified", never as
+/// unsupported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub struct CapabilitySet {
@@ -41,6 +63,12 @@ pub struct CapabilitySet {
     pub resume: Capability,
     /// Capability `steer`; §3.2.
     pub steer: Capability,
+    /// Capability `queue`; §3.2 (D-028 §6). Absent on pre-D-028 payloads.
+    #[serde(default = "Capability::unverified")]
+    pub queue: Capability,
+    /// Capability `interrupt`; §3.2 (D-028 §6). Absent on pre-D-028 payloads.
+    #[serde(default = "Capability::unverified")]
+    pub interrupt: Capability,
     /// Capability `model-switch`; §3.2.
     pub model_switch: Capability,
     /// Capability `fork`; §3.2.

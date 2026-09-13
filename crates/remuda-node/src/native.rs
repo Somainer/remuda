@@ -943,6 +943,7 @@ fn instance_spec(
             revision: U64(1),
         },
         model_id,
+        effort: launch.request.effort,
         permission_mode: PermissionMode::Claude(Box::new(ClaudePermission { mode, interaction })),
         env: BTreeMap::new(),
         args: with_max_budget(

@@ -143,6 +143,8 @@ fn native_ref_bg(spec: &InstanceSpec, job_id: &str, session: &str) -> NativeRef 
             reason: "review".into(),
             evidence_event_ids: vec![],
         },
+        signal_tier: None,
+        capabilities: Vec::new(),
         codex: None,
         acp: None,
         claude: Some(ClaudeRef {
@@ -480,6 +482,8 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
             reason: "review".into(),
             evidence_event_ids: vec![],
         },
+        signal_tier: None,
+        capabilities: Vec::new(),
         codex: None,
         acp: None,
         claude: Some(ClaudeRef {

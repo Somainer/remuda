@@ -313,6 +313,8 @@ async fn resume_reapplies_settings_and_model() {
             reason: "test".into(),
             evidence_event_ids: vec![],
         },
+        signal_tier: None,
+        capabilities: Vec::new(),
         codex: None,
         acp: None,
         claude: Some(ClaudeRef {

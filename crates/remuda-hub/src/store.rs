@@ -261,13 +261,29 @@ pub struct InstanceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Native effort tier name.
+    ///
+    /// Normalized to a D-028 §9.1 level (`low` … `max`) on read, so a row
+    /// stored with a legacy tier (`think`, `think-hard`, `default`) reads back
+    /// as the level it means. `ultracode` reads back as `xhigh` with
+    /// [`InstanceRecord::effort_ultracode`] set.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "effortName"
     )]
     pub effort_name: Option<String>,
+    /// Dynamic-workflow flag; D-028 §9.1. Session-only, never a sixth level.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortUltracode"
+    )]
+    pub effort_ultracode: Option<bool>,
     /// Native effort tier index.
+    ///
+    /// Legacy field, preserved so an older client's list row still renders.
+    /// It is **not** used to derive the tier: see the normalization note on
+    /// `effort_name`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -304,6 +320,17 @@ pub struct InstanceRecord {
         rename = "promotedAt"
     )]
     pub promoted_at: Option<String>,
+    /// `remuda` or `user` — who ran the launch command (D-028 §1.0 rule 4).
+    ///
+    /// Derived from `mode` / `promoted_at` for rows written before D-028, so
+    /// it is always populated on read even though no column stores it.
+    /// Provenance only: it never gates a capability.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "launchedBy"
+    )]
+    pub launched_by: Option<String>,
 }
 
 impl InstanceRecord {
@@ -324,6 +351,13 @@ impl InstanceRecord {
         });
         if let Some(object) = spec.as_object_mut() {
             if let Some(name) = &self.effort_name {
+                // Write the normalized D-028 shape so the resumed child never
+                // has to re-normalize, and keep the legacy keys for a Node
+                // that has not picked up the new field yet.
+                object.insert(
+                    "effort".into(),
+                    json!({ "name": name, "ultracode": self.effort_ultracode.unwrap_or(false) }),
+                );
                 object.insert("effortName".into(), json!(name));
             }
             if let Some(index) = self.effort_index {
@@ -1655,14 +1689,25 @@ impl Store {
             {
                 object.insert("model".into(), json!(model));
             }
-            if let Some(effort) = payload.get("effort") {
-                object.insert("effort".into(), effort.clone());
-            } else if payload.get("effortName").is_some() || payload.get("effortIndex").is_some() {
+            // D-028 §9.1: whatever spelling arrives — the new object, the old
+            // `{index, name}` object, a bare `effortName` string — is stored
+            // as one normalized shape, so reload and list rows agree and no
+            // consumer has to know the legacy tables.
+            let incoming = payload.get("effort").cloned().or_else(|| {
+                payload
+                    .get("effortName")
+                    .and_then(Value::as_str)
+                    .map(|name| json!(name))
+            });
+            if let Some(incoming) = incoming
+                && let Ok(selection) =
+                    serde_json::from_value::<remuda_protocol::EffortSelection>(incoming)
+            {
                 object.insert(
                     "effort".into(),
                     json!({
-                        "name": payload.get("effortName"),
-                        "index": payload.get("effortIndex"),
+                        "name": selection.level_name(),
+                        "ultracode": selection.ultracode,
                     }),
                 );
             }
@@ -4261,15 +4306,28 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let effort = spec.get("effort");
-            let effort_name = effort
+            // D-028 §9.1: normalize by NAME, never by index. The legacy
+            // tables were per-harness and different lengths, so index 3 was
+            // `ultracode` for claude but `ultra` for codex — carrying the
+            // index across would silently change the tier.
+            let legacy_name = effort
                 .and_then(|value| value.get("name"))
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    spec.get("effortName")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
+                .or_else(|| effort.and_then(Value::as_str))
+                .or_else(|| spec.get("effortName").and_then(Value::as_str));
+            let effort_ultracode = effort
+                .and_then(|value| value.get("ultracode"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let normalized = legacy_name.map(|name| {
+                let mut selection = remuda_protocol::EffortSelection::from_legacy_name(name);
+                if effort_ultracode {
+                    selection.ultracode = true;
+                }
+                selection
+            });
+            let effort_name = normalized.map(|selection| selection.level_name().to_string());
+            let effort_ultracode = normalized.map(|selection| selection.ultracode);
             let effort_index = effort
                 .and_then(|value| value.get("index"))
                 .and_then(Value::as_u64)
@@ -4279,6 +4337,16 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                         .and_then(Value::as_u64)
                         .map(|n| n as u32)
                 });
+            let mode: Option<String> = row.get(15)?;
+            let promoted_at: Option<String> = row.get(16)?;
+            let launched_by = Some(
+                if mode.as_deref() == Some("promoted") || promoted_at.is_some() {
+                    "user"
+                } else {
+                    "remuda"
+                }
+                .to_string(),
+            );
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 parent_instance_id: spec
@@ -4301,6 +4369,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_source_hint,
                 model,
                 effort_name,
+                effort_ultracode,
                 effort_index,
                 native_session_id: spec
                     .get("nativeSessionId")
@@ -4322,8 +4391,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
                 last_error: row.get(14)?,
-                mode: row.get(15)?,
-                promoted_at: row.get(16)?,
+                mode,
+                promoted_at,
+                launched_by,
             })
         },
     )

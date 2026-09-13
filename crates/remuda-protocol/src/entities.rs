@@ -256,12 +256,52 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     /// `mode`; protocol §2.3. How this Instance arrived at its current `kind`.
+    ///
+    /// Kept for compatibility with pre-D-028 peers. [`Instance::launched_by`]
+    /// is the field that answers "who typed the command"; `mode` keeps
+    /// answering "was this kind promoted".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<InstanceMode>,
     /// `promoted_at`; protocol §2.3. Set only while `mode` is
     /// [`InstanceMode::Promoted`] (D-025).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_at: Option<Timestamp>,
+    /// `launched_by`; protocol §2.3 (D-028 §1.0 rule 4). Who ran the command.
+    ///
+    /// Records provenance only — **never** a capability level. A `user`-launched
+    /// session is entitled to exactly the same signals as a `remuda`-launched
+    /// one. Absent on pre-D-028 rows; derive it with
+    /// [`Instance::derived_launched_by`], which reads `mode` / `promoted_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_by: Option<LaunchedBy>,
+}
+
+impl Instance {
+    /// `launched_by`, deriving it from `mode` / `promoted_at` when absent.
+    ///
+    /// A row written before D-028 has no `launchedBy`. `mode: promoted`
+    /// (equivalently: a `promoted_at` stamp) means a login shell had an agent
+    /// CLI take over its PTY foreground — nobody but the user typed that, so it
+    /// reads back as [`LaunchedBy::User`]. Everything else was started by
+    /// Remuda's own launch path: [`LaunchedBy::Remuda`].
+    pub fn derived_launched_by(&self) -> LaunchedBy {
+        if let Some(value) = self.launched_by {
+            return value;
+        }
+        derive_launched_by(self.mode, self.promoted_at.is_some())
+    }
+}
+
+/// Legacy-row `launchedBy` derivation; `protocol.md` §2.3 (D-028 §1.0).
+///
+/// Split out so Hub store rows — which carry `mode` / `promotedAt` as loose
+/// strings rather than an [`Instance`] — derive it the same way.
+pub fn derive_launched_by(mode: Option<InstanceMode>, promoted_at: bool) -> LaunchedBy {
+    if mode == Some(InstanceMode::Promoted) || promoted_at {
+        LaunchedBy::User
+    } else {
+        LaunchedBy::Remuda
+    }
 }
 
 /// RunCause; `protocol.md` §2.4.

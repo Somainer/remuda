@@ -363,16 +363,6 @@ pub struct InstanceSendParams {
     pub completion_scope: CompletionScope,
 }
 
-/// Native effort tier stored on `instance.configure`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct EffortSelection {
-    /// Index into the harness-native table.
-    pub index: u32,
-    /// Native tier name (`think`, `high`, `max`, …).
-    pub name: String,
-}
-
 /// InstanceConfigureParams; `protocol.md` §7.2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]

@@ -1552,6 +1552,8 @@ fn native_ref_for(live: &PtyLive) -> NativeRef {
             value: live.session_id.clone(),
         },
         transcript,
+        signal_tier: None,
+        capabilities: Vec::new(),
         codex: None,
         acp: None,
         claude: Some(ClaudeRef {

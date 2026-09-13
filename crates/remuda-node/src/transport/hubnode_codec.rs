@@ -319,6 +319,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             provider_auth_token: None,
             resume_session_id: None,
             resumed_from: None,
+            // Filled by apply_spec_launch_fields from the Hub spec.
+            effort: None,
         },
     };
     request.apply_spec_launch_fields(&spec);

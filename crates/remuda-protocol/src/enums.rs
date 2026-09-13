@@ -90,6 +90,11 @@ wire_enum!(InstanceMode, "2.3", {
     Promoted => "promoted",
 });
 
+wire_enum!(LaunchedBy, "2.3", {
+    Remuda => "remuda",
+    User => "user",
+});
+
 wire_enum!(Connectivity, "2.3", {
     Connected => "connected",
     Disconnected => "disconnected",
@@ -260,6 +265,8 @@ wire_enum!(InteractionResolutionReason, "2.6", {
 wire_enum!(CapabilityName, "3.2", {
     Resume => "resume",
     Steer => "steer",
+    Queue => "queue",
+    Interrupt => "interrupt",
     ModelSwitch => "model-switch",
     Fork => "fork",
     StructuredWorkflow => "structured-workflow",
@@ -293,6 +300,14 @@ wire_enum!(NativeRequestValueType, "1.3", {
     Number => "number",
 });
 
+wire_enum!(SignalTier, "1.3", {
+    Hook => "hook",
+    File => "file",
+    Osc => "osc",
+    Screen => "screen",
+    None => "none",
+});
+
 wire_enum!(AttachMode, "3.1", {
     Observe => "observe",
     Control => "control",
@@ -300,6 +315,8 @@ wire_enum!(AttachMode, "3.1", {
 
 wire_enum!(PromptMode, "3.1", {
     NewTurn => "new-turn",
+    Steer => "steer",
+    Queue => "queue",
 });
 
 wire_enum!(InputOrigin, "3.1", {
@@ -310,6 +327,14 @@ wire_enum!(InputOrigin, "3.1", {
 
 wire_enum!(ModelEffective, "3.1", {
     NextTurn => "next-turn",
+});
+
+wire_enum!(EffortName, "4.1", {
+    Low => "low",
+    Medium => "medium",
+    High => "high",
+    Xhigh => "xhigh",
+    Max => "max",
 });
 
 wire_enum!(ClaudePermissionMode, "4.1", {
@@ -424,6 +449,9 @@ wire_enum!(SourceChannel, "5.1", {
     Pty => "pty",
     Herdr => "herdr",
     Runtime => "runtime",
+    File => "file",
+    Osc => "osc",
+    Screen => "screen",
 });
 
 wire_enum!(SourceDelivery, "5.1", {

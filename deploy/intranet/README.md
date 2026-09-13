@@ -1,10 +1,11 @@
 # Intranet Hub behind the existing Caddy
 
-Status: **prepared only — awaiting-caddy-restart-approval**. The latest user
-instruction requires reviewable apply/rollback scripts and explicit approval
-before restarting Caddy. Do not activate the staged site or proceed with
-Node acceptance while waiting. Earlier live probes and baseline restoration
-are recorded in the evidence file; they are not final activation evidence.
+Status: **activated after explicit Caddy restart approval on 2026-09-13**.
+The approved apply completed without rollback. Gateway readiness retained its
+reviewed response hash, and Hub HTTPS `/healthz` returned 200 with certificate
+verification passing. See the [activation evidence](../../docs/design/evidence/intranet-hub-1.md#approved-activation--2026-09-13).
+Browser login and Node acceptance remain pending; earlier staging probes are
+historical and do not establish those checks.
 
 This is the immediate [D-020](../../docs/design/decisions.md) deployment
 path. Run Hub on the SG host, join its existing `deploy_default` network,
@@ -76,9 +77,9 @@ container loopback without publishing host port 2019. The gateway site and
 its `/v1` route remain unchanged. The script validates the candidate config,
 then runs `docker restart deploy-caddy-1` and checks the gateway response
 hash plus Remuda HTTPS `/healthz` with certificate verification. That restart
-may interrupt connections served by Caddy and is
-the action awaiting approval. Current preparation does not run it. Earlier
-API/SIGUSR1 attempts belong only in the evidence record.
+may interrupt connections served by Caddy and requires explicit approval.
+Preparation does not run it. The approved activation and earlier API/SIGUSR1
+attempts are recorded separately in the evidence file.
 
 The following is for use **after approval**, not during preparation:
 
@@ -105,15 +106,17 @@ these missing tools; an online Node does not establish session execution
 readiness.
 
 The prepared `rollback` path restores the original global admin setting
-(currently `admin off`) and import state, deactivating the staged Remuda
-include, then validates, restarts `deploy-caddy-1` and checks gateway health.
+(pre-activation `admin off`) and import state, deactivating the Remuda
+include, then restarts `deploy-caddy-1` and checks gateway health. It verifies
+the saved baseline hash before restoring it, allowing recovery even if Caddy
+is stopped.
 Rollback also contains a restart and must not run before approval. Preserve
 Hub data, the `/config` and certificate volumes, and the shared
 network. The standalone public VPS scripts are not intended to manage this
 existing Caddy deployment.
 
-Keep this explicit rollback command for approved recovery; it is not run
-while awaiting restart approval:
+Keep this explicit rollback command for approved recovery; it was not needed
+during the successful activation:
 
 ```bash
 python3 remuda-caddy-change.py rollback --settings .remuda-caddy-change.json

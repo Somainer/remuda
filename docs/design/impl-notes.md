@@ -1111,3 +1111,20 @@ was installed and no SG/bolt persistent change was made under this milestone.
 The Mac Herdr default isolation fix and remaining acceptance/remote install plan
 are recorded in [intranet-enroll-1.md](./evidence/intranet-enroll-1.md).
 An approved compatible Hub upgrade is required before enrollment can continue.
+
+### 2026-09-13 — Intranet upgrade and Mac acceptance continuation
+
+The approved Hub-only upgrade to `9dd7ec7` resolved the prior D-018 HTTP 405.
+Certificate-verified health, login/pairing, secure cookies and enrollment now pass.
+The new Mac launchd Node uses isolated Herdr defaults and an optimized binary;
+host identity and credential persisted across its binary upgrade. Shell prompt/reply
+and stop passed. A controlled WSS interruption replayed four offline journal events
+from Hub watermark 7 to 11 with the same PID and host ID. Caddy and the existing
+demo remained untouched; no SG/bolt Node was installed.
+
+Remaining blocker: `native-claude-sessionstart`. Bounded Claude PTY attempts
+(including 180 seconds on the optimized release) launched Claude but produced no
+current SessionStart metadata or reply; inputs stayed queued. Acceptance instances
+were stopped. See [intranet-enroll-1.md](./evidence/intranet-enroll-1.md) for exact
+artifacts, failed probes, replay evidence, preserved invariants and the remote Node
+installation plan. No startup/readiness safety guard was bypassed.

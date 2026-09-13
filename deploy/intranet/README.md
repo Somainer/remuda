@@ -1,13 +1,13 @@
 # Intranet Hub behind the existing Caddy
 
-Status: **HTTPS activated; Mac device paired; Node enrollment blocked by the
-deployed Hub's missing D-018 endpoint**. Approved Caddy activation is recorded in
-[intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md). API pairing and
-the cookie session passed, but authenticated `POST /v1/hosts/enroll-token`
-returned HTTP 405. A compatible Hub upgrade is required before installing the
-Mac daemon. See [intranet-enroll-1.md](../../docs/design/evidence/intranet-enroll-1.md)
-for the isolation fix, pending PTY/reconnect acceptance and SG/bolt installation
-plan. No remote Node installation was performed in this milestone.
+Status: **HTTPS active; Hub upgraded to `9dd7ec7`; Mac device paired and persistent
+Node enrolled; shell prompt/reply and outbound WSS durable replay passed. Claude
+PTY acceptance is blocked: native startup never reached SessionStart readiness.** Approved Caddy activation is recorded in
+[intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md). The Hub-only
+upgrade preserved data, environment, mounts and Caddy. See
+[intranet-enroll-1.md](../../docs/design/evidence/intranet-enroll-1.md) for build
+identity, pairing, Node isolation, live acceptance and the unexecuted SG/bolt Node
+installation plan.
 
 This is the immediate [D-020](../../docs/design/decisions.md) deployment
 path. Run Hub on the SG host, join its existing `deploy_default` network,

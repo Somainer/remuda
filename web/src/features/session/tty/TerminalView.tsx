@@ -15,6 +15,14 @@ import { LocalInput } from "./LocalInput";
 import { attachTerminalRenderer, type TerminalRenderer } from "./renderer";
 import { createFontMeasure, fittedTerminalFont, responsiveTerminalSize, whenFontsReady } from "./terminalFit";
 import { attachTerminalTouch } from "./terminalTouch";
+import {
+  allowInput,
+  inputGate,
+  localWheelWanted,
+  MOUSE_TRACKING_RESET,
+  trackingActive,
+} from "./mouseReports";
+import { applyStdinPolicy, stdinPolicy } from "./stdinPolicy";
 import { NIGHT_CORRAL_THEME, TERMINAL_FONT_FAMILY } from "./theme";
 import css from "./TerminalView.module.css";
 
@@ -57,7 +65,10 @@ export function TerminalView({
   const resetStreamRef = useRef(true);
   const generationRef = useRef(0);
   const directRef = useRef(true);
-  const { mobile, offsetTop } = useWorkbenchViewport();
+  const frozenRef = useRef(false);
+  const gateRef = useRef({ keyboard: true, mouse: true });
+  const localWheelRef = useRef(false);
+  const { mobile, coarsePointer, offsetTop } = useWorkbenchViewport();
   const [inputOverride, setInputOverride] = useState<{ direct: boolean; mode: DisplayMode } | null>(null);
   const [status, setStatus] = useState<TtyStatus>("connecting");
   const [cols, setCols] = useState(80);
@@ -65,7 +76,12 @@ export function TerminalView({
   const [fullscreen, setFullscreen] = useState(false);
   const [renderer, setRenderer] = useState<TerminalRenderer>("dom");
   const [mouseMode, setMouseMode] = useState("none");
-  const directInput = inputOverride?.direct ?? !mobile;
+  // A2: sticky DECSET tracking. `mouseReports` is the user's escape hatch —
+  // with it off, pointer reports are dropped and the wheel scrolls locally.
+  const [mouseReports, setMouseReports] = useState(true);
+  // A3: a narrow *desktop* window is still a mouse+keyboard terminal. Only a
+  // coarse pointer (no hardware keyboard) should default to the local dock.
+  const directInput = inputOverride?.direct ?? !coarsePointer;
   const mode = inputOverride?.mode ?? (mobile ? "responsive" : "fit");
   const ioMode = directInput ? "raw" : "keys";
   const modeRef = useRef<DisplayMode>(mode);
@@ -95,12 +111,26 @@ export function TerminalView({
   useEffect(() => {
     directRef.current = directInput;
   }, [directInput]);
+  useEffect(() => {
+    frozenRef.current = frozen;
+  }, [frozen]);
+  useEffect(() => {
+    gateRef.current = inputGate({ directInput, frozen, mouseReports });
+  }, [directInput, frozen, mouseReports]);
+  useEffect(() => {
+    localWheelRef.current = localWheelWanted({ mouseMode, mouseReports });
+  }, [mouseMode, mouseReports]);
 
   useEffect(() => {
     const host = hostRef.current;
     const viewport = viewportRef.current;
     if (!host || !viewport) return;
 
+    // The Terminal is rebuilt whenever `instance.id` changes (sidebar A→B→A
+    // keeps this component mounted), so the stdin policy has to be derived
+    // here from the *current* refs — the [directInput, frozen] effect below
+    // does not re-run when only the terminal instance changed.
+    const initialStdin = stdinPolicy({ directInput: directRef.current, frozen: frozenRef.current });
     const term = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
@@ -110,7 +140,7 @@ export function TerminalView({
       lineHeight: 1,
       scrollback: 4000,
       convertEol: false,
-      disableStdin: true,
+      disableStdin: initialStdin.disableStdin,
       macOptionIsMeta: true,
       theme: NIGHT_CORRAL_THEME,
     });
@@ -125,7 +155,17 @@ export function TerminalView({
     term.open(host);
     termRef.current = term;
     searchRef.current = search;
+    if (initialStdin.focus) term.focus();
+    // Per-instance view state must not leak across a session switch.
+    resetStreamRef.current = true;
+    setReady(false);
+    setStatus("connecting");
+    setMouseMode(term.modes.mouseTrackingMode);
+    setMouseReports(true);
+    setPreview("");
+    setRawTail("");
     const font = createFontMeasure(host, TERMINAL_FONT_FAMILY);
+    let disposed = false;
     const outQueue: Uint8Array[] = [];
     let outRaf = 0;
     let resizeTimer = 0;
@@ -142,9 +182,16 @@ export function TerminalView({
 
     const applyFit = () => {
       if (!termRef.current || !viewportRef.current) return;
+      // A4: xterm is mounted in `.host`, which carries 16px/20px padding inside
+      // `.viewport`. Measuring `.viewport` overshot by that padding, so the
+      // bottom row was clipped and `.viewport` grew its own scrollbar.
+      // `clientHeight` still counts padding, so take it off explicitly.
+      const pad = window.getComputedStyle(host);
+      const padX = (parseFloat(pad.paddingLeft) || 0) + (parseFloat(pad.paddingRight) || 0);
+      const padY = (parseFloat(pad.paddingTop) || 0) + (parseFloat(pad.paddingBottom) || 0);
       const bounds = {
-        width: viewport.clientWidth,
-        height: viewport.clientHeight,
+        width: Math.max(0, host.clientWidth - padX),
+        height: Math.max(0, host.clientHeight - padY),
         dpr: window.devicePixelRatio || 1,
         lineHeight: term.options.lineHeight || 1,
         letterSpacing: term.options.letterSpacing || 0,
@@ -172,6 +219,19 @@ export function TerminalView({
         if (fitted != null && term.options.fontSize !== fitted) term.options.fontSize = fitted;
         fit.fit();
       }
+      // A4: FitAddon derives rows from its own CSS cell estimate, which can
+      // round one row larger than the renderer actually paints; that extra row
+      // then overflows `.host` and the bottom line is clipped. Trim against
+      // the painted screen height.
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
+      if (screen && term.rows > 1) {
+        const painted = screen.getBoundingClientRect().height;
+        const cell = painted / term.rows;
+        if (cell > 0 && painted > bounds.height) {
+          const fits = Math.max(3, Math.floor(bounds.height / cell));
+          if (fits < term.rows) term.resize(term.cols, fits);
+        }
+      }
       setCols(term.cols);
       setRows(term.rows);
       window.clearTimeout(resizeTimer);
@@ -180,12 +240,17 @@ export function TerminalView({
       }, 40);
     };
 
+    // Gate keyboard and pointer independently. `disableStdin` cannot do this:
+    // xterm drops mouse reports on the same flag, which is what made `keys`
+    // mode (and the stale-flag bug) kill scroll and clicks along with typing.
     const inputDisposable = term.onData((data) => {
       if (term.options.disableStdin) return;
+      if (!allowInput(data, gateRef.current)) return;
       send(data);
     });
     const binaryDisposable = term.onBinary((data) => {
       if (term.options.disableStdin) return;
+      if (!allowInput(data, gateRef.current)) return;
       send(binaryStringToBytes(data));
     });
 
@@ -193,6 +258,8 @@ export function TerminalView({
     void whenFontsReady().then(() => applyFitRef.current());
     applyFit();
     void attachTerminalRenderer(term).then((name) => {
+      // May resolve after a session switch already disposed this terminal.
+      if (disposed) return;
       setRenderer(name);
       applyFitRef.current();
     });
@@ -211,7 +278,8 @@ export function TerminalView({
         const bytes = payloadForStreamWrite(payload, false);
         const text = stripAnsi(payload);
         const latin1 = Array.from(payload, (b) => String.fromCharCode(b)).join("");
-        setPreview((current) => (shouldReset ? text : current + text));
+        // B5: bound the preview like rawTail — an unbounded <pre> wedges long sessions.
+        setPreview((current) => (shouldReset ? text : (current + text).slice(-4000)));
         setRawTail((current) => (shouldReset ? latin1 : (current + latin1).slice(-4000)));
         outQueue.push(bytes);
         if (!outRaf) outRaf = requestAnimationFrame(flushOut);
@@ -234,14 +302,35 @@ export function TerminalView({
     window.visualViewport?.addEventListener("resize", onViewport);
     window.addEventListener("resize", onViewport);
 
+    // B5: `.xterm-rows > div` does not exist under the webgl/canvas renderers,
+    // so the old lookup always fell back to a hardcoded 16px. Measure the
+    // screen element instead — it is renderer-independent.
+    const lineHeight = () => {
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
+      const measured = screen && term.rows > 0 ? screen.getBoundingClientRect().height / term.rows : 0;
+      return measured > 0 ? measured : 16;
+    };
+    const scrollPixels = (deltaY: number) => {
+      const lines = Math.trunc(deltaY / lineHeight());
+      if (lines) term.scrollLines(lines);
+    };
+
     const detachTouch = attachTerminalTouch(viewport, {
-      onScrollPixels: (deltaY) => {
-        const line = Math.max(1, host.querySelector<HTMLElement>(".xterm-rows > div")?.getBoundingClientRect().height || 16);
-        term.scrollLines(Math.trunc(deltaY / line));
-      },
+      onScrollPixels: scrollPixels,
       getGeneration: () => generationRef.current,
       hasSelection: () => term.hasSelection(),
-      enabled: () => !(directRef.current && term.modes.mouseTrackingMode !== "none"),
+      // With reports off we scroll locally, so touch panning stays ours.
+      enabled: () => localWheelRef.current || !trackingActive(term.modes.mouseTrackingMode),
+    });
+
+    // A2: while the app has tracking on, xterm cancels the local wheel and
+    // reports instead. With 鼠标上报 off we take the wheel back and scroll the
+    // scrollback ourselves; the report itself is dropped by the input gate.
+    term.attachCustomWheelEventHandler((event) => {
+      if (!localWheelRef.current) return true;
+      scrollPixels(-event.deltaY);
+      event.preventDefault();
+      return false;
     });
 
     window.__ttyLab = {
@@ -253,6 +342,7 @@ export function TerminalView({
     };
 
     return () => {
+      disposed = true;
       delete window.__ttyLab;
       detachTouch();
       observer.disconnect();
@@ -275,10 +365,7 @@ export function TerminalView({
   }, [mode, fullscreen]);
 
   useEffect(() => {
-    const term = termRef.current;
-    if (!term) return;
-    term.options.disableStdin = frozen || !directInput;
-    if (directInput && !frozen) term.focus();
+    applyStdinPolicy(termRef.current, { directInput, frozen });
   }, [directInput, frozen]);
 
   useEffect(() => {
@@ -299,6 +386,7 @@ export function TerminalView({
       data-tty-io={ioMode}
       data-tty-renderer={renderer}
       data-tty-mouse={mouseMode}
+      data-tty-mouse-reports={mouseReports ? "1" : "0"}
       data-tty-fullscreen={fullscreen ? "1" : "0"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
@@ -327,6 +415,41 @@ export function TerminalView({
         <span className={css.modePill} data-testid="tty-mode-pill">
           {ioMode}
         </span>
+        {/* A2: sticky DECSET escape hatch. Only meaningful while the app asks
+            for reports, which is exactly when the wheel stops scrolling. */}
+        {trackingActive(mouseMode) ? (
+          <>
+            <button
+              type="button"
+              className={mouseReports ? css.segOn : css.geo}
+              data-testid="tty-mouse-reports"
+              aria-pressed={mouseReports}
+              title="关闭后滚轮在本地滚动，不再把鼠标事件发给远端"
+              onClick={() => setMouseReports((on) => !on)}
+            >
+              鼠标上报
+            </button>
+            <button
+              type="button"
+              className={css.geo}
+              data-testid="tty-mouse-reset"
+              title="向远端发送 DECRST，清掉残留的鼠标跟踪模式"
+              onClick={() => {
+                // Both halves are needed. Writing locally clears the emulator
+                // even when the app that set `?1000h` is long gone (the common
+                // sticky case, where nothing downstream would ever send the
+                // DECRST back). Sending it on tells an app that *is* still
+                // tracking to stop, so it does not immediately re-arm.
+                const term = termRef.current;
+                term?.write(MOUSE_TRACKING_RESET, () => setMouseMode(term.modes.mouseTrackingMode));
+                send(MOUSE_TRACKING_RESET);
+                setMouseReports(true);
+              }}
+            >
+              重置终端模式
+            </button>
+          </>
+        ) : null}
         {!mobile ? <AuxKeys disabled={frozen} onKey={send} variant="toolbar" /> : null}
         {!mobile ? (
           <button

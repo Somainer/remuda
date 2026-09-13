@@ -13,8 +13,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-const SCREEN_LINES: usize = 32;
-const SCREEN_BYTES: usize = 4096;
+#[cfg(test)]
+use remuda_screen::SCREEN_BYTES;
+use remuda_screen::{SCREEN_LINES, ScreenGrid};
+
 const ANSWER_BYTES: usize = 1024;
 
 /// `agent.start` can report not-ready after it has created a blocked pane.
@@ -578,50 +580,11 @@ pub(crate) async fn prompt_ready_for(
 }
 
 /// Only Claude's exact folder question with both known choices and one cursor.
+///
+/// Adapter over [`remuda_screen::trust_dialog_keys`]; the herdr screen arrives
+/// already ANSI-stripped, so it becomes a raw grid unchanged.
 fn trust_dialog_keys(screen: &str) -> Option<Vec<String>> {
-    let normalized = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-    if !normalized.contains("Quick safety check:")
-        || !normalized.contains("Is this a project you created or one you trust?")
-    {
-        return None;
-    }
-    let mut choices = Vec::new();
-    let mut selected = None;
-    for line in screen.lines() {
-        let line = line.trim();
-        let marked = line.starts_with(['❯', '›', '>']);
-        let label = line.trim_start_matches(['❯', '›', '>']).trim();
-        // Numbered versions of the same Claude menu use the same cursor keys.
-        let label = label
-            .trim_start_matches(|c: char| c.is_ascii_digit())
-            .trim_start_matches(['.', ')'])
-            .trim();
-        if matches!(label, "No, exit" | "Yes, I trust this folder") {
-            if marked && selected.replace(choices.len()).is_some() {
-                return None;
-            }
-            choices.push(label);
-        } else if marked {
-            return None;
-        }
-    }
-    if choices.len() != 2 || choices[0] == choices[1] {
-        return None;
-    }
-    let selected = selected?;
-    let yes = choices
-        .iter()
-        .position(|label| *label == "Yes, I trust this folder")?;
-    let mut keys = vec![
-        if yes < selected {
-            "up".into()
-        } else {
-            "down".into()
-        };
-        yes.abs_diff(selected)
-    ];
-    keys.push("enter".into());
-    Some(keys)
+    remuda_screen::trust_dialog_keys(&ScreenGrid::from_raw(screen))
 }
 
 fn answer_keys(pending: &Pending, answer: &InteractionAnswer) -> DriverResult<Vec<String>> {
@@ -673,117 +636,18 @@ fn answer_keys(pending: &Pending, answer: &InteractionAnswer) -> DriverResult<Ve
         .ok_or_else(|| invalid("unknown PTY answer option"))
 }
 
-fn excerpt(screen: &str) -> (String, bool) {
-    let lines: Vec<_> = screen.lines().collect();
-    let tail = lines[lines.len().saturating_sub(SCREEN_LINES)..].join("\n");
-    let mut start = tail.len().saturating_sub(SCREEN_BYTES);
-    while !tail.is_char_boundary(start) {
-        start += 1;
-    }
-    let truncated = start != 0 || lines.len() > SCREEN_LINES;
-    (tail[start..].trim().to_owned(), truncated)
-}
-
 pub(crate) fn screen_request(
     ctx: &ObsCtx,
     screen: &str,
 ) -> DriverResult<(Interaction, BTreeMap<String, Vec<String>>)> {
-    let (excerpt, truncated) = excerpt(screen);
-    let lower = excerpt.to_lowercase();
-    let mut choices: Vec<(String, String, Vec<String>)> = Vec::new();
-    let mut approval;
-    if ["[y/n]", "(y/n)", "[yes/no]", "(yes/no)"]
+    let parsed = remuda_screen::screen_request(&ScreenGrid::from_raw(screen));
+    let excerpt = parsed.excerpt.clone();
+    let keys: BTreeMap<String, Vec<String>> = parsed
+        .choices
         .iter()
-        .any(|s| lower.contains(s))
-    {
-        approval = true;
-        choices = vec![
-            (
-                "y".into(),
-                "Yes (y)".into(),
-                vec!["y".into(), "enter".into()],
-            ),
-            (
-                "n".into(),
-                "No (n)".into(),
-                vec!["n".into(), "enter".into()],
-            ),
-        ];
-    } else {
-        let mut selected = None;
-        for line in excerpt.lines() {
-            let line = line.trim();
-            let marked = line.starts_with(['❯', '›', '>']);
-            let line = line.trim_start_matches(['❯', '›', '>']).trim_start();
-            let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-            if digits == 0 || digits > 2 {
-                continue;
-            }
-            let rest = &line[digits..];
-            if !rest.starts_with(['.', ')', ':']) {
-                continue;
-            }
-            let label = rest[1..].trim();
-            if label.is_empty() {
-                continue;
-            }
-            if marked {
-                selected = Some(choices.len());
-            }
-            let id = line[..digits].to_owned();
-            let mut keys: Vec<_> = id.chars().map(|c| c.to_string()).collect();
-            keys.push("enter".into());
-            choices.push((id, label.to_owned(), keys));
-        }
-        if choices.len() < 2 || choices.len() > 12 {
-            choices.clear();
-        }
-        if let Some(selected) = selected {
-            for (index, (_, _, keys)) in choices.iter_mut().enumerate() {
-                *keys = vec![
-                    if index < selected {
-                        "up".into()
-                    } else {
-                        "down".into()
-                    };
-                    index.abs_diff(selected)
-                ];
-                keys.push("enter".into());
-            }
-        }
-        if choices.is_empty()
-            && (lower.contains("enter to continue") || lower.contains("press enter to continue"))
-        {
-            choices.push((
-                "enter".into(),
-                "Enter to continue".into(),
-                vec!["enter".into()],
-            ));
-        }
-        approval = !choices.is_empty()
-            && [
-                "approve",
-                "approval",
-                "permission",
-                "allow",
-                "trust",
-                "proceed",
-                "run this command",
-            ]
-            .iter()
-            .any(|word| lower.contains(word));
-    }
-    let mut keys = BTreeMap::new();
-    let mut ambiguous = false;
-    for (id, _, value) in &choices {
-        ambiguous |= keys.insert(id.clone(), value.clone()).is_some();
-    }
-    if ambiguous {
-        keys.clear();
-        choices.clear();
-        approval = false;
-    }
-    let request = if approval {
+        .map(|choice| (choice.id.clone(), choice.keys.clone()))
+        .collect();
+    let request = if parsed.approval {
         InteractionRequest::Approval(Box::new(ApprovalRequest {
             title: "Terminal approval".into(),
             description: excerpt.clone(),
@@ -791,12 +655,13 @@ pub(crate) fn screen_request(
             action_ref: Id::new("obj")?,
             requested_permissions_ref: None,
             input_digest: hash_bytes(screen.as_bytes())?,
-            options: choices
+            options: parsed
+                .choices
                 .iter()
-                .map(|(id, label, _)| {
+                .map(|choice| {
                     Ok(DecisionOption {
-                        id: id.clone(),
-                        label: label.clone(),
+                        id: choice.id.clone(),
+                        label: choice.label.clone(),
                         effect: DecisionEffect::NativeSpecific,
                         native_value_ref: Id::new("obj")?,
                     })
@@ -810,20 +675,21 @@ pub(crate) fn screen_request(
                 id: "screen".into(),
                 title: "Reply to the terminal prompt".into(),
                 description: Some(excerpt.clone()),
-                input: if choices.is_empty() {
+                input: if parsed.free_text() {
                     QuestionInput::Text
                 } else {
                     QuestionInput::SingleSelect
                 },
                 required: true,
-                options: choices
+                options: parsed
+                    .choices
                     .iter()
-                    .map(|(id, label, _)| QuestionOption {
-                        id: id.clone(),
-                        label: label.clone(),
+                    .map(|choice| QuestionOption {
+                        id: choice.id.clone(),
+                        label: choice.label.clone(),
                     })
                     .collect(),
-                allow_free_text: choices.is_empty(),
+                allow_free_text: parsed.free_text(),
                 sensitive: false,
             }],
         }))
@@ -840,7 +706,7 @@ pub(crate) fn screen_request(
             instance_id: ctx.instance_id.clone(),
             host_id: ctx.host_id.clone(),
             run_id: Some(ctx.run_id.clone()),
-            kind: if approval {
+            kind: if parsed.approval {
                 InteractionKind::Approval
             } else {
                 InteractionKind::Question
@@ -854,7 +720,9 @@ pub(crate) fn screen_request(
             request_version: U64(1),
             state: InteractionState::Pending,
             blocking: true,
-            answerable: !truncated && !ambiguous && !excerpt.is_empty(),
+            // D-022: a truncated or ambiguous screen is never answerable — a
+            // reply would be aimed at a prompt the human could not fully see.
+            answerable: !parsed.truncated && !parsed.ambiguous && !excerpt.is_empty(),
             carrier: InteractionCarrier::NativeTty,
             request,
             deadline: Knowledge::Unknown {

@@ -3036,6 +3036,7 @@ dependencies = [
  "remuda-claude-wire",
  "remuda-herdr",
  "remuda-protocol",
+ "remuda-screen",
  "remuda-signal",
  "remuda-testing",
  "serde",

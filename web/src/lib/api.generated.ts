@@ -232,6 +232,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/enroll-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint a single-use Node enroll token (D-018)
+         * @description Requires an authenticated device. The plaintext is returned once; the Hub stores only its Argon2 hash. The device pairing access code never enrolls a Node.
+         */
+        post: operations["mintEnrollToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts/ssh": {
         parameters: {
             query?: never;
@@ -544,6 +564,13 @@ export interface components {
         DeviceSession: {
             deviceId: string;
             name: string;
+            token: string;
+        };
+        EnrollToken: {
+            enrollTokenId: string;
+            /** Format: date-time */
+            expiresAt: string;
+            /** @description Single-use secret; returned once. */
             token: string;
         };
         ErrorBody: {
@@ -1234,6 +1261,27 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HostPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+        };
+    };
+    mintEnrollToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Enroll token */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnrollToken"];
                 };
             };
             401: components["responses"]["Error"];

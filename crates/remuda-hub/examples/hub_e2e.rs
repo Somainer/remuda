@@ -1,8 +1,8 @@
 //! In-process Hub plus a fake Node for Playwright live-hub e2e.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
-use remuda_hub::{HubConfig, spawn};
+use remuda_hub::{DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, spawn};
 use remuda_protocol::{HostId, InteractionId};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -52,16 +52,22 @@ async fn main() -> Result<()> {
         Some(spawn(config).await?)
     };
     let addr = hub.as_ref().map_or(addr, |hub| hub.addr);
+    // D-018: the access code pairs devices; a Node enrolls with a one-shot
+    // enroll token. In-process compositions mint one directly; attaching the
+    // fake engine to an already-running Hub goes through the device HTTP path.
+    let enroll = match &hub {
+        Some(hub) => hub
+            .mint_enroll_token(DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+            .await
+            .context("mint node enroll token")?,
+        None => mint_enroll_via_device(addr, BOOTSTRAP)
+            .await
+            .context("mint node enroll token")?,
+    };
     let host_id = HostId::new();
     let pending: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
-    let node = tokio::spawn(fake_node(
-        addr,
-        BOOTSTRAP.to_string(),
-        host_id.clone(),
-        pending,
-        ready_tx,
-    ));
+    let node = tokio::spawn(fake_node(addr, enroll, host_id.clone(), pending, ready_tx));
     ready_rx.await.context("fake node hello")?;
     let line = json!({
         "hub": format!("http://{addr}"),
@@ -76,9 +82,45 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn mint_enroll_via_device(addr: SocketAddr, bootstrap: &str) -> Result<String> {
+    let client = reqwest::Client::new();
+    let login: Value = client
+        .post(format!("http://{addr}/v1/login"))
+        .json(&json!({
+            "bootstrapToken": bootstrap,
+            "deviceName": "e2e-harness"
+        }))
+        .send()
+        .await
+        .context("login for enroll token")?
+        .error_for_status()
+        .context("login for enroll token")?
+        .json()
+        .await?;
+    let device_token = login
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("login token missing"))?;
+    let minted: Value = client
+        .post(format!("http://{addr}/v1/hosts/enroll-token"))
+        .header("Authorization", format!("Bearer {device_token}"))
+        .send()
+        .await
+        .context("POST /v1/hosts/enroll-token")?
+        .error_for_status()
+        .context("POST /v1/hosts/enroll-token")?
+        .json()
+        .await?;
+    minted
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("enroll token missing"))
+}
+
 async fn fake_node(
     addr: SocketAddr,
-    bootstrap: String,
+    enroll: String,
     host_id: HostId,
     pending: Arc<Mutex<HashMap<String, Value>>>,
     ready: oneshot::Sender<()>,
@@ -88,7 +130,7 @@ async fn fake_node(
         .context("node ws")?;
     req.headers_mut().insert(
         "Authorization",
-        format!("Bearer {bootstrap}")
+        format!("Bearer {enroll}")
             .parse()
             .context("authorization header")?,
     );
@@ -119,7 +161,17 @@ async fn fake_node(
         .into(),
     ))
     .await?;
-    let _hello = ws.next().await;
+    let hello = match ws.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        Some(Ok(other)) => anyhow::bail!("hello was {other}"),
+        Some(Err(err)) => return Err(err.into()),
+        None => anyhow::bail!("hello closed"),
+    };
+    let value: Value = serde_json::from_str(&hello)?;
+    anyhow::ensure!(
+        value["result"]["nodeToken"].as_str().is_some(),
+        "enroll hello {value}"
+    );
     let _ = ready.send(());
     let mut append_n = 0u64;
     while let Some(msg) = ws.next().await {

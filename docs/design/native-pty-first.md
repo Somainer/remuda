@@ -407,6 +407,95 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 
 同期：`claude-bg` 与 herdr 传输先降为可选 feature。测试夹具（stream-json 脚本、`fake-herdr`、herdr 线格式 fixture）保留到对应 carrier 退役为止，新增统一的 `fake-harness` 作为后继。
 
+### 12.1 parity gate 的实现：`remuda journal diff`
+
+上面第 3 条的比较器已落地为 `remuda journal diff`（`crates/remuda/src/cmd/journal_diff.rs`），
+P6/P7 直接调用，不必再各自写一份 diff 逻辑。
+
+```
+remuda journal diff <left.json> <right.json> [--whitelist F] [--no-whitelist] [--json] [--color auto|always|never]
+```
+
+**输入**：两份同一场景的 journal dump。同时接受 Hub 的
+`GET /v1/instances/{id}/journal`（`{events:[…]}`）、coordinator 的 jdump /
+`remuda instance read --source journal`（`{observations:[…]}`）、裸数组，以及
+以上任一形状的 JSONL。左侧惯例是 `claude-print`，右侧是 `agent-pty`。
+
+**归一化**（两侧走同一条代码路径，因此不会「各归一化各的」）：
+
+1. 剥掉易变字段——`seq`、`eventId`/`journalId`/`instanceId`/`runId`/`hostId`、
+   `observedAt`/`nativeAt`、`revision`/`baseRevision`、`sourceCursor`、
+   `processGeneration`。driver / channel 一并剥掉：**同一事实经不同 carrier
+   观测仍是同一事实**，这正是要证明的东西。
+2. **折叠 mutation 链**。`message` / `thought` / `tool_call` / `tool_result` 的
+   `open`→`append`→`replace`→`close` 按 node id 回放成一条事件：`append` 按
+   `targetBlock` 拼进已有文本块，`replace` / `close` 用快照覆盖。于是「print 逐
+   token append 三次」与「pty 整行 append 一次」收敛到同一条最终文本。
+3. **native id → 每侧序号别名**（`msg#1`、`tool#2`、`int#1`）。两侧的 UUID 必然
+   不同；出现顺序才是可比的身份。
+4. `Knowledge<T>` 塌缩成取值，`unknown` / `not-applicable` 塌缩成标记——
+   `unknown` 的 `reason` 与 `evidenceEventIds` 是易变的，值本身不是。
+5. 文本到达的**方式**保留为合成字段 `granularity`
+   （`token-level` / `record-level` / `snapshot` / `single`），这样 §7 的粒度差异
+   是一条可白名单的具体差异，而不是整条消息不匹配。
+
+对齐用事件签名（kind + topic + 别名）的最长公共子序列，因此**少一条事件会被
+报成少一条**，而不是把后面所有事件错位成一片红。
+
+**输出**：人读的 unified diff（红=阻塞，黄=已白名单，绿=结论；`--color auto`
+在管道里和 `NO_COLOR` 下自动关闭），或 `--json` 的
+`{equal, differences[], whitelisted[], left, right, whitelistPath, rules}`。
+**退出码 0 = 全绿（差异全在白名单内），1 = 有阻塞差异**——P7 的门禁读这个码。
+
+**白名单**：默认读 `docs/design/parity-whitelist.toml`（相对 cwd）。
+`--no-whitelist` 关掉全部豁免，用来看「未经修饰的真实差异有多少」。
+**默认文件不存在时按空白名单处理——缺省只会更严，不会更松。**
+
+```toml
+version = 1                      # 未知版本直接拒绝，不降级解析
+
+[[rule]]
+kind = "message"                 # 选择器：kind / topic / lifecycle（至少一个）
+field = "granularity"            # 归一化后的字段路径；省略则覆盖整条事件
+allow = ["record-level", "token-level"]   # 可互换的取值；省略则任意取值
+reason = "…"                     # 必填，且不得为空白
+```
+
+| 键 | 含义 |
+|---|---|
+| `kind` | 归一化事件种类（`message`/`tool_call`/`usage`/`lifecycle`…） |
+| `topic` | `lifecycle` 取其 topic（`hook`/`session`/`diagnostic`…），其余等于 `kind` |
+| `lifecycle` | `kind = "lifecycle"` + `topic = <值>` 的语法糖 |
+| `field` | 归一化字段路径；**覆盖整棵子树**（`cost` 同时覆盖 `cost.amount`） |
+| `allow` | 字符串或字符串数组；**任一侧命中即豁免**（粒度差异天然不对称） |
+| `ignore` | 对齐**之前**从两侧丢弃该事件（只有一侧的 carrier 能物理观测到时用）；与 `field`/`allow` 互斥 |
+| `allow-unmatched` | 允许该事件只出现在一侧 |
+| `reason` | **必填**。没有 reason 的规则就是一个没人记得为什么存在的 parity 漏洞 |
+
+规则按声明顺序匹配，首条命中生效。**没被任何规则覆盖的差异一律失败**——
+白名单是显式豁免清单，不是启发式。
+
+**P7 门禁怎么用它**（对应 §13 P7「parity 连续 3 次全绿方可翻默认」）：
+
+1. 同一脚本场景跑一次 `claude-print`，导出 journal；再跑一次 `agent-pty`，导出 journal。
+2. `remuda journal diff print.json pty.json --json`，记录 `equal` 与
+   `whitelisted[]`。
+3. **连续 3 次**（各自独立起 session，不复用 dump）`equal == true` 才算一次全绿，
+   方可对该 harness 翻默认。任一次 `differences[]` 非空即阻塞放行。
+4. 三次的 `whitelisted[]` 应当稳定；**豁免集合本身在扩大**也是回归信号——说明
+   两条路径在分叉，而不是在收敛。
+
+**怎么扩展白名单**：先确认这条差异**确实是粒度或 carrier 机制差异**，而不是
+一侧丢了事实。判据是「把两侧的 `--no-whitelist` 输出摆在一起，信息量是否相等」：
+信息量相等 → 加规则并写清出处（§号 + 为什么两条路径必然不同）；信息量不等 →
+**这是 bug，修 adapter，不加规则**。每条规则都应当写明何时可以删除
+（例如 `usage.cost` 那条：UsageAdapter 三家上报真实 cost 后即可移除）。
+
+夹具在 `crates/remuda/tests/fixtures/journal-parity/`：一个 3 turn 场景
+（文本、工具调用+结果、审批）的 print 版与 pty 版，外加一个丢了 `tool_result`
+的反例（必须失败）。两侧由 `generate.py` 从**同一份**场景描述生成，测试会校验
+夹具与生成器一致——手改夹具会让两侧悄悄解耦，门禁就不再证明任何东西。
+
 ---
 
 ## 13 分阶段实施与 worker 切分

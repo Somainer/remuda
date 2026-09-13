@@ -173,6 +173,7 @@ export type BoolLiteral_true = true;
 export type Capability = ({
   "evidence": ((CapabilityEvidence)[]);
   "prerequisites": (((string))[]);
+  "provision": CapabilityProvision;
   "reasonCode": (string);
   "scope": (((string))[]);
   "state": CapabilityState;
@@ -189,6 +190,9 @@ export type CapabilityEvidence = ({
 
 /** CapabilityName wire values; `protocol.md` §3.2. */
 export type CapabilityName = ("resume" | "steer" | "queue" | "interrupt" | "model-switch" | "fork" | "structured-workflow" | "artifact" | "tty-attach" | "hooks" | "interactive-approval" | "question" | "plan-review" | "elicitation" | "live-attach" | "completion-native-turn" | "completion-task");
+
+/** CapabilityProvision wire values; `protocol.md` §3.2. */
+export type CapabilityProvision = ("native" | "emulated" | "unknown");
 
 /** Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid.  D-028 §6 added `queue` / `interrupt` alongside `steer`. They are `#[serde(default)]` to an `unknown` [`Capability`] so a snapshot written by a pre-D-028 peer still parses; "absent" is read as "not verified", never as unsupported. */
 export type CapabilitySet = ({
@@ -3185,6 +3189,7 @@ export type RunWaitResult = ({
 /** One capability this live session actually reached, with the tier that proves it; `protocol.md` §1.3 (D-028 §4.3).  A runtime entry outranks the static `DriverKind` matrix for the same name. It carries its own `state`, so a session may report a capability as `unknown` just as truthfully as `supported`. */
 export type RuntimeCapability = ({
   "name": CapabilityName;
+  "provision": CapabilityProvision;
   "reasonCode": (string);
   "state": CapabilityState;
   "tier": SignalTier;

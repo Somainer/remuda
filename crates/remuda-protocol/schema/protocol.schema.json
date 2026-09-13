@@ -811,6 +811,11 @@
           },
           "type": "array"
         },
+        "provision": {
+          "$ref": "#/$defs/CapabilityProvision",
+          "default": "unknown",
+          "description": "Who implements it: the harness, or Remuda on its behalf; §3.2 (D-028 §6).\n\nOrthogonal to `state`. `supported` answers \"can this be done\", this\nanswers \"by whom\" — and the difference is user-visible, because an\nemulated queue is held in Remuda's ledger while a native one lives\ninside the harness where Remuda cannot edit it. Defaults to\n[`CapabilityProvision::Unknown`] so a pre-D-028 payload stays truthful."
+        },
         "reasonCode": {
           "description": "`reason_code`; protocol §3.2.",
           "type": "string"
@@ -829,6 +834,7 @@
       },
       "required": [
         "state",
+        "provision",
         "scope",
         "reasonCode",
         "prerequisites",
@@ -949,6 +955,26 @@
         }
       ]
     },
+    "CapabilityProvision": {
+      "description": "CapabilityProvision wire values; `protocol.md` §3.2.",
+      "oneOf": [
+        {
+          "const": "native",
+          "description": "Wire value `native`.",
+          "type": "string"
+        },
+        {
+          "const": "emulated",
+          "description": "Wire value `emulated`.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Wire value `unknown`.",
+          "type": "string"
+        }
+      ]
+    },
     "CapabilitySet": {
       "description": "Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid.\n\nD-028 §6 added `queue` / `interrupt` alongside `steer`. They are\n`#[serde(default)]` to an `unknown` [`Capability`] so a snapshot written by\na pre-D-028 peer still parses; \"absent\" is read as \"not verified\", never as\nunsupported.",
       "properties": {
@@ -985,6 +1011,7 @@
           "default": {
             "evidence": [],
             "prerequisites": [],
+            "provision": "unknown",
             "reasonCode": "insufficient-evidence",
             "scope": [],
             "state": "unknown"
@@ -1012,6 +1039,7 @@
           "default": {
             "evidence": [],
             "prerequisites": [],
+            "provision": "unknown",
             "reasonCode": "insufficient-evidence",
             "scope": [],
             "state": "unknown"
@@ -13995,6 +14023,11 @@
           "$ref": "#/$defs/CapabilityName",
           "description": "Which capability this entry overrides."
         },
+        "provision": {
+          "$ref": "#/$defs/CapabilityProvision",
+          "default": "unknown",
+          "description": "Whether the harness provides it or Remuda emulates it; D-028 §6."
+        },
         "reasonCode": {
           "description": "Stable machine-readable cause (`hook-socket-open`, `no-adapter`, …).",
           "type": "string"
@@ -14011,6 +14044,7 @@
       "required": [
         "name",
         "state",
+        "provision",
         "tier",
         "reasonCode"
       ],

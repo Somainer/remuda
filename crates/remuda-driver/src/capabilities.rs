@@ -2,9 +2,9 @@
 
 use crate::binary::BinaryPin;
 use remuda_protocol::{
-    AdapterTransport, Capability, CapabilityEvidence, CapabilityName, CapabilitySet,
-    CapabilitySnapshot, CapabilityState, DriverKind, EvidenceType, Id, Knowledge, NativeRef,
-    SignalTier, U64,
+    AdapterTransport, Capability, CapabilityEvidence, CapabilityName, CapabilityProvision,
+    CapabilitySet, CapabilitySnapshot, CapabilityState, DriverKind, EvidenceType, Id, Knowledge,
+    NativeRef, SignalTier, U64,
 };
 
 /// Adapter version stamped on capability snapshots.
@@ -184,6 +184,7 @@ pub fn capability_set_with_runtime(
     for entry in &native_ref.capabilities {
         *slot(&mut set, entry.name) = Capability {
             state: entry.state,
+            provision: entry.provision,
             scope: vec![],
             reason_code: entry.reason_code.clone(),
             prerequisites: vec![],
@@ -220,6 +221,10 @@ fn tier_capabilities(tier: SignalTier) -> &'static [CapabilityName] {
 fn tier_cap(tier: SignalTier) -> Capability {
     Capability {
         state: CapabilityState::Supported,
+        // The tier *is* the harness's own signal channel, so what it grants is
+        // native by construction. Anything Remuda stands in for is reported by
+        // an explicit entry, which carries its own provision.
+        provision: CapabilityProvision::Native,
         scope: vec![],
         reason_code: format!("signal-tier-{}", tier_slug(tier)),
         prerequisites: vec![],
@@ -304,6 +309,13 @@ fn cap(kind: DriverKind, name: CapabilityName) -> Capability {
     };
     Capability {
         state,
+        // The static matrix records native evidence only (§3.3); nothing in it
+        // describes a Remuda-emulated path, so a matrix cell never claims one.
+        // §6's native/emulated distinction arrives with the runtime report.
+        provision: match mark {
+            MatrixMark::SupportedStar => CapabilityProvision::Native,
+            MatrixMark::NotProvided | MatrixMark::Unknown => CapabilityProvision::Unknown,
+        },
         scope: vec![],
         reason_code: reason_code.into(),
         prerequisites: vec![],
@@ -314,7 +326,7 @@ fn cap(kind: DriverKind, name: CapabilityName) -> Capability {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remuda_protocol::{AgentKind, HostId, RuntimeCapability};
+    use remuda_protocol::{AgentKind, CapabilityProvision, HostId, RuntimeCapability};
 
     fn native_ref(tier: Option<SignalTier>, entries: Vec<RuntimeCapability>) -> NativeRef {
         NativeRef {
@@ -344,6 +356,7 @@ mod tests {
         RuntimeCapability {
             name,
             state,
+            provision: CapabilityProvision::Native,
             tier: SignalTier::Hook,
             reason_code: "measured".into(),
         }
@@ -452,6 +465,31 @@ mod tests {
         );
         assert_eq!(print.resume.state, CapabilityState::Unknown);
         assert_eq!(print.resume.reason_code, "measured");
+
+        // §6: a capability Remuda stands in for reports `emulated`, and the
+        // runtime entry carries that through. The tier's own grants stay
+        // `native` — the tier *is* the harness's channel.
+        let emulated = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(
+                Some(SignalTier::Hook),
+                vec![RuntimeCapability {
+                    name: CapabilityName::Queue,
+                    state: CapabilityState::Supported,
+                    provision: CapabilityProvision::Emulated,
+                    tier: SignalTier::Hook,
+                    reason_code: "remuda-ledger".into(),
+                }],
+            )),
+        );
+        assert_eq!(emulated.queue.provision, CapabilityProvision::Emulated);
+        assert_eq!(emulated.hooks.provision, CapabilityProvision::Native);
+        // The static matrix never claims a provider: it records native
+        // evidence for `supported` cells and says nothing for the rest.
+        let stat = capability_set(DriverKind::ShellPty);
+        assert_eq!(stat.tty_attach.provision, CapabilityProvision::Native);
+        assert_eq!(stat.queue.provision, CapabilityProvision::Unknown);
+        assert_eq!(stat.resume.provision, CapabilityProvision::Unknown);
     }
 
     /// §6: no driver claims queue/interrupt in this task. They are unmeasured

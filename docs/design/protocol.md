@@ -81,7 +81,7 @@ type HerdrServer = {
 type SignalTier = "hook" | "file" | "osc" | "screen" | "none";
 type RuntimeCapability = {
   name: CapabilityName; state: "supported" | "unsupported" | "unknown";
-  tier: SignalTier; reasonCode: string;
+  provision?: CapabilityProvision; tier: SignalTier; reasonCode: string;
 };
 type NativeRef = {
   hostId: Id;
@@ -475,8 +475,10 @@ type CapabilityName = "resume" | "steer" | "queue" | "interrupt" | "model-switch
   | "fork" | "structured-workflow" | "artifact" | "tty-attach" | "hooks"
   | "interactive-approval" | "question" | "plan-review" | "elicitation"
   | "live-attach" | "completion-native-turn" | "completion-task";
+type CapabilityProvision = "native" | "emulated" | "unknown";
 type Capability = {
   state: "supported" | "unsupported" | "unknown";
+  provision?: CapabilityProvision; // D-028 §6；缺省读作 unknown。
   scope: string[];
   reasonCode: string;
   prerequisites: string[];
@@ -500,6 +502,8 @@ type DriverDescriptor = {
   capabilities: CapabilitySnapshot;
 };
 ~~~
+
+`provision` 与 `state` 正交：`state` 回答「这件事能不能做」，`provision` 回答「**谁**来做」——`native` 是 harness 自己的语义，`emulated` 是 Remuda 代劳。这个区别必须对用户可见（D-028 §6）：emulated 的队列存在 Remuda 自己的账本里、chip 可增删改，native 的队列在 harness 内部、Remuda 改不了；把后者包装成前者会让「移除排队项」这个按钮静默失效。缺省读作 `unknown`——旧 peer 没说过谁提供，替它断言 `native` 就是凭空造证据。三项的逐 harness 实测结论见 [native-pty-first §6](./native-pty-first.md#6-steer--排队--打断)；本规格只定义字段，不替 driver 填值。
 
 `queue` / `interrupt` 是 D-028 §6 新增的名字。旧 peer 序列化的 snapshot 里没有它们，**缺失读作 `unknown`**：「对方没提」不是「对方不支持」的证据。这与 `NativeRef.signalTier`（§1.3）是同一条原则的两面——运行时上报缺省时静态矩阵继续生效，静态矩阵里没有的名字缺省时读作未验证。
 

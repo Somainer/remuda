@@ -10,7 +10,7 @@ D-028 §13 conflict rule ② requires all protocol changes to land **once**, pur
 | --- | --- | --- | --- |
 | 1 | `Instance.launchedBy: "remuda" \| "user"` | §1.0 rule 4, §2.3 | `entities.rs`, `enums.rs` |
 | 2 | `NativeRef.signalTier` + `NativeRef.capabilities[]`, and `capability_set_with_runtime` layering them over the static matrix | §4.3 | `native.rs`, `remuda-driver/capabilities.rs` |
-| 3 | `PromptMode` gains `steer` / `queue`; `CapabilityName` gains `queue` / `interrupt` | §6 | `enums.rs`, `capabilities.rs` |
+| 3 | `PromptMode` gains `steer` / `queue`; `CapabilityName` gains `queue` / `interrupt`; `Capability.provision: native\|emulated\|unknown` | §6 | `enums.rs`, `capabilities.rs` |
 | 4 | `InstanceSpec.effort: {name, ultracode}`, legacy normalization, `--effort` emission, flag value allowlist | §9.1 | `launch.rs`, `materializer.rs`, `flags.rs`, `remuda-hub/store.rs` |
 | 5 | kind/driver matrix admits `(claude\|codex\|grok\|agy, shell-pty)`; materializer `ShellPty` agent arm; presets moved out of the herdr driver | §5.1 | `runtime.rs`, `materializer.rs`, `presets.rs` |
 | 6 | `SourceChannel` gains `file` / `osc` / `screen`; `exited` / `failed` / `interrupted` documented | §4.3, §5.3, §5.5 | `enums.rs`, `protocol.md` |
@@ -47,7 +47,9 @@ The tier itself is evidence, not just a label. `hook` can block the agent and re
 
 `queue` and `interrupt` are new `CapabilityName` values, so a pre-D-028 `CapabilitySnapshot` has no entry for them. They are `#[serde(default)]` to `unknown`, never `unsupported`: a peer that did not mention a capability has not told us it lacks one.
 
-**No driver reports these as supported in this branch.** Not an oversight — §14 risks 6 and 7 record that claude's queue-vs-steer semantics and grok/agy's keys are unmeasured, and codex's measured `Tab`/`Esc` are not yet implemented in Remuda. `unsupported` would be an unbacked assertion; `unknown` returns `CAPABILITY_UNKNOWN` and shows "尚未验证". `shell-pty`'s `steer` moved from `unsupported` to `unknown` for the same reason.
+`Capability.provision` is the third addition here, required by §6 after the spike evidence landed on main: capabilities must express `native | emulated | unknown` per harness rather than a single bool. It is a separate field rather than extra `CapabilityState` variants because it is **orthogonal** to state — `state` answers "can this be done", `provision` answers "by whom". The distinction is user-visible: an emulated queue lives in Remuda's own ledger where chips can be added and removed, a native one lives inside the harness where they cannot, so presenting the second as the first would make a "remove queued item" button silently inert. Absent reads as `unknown`; defaulting a pre-D-028 payload to `native` would invent a claim the peer never made.
+
+**No driver reports these as supported in this branch.** The measured evidence that landed on main (`claude-queue-steer-1`, `codex-signals-1`, `grok-signals-1`) says so itself — the claude report states in its conclusion that it "does not validate a Remuda driver or change its current `unknown` capability flags". The keys are measured; Remuda does not implement them yet, and a capability describes what Remuda can do, not what the harness could do if someone wired it. `unsupported` would be an unbacked assertion in the other direction; `unknown` returns `CAPABILITY_UNKNOWN` and shows "尚未验证". `shell-pty`'s `steer` moved from `unsupported` to `unknown` for the same reason. Filling in `native` / `emulated` per harness is P4's job, and the field is now there to receive it.
 
 ### 4 · effort
 
@@ -90,8 +92,8 @@ Three new variants on an enum that already had nine. Existing ones are untouched
 | Test | Proves |
 | --- | --- |
 | `instance_without_launched_by_parses_and_derives_it` | Old Instance parses; derivation yields `remuda` with no mode, `user` when promoted; an explicit value wins |
-| `native_ref_without_runtime_capabilities_parses` | Old NativeRef parses; `signalTier` absent and capabilities empty; the populated form round-trips |
-| `capability_set_without_queue_and_interrupt_reads_as_unknown` | A snapshot with both names removed parses, and both read `unknown` — not `unsupported` |
+| `native_ref_without_runtime_capabilities_parses` | Old NativeRef parses; `signalTier` absent and capabilities empty; the populated form round-trips carrying `native` / `emulated` / `unknown` provisions; an entry written before `provision` reads as `unknown` |
+| `capability_set_without_queue_and_interrupt_reads_as_unknown` | A snapshot with both names removed parses, and both read `unknown` — not `unsupported`; `provision` defaults to `unknown`, not `native` |
 | `prompt_mode_gains_steer_and_queue_without_moving_new_turn` | `new-turn` unchanged; the two new values parse; an unknown value is still refused |
 | `source_channel_gains_file_osc_screen` | New variants parse; existing ones unchanged |
 | `effort_selection_normalizes_legacy_tier_names` | 11 legacy/current names × 3 payload shapes land on one value each; the `ultra`/`ultracode` index collision is pinned; `{index}` with no name is refused |
@@ -99,7 +101,7 @@ Three new variants on an enum that already had nine. Existing ones are untouched
 
 Hub-side, `legacy_effort_tier_names_normalize_by_name_not_index` covers the same collision through SQLite storage, `launched_by_is_derived_from_mode_for_legacy_rows` covers the derivation, and the end-to-end `instance_configure_is_journaled_and_persisted` now posts a **pre-D-028 client payload** (`{index: 1, name: "think"}`) over HTTP and asserts it still works, reading back the normalized level.
 
-Driver-side, `capability_set_with_runtime` precedence has four tests and `shell_pty_agent` has six covering per-kind argv.
+Driver-side, `capability_set_with_runtime` precedence has four tests — including that an emulated entry keeps its provision while a tier's own grants stay `native`, since the tier *is* the harness's channel — and `shell_pty_agent` has six covering per-kind argv.
 
 ## Verification
 
@@ -108,7 +110,7 @@ Driver-side, `capability_set_with_runtime` precedence has four tests and `shell_
 | `cargo fmt --all` | clean |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | clean |
 | `cargo test --workspace --locked` | PASS except two pre-existing environmental failures (below) |
-| `pnpm test` (web) | PASS: 304 tests in 61 files |
+| `pnpm test` (web) | PASS: 309 tests in 61 files |
 | `pnpm exec tsc --noEmit` (web) | clean |
 | `./scripts/ci/secret-scan.sh` | pass |
 

@@ -101,6 +101,9 @@ pub struct RuntimeCapability {
     pub name: CapabilityName,
     /// Observed state. `unknown` is honest and stays callable-refusing.
     pub state: CapabilityState,
+    /// Whether the harness provides it or Remuda emulates it; D-028 §6.
+    #[serde(default = "crate::unknown_provision")]
+    pub provision: CapabilityProvision,
     /// Signal tier that produced the observation.
     pub tier: SignalTier,
     /// Stable machine-readable cause (`hook-socket-open`, `no-adapter`, …).

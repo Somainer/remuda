@@ -288,6 +288,12 @@ wire_enum!(CapabilityState, "3.2", {
     Unknown => "unknown",
 });
 
+wire_enum!(CapabilityProvision, "3.2", {
+    Native => "native",
+    Emulated => "emulated",
+    Unknown => "unknown",
+});
+
 wire_enum!(EvidenceType, "3.2", {
     Fixture => "fixture",
     NativeNegotiation => "native-negotiation",

@@ -1954,6 +1954,7 @@ fn fixture_capabilities(
 ) -> Result<CapabilitySnapshot, NodeError> {
     let unknown_capability = Capability {
         state: CapabilityState::Unknown,
+        provision: remuda_protocol::CapabilityProvision::Unknown,
         scope: Vec::new(),
         reason_code: "not-verified".to_owned(),
         prerequisites: Vec::new(),
@@ -1961,6 +1962,7 @@ fn fixture_capabilities(
     };
     let unsupported = Capability {
         state: CapabilityState::Unsupported,
+        provision: remuda_protocol::CapabilityProvision::Unknown,
         scope: Vec::new(),
         reason_code: "fake-driver".to_owned(),
         prerequisites: Vec::new(),
@@ -1968,6 +1970,7 @@ fn fixture_capabilities(
     };
     let supported = Capability {
         state: CapabilityState::Supported,
+        provision: remuda_protocol::CapabilityProvision::Native,
         scope: vec!["local-fixture".to_owned()],
         reason_code: "fake-driver".to_owned(),
         prerequisites: Vec::new(),
@@ -2014,6 +2017,7 @@ fn fixture_capabilities(
             completion_native_turn: supported,
             completion_task: Capability {
                 state: CapabilityState::Unsupported,
+                provision: remuda_protocol::CapabilityProvision::Unknown,
                 scope: Vec::new(),
                 reason_code: "fake-native-turn-only".to_owned(),
                 prerequisites: Vec::new(),

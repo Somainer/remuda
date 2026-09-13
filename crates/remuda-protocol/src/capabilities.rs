@@ -23,6 +23,15 @@ pub struct CapabilityEvidence {
 pub struct Capability {
     /// `state`; protocol §3.2.
     pub state: CapabilityState,
+    /// Who implements it: the harness, or Remuda on its behalf; §3.2 (D-028 §6).
+    ///
+    /// Orthogonal to `state`. `supported` answers "can this be done", this
+    /// answers "by whom" — and the difference is user-visible, because an
+    /// emulated queue is held in Remuda's ledger while a native one lives
+    /// inside the harness where Remuda cannot edit it. Defaults to
+    /// [`CapabilityProvision::Unknown`] so a pre-D-028 payload stays truthful.
+    #[serde(default = "unknown_provision")]
+    pub provision: CapabilityProvision,
     /// `scope`; protocol §3.2.
     pub scope: Vec<String>,
     /// `reason_code`; protocol §3.2.
@@ -31,6 +40,10 @@ pub struct Capability {
     pub prerequisites: Vec<String>,
     /// `evidence`; protocol §3.2.
     pub evidence: Vec<CapabilityEvidence>,
+}
+
+pub(crate) fn unknown_provision() -> CapabilityProvision {
+    CapabilityProvision::Unknown
 }
 
 impl Capability {
@@ -42,6 +55,7 @@ impl Capability {
     pub fn unverified() -> Self {
         Self {
             state: CapabilityState::Unknown,
+            provision: CapabilityProvision::Unknown,
             scope: vec![],
             reason_code: "insufficient-evidence".into(),
             prerequisites: vec![],

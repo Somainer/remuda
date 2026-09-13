@@ -56,6 +56,7 @@ pub fn schema_document() -> Value {
         Capability,
         CapabilityEvidence,
         CapabilityName,
+        CapabilityProvision,
         CapabilitySet,
         CapabilitySnapshot,
         CapabilityState,

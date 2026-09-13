@@ -1,6 +1,7 @@
 import type {
   Capability,
   CapabilityName,
+  CapabilityProvision,
   CapabilitySnapshot,
   DriverKind,
   NativeRef,
@@ -31,6 +32,12 @@ const NAMES: CapabilityName[] = [
 
 function cap(state: Capability["state"], reason: string): Capability {
   return { state, scope: [], reasonCode: reason, prerequisites: [], evidence: [] };
+}
+
+/** Present an emulated capability as emulated. D-028 §6 requires it be user-visible: an
+ *  emulated queue lives in Remuda's ledger, a native one inside the harness. */
+export function provisionOf(capability: Capability | undefined): CapabilityProvision {
+  return capability?.provision ?? "unknown";
 }
 
 /**
@@ -67,12 +74,15 @@ export function withRuntimeCapabilities(
   const capabilities = { ...snapshot.capabilities };
   if (nativeRef.signalTier) {
     for (const name of TIER_CAPABILITIES[nativeRef.signalTier] ?? []) {
-      capabilities[name] = cap("supported", `signal-tier-${nativeRef.signalTier}`);
+      capabilities[name] = {
+        ...cap("supported", `signal-tier-${nativeRef.signalTier}`),
+        provision: "native",
+      };
     }
   }
   // Explicit entries are more specific than the tier default, so they win.
   for (const entry of nativeRef.capabilities ?? []) {
-    capabilities[entry.name] = cap(entry.state, entry.reasonCode);
+    capabilities[entry.name] = { ...cap(entry.state, entry.reasonCode), provision: entry.provision };
   }
   return { ...snapshot, capabilities };
 }

@@ -362,14 +362,38 @@ mod d028 {
             "transcript": {"state": "unknown", "reason": "not-emitted", "evidenceEventIds": []},
             "signalTier": "hook",
             "capabilities": [
-                {"name": "steer", "state": "unknown", "tier": "hook", "reasonCode": "unmeasured"},
-                {"name": "resume", "state": "supported", "tier": "hook", "reasonCode": "session-meta"}
+                {"name": "steer", "state": "unknown", "provision": "unknown",
+                 "tier": "hook", "reasonCode": "unmeasured"},
+                {"name": "queue", "state": "supported", "provision": "emulated",
+                 "tier": "hook", "reasonCode": "remuda-ledger"},
+                {"name": "resume", "state": "supported", "provision": "native",
+                 "tier": "hook", "reasonCode": "session-meta"}
             ]
         });
         let runtime = round_trip::<NativeRef>(runtime);
         assert_eq!(runtime.signal_tier, Some(SignalTier::Hook));
-        assert_eq!(runtime.capabilities.len(), 2);
+        assert_eq!(runtime.capabilities.len(), 3);
         assert_eq!(runtime.capabilities[0].state, CapabilityState::Unknown);
+        // §6 requires the three-way native/emulated/unknown distinction to be
+        // expressible per capability: an emulated queue lives in Remuda's
+        // ledger, a native one inside the harness where we cannot edit it.
+        assert_eq!(
+            runtime.capabilities[1].provision,
+            CapabilityProvision::Emulated
+        );
+        assert_eq!(
+            runtime.capabilities[2].provision,
+            CapabilityProvision::Native
+        );
+
+        // An entry written before `provision` existed reads as `unknown`
+        // rather than silently claiming the harness provides it.
+        let legacy_entry = json!({
+            "name": "steer", "state": "supported", "tier": "hook", "reasonCode": "old-peer"
+        });
+        let decoded: RuntimeCapability =
+            from_json_slice(&serde_json::to_vec(&legacy_entry).unwrap()).unwrap();
+        assert_eq!(decoded.provision, CapabilityProvision::Unknown);
     }
 
     /// A CapabilitySnapshot serialized before `queue` / `interrupt` existed
@@ -389,6 +413,17 @@ mod d028 {
         assert_eq!(
             snapshot.capabilities.interrupt.state,
             CapabilityState::Unknown
+        );
+        // §6: an old peer said nothing about who provides a capability, so
+        // neither do we. `provision` is orthogonal to `state`, and defaulting
+        // it to `native` would invent a claim the peer never made.
+        assert_eq!(
+            snapshot.capabilities.queue.provision,
+            CapabilityProvision::Unknown
+        );
+        assert_eq!(
+            snapshot.capabilities.resume.provision,
+            CapabilityProvision::Unknown
         );
         // Re-serializing adds the two names; that is the additive change, and
         // it round-trips from there.

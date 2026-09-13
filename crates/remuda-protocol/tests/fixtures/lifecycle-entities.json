@@ -162,6 +162,7 @@
         "capabilities": {
           "resume": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -169,6 +170,7 @@
           },
           "steer": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -176,6 +178,7 @@
           },
           "queue": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "insufficient-evidence",
             "prerequisites": [],
@@ -183,6 +186,7 @@
           },
           "interrupt": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "insufficient-evidence",
             "prerequisites": [],
@@ -190,6 +194,7 @@
           },
           "model-switch": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -197,6 +202,7 @@
           },
           "fork": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -204,6 +210,7 @@
           },
           "structured-workflow": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -211,6 +218,7 @@
           },
           "artifact": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -218,6 +226,7 @@
           },
           "tty-attach": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -225,6 +234,7 @@
           },
           "hooks": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -232,6 +242,7 @@
           },
           "interactive-approval": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -239,6 +250,7 @@
           },
           "question": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -246,6 +258,7 @@
           },
           "plan-review": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -253,6 +266,7 @@
           },
           "elicitation": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -260,6 +274,7 @@
           },
           "live-attach": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -267,6 +282,7 @@
           },
           "completion-native-turn": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],
@@ -274,6 +290,7 @@
           },
           "completion-task": {
             "state": "unknown",
+            "provision": "unknown",
             "scope": [],
             "reasonCode": "not-verified",
             "prerequisites": [],

@@ -72,6 +72,20 @@ async fn relay(socket: &std::path::Path, event: &str, credential: &str, stdin: &
 const SESSION_START: &str = r#"{"session_id":"0199a1f0-0000-7000-8000-000000000000",
         "transcript_path":"/w/s.jsonl","cwd":"/w","hook_event_name":"SessionStart"}"#;
 
+#[test]
+fn the_blocking_wait_still_matches_the_interaction_brokers_ttl() {
+    // These are two constants in two crates: remuda-signal cannot depend on
+    // remuda-driver without a cycle, so the alignment is asserted here, where
+    // both are in scope. If the broker's TTL moves and this does not, a hook
+    // gives up before the broker retires the ticket and a decision the user
+    // *did* make becomes a silent fallback.
+    assert_eq!(
+        remuda_signal::BLOCKING_WAIT,
+        remuda_driver::interaction::DEFAULT_TTL,
+        "a blocking hook must not give up before the broker would"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_relay_forwards_stdin_and_prints_the_nodes_reply() {
     let dir = tempfile::tempdir().unwrap();

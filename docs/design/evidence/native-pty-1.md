@@ -197,7 +197,9 @@ be one — it is generated in `launch/session.rs` and read from nowhere. What it
 authorises is exactly one thing: appending hook events to one instance's
 journal, for as long as that instance lives. It is compared length-then-bytes
 so a wrong credential costs the same whatever it is, and a rejected event never
-reaches the journal. Requests are capped at 4 MiB before being buffered.
+reaches the journal. Requests are capped at 4 MiB before being buffered, and a
+peer that connects and then says nothing is dropped after 30 s rather than
+holding a task and an fd for the life of the instance.
 
 **What env is injected, and why it bypasses the allowlist.** `child_env`
 inherits a closed allowlist (§4.2) whose purpose is to keep the Node's own

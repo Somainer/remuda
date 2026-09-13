@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { Instance } from "../types/instance";
@@ -129,10 +129,13 @@ describe("SessionPage promotion rendering", () => {
 
   it("keeps the terminal tab working on a promoted instance", async () => {
     await renderSession(promotedInstance(), "structured");
-    // Both tabs are offered; promotion adds the structured one, it does not
-    // take the terminal away.
-    expect(screen.getByRole("link", { name: "终端" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "结构" })).toBeTruthy();
+    // Both states are offered on the one segmented switch; promotion adds the
+    // structured one, it does not take the terminal away.
+    const sw = screen.getByTestId("view-switch");
+    expect(sw).toBeTruthy();
+    expect(within(sw).getAllByRole("radio")).toHaveLength(2);
+    expect(screen.getByTestId("view-switch-tty")).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("view-switch-structured")).toHaveAttribute("aria-checked", "true");
   });
 });
 

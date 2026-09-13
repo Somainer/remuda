@@ -498,7 +498,6 @@ class HubStore {
   /**
    * Real deletion. `force` is what stops a live Instance — the Hub does the
    * stop and the delete together, so the caller must not close it first.
-   * Rejects with `DELETE_UNSUPPORTED` on a Hub that predates the route.
    */
   async deleteInstance(instanceId: Id, force = false) {
     const result = await api.instanceDelete(instanceId, force);

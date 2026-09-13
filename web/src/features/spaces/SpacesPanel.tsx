@@ -1,8 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
-import { DELETE_UNSUPPORTED } from "../../lib/api";
-import { HubHttpError } from "../../lib/httpError";
 import { hubStore } from "../../lib/store";
 import { projectStatus } from "../../lib/status";
 import { newSessionPath, spaceSessions, spaceStore, type Space, type SpacePrefs } from "./store";
@@ -42,20 +40,15 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
    * Deletes the record for real. `force` is how a live session is stopped: the
    * Hub stops and deletes together, so this must not close it separately.
    */
-  async function remove(spaceId: string, instance: Instance, force: boolean) {
+  async function remove(instance: Instance, force: boolean) {
     setBusy(true);
     try {
       const result = await hubStore.deleteInstance(instance.id, force);
       // The Hub record is gone either way; only the Node's own data may remain.
       hubStore.toast(result.nodePurge && result.nodePurge !== "purged"
         ? "已删除会话；该主机数据待其上线后清理" : "已删除会话");
-    } catch (error) {
-      // On a Hub that predates the route the row leaves this device's lists and
-      // the record stays on the Hub; say so rather than claiming a deletion.
-      if (error instanceof HubHttpError && error.code === DELETE_UNSUPPORTED) {
-        spaceStore.hideSession(spaceId, instance.id);
-        hubStore.toast("当前 Hub 尚不支持删除，已从本设备列表隐藏");
-      } else hubStore.toast("删除失败，请重试");
+    } catch {
+      hubStore.toast("删除失败，请重试");
     } finally {
       setBusy(false);
       setDeleting(undefined);
@@ -69,7 +62,7 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
     </header>
     <div className={css.groups}>
       {spaces.map((space, index) => {
-        const { live, exited } = spaceSessions(space, prefs);
+        const { live, exited } = spaceSessions(space);
         const exitedOpen = prefs.exitedOpen[space.id] === true;
         return <section key={space.id} className={css.group} data-active={space.id === active?.id}>
           <div className={css.groupHead}>
@@ -121,7 +114,7 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
         : `「${hubStore.titleOf(target.id)}」仍在运行，删除前会先停止它。记录将被删除，无法恢复。`}
       busy={busy} onClose={() => { if (!busy) setDeleting(undefined); }}
       actions={projectStatus(target) === "exited"
-        ? [{ id: "delete-session-confirm", label: "删除", tone: "danger", onSelect: () => void remove(deleting.spaceId, target, false) }]
-        : [{ id: "delete-session-stop", label: "停止并删除", tone: "danger", onSelect: () => void remove(deleting.spaceId, target, true) }]} /> : null}
+        ? [{ id: "delete-session-confirm", label: "删除", tone: "danger", onSelect: () => void remove(target, false) }]
+        : [{ id: "delete-session-stop", label: "停止并删除", tone: "danger", onSelect: () => void remove(target, true) }]} /> : null}
   </section>;
 }

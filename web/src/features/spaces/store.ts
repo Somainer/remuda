@@ -35,12 +35,11 @@ export type SpacePrefs = {
   selectedSpaceId?: string;
   selectedTabs: Record<string, string>;
   closedTabs: Record<string, DismissedTab[]>;
-  hiddenSessions: Record<string, string[]>;
 };
 
 export function defaultSpacePrefs(): SpacePrefs {
   return { version: 1, collapsed: false, groupCollapsed: {}, exitedOpen: {}, names: {}, order: [],
-    selectedTabs: {}, closedTabs: {}, hiddenSessions: {} };
+    selectedTabs: {}, closedTabs: {} };
 }
 
 export function spaceKey(hostId: string, workspaceId: string): string {
@@ -90,29 +89,20 @@ function dismissedIn(space: Space, prefs: SpacePrefs): Map<string, DismissedTab>
   return new Map((prefs.closedTabs[space.id] ?? []).map((entry) => [entry.id, entry]));
 }
 
-/** Sessions hidden by the delete fallback, used while the Hub has no DELETE route. */
-function hiddenIn(space: Space, prefs: SpacePrefs): Set<string> {
-  return new Set(prefs.hiddenSessions[space.id] ?? []);
-}
-
 /** A dismissed session keeps running; it returns to the strip once it needs a human. */
 export function visibleTabs(space: Space, prefs: SpacePrefs): Instance[] {
   const dismissed = dismissedIn(space, prefs);
-  const hidden = hiddenIn(space, prefs);
   return space.instances.filter((instance) => {
-    if (hidden.has(instance.id)) return false;
     const entry = dismissed.get(instance.id);
     return !entry || (entry.resurface && projectStatus(instance) === "blocked");
   });
 }
 
 /** The sidebar lists live sessions inline and collects exited ones into a group. */
-export function spaceSessions(space: Space, prefs: SpacePrefs): { live: Instance[]; exited: Instance[] } {
-  const hidden = hiddenIn(space, prefs);
-  const rows = space.instances.filter((instance) => !hidden.has(instance.id));
+export function spaceSessions(space: Space): { live: Instance[]; exited: Instance[] } {
   return {
-    live: rows.filter((instance) => projectStatus(instance) !== "exited"),
-    exited: rows.filter((instance) => projectStatus(instance) === "exited"),
+    live: space.instances.filter((instance) => projectStatus(instance) !== "exited"),
+    exited: space.instances.filter((instance) => projectStatus(instance) === "exited"),
   };
 }
 
@@ -179,7 +169,6 @@ export function parseSpacePrefs(raw: string | null): SpacePrefs {
       selectedSpaceId: typeof value.selectedSpaceId === "string" ? value.selectedSpaceId : undefined,
       selectedTabs: stringMap(value.selectedTabs),
       closedTabs: Object.fromEntries(Object.entries(record(value.closedTabs)).map(([key, item]) => [key, dismissedTabs(item)])),
-      hiddenSessions: Object.fromEntries(Object.entries(record(value.hiddenSessions)).map(([key, item]) => [key, strings(item)])),
     };
   } catch {
     return defaultSpacePrefs();
@@ -250,13 +239,6 @@ export function createSpaceStore(storage = browserStorage()) {
       const closedTabs = Object.fromEntries(Object.entries(prefs.closedTabs).map(([spaceId, entries]) =>
         [spaceId, entries.map((entry) => entry.resurface || blocked.has(entry.id) ? entry : { ...entry, resurface: true })]));
       update({ closedTabs });
-    },
-    /** Fallback for a Hub without a delete endpoint: drop the session from this device's lists. */
-    hideSession(spaceId: string, instanceId: string) {
-      const selectedTabs = { ...prefs.selectedTabs };
-      if (selectedTabs[spaceId] === instanceId) delete selectedTabs[spaceId];
-      update({ selectedTabs, hiddenSessions: { ...prefs.hiddenSessions,
-        [spaceId]: [...new Set([...(prefs.hiddenSessions[spaceId] ?? []), instanceId])] } });
     },
   };
 }

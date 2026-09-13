@@ -14,28 +14,29 @@ Addresses two pieces of user feedback on the D-024 strip: the active tab and the
 
 ## Delete is wired to the real endpoint
 
-`DELETE /v1/instances/{id}` landed on `wt/x-ttyhub/tty-relay-hardening` (`8896fc7`) while this work was in progress, and 删除 / 停止并删除 call it directly:
+`DELETE /v1/instances/{id}` is on `origin/main` (`288fde4`, from x-ttyhub), and 删除 / 停止并删除 call it directly. There is no feature detection and no fallback path:
 
 - A terminal-state session deletes outright.
-- A live session is refused with `409` unless `?force=1`, which makes the **Hub** stop it and then delete it. 停止并删除 therefore sends that one request; the client deliberately does **not** close the session itself first, which would be a second, racing stop.
+- A live session is refused with `409` unless `?force=1`, which makes the **Hub** stop it and then delete it. 停止并删除 sends that one request; the client deliberately does **not** close the session itself first, which would be a second, racing stop.
 - A repeated delete answers `404`, so the client treats it as an idempotent success rather than an error.
 - The response's `nodePurge` reports the Node side only. The Hub record is deleted whatever it says, so anything other than `purged` produces 「已删除会话；该主机数据待其上线后清理」 instead of a bare success.
+- A refused delete keeps the row listed and says 删除失败，请重试; it never shows a success message.
 
-The `405`/`501` → `DELETE_UNSUPPORTED` fallback is kept for a Hub that predates the route: it hides the row from this device and says 「当前 Hub 尚不支持删除，已从本设备列表隐藏」. **The record still exists on the Hub in that path and the UI does not claim otherwise.** That fallback can be dropped once every deployed Hub carries the route.
+`InstanceDeleted` comes from the generated OpenAPI types rather than a hand-written shape, so a later change to the response is a typecheck failure here instead of a silent mismatch. The mock adapter mirrors the same contract — `409` on a live instance without force, `404`-idempotent, `nodePurge` reported — so the client paths are exercised without a Hub. This branch contains no Rust change.
+
+An earlier revision of this branch predated the endpoint and carried a `405`/`501` → hide-the-row fallback, with `hiddenSessions` in the device preferences. Both are removed now that the route is on main; keeping them would have left an unreachable path and a persisted field nothing writes.
 
 The delete target is held as `{spaceId, instanceId}` and re-resolved from current props each render, so a session that resumes while the sheet is open is offered 停止并删除 rather than the exited-only action.
-
-This branch contains no Rust change; the endpoint itself is x-ttyhub's, and the mock adapter mirrors its contract (409 on live without force, 404-idempotent) so the client paths are exercised without it.
 
 ## Verification
 
 | Check | Result / boundary |
 | --- | --- |
-| `pnpm test` (web unit) | PASS: 242 tests in 54 files |
-| Dismiss/resurface and exited grouping unit tests | PASS: 13 store tests, including legacy `closedTabs` migration, blocked-episode suppression and re-arming, and the hide fallback |
+| `pnpm test` (web unit) | PASS: 251 tests in 56 files |
+| Dismiss/resurface and exited grouping unit tests | PASS: 13 store tests, including legacy `closedTabs` migration, blocked-episode suppression and re-arming, and exited grouping |
 | `SpaceTabs` component tests | PASS: 6 tests — exited tab closes with no sheet and no command; 仅关闭标签 sends no close; cancel is inert; dismissed tab returns on blocked; plus the three pre-existing async-close cases |
-| `SpacesPanel` component tests | PASS: 6 tests — default-collapsed group, resume, confirm-before-delete, the 405 fallback message, `force=1` for a live target with no separate close, and the non-`purged` `nodePurge` message |
-| Mutation checks | Each new assertion was re-run against a deliberately broken implementation (resurface disabled, exited routed through the sheet, 仅关闭 wired to stop, fallback claiming success, group defaulting open, `force` dropped, `nodePurge` ignored) and failed in every case |
+| `SpacesPanel` component tests | PASS: 6 tests — default-collapsed group, resume, confirm-before-delete, a refused delete keeping the row, `force=1` for a live target with no separate close, and the non-`purged` `nodePurge` message |
+| Mutation checks | Each new assertion was re-run against a deliberately broken implementation (resurface disabled, exited routed through the sheet, 仅关闭 wired to stop, group defaulting open, `force` dropped, `nodePurge` ignored) and failed in every case |
 | `pnpm lint` | PASS: 4 pre-existing warnings in hosts/providers/NewSession, none in spaces |
 | `pnpm exec tsc -b` | PASS |
 | `./scripts/ci/secret-scan.sh` | PASS |

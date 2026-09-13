@@ -2,8 +2,6 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DELETE_UNSUPPORTED } from "../../lib/api";
-import { HubHttpError } from "../../lib/httpError";
 import { mockDb } from "../../lib/mock";
 import { hubStore } from "../../lib/store";
 import type { Instance } from "../../types/instance";
@@ -85,21 +83,20 @@ describe("SpacesPanel exited sessions", () => {
     expect(hubStore.deleteInstance).toHaveBeenCalledWith("gone", false);
     expect(hubStore.close).not.toHaveBeenCalled();
     await waitFor(() => expect(hubStore.toast).toHaveBeenCalledWith("已删除会话"));
-    expect(spaceStore.getSnapshot().hiddenSessions[alpha] ?? []).toEqual([]);
   });
 
-  it("hides the row and says so when the Hub has no delete route yet", async () => {
+  it("keeps the session listed and reports failure when the delete is refused", async () => {
     const user = userEvent.setup();
-    vi.mocked(hubStore.deleteInstance).mockRejectedValueOnce(new HubHttpError(405, DELETE_UNSUPPORTED, "no route"));
+    vi.mocked(hubStore.deleteInstance).mockRejectedValueOnce(new Error("hub unavailable"));
     spaceStore.toggleExited(alpha);
     renderPanel();
     await user.click(screen.getByTestId("exited-delete"));
     await user.click(screen.getByTestId("delete-session-confirm"));
 
-    await waitFor(() => expect(spaceStore.getSnapshot().hiddenSessions[alpha]).toEqual(["gone"]));
-    // The record survives on the Hub, so the message must not claim a deletion.
-    expect(hubStore.toast).toHaveBeenCalledWith("当前 Hub 尚不支持删除，已从本设备列表隐藏");
+    await waitFor(() => expect(hubStore.toast).toHaveBeenCalledWith("删除失败，请重试"));
+    // A failed delete must not look like a successful one.
     expect(hubStore.toast).not.toHaveBeenCalledWith("已删除会话");
+    expect(screen.getByTestId("exited-session")).toHaveAttribute("data-instance-id", "gone");
   });
 
   it("does not claim the host data is gone when the Node could not purge it", async () => {
@@ -112,7 +109,7 @@ describe("SpacesPanel exited sessions", () => {
 
     // The Hub record is deleted either way; only the host copy is pending.
     await waitFor(() => expect(hubStore.toast).toHaveBeenCalledWith("已删除会话；该主机数据待其上线后清理"));
-    expect(spaceStore.getSnapshot().hiddenSessions[alpha] ?? []).toEqual([]);
+    expect(hubStore.toast).not.toHaveBeenCalledWith("已删除会话");
   });
 
   it("stops a running session before deleting it", async () => {

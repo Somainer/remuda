@@ -247,7 +247,10 @@ async fn spawn_inner(
         agent_approvals: agent_approvals::AgentApprovals::new()?,
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
-    let reaper_store = store.clone();
+    // A Hub restart must not inherit yesterday's unacknowledged creates: they
+    // would keep holding placement slots with no Node that can ever settle them.
+    expire_stale_requested(&state, config.requested_grace_ms).await;
+    let reaper_state = state.clone();
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
@@ -272,9 +275,10 @@ async fn spawn_inner(
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Err(err) = reaper_store.expire_lost_hosts(config.host_lost_grace_ms).await {
+                    if let Err(err) = reaper_state.store.expire_lost_hosts(config.host_lost_grace_ms).await {
                         tracing::error!(error = %err, "host-lost sweep failed");
                     }
+                    expire_stale_requested(&reaper_state, config.requested_grace_ms).await;
                 }
             }
         }
@@ -286,6 +290,35 @@ async fn spawn_inner(
         task: Some(task),
         store: Some(store),
     })
+}
+
+/// Fail `requested` instances the Node never acknowledged.
+///
+/// Each expiry gets a Hub-authored journal diagnostic so the row explains
+/// itself, and stops counting toward the host's `maxInstances` ceiling.
+async fn expire_stale_requested(state: &AppState, window_ms: u64) {
+    let expired = match state.store.expire_stale_requested(window_ms).await {
+        Ok(expired) => expired,
+        Err(error) => {
+            tracing::error!(%error, "stale-requested sweep failed");
+            return;
+        }
+    };
+    for (host_id, instance_id) in expired {
+        tracing::warn!(
+            %host_id,
+            %instance_id,
+            window_ms,
+            "create was never acknowledged by the node; expiring to failed"
+        );
+        crate::ws::publish_hub_diagnostic(
+            state,
+            &instance_id,
+            "create_never_acknowledged",
+            "create was never acknowledged by the node; expired to failed",
+        )
+        .await;
+    }
 }
 
 /// Axum router (HTTP + WS + static).

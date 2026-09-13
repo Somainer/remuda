@@ -20,14 +20,13 @@ use remuda_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
-/// Per-socket cap on remembered tty stream bindings. A Node with more live
-/// streams than this recycles the map rather than growing it without bound.
-const MAX_TTY_STREAMS_PER_SOCKET: usize = 1_024;
+/// Cap on remembered tty stream bindings across all hosts.
+const MAX_TTY_STREAMS: usize = 1_024;
 
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
@@ -55,25 +54,65 @@ impl FollowEvent {
     }
 }
 
-/// Stream UUID → instance and bounded output cache for snapshot-on-attach.
+/// Stream UUID → owning host/instance, plus a bounded output cache for
+/// snapshot-on-attach.
+///
+/// Bindings are keyed by *host*, not by socket. A Node reconnect replaces the
+/// socket but keeps the same host id, so a follow socket opened before the
+/// reconnect keeps receiving output once the Node re-announces its streams —
+/// previously the per-socket ownership set was empty on the new socket and
+/// every binary frame was dropped silently while the snapshot still painted
+/// (B2).
 #[derive(Clone, Default)]
 pub struct TtyRelay {
-    streams: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    streams: Arc<std::sync::Mutex<HashMap<String, StreamOwner>>>,
     buffers: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
 }
 
+/// Host-validated owner of a tty stream UUID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StreamOwner {
+    host_id: String,
+    instance_id: String,
+}
+
 impl TtyRelay {
-    fn bind(&self, stream_uuid: &str, instance_id: &str) {
+    fn bind(&self, stream_uuid: &str, host_id: &str, instance_id: &str) {
         if let Ok(mut streams) = self.streams.lock() {
-            streams.insert(stream_uuid.to_owned(), instance_id.to_owned());
+            if streams.len() >= MAX_TTY_STREAMS && !streams.contains_key(stream_uuid) {
+                // A Node with more live streams than this recycles the map
+                // rather than growing it without bound.
+                streams.clear();
+            }
+            streams.insert(
+                stream_uuid.to_owned(),
+                StreamOwner {
+                    host_id: host_id.to_owned(),
+                    instance_id: instance_id.to_owned(),
+                },
+            );
         }
     }
 
+    /// Instance behind a stream UUID, only when `host_id` is the binder.
+    ///
+    /// The registry is process-wide, so without the host check a Node could
+    /// push binary frames onto a stream a different Node registered (T2).
+    fn instance_for_host(&self, stream_uuid: &str, host_id: &str) -> Option<String> {
+        self.streams.lock().ok().and_then(|streams| {
+            streams
+                .get(stream_uuid)
+                .filter(|owner| owner.host_id == host_id)
+                .map(|owner| owner.instance_id.clone())
+        })
+    }
+
     fn instance_of(&self, stream_uuid: &str) -> Option<String> {
-        self.streams
-            .lock()
-            .ok()
-            .and_then(|streams| streams.get(stream_uuid).cloned())
+        self.streams.lock().ok().and_then(|streams| {
+            streams
+                .get(stream_uuid)
+                .map(|owner| owner.instance_id.clone())
+        })
     }
 
     fn push_output(&self, instance_id: &str, payload: &[u8]) {
@@ -189,10 +228,6 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     let mut host_id: Option<String> = None;
     let mut hello_done = false;
     let mut session_generation: Option<u64> = None;
-    // Stream UUIDs this socket bound via a host-validated `tty.frame`. The
-    // `TtyRelay` registry is process-wide, so binary frames — which carry no
-    // instance or host id — are honoured only for streams in this set (T2).
-    let mut tty_streams: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -205,8 +240,8 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             incoming = stream.next() => {
                 let Some(Ok(msg)) = incoming else { break; };
                 if let Message::Binary(bytes) = &msg {
-                    if hello_done {
-                        handle_tty_binary(&state, &tty_streams, bytes);
+                    if let Some(host_id) = host_id.as_deref().filter(|_| hello_done) {
+                        handle_tty_binary(&state, host_id, bytes);
                     }
                     continue;
                 }
@@ -237,7 +272,7 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                     }
                     break;
                 }
-                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, &mut tty_streams, method, params, &out_tx, &pending).await {
+                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, method, params, &out_tx, &pending).await {
                     Ok(Some(result)) => {
                         if !id.is_null() {
                             let _ = sink.send(Message::Text(rpc_ok(id, result).to_string().into())).await;
@@ -280,7 +315,6 @@ pub(crate) async fn handle_node_method(
     host_id: &mut Option<String>,
     hello_done: &mut bool,
     session_generation: &mut Option<u64>,
-    tty_streams: &mut HashSet<String>,
     method: &str,
     params: Value,
     out_tx: &mpsc::Sender<Value>,
@@ -369,6 +403,7 @@ pub(crate) async fn handle_node_method(
                     )
                     .await?;
             }
+            reconcile_lost_instances(state, &host.host_id, &params).await?;
             let generation = state
                 .nodes
                 .insert(
@@ -537,14 +572,10 @@ pub(crate) async fn handle_node_method(
                         })
                     && let Some(uuid) = stream_uuid_of(&stream_id)
                 {
-                    // Record ownership on this socket too: `TtyRelay` is
-                    // process-wide, so without this a Node could push binary
-                    // frames onto a stream another Node bound (T2).
-                    if tty_streams.len() >= MAX_TTY_STREAMS_PER_SOCKET {
-                        tty_streams.clear();
-                    }
-                    tty_streams.insert(uuid.clone());
-                    state.tty.bind(&uuid, &instance_id);
+                    // Ownership is recorded against the host, not this
+                    // socket, so the binding survives a Node reconnect and a
+                    // different Node still cannot push onto this stream (T2).
+                    state.tty.bind(&uuid, host_id, &instance_id);
                 }
                 if let Some(b64) =
                     typed
@@ -605,6 +636,103 @@ pub(crate) async fn handle_node_method(
     }
 }
 
+/// Reconcile Hub-side instance rows against what the Node reports at hello.
+///
+/// A Node restart loses every in-memory instance: the Hub keeps rows in
+/// `running`/`requested` that no epoch will ever settle, they hold placement
+/// slots, and a later stop never completes. When the announced `nodeEpoch`
+/// differs from the one recorded for this host, every live row the Node no
+/// longer lists is projected to `exited` with a Hub-authored diagnostic so the
+/// loss is visible in the journal instead of silent.
+///
+/// Nodes that omit `instances` (a plain, non-daemon hello) report nothing, so
+/// reconciliation only runs when an epoch change is actually observed and the
+/// Node did send an inventory — otherwise a stateless Node would wipe rows it
+/// simply never enumerates.
+async fn reconcile_lost_instances(
+    state: &AppState,
+    host_id: &str,
+    params: &Value,
+) -> Result<(), HubError> {
+    let epoch = params
+        .get("nodeEpoch")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let changed = state
+        .store
+        .record_node_epoch(host_id.to_string(), epoch)
+        .await?;
+    if !changed {
+        return Ok(());
+    }
+    let Some(reported) = params.get("instances").and_then(Value::as_array) else {
+        tracing::warn!(
+            %host_id,
+            "node epoch changed but hello carried no instance inventory; \
+             leaving instance rows untouched"
+        );
+        return Ok(());
+    };
+    let reported: Vec<String> = reported
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .or_else(|| item.get("instanceId"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let lost = state
+        .store
+        .reconcile_reported_instances(
+            host_id.to_string(),
+            reported,
+            "node-epoch-changed".to_string(),
+        )
+        .await?;
+    for instance_id in lost {
+        tracing::warn!(
+            %host_id,
+            %instance_id,
+            "node epoch changed; instance lost"
+        );
+        publish_hub_diagnostic(
+            state,
+            &instance_id,
+            "node_epoch_changed",
+            "node epoch changed; instance lost",
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Append and fan out a Hub-authored diagnostic, logging rather than failing.
+pub(crate) async fn publish_hub_diagnostic(
+    state: &AppState,
+    instance_id: &str,
+    native_name: &str,
+    message: &str,
+) {
+    match state
+        .store
+        .append_hub_diagnostic(
+            instance_id.to_string(),
+            native_name.to_string(),
+            message.to_string(),
+        )
+        .await
+    {
+        Ok(Some(record)) => publish_journal(&state.bus, &record),
+        Ok(None) => {}
+        Err(error) => tracing::error!(
+            %instance_id,
+            %error,
+            "failed to journal hub diagnostic"
+        ),
+    }
+}
+
 /// Strip the `tty_` registry prefix from a stream ID, keeping the bare UUID.
 ///
 /// Binary headers carry the UUID without the prefix, so both sides of the
@@ -613,11 +741,12 @@ pub(crate) async fn handle_node_method(
 ///
 /// The frame header carries only a stream UUID — no instance or host id — so
 /// attribution comes from the stream registry, never from the sending host.
-/// `tty_streams` additionally scopes that lookup to the streams *this* socket
-/// bound, because [`TtyRelay`] is process-wide: without it a Node could push
-/// binary frames onto a stream a different Node registered. An unregistered
-/// stream is dropped rather than published under a guessed id.
-fn handle_tty_binary(state: &AppState, tty_streams: &HashSet<String>, bytes: &[u8]) {
+/// The lookup is additionally scoped to the streams *this host* bound, because
+/// [`TtyRelay`] is process-wide: without it a Node could push binary frames
+/// onto a stream a different Node registered. An unregistered stream is
+/// dropped rather than published under a guessed id. Scoping by host rather
+/// than by socket is what lets output resume after a Node reconnect (B2).
+fn handle_tty_binary(state: &AppState, host_id: &str, bytes: &[u8]) {
     let max = default_limits().max_binary_chunk_bytes;
     let Ok((header, payload)) = hubnode::decode_tty_binary_frame(bytes, max) else {
         return;
@@ -626,11 +755,8 @@ fn handle_tty_binary(state: &AppState, tty_streams: &HashSet<String>, bytes: &[u
         return;
     }
     let uuid = header.stream_uuid.uuid().to_string();
-    // Only streams this socket registered: `TtyRelay` is shared across Nodes.
-    if !tty_streams.contains(&uuid) {
-        return;
-    }
-    let Some(instance_id) = state.tty.instance_of(&uuid) else {
+    // Only streams this host registered: `TtyRelay` is shared across Nodes.
+    let Some(instance_id) = state.tty.instance_for_host(&uuid, host_id) else {
         return;
     };
     state.tty.push_output(&instance_id, payload);
@@ -822,7 +948,7 @@ async fn follow_session(
                     match msg {
                         Message::Binary(bytes) => {
                             if want_tty {
-                                handle_follow_input(&state, &instance_ids, &bytes).await;
+                                handle_follow_input(&state, &out_tx, &instance_ids, &bytes).await;
                             }
                         }
                         Message::Text(text) => {
@@ -848,7 +974,7 @@ async fn follow_session(
                                     }
                                 }
                             } else if kind == Some("tty.resize") && want_tty {
-                                handle_follow_resize(&state, &instance_ids, &value).await;
+                                handle_follow_resize(&state, &out_tx, &instance_ids, &value).await;
                             }
                         }
                         _ => {}
@@ -922,70 +1048,192 @@ async fn send_follow_snapshot(
     Ok(())
 }
 
+/// Replay the TTY snapshot for one instance, preferring a live `tty.attach`.
+///
+/// Re-attaching also re-binds the stream UUID for the owning host, which is how
+/// a follow socket that outlived a Node reconnect gets its stream back (B2).
+/// When the Node cannot be reached, the Hub's own cached output is sent instead
+/// of being computed and dropped (B3) — the follower then paints the last known
+/// screen rather than an empty terminal.
 async fn send_tty_snapshot(
     state: &AppState,
     out_tx: &mpsc::Sender<FollowMsg>,
     instance_id: &str,
 ) -> Result<(), ()> {
-    if let Some(host_id) = state
+    let host_id = state
         .store
         .get_instance(instance_id.to_string())
         .await
         .ok()
         .flatten()
-        .map(|instance| instance.host_id)
-        && let Ok(Some(response)) = state
+        .map(|instance| instance.host_id);
+    let mut cached_stream_id = None;
+    if let Some(host_id) = host_id.as_deref() {
+        match state
             .nodes
             .call(
-                &host_id,
+                host_id,
                 "tty.attach",
                 json!({ "instanceId": instance_id, "mode": "write" }),
                 Duration::from_secs(5),
             )
             .await
-    {
-        let result = response.get("result").cloned().unwrap_or(response);
-        if let Some(stream_id) = result.get("streamId").and_then(Value::as_str)
-            && let Some(uuid) = stream_uuid_of(stream_id)
         {
-            state.tty.bind(&uuid, instance_id);
-        }
-        if let Some(b64) = result.get("snapshotBase64").and_then(Value::as_str)
-            && let Ok(bytes) = decode_b64(b64)
-            && !bytes.is_empty()
-        {
-            state.tty.push_output(instance_id, &bytes);
-            let stream_id = result.get("streamId").and_then(Value::as_str).unwrap_or("");
-            let offset = result
-                .get("availableFrom")
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if let Some(frame) = encode_output_frame(stream_id, offset, &bytes) {
-                out_tx
-                    .send(FollowMsg::Binary(frame))
-                    .await
-                    .map_err(|_| ())?;
-                return Ok(());
+            Ok(Some(response)) => {
+                let result = response.get("result").cloned().unwrap_or(response);
+                let stream_id = result
+                    .get("streamId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(stream_id) = stream_id.as_deref()
+                    && let Some(uuid) = stream_uuid_of(stream_id)
+                {
+                    state.tty.bind(&uuid, host_id, instance_id);
+                }
+                cached_stream_id = stream_id;
+                if let Some(b64) = result.get("snapshotBase64").and_then(Value::as_str)
+                    && let Ok(bytes) = decode_b64(b64)
+                    && !bytes.is_empty()
+                {
+                    state.tty.push_output(instance_id, &bytes);
+                    let offset = result
+                        .get("availableFrom")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    if let Some(frame) = encode_output_frame(
+                        cached_stream_id.as_deref().unwrap_or(""),
+                        offset,
+                        &bytes,
+                    ) {
+                        out_tx
+                            .send(FollowMsg::Binary(frame))
+                            .await
+                            .map_err(|_| ())?;
+                        return Ok(());
+                    }
+                }
             }
+            Ok(None) => tracing::debug!(
+                %instance_id,
+                %host_id,
+                "tty.attach skipped: node offline; falling back to the cached snapshot"
+            ),
+            Err(error) => tracing::warn!(
+                %instance_id,
+                %host_id,
+                %error,
+                "tty.attach failed; falling back to the cached snapshot"
+            ),
         }
     }
+    // B3: the Hub's own bounded cache is the last resort. Without a stream id
+    // from the Node there is nothing to address a binary frame to, so the
+    // cached bytes travel as a JSON diagnostic the follower can still render.
     let cached = state.tty.snapshot(instance_id);
     if cached.is_empty() {
         return Ok(());
     }
+    let frame = cached_stream_id
+        .as_deref()
+        .and_then(|stream_id| encode_output_frame(stream_id, 0, &cached));
+    let message = match frame {
+        Some(frame) => FollowMsg::Binary(frame),
+        None => FollowMsg::Text(
+            json!({
+                "type": "tty.snapshot",
+                "instanceId": instance_id,
+                "source": "hub-cache",
+                "dataBase64": encode_b64(&cached),
+            })
+            .to_string(),
+        ),
+    };
+    out_tx.send(message).await.map_err(|_| ())?;
     Ok(())
 }
 
-async fn handle_follow_input(state: &AppState, instance_ids: &[String], bytes: &[u8]) {
+/// Tell the follower that one of its tty operations did not reach the PTY.
+///
+/// Every input failure used to be a bare `return`, so a dead keyboard looked
+/// exactly like an idle terminal from both the browser and the Hub log (B4).
+async fn send_tty_diagnostic(
+    out_tx: &mpsc::Sender<FollowMsg>,
+    instance_id: Option<&str>,
+    operation: &str,
+    reason: &str,
+    detail: &str,
+) {
+    let frame = json!({
+        "type": "tty.diagnostic",
+        "instanceId": instance_id,
+        "operation": operation,
+        "reason": reason,
+        "detail": detail,
+    });
+    // A closed follow socket is the caller's next read; nothing to report here.
+    let _ = out_tx.try_send(FollowMsg::Text(frame.to_string()));
+}
+
+async fn handle_follow_input(
+    state: &AppState,
+    out_tx: &mpsc::Sender<FollowMsg>,
+    instance_ids: &[String],
+    bytes: &[u8],
+) {
     let max = default_limits().max_tty_input_bytes;
-    let Ok((header, payload)) = hubnode::decode_tty_binary_frame(bytes, max) else {
-        return;
+    let first = instance_ids.first().map(String::as_str);
+    let (header, payload) = match hubnode::decode_tty_binary_frame(bytes, max) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            tracing::warn!(
+                instance_id = ?first,
+                frame_bytes = bytes.len(),
+                %error,
+                "follow tty input frame rejected"
+            );
+            send_tty_diagnostic(
+                out_tx,
+                first,
+                "tty.write",
+                "malformed-frame",
+                &error.to_string(),
+            )
+            .await;
+            return;
+        }
     };
     if header.channel != remuda_protocol::BinaryChannel::TtyInput {
+        tracing::warn!(
+            instance_id = ?first,
+            channel = header.channel as u8,
+            "follow tty input frame on the wrong channel"
+        );
+        send_tty_diagnostic(
+            out_tx,
+            first,
+            "tty.write",
+            "wrong-channel",
+            "tty input must use the tty-input binary channel",
+        )
+        .await;
         return;
     }
     if payload.len() > max as usize {
+        tracing::warn!(
+            instance_id = ?first,
+            payload_bytes = payload.len(),
+            max,
+            "follow tty input exceeds maxTtyInputBytes"
+        );
+        send_tty_diagnostic(
+            out_tx,
+            first,
+            "tty.write",
+            "payload-too-large",
+            &format!("{} bytes exceeds maxTtyInputBytes {max}", payload.len()),
+        )
+        .await;
         return;
     }
     let uuid = header.stream_uuid.uuid().to_string();
@@ -994,57 +1242,139 @@ async fn handle_follow_input(state: &AppState, instance_ids: &[String], bytes: &
         .instance_of(&uuid)
         .or_else(|| instance_ids.first().cloned());
     let Some(instance_id) = instance_id else {
-        return;
-    };
-    let Some(host_id) = state
-        .store
-        .get_instance(instance_id.clone())
-        .await
-        .ok()
-        .flatten()
-        .map(|instance| instance.host_id)
-    else {
-        return;
-    };
-    let _ = state
-        .nodes
-        .call(
-            &host_id,
+        tracing::warn!(
+            stream_uuid = %uuid,
+            "follow tty input has no bound stream and no subscribed instance"
+        );
+        send_tty_diagnostic(
+            out_tx,
+            None,
             "tty.write",
-            json!({
-                "instanceId": instance_id,
-                "dataBase64": encode_b64(payload),
-            }),
-            Duration::from_secs(5),
+            "unbound-stream",
+            "no instance is bound to this tty stream",
         )
         .await;
+        return;
+    };
+    forward_tty_call(
+        state,
+        out_tx,
+        &instance_id,
+        "tty.write",
+        json!({
+            "instanceId": instance_id,
+            "dataBase64": encode_b64(payload),
+        }),
+    )
+    .await;
 }
 
-async fn handle_follow_resize(state: &AppState, instance_ids: &[String], value: &Value) {
+async fn handle_follow_resize(
+    state: &AppState,
+    out_tx: &mpsc::Sender<FollowMsg>,
+    instance_ids: &[String],
+    value: &Value,
+) {
     let Some(instance_id) = instance_ids.first() else {
+        tracing::warn!("follow tty.resize arrived before any instance subscription");
+        send_tty_diagnostic(
+            out_tx,
+            None,
+            "tty.resize",
+            "no-subscription",
+            "subscribe to an instance before resizing",
+        )
+        .await;
         return;
     };
     let cols = value.get("cols").and_then(Value::as_u64).unwrap_or(80);
     let rows = value.get("rows").and_then(Value::as_u64).unwrap_or(24);
-    let Some(host_id) = state
-        .store
-        .get_instance(instance_id.clone())
-        .await
-        .ok()
-        .flatten()
-        .map(|instance| instance.host_id)
-    else {
-        return;
+    forward_tty_call(
+        state,
+        out_tx,
+        instance_id,
+        "tty.resize",
+        json!({ "instanceId": instance_id, "cols": cols, "rows": rows }),
+    )
+    .await;
+}
+
+/// Relay one tty RPC to the owning Node, logging and reporting every failure.
+///
+/// Node errors used to be swallowed by `let _ =`, which is why an input that
+/// never reached the PTY produced no log line and no client-visible signal.
+async fn forward_tty_call(
+    state: &AppState,
+    out_tx: &mpsc::Sender<FollowMsg>,
+    instance_id: &str,
+    method: &str,
+    params: Value,
+) {
+    let host_id = match state.store.get_instance(instance_id.to_string()).await {
+        Ok(Some(instance)) => instance.host_id,
+        Ok(None) => {
+            tracing::warn!(%instance_id, %method, "tty relay target instance is unknown");
+            send_tty_diagnostic(
+                out_tx,
+                Some(instance_id),
+                method,
+                "unknown-instance",
+                "the Hub has no record of this instance",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%instance_id, %method, %error, "tty relay instance lookup failed");
+            send_tty_diagnostic(
+                out_tx,
+                Some(instance_id),
+                method,
+                "lookup-failed",
+                &error.to_string(),
+            )
+            .await;
+            return;
+        }
     };
-    let _ = state
+    match state
         .nodes
-        .call(
-            &host_id,
-            "tty.resize",
-            json!({ "instanceId": instance_id, "cols": cols, "rows": rows }),
-            Duration::from_secs(5),
-        )
-        .await;
+        .call(&host_id, method, params, Duration::from_secs(5))
+        .await
+    {
+        Ok(Some(response)) if response.get("error").is_some() => {
+            let detail = response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("node rejected the tty call")
+                .to_string();
+            tracing::warn!(%instance_id, %host_id, %method, %detail, "node rejected a tty call");
+            send_tty_diagnostic(out_tx, Some(instance_id), method, "node-error", &detail).await;
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(%instance_id, %host_id, %method, "tty call dropped: node offline");
+            send_tty_diagnostic(
+                out_tx,
+                Some(instance_id),
+                method,
+                "node-offline",
+                "no live Node session for this host",
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::warn!(%instance_id, %host_id, %method, %error, "tty call failed");
+            send_tty_diagnostic(
+                out_tx,
+                Some(instance_id),
+                method,
+                "call-failed",
+                &error.to_string(),
+            )
+            .await;
+        }
+    }
 }
 
 async fn resync_after_gap(

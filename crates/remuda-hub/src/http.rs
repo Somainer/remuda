@@ -650,6 +650,11 @@ pub(crate) async fn forward_if_online(
                 response = %response,
                 "node did not durably accept command; will not resend"
             );
+            if let Some(settled) =
+                settle_stop_for_unknown_instance(state, &command, &response).await?
+            {
+                return Ok(settled);
+            }
             fail_unaccepted_create(state, &command, node_rpc_error_message(&response)).await
         }
         Ok(Some(response)) => {
@@ -672,6 +677,7 @@ pub(crate) async fn forward_if_online(
                 .await?
                 .ok_or(HubError::NotFound)
         }
+
         Err(err) => {
             tracing::warn!(error = %err, command_id = %command.command_id, "node rpc unknown; will not resend");
             state
@@ -681,6 +687,72 @@ pub(crate) async fn forward_if_online(
                 .ok_or(HubError::NotFound)
         }
     }
+}
+
+/// Settle a stop/close the Node cannot honour because it lost the instance.
+///
+/// After a Node restart the Hub still holds `running` rows the new process
+/// knows nothing about. `instance.close` then fails forever and the row keeps a
+/// placement slot. When the Node answers "not found", the Hub projects the row
+/// to `exited` and settles the command instead of leaving it hanging.
+/// Returns `Some(command)` when it took ownership of the outcome.
+async fn settle_stop_for_unknown_instance(
+    state: &AppState,
+    command: &CommandRecord,
+    response: &Value,
+) -> Result<Option<CommandRecord>, HubError> {
+    if !matches!(
+        command.operation.as_str(),
+        "instance.close" | "instance.cancel"
+    ) {
+        return Ok(None);
+    }
+    if !node_reports_unknown_instance(response) {
+        return Ok(None);
+    }
+    let Some(instance_id) = command.instance_id.clone() else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        command_id = %command.command_id,
+        %instance_id,
+        operation = %command.operation,
+        "node does not know this instance; settling the stop as exited"
+    );
+    if state
+        .store
+        .settle_instance_exited(instance_id.clone(), "node-lost-instance".into())
+        .await
+        .map_err(map_store)?
+    {
+        crate::ws::publish_hub_diagnostic(
+            state,
+            &instance_id,
+            "node_lost_instance",
+            "stop requested for an instance the node does not know; settled as exited",
+        )
+        .await;
+    }
+    let settled = state
+        .store
+        .mark_settled(command.command_id.clone(), command.host_id.clone())
+        .await
+        .map_err(map_store)?;
+    Ok(Some(settled))
+}
+
+/// True when a Node RPC error says the instance is gone (`-32004` / "not found").
+fn node_reports_unknown_instance(response: &Value) -> bool {
+    if response.pointer("/error/code").and_then(Value::as_i64) == Some(-32004) {
+        return true;
+    }
+    response
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| {
+            let message = message.to_ascii_lowercase();
+            message.contains("not found") || message.contains("unknown instance")
+        })
 }
 
 async fn fail_unaccepted_create(

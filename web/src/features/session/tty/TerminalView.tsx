@@ -61,6 +61,7 @@ export function TerminalView({
   const frozenRef = useRef(false);
   const gateRef = useRef({ keyboard: true, mouse: true });
   const localWheelRef = useRef(false);
+  const altScreenRef = useRef(false);
   const { mobile, coarsePointer, offsetTop } = useWorkbenchViewport();
   const [inputOverride, setInputOverride] = useState<{ direct: boolean; mode: DisplayMode } | null>(null);
   const [status, setStatus] = useState<TtyStatus>("connecting");
@@ -72,6 +73,10 @@ export function TerminalView({
   // A2: sticky DECSET tracking. `mouseReports` is the user's escape hatch —
   // with it off, pointer reports are dropped and the wheel scrolls locally.
   const [mouseReports, setMouseReports] = useState(true);
+  // D-028 §4.6: the Node tells us on attach whether a full-screen TUI owns the
+  // display. `undefined` = not reported (older Node, or the raw-ring carrier
+  // which cannot know), and the wheel behaviour is then unchanged.
+  const [altScreen, setAltScreen] = useState<boolean | undefined>(undefined);
   // A3: a narrow *desktop* window is still a mouse+keyboard terminal. Only a
   // coarse pointer (no hardware keyboard) should default to the local dock.
   const directInput = inputOverride?.direct ?? !coarsePointer;
@@ -112,8 +117,9 @@ export function TerminalView({
     gateRef.current = inputGate({ directInput, frozen, mouseReports });
   }, [directInput, frozen, mouseReports]);
   useEffect(() => {
-    localWheelRef.current = localWheelWanted({ mouseMode, mouseReports });
-  }, [mouseMode, mouseReports]);
+    localWheelRef.current = localWheelWanted({ mouseMode, mouseReports, altScreen });
+    altScreenRef.current = altScreen === true;
+  }, [mouseMode, mouseReports, altScreen]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -330,6 +336,7 @@ export function TerminalView({
         if (next === "connecting") resetStreamRef.current = true;
         if (next === "failed") failRef.current?.(message ?? "tty follow failed");
       },
+      onAltScreen: setAltScreen,
     });
     sessionRef.current = session;
     generationRef.current += 1;
@@ -360,8 +367,12 @@ export function TerminalView({
       onScrollPixels: scrollPixels,
       getGeneration: () => generationRef.current,
       hasSelection: () => term.hasSelection(),
-      // With reports off we scroll locally, so touch panning stays ours.
-      enabled: () => localWheelRef.current || !trackingActive(term.modes.mouseTrackingMode),
+      // With reports off we scroll locally, so touch panning stays ours —
+      // unless a full-screen TUI owns the display, where there is no
+      // scrollback to pan through (§4.6).
+      enabled: () =>
+        !altScreenRef.current
+        && (localWheelRef.current || !trackingActive(term.modes.mouseTrackingMode)),
     });
 
     // A2: while the app has tracking on, xterm cancels the local wheel and

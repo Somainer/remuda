@@ -68,13 +68,30 @@ export function trackingActive(mouseMode: string): boolean {
  * Local wheel scrolling is ours to do whenever xterm would not scroll: the app
  * has tracking on (so xterm cancels the wheel and reports instead) but the
  * user has switched reporting off.
+ *
+ * Except in the alternate screen. A full-screen TUI (`?1049h`) has no
+ * scrollback worth showing — the rows above the viewport belong to the shell
+ * the TUI will hand the terminal back to — so scrolling locally drags the user
+ * away from the only frame that matters and out of sync with an application
+ * that is still repainting in place. Whatever the TUI does with the wheel is
+ * the right behaviour, including nothing.
+ *
+ * `altScreen` comes from the Node's attach report (D-028 §4.6), not from
+ * watching for `?1049h` in the byte stream: an attach mid-session never sees
+ * the DECSET that put the terminal there, and the repaint snapshot deliberately
+ * replays only the current state. `undefined` means the Node did not report —
+ * an older Node, or a carrier that cannot know — and the pre-D-028 behaviour is
+ * kept rather than guessed at either way.
  */
 export function localWheelWanted({
   mouseMode,
   mouseReports,
+  altScreen,
 }: {
   mouseMode: string;
   mouseReports: boolean;
+  altScreen?: boolean;
 }): boolean {
+  if (altScreen) return false;
   return trackingActive(mouseMode) && !mouseReports;
 }

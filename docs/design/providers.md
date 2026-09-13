@@ -12,12 +12,29 @@ Device-authenticated REST. OpenAPI: `crates/remuda-hub/openapi/openapi.json`.
 | --- | --- | --- |
 | GET | `/v1/providers` | List. Secret never returned. `?hostId=` returns universal + that host's scoped rows. |
 | POST | `/v1/providers` | Create. Body includes `authToken` once. `scope` is `universal` (default) or `host:<hostId>`. `defaultGateway` is unique per scope. |
+| POST | `/v1/providers/discover` | Probe a gateway **before** the profile is saved. Body `{baseUrl, headers?, token?, profileId?}`; Human/Bot devices only. The token is used for the one request and never echoed. |
 | GET | `/v1/providers/{id}` | Fingerprint + last4 only. |
 | PATCH | `/v1/providers/{id}` | Metadata and/or rotate `authToken`. |
 | DELETE | `/v1/providers/{id}` | Drops the vault entry. |
-| POST | `/v1/providers/{id}/test` | `GET {baseUrl}/v1/models` (or `{baseUrl}/models` if base already ends with `/v1`). Reports `reachable` / `ok` / `message`. |
+| POST | `/v1/providers/{id}/test` | `GET {baseUrl}/v1/models` (or `{baseUrl}/models` if base already ends with `/v1`). Reports `reachable` / `ok` / `message` / `models`. |
 
 Profile JSON: `id` (`pvp_…`), `name`, `kind` (`gateway`\|`direct`), `baseUrl`, `models`, `defaultModel`, `headers`, `defaultGateway`, `scope`, `revision`, `secret: {present, last4, fingerprint}`.
+
+## Model catalog
+
+`models` is a structured array, not a string list:
+
+```json
+{ "id": "gw/wide", "enabled": true, "label": "Wide", "contextWindow": 1048576, "tags": ["1m"] }
+```
+
+Only `id` is required. `enabled` gates what New Session may offer — an unticked model stays in the profile so the operator can see it without exposing it. `label`, `contextWindow` and `tags` are filled in from whatever the gateway reports; a context window of 1M tokens or more also earns a `1m` tag.
+
+`defaultModel` must name one of the **enabled** models (400 otherwise). Replacing the catalog through PATCH re-resolves a default the new list no longer enables rather than failing the request.
+
+Legacy `["id", …]` catalogs are accepted on input and migrated in place when the Hub opens its database, so old profiles keep working and are rewritten once.
+
+`/discover` and `/test` share one probe and return the same shape: `{ok, reachable, status, latencyMs, message, models}`. The normalizer handles the Anthropic shape (`{"data":[{"id","display_name"}]}`), the OpenAI shape (`{"object":"list","data":[…]}`), a `{"models": …}` wrapper and a bare array; an unreadable body yields no models rather than an error. `/discover` with a `profileId` reuses that profile's stored token, base URL and headers, so re-probing an existing gateway never means retyping the secret.
 
 Host JSON adds `providerBinding` (`auto`\|`native`\|`profile:<id>`). PATCH `/v1/hosts/{id}` sets it.
 
@@ -59,7 +76,9 @@ Gateway env: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ENABLE_G
 
 Provider page: list / create / edit / rotate token / test / delete / set default gateway.
 
-New Session `delegation=gateway` selects the default gateway profile and prefills its `defaultModel`.
+The model field is a structured list, not a text box. **探测模型** calls `/v1/providers/discover` with whatever base URL and token are typed (or, when editing, the saved profile's), then shows the gateway's models as a checklist: id plus context/tag chips, a radio for the default, and a chip input for typing an id by hand when a gateway lists nothing. Editing pre-checks the saved models and badges discovered-but-new ones; a re-probe never re-enables a model the operator unticked.
+
+New Session `delegation=gateway` selects the default gateway profile, offers only that profile's **enabled** models, and prefills its `defaultModel`.
 
 ## How to enter a real gateway
 
@@ -67,9 +86,9 @@ New Session `delegation=gateway` selects the default gateway profile and prefill
 2. Name (any label).
 3. Base URL of the Anthropic-Messages-compatible endpoint, including `/v1` if the gateway expects it (example: `https://your-gateway.example/v1`).
 4. Auth token (Bearer / `x-api-key`). Submitted once; afterwards the UI shows `••••last4` only.
-5. Optional model list (one per line) and default model (New Session prefills this).
+5. **探测模型** — reads the gateway's `/v1/models` and lists what it offers. Tick the models to expose, pick one as the default, or type an id by hand if the gateway lists nothing.
 6. Check **设为默认网关**.
 7. **测试连通** — dummy URLs such as `http://127.0.0.1:1` report `unreachable: …` with a clear message. A real gateway should list models or at least return HTTP 401/200.
-8. New Session → **网关 (gateway)** uses that profile.
+8. New Session → **网关 (gateway)** uses that profile and offers its enabled models.
 
 Do not put the token in `headers`. Do not commit tokens or screenshots that show the token.

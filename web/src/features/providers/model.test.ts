@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import { PROVIDER_PROFILES } from "./fixtures";
 import {
   DELEGATION_COPY,
+  contextChip,
   defaultGatewayProfile,
+  enabledModels,
   formatSecret,
   fromHub,
   healthLine,
+  mergeDiscovered,
+  normalizeModels,
   parseModels,
   redactSecretRef,
   shouldAvoidUnhealthy,
@@ -46,13 +50,82 @@ describe("provider profiles D-012", () => {
       name: "mine",
       kind: "gateway",
       baseUrl: "https://gw.example/v1",
-      models: ["m"],
+      models: [{ id: "m", enabled: true }],
       defaultModel: "m",
       defaultGateway: true,
       secret: { present: true, last4: "t0k1", fingerprint: "0123456789abcdef" },
     });
     expect(JSON.stringify(mapped)).not.toMatch(/authToken|sk-/);
     expect(mapped.secret.last4).toBe("t0k1");
-    expect(parseModels("a, b\nc")).toEqual(["a", "b", "c"]);
+    expect(parseModels("a, b\nc")).toEqual([
+      { id: "a", enabled: true },
+      { id: "b", enabled: true },
+      { id: "c", enabled: true },
+    ]);
+  });
+});
+
+describe("structured model catalog", () => {
+  it("migrates a legacy string list from the Hub into enabled entries", () => {
+    const mapped = fromHub({
+      id: "pvp_legacy",
+      name: "legacy",
+      kind: "gateway",
+      baseUrl: "https://gw.example/v1",
+      models: ["passthrough/auto", "passthrough/auto_model"],
+      defaultGateway: false,
+    });
+    expect(mapped.models).toEqual([
+      { id: "passthrough/auto", enabled: true },
+      { id: "passthrough/auto_model", enabled: true },
+    ]);
+    expect(enabledModels(mapped.models)).toHaveLength(2);
+  });
+
+  it("keeps metadata, drops blanks and duplicates, and honours enabled=false", () => {
+    expect(
+      normalizeModels([
+        { id: " gw/a ", enabled: false },
+        { id: "gw/a" },
+        { id: "", enabled: true },
+        { id: "gw/b", label: "B", contextWindow: 1_048_576, tags: ["1m"] },
+      ]),
+    ).toEqual([
+      { id: "gw/a", enabled: false },
+      { id: "gw/b", enabled: true, label: "B", contextWindow: 1_048_576, tags: ["1m"] },
+    ]);
+    expect(normalizeModels(undefined)).toEqual([]);
+  });
+
+  it("merges discovery: keeps choices, adds metadata, flags new ids, keeps manual ones", () => {
+    const current = [
+      { id: "gw/keep", enabled: false },
+      { id: "gw/manual", enabled: true },
+    ];
+    const discovered = [
+      { id: "gw/keep", enabled: true, label: "Keep", contextWindow: 200_000 },
+      { id: "gw/fresh", enabled: true, label: "Fresh" },
+    ];
+    const { models, added } = mergeDiscovered(current, discovered);
+    // A saved model keeps the operator's enabled choice but gains metadata.
+    expect(models[0]).toEqual({
+      id: "gw/keep",
+      enabled: false,
+      label: "Keep",
+      contextWindow: 200_000,
+    });
+    // A manual id the gateway does not list survives the merge.
+    expect(models[1]).toEqual({ id: "gw/manual", enabled: true });
+    expect(models[2]).toEqual({ id: "gw/fresh", enabled: true, label: "Fresh" });
+    expect(added).toEqual(["gw/fresh"]);
+  });
+
+  it("formats context windows as chips", () => {
+    expect(contextChip(1_048_576)).toBe("1m");
+    expect(contextChip(2_000_000)).toBe("2m");
+    expect(contextChip(200_000)).toBe("200k");
+    expect(contextChip(512)).toBe("512");
+    expect(contextChip(null)).toBeNull();
+    expect(contextChip(0)).toBeNull();
   });
 });

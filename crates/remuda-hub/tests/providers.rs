@@ -1,10 +1,11 @@
-//! Provider profile CRUD: encrypted secret, GET redaction, unreachable test.
+//! Provider profile CRUD: encrypted secret, GET redaction, unreachable test,
+//! and `/discover` against a fake upstream.
 
 use anyhow::{Context, Result};
 use remuda_hub::{HubConfig, spawn};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 async fn boot() -> Result<(remuda_hub::RunningHub, String, tempfile::TempDir)> {
     let dir = tempfile::tempdir()?;
@@ -684,4 +685,452 @@ async fn connect_provider_test_node(
                 .await;
         }
     }))
+}
+
+/// A fake gateway serving `/v1/models`. Returns its address and the tokens it
+/// was presented with, so a test can assert the probe forwarded the secret
+/// without the Hub ever echoing it back to the caller.
+struct FakeUpstream {
+    addr: std::net::SocketAddr,
+    seen: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeUpstream {
+    /// Serve `body` for every `/v1/models` GET; anything else is a 404.
+    async fn serve(body: &'static str) -> Result<Self> {
+        Self::serve_with_status(200, body).await
+    }
+
+    async fn serve_with_status(status: u16, body: &'static str) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    for line in head.lines() {
+                        // reqwest emits lowercase header names.
+                        if let Some(value) = line
+                            .split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                            .map(|(_, value)| value)
+                        {
+                            recorded.lock().await.push(value.trim().to_string());
+                        }
+                    }
+                    let (code, payload) = if head.starts_with("GET /v1/models") {
+                        (status, body)
+                    } else {
+                        (404, "{}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Ok(Self { addr, seen, task })
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for FakeUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+const ANTHROPIC_MODELS: &str = r#"{"data":[
+    {"type":"model","id":"gw/fable","display_name":"Fable","created_at":"2026-01-01"},
+    {"type":"model","id":"gw/wide","display_name":"Wide","context_window":1048576}
+],"has_more":false}"#;
+
+const OPENAI_MODELS: &str = r#"{"object":"list","data":[
+    {"id":"gw/small","object":"model","owned_by":"gw"},
+    {"id":"gw/large","object":"model","context_length":200000}
+]}"#;
+
+#[tokio::test]
+async fn discover_normalizes_both_upstream_shapes_without_echoing_the_token() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+
+    let anthropic = FakeUpstream::serve(ANTHROPIC_MODELS).await?;
+    let token = "sk-fake-discover-wwww";
+    let body = json!({ "baseUrl": anthropic.base_url(), "token": token }).to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&body),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "discover {status} {rest}");
+    assert!(!rest.contains(token), "discover echoed the token: {rest}");
+    let result: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["reachable"], true);
+    assert_eq!(result["status"], 200);
+    let models = result["models"].as_array().context("models")?;
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["id"], "gw/fable");
+    assert_eq!(models[0]["label"], "Fable");
+    assert_eq!(models[0]["enabled"], true);
+    assert_eq!(models[1]["contextWindow"], 1_048_576);
+    assert_eq!(models[1]["tags"], json!(["1m"]));
+    // The probe authenticated with the supplied token even though the profile
+    // does not exist yet.
+    assert_eq!(
+        anthropic.seen.lock().await.first().map(String::as_str),
+        Some(format!("Bearer {token}").as_str())
+    );
+
+    let openai = FakeUpstream::serve(OPENAI_MODELS).await?;
+    let body = json!({ "baseUrl": openai.base_url() }).to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&body),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "openai discover {status} {rest}");
+    let result: Value = serde_json::from_str(rest.trim())?;
+    let ids: Vec<&str> = result["models"]
+        .as_array()
+        .context("models")?
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["gw/small", "gw/large"]);
+    assert_eq!(result["models"][1]["contextWindow"], 200_000);
+    assert_eq!(result["models"][1]["tags"], json!([]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn discover_reuses_a_saved_profile_token_and_test_returns_the_same_shape() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+    let upstream = FakeUpstream::serve(ANTHROPIC_MODELS).await?;
+    let token = "sk-fake-saved-vvvv";
+    let create = json!({
+        "name": "fake-upstream",
+        "kind": "gateway",
+        "baseUrl": upstream.base_url(),
+        "authToken": token,
+    })
+    .to_string();
+    let (status, _, rest) = http(hub.addr, "POST", "/v1/providers", &auth, Some(&create)).await?;
+    anyhow::ensure!(status == 200, "create {status} {rest}");
+    let created: Value = serde_json::from_str(rest.trim())?;
+    let id = created["id"].as_str().context("id")?;
+
+    // No token in the body: the Hub loads the stored one.
+    let body = json!({ "profileId": id }).to_string();
+    let (status, _, discovered) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&body),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "discover {status} {discovered}");
+    assert!(!discovered.contains(token));
+    assert_eq!(
+        upstream.seen.lock().await.first().map(String::as_str),
+        Some(format!("Bearer {token}").as_str())
+    );
+
+    let (status, _, tested) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/providers/{id}/test"),
+        &auth,
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "test {status} {tested}");
+    assert!(!tested.contains(token));
+    let discovered: Value = serde_json::from_str(discovered.trim())?;
+    let tested: Value = serde_json::from_str(tested.trim())?;
+    assert_eq!(
+        discovered["models"], tested["models"],
+        "/test and /discover must report the same normalized catalog"
+    );
+    assert_eq!(discovered["ok"], tested["ok"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discover_requires_auth_a_base_url_and_reports_unreachable() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+
+    // No device cookie at all.
+    let body = json!({ "baseUrl": "http://127.0.0.1:1" }).to_string();
+    let (status, _, _) = http(hub.addr, "POST", "/v1/providers/discover", &[], Some(&body)).await?;
+    assert_eq!(status, 401, "discover must require a device");
+
+    // Missing / malformed base URL.
+    for bad in [json!({}), json!({ "baseUrl": "ftp://nope" })] {
+        let (status, _, rest) = http(
+            hub.addr,
+            "POST",
+            "/v1/providers/discover",
+            &auth,
+            Some(&bad.to_string()),
+        )
+        .await?;
+        assert_eq!(status, 400, "{bad}: {rest}");
+    }
+
+    // The token must not travel in `headers`.
+    let leaky = json!({
+        "baseUrl": "http://127.0.0.1:1",
+        "headers": { "Authorization": "Bearer sk-leak" }
+    })
+    .to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&leaky),
+    )
+    .await?;
+    assert_eq!(status, 400, "{rest}");
+
+    // Unknown profile.
+    let (status, _, _) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&json!({ "profileId": "pvp_missing" }).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 404);
+
+    // Reachability failures mirror `/test`.
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&json!({ "baseUrl": "http://127.0.0.1:1" }).to_string()),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "unreachable {status} {rest}");
+    let result: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["reachable"], false);
+    assert_eq!(result["models"], json!([]));
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unreachable"),
+        "{result}"
+    );
+
+    // An upstream that answers but rejects the credential is reachable, not ok.
+    let denied = FakeUpstream::serve_with_status(401, r#"{"error":"no"}"#).await?;
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&json!({ "baseUrl": denied.base_url() }).to_string()),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "401 upstream {status} {rest}");
+    let result: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["reachable"], true);
+    assert_eq!(result["models"], json!([]));
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("auth failed"),
+        "{result}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn structured_models_round_trip_and_default_model_must_be_enabled() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+    let create = json!({
+        "name": "structured",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "models": [
+            { "id": "gw/on", "enabled": true, "label": "On", "contextWindow": 1048576, "tags": ["1m"] },
+            { "id": "gw/off", "enabled": false }
+        ],
+        "defaultModel": "gw/on",
+        "authToken": "sk-structured-xxxx"
+    })
+    .to_string();
+    let (status, _, rest) = http(hub.addr, "POST", "/v1/providers", &auth, Some(&create)).await?;
+    anyhow::ensure!(status == 200, "create {status} {rest}");
+    let created: Value = serde_json::from_str(rest.trim())?;
+    let id = created["id"].as_str().context("id")?.to_string();
+    assert_eq!(created["models"][0]["label"], "On");
+    assert_eq!(created["models"][0]["contextWindow"], 1_048_576);
+    assert_eq!(created["models"][0]["tags"], json!(["1m"]));
+    assert_eq!(created["models"][1]["enabled"], false);
+    assert_eq!(created["defaultModel"], "gw/on");
+
+    // A disabled model cannot be the default.
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &auth,
+        Some(
+            &json!({
+                "name": "bad-default",
+                "kind": "gateway",
+                "baseUrl": "http://127.0.0.1:1",
+                "models": [{ "id": "gw/on" }, { "id": "gw/off", "enabled": false }],
+                "defaultModel": "gw/off",
+                "authToken": "sk-bad-default-xxxx"
+            })
+            .to_string(),
+        ),
+    )
+    .await?;
+    assert_eq!(status, 400, "{rest}");
+    assert!(rest.contains("defaultModel"), "{rest}");
+
+    // Patching the catalog so the saved default disappears re-resolves it to
+    // the first enabled model rather than leaving an orphan.
+    let patch = json!({ "models": [{ "id": "gw/new" }, { "id": "gw/other" }] }).to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "PATCH",
+        &format!("/v1/providers/{id}"),
+        &auth,
+        Some(&patch),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "patch {status} {rest}");
+    let patched: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(patched["defaultModel"], "gw/new");
+
+    // Disabling every model leaves no default to prefill.
+    let patch = json!({ "models": [{ "id": "gw/new", "enabled": false }] }).to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "PATCH",
+        &format!("/v1/providers/{id}"),
+        &auth,
+        Some(&patch),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "patch {status} {rest}");
+    let patched: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(patched["defaultModel"], Value::Null);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_legacy_string_catalog_migrates_to_structured_rows() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("data");
+    let id = "pvp_00000000-0000-7000-8000-00000000legacy";
+
+    // Boot once so the schema exists, create a row, then rewrite its catalog to
+    // the pre-migration string form directly in SQLite.
+    {
+        let hub = spawn(HubConfig::for_test(data.clone())).await?;
+        let cookie = login(hub.addr, &hub.bootstrap_token.clone()).await?;
+        let create = json!({
+            "name": "legacy",
+            "kind": "gateway",
+            "baseUrl": "http://127.0.0.1:1",
+            "models": ["passthrough/auto"],
+            "authToken": "sk-fake-legacy-llll"
+        })
+        .to_string();
+        let (status, _, rest) = http(
+            hub.addr,
+            "POST",
+            "/v1/providers",
+            &[("Cookie", cookie.as_str())],
+            Some(&create),
+        )
+        .await?;
+        anyhow::ensure!(status == 200, "create {status} {rest}");
+        drop(hub);
+    }
+    let db = data.join("hub.sqlite");
+    let conn = rusqlite::Connection::open(&db)?;
+    conn.execute(
+        "UPDATE provider_profiles SET id = ?1, models_json = ?2",
+        rusqlite::params![id, r#"["passthrough/auto","passthrough/auto_model"]"#],
+    )?;
+    drop(conn);
+
+    // Reopening runs the migration.
+    let hub = spawn(HubConfig::for_test(data.clone())).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token.clone()).await?;
+    let (status, _, rest) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/providers/{id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "get {status} {rest}");
+    let profile: Value = serde_json::from_str(rest.trim())?;
+    let models = profile["models"].as_array().context("models")?;
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["id"], "passthrough/auto");
+    assert_eq!(models[0]["enabled"], true, "migrated models stay usable");
+    assert_eq!(models[1]["id"], "passthrough/auto_model");
+    assert_eq!(models[1]["enabled"], true);
+    drop(hub);
+
+    // The stored column is rewritten, not just parsed on read.
+    let conn = rusqlite::Connection::open(&db)?;
+    let stored: String = conn.query_row(
+        "SELECT models_json FROM provider_profiles WHERE id = ?1",
+        rusqlite::params![id],
+        |row| row.get(0),
+    )?;
+    let stored: Value = serde_json::from_str(&stored)?;
+    assert!(stored[0].is_object(), "still a bare string list: {stored}");
+    assert_eq!(stored[0]["id"], "passthrough/auto");
+    assert_eq!(stored[0]["enabled"], true);
+    Ok(())
 }

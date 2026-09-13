@@ -370,7 +370,7 @@ mod tests {
             name: name.into(),
             kind: "gateway".into(),
             base_url: "http://127.0.0.1:1".into(),
-            models: vec!["m".into()],
+            models: vec![crate::provider_models::ProviderModel::plain("m")],
             default_model: Some("m".into()),
             headers: BTreeMap::new(),
             default_gateway: default,

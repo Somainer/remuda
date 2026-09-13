@@ -1,6 +1,7 @@
 //! Single-writer SQLite actor. Connections never cross `.await`.
 
 use crate::config::{new_id, now_rfc3339};
+use crate::provider_models::{self, ProviderModel};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -467,8 +468,8 @@ pub struct ProviderRecord {
     pub kind: String,
     /// Ingress base URL.
     pub base_url: String,
-    /// Catalog model ids.
-    pub models: Vec<String>,
+    /// Catalog models (structured; legacy string lists migrate on read).
+    pub models: Vec<ProviderModel>,
     /// Prefill for New Session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
@@ -515,7 +516,7 @@ impl ProviderRecord {
             "name": self.name,
             "kind": self.kind,
             "baseUrl": self.base_url,
-            "models": self.models,
+            "models": self.models.iter().map(ProviderModel::to_json).collect::<Vec<_>>(),
             "defaultModel": self.default_model,
             "headers": self.headers,
             "defaultGateway": self.default_gateway,
@@ -546,7 +547,7 @@ impl ProviderRecord {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .or(self.default_model.as_deref())
-            .or(self.models.first().map(String::as_str))
+            .or_else(|| provider_models::enabled_ids(&self.models).first().copied())
             .unwrap_or("");
         json!({
             "profileId": self.id,
@@ -2270,7 +2271,7 @@ impl Store {
         name: String,
         kind: String,
         base_url: String,
-        models: Vec<String>,
+        models: Vec<ProviderModel>,
         default_model: Option<String>,
         headers: BTreeMap<String, String>,
         default_gateway: bool,
@@ -2323,7 +2324,7 @@ impl Store {
         name: Option<String>,
         kind: Option<String>,
         base_url: Option<String>,
-        models: Option<Vec<String>>,
+        models: Option<Vec<ProviderModel>>,
         default_model: Option<Option<String>>,
         headers: Option<BTreeMap<String, String>>,
         default_gateway: Option<bool>,
@@ -2471,7 +2472,7 @@ fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderRecord>, 
 fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
     let models_json: String = row.get(4)?;
     let headers_json: String = row.get(6)?;
-    let models: Vec<String> = serde_json::from_str(&models_json).unwrap_or_default();
+    let models = provider_models::parse_models_json(&models_json);
     let headers: BTreeMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
     let secret_name: Option<String> = row.get(9)?;
     let last_test_ok: Option<i64> = row.get(12)?;
@@ -2732,8 +2733,35 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
     crate::workspaces::migrate(&conn)?;
+    migrate_provider_models(&conn)?;
     dedup_duplicate_hosts(&conn)?;
     Ok(conn)
+}
+
+/// Rewrite legacy `["id", …]` catalogs as structured rows (all enabled).
+///
+/// Reads tolerate either shape, so this only makes the stored form uniform;
+/// a row that cannot be parsed is left untouched rather than emptied.
+fn migrate_provider_models(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let legacy: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, models_json FROM provider_profiles")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<(String, String)>, _>>()?
+            .into_iter()
+            .filter(|(_, raw)| provider_models::is_legacy_json(raw))
+            .collect()
+    };
+    for (id, raw) in legacy {
+        let models = provider_models::parse_models_json(&raw);
+        let Ok(encoded) = serde_json::to_string(&models) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE provider_profiles SET models_json = ?1 WHERE id = ?2",
+            params![encoded, id],
+        )?;
+    }
+    Ok(())
 }
 
 fn apply_instance_projection(

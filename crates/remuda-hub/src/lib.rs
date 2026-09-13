@@ -25,6 +25,7 @@ mod inventory;
 mod maintenance;
 mod objects;
 mod placement;
+mod provider_models;
 mod provider_resolve;
 mod providers;
 mod proxy;

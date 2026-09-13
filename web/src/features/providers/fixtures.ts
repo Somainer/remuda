@@ -14,7 +14,10 @@ export const PROVIDER_PROFILES: ProviderProfile[] = [
     health: { ok: true, status: 200, latencyMs: 12, checkedAt: "2026-09-12T00:00:00.000Z" },
     secret: { present: true, last4: "34ef", fingerprint: "0123456789abcdef" },
     secretRef: "34ef",
-    models: ["passthrough/auto", "passthrough/auto_model"],
+    models: [
+      { id: "passthrough/auto", enabled: true, label: "Auto", contextWindow: 1_048_576, tags: ["1m"] },
+      { id: "passthrough/auto_model", enabled: true, label: "Auto model" },
+    ],
     defaultModel: "passthrough/auto",
     defaultGateway: true,
     scope: "universal",

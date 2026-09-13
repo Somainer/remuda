@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { isSessionRoute, MORE_NAV } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
@@ -46,7 +46,7 @@ export function Shell() {
     }
   }, [activeSpaceId, activeInstanceId, knownInstance]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (mobile || !onSessions || onNew) return;
     const onKey = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey || event.isComposing || event.repeat) return;

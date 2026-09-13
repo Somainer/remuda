@@ -778,6 +778,19 @@ fn spawn_observation_pump(
             if let Some(session) = native_session_evidence(&observation) {
                 record_native_session(store.as_ref(), &instance_id, &session);
             }
+            // D-028 §4.3: Hook outranks Screen. Without this the hook events
+            // are journaled but the instance still follows `agent_status`,
+            // which is a screen guess — the composer would keep believing the
+            // screen over the harness's own account of what it is doing.
+            if let Some(activity) = crate::signal::hook_activity(&observation)
+                && let Err(error) = store.set_instance_state(
+                    &instance_id,
+                    None,
+                    Some(remuda_protocol::Knowledge::Known { value: activity }),
+                )
+            {
+                tracing::warn!(%error, "hook activity not applied");
+            }
             match store.append_driver_observation(&instance_id, observation) {
                 Ok(committed) => {
                     if let Err(error) = interactions.ingest(&committed).await {

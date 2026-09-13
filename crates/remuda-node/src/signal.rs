@@ -92,6 +92,31 @@ pub fn binds_instance(agent_pid: i32, foreground_pid: Option<i32>) -> bool {
     }
 }
 
+/// The activity a hook observation proves, if it proves one.
+///
+/// This is the §4.3 priority made real: without it the hook events are
+/// journaled but the *instance* still follows `agent_status`, which is a screen
+/// guess. A hook is the harness saying what it is doing, so it outranks the
+/// screen and must be what moves the composer.
+///
+/// Only the three turn-boundary events and the interaction events qualify.
+/// Tool events say a turn is in progress but are not its boundaries, and
+/// `SubagentStop` fires with no subagent at all (design §3.1 [V]) — treating
+/// either as evidence would flip the composer on a non-event.
+#[must_use]
+pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activity> {
+    use remuda_protocol::Activity;
+    let native = hook_lifecycle(observation)?;
+    match native.native_name.as_str() {
+        "UserPromptSubmit" => Some(Activity::Working),
+        // A turn that ended badly still ended: the composer has to come back,
+        // or the user cannot type again after one failed turn.
+        "Stop" | "StopFailure" => Some(Activity::Idle),
+        "Notification" | "PermissionRequest" | "Elicitation" => Some(Activity::WaitingInteraction),
+        _ => None,
+    }
+}
+
 /// Session identity carried by a hook `SessionStart`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookSessionEvidence {
@@ -220,6 +245,51 @@ mod tests {
             assert!(!hooks_enabled(Some(value)), "{value}");
         }
         assert!(!hooks_enabled(None), "P1 default must be off");
+    }
+
+    #[test]
+    fn the_turn_boundaries_move_the_instance_and_nothing_else_does() {
+        use remuda_protocol::Activity;
+        let hook =
+            |name: &str| observation(SourceChannel::Hook, name, Some("s-1"), &[("ppid", "42")]);
+        assert_eq!(
+            hook_activity(&hook("UserPromptSubmit")),
+            Some(Activity::Working)
+        );
+        assert_eq!(hook_activity(&hook("Stop")), Some(Activity::Idle));
+        // A failed turn still frees the composer.
+        assert_eq!(hook_activity(&hook("StopFailure")), Some(Activity::Idle));
+        assert_eq!(
+            hook_activity(&hook("PermissionRequest")),
+            Some(Activity::WaitingInteraction)
+        );
+        // Tool events are progress, not boundaries; SubagentStop is not
+        // evidence at all.
+        for name in [
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolBatch",
+            "MessageDisplay",
+            "SubagentStop",
+            "SessionStart",
+        ] {
+            assert_eq!(hook_activity(&hook(name)), None, "{name} must not move it");
+        }
+    }
+
+    #[test]
+    fn a_screen_guess_cannot_masquerade_as_hook_activity() {
+        // Hook outranks screen (§4.3); that only holds if the channel is what
+        // decides, not the event name.
+        assert_eq!(
+            hook_activity(&observation(
+                SourceChannel::Pty,
+                "UserPromptSubmit",
+                Some("s-1"),
+                &[("ppid", "42")]
+            )),
+            None
+        );
     }
 
     #[test]

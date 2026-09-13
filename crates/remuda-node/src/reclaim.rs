@@ -91,7 +91,25 @@ impl DevNode {
             }
             Err(CarrierWait::Failed(error)) => return Err(error),
         };
-        let agents = client.agent_list().await.map_err(node_error)?.agents;
+        // Same race one call later: the server can finish exiting between the
+        // snapshot and this read.
+        let agents = match client.agent_list().await {
+            Ok(list) => list.agents,
+            Err(error) if error.is_transient_carrier() || error.is_disconnect() => {
+                tracing::warn!(
+                    socket = %socket.display(),
+                    "herdr server exited between snapshot and agent list; treating its panes as gone"
+                );
+                for resource in resources.iter().filter(|r| r.socket_path == socket) {
+                    self.inner.store.remove_pty_resource(&resource.key())?;
+                    if let Some(id) = &resource.instance_id {
+                        self.mark_exited(id, "carrier-shutdown")?;
+                    }
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(node_error(error)),
+        };
         let mut adopted = BTreeSet::new();
         let mut adopted_panes = BTreeSet::new();
         for resource in resources.iter().filter(|r| r.socket_path == socket) {
@@ -353,8 +371,13 @@ async fn wait_for_snapshot(
                 tokio::time::sleep(backoff).await;
                 attempt = attempt.saturating_add(1);
             }
-            // The socket went away mid-wait: the predecessor is gone.
-            Err(error) if error.is_transient_carrier() => return Err(CarrierWait::Gone),
+            // The socket went away mid-wait, or the server closed the
+            // connection on its way out. `session.snapshot` is read-only, so
+            // unlike a prompt there is nothing to be uncertain about: the
+            // predecessor is gone and took its panes with it.
+            Err(error) if error.is_transient_carrier() || error.is_disconnect() => {
+                return Err(CarrierWait::Gone);
+            }
             Err(error) => return Err(CarrierWait::Failed(node_error(error))),
         }
     }

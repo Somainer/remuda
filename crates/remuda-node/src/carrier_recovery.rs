@@ -71,13 +71,18 @@ impl DevNode {
         // stale. Collect them before the restart replaces the socket.
         let affected = self.lost_instances(&socket)?;
 
-        let restarted = match remuda_herdr::HerdrServer::ensure_with_policy(
+        let mut options = remuda_herdr::EnsureOptions::new(
             config.herdr_session.clone(),
             config.herdr_socket_dir.clone(),
-            policy,
         )
-        .await
-        {
+        .with_policy(policy);
+        // Honour the Node's configured executable. Falling back to `herdr` on
+        // PATH here would exec the real binary out from under a test (or an
+        // operator) that deliberately pinned a different one.
+        if let Some(binary) = &config.herdr_binary {
+            options = options.with_binary(binary.clone());
+        }
+        let restarted = match remuda_herdr::HerdrServer::ensure_with(options).await {
             Ok(server) => {
                 if let Some(previous) = server.renamed_from() {
                     tracing::warn!(
@@ -162,13 +167,16 @@ impl DevNode {
             } else {
                 "herdr session server was lost and could not be restarted"
             },
+            remuda_protocol::Severity::Error,
         )?;
         if restarted {
+            // The restart itself is good news; only the loss is an error.
             append_carrier_diagnostic(
                 store,
                 instance_id,
                 CARRIER_RESTARTED,
                 "a fresh herdr session server is available for new instances",
+                remuda_protocol::Severity::Info,
             )?;
         }
         store.mark_unsettled_unknown(instance_id)?;
@@ -189,11 +197,12 @@ fn append_carrier_diagnostic(
     instance_id: &InstanceId,
     name: &str,
     status: &str,
+    severity: remuda_protocol::Severity,
 ) -> Result<(), NodeError> {
     let payload = crate::DriverEmission::NativeLifecycle {
         name: name.to_owned(),
         status: status.to_owned(),
-        severity: remuda_protocol::Severity::Error,
+        severity,
     }
     .into_payload()?;
     store.append_observation(
@@ -437,6 +446,13 @@ mod tests {
             .session_snapshot()
             .await
             .expect("restarted carrier serves real requests");
+        // The replacement must be the executable the config pinned. A real
+        // `herdr` here would mean recovery ignored `herdr_binary` and leaked a
+        // long-lived server onto the developer's machine.
+        assert!(
+            !socket_dir.join("herdr").join("sessions").exists(),
+            "only the real herdr writes a sessions/ tree; the fake must have been used"
+        );
 
         assert_eq!(
             store.get_instance(&id).expect("instance").lifecycle,

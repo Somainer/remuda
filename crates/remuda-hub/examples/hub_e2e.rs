@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
 
 async fn mint_enroll_via_device(addr: SocketAddr, bootstrap: &str) -> Result<String> {
     let client = reqwest::Client::new();
-    let login: Value = client
+    let login = client
         .post(format!("http://{addr}/v1/login"))
         .json(&json!({
             "bootstrapToken": bootstrap,
@@ -92,18 +92,24 @@ async fn mint_enroll_via_device(addr: SocketAddr, bootstrap: &str) -> Result<Str
         }))
         .send()
         .await
-        .context("login for enroll token")?
-        .error_for_status()
-        .context("login for enroll token")?
-        .json()
-        .await?;
-    let device_token = login
-        .get("token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("login token missing"))?;
+        .context("login for enroll token")?;
+    let cookie = login
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value.split(';').map(str::trim).find_map(|part| {
+                part.strip_prefix("remuda_device=")
+                    .filter(|token| !token.is_empty())
+                    .map(|token| format!("remuda_device={token}"))
+            })
+        });
+    login.error_for_status().context("login for enroll token")?;
+    let cookie = cookie.ok_or_else(|| anyhow!("login cookie missing"))?;
     let minted: Value = client
         .post(format!("http://{addr}/v1/hosts/enroll-token"))
-        .header("Authorization", format!("Bearer {device_token}"))
+        .header(reqwest::header::COOKIE, cookie)
         .send()
         .await
         .context("POST /v1/hosts/enroll-token")?

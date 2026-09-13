@@ -1,0 +1,93 @@
+# Parity whitelist for `remuda journal diff` — D-028 §12 step 3, §13 P7.
+#
+# The gate runs one scenario through `claude-print` and through `agent-pty`,
+# normalizes both journals, and fails on any difference not covered here.
+# Every rule needs a `reason`: a rule without one is a silent parity hole.
+# Schema and extension procedure: docs/design/native-pty-first.md §12.1.
+
+version = 1
+
+# --- granularity: the difference D-028 §12.3 names explicitly ---------------
+
+[[rule]]
+kind = "message"
+field = "granularity"
+allow = ["record-level", "token-level", "snapshot", "single"]
+reason = """
+§7: print streams assistant text as stream-json token deltas; the PTY path
+tails `MessageDisplay` hook lines and the transcript, so the same text arrives
+record-level. The collapsed final text still has to match exactly — only how it
+arrived may differ."""
+
+[[rule]]
+kind = "thought"
+field = "granularity"
+allow = ["record-level", "token-level", "snapshot", "single"]
+reason = """
+Same as assistant text: print emits `thinking_delta`, the PTY path reconstructs
+thoughts from whole transcript blocks."""
+
+# --- usage: estimated on the PTY side until UsageAdapter reports ------------
+
+[[rule]]
+topic = "usage"
+field = "accounting"
+allow = "estimated"
+reason = """
+§12.1: print is the only reported cost/usage emitter today. The PTY path
+converts tokens with a local price table and must label the result `estimated`;
+the token counts themselves are still compared field by field."""
+
+[[rule]]
+topic = "usage"
+field = "cost"
+reason = """
+Follows `accounting = estimated`: a locally converted amount will not match the
+provider-reported one to the cent. Retire this rule once UsageAdapter reports
+real cost for all three harnesses (§12 step 1)."""
+
+# --- signals that only one carrier can physically observe -------------------
+
+[[rule]]
+lifecycle = "hook"
+ignore = true
+reason = """
+§4.2: hook lifecycle events come from the per-instance hook socket, which only
+exists on the native PTY path. They are dropped from both sides rather than
+compared — `claude-print` has no equivalent to align them against."""
+
+[[rule]]
+kind = "raw_tty"
+ignore = true
+reason = """
+§4.6: raw PTY bytes exist only when there is a PTY. Terminal fidelity is
+covered by the P0 snapshot A/B test, not by the structured-event gate."""
+
+[[rule]]
+lifecycle = "diagnostic"
+allow-unmatched = true
+reason = """
+Diagnostics are carrier-specific notes (trust dialog auto-accept, promotion,
+shim activation) and carry no conversation content. They may appear on one side
+only; anything a diagnostic *reports* must still show up as a real event."""
+
+# --- approval carrier: same decision, different mechanism -------------------
+
+[[rule]]
+kind = "interaction.requested"
+field = "carrier"
+allow = ["claude-control", "claude-hook", "native-tty"]
+reason = """
+§4.4: print carries approvals over the stream-json control channel
+(`claude-control`); the PTY path uses the `PermissionRequest` hook
+(`claude-hook`) and falls back to keys in confined sessions (`native-tty`).
+The request contents and the committed answer must still match."""
+
+[[rule]]
+kind = "interaction.answered"
+field = "delivery"
+allow = ["written", "confirmed"]
+reason = """
+A hook decision returns synchronously (`confirmed`); a control-channel reply is
+acknowledged asynchronously (`written`). Both mean the answer reached the
+agent — `rejected`, `not-sent` and `unknown` are still failures."""

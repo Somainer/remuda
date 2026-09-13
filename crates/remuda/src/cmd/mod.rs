@@ -10,6 +10,7 @@ pub mod hub_client;
 mod hub_maintenance;
 pub mod instance;
 mod instance_interaction;
+pub mod journal_diff;
 pub mod mcp;
 pub mod merge;
 pub mod node;
@@ -45,6 +46,7 @@ commands! {
     Version(version::Args),
     Ssh(ssh::Args),
     Instance(instance::Args),
+    Journal(journal_diff::Args),
     Fleet(fleet::Args),
     Worktree(worktree::Args),
     Merge(merge::MergeArgs),

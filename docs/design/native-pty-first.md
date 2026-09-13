@@ -31,7 +31,7 @@
 - **结构化视图必须实时流式**（§7）：claude 走 `MessageDisplay` hook 的行级 delta + transcript 块级权威值，grok 走 `updates.jsonl` 的 ACP chunk，codex 只有 completed item——**能力诚实上报，不拿 record 级冒充 token 级**。
 - **保留 `codex-appserver` / `grok-acp` 枚举与 wire crate**（`remuda-codex-wire` 已 D-013 freeze，含类型化审批），它们是 codex 审批风险的唯一已知解法。
 - **`claude-print` 按条件退役，不按日程退役**（见 §12），先降为非 TTY 宿主的 legacy。
-- **跨 Node 重启存活是唯一没有廉价替代的 herdr 能力**（§8）：本轮**先接受丢失**（方案 A），把 `remuda-ptyd`（方案 B）排到 P8，**待用户拍板**。
+- **跨 Node 重启存活是唯一没有廉价替代的 herdr 能力**（§8）：本轮**先接受丢失**（方案 A），把 `remuda-ptyd`（方案 B）排到 P8。**用户已拍板（2026-09-14）：先接受丢失，持有进程放后面做。**
 - 工期：约 26 人日，4 worker 并行约 12–14 个工作日（不含 P8）。
 
 ---
@@ -287,7 +287,7 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 
 ---
 
-## 8 Node 重启存活（**待用户拍板**）
+## 8 Node 重启存活（**已拍板：方案 A 过渡，方案 B 排 P8**）
 
 **先把话说直白：in-process 的 PTY 随 Node 进程一起死。** `portable-pty` 的 child 由 Node 拥有，master fd 关闭时内核向前台进程组发 SIGHUP；唯一的持久载体记录 `PtyResource` 是 herdr 专用的。今天 herdr 能在 Node 重启后**不重放 prompt 直接认领**一个活着的 agent（D-010 的 `reconcile`）；换成 native PTY 后，**每一个**会话都会在 Node 重启时消失，而不只是孤儿。
 
@@ -299,7 +299,7 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 | herdr | 对需要存活的宿主**保留 herdr 为可选 carrier** | 可彻底删除 herdr |
 | 风险 | 已知、可解释、零新代码 | 相当于自己写半个终端复用器；必须先有 §5.3 的进程组回收与孤儿清扫 |
 
-**建议**：**A 作为本轮的过渡态**（诚实告知 + Resume 兜底 + herdr 保留为 optional feature），**B 排 P8** 作为删除 herdr 的前置条件。B 落地前，「跨 Node 重启存活」是 herdr 在本仓库**唯一**不可替代的能力，herdr 的删除节点也以此为准。**此处需要用户拍板**：是否接受过渡期内「Node 重启 = 会话结束」。
+**建议**：**A 作为本轮的过渡态**（诚实告知 + Resume 兜底 + herdr 保留为 optional feature），**B 排 P8** 作为删除 herdr 的前置条件。B 落地前，「跨 Node 重启存活」是 herdr 在本仓库**唯一**不可替代的能力，herdr 的删除节点也以此为准。**用户决定（2026-09-14）：接受过渡期内「Node 重启 = 会话结束」，持有进程（方案 B）放到 P8 之后再做。**
 
 ---
 
@@ -394,7 +394,7 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 | **P5** | `PermissionRequest` 裁决 + hook 路径 `respond_interaction` | allow/deny 均生效；超时 deny；confined 会话能回落按键 | 3 | **W2** |
 | **P6** | codex / grok adapter + `UsageAdapter` + MCP 附件 | 三家 lifecycle 来自结构化通道；usage 覆盖三家；图片三家可读 | 4 | **W4a** `codex_adapter.rs`、**W4b** `grok_adapter.rs`（各自独立文件） |
 | **P7** | 规则表移植 + capabilities 运行时化 + web 去 driver 分支 + parity gate + 逐 harness 翻默认 + print→legacy / herdr→optional | 规则表带版本；UI 门禁改看 `signalTier`；parity 连续 3 次全绿方可翻默认 | 4 | **W1**（规则表/引擎、web）+ **W3**（capabilities、enums、feature gate） |
-| **P8** | `remuda-ptyd`：跨 Node 重启存活（**待拍板**，§8） | Node 重启后终端与结构视图无感续接；孤儿清扫可验证 | 5+ | **W5**：`crates/remuda-ptyd/*` + Node adopt 路径 |
+| **P8** | `remuda-ptyd`：跨 Node 重启存活（已拍板排后，§8） | Node 重启后终端与结构视图无感续接；孤儿清扫可验证 | 5+ | **W5**：`crates/remuda-ptyd/*` + Node adopt 路径 |
 
 合计 P0–P7 约 **25 人日**，4 worker 并行约 **12–14 个工作日**；P8 另计。
 
@@ -414,7 +414,7 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 | 2 | **shim 劫持 PATH**：`which claude` 显示 Remuda 路径、可能撞用户 wrapper、非 login shell 注入失败、用户用绝对路径绕开 | 透明 `exec`、提供 `REMUDA_SHIM=off`、失败自动降到 tier C/D 并在 UI 明示降级原因 |
 | 3 | **codex 审批无结构化通道**（hooks trust gate 未破 **[V-BLOCKED]**，app-server 未验 **[U]**） | P6 前半天 spike；失败报 **degraded** 而非 unsupported，保留 appserver driver 作旁路 |
 | 4 | **模拟器内存/CPU 未测量**（N × maxInstances） | P0 必须带基准并限制 scrollback 行数 |
-| 5 | **跨 Node 重启存活**（§8） | **待用户拍板**；A 为过渡态，herdr 保留 optional，B 排 P8 |
+| 5 | **跨 Node 重启存活**（§8） | **已拍板**：A 为过渡态（Hub 标 `node-epoch-changed` + Resume 兜底），herdr 保留 optional，B 排 P8 |
 | 6 | **claude 的 queue-vs-steer 语义未验证**（**[U]**） | P4 以 `queue-operation` 记录为判据实测；未出结论前 `steer` 保持 `unknown` |
 | 7 | **grok / agy 的排队与打断键位全未验证** | v1 只承诺「打断进程」；composer 对应按钮显示「尚未验证」 |
 | 8 | **cost 为本地价目表换算**，与 print 的 `total_cost_usd` 可能偏差 | UI 标注「估算」，并在 parity gate 白名单中显式列出该差异 |
@@ -452,11 +452,11 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 | 17 | `agent.get/list` + `state_change_seq` | 本地 agent 注册表 + 状态 epoch（防止旧屏幕配新状态），**须重造** | P2 | 新建 |
 | 18 | hook 上报的原生 session 身份 | `SessionStart` hook → `session-meta.json`（Remuda 自有，本就是优先路径） | — | 已有 |
 | 19 | `events.subscribe` 推送流 | 进程内事件 + VT diff 边沿（无需 RPC，也没有 herdr「新 pane 要重连」的限制） | P1 | 新建 |
-| 20 | `session.snapshot` | 持久实例记录（仅方案 B 需要） | P8 | 待拍板 |
+| 20 | `session.snapshot` | 持久实例记录（仅方案 B 需要） | P8 | 排后（已拍板） |
 | 21 | `terminal observe/control`（rendered-ansi 帧） | §4.6 真字节 + 模拟器合成 snapshot + `full` 重绘标志 | P0 | 部分已有 |
 | 22 | `terminal.input` | 已有本地写入 | — | 已有 |
 | 23 | `terminal.resize` | `LocalPty::resize` | — | 已有 |
-| 24 | **pane 活过 Node 重启**（D-010） | §8：方案 A 接受丢失 / 方案 B `remuda-ptyd` | P8 | **待用户拍板** |
+| 24 | **pane 活过 Node 重启**（D-010） | §8：方案 A 接受丢失（本轮）/ 方案 B `remuda-ptyd` | P8 | **已拍板**：A 过渡，B 排 P8 |
 | 25 | trust/审批对话框检测 | 解析器本就是 Remuda 自有；`blocked` 触发源改为规则表 | P7 | 部分已有 |
 | 26 | socket 隔离与 `HERDR_*` 环境 | 无需；但 web 的 inventory 字段（version/socket/path）要一并下线 | P7 | 删除 |
 | 27 | `worktree.*` | 早已 native（git CLI + worktree 记录），protocol 明确拒绝过 herdr 的实现 | — | 已有 |

@@ -193,7 +193,7 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         None
     };
     let labels = parse_labels(&args.labels)?;
-    std::fs::create_dir_all(data_dir.join("workspace"))?;
+    remuda_node::prepare_workspace(&data_dir.join("workspace"))?;
     std::fs::create_dir_all(data_dir.join("herdr"))?;
     let mut native = NativeDriverConfig::new(data_dir.clone());
     native.herdr_socket_dir = Some(data_dir.join("herdr"));

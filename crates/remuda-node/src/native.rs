@@ -212,8 +212,24 @@ impl DriverFactory for NativeClaudeFactory {
                 .clone()
                 .unwrap_or_else(|| instance_dir.join("native-home"))
         };
+        #[cfg(target_os = "macos")]
+        if matches!(
+            self.kind,
+            DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg
+        ) || (self.kind == DriverKind::GenericPty
+            && launch.request.kind == remuda_protocol::AgentKind::Claude)
+        {
+            let inherited_home = (inherit_default_config && self.kind == DriverKind::ClaudePty)
+                .then(|| std::env::var_os("CLAUDE_CONFIG_DIR"))
+                .flatten()
+                .map(PathBuf::from)
+                .map(|path| launch.workspace_root.join(path));
+            crate::native_config_access::check_claude_config_access(
+                inherited_home.as_deref().unwrap_or(&native_home),
+            )?;
+        }
         if !inherit_default_config {
-            std::fs::create_dir_all(&native_home)
+            crate::prepare_workspace(&native_home)
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
         }
         let spec = instance_spec(&launch, &self.config, &profile)?;

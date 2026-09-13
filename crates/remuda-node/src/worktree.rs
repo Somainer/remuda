@@ -156,13 +156,13 @@ fn create_record(
 /// Resolve a caller-supplied instance `cwd` against the registered workspace.
 ///
 /// An Instance may run in the workspace root or in any worktree beside it
-/// (`<repo>/../remuda-wt/…`), and nowhere else. `None` and a path that is not
-/// a directory both fall back to the workspace root, preserving the previous
-/// behaviour for callers that omit `cwd` (`security-review-2.md` G5).
+/// (`<repo>/../remuda-wt/…`), and nowhere else. `None` falls back to the
+/// workspace root; inaccessible directories fail before launching a driver.
 pub fn resolve_instance_cwd(
     workspace_root: &Path,
     cwd: Option<&str>,
 ) -> Result<PathBuf, NodeError> {
+    crate::workspace_access_check(workspace_root)?;
     // The configured root may be relative (`DevServerConfig` defaults to
     // `"."`); resolve it against the process cwd before anything else.
     let workspace_root = if workspace_root.is_absolute() {
@@ -180,6 +180,11 @@ pub fn resolve_instance_cwd(
         });
     };
     let candidate = path_guard::absolutize(&workspace_root, Path::new(raw));
+    crate::workspace_access_check(&candidate).map_err(|error| {
+        NodeError::InvalidRequest(format!(
+            "cwd is not a directory or is inaccessible: {error}"
+        ))
+    })?;
     // The worktree root is advisory here: a Node whose workspace has no parent
     // simply has no second root, rather than failing every create.
     let worktrees = path_guard::worktree_root(&workspace_root).ok();
@@ -260,12 +265,24 @@ fn unique_branch(repo: &Path, name: &str) -> Result<String, NodeError> {
 
 fn ref_exists(repo: &Path, branch: &str) -> Result<bool, NodeError> {
     let spec = format!("refs/heads/{branch}");
-    let status = Command::new("git")
-        .current_dir(repo)
-        .args(["show-ref", "--verify", "--quiet", &spec])
-        .status()
-        .map_err(NodeError::from)?;
-    Ok(status.success())
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet", &spec]);
+    let output = crate::workspace_access::bounded_workspace_command(
+        &mut command,
+        repo,
+        std::time::Duration::from_secs(3),
+    )?;
+    if matches!(output.status.code(), Some(0 | 1)) {
+        return Ok(output.status.success());
+    }
+    crate::workspace_access::check_workspace_output(repo, &output)?;
+    Err(NodeError::InvalidRequest(format!(
+        "git show-ref failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
 }
 
 fn find_listed_worktree(repo: &Path, path: &Path) -> Result<Option<(String, String)>, NodeError> {
@@ -327,12 +344,22 @@ fn upsert(catalog: &mut Catalog, record: WorktreeRecord) {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, NodeError> {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .map_err(NodeError::from)?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    let output = if matches!(args, ["rev-parse", ..] | ["worktree", "list", ..]) {
+        crate::workspace_access::bounded_workspace_command(
+            &mut command,
+            repo,
+            std::time::Duration::from_secs(3),
+        )?
+    } else {
+        // Checking access is bounded; a large checkout is a mutation that must
+        // not be killed by a probe deadline and later mistaken for complete.
+        crate::workspace_access_check(repo)?;
+        command.current_dir("/").env("LC_ALL", "C").output()?
+    };
     if !output.status.success() {
+        crate::workspace_access::check_workspace_output(repo, &output)?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(NodeError::InvalidRequest(format!(

@@ -19,7 +19,7 @@ pub(super) async fn run(config: Config, args: Args, mut shutdown: Shutdown) -> R
     native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
     native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
     native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
-    std::fs::create_dir_all(&config.node.workspace)?;
+    remuda_node::prepare_workspace(&config.node.workspace)?;
     let runtime = compose(&ServeConfig {
         http: DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone()),
         data_dir: config.data_dir.clone(),

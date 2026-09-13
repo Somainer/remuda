@@ -119,8 +119,11 @@ pub(super) fn launchd_unit(unit: &UnitConfig<'_>) -> Result<String> {
         ));
     }
     let log = xml(path_text(&unit.data_dir.join("node/daemon.log"))?)?;
+    // The daemon handles user-requested terminal work over WSS, not XPC
+    // activities. Background policy is inherited by Herdr/native children and
+    // heavily throttles even startup inventory and binary pinning.
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<!-- {marker} -->\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LAUNCHD_LABEL}</string>\n<key>ProgramArguments</key><array>\n{args}\n</array>\n<key>EnvironmentVariables</key><dict>{environment}</dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ProcessType</key><string>Background</string>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<!-- {marker} -->\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LAUNCHD_LABEL}</string>\n<key>ProgramArguments</key><array>\n{args}\n</array>\n<key>EnvironmentVariables</key><dict>{environment}</dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ProcessType</key><string>Interactive</string>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n"
     ))
 }
 
@@ -154,6 +157,7 @@ mod tests {
         assert!(systemd.contains("\"node\" \"daemon\""));
         assert!(!systemd.contains("enroll-token"));
         let plist = launchd_unit(&unit).unwrap();
+        assert!(plist.contains("<key>ProcessType</key><string>Interactive</string>"));
         assert!(plist.contains("<string>&lt;sg-host&gt; &amp; &apos;label&apos;</string>"));
         assert!(plist.contains("<string>/opt/bin &amp; tools</string>"));
         assert!(plist.contains("<string>daemon</string>"));

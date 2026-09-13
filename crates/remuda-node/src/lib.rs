@@ -14,6 +14,8 @@ mod interactions;
 mod inventory;
 mod model;
 mod native;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod native_config_access;
 mod origin;
 mod reclaim;
 mod runtime;
@@ -24,6 +26,7 @@ mod stdio;
 mod store;
 mod transport;
 mod tty;
+mod workspace_access;
 mod worktree;
 
 pub use carrier::{
@@ -38,7 +41,10 @@ pub use daemon::{
     daemon_is_running, daemon_socket_path, run_daemon_runtime_controlled,
     run_daemon_runtime_listener, run_daemon_runtime_opts,
 };
-pub use diagnostics::{DoctorCheck, DoctorContext, DoctorReport, doctor_port, doctor_snapshot};
+pub use diagnostics::{
+    DoctorCheck, DoctorContext, DoctorReport, doctor_port, doctor_snapshot, doctor_with_workspace,
+    doctor_workspace,
+};
 pub use driver::{
     Driver, DriverEmission, DriverError, DriverFactory, DriverFuture, DriverLaunch, DriverRegistry,
     DriverRequest, DriverStartFuture, FakeDriver,
@@ -75,4 +81,7 @@ pub use tty::{
     TTY_CHANNEL_INPUT, TTY_CHANNEL_OUTPUT, TTY_DEFAULT_COLS, TTY_DEFAULT_ROWS,
     TTY_FRAME_HEADER_BYTES, TTY_MAX_INPUT_BYTES, TtyAttach, TtyEvent, TtyRegistry,
     decode_tty_input, encode_tty_frame, encode_tty_input,
+};
+pub use workspace_access::{
+    macos_workspace_guidance, prepare_workspace, workspace_access_check, workspace_access_guidance,
 };

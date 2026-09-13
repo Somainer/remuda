@@ -357,6 +357,58 @@ async fn enrollment_file_keeps_the_same_host_id_across_hello() {
         .expect("second shutdown");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_wss_doctor_returns_workspace_access_report_through_hub() {
+    use remuda_node::{DaemonControl, DevNode, DevServerConfig};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let hub = remuda_hub::spawn(HubConfig::for_test(fixture.path().join("hub")))
+        .await
+        .unwrap();
+    let node =
+        DevNode::new(&DevServerConfig::loopback(0).with_workspace_root(workspace.clone())).unwrap();
+    let host_id = node.host().meta.id.as_id().to_string();
+    let control = DaemonControl::new().unwrap();
+    let lease = control.acquire_outbound().await.unwrap();
+    let link = WssLink::connect_runtime_controlled(
+        WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone()),
+        node,
+        lease.clone(),
+    )
+    .await
+    .unwrap();
+    // The already registered workspace becomes unavailable while its Node stays online.
+    std::fs::remove_dir(&workspace).unwrap();
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+    let (status, body) = tokio::time::timeout(
+        SLOW_TIMEOUT,
+        http(
+            hub.addr,
+            "GET",
+            &format!("/v1/hosts/{host_id}/doctor"),
+            &[("Cookie", cookie.as_str())],
+            None,
+        ),
+    )
+    .await
+    .expect("doctor response deadline");
+    assert_eq!(status, 200, "{body}");
+    let report: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["exitCode"], 1, "{report}");
+    let checks = report["checks"].as_array().expect("actual doctor checks");
+    let access = checks
+        .iter()
+        .find(|check| check["name"] == "workspace.access")
+        .expect("workspace access check");
+    assert_eq!(access["status"], "blocker", "{access}");
+    assert_eq!(access["details"]["path"], workspace.display().to_string());
+    assert!(access["message"].as_str().unwrap().contains("inaccessible"));
+    link.shutdown().await;
+}
+
 #[tokio::test]
 async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
     use futures::StreamExt;

@@ -1,7 +1,9 @@
 //! D-026 Node behaviour: record the driver's session id, then resume it onto a
 //! new Instance instead of reviving the exited one.
 
-use remuda_node::{DevNode, DevServerConfig, DriverRegistry, LocalStore, MemoryStore, dispatch_hub_rpc};
+use remuda_node::{
+    DevNode, DevServerConfig, DriverRegistry, LocalStore, MemoryStore, dispatch_hub_rpc,
+};
 use remuda_protocol::{
     Completeness, DriverKind, Instance, InstanceId, Knowledge, LifecyclePayload, LifecycleTopic,
     NativeLifecycle, ObservationPayload, Severity,
@@ -85,7 +87,11 @@ async fn store_records_the_session_a_driver_reports() {
         .expect("changed");
     assert_eq!(session_id_of(&updated), Some(session));
     assert_eq!(
-        updated.native_ref.claude.as_ref().map(|c| c.session_id.as_str()),
+        updated
+            .native_ref
+            .claude
+            .as_ref()
+            .map(|c| c.session_id.as_str()),
         Some(session),
     );
     match &updated.native_ref.transcript {

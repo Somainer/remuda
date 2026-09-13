@@ -105,9 +105,10 @@ async fn resume_creates_a_linked_child_on_both_targets_and_refuses_agents() -> R
         .as_str()
         .context("parent id")?
         .to_owned();
-    let (create_method, create_params) = tokio::time::timeout(Duration::from_secs(5), launch_rx.recv())
-        .await?
-        .context("create forwarded")?;
+    let (create_method, create_params) =
+        tokio::time::timeout(Duration::from_secs(5), launch_rx.recv())
+            .await?
+            .context("create forwarded")?;
     assert_eq!(create_method, "instance.create");
     let agent = create_params["agentCredential"]["token"]
         .as_str()
@@ -231,7 +232,9 @@ async fn resume_creates_a_linked_child_on_both_targets_and_refuses_agents() -> R
     assert_eq!(bad_mode.status(), 400);
 
     let missing = client
-        .post(format!("{base}/v1/instances/ins_00000000-0000-7000-8000-000000000000/resume"))
+        .post(format!(
+            "{base}/v1/instances/ins_00000000-0000-7000-8000-000000000000/resume"
+        ))
         .bearer_auth(&human)
         .json(&json!({"mode":"structured"}))
         .send()

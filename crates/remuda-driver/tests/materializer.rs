@@ -1020,7 +1020,9 @@ fn resume_keeps_the_same_launch_surface_as_a_new_session() {
 
     let flags = |argv: &[String]| -> Vec<String> {
         argv.iter()
-            .filter(|token| token.starts_with("--") && *token != "--resume" && *token != "--session-id")
+            .filter(|token| {
+                token.starts_with("--") && *token != "--resume" && *token != "--session-id"
+            })
             .cloned()
             .collect()
     };

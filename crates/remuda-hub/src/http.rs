@@ -776,8 +776,9 @@ impl ResumeMode {
 
 /// Whole days between `updated_at` and now; `None` when unparseable.
 fn resume_age_days(updated_at: &str) -> Option<i64> {
-    let then = time::OffsetDateTime::parse(updated_at, &time::format_description::well_known::Rfc3339)
-        .ok()?;
+    let then =
+        time::OffsetDateTime::parse(updated_at, &time::format_description::well_known::Rfc3339)
+            .ok()?;
     let seconds = (time::OffsetDateTime::now_utc() - then).whole_seconds();
     Some(seconds / 86_400)
 }

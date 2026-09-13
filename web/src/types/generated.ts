@@ -3433,6 +3433,7 @@ export type TtyAttachParams = ({
 
 /** TtyAttachResult; `protocol.md` §7.4. */
 export type TtyAttachResult = ({
+  "altScreen"?: (boolean | null);
   "availableFrom": U64;
   "nextOffset": U64;
   "representation": TtyRepresentation;

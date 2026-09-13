@@ -1,0 +1,144 @@
+//! Attach snapshot as a synthesized repaint, behind the emulator flag
+//! (D-028 §4.6, §13 P0).
+//!
+//! These run against a real PTY. `REMUDA_PTY_EMULATOR` selects the production
+//! default, but the tests set `ShellPtyOptions::emulator` directly: the
+//! workspace forbids `unsafe`, so `set_var` is unavailable, and a process-wide
+//! flag would leak between tests sharing a process regardless.
+
+use remuda_driver::{Driver, ShellPtyDriver, ShellPtyOptions};
+use remuda_node::{TtyAttach, TtyRegistry};
+use remuda_protocol::InstanceId;
+use std::time::Duration;
+
+/// Paints two frames over each other, then sits still. The second frame is the
+/// only thing on screen; both are in the byte ring.
+const REPAINT: &str = r#"
+import os, sys, time
+os.write(1, b"\x1b[2J\x1b[Hfirst frame that a ring snapshot would still carry")
+time.sleep(0.2)
+os.write(1, b"\x1b[2J\x1b[Hsecond frame is the only thing on screen")
+sys.stdout.flush()
+time.sleep(30)
+"#;
+
+/// Enters the alternate screen and paints a TUI frame over real scrollback.
+const ALT_SCREEN: &str = r#"
+import os, sys, time
+os.write(1, b"scrollback line before the tui\r\n")
+os.write(1, b"\x1b[?1049h\x1b[2J\x1b[Hfullscreen tui frame")
+sys.stdout.flush()
+time.sleep(30)
+"#;
+
+/// Spawn a shell-pty running `script`, bridge it into a registry, and return
+/// the attach once its snapshot shows `marker`.
+async fn attach_when(script: &str, emulator: bool, marker: &str) -> TtyAttach {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+    options.args = vec![
+        "python3".into(),
+        "-u".into(),
+        "-c".into(),
+        script.to_owned(),
+    ];
+    options.emulator = emulator;
+    let driver = ShellPtyDriver::new(options);
+    driver.spawn().await.expect("spawn shell-pty");
+    let bridge = driver.tty_bridge().await.expect("local bridge");
+
+    let registry = TtyRegistry::new();
+    let instance_id = InstanceId::new();
+    registry
+        .start(instance_id.clone(), bridge, 80, 24)
+        .await
+        .expect("start bridge");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last = String::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(attached) = registry.attach(&instance_id).await {
+            last = String::from_utf8_lossy(&attached.snapshot).into_owned();
+            if last.contains(marker) {
+                return attached;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("snapshot never contained {marker:?}; last was {last:?}");
+}
+
+#[tokio::test]
+async fn with_the_emulator_off_the_snapshot_is_the_raw_ring_exactly_as_before() {
+    let attached = attach_when(REPAINT, false, "second frame").await;
+    let text = String::from_utf8_lossy(&attached.snapshot);
+    assert!(
+        text.contains("first frame"),
+        "the ring carries overpainted frames — that is the pre-D-028 \
+         behaviour P0 must preserve unchanged: {text:?}"
+    );
+    assert!(
+        !attached.alt_screen,
+        "the ring path cannot know the mode and must not claim to"
+    );
+    assert_eq!(
+        attached.available_from,
+        attached
+            .next_offset
+            .saturating_sub(attached.snapshot.len() as u64),
+        "a ring slice keeps its place in the offset stream"
+    );
+}
+
+#[tokio::test]
+async fn with_the_emulator_on_the_snapshot_is_a_repaint_of_the_current_screen() {
+    let attached = attach_when(REPAINT, true, "second frame").await;
+    let text = String::from_utf8_lossy(&attached.snapshot);
+    assert!(
+        !text.contains("first frame"),
+        "a repaint carries the current screen, not the history that made it \
+         (§4.6): {text:?}"
+    );
+    assert!(
+        text.starts_with("\u{1b}[!p"),
+        "a repaint opens with a soft reset so the client starts clean: {text:?}"
+    );
+    assert_eq!(
+        attached.available_from, attached.next_offset,
+        "a synthesized repaint occupies no offset range of its own, so live \
+         output resumes at the next unseen byte"
+    );
+}
+
+#[tokio::test]
+async fn an_alt_screen_session_reports_it_and_snapshots_only_the_alt_grid() {
+    let attached = attach_when(ALT_SCREEN, true, "fullscreen tui frame").await;
+    let text = String::from_utf8_lossy(&attached.snapshot).into_owned();
+    assert!(
+        attached.alt_screen,
+        "?1049 must be reported so the web stops hijacking the wheel (§4.6)"
+    );
+    assert!(
+        !text.contains("scrollback line before the tui"),
+        "a full-screen TUI has no meaningful scrollback; snapshot the alt grid \
+         alone: {text:?}"
+    );
+    assert!(
+        text.contains("\u{1b}[?1049h"),
+        "the client must enter the alt buffer before the paint: {text:?}"
+    );
+    let json = attached.into_json().expect("attach json");
+    assert_eq!(json["altScreen"], serde_json::Value::Bool(true));
+    assert_eq!(
+        json["representation"], "pty-bytes",
+        "D-016 wire format is unchanged; altScreen is purely additive"
+    );
+}
+
+#[tokio::test]
+async fn a_primary_screen_session_reports_alt_screen_false() {
+    let attached = attach_when(REPAINT, true, "second frame").await;
+    assert!(!attached.alt_screen);
+    let json = attached.into_json().expect("attach json");
+    assert_eq!(json["altScreen"], serde_json::Value::Bool(false));
+}

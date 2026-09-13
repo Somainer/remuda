@@ -14,13 +14,14 @@ use crate::error::{DriverError, DriverResult};
 use crate::profile::{Delegation, ProviderKind};
 use crate::promote::{Detected, ProcessTable, ScreenStatus, SystemProcessTable};
 use crate::recipe::{LaunchAudit, LaunchRecipe, RecipePermission, RecipeProvider};
-use crate::tty::{LocalPty, TTY_SNAPSHOT_MAX, TtyBridge, logical_keys_to_bytes};
+use crate::tty::{LocalPty, PtySnapshot, TTY_SNAPSHOT_MAX, TtyBridge, logical_keys_to_bytes};
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use remuda_protocol::{
     AgentKind, ApprovalAuthority, BoolLiteral, DriverInput, DriverKind, HostId, Id, InputDelivery,
     InstanceId, InstanceSpec, RunId, U64,
 };
+use remuda_screen::{Emulator, ScreenGrid};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,23 @@ mod promotion;
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+
+/// Env flag that turns the terminal emulator on (D-028 §13 P0).
+///
+/// Off by default this phase: with it off the ring is the only screen source
+/// and every signature is byte-identical to pre-D-028. Rollback is `unset` and
+/// a Node restart — no schema migration, orthogonal to the other four flags
+/// (§13 conflict rule ⑤).
+pub const EMULATOR_ENV: &str = "REMUDA_PTY_EMULATOR";
+
+/// Whether [`EMULATOR_ENV`] asks for the emulator.
+#[must_use]
+pub fn emulator_enabled() -> bool {
+    matches!(
+        std::env::var(EMULATOR_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
 
 /// How often the promotion poller samples the foreground process group.
 /// Detection is then visible within ~2 poll intervals (D-025 budget: ~2 s).
@@ -82,6 +100,16 @@ pub struct ShellPtyOptions {
     /// `None` — the P1 default — means no socket, no overlay and no shim: a
     /// Node that has not opted in behaves exactly as it did before.
     pub hooks: Option<HookConfig>,
+    /// Run a terminal emulator alongside the byte ring (D-028 §4.1, §13 P0).
+    ///
+    /// Defaults to [`emulator_enabled`], so production is driven by
+    /// [`EMULATOR_ENV`] and off unless it is set. Tests set it directly rather
+    /// than mutating process environment, which this workspace forbids and
+    /// which would leak across tests sharing a process anyway.
+    ///
+    /// Orthogonal to `hooks`: §13 rule ⑤ makes the five flags independent, so
+    /// either, both or neither may be on.
+    pub emulator: bool,
 }
 
 /// What the driver needs to stand up this instance's hook path.
@@ -110,6 +138,7 @@ impl ShellPtyOptions {
             promote: false,
             claude_home: None,
             hooks: None,
+            emulator: emulator_enabled(),
         }
     }
 }
@@ -120,9 +149,40 @@ struct PtyState {
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     output: broadcast::Sender<Vec<u8>>,
     ring: std::sync::Mutex<VecDeque<u8>>,
+    /// Terminal emulator, when [`EMULATOR_ENV`] is on. Fed the same bytes as
+    /// the ring, never instead of it: §4.6 keeps the ring as the fallback for
+    /// any emulator failure, so the emulator can never cost a byte of output.
+    emulator: Option<std::sync::Mutex<Emulator>>,
     cols: AtomicU16,
     rows: AtomicU16,
     closed: AtomicBool,
+}
+
+impl PtyState {
+    /// Current screen as a grid: the emulator's when it is on, otherwise the
+    /// ANSI-stripped ring tail, which is what the matchers read before D-028.
+    pub(super) fn screen_grid(&self) -> ScreenGrid {
+        if let Some(emulator) = &self.emulator {
+            match emulator.lock() {
+                Ok(emulator) => return emulator.grid(),
+                Err(_) => tracing::warn!(
+                    "pty emulator lock poisoned; falling back to the raw ring for signatures"
+                ),
+            }
+        }
+        ScreenGrid::from_raw(&remuda_screen::screen_tail(&self.ring_text()))
+    }
+
+    /// Ring contents as lossy UTF-8.
+    fn ring_text(&self) -> String {
+        self.ring
+            .lock()
+            .ok()
+            .map(|ring| {
+                String::from_utf8_lossy(&ring.iter().copied().collect::<Vec<_>>()).into_owned()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Login shell in a PTY, with optional agent promotion (D-025).
@@ -270,12 +330,22 @@ impl ShellPtyDriver {
         let writer = master.take_writer().map_err(pty_err)?;
         let reader = master.try_clone_reader().map_err(pty_err)?;
         let (output, _) = broadcast::channel(64);
+        let emulator = self.options.emulator.then(|| {
+            tracing::info!(
+                cols,
+                rows,
+                scrollback = remuda_screen::DEFAULT_SCROLLBACK_LINES,
+                "terminal emulator on for this PTY ({EMULATOR_ENV})"
+            );
+            std::sync::Mutex::new(Emulator::new(cols, rows))
+        });
         let state = Arc::new(PtyState {
             writer: Mutex::new(writer),
             master: Mutex::new(master),
             child: Mutex::new(child),
             output: output.clone(),
             ring: std::sync::Mutex::new(VecDeque::new()),
+            emulator,
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
             closed: AtomicBool::new(false),
@@ -346,10 +416,38 @@ impl LocalPty for PtyState {
     }
 
     fn snapshot(&self) -> Vec<u8> {
-        self.ring
-            .lock()
-            .map(|ring| ring.iter().copied().collect())
-            .unwrap_or_default()
+        self.screen_snapshot().bytes
+    }
+
+    /// §4.6: a synthesized repaint when the emulator is on, the raw ring when
+    /// it is not — and an honest label either way, so Node can log which one
+    /// the client actually received.
+    fn screen_snapshot(&self) -> PtySnapshot {
+        let ring = || {
+            self.ring
+                .lock()
+                .map(|ring| ring.iter().copied().collect::<Vec<u8>>())
+                .unwrap_or_default()
+        };
+        let Some(emulator) = &self.emulator else {
+            return PtySnapshot::raw_ring(ring());
+        };
+        match emulator.lock() {
+            Ok(emulator) => {
+                let snapshot = remuda_screen::snapshot(Some(&emulator), ring());
+                PtySnapshot {
+                    bytes: snapshot.bytes,
+                    source: snapshot.source,
+                    alt_screen: snapshot.alt_screen,
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "pty emulator lock poisoned; serving the raw ring snapshot instead of a repaint"
+                );
+                PtySnapshot::raw_ring(ring())
+            }
+        }
     }
 
     async fn write_bytes(&self, bytes: &[u8]) -> DriverResult<()> {
@@ -379,6 +477,14 @@ impl LocalPty for PtyState {
             .map_err(pty_err)?;
         self.cols.store(cols, Ordering::SeqCst);
         self.rows.store(rows, Ordering::SeqCst);
+        if let Some(emulator) = &self.emulator {
+            match emulator.lock() {
+                Ok(mut emulator) => emulator.resize(cols, rows),
+                // A stale emulator size skews the grid but must not fail the
+                // resize: the PTY itself already took it.
+                Err(_) => tracing::warn!("pty emulator lock poisoned; screen size not updated"),
+            }
+        }
         Ok(())
     }
 }
@@ -611,6 +717,17 @@ fn read_pty(state: Arc<PtyState>, mut reader: Box<dyn Read + Send>) {
                     ring.extend(chunk.iter().copied());
                     while ring.len() > TTY_SNAPSHOT_MAX {
                         ring.pop_front();
+                    }
+                }
+                // §4.1: the emulator sees every byte the ring sees. It is fed
+                // after the ring and before the fan-out so a failure here can
+                // only degrade signatures, never the live stream.
+                if let Some(emulator) = &state.emulator {
+                    match emulator.lock() {
+                        Ok(mut emulator) => emulator.feed(&chunk),
+                        Err(_) => tracing::warn!(
+                            "pty emulator lock poisoned; screen state will drift from the ring"
+                        ),
                     }
                 }
                 let _ = state.output.send(chunk);

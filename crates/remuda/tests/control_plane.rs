@@ -251,7 +251,9 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
     let body_idx = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
     let req_body = &text[body_idx.min(text.len())..];
 
-    let (status, payload) = if path_only == "/v1/hosts" {
+    let (status, payload) = if path_only == "/v1/caller" {
+        (200, json!({"origin":"human", "children":[]}))
+    } else if path_only == "/v1/hosts" {
         (
             200,
             json!({"items":[{"hostId":"hst_1","online":true,"labels":["region=sg"],"instanceCount":0,"maxInstances":4}],"nextCursor":null}),
@@ -285,4 +287,34 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
     );
     stream.write_all(response.as_bytes())?;
     Ok(())
+}
+
+#[test]
+fn fleet_all_send_and_keys_fail_before_enumeration_for_agent_origin() {
+    for operation in ["send", "keys"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let n = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /v1/caller "));
+            let body = r#"{"origin":"agent","instanceId":"self","hostId":"host-a","children":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let output = Command::new(bin())
+            .args(["fleet", operation, "--all", "--confirm", "enter"])
+            .env("REMUDA_HUB", format!("http://{addr}"))
+            .env("REMUDA_TOKEN", "scoped-test-device")
+            .env_remove("REMUDA_BOOTSTRAP_TOKEN")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("forbidden from Agent origin"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

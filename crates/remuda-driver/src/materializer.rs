@@ -116,18 +116,22 @@ impl fmt::Debug for TokenBrokerBind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LaunchOrigin {
-    /// Human UI/CLI (and other non-bot command origins).
-    #[default]
+    /// Authenticated human UI/CLI.
     Human,
     /// Bot or dispatcher path. Cannot request bypass (D-011).
     Bot,
+    /// An instance, or an unknown caller. Never inherits operator authority.
+    #[default]
+    #[serde(other)]
+    Agent,
 }
 
 impl From<InputOrigin> for LaunchOrigin {
     fn from(value: InputOrigin) -> Self {
         match value {
             InputOrigin::Human => Self::Human,
-            InputOrigin::Bot | InputOrigin::Agent => Self::Bot,
+            InputOrigin::Bot => Self::Bot,
+            InputOrigin::Agent => Self::Agent,
         }
     }
 }
@@ -136,9 +140,8 @@ impl From<CommandOrigin> for LaunchOrigin {
     fn from(value: CommandOrigin) -> Self {
         match value {
             CommandOrigin::Bot => Self::Bot,
-            CommandOrigin::Ui | CommandOrigin::Cli | CommandOrigin::Mcp | CommandOrigin::System => {
-                Self::Human
-            }
+            CommandOrigin::Ui | CommandOrigin::Cli => Self::Human,
+            CommandOrigin::Mcp | CommandOrigin::System => Self::Agent,
         }
     }
 }
@@ -575,7 +578,7 @@ fn permission_plan(
             if matches!(
                 claude.mode,
                 ClaudePermissionMode::BypassPermissions | ClaudePermissionMode::DontAsk
-            ) && origin == LaunchOrigin::Bot
+            ) && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
             {
                 return Err(DriverError::BypassNotAllowedForBot);
             }

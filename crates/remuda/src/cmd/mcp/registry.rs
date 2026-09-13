@@ -22,9 +22,10 @@ impl Tool {
     pub fn new(
         name: &'static str,
         description: &'static str,
-        schema: Value,
+        mut schema: Value,
         handler: Handler,
     ) -> Self {
+        super::scope::tool_schema(name, &mut schema);
         Self {
             name,
             description,

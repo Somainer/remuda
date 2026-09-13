@@ -64,6 +64,7 @@ async fn handle_conn(mut stream: TcpStream) -> std::io::Result<()> {
 
 fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
     match (method, path) {
+        ("GET", "/v1/caller") => (200, json!({"origin":"human", "children":[]})),
         ("GET", "/healthz") => (200, json!({ "ok": true })),
         ("POST", "/v1/login") => (
             200,

@@ -70,6 +70,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/caller": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get authenticated origin and direct instance scope */
+        get: operations["callerGet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/devices": {
         parameters: {
             query?: never;
@@ -371,6 +388,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/mcp-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint a credential bound to an agent instance
+         * @description Requires Human origin. The returned credential always has Agent origin and cannot be rebound to another instance.
+         */
+        post: operations["instanceMcpTokenCreate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/interactions": {
         parameters: {
             query?: never;
@@ -528,6 +565,23 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AgentApprovalRequired: {
+            /** @constant */
+            code: "HUMAN_APPROVAL_REQUIRED";
+            error: string;
+            interactionId: string;
+        };
+        CallerContext: {
+            /** @description Direct children created by this instance; descendants do not inherit scope. */
+            children: string[];
+            hostId: string | null;
+            instanceId: string | null;
+            /**
+             * @description Authenticated origin; clients must treat an unknown origin as Agent.
+             * @enum {string}
+             */
+            origin: "human" | "bot" | "agent";
+        };
         CommandRecord: {
             commandId: string;
             createdAt?: string;
@@ -579,9 +633,15 @@ export interface components {
             error: string;
             reasons?: string[];
         };
-        /** @description Select running instances and fan one command out. Requires `all` or at least one of `hosts` / `labels` / `kinds`; filters intersect. */
+        /** @description Select running instances and fan one command out. Requires `all` or at least one of `hosts` / `labels` / `kinds`; filters intersect. Agent broadcasts are checked before dispatch; cross-instance sends and all key input require Human approval. */
         FleetBroadcast: {
+            /** @description Forbidden from Agent origin, even with filters. Human/Bot callers must also set confirm=true. */
             all?: boolean;
+            /**
+             * @description Explicit confirmation of an all broadcast; does not exempt Agent callers.
+             * @default false
+             */
+            confirm: boolean;
             hosts?: string[];
             /** @description Base key; each instance is queued under `<key>:<instanceId>` so a retry replays instead of double-sending. */
             idempotencyKey?: string;
@@ -717,6 +777,12 @@ export interface components {
             hostId?: string;
             instance: components["schemas"]["InstanceRecord"];
         };
+        InstanceMcpToken: {
+            /** @constant */
+            origin: "agent";
+            /** @description Bearer credential; keep secret and do not journal it. */
+            token: string;
+        };
         InstancePage: {
             items: components["schemas"]["InstanceRecord"][];
             nextCursor?: string | null;
@@ -746,6 +812,8 @@ export interface components {
             lifecycle: "requested" | "starting" | "running" | "closing" | "exited" | "failed";
             model?: string | null;
             name?: string | null;
+            /** @description Immutable creator instance, recorded by the Hub from authenticated identity. */
+            readonly parentInstanceId?: string | null;
             providerProfileId?: string | null;
             providerSource?: string | null;
             providerSourceHint?: string | null;
@@ -776,6 +844,11 @@ export interface components {
         };
         LoginRequest: {
             bootstrapToken: string;
+            /**
+             * @default human
+             * @enum {string}
+             */
+            deviceKind: "human" | "bot";
             deviceName?: string;
         };
         PairCode: {
@@ -913,6 +986,15 @@ export interface components {
         };
     };
     responses: {
+        /** @description Human approval required, or an action conflict. For HUMAN_APPROVAL_REQUIRED, a Human must answer the Interaction with allow-once before retrying the exact action with x-remuda-approval-id. */
+        AgentActionConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AgentApprovalRequired"] | components["schemas"]["ErrorBody"];
+            };
+        };
         /** @description Hub error */
         Error: {
             headers: {
@@ -924,6 +1006,10 @@ export interface components {
         };
     };
     parameters: {
+        /** @description Retry an action after Human approval with its interaction ID. The grant is single-use and bound to the exact caller and action. */
+        AgentApproval: string;
+        /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+        CallerInstance: string;
         IdPath: string;
     };
     requestBodies: never;
@@ -1045,6 +1131,31 @@ export interface operations {
             };
         };
     };
+    callerGet: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-derived caller identity */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CallerContext"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
     deviceList: {
         parameters: {
             query?: never;
@@ -1138,7 +1249,12 @@ export interface operations {
     fleetBroadcast: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+                /** @description Retry an action after Human approval with its interaction ID. The grant is single-use and bound to the exact caller and action. */
+                "x-remuda-approval-id"?: components["parameters"]["AgentApproval"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -1158,12 +1274,20 @@ export interface operations {
                 };
             };
             400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["AgentActionConflict"];
         };
     };
     fleetCreate: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+                /** @description Retry an action after Human approval with its interaction ID. The grant is single-use and bound to the exact caller and action. */
+                "x-remuda-approval-id"?: components["parameters"]["AgentApproval"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -1182,6 +1306,9 @@ export interface operations {
                     "application/json": components["schemas"]["FleetCreateResult"];
                 };
             };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["AgentActionConflict"];
             422: components["responses"]["Error"];
         };
     };
@@ -1467,7 +1594,12 @@ export interface operations {
     instanceCreate: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+                /** @description Retry an action after Human approval with its interaction ID. The grant is single-use and bound to the exact caller and action. */
+                "x-remuda-approval-id"?: components["parameters"]["AgentApproval"];
+            };
             path?: never;
             cookie?: never;
         };
@@ -1487,6 +1619,8 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["AgentActionConflict"];
             /** @description PLACEMENT_UNSATISFIABLE when host availability or placement constraints cannot be satisfied; PROVIDER_NOT_CONFIGURED when explicit gateway delegation has no matching provider profile. Unspecified or direct delegation may use native authentication without a provider profile. */
             422: {
                 headers: {
@@ -1534,7 +1668,12 @@ export interface operations {
     instanceCommand: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Narrow a device credential to an existing instance with Agent origin. Cannot promote or rebind a scoped credential. */
+                "x-remuda-instance-id"?: components["parameters"]["CallerInstance"];
+                /** @description Retry an action after Human approval with its interaction ID. The grant is single-use and bound to the exact caller and action. */
+                "x-remuda-approval-id"?: components["parameters"]["AgentApproval"];
+            };
             path: {
                 id: components["parameters"]["IdPath"];
             };
@@ -1556,7 +1695,9 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+            409: components["responses"]["AgentActionConflict"];
         };
     };
     instanceJournal: {
@@ -1582,6 +1723,31 @@ export interface operations {
                 };
             };
             401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    instanceMcpTokenCreate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Scoped agent credential */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceMcpToken"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
             404: components["responses"]["Error"];
         };
     };

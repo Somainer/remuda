@@ -9,6 +9,8 @@
 
 #![allow(missing_docs)] // handler types; public API is documented below.
 
+pub mod agent_approvals;
+mod agent_scope;
 mod alerts;
 mod auth;
 mod config;
@@ -76,6 +78,7 @@ pub struct AppState {
     followers: Followers,
     blocked: BlockedWatch,
     auth_limits: rate_limit::AuthRateLimits,
+    agent_approvals: agent_approvals::AgentApprovals,
 }
 
 /// A bound Hub that shuts down when dropped.
@@ -240,6 +243,7 @@ async fn spawn_inner(
         followers: Followers::default(),
         blocked: BlockedWatch::default(),
         auth_limits: rate_limit::AuthRateLimits::default(),
+        agent_approvals: agent_approvals::AgentApprovals::new()?,
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     let reaper_store = store.clone();
@@ -296,11 +300,16 @@ pub fn router(state: AppState) -> Router {
         .merge(placement::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
-        .merge(providers::routes());
+        .merge(providers::routes())
+        .merge(agent_scope::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }
     app.fallback(static_fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            agent_scope::restrict_agent_routes,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             rate_limit::limit_auth_attempts,

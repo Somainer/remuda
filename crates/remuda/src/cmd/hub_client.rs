@@ -55,7 +55,15 @@ impl HubOpts {
     /// Build a [`HubClient`] from flags, `REMUDA_*` env, and the Hub data dir.
     pub(crate) fn connect(&self) -> Result<HubClient, ClientError> {
         let resolved = resolve_hub(&ResolveInput::from_opts(self));
-        HubClient::new(resolved.url, resolved.token, resolved.bootstrap_token)
+        let instance = env_present("REMUDA_INSTANCE_ID");
+        // Instances never fall back to a Node's bootstrap or a repo token file.
+        let bootstrap = if instance.is_some() {
+            None
+        } else {
+            resolved.bootstrap_token
+        };
+        HubClient::new(resolved.url, resolved.token, bootstrap)
+            .map(|client| client.with_caller_instance(instance))
     }
 }
 

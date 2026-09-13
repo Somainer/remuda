@@ -20,6 +20,8 @@ fn loopback_config(root: &std::path::Path) -> DevServerConfig {
 
 fn create_req(prompt: &str) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        origin: remuda_protocol::InputOrigin::Human,
+        agent_credential: None,
         command_id: None,
         instance_id: None,
         host_id: None,

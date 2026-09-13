@@ -239,17 +239,23 @@ fn rm_refuses_an_active_merge_even_with_force() {
     assert!(path.exists());
 }
 
-#[test]
-fn mcp_worktree_rm_uses_the_same_safety_checks_and_preserves_the_branch() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_worktree_rm_uses_the_same_safety_checks_and_preserves_the_branch() {
     use std::io::Write;
     use std::process::Stdio;
-    let (_keep, repo) = fixture();
+    let (keep, repo) = fixture();
+    let hub = remuda_hub::spawn(remuda_hub::HubConfig::for_test(keep.path().join("hub")))
+        .await
+        .unwrap();
+    let token = hub.mint_device_token("worktree-coordinator").await.unwrap();
+    let hub_url = format!("http://{}", hub.addr);
     let tree = result(worktree(&repo, &["create", "worker"]));
     let path = std::path::Path::new(tree["path"].as_str().unwrap());
     std::fs::write(path.join("unfinished.txt"), "unfinished\n").unwrap();
     let mut child = Command::new(bin())
         .current_dir(&repo)
-        .args(["mcp", "--hub", "http://127.0.0.1:0", "--token", "fixture"])
+        .args(["mcp", "--hub", &hub_url, "--token", &token])
+        .env_remove("REMUDA_INSTANCE_ID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

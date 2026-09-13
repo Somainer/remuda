@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 pub(crate) struct RuntimeLink {
     pub controller: Option<super::RuntimeController>,
     pub node: DevNode,
+    pub hub_url: String,
     pub journal: JournalSender,
     pub watermarks: Arc<Mutex<HashMap<String, SeqWatermark>>>,
     pub pumps: Arc<Mutex<HashSet<String>>>,
@@ -26,6 +27,7 @@ impl RuntimeLink {
         Self {
             controller: self.controller.clone(),
             node: self.node.clone(),
+            hub_url: self.hub_url.clone(),
             journal: self.journal.clone(),
             watermarks: self.watermarks.clone(),
             pumps: self.pumps.clone(),
@@ -126,10 +128,11 @@ async fn dispatch_hub(
     }
     match HubNodeMethod::parse(method) {
         Some(HubNodeMethod::InstanceCreate) => {
-            let created = runtime
-                .node
-                .create_instance(create_from_params(&runtime.node, &params)?)
-                .await?;
+            let mut request = create_from_params(&runtime.node, &params)?;
+            if let Some(credential) = &mut request.agent_credential {
+                credential.hub = Some(runtime.hub_url.clone());
+            }
+            let created = runtime.node.create_instance(request).await?;
             catch_up(runtime, &created.instance.meta.id).await?;
             Ok(serde_json::to_value(&created)?)
         }
@@ -240,6 +243,12 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         }
     };
     let mut request = CreateInstanceRequest {
+        origin: crate::origin::wire_origin(params),
+        agent_credential: params
+            .get("agentCredential")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?,
         command_id: parsed
             .command_id
             .as_deref()
@@ -262,7 +271,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         permission_mode: spec
             .get("permissionMode")
             .and_then(Value::as_str)
-            .unwrap_or("dontAsk")
+            .unwrap_or("manual")
             .to_owned(),
         prompt: parsed
             .prompt
@@ -307,6 +316,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: crate::origin::wire_origin(&params),
                 command_id,
                 operation: CommandAction::Send,
                 prompt: Some(prompt),
@@ -346,6 +356,7 @@ async fn cancel_from_params(
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: crate::origin::wire_origin(&params),
                 command_id,
                 operation: CommandAction::Cancel,
                 prompt: None,
@@ -381,6 +392,7 @@ async fn close_from_params(
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: crate::origin::wire_origin(&params),
                 command_id,
                 operation: CommandAction::Close,
                 prompt: None,
@@ -441,6 +453,7 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: crate::origin::wire_origin(&params),
                 command_id,
                 operation: CommandAction::WriteTty,
                 prompt: None,
@@ -488,6 +501,7 @@ async fn respond_from_params(
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: crate::origin::wire_origin(&params),
                 command_id,
                 operation: CommandAction::RespondInteraction,
                 prompt: None,
@@ -784,6 +798,7 @@ mod tests {
         let (journal, mut jobs, _) = super::super::journal_channel(4);
         let runtime = RuntimeLink {
             controller: None,
+            hub_url: "http://127.0.0.1:1".into(),
             node: node.clone(),
             journal,
             watermarks: watermarks.clone(),

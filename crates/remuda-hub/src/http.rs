@@ -20,6 +20,8 @@ pub struct LoginBody {
     bootstrap_token: String,
     #[serde(default = "default_device_name")]
     device_name: String,
+    #[serde(default)]
+    device_kind: Option<String>,
 }
 
 fn default_device_name() -> String {
@@ -167,9 +169,15 @@ pub async fn login(
     }
     let token = crate::config::random_token();
     let hash = hash_secret(&token)?;
+    let kind = body.device_kind.unwrap_or_else(|| "human".into());
+    if !matches!(kind.as_str(), "human" | "bot") {
+        return Err(HubError::BadRequest(
+            "deviceKind must be human or bot; instance credentials are Hub-issued".into(),
+        ));
+    }
     let device = state
         .store
-        .insert_device(body.device_name, hash, token[..16].to_owned())
+        .insert_device_as(body.device_name, hash, token[..16].to_owned(), kind, None)
         .await?;
     let cookie = device_cookie(&token, state.config.cookie_secure);
     let body = json!({
@@ -282,7 +290,7 @@ pub async fn create_instance(
     Json(body): Json<CreateInstanceBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
     let title = body.title.clone().or(body.name.clone());
     let workspace_id = body.workspace_id.clone().or(body.cwd.clone());
     let mut spec = json!({
@@ -361,6 +369,15 @@ pub async fn create_instance(
             }
         }
     })?;
+    crate::agent_scope::prepare_create(
+        &state,
+        &headers,
+        &device,
+        &host.host_id,
+        &body.driver,
+        &mut spec,
+    )
+    .await?;
     let (instance, command) = crate::placement::spawn_on_host(
         &state,
         &host,
@@ -387,7 +404,7 @@ pub async fn post_command(
     Json(body): Json<CommandBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
     let instance = state
         .store
         .get_instance(instance_id.clone())
@@ -398,9 +415,22 @@ pub async fn post_command(
         payload = json!({});
     }
     if let Some(obj) = payload.as_object_mut() {
-        obj.entry("instanceId".to_string())
-            .or_insert_with(|| json!(instance_id.clone()));
+        obj.insert("instanceId".to_string(), json!(instance_id.clone()));
     }
+    if !payload.is_object() {
+        return Err(HubError::BadRequest(
+            "command payload must be an object".into(),
+        ));
+    }
+    crate::agent_scope::authorize_command(
+        &state,
+        &headers,
+        &device,
+        &instance,
+        &body.operation,
+        &mut payload,
+    )
+    .await?;
     let (command, created) = state
         .store
         .queue_command(
@@ -584,6 +614,11 @@ pub(crate) async fn forward_if_online(
         .ok_or_else(|| HubError::BadRequest("command payload must be an object".into()))?;
     object.insert("commandId".into(), json!(command.command_id));
     if command.operation == "instance.create" {
+        let instance_id = command.instance_id.clone().ok_or(HubError::NotFound)?;
+        let token = crate::agent_scope::instance_token(state.store.clone(), instance_id).await?;
+        // Credential travels only on the authenticated carrier, never in the
+        // persisted command, returned HTTP body, or launch recipe.
+        object.insert("agentCredential".into(), json!({"token":token}));
         params = crate::providers::with_launch_secret(state, &command.host_id, params).await?;
     }
     match state

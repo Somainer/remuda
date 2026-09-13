@@ -76,6 +76,8 @@ pub struct ClaudePrintOptions {
     pub broker: Arc<dyn SecretBroker>,
     /// Extra env (tests set `FAKE_CLAUDE_SCRIPT` here).
     pub extra_env: std::collections::BTreeMap<String, String>,
+    /// Hub-issued instance context; separate from ordinary environment overlays.
+    pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// Override `--setting-sources`.
     pub setting_sources: Option<Vec<String>>,
     /// Initialize handshake timeout.
@@ -85,7 +87,7 @@ pub struct ClaudePrintOptions {
 }
 
 impl ClaudePrintOptions {
-    /// Human-originated print driver with the env/file broker.
+    /// Print driver with unknown (Agent) origin and the env/file broker.
     pub fn new(
         profile: ProviderProfile,
         launch_dir: PathBuf,
@@ -98,9 +100,10 @@ impl ClaudePrintOptions {
             native_home,
             inherit_default_config: false,
             binary,
-            origin: InputOrigin::Human,
+            origin: InputOrigin::Agent,
             broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: std::collections::BTreeMap::new(),
+            agent_mcp: None,
             setting_sources: None,
             handshake_timeout: Duration::from_secs(30),
             settings_overlay_path: None,
@@ -289,6 +292,9 @@ impl ClaudePrintDriver {
                 continue;
             }
             command.env(key, value);
+        }
+        if let Some(context) = &self.options.agent_mcp {
+            command.envs(context.environment()?);
         }
         configure_native_home(
             &mut command,

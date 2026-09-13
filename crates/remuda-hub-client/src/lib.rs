@@ -7,7 +7,8 @@
 mod error;
 mod types;
 
-use std::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -21,10 +22,70 @@ pub use types::{
     LoginRequest, LoginResponse,
 };
 
+/// Authenticated caller authority; unknown values fail closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallerOrigin {
+    /// Operator-owned human device, including a human-run coordinator MCP.
+    Human,
+    /// Operator-owned bot/dispatcher device.
+    Bot,
+    /// An instance or an unrecognized principal.
+    #[default]
+    #[serde(other)]
+    Agent,
+}
+
+/// Hub-validated MCP identity, independent of tool arguments.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerContext {
+    /// Unknown/missing kinds are Agent.
+    #[serde(default)]
+    pub origin: CallerOrigin,
+    /// Present for an instance-bound caller.
+    pub instance_id: Option<String>,
+    /// The caller's host, used for same-host child creates.
+    pub host_id: Option<String>,
+    /// Direct children recorded by the Hub at creation.
+    #[serde(default)]
+    pub children: Vec<String>,
+}
+
+impl CallerContext {
+    /// Whether an instance is self or a direct child (never a sibling/ancestor).
+    pub fn owns(&self, instance: &str) -> bool {
+        self.instance_id.as_deref() == Some(instance)
+            || self.children.iter().any(|id| id == instance)
+    }
+
+    /// Fleet-wide delivery requires an explicit operator confirmation.
+    pub fn check_fleet_all(&self, all: bool, confirm: bool) -> Result<(), ClientError> {
+        if !all {
+            return Ok(());
+        }
+        if self.origin == CallerOrigin::Agent {
+            return Err(ClientError::Internal(
+                "fleet --all / all:true is forbidden from Agent origin".into(),
+            ));
+        }
+        if !confirm {
+            return Err(ClientError::Internal(
+                "fleet --all requires explicit --confirm (MCP confirm:true)".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Device-authenticated JSON client for Hub `/v1/*` and `/v1/follow`.
+#[derive(Clone)]
 pub struct HubClient {
     base: String,
-    token: Mutex<Option<String>>,
+    token: Arc<Mutex<Option<String>>>,
+    caller_instance: Option<String>,
+    approval_id: Option<String>,
+    require_approval: bool,
     bootstrap: Option<String>,
     http: reqwest::Client,
 }
@@ -45,10 +106,34 @@ impl HubClient {
         }
         Ok(Self {
             base,
-            token: Mutex::new(token.filter(|s| !s.is_empty())),
+            token: Arc::new(Mutex::new(token.filter(|s| !s.is_empty()))),
+            caller_instance: None,
+            approval_id: None,
+            require_approval: false,
             bootstrap: bootstrap.filter(|s| !s.is_empty()),
             http: http.build()?,
         })
+    }
+
+    /// Narrow this client to an MCP instance caller. This header never promotes
+    /// a token already bound to a different instance.
+    #[must_use]
+    pub fn with_caller_instance(mut self, instance: Option<String>) -> Self {
+        self.caller_instance = instance;
+        self
+    }
+
+    /// Bind one MCP invocation to an exact human-approved action.
+    #[must_use]
+    pub fn with_approval(mut self, id: Option<String>, required: bool) -> Self {
+        self.approval_id = id;
+        self.require_approval = required;
+        self
+    }
+
+    /// Authenticated caller identity and immutable direct children from the Hub.
+    pub async fn caller_context(&self) -> Result<CallerContext, ClientError> {
+        Ok(serde_json::from_value(self.get("/v1/caller").await?)?)
     }
 
     /// Hub base URL.
@@ -232,6 +317,15 @@ impl HubClient {
         let mut req = self.http.request(method, &url);
         if let Some(token) = self.current_token()? {
             req = req.bearer_auth(token);
+        }
+        if let Some(instance) = &self.caller_instance {
+            req = req.header("x-remuda-instance-id", instance);
+        }
+        if let Some(id) = &self.approval_id {
+            req = req.header("x-remuda-approval-id", id);
+        }
+        if self.require_approval {
+            req = req.header("x-remuda-require-approval", "true");
         }
         if let Some(body) = body {
             req = req.json(body);

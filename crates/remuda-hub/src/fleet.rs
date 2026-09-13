@@ -65,6 +65,9 @@ struct BroadcastBody {
     /// narrow the set.
     #[serde(default)]
     all: bool,
+    /// Explicit operator confirmation for all-target broadcasts.
+    #[serde(default)]
+    confirm: bool,
     /// Restrict to these host ids.
     #[serde(default)]
     hosts: Vec<String>,
@@ -100,10 +103,20 @@ fn is_broadcast_target(lifecycle: &str) -> bool {
 async fn broadcast(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<BroadcastBody>,
+    Json(mut body): Json<BroadcastBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
+    crate::agent_scope::check_fleet_all(&device, body.all, body.confirm)?;
+    if body.payload.is_null() {
+        body.payload = json!({});
+    }
+    if !body.payload.is_object() {
+        return Err(HubError::BadRequest(
+            "broadcast payload must be an object".into(),
+        ));
+    }
+    crate::agent_scope::stamp(&mut body.payload, &device);
     let filtered = !body.hosts.is_empty() || !body.labels.is_empty() || !body.kinds.is_empty();
     if !body.all && !filtered {
         return Err(HubError::BadRequest(
@@ -139,6 +152,26 @@ async fn broadcast(
     }
 
     let instances = state.store.list_instances(None).await?;
+    let targets: Vec<_> = instances
+        .iter()
+        .filter(|row| {
+            is_broadcast_target(&row.lifecycle)
+                && allowed
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&row.host_id))
+                && (body.kinds.is_empty() || body.kinds.contains(&row.kind))
+        })
+        .collect();
+    crate::agent_scope::check_broadcast(
+        &state,
+        &headers,
+        &device,
+        &targets,
+        &body.operation,
+        &body.payload,
+    )
+    .await?;
+
     let mut results = Vec::new();
     let (mut accepted, mut failed, mut skipped) = (0usize, 0usize, 0usize);
     for instance in instances {
@@ -250,7 +283,7 @@ async fn create_fleet(
     Json(body): Json<CreateFleetBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
     let mut spec = body.spec;
     if spec.is_null() {
         spec = json!({});
@@ -312,6 +345,24 @@ async fn create_fleet(
         return Err(HubError::Unsatisfiable {
             reasons: vec!["fleet matched no hosts".into()],
         });
+    }
+    crate::agent_scope::stamp(&mut spec, &device);
+    spec["parentInstanceId"] = json!(device.instance_id);
+    if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human
+        && spec["permissionMode"].is_null()
+    {
+        spec["permissionMode"] = json!("manual");
+    }
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        let mut approval_required = headers.contains_key("x-remuda-require-approval")
+            || crate::agent_scope::shell_driver(&driver);
+        for host in &chosen {
+            approval_required |=
+                !crate::agent_scope::same_host(&state, &device, &host.host_id).await?;
+        }
+        if approval_required {
+            crate::agent_scope::require_approval(&state, &headers, &device, json!({"operation":"fleet.create", "hosts":chosen.iter().map(|h| &h.host_id).collect::<Vec<_>>(), "spec":spec})).await?;
+        }
     }
     let mut members = Vec::new();
     let mut instance_ids = Vec::new();
@@ -379,7 +430,10 @@ async fn fleet_commands(
     Json(body): Json<FleetCommandBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
-    require_device(&state.store, &headers).await?;
+    let device = crate::agent_scope::caller(&state, &headers).await?;
+    if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+        return Err(HubError::Forbidden);
+    }
     let Some((_spec, members)) = state.store.get_fleet(id.clone()).await? else {
         return Err(HubError::NotFound);
     };
@@ -393,6 +447,7 @@ async fn fleet_commands(
             obj.entry("instanceId".to_string())
                 .or_insert_with(|| json!(instance_id.clone()));
         }
+        crate::agent_scope::stamp(&mut payload, &device);
         let (command, created) = state
             .store
             .queue_command(

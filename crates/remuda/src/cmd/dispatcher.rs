@@ -112,7 +112,7 @@ pub(crate) async fn run_configured(
         // rule for the standalone path rather than making an exception to it.
         Some(hub) => {
             let token = hub
-                .mint_device_token("remuda-dispatcher")
+                .mint_bot_device_token("remuda-dispatcher")
                 .await
                 .context("mint dispatcher device token")?;
             HubClient::new(local_hub_url(hub.addr), Some(token), None)?

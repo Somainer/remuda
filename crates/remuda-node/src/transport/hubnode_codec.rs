@@ -192,9 +192,11 @@ pub async fn dispatch_method(
         .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?;
     }
     if method == "instance.close" {
+        let origin = crate::origin::wire_origin(&params);
         let parsed: InstanceCancelParams = serde_json::from_value(params)?;
         let instance_id = InstanceId::from_str(&parsed.instance_id)?;
         return submit(
+            origin,
             node,
             &instance_id,
             CommandAction::Close,
@@ -283,6 +285,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
     let mut request: CreateInstanceRequest = match serde_json::from_value(spec_for_request) {
         Ok(request) => request,
         Err(_) => CreateInstanceRequest {
+            origin: remuda_protocol::InputOrigin::Agent,
+            agent_credential: None,
             command_id: None,
             instance_id: None,
             host_id: None,
@@ -292,7 +296,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             model: "fake".into(),
             args: Vec::new(),
             provider_profile_id: "dev-fake".into(),
-            permission_mode: "dontAsk".into(),
+            permission_mode: "manual".into(),
             prompt: String::new(),
             cwd: None,
             delegation: None,
@@ -304,6 +308,12 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
         },
     };
     request.apply_spec_launch_fields(&spec);
+    request.origin = crate::origin::wire_origin(&params);
+    request.agent_credential = params
+        .get("agentCredential")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
     if request.cwd.is_none() {
         request.cwd = spec
             .get("cwd")
@@ -369,6 +379,7 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
         .to_owned();
     let instance_id = InstanceId::from_str(&parsed.instance_id)?;
     submit(
+        crate::origin::wire_origin(&params),
         node,
         &instance_id,
         CommandAction::Send,
@@ -395,6 +406,7 @@ async fn dispatch_configure(node: &DevNode, params: Value) -> Result<Value, Node
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: crate::origin::wire_origin(&params),
                 command_id: command_id.map(str::parse).transpose()?,
                 operation: CommandAction::Configure,
                 prompt: None,
@@ -413,9 +425,10 @@ async fn dispatch_configure(node: &DevNode, params: Value) -> Result<Value, Node
 }
 
 async fn dispatch_cancel(node: &DevNode, params: Value) -> Result<Value, NodeError> {
-    let parsed: InstanceCancelParams = serde_json::from_value(params)?;
+    let parsed: InstanceCancelParams = serde_json::from_value(params.clone())?;
     let instance_id = InstanceId::from_str(&parsed.instance_id)?;
     submit(
+        crate::origin::wire_origin(&params),
         node,
         &instance_id,
         CommandAction::Cancel,
@@ -479,6 +492,7 @@ async fn dispatch_keys(node: &DevNode, params: Value) -> Result<Value, NodeError
         return Ok(json!({ "ok": true, "accepted": "tty-bytes" }));
     }
     submit(
+        crate::origin::wire_origin(&params),
         node,
         &instance_id,
         CommandAction::WriteTty,
@@ -508,6 +522,7 @@ async fn dispatch_respond(node: &DevNode, params: Value) -> Result<Value, NodeEr
         .ok_or_else(|| NodeError::InvalidRequest("instance.respond requires instanceId".into()))?;
     let instance_id = InstanceId::from_str(instance_id)?;
     submit(
+        crate::origin::wire_origin(&params),
         node,
         &instance_id,
         CommandAction::RespondInteraction,
@@ -523,6 +538,7 @@ async fn dispatch_respond(node: &DevNode, params: Value) -> Result<Value, NodeEr
 
 #[allow(clippy::too_many_arguments)]
 async fn submit(
+    origin: remuda_protocol::InputOrigin,
     node: &DevNode,
     instance_id: &InstanceId,
     operation: CommandAction,
@@ -537,6 +553,7 @@ async fn submit(
         .submit_command(
             instance_id,
             InstanceCommandRequest {
+                origin,
                 command_id: command_id.map(str::parse).transpose()?,
                 operation,
                 prompt,

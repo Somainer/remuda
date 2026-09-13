@@ -79,6 +79,7 @@ fn driver_for(
     );
     let mut options =
         ClaudePrintOptions::new(profile(), launch, home, BinarySource::Pinned(pin_fake()));
+    options.origin = InputOrigin::Human;
     options.extra_env = extra;
     options.handshake_timeout = Duration::from_secs(5);
     let mut spec = load_spec();

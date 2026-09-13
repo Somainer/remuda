@@ -310,6 +310,7 @@ pub async fn spawn_on_host(
         .await
         .map_err(crate::http::map_store)?;
     let payload = json!({
+        "origin": request.spec.get("origin").cloned().unwrap_or(json!("agent")),
         "instanceId": instance.instance_id,
         "spec": request.spec,
         "initialInput": request.prompt.as_ref().map(|text| json!({ "type": "prompt", "text": text })),

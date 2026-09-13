@@ -274,6 +274,7 @@ impl DevNode {
             None,
             payload_digest,
         )?;
+        set_command_origin(&mut command, request.origin);
         let inserted = self
             .inner
             .store
@@ -315,7 +316,7 @@ impl DevNode {
         let instance = self.inner.store.get_instance(instance_id)?;
         let (operation, driver_request, close_after) = command_parts(&request)?;
         let command_id = request.command_id.clone().unwrap_or_default();
-        let command = new_command(
+        let mut command = new_command(
             command_id.clone(),
             operation,
             instance_id,
@@ -324,6 +325,7 @@ impl DevNode {
             request.run_id.clone(),
             digest_json(&request)?,
         )?;
+        set_command_origin(&mut command, request.origin);
         let inserted = self
             .inner
             .store
@@ -689,6 +691,7 @@ async fn materialize_instance(
                 command_id: create_command.command_id.clone(),
                 request: DriverRequest::Send {
                     prompt: initial_prompt,
+                    origin: crate::origin::input_origin(create_command.origin),
                 },
                 close_after: false,
             },
@@ -766,7 +769,7 @@ async fn execute_queued(
     interactions: Arc<InteractionRuntime>,
 ) -> Result<(), NodeError> {
     let mut command = store.get_command(&queued.command_id)?;
-    if let DriverRequest::Send { prompt } = &queued.request {
+    if let DriverRequest::Send { prompt, .. } = &queued.request {
         store.set_instance_state(
             instance_id,
             None,
@@ -966,7 +969,10 @@ fn command_parts(
             validate_text(&prompt, "prompt")?;
             Ok((
                 CommandOperation::InstanceSend,
-                DriverRequest::Send { prompt },
+                DriverRequest::Send {
+                    prompt,
+                    origin: request.origin,
+                },
                 false,
             ))
         }
@@ -1124,11 +1130,11 @@ fn new_command(
         command_id,
         actor: ActorRef {
             principal_id: Id::new("prn")?,
-            actor_type: ActorType::Human,
+            actor_type: ActorType::Agent,
             device_id: None,
             instance_id: Some(instance_id.clone()),
         },
-        origin: CommandOrigin::Ui,
+        origin: CommandOrigin::Mcp,
         operation,
         target: CommandTarget {
             host_id: host_id.clone(),
@@ -1162,6 +1168,15 @@ fn new_command(
             },
         },
     })
+}
+
+fn set_command_origin(command: &mut Command, origin: remuda_protocol::InputOrigin) {
+    command.origin = crate::origin::command_origin(origin);
+    command.actor.actor_type = match origin {
+        remuda_protocol::InputOrigin::Human => ActorType::Human,
+        remuda_protocol::InputOrigin::Bot => ActorType::Bot,
+        remuda_protocol::InputOrigin::Agent => ActorType::Agent,
+    };
 }
 
 fn accept_command(command: &mut Command) -> Result<(), NodeError> {
@@ -1674,6 +1689,7 @@ mod tests {
             remuda_protocol::hubnode::METHOD_INSTANCE_CONFIGURE,
             serde_json::json!({
                 "instanceId": created.instance.meta.id,
+                "origin": "human",
                 "model": "opus",
                 "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
             }),
@@ -1692,6 +1708,7 @@ mod tests {
                 if command.operation == CommandOperation::InstanceConfigure
                     && command.state == CommandState::Settled
                 {
+                    assert_eq!(command.origin, CommandOrigin::Ui);
                     break;
                 }
                 tokio::task::yield_now().await;

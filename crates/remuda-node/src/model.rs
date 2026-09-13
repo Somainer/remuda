@@ -35,13 +35,22 @@ fn default_profile() -> String {
 }
 
 fn default_permission() -> String {
-    "dontAsk".to_owned()
+    "manual".to_owned()
 }
 
 /// Body accepted by `POST /v1/instances` and the local JSON-RPC `instance.create` bridge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateInstanceRequest {
+    /// Authenticated Hub caller kind; absent or unknown means Agent.
+    #[serde(
+        default = "crate::origin::agent_origin",
+        deserialize_with = "crate::origin::deserialize_origin"
+    )]
+    pub origin: remuda_protocol::InputOrigin,
+    /// Transport-only scoped credential for this instance's MCP process.
+    #[serde(default, skip_serializing)]
+    pub agent_credential: Option<crate::origin::AgentCredential>,
     /// Optional client-selected Command identity for retry-safe Hub forwarding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_id: Option<CommandId>,
@@ -72,7 +81,7 @@ pub struct CreateInstanceRequest {
     /// Provider profile label used to construct the native launch profile.
     #[serde(default = "default_profile")]
     pub provider_profile_id: String,
-    /// Development permission label; the fake driver performs no tools.
+    /// Permission label; omission defaults to manual.
     #[serde(default = "default_permission")]
     pub permission_mode: String,
     /// Optional initial prompt delivered through the bounded instance task.
@@ -202,6 +211,12 @@ pub enum CommandAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceCommandRequest {
+    /// Authenticated Hub caller kind; absent or unknown means Agent.
+    #[serde(
+        default = "crate::origin::agent_origin",
+        deserialize_with = "crate::origin::deserialize_origin"
+    )]
+    pub origin: remuda_protocol::InputOrigin,
     /// Optional client-supplied idempotency identity.
     #[serde(default)]
     pub command_id: Option<CommandId>,

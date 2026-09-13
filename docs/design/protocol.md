@@ -313,6 +313,34 @@ stateDiagram-v2
 
 派发顺序固定为：Hub durable inbox → Node durable command receipt → Node 写 `intent-durable` 并 fsync → 唯一 driver owner 发一次原生操作 → 记录 transport-written → 原生证据推进 accepted → 业务证据推进 settled。进程恰好在发出与落账之间崩溃时，intent 已存在即视为“可能发送”；恢复先查原生历史/请求状态，没有原生幂等保证则保持 unknown，**绝不因为找不到 ACK 而重发**。无法证明没执行时也不能标 rejected；超时查询返回 unknown 的现状。
 
+### Origin
+
+D-017 明确：agent instance 不是受信任 principal。请求来源和被操作实例的创建来源分别记录；Human 创建的实例在随后调用 MCP 时仍是 Agent，Human 向 Agent 创建的实例发送输入仍是 Human。
+
+Hub 从已认证设备记录的 `kind`（`human` / `bot` / `agent`）和绑定的 `instanceId` 解析来源。设备名、MCP tool arguments、请求体的 `origin` / `actor` / `parentInstanceId` 都不能提升权限。历史配对设备沿用 Human，bootstrap 登录可显式声明 `deviceKind: "bot"`；Agent 凭据只能由 Hub 绑定到已有实例后签发。`GET /v1/caller` 返回已验证的 `origin`、`instanceId`、`hostId` 与直接 `children`。`x-remuda-instance-id` 只能收窄权限，不能更换已绑定实例。
+
+Hub 在 create 与 command 的载荷外层覆盖 `origin: "human" | "bot" | "agent"`，同时覆盖输入来源。经 WSS / SSH stdio 解码后，Node 在 create 的 driver options、每次 `PromptInput` 和 Command 中保留来源，materializer 使用独立的 `LaunchOrigin::{Human,Bot,Agent}`。缺失或未知来源、未声明来源的 driver options 默认 Agent；`CommandOrigin::Mcp` / `System` 不能隐式转换为 Human。现有 Command 的 `origin` wire enum 不扩展：Human 对应 `ui`，Bot 对应 `bot`，Agent 对应 `mcp`，`actor.actorType` 同时区分三类。
+
+每次 Hub 转发 create 时，为新实例签发仅绑定该实例的设备 token，经已认证 carrier 单独交给 Node。Node 把 `REMUDA_INSTANCE_ID`、`REMUDA_HOST_ID` 和该 `REMUDA_TOKEN` 注入实例子进程；WSS 使用其已配置的 Hub 地址作为 `REMUDA_HUB`，SSH stdio 部署须提供该地址。token 不进入持久化 command、HTTP create 返回体、request digest 或 launch recipe。实例内 CLI 不回退到 bootstrap 环境变量或仓库 token 文件。Human 可用 `POST /v1/instances/{id}/mcp-token` 为该实例配置外置 MCP，返回的仍是 Agent token。人类设备直接运行、没有实例绑定的 coordinator `claude -p --mcp-config …` 保持 Human。
+
+| 动作 | Agent 来源 | Human / Bot 来源 |
+| --- | --- | --- |
+| send / stop / rm 自己或直接创建的子实例 | 可执行；不扩展到兄弟、祖先或孙实例 | 可执行 |
+| 同 host create | 可执行，Hub 在 create 时持久记录 `parentInstanceId`；省略 MCP host 时使用 caller host | 按 placement 执行 |
+| 跨实例 send / stop / rm、跨 host create | 人类批准精确动作后执行一次 | 可执行 |
+| `remuda_instance_keys` / `tty.write` | 即使目标为自己或子实例也必须审批；新 `shell-pty`（含 `shell` / `terminal` alias）create 和 send 也经此门控；无原始 follow/tty 写通道 | 可执行 |
+| `remuda_fleet_send {all:true}` / `remuda_fleet_keys {all:true}` / `fleet send --all` / `fleet keys --all` | 明确拒绝，`confirm` 或审批都不能豁免 | 必须显式 `confirm:true` / `--confirm` |
+| filters 选择的 fleet send / keys | Hub 先检查整个目标集合；send 只含自己/直接子实例时可执行，跨实例或 keys 必须审批后才排队 | 可执行 |
+| 本地 MCP merge / worktree create | 无实例范围的执行目标，拒绝；使用已有 workspace 创建子实例 | coordinator 可执行 |
+
+`POST /v1/fleet/broadcast` 与 MCP/CLI 共用全量发送约束；`all:true` 必须另带 `confirm:true`，Agent 不接受此豁免。
+
+MCP `call_tool` 在副作用前决定范围，并把需审批动作送到 Hub broker gate；Hub 重新依据认证与真实目标检查后才排队或转发。需要审批时 HTTP 返回 `409 HUMAN_APPROVAL_REQUIRED` 和 `interactionId`，MCP 将其作为明确的工具错误返回。票据显示在 `GET /v1/interactions`，只能由 Human 设备通过既有 `/v1/interactions/{id}/answer` 提交 `allow-once` / `deny` 及匹配的 `inputDigest`。随后用 MCP `approvalId`（HTTP `x-remuda-approval-id`）重试完全相同的动作。grant 绑定 caller device、caller instance/host、操作、目标 host/instance 和完整有效载荷；更改文本/目标、其他设备使用、重复消费、拒绝、过期均不能执行。复用 `InteractionBroker` 的 first-answer-wins，TTL 为 15 分钟；Hub 重启丢弃未消费 grant，必须重新申请审批。超时或 ACK 丢失不自动重放已批准的动作。
+
+Agent create 的 generic-pty 在 materialize 前把 bypass/dontAsk 降为 asking mode，因而得到非 yolo argv。preset bypass flags 仅在 `permissionMode=bypassPermissions` 且 Human/Bot 时合并；默认模式绝不追加。D-011 的 Bot materializer 拒绝 bypass/dontAsk 规则继续存在，因此此条件不授予 Bot 额外豁免。Agent 的结构化 Claude create 显式请求 bypass/dontAsk 会被拒绝，省略权限模式则采用 manual。
+
+此范围约束覆盖 Hub 与 MCP 控制面。Node stdio 的认证依赖其 SSH carrier，本地开发 Node HTTP 的 access code 仍是操作员凭据；同 UID 文件、原生 CLI 与 herdr 的进程隔离和凭据清理是独立边界（security-review-2 tasks 9/12/13），不能把 parent-child 范围检查描述为 OS sandbox。
+
 ### 2.6 Interaction
 
 | 字段 | 类型 | 含义 |

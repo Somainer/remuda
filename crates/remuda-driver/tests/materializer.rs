@@ -935,3 +935,21 @@ fn host_env_binding_cannot_launder_a_denied_source_name() {
         "a host-env binding laundered a denied source name"
     );
 }
+
+#[test]
+fn unknown_and_mcp_launch_origins_fail_closed() {
+    use remuda_protocol::InputOrigin;
+    assert_eq!(LaunchOrigin::default(), LaunchOrigin::Agent);
+    assert_eq!(
+        serde_json::from_str::<LaunchOrigin>("\"future-origin\"").unwrap(),
+        LaunchOrigin::Agent
+    );
+    assert_eq!(LaunchOrigin::from(CommandOrigin::Mcp), LaunchOrigin::Agent);
+    assert_eq!(
+        LaunchOrigin::from(CommandOrigin::System),
+        LaunchOrigin::Agent
+    );
+    assert_eq!(LaunchOrigin::from(InputOrigin::Agent), LaunchOrigin::Agent);
+    assert_eq!(LaunchOrigin::from(InputOrigin::Bot), LaunchOrigin::Bot);
+    assert_eq!(LaunchOrigin::from(InputOrigin::Human), LaunchOrigin::Human);
+}

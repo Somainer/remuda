@@ -60,6 +60,8 @@ pub struct ClaudeBgOptions {
     pub broker: Arc<dyn SecretBroker>,
     /// Extra env for the `--bg` process (no secrets logged).
     pub extra_env: BTreeMap<String, String>,
+    /// Hub-issued instance context; separate from ordinary environment overlays.
+    pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// Override `--setting-sources`.
     pub setting_sources: Option<Vec<String>>,
     /// Let Claude resolve its default config directory instead of exporting
@@ -70,7 +72,7 @@ pub struct ClaudeBgOptions {
 }
 
 impl ClaudeBgOptions {
-    /// Isolated `remuda-test` session, human origin, env/file broker.
+    /// Isolated `remuda-test` session, unknown origin, env/file broker.
     pub fn new(
         profile: ProviderProfile,
         launch_dir: PathBuf,
@@ -82,12 +84,13 @@ impl ClaudeBgOptions {
             launch_dir,
             native_home,
             binary,
-            origin: LaunchOrigin::Human,
+            origin: LaunchOrigin::default(),
             session_name: "remuda-test".into(),
             socket_dir: None,
             herdr_binary: None,
             broker: Arc::new(EnvFileSecretBroker::env_only()),
             extra_env: BTreeMap::new(),
+            agent_mcp: None,
             setting_sources: None,
             inherit_default_config: false,
             settings_overlay_path: None,
@@ -321,6 +324,9 @@ impl ClaudeBgDriver {
             &self.options.extra_env,
             self.options.inherit_default_config,
         );
+        if let Some(context) = &self.options.agent_mcp {
+            command.envs(context.environment()?);
+        }
         let output = command.output().await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

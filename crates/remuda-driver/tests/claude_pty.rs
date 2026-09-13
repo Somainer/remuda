@@ -89,6 +89,9 @@ async fn fake_herdr_start_prompt_idle_close() {
         inherit_default_config: false,
         settings_overlay_path: None,
         auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        // Never read the developer's real ~/.claude.json from a test.
+        host_claude_config: None,
     });
 
     let mut handle = driver.start(spec(&cwd)).await.expect("start");
@@ -234,6 +237,9 @@ async fn live_claude_pty_haiku_once() {
         inherit_default_config: false,
         settings_overlay_path: None,
         auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        // Never read the developer's real ~/.claude.json from a test.
+        host_claude_config: None,
     });
     let mut spec = spec(&cwd);
     spec.model_id = Some("haiku".into());

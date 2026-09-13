@@ -98,6 +98,15 @@ pub struct ClaudePtyOptions {
     pub inherit_default_config: bool,
     /// Node verified that cwd belongs to a registered workspace and enabled automatic trust.
     pub auto_trust_registered_workspace: bool,
+    /// Mark the scoped `CLAUDE_CONFIG_DIR` as already onboarded before launch,
+    /// mirroring the host user's theme/disclaimer flags but never credentials.
+    /// Disabled when the launch inherits the user's own default config, which
+    /// is onboarded already.
+    pub seed_onboarding: bool,
+    /// Where the host user's Claude configuration lives, as the source of the
+    /// allowlisted flags copied by `seed_onboarding`. `None` skips the copy and
+    /// seeds only `hasCompletedOnboarding`.
+    pub host_claude_config: Option<crate::claude_onboarding::HostClaudeConfig>,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
 }
@@ -127,6 +136,8 @@ impl ClaudePtyOptions {
             inherit_default_config: false,
             settings_overlay_path: None,
             auto_trust_registered_workspace: false,
+            seed_onboarding: true,
+            host_claude_config: crate::claude_onboarding::HostClaudeConfig::from_env(),
         }
     }
 }
@@ -178,6 +189,22 @@ impl ClaudePtyDriver {
             closed: AtomicBool::new(false),
             seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Seed the scoped config dir so the native first-run flow never starts.
+    ///
+    /// Returns the outcome when anything changed; `None` when seeding is off
+    /// (an inherited default config is already onboarded) or the directory
+    /// needed no change. Never reads or copies credentials.
+    fn seed_onboarding(&self) -> DriverResult<Option<crate::claude_onboarding::SeedOutcome>> {
+        if !self.options.seed_onboarding || self.options.inherit_default_config {
+            return Ok(None);
+        }
+        let outcome = crate::claude_onboarding::seed_scoped_config(
+            &self.options.native_home,
+            self.options.host_claude_config.as_ref(),
+        )?;
+        Ok((!outcome.is_noop()).then_some(outcome))
     }
 
     /// Last persisted recipe, if any. Contains no secrets or prompts.
@@ -244,6 +271,11 @@ impl ClaudePtyDriver {
         }
         apply_tty_bypass_flag(&mut recipe);
         refuse_bare(&recipe.argv)?;
+        // A scoped CLAUDE_CONFIG_DIR is fresh on first use, so the native CLI
+        // would run its first-run wizard instead of mounting a composer: Herdr
+        // calls that pane idle, no SessionStart hook fires, and a queued prompt
+        // waits forever. Seed the flags that gate the wizard before launch.
+        let seeded = self.seed_onboarding()?;
         *self.last_recipe.lock().await = Some(recipe.clone());
         *self.last_spec.lock().await = Some(spec.clone());
 
@@ -385,6 +417,33 @@ impl ClaudePtyDriver {
         )
         .await?;
 
+        if let Some(seeded) = seeded {
+            emit_obs(
+                &tx,
+                &self.seq,
+                &ctx,
+                SourceChannel::Herdr,
+                Completeness::Structured,
+                ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+                    NativeLifecycle {
+                        topic: LifecycleTopic::Diagnostic,
+                        native_name: "claude-onboarding".into(),
+                        native_id: Knowledge::Known {
+                            value: pane_id.clone(),
+                        },
+                        status: Knowledge::Known {
+                            value: seeded.summary(),
+                        },
+                        related_ids: BTreeMap::new(),
+                        data_ref: None,
+                        severity: Severity::Info,
+                        affects_completion: false,
+                    },
+                )))),
+            )
+            .await?;
+        }
+
         let interactions = PtyInteractions::new(
             client.clone(),
             pane_id.clone(),
@@ -477,7 +536,11 @@ impl Driver for ClaudePtyDriver {
             .filter(|live| !live.closed)
             .ok_or(DriverError::ControlUnavailable)?;
         require_session_start(live)?;
-        crate::pty_interaction::prompt_ready(&live.client, &live.pane_id).await
+        // SessionStart proves the native session is real, so no later screen
+        // can be a first-run wizard; stop reading the viewport for one.
+        live.interactions.disarm_startup_watch().await;
+        crate::pty_interaction::prompt_ready_for(&live.client, &live.pane_id, &live.interactions)
+            .await
     }
 
     async fn attach(&self, native_ref: NativeRef) -> DriverResult<DriverAck> {

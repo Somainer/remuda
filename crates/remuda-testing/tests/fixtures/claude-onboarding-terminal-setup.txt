@@ -1,0 +1,9 @@
+ Use Claude Code's terminal setup?
+
+ For the optimal coding experience, enable the recommended settings
+ for your terminal: Shift+Enter for newlines
+
+ ❯ 1. Yes, use recommended settings
+   2. No, maybe later with /terminal-setup
+
+ enter confirm · escape skip

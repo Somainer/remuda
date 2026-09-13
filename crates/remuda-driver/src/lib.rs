@@ -10,6 +10,7 @@ mod binary;
 mod capabilities;
 pub mod child_env;
 pub mod claude_bg;
+pub mod claude_onboarding;
 pub mod claude_print;
 pub mod claude_pty;
 pub mod claude_transcript;
@@ -41,6 +42,9 @@ pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
 };
 pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
+pub use claude_onboarding::{
+    HostClaudeConfig, SeedOutcome, StartupDialog, seed_scoped_config, startup_dialog,
+};
 pub use claude_print::TranscriptMapper;
 pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
 pub use claude_transcript::{TranscriptTail, encode_project_dir, locate_transcript, project_dir};

@@ -187,6 +187,9 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
         inherit_default_config: false,
         settings_overlay_path: None,
         auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        // The live run exercises seeding against the operator's real flags.
+        host_claude_config: remuda_driver::HostClaudeConfig::from_env(),
     });
 
     let t0 = Instant::now();

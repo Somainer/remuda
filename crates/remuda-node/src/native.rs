@@ -8,8 +8,8 @@ use remuda_driver::claude_print::{ClaudePrintDriver, ClaudePrintOptions};
 use remuda_driver::{
     BinarySource, ClaudeBgDriver, ClaudeBgOptions, ClaudeProviderOverlay, ClaudePtyDriver,
     ClaudePtyOptions, Delegation, Driver as NativeDriver, GenericPtyDriver, GenericPtyOptions,
-    ProviderHealth, ProviderKind, ProviderProfile, Secret, ShellPtyDriver, ShellPtyOptions,
-    preset_by_id, write_claude_provider_overlay,
+    HostClaudeConfig, ProviderHealth, ProviderKind, ProviderProfile, Secret, ShellPtyDriver,
+    ShellPtyOptions, preset_by_id, write_claude_provider_overlay,
 };
 use remuda_protocol::{
     ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode, ClaudePermission,
@@ -49,6 +49,9 @@ pub struct NativeDriverConfig {
     pub herdr_orphan_sweep: bool,
     /// Automatically accept the exact Claude folder-trust dialog for registered workspaces.
     pub auto_trust_registered_workspaces: bool,
+    /// Seed a Node-scoped `CLAUDE_CONFIG_DIR` so Claude's first-run onboarding
+    /// never starts. Disable only to reproduce the wizard deliberately.
+    pub seed_claude_onboarding: bool,
     /// Promote a `terminal` instance when a known agent CLI takes the PTY
     /// foreground, and hydrate its transcript (D-025).
     pub promote_terminal_agents: bool,
@@ -88,6 +91,8 @@ impl NativeDriverConfig {
             herdr_orphan_sweep: !std::env::var("REMUDA_HERDR_ORPHAN_SWEEP")
                 .is_ok_and(|v| matches!(v.as_str(), "0" | "false")),
             auto_trust_registered_workspaces: true,
+            seed_claude_onboarding: !std::env::var("REMUDA_CLAUDE_SEED_ONBOARDING")
+                .is_ok_and(|value| matches!(value.as_str(), "0" | "false")),
             promote_terminal_agents: true,
             print_handshake_timeout: Duration::from_secs(30),
             extra_env,
@@ -291,6 +296,12 @@ impl DriverFactory for NativeClaudeFactory {
                     .config
                     .auto_trust_registered_workspaces
                     && cwd_is_registered(&launch.workspace_root, &launch.registered_workspace_root);
+                // A Node-scoped config dir is fresh on first use, so Claude
+                // would run its first-run wizard instead of mounting a prompt
+                // composer. Seed the flags that gate it, mirroring the host
+                // user's theme/disclaimer choices but never any credential.
+                options.seed_onboarding = self.config.seed_claude_onboarding;
+                options.host_claude_config = HostClaudeConfig::from_env();
                 Arc::new(ClaudePtyDriver::new(options))
             }
             DriverKind::ClaudeBg => {

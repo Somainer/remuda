@@ -119,8 +119,8 @@ Reading it:
 
 ## 4 — What the live run corrected
 
-Three defects that only a real login shell would have shown. Each now has a
-regression test.
+Four defects the live run exposed — three of them only a real login shell would
+have shown. Each now has a regression test.
 
 1. **The shim was buried by the login profile.** Putting the shim directory at
    the front of the child's `PATH` is not enough: `~/.zprofile` and `~/.zshrc`
@@ -136,7 +136,16 @@ regression test.
    `.zshenv` ever ran. Each file now swaps only while sourcing the user's rc;
    the last one hands `ZDOTDIR` back for good, so the interactive shell the
    human ends up in reports their own value.
-3. **The shim could exec-loop.** It located itself with `dirname`, which lives
+3. **Hook evidence reached the journal but not the instance.** The Node's
+   observation pump folded activity only from `agent_status` and `session`,
+   both screen-derived. The hook events were being journaled while the
+   instance's own `activity` kept following the screen — so §4.3's
+   `Hook > Screen` ranking was true of the envelope and false of the thing the
+   composer actually reads. The pump now folds turn boundaries and interaction
+   events from the hook channel. Tool events and `SubagentStop` deliberately do
+   not qualify, and the *channel* decides rather than the event name, so a
+   screen-derived `UserPromptSubmit` cannot masquerade as one.
+4. **The shim could exec-loop.** It located itself with `dirname`, which lives
    in `/usr/bin`; a `PATH` without it left the shim unable to recognise itself,
    so it resolved to *itself* and forked without bound. It now uses shell
    builtins, skips `$0` explicitly, and carries a re-entry guard that degrades

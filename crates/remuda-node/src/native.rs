@@ -58,10 +58,15 @@ pub struct NativeDriverConfig {
     /// no overlay is written and no shim is generated, so a Node that has not
     /// opted in behaves exactly as it did before.
     pub pty_hooks: bool,
-    /// The `remuda` binary hooks re-enter as the relay. Defaults to this
-    /// process's own executable, which is the binary the Node is already
-    /// running and therefore the one guaranteed to exist and match.
-    pub relay_binary: Option<PathBuf>,
+    /// The `remuda` binary hooks re-enter as the relay.
+    ///
+    /// `None` — the normal case — resolves this process's own executable at
+    /// launch: it is the binary the Node is already running, so it exists and
+    /// its relay speaks the same wire as the socket it will connect to. Boxed
+    /// because `NativeDriverConfig` is a variant of `LocalDrivers`, and an
+    /// inline `PathBuf` for a field that is almost always absent pushes that
+    /// enum over the size clippy is willing to accept.
+    pub relay_binary: Option<Box<PathBuf>>,
     /// Claude print initialize timeout.
     pub print_handshake_timeout: Duration,
     /// Non-secret development environment forwarded to drivers.
@@ -383,7 +388,7 @@ impl DriverFactory for NativeClaudeFactory {
 /// splits them.
 fn relay_binary(config: &NativeDriverConfig) -> Result<PathBuf, DriverError> {
     if let Some(path) = &config.relay_binary {
-        return Ok(path.clone());
+        return Ok(path.as_ref().clone());
     }
     std::env::current_exe().map_err(|error| {
         DriverError::Failed(format!(

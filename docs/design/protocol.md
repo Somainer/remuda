@@ -78,12 +78,19 @@ type HerdrServer = {
   binaryPath: string; version: string; digest: Digest; protocolVersion: string;
   serverIdentity: Id; serverEpoch: Id; representation: "rendered-ansi";
 };
+type SignalTier = "hook" | "file" | "osc" | "screen" | "none";
+type RuntimeCapability = {
+  name: CapabilityName; state: "supported" | "unsupported" | "unknown";
+  tier: SignalTier; reasonCode: string;
+};
 type NativeRef = {
   hostId: Id;
   nativeStoreId: Id;
   kind: "claude" | "codex" | "grok" | "agy" | "generic";
   sessionId: Knowledge<string>;
   transcript: Knowledge<{ objectId: Id; sourcePath: string }>;
+  signalTier?: SignalTier;          // D-028 §4.3；缺省表示"无人上报"，不等于 "none"。
+  capabilities?: RuntimeCapability[]; // 运行时上报，逐项盖过静态矩阵。
   codex?: { threadId: string };
   acp?: { sessionId: string; protocolVersion: number };
   claude?: { sessionId: string };
@@ -101,6 +108,8 @@ type NativeRequestKey =
   | { type: "hook"; invocationId: Id }
   | { type: "none" };
 ~~~
+
+**运行时能力上报（D-028 §4.3）。** `signalTier` 是这个 session **实际拿到**的最高信号层级（`Hook > File > OSC > Screen`），`capabilities` 是它逐项上报的能力。二者都可缺省，缺省的含义是「没有人上报」——与上报了 `none` 不是一回事：前者让 §3.3 的静态矩阵继续生效，后者是一句「我什么信号都没有」的断言。有运行时值时**逐个 name 覆盖**静态矩阵，且**两个方向都能覆盖**：实测发现某能力不可用的 session 必须能把矩阵里的 `supported` 改回去，否则「运行时上报」就只能往乐观的方向修正。tier 本身也是证据：`hook` 能阻塞 agent 并拿回裁决（这正是 `interactive-approval` 的含义），`file` 只能证明身份与回合边界，`osc` / `screen` 两者都不能证明——这是它们排在最底层的原因。这条通道兑现统一原则第 5 条：能力取决于**本 session 拿到的信号层级**，而不是谁启动的、也不是 `DriverKind` 这一列。
 
 `NativeRef.claudeBg` 只记录 native store 中的完整 job ID，即使统一 sessionId 为 unknown 也可保留；它不能替代 Claude UUID。未发布草案的 `claude.backgroundJobId` 移到独立 claudeBg 分支，不保留两个可分叉的 job ID 字段。Herdr 的 session 是明确选择的 server session 名，paneId 与 serverIdentity/serverEpoch 一起才标识原生 pane；server epoch 改变使旧 pane 控制失效。`NativeRef` 的 kind 与对应分支必须一致；分支中的 claude.sessionId、codex.threadId、acp.sessionId、agy.conversationId 必须等于已知的统一 sessionId，缺少该身份时不生成分支。未知 session 时 `sessionId.state=unknown`，不得虚构 Claude UUID / Codex threadId。`NativeRequestKey` 将 RPC 数字原样编码成十进制字符串并保留原类型，因此 JSON-RPC 的 `1` 与 `"1"` 不碰撞。`sourcePath` 只在授权给执行主机的视图返回，公网 UI 使用 objectId；它不是允许浏览器任意读绝对路径的授权。
 
@@ -210,6 +219,7 @@ stateDiagram-v2
 | `exit` | `Knowledge<{code: number\|null, signal: string\|null, observedAt: Timestamp}>` | 只能由 owner/supervisor 的退出证据赋值 |
 | `lastError?` | `string` | 可省略的 driver/原生诊断文本，通常随 `lifecycle=failed` 写入；只是展示用摘要，不是状态、不是终态证据，也不能替代 `exit` 或 Run 的 `terminalEvidence` |
 | `mode?` / `promotedAt?` | `native\|promoted` / `Timestamp` | 该 Instance 如何到达当前 `kind`。`promoted` 表示 `terminal` + `shell-pty` 实例的 PTY 前台被已知 agent CLI 接管（D-025）：`kind` 改为该 agent，`driver` 仍是 `shell-pty`，`promotedAt` 记录检测时刻。降级回 `terminal` 时 `mode` 复位为 `native` 且清空 `promotedAt`。只有 driver 的 `agent_promoted` / `agent_demoted` native lifecycle 能改这两个字段，同名 `agent_detected` diagnostic 只进 journal |
+| `launchedBy?` | `remuda\|user` | **谁敲的这条命令**（D-028 §1.0 规则 4）。只记录出身，**不表示能力等级**：user 启动的 session 与 remuda 启动的享有完全相同的信号与能力。D-028 之前写入的行没有这个字段，读取时由 `mode` / `promotedAt` 推导——`promoted` 意味着一个 login shell 的前台被 agent CLI 接管，那条命令只可能是人敲的，因此推导为 `user`，其余为 `remuda`。它与 `mode` 并存而不取代它：`mode` 回答「kind 是不是提升来的」，`launchedBy` 回答「谁启动的」 |
 
 ~~~mermaid
 stateDiagram-v2
@@ -232,6 +242,18 @@ stateDiagram-v2
     reconciling --> unknown: 证据不足
     exited --> preparing: 显式 native resume 新 generation
 ~~~
+
+**`exited` / `failed` / `interrupted` 是三件不同的事（D-028 §5.3、§5.5）。** 混淆它们会让 UI 谎报：
+
+| | 含义 | 判据 | 层级 |
+| --- | --- | --- | --- |
+| `exited` | 托管进程正常结束 | `child.wait()` 拿到退出码 0，或 PTY master EOF 先到且随后确认退出码为 0 | Instance `lifecycle` |
+| `failed` | 确定的失败 | 非零退出码或被信号杀死；或确认的启动失败。**断线不升级为 failed** | Instance `lifecycle` |
+| `interrupted` | 一条消息在发出前被取消 | 队列中的 user message 被 cancel/close 掉 | Message `status`（§5.2），**不是** lifecycle |
+
+退出检测要**双证据**：一个 waiter task 等 `child.wait()` 拿退出码/信号，PTY master EOF 作为第二证据（`wait()` 竞态时可能先到）。任一先到即发 `native-exit`，并写明来源——今天 `read_pty` 在 EOF 只 `break`，结果是崩掉的 agent 在 UI 上永远显示 ready。
+
+promoted 实例还要再分一层：前台 agent 消失是 **demote**（D-025，shell 还活着，实例不终结），只有 shell 自己退出才是实例 `exited`。停进程若无法确认进程组已消失，记 `stop-incomplete` 诊断，**不谎报 exited**。
 
 一个 Instance 表示一个原生 session 及其进程托管关系，允许同一原生 session 在不同时刻使用替换进程；不允许两个活进程同时写它。`ready` 不保证空闲。`failed` 是确定启动失败，不把断线升级成失败。原生已在执行但无法 attach 时保持 unknown 或 observed-only；不能悄悄启动第二份。
 
@@ -396,7 +418,7 @@ type DriverAck = {
   evidenceRawIds: Id[];
 };
 type DriverInput =
-  | { type: "prompt"; mode: "new-turn"; blocks: ContentBlock[];
+  | { type: "prompt"; mode: "new-turn" | "steer" | "queue"; blocks: ContentBlock[];
       origin: "human" | "bot" | "agent"; nativeClientMessageId: string }
   | { type: "steer"; expectedNativeTurnId: string; blocks: ContentBlock[];
       nativeClientMessageId: string }
@@ -427,6 +449,16 @@ type DriverRecord =
   | { type: "transport-state"; state: "connected"|"disconnected"; connectionEpoch: Id };
 ~~~
 
+**三种输入模式（D-028 §6）。** `PromptMode` 从只有 `new-turn` 扩为三个：
+
+| mode | 含义 | 与 `type: "steer"` 分支的关系 |
+| --- | --- | --- |
+| `new-turn` | 开启新回合。实例空闲时的默认，语义不变 | 无关 |
+| `steer` | 当前回合**正在跑**时插入文本，期望被本回合吸收 | 这是「没有 expectedNativeTurnId 可用」时的表达。`type: "steer"` 分支要求调用方指定确切的 native turn id，因而只有结构化 driver 能用；PTY 载体上根本观测不到 turn id，只能表达「现在发进去」这个意图。两者并存不重复：一个是**定向到某回合**，一个是**定向到当下** |
+| `queue` | 明确排队，等当前回合结束再投递 | 无关。对应 D-022 的 `pty_queue` 与 claude transcript 里的 `queue-operation` 账本 |
+
+**能力必须诚实。** `steer` / `queue` / `interrupt` 三项 capability 在实测前一律 `unknown`（§14 风险 6、7：claude「回合中打字+Enter 到底是排队还是 steer」尚无结论，grok / agy 的键位全未验证）。调用 `unknown` 的能力返回 `CAPABILITY_UNKNOWN`，UI 显示「尚未验证」——不是灰按钮假装不支持。已排队但在发出前被取消的消息按 §5.2 更新为 `status: "interrupted"`，不留在 `queued` 里骗人。本轮只开协议面，不改任何 driver 行为。
+
 这里的接口是 Node 进程内契约；wire 传输不直接序列化 Uint8Array。start/attach/resume 只建立连接和原生身份，不顺带发送 prompt；`instance.create` 可包含 initialInput，Node 将其作为独立 send 子命令并在 create 返回中提供两个 commandId，避免把“已启动”当“任务完成”。DriverAck 的 transport-written 不推进 native-input accepted；adapter 解析后追加的 observation 才可能提供接纳证据。
 
 每个 Instance 仅一个 driver handle 写控制流；读线程必须持续排空 stdout/stderr，与等待 Interaction 的线程分离。cancel 只请求取消指定 Run，close 终止这个 Instance 的托管进程并保留 native session；取消后仍等待对应终态。UI 关页、Hub WS 断开、`events.unsubscribe` 都不调用 close。observe/control attach 只能认领已存在的 transport；运行 `claude attach` 创建 pane 始终是有副作用的 `instance.open_terminal`，即使目前 job 仍存活也不能由只读 attach 代发。它要求显式人类动作与 `allowWake:true`；没有此授权返回 `ATTACH_WOULD_WAKE`。control-plane §1.5–1.6
@@ -439,8 +471,8 @@ resume 只接受明确 NativeRef，禁止 `--continue` / “最近会话”选�
 ### 3.2 能力对象
 
 ~~~typescript
-type CapabilityName = "resume" | "steer" | "model-switch" | "fork"
-  | "structured-workflow" | "artifact" | "tty-attach" | "hooks"
+type CapabilityName = "resume" | "steer" | "queue" | "interrupt" | "model-switch"
+  | "fork" | "structured-workflow" | "artifact" | "tty-attach" | "hooks"
   | "interactive-approval" | "question" | "plan-review" | "elicitation"
   | "live-attach" | "completion-native-turn" | "completion-task";
 type Capability = {
@@ -469,6 +501,8 @@ type DriverDescriptor = {
 };
 ~~~
 
+`queue` / `interrupt` 是 D-028 §6 新增的名字。旧 peer 序列化的 snapshot 里没有它们，**缺失读作 `unknown`**：「对方没提」不是「对方不支持」的证据。这与 `NativeRef.signalTier`（§1.3）是同一条原则的两面——运行时上报缺省时静态矩阵继续生效，静态矩阵里没有的名字缺省时读作未验证。
+
 CapabilitySnapshot 的 adapterTransport 必填，Rust print 与 SDK sidecar、spawned Codex 与 embedded Codex 分开保存证据；替换 transport 必须创建新 Instance，不能沿用另一 transport 的 supported。native 可用、adapter 已实现、配置允许、所选 build 的验证通过，这四项同时成立才返回 supported。源码/help 只证明候选能力存在，不自动打开生产功能。unknown 不当成 false，也不当成可调用；调用返回 `CAPABILITY_UNKNOWN`，UI 显示“尚未验证”与原生通道。snapshot 必须随每个 generation 保存；native 动态能力变化生成新 snapshot，通过 lifecycle 事件宣布，只影响后续操作。
 
 ### 3.3 每个 driver 的候选能力矩阵
@@ -486,7 +520,13 @@ CapabilitySnapshot 的 adapterTransport 必填，Rust print 与 SDK sidecar、sp
 | `generic-pty` / binary pin | N 默认；产品专用恢复由新 driver 声明 | N | N 语义 API；允许人控键盘 | N | N | N 语义 artifact；普通文件浏览另计 | S* 自有 PTY 或已验证 carrier | N 默认；自定义探针须另建版本化 adapter |
 | `shell-pty` / login `$SHELL` | N | N | N | N | N | N | S* portable-pty；kind=`terminal`；无法识别的 agent CLI 的 fallback | N |
 
-`shell-pty` 另有 **terminal → agent promotion**（D-025）：轮询 PTY 前台进程组，已知 agent CLI 接管时把实例 promote 成该 kind（`driver` 不变，见 §2.3 `mode`），Claude 另按 SessionStart 同款 transcript 路径水合结构化消息。promote 不改变本行的能力矩阵——resume/steer 等仍是 `N`，能力来自 PTY 而非语义 API。
+本表是**静态 fallback**，不再是唯一真相（D-028 §4.3）。表格按 `DriverKind` 取值，因此 promoted 的 `shell-pty` session 无法用它表达自己实际拿到的能力；`NativeRef.signalTier` / `NativeRef.capabilities` 的运行时上报**逐项盖过**本表，缺省时本表生效。
+
+`steer` / `queue` / `interrupt` 三列在 D-028 本轮对**所有** driver 都是 `U`。不是遗漏：codex 的 `Tab` 排队与 `Esc` 打断虽已实测，但 Remuda 尚未实现对应键位，而 claude 的 queue-vs-steer 语义与 grok / agy 的键位根本没有结论（§14 风险 6、7）。写 `N` 会是一句没有依据的断言。
+
+`shell-pty` 另有 **terminal → agent promotion**（D-025）：轮询 PTY 前台进程组，已知 agent CLI 接管时把实例 promote 成该 kind（`driver` 不变，见 §2.3 `mode`），Claude 另按 SessionStart 同款 transcript 路径水合结构化消息。promote 本身不改变本表这一行——但 promote 之后拿到的 `signalTier` 会：一个把 hook socket 接起来的 session 上报 `resume` / `hooks` / `interactive-approval`，而这三项在本表的 `shell-pty` 行里都是 `N`。这正是运行时上报存在的理由。
+
+`shell-pty` 同时是 D-028 §5.1 的 **agent-in-native-pty** 载体：`(claude|codex|grok|agy, shell-pty)` 组合现在合法，与 promoted 的终端跑在同一条路径上。载体相同、能力就相同，这是统一原则要求的结果。
 
 依据：agent-protocols §2–5、§9、Claude control-plane、Codex schema、Grok 专项实测、hooks-integrations。Grok 的 plan、Codex collab 与 runtime child 不能用 `engine=claude-workflow`。claude-pty 无法自动回答的提示继续留在原生 TUI，不以降级 print 代替。
 
@@ -514,7 +554,7 @@ type PermissionMode =
 type InstanceSpec = {
   schemaVersion: 1;
   host: Id; workspaceId: Id;
-  kind: "claude"|"codex"|"grok"|"agy"|"generic";
+  kind: "claude"|"codex"|"grok"|"agy"|"generic"|"terminal";
   driver: DriverKind;
   binaryRef: Id;
   cwd: string;
@@ -522,6 +562,7 @@ type InstanceSpec = {
     | {mode: "create"; worktreeId: Id; baseOid: string; branch: string};
   providerProfile: {id: Id; revision: U64};
   modelId: string|null; // null 请求 owning profile 的显式默认解析。
+  effort?: {name: "low"|"medium"|"high"|"xhigh"|"max"; ultracode: boolean};
   permissionMode: PermissionMode;
   env: Record<string, EnvBinding>;
   args: string[];
@@ -557,6 +598,12 @@ type MaterializedLaunch = {
     prohibitedOptionsChecked: true};
 };
 ~~~
+
+**effort（D-028 §9.1）。** 五档 `low` / `medium` / `high` / `xhigh` / `max`，默认 `high`（成本基准 1.0）。`ultracode` **不是第六档**，是正交 boolean（等价 `xhigh` + dynamic workflow），session-only、永不持久化为档名。落地为 argv 上的**一个** flag：`--effort <档名>`，置了 ultracode 时为 `--effort ultracode`（原生 flag 只收一个值）。`effort` 缺省表示「交给 harness 决定」，materializer **不发** `--effort`——这与请求默认档不是一回事。
+
+历史档名按**名字**归一，绝不按 index：`default→low`、`think→high`、`think-hard→xhigh`、`ultracode→xhigh + ultracode:true`，无法识别的名字落到 `high`（一个过期的 UI 字符串不该让启动失败）。按 index 归一会出错，因为旧表是 per-harness 且长度不同——claude 的 index 3 是 `ultracode`，codex 的 index 3 是 `ultra`。旧客户端发来的 `{index, name}` 仍然接受，`index` 在读取时被忽略、也不写回。
+
+**绝不使用 `CLAUDE_CODE_EFFORT_LEVEL`**：它的优先级高于会话内 `/effort`，会把 PTY 的实时改档钉死。反向地，`child_env` 必须从子进程环境中**剥离**宿主继承的该变量，否则外部环境静默覆盖一切。
 
 `MaterializedLaunch` 是进程内结构，含 env 值的部分不准序列化到 RPC、Observation 或错误。持久 LaunchManifest 只存 audit、配置对象引用、binary/cwd/nativeStore/ProviderSelection；重启从 secret store 重新解析相同 credential version，不从日志恢复 secret。私有 settingsOverlay 的明文也不返回 UI；可审查的界面展示 key 名、非敏感 provider/model 字段和凭据引用。`args` 是原生 argv 数组，不是 shell 字符串；materializer 用 allowlist 解析器拒绝与保留 flag 冲突、重复 flag、未知危险启动模式和不兼容 driver 的 flag，不能只搜索子字符串。
 
@@ -613,6 +660,17 @@ resume 配方用 `--resume <exact session UUID>` 替换新建 `--session-id`，�
 **claude-pty：**同一 Claude 配方移除 `-p`、输入/输出 stream flags 和 host permission flags；保留 settings sources、settings、model、session ID 与 native permission mode，由 carrier 分配终端。runtime 默认使用 `manual` + native TUI，已选 auto 的 profile 可原样保留；不自动 bypass。采用 Herdr 时先取得专用 pane，通过已验证的 `agent.start`/受控 launcher 执行 argv；Herdr args 若只能接受 shell 命令文本，使用只含固定 executable 与 launchId 的本地 launcher，让它读取私有 manifest 后 exec，禁止拼 prompt/env/token 到 shell。
 
 Herdr 负责 pane 生存，Node 负责 Instance/native session 对应；runtime 使用 hook 的 `SessionStart.transcript_path` 定位文件，不自己将 cwd 简单替换 `/` 来猜完整目录编码。`--bg` 是未来单独的 carrier variant，不与 print 混用；本规格不把它作为六个 driver 的隐式实现。若以后接入，必须处理它忽略 `--session-id`、attach 会 wake、多个 settings 共享 daemon、logs 是 PTY 转储的行为，不杀共享 supervisor。control-plane §1–3
+
+**agent-in-native-pty（`shell-pty` + agent kind，D-028 §5.1）：**Remuda 自持 PTY 里跑 agent CLI，与 D-025 promote 的终端**同一条路径**。argv 来自 per-kind recipe，不是把 `spec.args` 原样交给 `CommandBuilder`；`flags.rs` 的 BANNED / RESERVED / EXTRA allowlist 在这条路径上同样生效（此前 shell-pty 完全绕过它）。
+
+| kind | argv 模板 | 配置注入 | yolo argv（仅 Human/Bot 且显式 bypass） |
+| --- | --- | --- | --- |
+| `claude` | `--setting-sources user,project,local` [`--settings <overlay>`] [`--effort <v>`] | argv 上的 settings overlay | `--dangerously-skip-permissions` |
+| `codex` | [`--effort <v>`] | env `CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` |
+| `grok` | [`--effort <v>`] | env `GROK_HOME` 指向影子目录 | `--always-approve` |
+| `agy` | [`--effort <v>`] | 无 | `--yolo` |
+
+新建 session **不**钉 `--session-id`：id 由 harness 回报（SessionStart hook / `session_index.jsonl` / `active_sessions.json`），自己造一个只会多出一个要对账的身份。resume 走 `--resume <sid>`，与 §5.6 同路径。`LaunchRecipe` 必须真填 `settings_digest`、`env_allowlist`、provider kind——旧的 shell-pty stub 发的是空白名单加硬编码 provider，D-028 §5.1 步骤 4 把它们列为审计要求。**D-011 / D-017 的授权规则随表一起搬家、一字不改**：Agent origin 一律使用非 yolo preset，bot dispatcher 不自动 bypass。
 
 **codex-appserver：**
 
@@ -723,7 +781,8 @@ type SourceCursor =
   | {type: "runtime"; ledgerRevision: U64};
 type ObservationSource = {
   driverKind: DriverKind; driverVersion: string; adapterVersion: string;
-  channel: "stdout"|"stderr"|"transcript"|"workflow-journal"|"hook"|"rpc"|"pty"|"herdr"|"runtime";
+  channel: "stdout"|"stderr"|"transcript"|"workflow-journal"|"hook"|"rpc"|"pty"|"herdr"|"runtime"
+    |"file"|"osc"|"screen";
   delivery: "live"|"replay"|"unknown";
   nativeSessionId: Knowledge<string>; nativeTurnId: Knowledge<string>;
   nativeAgentId: Knowledge<string>;
@@ -749,6 +808,8 @@ type Observation = {
 ~~~
 
 这是 §8.3 草案的正式化：旧 `sessionId` 改名 `instanceId`，native session 只在 source/NativeRef；不同时输出两个可能分歧的别名。seq 是 **一个 instance journal 内持久、连续、单调的 U64**，从 1 开始，process restart 不重置。Node 是唯一分配者；Hub 原样镜像，不重新编号。Raw bytes 先落受保护的 object，再把其引用、source cursor、normalized event、实体变更一起持久提交，提交后才 broadcast/ACK；失败不前移 durableSeq。runtime 自产的生命周期事实 rawRef 可以为 null，必须带 ledger/source evidence；native 原始记录不能无理由丢 rawRef。
+
+**信号分层（D-028 §4.3）。** `channel` 新增 `file` / `osc` / `screen`，与既有的 `hook` 一起构成优先级阶梯 `Hook > File > OSC > Screen`。每条 Observation 因此能解释「凭什么说它 blocked」：`hook` 是 agent 自己报的，`file` 是 tail 它的 transcript / rollout / `updates.jsonl` 读到的，`osc` 是终端控制序列，`screen` 是屏幕签名反推。既有的 `transcript` 保留给已建立的 Claude transcript 路径，`pty` 保留给原始字节；新变体不取代它们。分层与 `Completeness` 正交：前者说**证据来自哪里**，后者说**这条 payload 有多完整**。`unknown` 永不塌缩成 `idle`——没有规则命中是诚实的「不知道」，不是「已完成」的证据。
 
 `structured` 仅表示该 payload 经过明确 schema 映射，**不表示整个 Run 已完整或可信执行**；`partial` 是缺字段、流中增量或可识别但不完整的 native 内容；`screen-derived` 仅来自屏幕/启发式；`opaque` 完全未解释。被截断的 stderr 不拼成可验证 tool_result。raw storage 可含用户输入与工具输出，默认只授予同账号、相应 host/workspace 的 read-raw 权限，禁止把 env/auth frame 写入普通日志；对外 redacted 派生对象与原始 object 使用不同 digest，不覆盖原证据。
 
@@ -802,7 +863,7 @@ type ToolResultPayload = NodeMutation & {
 
 open 的 revision 为 1、baseRevision 为 null；append/replace/close 的 revision 必须是当前 node revision+1，baseRevision 必须匹配。append 的 blocks 只包含新增内容，targetBlock 指向已有文本块；完整原生 message/item 到达时用 replace，再 close，不能把完整文本再 append 一遍。replace 给出完整当前值，空数组表示确实为空。Claude 对同一 message.id 分块发送的 assistant records 由专用 adapter 合并 content block ID/index，不覆盖此前已经观察到的另一 tool_use。某些源没有可确定 delta 语义时只做完整快照 replace 或 opaque。
 
-PTY 输入因原生交互或 control 尚未就绪而等待时，Node 以 user message 的 `status: "queued"` 记录待发文本；确认写入后用相同 node/message ID 的 replace 更新为 `complete`。这里的 complete 仅证明输入已发送，不证明 assistant turn 完成。排队期间 `instance.create` 可结算 accepted，Instance 保持 ready，原生阻塞交互仍可回答；未发送即取消/关闭的消息更新为 interrupted。`queued` 不用于 thought。
+PTY 输入因原生交互或 control 尚未就绪而等待时，Node 以 user message 的 `status: "queued"` 记录待发文本；确认写入后用相同 node/message ID 的 replace 更新为 `complete`。`PromptMode: "queue"`（§3.1）走的是同一套账本，区别只在于排队是调用方**明确要求**的而不是 ready 判定推出来的；两者都不新增 status 值。这里的 complete 仅证明输入已发送，不证明 assistant turn 完成。排队期间 `instance.create` 可结算 accepted，Instance 保持 ready，原生阻塞交互仍可回答；未发送即取消/关闭的消息更新为 interrupted。`queued` 不用于 thought。
 
 同一 node 的 source 优先级由字段定义：结构化 native item/message 负责内容和最终 tool 结果；hook 负责它自身的前后事件和交互请求；screen 只负责展示提示。低信息来源不能把高信息值改成空值。usage 不随 message replace 被累加第二次。thought 只显示原生实际输出的文本/summary，redacted thinking 保存 redaction 标记，不尝试恢复隐藏内容。
 
@@ -1269,8 +1330,8 @@ Hub 生成 ownerFence，Node 在本地 durable store 单调保存；旧 fence �
 | `instance.attach` | Hub→Node | `{instanceId,ref:AttachRef}` → Command；不得 wake/resume |
 | `instance.open_terminal` | Hub→Node | `{instanceId,backgroundJobId,allowWake:true,carrier:{backend:"herdr",server:HerdrServer,session}}` → Command；只允许经认证的人类显式动作，可能 wake native job。使用同一 Command wrapper、digest、expected generation/fence 与持久 dispatch intent；不创建 Run、不含 prompt |
 | `instance.resume` | Hub→Node | `{instanceId,nativeRef,providerProfileRevision,expectedPreviousGeneration}` → Command；不含 prompt，后续输入另发 |
-| `instance.send` | Hub→Node | `{instanceId,runId,input:prompt\|steer,completionScope}` → Command；input 使用 DriverInput 对应分支，model-switch 只能经 configure；steer 必须指定既有 runId，不创建新 Run |
-| `instance.configure` | Hub→Node | `{instanceId,modelId,effective:"next-turn"}` → Command；仅能力支持且无活 foreground Run 时，转 Driver.send(model-switch) |
+| `instance.send` | Hub→Node | `{instanceId,runId,input:prompt\|steer,completionScope}` → Command；input 使用 DriverInput 对应分支，model-switch 只能经 configure；steer 必须指定既有 runId，不创建新 Run。prompt 分支的 `mode` 三选一（§3.1）：`new-turn` 开新回合、`steer` 插入当前回合、`queue` 明确排队。三者能力分别由 capability `steer` / `queue` 上报，未实测时为 `unknown`，调用返回 `CAPABILITY_UNKNOWN` 而不是假装不支持 |
+| `instance.configure` | Hub→Node | `{instanceId,modelId,effective:"next-turn",effort?}` → Command；仅能力支持且无活 foreground Run 时，转 Driver.send(model-switch)。`effort` 用 §4.1 的 `{name, ultracode}`；历史档名按名字归一后再存，Hub 不保存两种拼法 |
 | `instance.fork` | Hub→Node | `{sourceInstanceId,newInstanceId,nativeBoundary:{type:"latest-terminal"},newSpec}` → Command；expected 校验 source instance revision；原生 fork 返回新 native ID，不支持任意历史切点 |
 | `instance.cancel` | Hub→Node | `{instanceId,runId}` → Command；expected 中必须含 processGeneration/runGeneration |
 | `instance.close` | Hub→Node | `{instanceId,mode:"terminate",retainNativeSession:true}` → Command；不接受清除 transcript 的隐含请求 |

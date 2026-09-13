@@ -56,6 +56,15 @@ Probing `http://127.0.0.1:1` reports the failure inline under the button and lea
 
 Profiles written before this change stored `models` as `["id", …]`. Reads accept either shape, and opening the database rewrites legacy rows in place as `{id, enabled: true}` so old profiles keep working and migrate once. Covered by `a_legacy_string_catalog_migrates_to_structured_rows`, which writes the pre-migration string form straight into SQLite, reopens the Hub, and asserts both the REST view and the stored column.
 
+## Reproducing
+
+```
+cd web && pnpm run test:e2e:hub                     # verifies; writes nothing tracked
+REMUDA_EVIDENCE=1 pnpm exec playwright test -c playwright.hub.config.ts providers-discovery
+```
+
+A default run writes its screenshots to the gitignored `web/test-results/providers-2/`. Only `REMUDA_EVIDENCE=1` rewrites the committed images in this directory, so a plain e2e run leaves the worktree clean.
+
 ## Tests
 
 - Hub (`cargo test -p remuda-hub`, 109 passed): `discover_normalizes_both_upstream_shapes_without_echoing_the_token` (Anthropic + OpenAI shapes, `1m` tagging, token forwarded but never echoed), `discover_reuses_a_saved_profile_token_and_test_returns_the_same_shape`, `discover_requires_auth_a_base_url_and_reports_unreachable` (401 without a device, 400 on a bad/missing base URL, 400 when the token is smuggled into `headers`, 404 on an unknown profile, unreachable vs. reachable-but-401), `structured_models_round_trip_and_default_model_must_be_enabled`, `a_legacy_string_catalog_migrates_to_structured_rows`, plus 6 `provider_models` unit tests.

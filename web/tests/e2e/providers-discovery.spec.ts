@@ -1,12 +1,26 @@
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
 
-const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "__screenshots__");
+const here = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * A default run must not touch tracked files, so shots land in the gitignored
+ * `test-results/`. Re-capture the committed evidence with REMUDA_EVIDENCE=1.
+ */
+const evidence = process.env.REMUDA_EVIDENCE === "1";
+const shotDir = evidence
+  ? path.join(here, "../../../docs/design/evidence")
+  : path.join(here, "../../test-results/providers-2");
 /** Fake Anthropic-Messages gateway started by the hub_e2e harness. */
 const upstream = process.env.VITE_E2E_UPSTREAM ?? "http://127.0.0.1:58881";
 const token = "sk-fake-e2e-discover-qqqq";
+
+async function shot(page: Page, name: string) {
+  await mkdir(shotDir, { recursive: true });
+  await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
+}
 
 test.describe.configure({ mode: "serial" });
 
@@ -41,14 +55,14 @@ test("discover a gateway catalog, expose two models, and launch with them", asyn
   await expect(page.locator('[data-testid=provider-model-row][data-new="1"]')).toHaveCount(0);
   const fast = page.locator('[data-testid=provider-model-row][data-model="e2e/fast"]');
   await expect(fast).toContainText("200k");
-  await page.screenshot({ path: path.join(dir, "providers-2-discover-1440.png"), animations: "disabled" });
+  await shot(page, "providers-2-discover-1440.png");
 
   // Expose two of the three and keep e2e/auto as the default.
   const plain = page.locator('[data-testid=provider-model-row][data-model="e2e/plain"]');
   await plain.getByTestId("provider-model-enabled").uncheck();
   await expect(page.getByTestId("provider-models-count")).toContainText("2/3 已启用");
   await auto.getByTestId("provider-model-default").check();
-  await page.screenshot({ path: path.join(dir, "providers-2-checklist-1440.png"), animations: "disabled" });
+  await shot(page, "providers-2-checklist-1440.png");
   await page.getByTestId("provider-save").click();
   await expect(page.getByTestId("provider-form")).toHaveCount(0);
 
@@ -63,7 +77,7 @@ test("discover a gateway catalog, expose two models, and launch with them", asyn
   // /test reports the same catalog the probe found.
   await page.getByTestId("provider-test").click();
   await expect(page.getByTestId("provider-test-result")).toContainText("3 models");
-  await page.screenshot({ path: path.join(dir, "providers-2-detail-1440.png"), animations: "disabled" });
+  await shot(page, "providers-2-detail-1440.png");
 
   // Editing re-probes with the stored token: no model is newly discovered and
   // the unticked one stays hidden.
@@ -84,7 +98,7 @@ test("discover a gateway catalog, expose two models, and launch with them", asyn
   await expect(picker.locator("option")).toHaveCount(2);
   await expect(picker).toHaveValue("e2e/auto");
   await expect(picker.locator('option[value="e2e/plain"]')).toHaveCount(0);
-  await page.screenshot({ path: path.join(dir, "providers-2-new-session-1440.png"), animations: "disabled" });
+  await shot(page, "providers-2-new-session-1440.png");
 });
 
 test("discovery against a dead gateway reports unreachable inline", async ({ page }) => {
@@ -96,5 +110,5 @@ test("discovery against a dead gateway reports unreachable inline", async ({ pag
   await page.getByTestId("provider-discover").click();
   await expect(page.getByTestId("provider-discover-error")).toContainText("unreachable");
   await expect(page.getByTestId("provider-models-empty")).toBeVisible();
-  await page.screenshot({ path: path.join(dir, "providers-2-unreachable-1440.png"), animations: "disabled" });
+  await shot(page, "providers-2-unreachable-1440.png");
 });

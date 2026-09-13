@@ -65,8 +65,12 @@ Desktop 1440×900 and phone 400×844, `prefers-reduced-motion: reduce`.
 
 ## Tests
 
-- `pnpm --dir web test` — 177 passed, 48 files. New: `ViewSwitch.test.tsx` (segmented state, click semantics, arrow-key roving), `viewPref.test.ts` (per-instance recall, junk rejection), two `Composer.test.tsx` cases for the static harness label.
+- `pnpm --dir web test` — 222 passed, 53 files. New: `ViewSwitch.test.tsx` (segmented state, click semantics, arrow-key roving), `viewPref.test.ts` (per-instance recall, junk rejection), two `Composer.test.tsx` cases for the static harness label.
 - `pnpm --dir web exec playwright test` — mock suite, chromium + mobile-webkit. `session-structured.spec.ts` gained a `session chrome` describe covering the single segmented control, keyboard movement, per-instance recall, the absent switch on `claude-print`, no harness menu in-session, all four ways back from 文件, deep-link context, and a 400px back affordance. `composer-effort.spec.ts`, `new-session.spec.ts`, `session-terminal-lab.spec.ts`, and `terminal-live.spec.ts` were retargeted from the removed `终端` / `结构` links to `view-switch-*`.
+
+Rebased across the effort-slider work (`22e9c3c`, then the codex-style slider in `b7b3b5a`) and the spaces/tabs shell (`bb935f0`): the slider, its `effort-slider` / `effort-slider-panel` / `effort-open-list` testids, `effortDisabled`, and the spaces `useSpaceWorkbench` wiring in `SessionPage` are kept as-is. The two `composer-effort.spec.ts` cases that reached the codex and grok effort tables *through the harness menu* now reach them through the codex and grok mock sessions instead, so that coverage survives the menu's removal.
 - `pnpm --dir web lint`, `pnpm --dir web exec tsc -b`, `./scripts/ci/secret-scan.sh`.
 
-`agent-board.spec.ts` fails on this branch and on a clean `origin/main` checkout alike (worktree label in a board card, `x-space`-owned) — not touched here.
+The codex effort table is asserted as a unit test rather than e2e: `codex-worker` lives in a non-default space, so `/sessions` no longer lists it. The grok table keeps its e2e case because `Grok 会话` is in the default space.
+
+Pre-existing failures, unrelated and untouched here: `agent-board.spec.ts` (3 cases) and `spaces.spec.ts` reach `codex-worker` / `grok-canary` through `/sessions` and hit the same space-scoping change; they fail on a clean `origin/main` checkout too. A full `--workers=1` run on a loaded machine also times out mobile-webkit at browser launch ("while setting up page"); those are load artifacts, not assertions — the same specs pass on chromium.

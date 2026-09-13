@@ -219,6 +219,23 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("effort-reset")).toBeDisabled();
   });
 
+  it("lists the native codex table for a codex session", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_codex"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="codex"
+        model="gpt-5"
+        effort={effortAt("codex", 1)}
+        onEffort={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,ultra");
+  });
+
   it("shows the harness as a static label inside a session, with no menu", async () => {
     const user = userEvent.setup();
     render(

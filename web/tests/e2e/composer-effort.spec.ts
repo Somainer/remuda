@@ -160,15 +160,6 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("data-tiers", /think/);
   });
 
-  test("codex session lists the native codex effort table", async ({ page }) => {
-    await page.goto("/sessions");
-    await row(page, "codex-worker").click();
-    await page.getByTestId("view-switch-structured").click();
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-harness", "codex");
-    await openEffort(page);
-    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,ultra");
-  });
-
   test("an existing session shows the harness as a label, not a menu", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();

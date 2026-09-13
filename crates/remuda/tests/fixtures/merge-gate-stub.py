@@ -19,6 +19,9 @@ with trace.open("a", encoding="utf-8") as output:
 if step == "cargo-test" and os.environ.get("REMUDA_TEST_GATE_CAS"):
     subprocess.run(["git", "update-ref", "refs/heads/main",
                     os.environ["REMUDA_TEST_GATE_CAS"]], check=True)
+if step == "gen-api-current":
+    Path("web/src/lib/api.generated.ts").write_text(
+        "generated client current\n", encoding="utf-8")
 if step == os.environ.get("REMUDA_TEST_GATE_FAIL"):
     sys.exit(1)
 if step == os.environ.get("REMUDA_TEST_GATE_RETRY"):

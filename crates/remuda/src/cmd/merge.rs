@@ -1,5 +1,6 @@
 //! Coordinator merge: verify an immutable merge, then compare-and-swap main.
 
+mod generated_api;
 mod web_e2e;
 
 use std::fs;
@@ -42,7 +43,7 @@ pub(crate) struct MergeArgs {
     #[arg(long)]
     #[serde(default)]
     pub full: bool,
-    /// Include web checks even when the merge does not change web/.
+    /// Include web checks even when the merge does not change crates/ or web/.
     #[arg(long)]
     #[serde(default)]
     pub web: bool,
@@ -346,6 +347,7 @@ fn execute_inner(
             test_range(report),
             report.web_e2e,
         )?);
+        report.steps.push(generated_api::plan(report.web));
         report.steps.push(Step::planned("verify-tree"));
         report.steps.push(Step::planned("record-gate"));
         report.steps.push(Step::planned("update-main"));
@@ -562,7 +564,7 @@ pub(crate) fn pending(repo: Option<&Path>) -> Result<serde_json::Value> {
 fn web_changed(paths: &[u8]) -> bool {
     paths
         .split(|byte| *byte == 0)
-        .any(|path| path.starts_with(b"web/"))
+        .any(|path| path.starts_with(b"crates/") || path.starts_with(b"web/"))
 }
 
 fn record<T>(
@@ -676,11 +678,14 @@ fn run_gate(
                     }
         });
     report.steps.extend(steps);
+    if !status.success() || !complete {
+        report.steps.push(generated_api::plan(false));
+    }
     ensure!(
         status.success() && complete,
         "gate failed or returned an incomplete step report"
     );
-    Ok(())
+    generated_api::run(report, merged_worktree, target)
 }
 
 #[derive(Default)]
@@ -914,7 +919,10 @@ mod tests {
     #[test]
     fn web_selection_uses_nul_delimited_repo_paths() {
         assert!(web_changed(b"crates/a.rs\0web/a file\n.ts\0"));
-        assert!(!web_changed(b"webish/a.rs\0docs/web/a.rs\0"));
+        assert!(web_changed(b"crates/remuda-hub/openapi/openapi.json\0"));
+        assert!(!web_changed(
+            b"webish/a.rs\0docs/web/a.rs\0cratesish/a.rs\0"
+        ));
         assert!(!web_changed(b""));
     }
 

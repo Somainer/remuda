@@ -66,7 +66,7 @@ impl Repo {
         let stub = parent.join("gate stub.py");
         let trace = parent.join("trace.jsonl");
         fs::create_dir_all(root.join("scripts/ci")).unwrap();
-        fs::create_dir_all(root.join("web")).unwrap();
+        fs::create_dir_all(root.join("web/src/lib")).unwrap();
         fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "--bare", "-b", "main"]);
         git(&root, &["init", "-b", "main"]);
@@ -101,6 +101,11 @@ impl Repo {
                 .success()
         );
         fs::write(root.join("web/.keep"), "fixture\n").unwrap();
+        fs::write(
+            root.join("web/src/lib/api.generated.ts"),
+            "generated client current\n",
+        )
+        .unwrap();
         fs::write(root.join(".gitignore"), "/data/tmp/\n/target-gate/\n").unwrap();
         fs::write(root.join("shared file.txt"), "base\n").unwrap();
         let initial = [
@@ -109,6 +114,7 @@ impl Repo {
             "scripts/ci/gate.sh",
             "scripts/ci/affected.py",
             "web/.keep",
+            "web/src/lib/api.generated.ts",
         ];
         let mut add = vec!["add", "--"];
         add.extend(initial);
@@ -242,6 +248,10 @@ fn affected_gate_tests_only_changed_crates_and_reverse_dependencies() {
         "crates/core/src/lib.rs",
         "pub fn changed() {}\n",
     );
+    let (output, report) = repo.merge(&["--dry-run"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(report["web"], true);
+    assert_eq!(step(&report, "gen-api-current")["status"], "planned");
     let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
     assert_exit(&output, &report, 0);
     assert_eq!(report["affected"], true);
@@ -250,6 +260,9 @@ fn affected_gate_tests_only_changed_crates_and_reverse_dependencies() {
         json!(["gate-app", "gate-core"])
     );
     assert_eq!(step(&report, "cargo-test")["status"], "ok");
+    assert_eq!(report["web"], true);
+    assert_eq!(step(&report, "web-install")["status"], "ok");
+    assert_eq!(step(&report, "gen-api-current")["status"], "ok");
     repo.assert_cleaned();
 }
 
@@ -277,6 +290,9 @@ fn docs_only_gate_skips_tests_but_keeps_the_other_rust_checks() {
     let repo = Repo::new();
     git(&repo.source, &["reset", "--hard", &repo.base]);
     commit_file(&repo.source, "docs/note.md", "documentation\n");
+    let (output, report) = repo.merge(&["--dry-run"], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(step(&report, "gen-api-current")["status"], "skipped");
     let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
     assert_exit(&output, &report, 0);
     assert_eq!(step(&report, "cargo-test")["status"], "skipped");
@@ -285,6 +301,13 @@ fn docs_only_gate_skips_tests_but_keeps_the_other_rust_checks() {
         assert_eq!(step(&report, name)["status"], "ok");
     }
     assert!(!repo.trace().iter().any(|line| line["step"] == "cargo-test"));
+    assert_eq!(step(&report, "gen-api-current")["status"], "skipped");
+    assert!(
+        !repo
+            .trace()
+            .iter()
+            .any(|line| line["step"] == "gen-api-current")
+    );
     repo.assert_cleaned();
 }
 
@@ -379,7 +402,8 @@ fn test_retry_is_reported_once_and_forced_web_runs_in_web_directory_without_push
             "cargo-test",
             "web-install",
             "web-build",
-            "web-test"
+            "web-test",
+            "gen-api-current"
         ]
     );
     assert!(
@@ -388,10 +412,71 @@ fn test_retry_is_reported_once_and_forced_web_runs_in_web_directory_without_push
             .all(|event| event["target"] == repo.root.join("chosen-target").to_str().unwrap())
     );
     assert!(
-        trace[6..]
+        trace[6..9]
             .iter()
             .all(|event| Path::new(event["cwd"].as_str().unwrap()).ends_with("worktree/web"))
     );
+    assert!(Path::new(trace[9]["cwd"].as_str().unwrap()).ends_with("worktree"));
+    assert!(trace.iter().all(|event| event["incremental"] == "0"));
+    let generated = step(&report, "gen-api-current");
+    assert_eq!(
+        generated["command"],
+        json!([repo.stub.to_str().unwrap(), "gen-api-current"])
+    );
+    assert_eq!(generated["cwd"], ".");
+    assert_eq!(generated["status"], "ok");
+    assert_eq!(step(&report, "verify-tree")["status"], "ok");
+    let names: Vec<_> = report["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names
+            .windows(3)
+            .any(|steps| { steps == ["web-hub-e2e", "gen-api-current", "verify-tree"] })
+    );
+    repo.assert_cleaned();
+}
+
+#[test]
+fn stale_generated_client_fails_without_updating_main_or_the_source_worktree() {
+    let repo = Repo::new();
+    let path = "web/src/lib/api.generated.ts";
+    commit_file(&repo.source, path, "stale generated client\n");
+    let (output, report) = repo.merge(&["--gate"], &[]);
+    assert_exit(&output, &report, 1);
+    let generated = step(&report, "gen-api-current");
+    assert_eq!(generated["status"], "failed");
+    assert_eq!(generated["attempts"], 1);
+    assert!(
+        generated["error"].as_str().unwrap().contains(path),
+        "{report}"
+    );
+    assert_eq!(report["mainUpdated"], false);
+    assert_eq!(repo.main(), repo.base);
+    assert_eq!(repo.remote_main(), repo.base);
+    assert_eq!(
+        fs::read_to_string(repo.source.join(path)).unwrap(),
+        "stale generated client\n"
+    );
+    assert_eq!(repo.trace().last().unwrap()["step"], "gen-api-current");
+    repo.assert_cleaned();
+}
+
+#[test]
+fn generator_command_failure_blocks_main_without_retrying() {
+    let repo = Repo::new();
+    let (output, report) = repo.merge(
+        &["--gate", "--web"],
+        &[("REMUDA_TEST_GATE_FAIL", "gen-api-current")],
+    );
+    assert_exit(&output, &report, 1);
+    assert_eq!(step(&report, "gen-api-current")["status"], "failed");
+    assert_eq!(step(&report, "gen-api-current")["attempts"], 1);
+    assert_eq!(repo.main(), repo.base);
+    assert_eq!(repo.remote_main(), repo.base);
     repo.assert_cleaned();
 }
 
@@ -440,7 +525,7 @@ fn auth_changes_select_live_web_e2e_in_both_dry_run_and_execution() {
         assert_exit(&output, &report, 0);
         assert_eq!(report["web"], true);
         assert_eq!(step(&report, "web-hub-e2e")["status"], "ok");
-        assert_eq!(repo.trace().last().unwrap()["step"], "web-hub-e2e");
+        assert_eq!(repo.trace().last().unwrap()["step"], "gen-api-current");
         repo.assert_cleaned();
     }
 }
@@ -460,6 +545,7 @@ fn live_web_e2e_failure_blocks_main_without_retrying() {
     assert_exit(&output, &report, 1);
     assert_eq!(step(&report, "web-hub-e2e")["status"], "failed");
     assert_eq!(step(&report, "web-hub-e2e")["attempts"], 1);
+    assert_eq!(step(&report, "gen-api-current")["status"], "skipped");
     assert_eq!(repo.main(), repo.base);
     assert_eq!(repo.remote_main(), repo.base);
     repo.assert_cleaned();
@@ -476,6 +562,7 @@ fn gate_failures_stop_in_order_and_never_update_main() {
         assert_eq!(step(&report, failure)["status"], "failed");
         assert_eq!(step(&report, failure)["attempts"], attempts);
         assert_eq!(step(&report, "web-install")["status"], "skipped");
+        assert_eq!(step(&report, "gen-api-current")["status"], "skipped");
         assert_eq!(repo.main(), repo.base);
         assert_eq!(repo.remote_main(), repo.base);
         repo.assert_cleaned();
@@ -583,6 +670,12 @@ fn dry_run_does_not_fetch_create_worktrees_or_run_gate_commands() {
     assert_eq!(report["web"], true);
     assert_eq!(step(&report, "fetch")["status"], "planned");
     assert_eq!(step(&report, "web-install")["status"], "planned");
+    assert_eq!(step(&report, "gen-api-current")["status"], "planned");
+    assert_eq!(
+        step(&report, "gen-api-current")["command"],
+        json!([repo.stub.to_str().unwrap(), "gen-api-current"])
+    );
+    assert_eq!(step(&report, "gen-api-current")["cwd"], ".");
     assert_eq!(step(&report, "update-main")["status"], "planned");
     assert_eq!(report["mainUpdated"], false);
     assert_eq!(report["merged"], Value::Null);

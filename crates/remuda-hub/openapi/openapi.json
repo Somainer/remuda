@@ -1436,7 +1436,12 @@
           "enabled": { "type": "boolean", "default": true },
           "label": { "type": ["string", "null"] },
           "contextWindow": { "type": ["integer", "null"] },
-          "tags": { "type": "array", "items": { "type": "string" } }
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "surfaces": {
+            "type": "array",
+            "description": "Gateway listings that reported this id (`anthropic`, `openai`). A gateway may serve a different catalog per header, so the probe unions both. Empty for a manually typed id.",
+            "items": { "type": "string" }
+          }
         }
       },
       "ProviderModelInput": {

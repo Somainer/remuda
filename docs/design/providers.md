@@ -16,7 +16,7 @@ Device-authenticated REST. OpenAPI: `crates/remuda-hub/openapi/openapi.json`.
 | GET | `/v1/providers/{id}` | Fingerprint + last4 only. |
 | PATCH | `/v1/providers/{id}` | Metadata and/or rotate `authToken`. |
 | DELETE | `/v1/providers/{id}` | Drops the vault entry. |
-| POST | `/v1/providers/{id}/test` | `GET {baseUrl}/v1/models` (or `{baseUrl}/models` if base already ends with `/v1`). Reports `reachable` / `ok` / `message` / `models`. |
+| POST | `/v1/providers/{id}/test` | `GET {baseUrl}/v1/models` (or `{baseUrl}/models` if base already ends with `/v1`) on both the OpenAI and Anthropic surfaces, unioned. Reports `reachable` / `ok` / `message` / `models`. |
 
 Profile JSON: `id` (`pvp_…`), `name`, `kind` (`gateway`\|`direct`), `baseUrl`, `models`, `defaultModel`, `headers`, `defaultGateway`, `scope`, `revision`, `secret: {present, last4, fingerprint}`.
 
@@ -25,14 +25,25 @@ Profile JSON: `id` (`pvp_…`), `name`, `kind` (`gateway`\|`direct`), `baseUrl`,
 `models` is a structured array, not a string list:
 
 ```json
-{ "id": "gw/wide", "enabled": true, "label": "Wide", "contextWindow": 1048576, "tags": ["1m"] }
+{ "id": "gw/wide", "enabled": true, "label": "Wide", "contextWindow": 1048576, "tags": ["1m"], "surfaces": ["openai", "anthropic"] }
 ```
 
-Only `id` is required. `enabled` gates what New Session may offer — an unticked model stays in the profile so the operator can see it without exposing it. `label`, `contextWindow` and `tags` are filled in from whatever the gateway reports; a context window of 1M tokens or more also earns a `1m` tag.
+Only `id` is required. `enabled` gates what New Session may offer — an unticked model stays in the profile so the operator can see it without exposing it. `label`, `contextWindow` and `tags` are filled in from whatever the gateway reports; a context window of 1M tokens or more also earns a `1m` tag. `surfaces` records which gateway listing reported the id (see below); a manually typed id has none.
 
 `defaultModel` must name one of the **enabled** models (400 otherwise). Replacing the catalog through PATCH re-resolves a default the new list no longer enables rather than failing the request.
 
 Legacy `["id", …]` catalogs are accepted on input and migrated in place when the Hub opens its database, so old profiles keep working and are rewritten once.
+
+### Two listings per gateway
+
+A gateway may answer `GET /v1/models` **differently depending on the request headers**. One observed gateway returns its full OpenAI-style catalog (hundreds of ids across `passthrough/`, `cursor/`, `gemini-` and more) to a plain `Authorization: Bearer` request, but only six `claude-*` ids once `anthropic-version` is set. Probing a single surface therefore under-reports badly.
+
+`/discover` and `/test` probe **both** surfaces concurrently and union the results:
+
+- `openai` — `Authorization: Bearer` + `x-api-key`, no `anthropic-version`.
+- `anthropic` — the same credentials plus `anthropic-version: 2023-06-01`.
+
+Ids are deduplicated, and an id served by both keeps the richer metadata (a label or context window reported by only one listing is retained). Every entry records the listings it came from in `surfaces`. **No id is filtered by prefix** — whatever either listing returns is offered. A gateway that speaks only one surface still works; the probe message names the surfaces that answered (`… 12 models via openai+anthropic`). A re-probe restates `surfaces` rather than accumulating stale ones.
 
 `/discover` and `/test` share one probe and return the same shape: `{ok, reachable, status, latencyMs, message, models}`. The normalizer handles the Anthropic shape (`{"data":[{"id","display_name"}]}`), the OpenAI shape (`{"object":"list","data":[…]}`), a `{"models": …}` wrapper and a bare array; an unreadable body yields no models rather than an error. `/discover` with a `profileId` reuses that profile's stored token, base URL and headers, so re-probing an existing gateway never means retyping the secret.
 
@@ -76,9 +87,11 @@ Gateway env: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ENABLE_G
 
 Provider page: list / create / edit / rotate token / test / delete / set default gateway.
 
-The model field is a structured list, not a text box. **探测模型** calls `/v1/providers/discover` with whatever base URL and token are typed (or, when editing, the saved profile's), then shows the gateway's models as a checklist: id plus context/tag chips, a radio for the default, and a chip input for typing an id by hand when a gateway lists nothing. Editing pre-checks the saved models and badges discovered-but-new ones; a re-probe never re-enables a model the operator unticked.
+The model field is a structured list, not a text box. **探测模型** calls `/v1/providers/discover` with whatever base URL and token are typed (or, when editing, the saved profile's), then shows the gateway's models as a checklist: id plus context/tag chips, a chip naming each listing that reported it, a radio for the default, and a chip input for typing an id by hand when a gateway lists nothing. Editing pre-checks the saved models and badges discovered-but-new ones; a re-probe never re-enables a model the operator unticked.
 
-New Session `delegation=gateway` selects the default gateway profile, offers only that profile's **enabled** models, and prefills its `defaultModel`.
+Catalogs can run to hundreds of ids, so the checklist has a search box (matching id or label) and groups rows by id prefix — everything up to and including the first `/` or `-`, giving buckets like `passthrough/`, `cursor/`, `gemini-`, `claude-`. Each group header shows `enabled/total` and collapses. Filtering only changes what is displayed: ticking a filtered row still edits the full catalog.
+
+New Session `delegation=gateway` selects the default gateway profile, offers only that profile's **enabled** models, and prefills its `defaultModel`. The picker groups into `<optgroup>`s using the same prefix buckets once a catalog spans more than one. The offered list is derived from the profile in the store, so a remembered model the catalog no longer exposes is replaced rather than shown.
 
 ## How to enter a real gateway
 
@@ -86,7 +99,7 @@ New Session `delegation=gateway` selects the default gateway profile, offers onl
 2. Name (any label).
 3. Base URL of the Anthropic-Messages-compatible endpoint, including `/v1` if the gateway expects it (example: `https://your-gateway.example/v1`).
 4. Auth token (Bearer / `x-api-key`). Submitted once; afterwards the UI shows `••••last4` only.
-5. **探测模型** — reads the gateway's `/v1/models` and lists what it offers. Tick the models to expose, pick one as the default, or type an id by hand if the gateway lists nothing.
+5. **探测模型** — reads the gateway's `/v1/models` on both surfaces (plain Bearer and `anthropic-version`) and lists the union of what they offer. Filter with the search box, collapse the prefix groups, tick the models to expose, pick one as the default, or type an id by hand if the gateway lists nothing.
 6. Check **设为默认网关**.
 7. **测试连通** — dummy URLs such as `http://127.0.0.1:1` report `unreachable: …` with a clear message. A real gateway should list models or at least return HTTP 401/200.
 8. New Session → **网关 (gateway)** uses that profile and offers its enabled models.

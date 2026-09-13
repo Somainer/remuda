@@ -1,8 +1,8 @@
-import { useId, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Button } from "../../components/Button";
 import ui from "../../styles/ui.module.css";
 import css from "./providers.module.css";
-import { contextChip, type ProviderModel } from "./model";
+import { contextChip, filterModels, groupModels, type ProviderModel } from "./model";
 
 type Props = {
   models: ProviderModel[];
@@ -32,8 +32,14 @@ export function ModelList({
   onDefaultChange,
 }: Props) {
   const [manual, setManual] = useState("");
+  const [query, setQuery] = useState("");
+  // Collapsed groups by key. A gateway can serve hundreds of ids, so the list
+  // is grouped; groups start open so a small catalog still reads as one list.
+  const [collapsed, setCollapsed] = useState<Record<string, true>>({});
   const groupName = useId();
   const enabled = models.filter((m) => m.enabled);
+  const visible = useMemo(() => filterModels(models, query), [models, query]);
+  const groups = useMemo(() => groupModels(visible), [visible]);
 
   const toggle = (id: string, on: boolean) => {
     onChange(models.map((m) => (m.id === id ? { ...m, enabled: on } : m)));
@@ -88,71 +94,148 @@ export function ModelList({
         </p>
       ) : null}
       {models.length ? (
-        <ul className={css.modelList}>
-          {models.map((model) => {
-            const isNew = discovered.includes(model.id);
-            const context = contextChip(model.contextWindow);
-            // The Hub tags a 1M window "1m", which the context chip already
-            // shows; render each fact once.
-            const tags = model.tags?.filter((tag) => tag !== context) ?? [];
-            return (
-              <li
-                key={model.id}
-                className={css.modelRow}
-                data-testid="provider-model-row"
-                data-model={model.id}
-                data-enabled={model.enabled ? "1" : "0"}
-                data-new={isNew ? "1" : "0"}
-              >
-                <label className={css.modelPick}>
-                  <input
-                    type="checkbox"
-                    data-testid="provider-model-enabled"
-                    checked={model.enabled}
-                    onChange={(e) => toggle(model.id, e.target.checked)}
-                  />
-                  <span className={css.modelId}>{model.id}</span>
-                </label>
-                {model.label ? <span className={css.modelLabel}>{model.label}</span> : null}
-                {context ? (
-                  <span className={css.chipSmall} data-testid="provider-model-context">
-                    {context}
-                  </span>
-                ) : null}
-                {tags.map((tag) => (
-                  <span key={tag} className={css.chipSmall} data-testid="provider-model-tag">
-                    {tag}
-                  </span>
-                ))}
-                {isNew ? (
-                  <span className={css.badge} data-testid="provider-model-new">
-                    新增
-                  </span>
-                ) : null}
-                <label className={css.modelDefault} title="设为默认模型">
-                  <input
-                    type="radio"
-                    name={groupName}
-                    data-testid="provider-model-default"
-                    disabled={!model.enabled}
-                    checked={defaultModel === model.id}
-                    onChange={() => onDefaultChange(model.id)}
-                  />
-                  默认
-                </label>
-                <button
-                  type="button"
-                  className={css.modelRemove}
-                  data-testid="provider-model-remove"
-                  aria-label={`移除 ${model.id}`}
-                  onClick={() => remove(model.id)}
-                >
-                  ×
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+        <>
+          <input
+            className={ui.input}
+            type="search"
+            data-testid="provider-model-search"
+            value={query}
+            placeholder="筛选模型 id 或名称"
+            aria-label="筛选模型"
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              // The field lives inside the profile form; Enter must filter,
+              // not submit.
+              if (e.key === "Enter") e.preventDefault();
+            }}
+          />
+          {visible.length ? (
+            <ul className={css.modelList}>
+              {groups.map((group) => {
+                const shut = collapsed[group.key] === true;
+                const on = group.models.filter((m) => m.enabled).length;
+                return (
+                  <li
+                    key={group.key}
+                    className={css.modelGroup}
+                    data-testid="provider-model-group"
+                    data-group={group.key}
+                    data-collapsed={shut ? "1" : "0"}
+                  >
+                    <button
+                      type="button"
+                      className={css.modelGroupHead}
+                      data-testid="provider-model-group-toggle"
+                      aria-expanded={!shut}
+                      onClick={() =>
+                        setCollapsed((prev) => {
+                          const next = { ...prev };
+                          if (shut) delete next[group.key];
+                          else next[group.key] = true;
+                          return next;
+                        })
+                      }
+                    >
+                      <span aria-hidden>{shut ? "▸" : "▾"}</span>
+                      <span className={css.modelGroupKey}>{group.key}</span>
+                      <span className={css.modelGroupCount}>
+                        {on}/{group.models.length}
+                      </span>
+                    </button>
+                    {shut ? null : (
+                      <ul className={css.modelGroupList}>
+                        {group.models.map((model) => {
+                          const isNew = discovered.includes(model.id);
+                          const context = contextChip(model.contextWindow);
+                          // The Hub tags a 1M window "1m", which the context
+                          // chip already shows; render each fact once.
+                          const tags = model.tags?.filter((tag) => tag !== context) ?? [];
+                          return (
+                            <li
+                              key={model.id}
+                              className={css.modelRow}
+                              data-testid="provider-model-row"
+                              data-model={model.id}
+                              data-enabled={model.enabled ? "1" : "0"}
+                              data-new={isNew ? "1" : "0"}
+                            >
+                              <label className={css.modelPick}>
+                                <input
+                                  type="checkbox"
+                                  data-testid="provider-model-enabled"
+                                  checked={model.enabled}
+                                  onChange={(e) => toggle(model.id, e.target.checked)}
+                                />
+                                <span className={css.modelId}>{model.id}</span>
+                              </label>
+                              {model.label ? (
+                                <span className={css.modelLabel}>{model.label}</span>
+                              ) : null}
+                              {context ? (
+                                <span className={css.chipSmall} data-testid="provider-model-context">
+                                  {context}
+                                </span>
+                              ) : null}
+                              {tags.map((tag) => (
+                                <span
+                                  key={tag}
+                                  className={css.chipSmall}
+                                  data-testid="provider-model-tag"
+                                >
+                                  {tag}
+                                </span>
+                              ))}
+                              {/* Which gateway listing reported this id. */}
+                              {(model.surfaces ?? []).map((surface) => (
+                                <span
+                                  key={surface}
+                                  className={css.chipSurface}
+                                  data-testid="provider-model-surface"
+                                  data-surface={surface}
+                                >
+                                  {surface}
+                                </span>
+                              ))}
+                              {isNew ? (
+                                <span className={css.badge} data-testid="provider-model-new">
+                                  新增
+                                </span>
+                              ) : null}
+                              <label className={css.modelDefault} title="设为默认模型">
+                                <input
+                                  type="radio"
+                                  name={groupName}
+                                  data-testid="provider-model-default"
+                                  disabled={!model.enabled}
+                                  checked={defaultModel === model.id}
+                                  onChange={() => onDefaultChange(model.id)}
+                                />
+                                默认
+                              </label>
+                              <button
+                                type="button"
+                                className={css.modelRemove}
+                                data-testid="provider-model-remove"
+                                aria-label={`移除 ${model.id}`}
+                                onClick={() => remove(model.id)}
+                              >
+                                ×
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className={css.modelHint} data-testid="provider-models-no-match">
+              没有匹配 “{query.trim()}” 的模型。
+            </p>
+          )}
+        </>
       ) : (
         <p className={css.modelHint} data-testid="provider-models-empty">
           探测网关，或手动填入模型 id。

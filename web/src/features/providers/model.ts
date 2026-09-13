@@ -7,6 +7,12 @@ export type ProviderModel = {
   label?: string | null;
   contextWindow?: number | null;
   tags?: string[];
+  /**
+   * Gateway listings that reported this id (`anthropic`, `openai`). A gateway
+   * may serve a different catalog per header, so discovery probes both and
+   * unions them. Empty for a manually typed id.
+   */
+  surfaces?: string[];
 };
 
 /** Hub wire shape: a bare id (legacy) or a structured entry. */
@@ -182,6 +188,7 @@ export function normalizeModels(raw: ProviderModelInput[] | undefined | null): P
       ...(entry.label ? { label: entry.label } : {}),
       ...(entry.contextWindow ? { contextWindow: entry.contextWindow } : {}),
       ...(entry.tags?.length ? { tags: entry.tags } : {}),
+      ...(entry.surfaces?.length ? { surfaces: entry.surfaces } : {}),
     });
   }
   return out;
@@ -232,6 +239,9 @@ export function mergeDiscovered(
       ...(found.label ? { label: found.label } : {}),
       ...(found.contextWindow ? { contextWindow: found.contextWindow } : {}),
       ...(found.tags?.length ? { tags: found.tags } : {}),
+      // A re-probe re-states which listings serve the id; drop a stale surface
+      // rather than accumulating one the gateway no longer reports.
+      ...(found.surfaces?.length ? { surfaces: found.surfaces } : {}),
     };
   });
   for (const model of discovered) {
@@ -248,6 +258,44 @@ export function contextChip(tokens: number | null | undefined): string | null {
   if (tokens >= 1_000_000) return `${Math.round(tokens / 100_000) / 10}m`;
   if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}k`;
   return String(tokens);
+}
+
+/** Models whose id or label contains `query`, case-insensitively. */
+export function filterModels(models: ProviderModel[], query: string): ProviderModel[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return models;
+  return models.filter(
+    (m) =>
+      m.id.toLowerCase().includes(needle) || (m.label ?? "").toLowerCase().includes(needle),
+  );
+}
+
+/**
+ * The bucket an id belongs to: everything up to and including the first `/`
+ * or `-` (`passthrough/`, `cursor/`, `claude-`). An id with neither separator
+ * is its own bucket, so nothing is hidden behind a group it does not match.
+ */
+export function modelGroupKey(id: string): string {
+  const cut = id.search(/[/-]/);
+  return cut === -1 ? id : id.slice(0, cut + 1);
+}
+
+export type ModelGroup = { key: string; models: ProviderModel[] };
+
+/**
+ * Group by id prefix for catalogs too long to scan (astergate serves ~300).
+ * Groups appear in first-seen order and so do the models inside them, so a
+ * re-render never reshuffles the checklist.
+ */
+export function groupModels(models: ProviderModel[]): ModelGroup[] {
+  const out: ModelGroup[] = [];
+  for (const model of models) {
+    const key = modelGroupKey(model.id);
+    const group = out.find((g) => g.key === key);
+    if (group) group.models.push(model);
+    else out.push({ key, models: [model] });
+  }
+  return out;
 }
 
 type HubProvider = {

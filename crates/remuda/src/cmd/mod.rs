@@ -5,6 +5,7 @@ pub mod dev;
 pub mod dispatcher;
 pub mod doctor;
 pub mod fleet;
+pub mod hook;
 pub mod hub;
 pub mod hub_client;
 mod hub_maintenance;
@@ -53,6 +54,7 @@ commands! {
     Doctor(doctor::CommandArgs),
     Agents(agents::CommandArgs),
     Mcp(mcp::Args),
+    Hook(hook::CommandArgs),
 }
 
 #[cfg(test)]

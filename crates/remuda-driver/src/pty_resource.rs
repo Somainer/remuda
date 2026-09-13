@@ -10,6 +10,11 @@ use std::{
     time::Duration,
 };
 
+/// How long a stopped agent may take to leave its pane before the pane is
+/// closed anyway. The Instance is already gone from the Hub's point of view,
+/// so waiting longer only leaks panes into the operator's Herdr session.
+const AGENT_EXIT_GRACE: Duration = Duration::from_secs(2);
+
 /// A workspace created exclusively for one Node instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtyResource {
@@ -40,21 +45,88 @@ impl PtyResource {
         Client::connect(&self.socket_path).with_timeout(Duration::from_secs(2))
     }
 
-    /// Interrupt, offer shell exit, then close and verify the owned tab/workspace.
-    /// The grace wait is bounded; success proves carrier removal, not task success.
+    /// Interrupt the agent, then close and verify every pane, tab and the
+    /// workspace this Instance owns.
+    ///
+    /// The interrupt is a courtesy with a bounded grace: an agent that ignores
+    /// `ctrl+c` must not keep a pane alive, because the Instance is already
+    /// gone as far as the Hub is concerned and the pane would be an orphan in
+    /// the operator's Herdr session forever. After the grace the panes are
+    /// closed explicitly — closing the tab alone is not enough, since
+    /// `pane.split` may have landed the agent outside the recorded tab.
+    ///
+    /// Success proves carrier removal, never task success.
     pub async fn close(&self) -> DriverResult<()> {
         let client = self.client();
+        if !self.owned_workspace_present(&client).await? {
+            return Ok(());
+        }
+        self.interrupt_agent(&client).await;
+        // Every pane here belongs to this Instance: the workspace was created
+        // for it with a unique label, and the check above proved this is still
+        // that workspace and not an id reused after a server restart.
+        for pane in self.owned_panes(&client).await? {
+            let _ = client.pane_close(&pane).await;
+        }
+        // The tab reclaims the root shell left behind by `pane.split`.
+        let _ = client.tab_close(&self.tab_id).await;
+        if self.owned_workspace_present(&client).await? {
+            let _ = client.workspace_close(&self.workspace_id).await;
+        }
+        if self.owned_workspace_present(&client).await? {
+            return Err(DriverError::InvalidLaunchSpec(
+                "owned Herdr workspace survived close".into(),
+            ));
+        }
+        let surviving = self.owned_panes(&client).await?;
+        if !surviving.is_empty() {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "{} owned Herdr pane(s) survived close",
+                surviving.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Is this exact workspace — same id *and* creation label — still present?
+    ///
+    /// Herdr allocates ids deterministically (`w1`, `w1:t1`, `w1:p1`), so a
+    /// restarted server hands the same ids to unrelated workspaces. The
+    /// `remuda-<uuid>` creation label is the only field that distinguishes
+    /// ours, so it stays the ownership test: never close someone else's pane.
+    async fn owned_workspace_present(&self, client: &Client) -> DriverResult<bool> {
         let snapshot = client
             .session_snapshot()
             .await
             .map_err(super::claude_pty::map_herdr)?;
-        if !snapshot
+        Ok(snapshot
             .workspaces
             .iter()
-            .any(|w| w.workspace_id == self.workspace_id && w.label == self.workspace_label)
-        {
-            return Ok(());
-        }
+            .any(|w| w.workspace_id == self.workspace_id && w.label == self.workspace_label))
+    }
+
+    /// Panes inside the owned workspace, agent pane first so the native
+    /// process is reclaimed before the shell that would outlive it.
+    async fn owned_panes(&self, client: &Client) -> DriverResult<Vec<String>> {
+        let snapshot = client
+            .session_snapshot()
+            .await
+            .map_err(super::claude_pty::map_herdr)?;
+        let mut panes: Vec<String> = snapshot
+            .panes
+            .iter()
+            .filter(|pane| pane.workspace_id == self.workspace_id)
+            .map(|pane| pane.pane_id.clone())
+            .collect();
+        panes.sort_by_key(|pane| *pane != self.pane_id);
+        Ok(panes)
+    }
+
+    /// Ask the agent to exit, and wait a bounded time for it to do so.
+    ///
+    /// Best effort throughout: the caller closes the panes either way, so a
+    /// Herdr RPC failure here must not abort reclamation.
+    async fn interrupt_agent(&self, client: &Client) {
         let grace = async {
             let _ = client
                 .pane_send_keys(&self.pane_id, vec!["ctrl+c".into()])
@@ -90,37 +162,7 @@ impl PtyResource {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        let _ = tokio::time::timeout(Duration::from_secs(1), grace).await;
-        // Closing the tab also reclaims the root shell left by pane.split.
-        // A close can race natural exit; the final snapshot decides success.
-        let _ = client.tab_close(&self.tab_id).await;
-        let snapshot = client
-            .session_snapshot()
-            .await
-            .map_err(super::claude_pty::map_herdr)?;
-        if snapshot
-            .workspaces
-            .iter()
-            .any(|w| w.workspace_id == self.workspace_id && w.label == self.workspace_label)
-        {
-            client
-                .workspace_close(&self.workspace_id)
-                .await
-                .map_err(super::claude_pty::map_herdr)?;
-        }
-        if client
-            .session_snapshot()
-            .await
-            .map_err(super::claude_pty::map_herdr)?
-            .workspaces
-            .iter()
-            .any(|w| w.workspace_id == self.workspace_id && w.label == self.workspace_label)
-        {
-            return Err(DriverError::InvalidLaunchSpec(
-                "owned Herdr workspace survived close".into(),
-            ));
-        }
-        Ok(())
+        let _ = tokio::time::timeout(AGENT_EXIT_GRACE, grace).await;
     }
 }
 

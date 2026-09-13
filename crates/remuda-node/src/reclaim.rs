@@ -27,6 +27,45 @@ impl PtyResourceStore for ResourceStore {
     }
 }
 
+/// Close and forget every Herdr carrier this Instance still owns.
+///
+/// A driver's own `close()` reclaims the panes it holds in memory, but the
+/// durable `pty_resources` row is the only record that survives a rebuilt
+/// driver, an adopted pane, or a close that reported an error — and until
+/// this runs, that row's pane stays in the operator's Herdr session as an
+/// idle orphan (DEFECT B). Idempotent: a row whose workspace is already gone
+/// closes trivially and is dropped.
+///
+/// Best effort: a carrier that will not close keeps its row, so the next
+/// startup sweep tries again rather than losing track of it.
+pub(crate) async fn reclaim_instance_carriers(store: &dyn LocalStore, instance_id: &InstanceId) {
+    let resources = match store.pty_resources() {
+        Ok(resources) => resources,
+        Err(error) => {
+            tracing::warn!(%error, "could not list carrier ownership after close");
+            return;
+        }
+    };
+    for resource in resources
+        .iter()
+        .filter(|r| r.instance_id.as_ref() == Some(instance_id))
+    {
+        match resource.close().await {
+            Ok(()) => {
+                if let Err(error) = store.remove_pty_resource(&resource.key()) {
+                    tracing::warn!(%error, "carrier closed but ownership was not dropped");
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                instance_id = %instance_id.as_id(),
+                workspace_id = %resource.workspace_id,
+                "carrier did not close; ownership kept for the next sweep"
+            ),
+        }
+    }
+}
+
 impl DevNode {
     /// Configure the isolated Herdr session to reconcile at startup.
     pub fn with_herdr_config(mut self, config: NativeDriverConfig) -> Result<Self, NodeError> {
@@ -97,8 +136,22 @@ impl DevNode {
                 .await;
                 tracing::info!(instance_id = %instance.meta.id.as_id(), "adopted live Herdr pane without replay");
             } else if config.herdr_orphan_sweep {
-                resource.close().await.map_err(node_error)?;
-                self.inner.store.remove_pty_resource(&resource.key())?;
+                // Reclaim everything else: an Instance that is exited, failed,
+                // or whose agent is gone owns no pane. One stubborn carrier
+                // must not abort the sweep and leave the other orphans behind
+                // — the workspace pass below is the backstop for this one.
+                match resource.close().await {
+                    Ok(()) => {
+                        self.inner.store.remove_pty_resource(&resource.key())?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            workspace_id = %resource.workspace_id,
+                            "orphan carrier did not close; ownership kept for the next sweep"
+                        );
+                    }
+                }
                 if let Some(id) = &resource.instance_id {
                     self.mark_exited(id, "startup-orphan")?;
                 }
@@ -126,6 +179,16 @@ impl DevNode {
                     .iter()
                     .any(|w| w.workspace_id == workspace.workspace_id && w.label == workspace.label)
                 {
+                    // Close the panes first: a workspace whose agent ignores
+                    // the request would otherwise survive and leave an idle
+                    // pane in the operator's session (DEFECT B).
+                    for pane in snapshot
+                        .panes
+                        .iter()
+                        .filter(|pane| pane.workspace_id == workspace.workspace_id)
+                    {
+                        let _ = client.pane_close(&pane.pane_id).await;
+                    }
                     client
                         .workspace_close(&workspace.workspace_id)
                         .await
@@ -189,16 +252,9 @@ impl DevNode {
                 .await
                 .map_err(node_error)?;
         }
-        for resource in self
-            .inner
-            .store
-            .pty_resources()?
-            .iter()
-            .filter(|r| r.instance_id.as_ref() == Some(id))
-        {
-            resource.close().await.map_err(node_error)?;
-            self.inner.store.remove_pty_resource(&resource.key())?;
-        }
+        // Best effort per carrier: one that will not close must not stop the
+        // others from being reclaimed, nor leave the Instance looking live.
+        reclaim_instance_carriers(self.inner.store.as_ref(), id).await;
         self.mark_exited(id, reason)
     }
 
@@ -458,6 +514,62 @@ mod tests {
             store.get_instance(&id).unwrap().lifecycle,
             InstanceLifecycle::Exited
         );
+    }
+
+    /// DEFECT B: a stop settled, but the agent's Herdr pane stayed in the
+    /// operator's session. `fake-herdr` never drops an agent on `ctrl+c`, so
+    /// this is exactly the stubborn-agent case: closing must still reclaim the
+    /// pane, the tab and the workspace once the grace expires.
+    #[tokio::test]
+    async fn stopping_a_pty_instance_closes_its_agent_pane_and_forgets_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+        let client = Client::connect(&socket);
+        let store = Arc::new(MemoryStore::new(64));
+        let id = InstanceId::new();
+        store
+            .insert_instance(
+                crate::runtime::fixture_instance(
+                    id.clone(),
+                    HostId::new(),
+                    WorkspaceId::new(),
+                    DriverKind::ClaudePty,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let owned = resource(&client, Some(id.clone()), "remuda-stopped").await;
+        store.put_pty_resource(&owned).unwrap();
+        // A second Instance's pane proves the reclaim is scoped to one owner.
+        let other = resource(&client, None, "someone-else").await;
+        assert_eq!(client.session_snapshot().await.unwrap().panes.len(), 2);
+        assert_eq!(client.agent_list().await.unwrap().agents.len(), 2);
+
+        reclaim_instance_carriers(store.as_ref(), &id).await;
+
+        let snapshot = client.session_snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.workspaces.len(),
+            1,
+            "only the stopped Instance's workspace is closed"
+        );
+        assert_eq!(snapshot.workspaces[0].workspace_id, other.workspace_id);
+        assert_eq!(snapshot.panes.len(), 1, "the stopped agent's pane is gone");
+        assert_eq!(snapshot.panes[0].pane_id, other.pane_id);
+        let agents = client.agent_list().await.unwrap().agents;
+        assert_eq!(agents.len(), 1, "the stopped agent is no longer listed");
+        assert!(
+            store
+                .pty_resources()
+                .unwrap()
+                .iter()
+                .all(|r| r.instance_id.as_ref() != Some(&id))
+        );
+
+        // Idempotent: a second stop of the same Instance is a no-op.
+        reclaim_instance_carriers(store.as_ref(), &id).await;
+        assert_eq!(client.session_snapshot().await.unwrap().panes.len(), 1);
     }
 
     #[tokio::test]

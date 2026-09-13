@@ -65,6 +65,119 @@ impl DoctorReport {
     }
 }
 
+/// Check the registered workspace using the same bounded probe as Instance creation.
+pub fn doctor_workspace(report: &mut DoctorReport, workspace: &Path, _env: &ProbeEnv) {
+    match crate::workspace_access_check(workspace) {
+        Ok(()) => report.check(
+            "workspace.access",
+            "ok",
+            "Node can read the registered workspace",
+            json!({"path":workspace}),
+        ),
+        Err(error) => report.check(
+            "workspace.access",
+            "blocker",
+            &error.to_string(),
+            json!({"path":workspace}),
+        ),
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(message) =
+            crate::macos_workspace_guidance(workspace, Some(&_env.home), &executable)
+    {
+        report.check(
+            "workspace.macos-access",
+            "warning",
+            &message,
+            json!({"path":workspace,"executable":executable}),
+        );
+    }
+}
+
+/// Check access before inventory touches workspace-adjacent configuration files.
+/// An access blocker returns a partial report instead of entering unbounded reads.
+pub fn doctor_with_workspace(
+    context: &DoctorContext,
+    workspace: &Path,
+    env: ProbeEnv,
+) -> DoctorReport {
+    let mut preflight = DoctorReport::empty();
+    doctor_workspace(&mut preflight, workspace, &env);
+    if preflight.exit_code != 0 {
+        return preflight;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let default_config = env.home.join(".claude");
+        for marker in [
+            default_config.join("settings.json"),
+            env.home.join(".claude.json"),
+        ] {
+            if let Err(message) = claude_inventory_access(&marker) {
+                preflight.check(
+                    "config.claude.inventory",
+                    "blocker",
+                    &message,
+                    json!({"path":marker}),
+                );
+                return preflight;
+            }
+        }
+        doctor_claude_config_access(
+            &mut preflight,
+            &env.home,
+            std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+        );
+        if preflight.exit_code != 0 {
+            return preflight;
+        }
+    }
+    let mut report = doctor_snapshot(context, env);
+    report.checks.splice(0..0, preflight.checks);
+    report
+}
+
+#[cfg(target_os = "macos")]
+fn claude_inventory_access(path: &Path) -> Result<(), String> {
+    // Read one byte solely to trigger access checks; values never enter output.
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            r#"
+probe_error=$(/bin/ls -ld "$1" 2>&1)
+if [ $? -ne 0 ]; then
+    case "$probe_error" in *": No such file or directory") exit 0 ;; esac
+    printf '%s\n' "$probe_error" >&2; exit 1
+fi
+probe_error=$(/usr/bin/head -c 1 "$1" 2>&1 >/dev/null)
+if [ $? -ne 0 ]; then
+    case "$probe_error" in *": No such file or directory") exit 0 ;; esac
+    printf '%s\n' "$probe_error" >&2; exit 1
+fi
+"#,
+            "remuda-claude-inventory-probe",
+        ])
+        .arg(path);
+    let result = crate::workspace_access::bounded_workspace_command(
+        &mut command,
+        path,
+        Duration::from_secs(3),
+    );
+    let detail = match result {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
+        Err(error) => error.to_string(),
+    };
+    let executable = std::env::current_exe().unwrap_or_else(|_| "remuda".into());
+    Err(format!(
+        "Claude inventory configuration could not be read: {}; {}",
+        detail.trim(),
+        crate::workspace_access_guidance(&executable)
+    ))
+}
+
 /// Run filesystem, disk, executable, and identity probes using the Node collector.
 /// Auth states only describe existing markers; no login command or model is run.
 pub fn doctor_snapshot(context: &DoctorContext, env: ProbeEnv) -> DoctorReport {
@@ -219,6 +332,43 @@ pub fn doctor_snapshot(context: &DoctorContext, env: ProbeEnv) -> DoctorReport {
     report
 }
 
+#[cfg(target_os = "macos")]
+fn doctor_claude_config_access(
+    report: &mut DoctorReport,
+    home: &Path,
+    inherited_override: Option<PathBuf>,
+) {
+    let scope = if inherited_override.is_some() {
+        "inherited PTY CLAUDE_CONFIG_DIR"
+    } else {
+        "default Claude configuration"
+    };
+    let path = inherited_override.unwrap_or_else(|| home.join(".claude"));
+    if !path.is_absolute() {
+        report.check(
+            "claude.config-access",
+            "warning",
+            "relative CLAUDE_CONFIG_DIR depends on the instance working directory; configuration access is checked before launch",
+            json!({"path":path,"scope":scope}),
+        );
+        return;
+    }
+    match crate::native_config_access::check_claude_config_access(&path) {
+        Ok(()) => report.check(
+            "claude.config-access",
+            "ok",
+            "Claude startup extension directories are readable; credentials were not checked",
+            json!({"path":path,"scope":scope}),
+        ),
+        Err(error) => report.check(
+            "claude.config-access",
+            "blocker",
+            &error.to_string(),
+            json!({"path":path,"scope":scope}),
+        ),
+    }
+}
+
 fn identity_check(report: &mut DoctorReport, data_dir: &Path) {
     let node_path = data_dir.join("node/host-id");
     match std::fs::read_to_string(&node_path) {
@@ -331,6 +481,81 @@ pub fn doctor_port(report: &mut DoctorReport, name: &str, address: SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_workspace_short_circuits_inventory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let report = doctor_with_workspace(
+            &DoctorContext::default(),
+            &fixture.path().join("missing"),
+            ProbeEnv::from_process(),
+        );
+        assert_eq!(report.exit_code, 1);
+        assert!(report.inventory.is_null());
+        assert_eq!(report.checks[0].name, "workspace.access");
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| !check.name.starts_with("binary."))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inaccessible_claude_configuration_short_circuits_inventory() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join(".claude"), "not a directory").unwrap();
+        let mut env = ProbeEnv::from_process();
+        env.home = fixture.path().to_owned();
+        let report = doctor_with_workspace(&DoctorContext::default(), fixture.path(), env);
+        assert_eq!(report.exit_code, 1);
+        assert!(report.inventory.is_null());
+        assert!(report.checks.iter().any(|check| {
+            check.name.starts_with("config.claude.")
+                && check.status == "blocker"
+                && check.message.contains("configuration")
+        }));
+    }
+
+    #[test]
+    fn workspace_diagnostics_report_failed_access_as_a_blocker() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut report = DoctorReport::empty();
+        doctor_workspace(
+            &mut report,
+            &fixture.path().join("missing"),
+            &ProbeEnv::from_process(),
+        );
+        assert_eq!(report.exit_code, 1);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| { check.name == "workspace.access" && check.status == "blocker" })
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn protected_workspace_diagnostics_include_daemon_permission_guidance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("Documents/workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut env = ProbeEnv::from_process();
+        env.home = fixture.path().to_owned();
+        let mut report = DoctorReport::empty();
+        doctor_workspace(&mut report, &workspace, &env);
+        assert_eq!(report.exit_code, 0);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "workspace.macos-access")
+            .unwrap();
+        assert_eq!(check.status, "warning");
+        assert!(check.message.contains("Full Disk Access"));
+        assert!(check.message.contains("Privacy & Security"));
+    }
 
     #[test]
     fn disk_units_and_conflicting_port_are_explicit() {
@@ -530,4 +755,47 @@ mod tests {
         assert_eq!(gateway.details["configured"], true);
         assert_eq!(gateway.details["installed"], true);
     }
+}
+#[cfg(target_os = "macos")]
+#[test]
+fn claude_config_diagnostics_distinguish_default_override_and_relative_scopes() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join(".claude"), "invalid directory").unwrap();
+    let mut default = DoctorReport::empty();
+    doctor_claude_config_access(&mut default, fixture.path(), None);
+    assert_eq!(default.exit_code, 1);
+    assert_eq!(default.checks[0].name, "claude.config-access");
+    assert_eq!(default.checks[0].status, "blocker");
+    assert!(default.checks[0].message.contains("Full Disk Access"));
+
+    let isolated = fixture.path().join("isolated");
+    std::fs::create_dir_all(isolated.join("skills/example")).unwrap();
+    std::fs::write(
+        isolated.join("skills/example/SKILL.md"),
+        "private-markdown-never-returned",
+    )
+    .unwrap();
+    let mut overridden = DoctorReport::empty();
+    doctor_claude_config_access(&mut overridden, fixture.path(), Some(isolated));
+    assert_eq!(overridden.exit_code, 0);
+    assert_eq!(overridden.checks[0].status, "ok");
+    assert_eq!(
+        overridden.checks[0].details["scope"],
+        "inherited PTY CLAUDE_CONFIG_DIR"
+    );
+    assert!(
+        !serde_json::to_string(&overridden)
+            .unwrap()
+            .contains("private-markdown-never-returned")
+    );
+
+    let mut relative = DoctorReport::empty();
+    doctor_claude_config_access(&mut relative, fixture.path(), Some("relative".into()));
+    assert_eq!(relative.exit_code, 0);
+    assert_eq!(relative.checks[0].status, "warning");
+    assert!(
+        relative.checks[0]
+            .message
+            .contains("instance working directory")
+    );
 }

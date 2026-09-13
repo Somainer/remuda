@@ -43,6 +43,9 @@ pub(crate) struct Args {
     /// Explicit Herdr server socket included in the inventory.
     #[arg(long, global = true)]
     herdr_socket: Option<PathBuf>,
+    /// Directory registered for Instances managed by this Node.
+    #[arg(long, global = true)]
+    workspace: Option<PathBuf>,
 }
 
 impl Args {
@@ -58,6 +61,14 @@ impl Args {
         }
         if let Some(path) = &self.herdr_socket {
             config.node.herdr_socket = Some(path.clone());
+        }
+        if let Some(path) = &self.workspace {
+            ensure!(!path.as_os_str().is_empty(), "workspace cannot be empty");
+            config.node.workspace = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
         }
         config.node.labels.extend(parse_labels(&self.labels)?);
         config.validate()
@@ -105,7 +116,7 @@ pub(crate) async fn run(
         native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
         native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
         native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
-        std::fs::create_dir_all(&config.node.workspace)?;
+        remuda_node::prepare_workspace(&config.node.workspace)?;
         let runtime = compose(&ServeConfig {
             http: DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone()),
             data_dir: config.data_dir.clone(),
@@ -423,6 +434,7 @@ mod tests {
             labels: vec!["region=cli".into()],
             max_instances: Some(3),
             herdr_socket: None,
+            workspace: None,
         };
         args.apply(&mut config).expect("CLI overrides");
         assert_eq!(config.node.labels["region"], "cli");

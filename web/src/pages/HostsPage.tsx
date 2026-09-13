@@ -13,6 +13,7 @@ import {
 import { fromHub, type ProviderProfile } from "../features/providers";
 import { hubStore, useHub } from "../lib/store";
 import { api } from "../lib/api";
+import { HostDiagnostics } from "../features/hosts/HostDiagnostics";
 import ui from "../styles/ui.module.css";
 import css from "../features/hosts/hosts.module.css";
 
@@ -232,6 +233,7 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label:
             )}
           </div>
         </div>
+        <HostDiagnostics hostId={host.id} online={host.online} />
         <div className={css.fields}>
           <label className={ui.field}>
             显示名

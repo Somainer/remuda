@@ -117,6 +117,9 @@ async fn dispatch_hub(
         Some(controller) => Some(controller.dispatch_guard().await?),
         None => None,
     };
+    if method == "host.doctor" {
+        return runtime.node.doctor().await;
+    }
     if crate::interactions::is_interaction_method(method) {
         let result = runtime.node.dispatch_interaction(method, params).await?;
         if let Ok(page) = runtime.node.list_instances() {

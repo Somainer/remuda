@@ -152,8 +152,9 @@ impl DevNode {
             .read()
             .map_err(|_| NodeError::InvalidConfig("diagnostics lock poisoned".into()))?
             .clone();
+        let workspace = std::path::PathBuf::from(&self.inner.workspace.root_path);
         let report = tokio::task::spawn_blocking(move || {
-            crate::doctor_snapshot(&context, crate::ProbeEnv::from_process())
+            crate::doctor_with_workspace(&context, &workspace, crate::ProbeEnv::from_process())
         })
         .await
         .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
@@ -1414,6 +1415,7 @@ fn fixture_workspace(
     host_id: HostId,
     root: &Path,
 ) -> Result<Workspace, NodeError> {
+    crate::workspace_access_check(root)?;
     let now = timestamp_now()?;
     let root = root.to_string_lossy().into_owned();
     Ok(Workspace {

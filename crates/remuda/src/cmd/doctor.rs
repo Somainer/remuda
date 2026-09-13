@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Args;
-use remuda_node::{DoctorContext, DoctorReport, ProbeEnv, doctor_port, doctor_snapshot};
+use remuda_node::{DoctorContext, DoctorReport, ProbeEnv, doctor_port, doctor_with_workspace};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -162,8 +162,9 @@ pub(crate) async fn inspect(
             data_dir: Some(config.data_dir.clone()),
             listeners: Vec::new(),
         };
+        let workspace = config.node.workspace.clone();
         let mut report = tokio::task::spawn_blocking(move || {
-            doctor_snapshot(&context, ProbeEnv::from_process())
+            doctor_with_workspace(&context, &workspace, ProbeEnv::from_process())
         })
         .await?;
         let owned_listeners = local_node_listeners(&report, &registered, client).await;

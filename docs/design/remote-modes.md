@@ -38,6 +38,45 @@ hello requests control explicitly; a later controller must request takeover.
 Takeover fences the previous controller without stopping accepted instance work.
 The Hub-facing hello identifies the connection as a bridge to a persistent daemon.
 
+## macOS daemon prerequisites
+
+Terminal access and launchd access are separate macOS privacy decisions. A Node
+launched by `remuda node install` may lack permission to read `~/Documents`,
+`~/Desktop`, or `~/Downloads` even when the same command works in a terminal.
+Grant **Full Disk Access** to the installed Remuda executable in **System Settings
+→ Privacy & Security → Full Disk Access**, then restart that Node, or register a
+workspace outside those protected folders. The installer prints this guidance
+for a protected `--workspace` path; it does not grant access or change privacy
+settings. Keep the executable at a stable path when configuring access.
+
+Workspace registration, instance creation and read-only Git probes use bounded
+subprocess checks. A permission error or deadline returns an actionable access diagnostic
+instead of waiting indefinitely in a filesystem call. The host doctor and Hosts
+details show the workspace check and remediation. The path check is advisory:
+an unprotected path may still reach protected data through a symlink.
+
+Claude's user configuration is another access boundary. A skill, command or
+agent symlink under the effective Claude config directory can point into a
+protected folder and block native startup before the UI or `SessionStart`, even
+with a workspace under `/tmp`. The macOS Claude factory checks settings access,
+each skill entry’s `SKILL.md`, and command/agent Markdown discovery in one
+three-second subprocess before dispatch. It does not traverse unrelated skill
+fixtures or examples. Host doctor checks workspace and configuration access
+before collecting inventory; a blocker produces a partial report. Its config
+check covers the daemon’s default/inherited config, while instance creation also
+checks an explicit per-instance `claudeConfigDir`. Fix the reported access or
+explicitly choose an accessible `claudeConfigDir`; Remuda does not remove skills,
+copy credentials, or skip native configuration automatically. A real native
+startup dialog retains the D-022 queued-input behavior.
+
+Generated launchd units use `ProcessType=Interactive`: the daemon serves
+user-requested terminal work over WSS rather than XPC activities. The previous
+Background policy throttled native children and startup binary hashing. This
+scheduling change does not grant filesystem access or replace the privacy
+prerequisite. Existing installations adopt the unit change when reinstalled.
+See [daemon Claude evidence](./evidence/daemon-claude-1.md) for the isolated
+before/after probes and their limits.
+
 ## Recovery contract
 
 The Node sends journal records using their original `journal.append` sequence.

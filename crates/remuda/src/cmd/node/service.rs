@@ -274,6 +274,16 @@ fn service_environment() -> BTreeMap<String, String> {
 
 async fn install_service(mut config: Config, args: Args, install: InstallArgs) -> Result<()> {
     let launchd = install.manager.launchd()?;
+    if launchd {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(message) = remuda_node::macos_workspace_guidance(
+            &config.node.workspace,
+            home.as_deref(),
+            &std::env::current_exe()?,
+        ) {
+            eprintln!("warning: {message}");
+        }
+    }
     if let Some(hub) = install.hub {
         config.node.hub_url = Some(hub_endpoint(&hub));
     }

@@ -1200,6 +1200,26 @@ function createLiveApi(): HubApi {
 
 export const api: HubApi = MOCK ? createMockApi() : createLiveApi();
 
+export interface HostDoctorReport {
+  exitCode: number;
+  checks: { name: string; status: string; message: string }[];
+}
+
+/** Fresh read-only checks run by the selected Node with its own process permissions. */
+export async function fetchHostDoctor(hostId: Id): Promise<HostDoctorReport> {
+  if (MOCK) return { exitCode: 0, checks: [{ name: "host.diagnostics", status: "warning", message: "模拟模式不运行主机诊断" }] };
+  const report = await rest<unknown>(`/v1/hosts/${encodeURIComponent(hostId)}/doctor`, { signal: AbortSignal.timeout(65_000) });
+  if (!report || typeof report !== "object" || !("exitCode" in report) || !Number.isInteger(report.exitCode)
+    || !("checks" in report) || !Array.isArray(report.checks) || report.checks.length === 0
+    || !report.checks.every((check: unknown) => check !== null && typeof check === "object"
+      && "name" in check && typeof check.name === "string"
+      && "status" in check && ["ok", "warning", "blocker"].includes(String(check.status))
+      && "message" in check && typeof check.message === "string")) {
+    throw new Error("主机返回了无效的诊断报告；请升级 Node 后重新检查");
+  }
+  return report as HostDoctorReport;
+}
+
 /** Uncompressed P-256 prefix + dummy coordinates; mock VAPID only. */
 const MOCK_VAPID_PUBLIC_KEY =
   "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

@@ -136,8 +136,15 @@ test.describe("live remote terminal", () => {
     expect(a).not.toEqual(b);
 
     const lab = page.locator("[data-tty-lab='1']");
+    // The sidebar is the Spaces panel; its session rows are plain links.
+    // Clicking one is a client-side navigation, so TerminalView stays mounted
+    // and only the `[instance.id]` effect re-runs — the bug's exact trigger.
     const switchTo = async (id: string) => {
-      await page.locator(`[data-testid=session-row][href^="/s/${id}"]`).first().click();
+      const row = page
+        .locator(`[data-testid=spaces-panel] a[href="/s/${id}"], [data-testid=session-row][href^="/s/${id}"]`)
+        .first();
+      await expect(row).toBeVisible({ timeout: 20_000 });
+      await row.click();
       await expect(page).toHaveURL(new RegExp(`/s/${id}`), { timeout: 20_000 });
       await expect(lab).toHaveAttribute("data-tty-status", "live", { timeout: 30_000 });
       await page.waitForTimeout(800);

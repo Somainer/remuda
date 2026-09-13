@@ -48,8 +48,8 @@ so nothing leaks across a switch, and the async `attachTerminalRenderer` resolut
 guarded against landing on a disposed terminal.
 
 Regression test: `terminal-live.spec.ts` › *stdin, mouse and scroll survive a sidebar
-session switch (A→B→A)*. Creates two shell-pty sessions, switches via the sidebar (never
-`goto`, so the component stays mounted), then asserts `readOnly === false`, that typing
+session switch (A→B→A)*. Creates two shell-pty sessions, switches by clicking their rows
+in the Spaces panel (never `goto`, so the component stays mounted), then asserts `readOnly === false`, that typing
 echoes, and that a wheel + click over `printf '\033[?1000h\033[?1006h'; cat -v` produce
 SGR reports. Run against the pre-fix tree it fails exactly at the `readOnly` assertion
 (`Expected: false / Received: true`); after the fix it passes.

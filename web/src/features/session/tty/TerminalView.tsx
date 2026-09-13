@@ -22,6 +22,7 @@ import {
   MOUSE_TRACKING_RESET,
   trackingActive,
 } from "./mouseReports";
+import { createReplayGuard, groupByOrigin, type OutChunk } from "./replayGuard";
 import { applyStdinPolicy, stdinPolicy } from "./stdinPolicy";
 import { NIGHT_CORRAL_THEME, TERMINAL_FONT_FAMILY } from "./theme";
 import css from "./TerminalView.module.css";
@@ -39,16 +40,8 @@ declare global {
 
 type DisplayMode = "fit" | "fixed" | "responsive";
 
-function concatQueued(chunks: Uint8Array[]): Uint8Array {
-  const total = chunks.reduce((n, chunk) => n + chunk.byteLength, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
+/** The font the terminal is built with, and the ceiling every fit measures from. */
+const BASE_FONT_SIZE = 14;
 
 export function TerminalView({
   instance,
@@ -87,6 +80,7 @@ export function TerminalView({
   const modeRef = useRef<DisplayMode>(mode);
   const failRef = useRef(onAttachFailed);
   const applyFitRef = useRef<() => void>(() => {});
+  const settleFitRef = useRef<() => void>(() => {});
   const instanceRef = useRef(instance);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -136,7 +130,7 @@ export function TerminalView({
       cursorBlink: true,
       cursorStyle: "block",
       fontFamily: TERMINAL_FONT_FAMILY,
-      fontSize: 14,
+      fontSize: BASE_FONT_SIZE,
       lineHeight: 1,
       scrollback: 4000,
       convertEol: false,
@@ -166,18 +160,26 @@ export function TerminalView({
     setRawTail("");
     const font = createFontMeasure(host, TERMINAL_FONT_FAMILY);
     let disposed = false;
-    const outQueue: Uint8Array[] = [];
+    const outQueue: OutChunk[] = [];
+    const replayGuard = createReplayGuard();
     let outRaf = 0;
     let resizeTimer = 0;
 
     const flushOut = () => {
       outRaf = 0;
       if (!outQueue.length) return;
-      const merged = concatQueued(outQueue.splice(0));
-      term.write(merged, () => {
-        setReady(true);
-        setMouseMode(term.modes.mouseTrackingMode);
-      });
+      // One write per origin run, not one per batch: a frame can carry replayed
+      // snapshot bytes and live bytes together, and the guard decision differs.
+      for (const run of groupByOrigin(outQueue.splice(0))) {
+        if (run.replay) replayGuard.enter();
+        term.write(run.bytes, () => {
+          // xterm runs this right after *this* chunk is parsed, in FIFO order,
+          // so the guard drops exactly when the replayed bytes are done.
+          if (run.replay) replayGuard.leave();
+          setReady(true);
+          setMouseMode(term.modes.mouseTrackingMode);
+        });
+      }
     };
 
     const applyFit = () => {
@@ -197,7 +199,7 @@ export function TerminalView({
         letterSpacing: term.options.letterSpacing || 0,
       };
       if (modeRef.current === "responsive") {
-        const size = responsiveTerminalSize(bounds, font.measure, 14);
+        const size = responsiveTerminalSize(bounds, font.measure, BASE_FONT_SIZE);
         if (size && (term.cols !== size.cols || term.rows !== size.rows)) term.resize(size.cols, size.rows);
         if (size) {
           setCols(size.cols);
@@ -209,16 +211,24 @@ export function TerminalView({
         }
         return;
       }
-      fit.fit();
       if (modeRef.current === "fit") {
-        const fitted = fittedTerminalFont(
-          { ...bounds, cols: term.cols, rows: term.rows },
-          font.measure,
-          14,
-        );
-        if (fitted != null && term.options.fontSize !== fitted) term.options.fontSize = fitted;
-        fit.fit();
+        // Size the font against the grid the box yields at the BASE font, not
+        // against the current grid. `fit.fit()` derives cols/rows from the font
+        // in effect, so feeding those back into the font search is a ratchet:
+        // each pass shrinks the font, which widens the grid, which shrinks the
+        // font again — 13.2px drifted to 1.66px and 1426 columns across a
+        // fullscreen toggle. Anchoring on the base size makes it idempotent.
+        const target = responsiveTerminalSize(bounds, font.measure, BASE_FONT_SIZE);
+        if (target) {
+          const fitted = fittedTerminalFont(
+            { ...bounds, cols: target.cols, rows: target.rows },
+            font.measure,
+            BASE_FONT_SIZE,
+          );
+          if (fitted != null && term.options.fontSize !== fitted) term.options.fontSize = fitted;
+        }
       }
+      fit.fit();
       // A4: FitAddon derives rows from its own CSS cell estimate, which can
       // round one row larger than the renderer actually paints; that extra row
       // then overflows `.host` and the bottom line is clipped. Trim against
@@ -245,16 +255,47 @@ export function TerminalView({
     // mode (and the stale-flag bug) kill scroll and clicks along with typing.
     const inputDisposable = term.onData((data) => {
       if (term.options.disableStdin) return;
+      // Answers the emulator generated while parsing replayed history: the app
+      // that asked is gone, so these would land as junk on the shell prompt.
+      if (replayGuard.active()) return;
       if (!allowInput(data, gateRef.current)) return;
       send(data);
     });
     const binaryDisposable = term.onBinary((data) => {
       if (term.options.disableStdin) return;
+      if (replayGuard.active()) return;
       if (!allowInput(data, gateRef.current)) return;
       send(binaryStringToBytes(data));
     });
 
+    /**
+     * Re-fit across a container size change that React drives (fullscreen,
+     * display mode). One synchronous fit in the effect is not enough: the
+     * fullscreen rules swap the container to `position: fixed; inset: 0;
+     * height: 100dvh` plus safe-area padding, and the box the effect measures
+     * can still be the pre-swap one — which is how a fullscreen terminal ends
+     * up with a full-width but far-too-short grid drawn inside a tall area.
+     * There is no CSS transition on `.lab`, so `transitionend` never fires and
+     * cannot be the signal; settle across frames instead.
+     */
+    const settleFit = () => {
+      applyFit();
+      requestAnimationFrame(() => {
+        if (disposed) return;
+        applyFit();
+        requestAnimationFrame(() => {
+          if (disposed) return;
+          applyFit();
+        });
+      });
+      // Fonts can land after the transition, changing the cell size again.
+      void whenFontsReady().then(() => {
+        if (!disposed) applyFit();
+      });
+    };
+
     applyFitRef.current = applyFit;
+    settleFitRef.current = settleFit;
     void whenFontsReady().then(() => applyFitRef.current());
     applyFit();
     void attachTerminalRenderer(term).then((name) => {
@@ -269,7 +310,7 @@ export function TerminalView({
         resetStreamRef.current = true;
         term.reset();
       },
-      onFrame: (payload, _offset, _streamId, reset) => {
+      onFrame: (payload, _offset, _streamId, reset, replay) => {
         const shouldReset = reset || resetStreamRef.current;
         if (shouldReset) {
           term.reset();
@@ -281,7 +322,7 @@ export function TerminalView({
         // B5: bound the preview like rawTail — an unbounded <pre> wedges long sessions.
         setPreview((current) => (shouldReset ? text : (current + text).slice(-4000)));
         setRawTail((current) => (shouldReset ? latin1 : (current + latin1).slice(-4000)));
-        outQueue.push(bytes);
+        outQueue.push({ bytes, replay });
         if (!outRaf) outRaf = requestAnimationFrame(flushOut);
       },
       onStatus: (next, message) => {
@@ -360,8 +401,17 @@ export function TerminalView({
     };
   }, [instance.id]);
 
+  // A container size change that React drives needs more than the one
+  // synchronous fit this effect used to do — see settleFit. But only on an
+  // actual transition: running the multi-frame settle on mount races the
+  // renderer's own first sizing and leaves `.xterm-screen` collapsed.
+  const lastLayoutRef = useRef(`${mode}:${fullscreen}`);
   useEffect(() => {
-    applyFitRef.current();
+    const key = `${mode}:${fullscreen}`;
+    const changed = lastLayoutRef.current !== key;
+    lastLayoutRef.current = key;
+    if (changed) settleFitRef.current();
+    else applyFitRef.current();
   }, [mode, fullscreen]);
 
   useEffect(() => {
@@ -535,17 +585,15 @@ export function TerminalView({
           {rawTail}
         </pre>
       </div>
-      <div className={css.dock}>
-        {directInput ? (
-          <>
-            <span className={css.dockLabel}>raw</span>
-            <div className={css.directGhost}>直连开启中 —— 击键 / 鼠标 / 粘贴直接进 PTY</div>
-            <div className={css.directGhostSend}>发送</div>
-          </>
-        ) : (
+      {/* 直连 sends keys straight to the PTY, so the local input box has no
+          job. Render nothing at all rather than a disabled ghost: `.dock`
+          itself carries padding and a border-top, so keeping the container
+          would still reserve a strip of dead space under the terminal. */}
+      {!directInput ? (
+        <div className={css.dock} data-testid="tty-dock">
           <LocalInput disabled={frozen} mobile={mobile} onSend={send} />
-        )}
-      </div>
+        </div>
+      ) : null}
       {mobile ? <AuxKeys disabled={frozen} onKey={send} /> : null}
       {!mobile ? (
         <div className={css.note}>

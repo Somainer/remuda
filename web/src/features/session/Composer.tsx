@@ -2,12 +2,10 @@ import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from
 import { readDraft, writeDraft } from "../../lib/drafts";
 import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
-import type { HostCli } from "../hosts";
 import { EffortSlider } from "./EffortSlider";
 import {
   effortCaps,
   effortTable,
-  HARNESS_META,
   harnessMeta,
   isEmberTier,
   mapEffort,
@@ -16,7 +14,7 @@ import {
 } from "./effort";
 import css from "./session.module.css";
 
-type MenuId = "harness" | "effort" | "permission" | null;
+type MenuId = "effort" | "permission" | null;
 type Placement = "up" | "down";
 
 export function Composer({
@@ -33,10 +31,7 @@ export function Composer({
   effort,
   onEffort,
   onModel,
-  onHarness,
   contextLabel,
-  hostLabel,
-  hostCli = [],
   effortDisabled,
 }: {
   instanceId: string;
@@ -52,21 +47,18 @@ export function Composer({
   effort?: EffortSelection;
   onEffort?: (next: EffortSelection) => void;
   onModel?: (model: string) => void;
-  onHarness?: (kind: EffortKind) => void;
   contextLabel?: string | null;
-  hostLabel?: string;
-  hostCli?: HostCli[];
   /** True when the session cannot take instance.configure (exited / observed-only). */
   effortDisabled?: boolean;
 }) {
   const [text, setText] = useState(() => readDraft(instanceId));
-  const [harnessOverride, setHarnessOverride] = useState<string | null>(null);
   const [menu, setMenu] = useState<MenuId>(null);
   const [placement, setPlacement] = useState<Placement>("down");
   const rootRef = useRef<HTMLFormElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const harness = harnessOverride ?? kind;
+  // The harness is fixed for the life of a session; it is chosen on New Session.
+  const harness = kind;
 
   const caps = effortCaps(harness);
   const incoming = effort ?? { index: 1, name: "think", kind: (kind as EffortKind) || "claude" };
@@ -76,10 +68,6 @@ export function Composer({
   const ember = isEmberTier(harness, currentEffort.index);
   const effortLocked = Boolean(effortDisabled) || !onEffort || table.length === 0;
   const permLabel = PERMISSION_OPTIONS.find((m) => m.id === permissionMode)?.label ?? permissionMode;
-  const installed = new Set(hostCli.filter((c) => c.path || c.version).map((c) => c.kind));
-  if (!installed.size) installed.add("claude");
-  installed.add(String(kind));
-  installed.add(String(harness));
 
   const submit = async () => {
     const value = text.trim();
@@ -132,15 +120,6 @@ export function Composer({
     setMenu((cur) => (cur === id ? null : id));
   };
 
-  const pickHarness = (next: EffortKind, enabled: boolean) => {
-    if (!enabled) return;
-    setHarnessOverride(next);
-    const mapped = mapEffort({ ...currentEffort, kind: (currentEffort.kind || harness) as EffortKind }, next);
-    onHarness?.(next);
-    onEffort?.(mapped);
-    setMenu(null);
-  };
-
   const harnessChip = harnessMeta(harness);
   const effortChipLabel = currentEffort.name;
 
@@ -186,17 +165,10 @@ export function Composer({
       </div>
       <div className={css.controlBar} ref={barRef} data-testid="composer-bar">
         {caps.harness ? (
-          <button
-            type="button"
-            className={css.chip}
-            data-testid="harness-chip"
-            aria-expanded={menu === "harness"}
-            onClick={() => toggle("harness")}
-          >
+          <span className={css.chip} data-testid="harness-chip" data-readonly="1">
             <span className={css.chipMark}>{harnessChip.mark}</span>
             <span>{mobile ? harnessChip.label.replace(" Code", "") : harnessChip.label}</span>
-            <span className={css.chipCaret}>▾</span>
-          </button>
+          </span>
         ) : null}
         {caps.effort ? (
           <button
@@ -253,44 +225,6 @@ export function Composer({
           </button>
         )}
       </div>
-      {menu === "harness" ? (
-        <div
-          ref={menuRef}
-          className={`${css.popover} ${placement === "up" ? css.popoverUp : ""}`}
-          data-testid="harness-menu"
-          data-placement={placement}
-        >
-          {HARNESS_META.map((item) => {
-            const cli = hostCli.find((c) => c.kind === item.id);
-            const enabled = item.id === "terminal" || item.id === "claude" || installed.has(item.id);
-            const on = harness === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={`${css.harnessRow} ${on ? css.harnessOn : ""} ${enabled ? "" : css.harnessOff}`}
-                data-testid={`harness-option-${item.id}`}
-                data-installed={enabled ? "1" : "0"}
-                disabled={!enabled}
-                onClick={() => pickHarness(item.id, enabled)}
-              >
-                <span className={css.chipMark}>{item.mark}</span>
-                <span className={css.harnessName}>{item.label}</span>
-                {enabled ? (
-                  <span className={css.harnessMeta}>
-                    {cli?.auth === "logged_in" ? `${hostLabel ?? "host"} · logged_in` : cli?.version ?? ""}
-                    {on ? " ✓" : ""}
-                  </span>
-                ) : (
-                  <span className={css.harnessPlus} aria-label="未安装">
-                    +
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
       {menu === "effort" ? (
         <div
           ref={menuRef}

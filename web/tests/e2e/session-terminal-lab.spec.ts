@@ -18,8 +18,8 @@ test.describe("dev-only TTY lab M0-14", () => {
     await expect(page.getByTestId("tty-keybar")).toBeVisible();
     await expect(page.getByTestId("tty-key-esc")).toBeVisible();
     await expect(page.getByTestId("tty-key-ctrl-c")).toBeVisible();
-    await expect(page.getByRole("link", { name: "终端" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "结构" })).toBeVisible();
+    await expect(page.getByTestId("view-switch")).toHaveAttribute("data-view", "tty");
+    await expect(page.getByTestId("view-switch-structured")).toBeVisible();
     if (test.info().project.name === "chromium") {
       await page.screenshot({
         path: path.join(evidence, "terminal-1-lab.png"),
@@ -40,6 +40,6 @@ test.describe("dev-only TTY lab M0-14", () => {
     await page.goto("/sessions");
     await page.getByText("看 TaskManager spill").first().click();
     await expect(page.getByTestId("session-page")).toBeVisible();
-    await expect(page.getByRole("link", { name: "终端" })).toHaveCount(0);
+    await expect(page.getByTestId("view-switch")).toHaveCount(0);
   });
 });

@@ -219,6 +219,47 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("effort-reset")).toBeDisabled();
   });
 
+  it("shows the harness as a static label inside a session, with no menu", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_locked"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="codex"
+        model="gpt-5"
+        effort={effortAt("codex", 1)}
+      />,
+    );
+    const chip = screen.getByTestId("harness-chip");
+    expect(chip).toHaveAttribute("data-readonly", "1");
+    expect(chip).toHaveTextContent("Codex");
+    expect(chip).toHaveTextContent("X");
+    expect(chip.tagName).toBe("SPAN");
+    expect(chip).not.toHaveAttribute("aria-expanded");
+    await user.click(chip);
+    expect(screen.queryByTestId("harness-menu")).toBeNull();
+    expect(screen.queryByTestId("harness-option-claude")).toBeNull();
+    expect(screen.queryByTestId("harness-option-terminal")).toBeNull();
+  });
+
+  it("abbreviates the harness label on mobile but keeps it static", () => {
+    render(
+      <Composer
+        instanceId="ins_locked_m"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 1)}
+      />,
+    );
+    const chip = screen.getByTestId("harness-chip");
+    expect(chip).toHaveTextContent("Claude");
+    expect(chip).not.toHaveTextContent("Claude Code");
+    expect(chip.querySelector("button")).toBeNull();
+  });
+
   it("shows a read-only yolo permission chip for grok pty", () => {
     render(
       <Composer

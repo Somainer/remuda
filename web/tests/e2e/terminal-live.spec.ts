@@ -87,7 +87,7 @@ test.describe("live remote terminal", () => {
     await expect(lab).toBeVisible();
     await expect(page.getByTestId("tty-mode-pill")).toBeVisible();
     await expect(page.getByTestId("tty-keybar")).toBeVisible();
-    await expect(page.getByRole("link", { name: "结构" })).toBeVisible();
+    await expect(page.getByTestId("view-switch-structured")).toBeVisible();
     await expect(lab).toHaveAttribute("data-tty-status", /live|connecting|reconnecting/, { timeout: 10_000 });
     await page.waitForTimeout(1500);
     // A4: applyFit measures `.host` (which carries the padding), so the outer

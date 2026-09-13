@@ -35,8 +35,9 @@ test.describe("new session sheet", () => {
     await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "tty");
     await expect(page.locator("[data-tty-lab='1']")).toBeVisible();
     await expect(page.locator("[data-tty-ready='1']")).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole("link", { name: "终端" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "结构" })).toBeVisible();
+    await expect(page.getByTestId("view-switch")).toHaveAttribute("data-view", "tty");
+    await expect(page.getByTestId("view-switch-tty")).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByTestId("view-switch-structured")).toHaveAttribute("aria-checked", "false");
     if (test.info().project.name === "chromium") {
       await page.screenshot({ path: path.join(evidence, "terminal-1-new-session.png"), animations: "disabled" });
     }

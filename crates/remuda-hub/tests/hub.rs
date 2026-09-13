@@ -212,6 +212,137 @@ async fn healthz_ok() -> Result<()> {
 }
 
 #[tokio::test]
+async fn instance_configure_is_journaled_and_persisted() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "runtime.hello",
+            "params": { "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0", "label": "configure-node" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let method = frame["method"].as_str().unwrap_or_default();
+            let params = frame.get("params").cloned().unwrap_or(json!({}));
+            let command_id = params
+                .get("commandId")
+                .cloned()
+                .unwrap_or_else(|| json!("cmd_test"));
+            let _ = node
+                .send(Message::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "command": {
+                                "commandId": command_id,
+                                "state": "accepted",
+                                "operation": method
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+        }
+    });
+
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "model": "haiku",
+        "prompt": "configure-me",
+        "effort": { "index": 1, "name": "think", "kind": "claude" }
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim())?;
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+    assert_eq!(created["instance"]["effortName"], json!("think"));
+    assert_eq!(created["instance"]["effortIndex"], json!(1));
+
+    let configure = json!({
+        "operation": "instance.configure",
+        "payload": {
+            "model": "opus",
+            "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
+        }
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/instances/{instance_id}/commands"),
+        &[("Cookie", &cookie)],
+        Some(&configure),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let body: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(body["command"]["operation"], json!("instance.configure"));
+    assert_eq!(
+        body["command"]["payload"]["effort"]["name"],
+        json!("ultracode")
+    );
+    assert_eq!(body["command"]["payload"]["effort"]["index"], json!(3));
+    assert!(
+        matches!(
+            body["command"]["state"].as_str(),
+            Some("queued" | "accepted" | "settled")
+        ),
+        "three-state command, got {}",
+        body["command"]["state"]
+    );
+
+    let (status, _, inst) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{inst}");
+    let inst: Value = serde_json::from_str(inst.trim())?;
+    assert_eq!(inst["model"], json!("opus"));
+    assert_eq!(inst["effortName"], json!("ultracode"));
+    assert_eq!(inst["effortIndex"], json!(3));
+    Ok(())
+}
+
+#[tokio::test]
 async fn auth_reject_http_and_origin() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
     let (status, _, _) = http(hub.addr, "GET", "/v1/hosts", &[], None).await?;

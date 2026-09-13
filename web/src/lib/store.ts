@@ -9,6 +9,7 @@ import { api, observationText, type InstanceCreateSpec, type PtyKey, type Worktr
 import {
   DEFAULT_EFFORT_INDEX,
   effortAt,
+  effortFromRecord,
   mapEffort,
   type EffortKind,
   type EffortSelection,
@@ -515,14 +516,24 @@ class HubStore {
 
   effortOf(instanceId: Id, kind?: EffortKind | string): EffortSelection {
     const stored = this.state.effort[instanceId];
-    const fallbackKind = (kind ?? stored?.kind ?? "claude") as EffortKind;
-    if (!stored) return effortAt(fallbackKind, readDeviceSettings().defaultEffortIndex ?? DEFAULT_EFFORT_INDEX);
-    if (kind && stored.kind !== kind) return mapEffort(stored, kind);
-    return stored;
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    const fallbackKind = (kind ?? stored?.kind ?? instance?.kind ?? "claude") as EffortKind;
+    if (stored) {
+      if (kind && stored.kind !== kind) return mapEffort(stored, kind);
+      return stored;
+    }
+    const recorded = effortFromRecord(fallbackKind, instance?.effortName, instance?.effortIndex);
+    if (recorded) return recorded;
+    return effortAt(fallbackKind, readDeviceSettings().defaultEffortIndex ?? DEFAULT_EFFORT_INDEX);
   }
 
   modelOf(instanceId: Id, kind?: string): string {
-    return this.state.models[instanceId] ?? (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus");
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    return (
+      this.state.models[instanceId] ??
+      instance?.model ??
+      (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus")
+    );
   }
 
   hostName(hostId: Id) {

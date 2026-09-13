@@ -1039,8 +1039,10 @@
           "path": { "type": ["string", "null"] },
           "auth": {
             "type": "string",
-            "enum": ["logged_in", "logged_out", "unknown"]
-          }
+            "enum": ["logged_in", "logged_out", "unknown", "gateway-native", "none"]
+          },
+          "installed": { "type": "boolean" },
+          "nativeGateway": { "type": "boolean" }
         }
       },
       "HostView": {
@@ -1149,6 +1151,9 @@
           "cwd": { "type": ["string", "null"] },
           "delegation": { "type": ["string", "null"] },
           "providerProfileId": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "effortName": { "type": ["string", "null"] },
+          "effortIndex": { "type": ["integer", "null"] },
           "journalId": { "type": "string" },
           "durableSeq": { "type": "string" },
           "createdAt": { "type": "string" },

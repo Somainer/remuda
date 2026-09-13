@@ -1,5 +1,7 @@
 //! Node carrier selection and driver shutdown through the current public Node API.
 
+mod service;
+
 use crate::{
     Shutdown,
     config::{Config, SecretRef, parse_labels},
@@ -13,31 +15,33 @@ use remuda_node::{
 use std::{path::PathBuf, time::Duration};
 
 #[derive(ClapArgs)]
-#[command(about = "Run a Node over an outbound WSS or SSH-friendly stdio carrier.")]
+#[command(about = "Manage a durable Node daemon; --stdio is an ephemeral development carrier.")]
 pub(crate) struct Args {
+    #[command(subcommand)]
+    command: Option<service::Command>,
     /// Preserve unknown Herdr panes at startup for manual recovery.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_herdr_orphan_sweep: bool,
-    /// Carry Node NDJSON over stdin/stdout; logs always use stderr.
+    /// Development only: carry NDJSON over stdio; disconnect stops Instances.
     #[arg(long, conflicts_with = "hub_url")]
     stdio: bool,
     /// Registry display name for a supervised SSH host.
-    #[arg(long)]
+    #[arg(long, global = true)]
     display_label: Option<String>,
     /// Authenticated outbound WSS endpoint; defaults to the configured hub_url.
-    #[arg(long)]
+    #[arg(long, global = true)]
     hub_url: Option<String>,
     /// Private file containing the host enrollment token.
-    #[arg(long)]
+    #[arg(long, global = true)]
     host_token_file: Option<PathBuf>,
     /// Placement label in KEY=VALUE form; repeated labels override configured keys.
-    #[arg(long = "label", value_name = "KEY=VALUE")]
+    #[arg(long = "label", value_name = "KEY=VALUE", global = true)]
     labels: Vec<String>,
     /// Advertised maximum number of managed Instances.
-    #[arg(long)]
+    #[arg(long, global = true)]
     max_instances: Option<usize>,
     /// Explicit Herdr server socket included in the inventory.
-    #[arg(long)]
+    #[arg(long, global = true)]
     herdr_socket: Option<PathBuf>,
 }
 
@@ -62,10 +66,13 @@ impl Args {
 
 pub(crate) async fn run(
     mut config: Config,
-    args: Args,
+    mut args: Args,
     mut shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     args.apply(&mut config)?;
+    if let Some(command) = args.command.take() {
+        return service::run(config, args, command, shutdown).await;
+    }
     if !args.stdio {
         ensure!(
             config.node.hub_url.is_some(),
@@ -165,6 +172,7 @@ pub(crate) async fn run(
 /// dispatch receives an explicit JSON-RPC error.
 impl super::registry::Entrypoint for Args {
     fn enter(self, context: super::registry::Context) -> anyhow::Result<i32> {
+        service::detach_session(&self)?;
         super::registry::service(context, |config, shutdown| run(config, self, shutdown))
     }
 }
@@ -276,6 +284,9 @@ fn persist_host_token(path: &std::path::Path, token: &str) -> anyhow::Result<()>
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         Ok::<_, std::io::Error>(())
     })();
     if result.is_err() {
@@ -401,6 +412,7 @@ mod tests {
         config.node.labels.insert("region".into(), "file".into());
         config.node.labels.insert("gpu".into(), "none".into());
         let args = Args {
+            command: None,
             no_herdr_orphan_sweep: false,
             stdio: true,
             display_label: None,

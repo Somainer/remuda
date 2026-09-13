@@ -163,6 +163,7 @@ pub fn schema_document() -> Value {
         InstanceAttachParams,
         InstanceCancelParams,
         InstanceCloseParams,
+        EffortSelection,
         InstanceConfigureParams,
         InstanceCreateParams,
         InstanceCreateResult,

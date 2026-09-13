@@ -303,6 +303,73 @@ impl Store {
         .await
     }
 
+    /// A bridge is only a controller link. Begin host-loss grace after a failed
+    /// independent daemon probe, and never reset that timer on another retry.
+    async fn ssh_daemon_probe(
+        &self,
+        id: String,
+        reachable: bool,
+        error: Option<String>,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE hosts SET state = ?2, offline_since = CASE WHEN ?3 THEN NULL
+                 WHEN state = 'daemon-unreachable' THEN COALESCE(offline_since, ?4)
+                 ELSE ?4 END WHERE id = ?1 AND state != 'retired'",
+                params![
+                    id,
+                    if reachable {
+                        "offline-alive"
+                    } else {
+                        "daemon-unreachable"
+                    },
+                    reachable,
+                    now_rfc3339()
+                ],
+            )?;
+            conn.execute(
+                "UPDATE ssh_hosts SET last_error = ?2 WHERE host_id = ?1",
+                params![id, error],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Reconcile observed state without trusting the Node to advance the Hub's
+    /// durable journal watermark. Replay is still required for every missing seq.
+    pub(crate) async fn reconcile_daemon_instances(
+        &self,
+        host_id: String,
+        instances: Vec<Value>,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            for instance in instances {
+                if instance["hostId"].as_str() != Some(&host_id) { continue; }
+                let Some(id) = instance["id"].as_str().or_else(|| instance["instanceId"].as_str()) else { continue; };
+                let lifecycle = match instance["lifecycle"].as_str() {
+                    Some("ready" | "running") => "running",
+                    Some(value @ ("requested" | "preparing" | "starting" | "closing" | "exited" | "failed" | "unknown" | "reconciling")) => value,
+                    _ => continue,
+                };
+                let activity = instance["activity"].as_str().or_else(|| instance["activity"]["value"].as_str());
+                let activity = match activity {
+                    Some("waiting-interaction") => "blocked",
+                    Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
+                    _ => "unknown",
+                };
+                tx.execute(
+                    "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
+                     last_error = ?5, updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
+                    params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), now_rfc3339()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     async fn retire_managed_host(&self, id: String) -> Result<(), HubError> {
         let outcome = self.run(move |conn| {
             let tx = conn.transaction()?;
@@ -338,23 +405,36 @@ async fn supervise(state: AppState, host: ManagedHost) {
         if record.state == "retired" {
             return;
         }
-        let _ = state
-            .store
-            .ssh_status(host.id.clone(), "connecting", record.last_error.clone())
-            .await;
+        if !matches!(
+            record.state.as_str(),
+            "offline-alive" | "daemon-unreachable"
+        ) {
+            let _ = state
+                .store
+                .ssh_status(host.id.clone(), "connecting", record.last_error.clone())
+                .await;
+        }
         let started = Instant::now();
-        let result = connect_once(&state, &host, &record, &client).await;
-        state.nodes.remove(&host.id).await;
+        let mut generation = None;
+        let result = connect_once(&state, &host, &record, &client, &mut generation).await;
+        if let Some(generation) = generation
+            && !state.nodes.remove_generation(&host.id, generation).await
+        {
+            return;
+        }
         let _ = state.store.mark_host_offline(host.id.clone()).await;
         let message = match result {
             Ok(()) => "SSH connection closed".into(),
             Err(error) => error.to_string(),
         };
+        let reachable = remuda_ssh::ManagedNode::daemon_reachable(&client, &host.id)
+            .await
+            .unwrap_or(false);
         let _ = state
             .store
-            .ssh_status(
+            .ssh_daemon_probe(
                 host.id.clone(),
-                "offline",
+                reachable,
                 Some(message.chars().take(1000).collect()),
             )
             .await;
@@ -371,6 +451,7 @@ async fn connect_once(
     managed: &ManagedHost,
     record: &HostRecord,
     client: &SshClient,
+    generation: &mut Option<u64>,
 ) -> anyhow::Result<()> {
     // Also bounds a stalled binary upload before the SSH child's output wait.
     let prepared = tokio::time::timeout(
@@ -388,6 +469,10 @@ async fn connect_once(
     .map_err(|_| {
         anyhow::anyhow!("SSH preflight timed out after 180s; check SSH and the upload artifact")
     })??;
+    state
+        .store
+        .ssh_daemon_probe(managed.id.clone(), true, record.last_error.clone())
+        .await?;
     let mut carrier = StdioTransport::connect_ssh(client.clone(), prepared.argv).await?;
     let hello = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
@@ -406,8 +491,10 @@ async fn connect_once(
     anyhow::ensure!(
         hello["method"] == "node.hello"
             && hello["params"]["hostId"] == managed.id
+            && hello["params"]["bridge"] == true
+            && hello["params"]["daemon"] == true
             && hello.get("id").is_some(),
-        "SSH Node hello identity/protocol mismatch"
+        "SSH Node hello identity/protocol mismatch; persistent daemon bridge required"
     );
     let (out_tx, mut out_rx) = mpsc::channel::<Value>(32);
     let pending = Arc::new(AsyncMutex::new(
@@ -415,7 +502,6 @@ async fn connect_once(
     ));
     let mut host_id = None;
     let mut hello_done = false;
-    let mut generation = None;
     // Per-session tty stream ownership, as on the WS path (T2).
     let mut tty_streams = std::collections::HashSet::new();
     let mut params = hello["params"].clone();
@@ -430,7 +516,7 @@ async fn connect_once(
         &session_token,
         &mut host_id,
         &mut hello_done,
-        &mut generation,
+        generation,
         &mut tty_streams,
         "node.hello",
         params,
@@ -438,6 +524,16 @@ async fn connect_once(
         &pending,
     )
     .await?;
+    state
+        .store
+        .reconcile_daemon_instances(
+            managed.id.clone(),
+            hello["params"]["instances"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .await?;
     carrier
         .send_json(&crate::error::rpc_ok(
             hello["id"].clone(),
@@ -461,10 +557,10 @@ async fn connect_once(
                     continue;
                 }
                 let method = frame["method"].as_str().unwrap_or("");
-                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, &mut generation, &mut tty_streams, method, frame["params"].clone(), &out_tx, &pending).await;
+                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, generation, &mut tty_streams, method, frame["params"].clone(), &out_tx, &pending).await;
                 if let Some(id) = frame.get("id").filter(|id| !id.is_null()) {
                     let reply = match result { Ok(Some(value)) => crate::error::rpc_ok(id.clone(), value), Ok(None) => continue, Err(error) => crate::error::rpc_error(id.clone(), -32000, &error.to_string()) };
-                    carrier.send_json(&reply).await?;
+                    tokio::time::timeout(Duration::from_secs(15), carrier.send_json(&reply)).await??;
                 }
             }
         }
@@ -478,7 +574,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn restart_grace_uses_ssh_disconnect_time_instead_of_old_inventory() {
+    async fn bridge_loss_grace_begins_only_after_daemon_probe_fails() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let id = new_id("hst").unwrap();
@@ -529,7 +625,50 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 1);
+        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
+        let id = instance.host_id.clone();
+        store
+            .ssh_daemon_probe(id.clone(), true, None)
+            .await
+            .unwrap();
+        assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 0);
+        let disconnected_id = id.clone();
+        store
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE hosts SET state = 'offline', offline_since = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                    [disconnected_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .ssh_daemon_probe(id.clone(), false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.expire_lost_hosts(60_000).await.unwrap(),
+            0,
+            "first failed daemon probe must reset the earlier bridge disconnect timestamp"
+        );
+        let old_id = id.clone();
+        store
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE hosts SET offline_since = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                    [old_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.ssh_daemon_probe(id, false, None).await.unwrap();
+        assert_eq!(
+            store.expire_lost_hosts(60_000).await.unwrap(),
+            1,
+            "failed retries must not restart grace"
+        );
         let instance = store
             .get_instance(instance.instance_id)
             .await
@@ -537,6 +676,75 @@ mod tests {
             .unwrap();
         assert_eq!(instance.lifecycle, "exited");
         assert_eq!(instance.last_error.as_deref(), Some("host-lost"));
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn daemon_snapshot_is_host_scoped_and_cannot_advance_acked_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut instances = Vec::new();
+        for target in ["first-node", "other-node"] {
+            let host = new_id("hst").unwrap();
+            store
+                .insert_managed_host(
+                    host.clone(),
+                    AddSshHost {
+                        target: target.into(),
+                        label: target.into(),
+                        labels: vec![],
+                        remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .ssh_status(host.clone(), "online", None)
+                .await
+                .unwrap();
+            instances.push(
+                store
+                    .insert_instance(
+                        host,
+                        None,
+                        "codex".into(),
+                        "codex-appserver".into(),
+                        None,
+                        json!({}),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let own = &instances[0];
+        let other = &instances[1];
+        store
+            .append_journal(
+                own.host_id.clone(),
+                own.instance_id.clone(),
+                Some(1),
+                json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+            )
+            .await
+            .unwrap();
+        store.reconcile_daemon_instances(own.host_id.clone(), vec![
+            json!({"id":own.instance_id,"hostId":own.host_id,"lifecycle":"exited","activity":{"state":"known","value":"idle"},"durableSeq":"999"}),
+            json!({"id":other.instance_id,"hostId":own.host_id,"lifecycle":"exited","activity":"idle"}),
+        ]).await.unwrap();
+        let updated = store
+            .get_instance(own.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.lifecycle, "exited");
+        assert_eq!(updated.activity, "idle");
+        assert_eq!(updated.durable_seq, "1");
+        let untouched = store
+            .get_instance(other.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.lifecycle, other.lifecycle);
         store.close().await;
     }
 }

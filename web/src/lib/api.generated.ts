@@ -601,8 +601,10 @@ export interface components {
         };
         HostCli: {
             /** @enum {string} */
-            auth?: "logged_in" | "logged_out" | "unknown";
+            auth?: "logged_in" | "logged_out" | "unknown" | "gateway-native" | "none";
+            installed?: boolean;
             kind: string;
+            nativeGateway?: boolean;
             path?: string | null;
             version?: string | null;
         } & {
@@ -699,6 +701,8 @@ export interface components {
             delegation?: string | null;
             driver: string;
             durableSeq: string;
+            effortIndex?: number | null;
+            effortName?: string | null;
             hostId: string;
             instanceId: string;
             journalId: string;
@@ -708,6 +712,7 @@ export interface components {
              * @enum {string}
              */
             lifecycle: "requested" | "starting" | "running" | "closing" | "exited" | "failed";
+            model?: string | null;
             name?: string | null;
             providerProfileId?: string | null;
             title?: string | null;

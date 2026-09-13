@@ -276,6 +276,13 @@ impl Driver for AdoptedPty {
                         "adopted PTY requires native TTY interaction".into(),
                     ));
                 }
+                DriverRequest::Configure { .. } => {
+                    return Ok(vec![crate::driver::DriverEmission::NativeLifecycle {
+                        name: "instance.configure".into(),
+                        status: "accepted-noop: adopted PTY has no runtime effort command".into(),
+                        severity: remuda_protocol::Severity::Info,
+                    }]);
+                }
             }
             Ok(Vec::new())
         })

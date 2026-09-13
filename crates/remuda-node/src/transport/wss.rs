@@ -23,6 +23,21 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 mod runtime_wss;
+
+#[cfg(unix)]
+type RuntimeController = crate::daemon::DaemonWssFence;
+#[cfg(not(unix))]
+type RuntimeController = ();
+
+struct ConnectingTask(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for ConnectingTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
 use crate::transport::hubnode::SeqWatermark;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -237,15 +252,43 @@ pub struct WssLink {
 impl WssLink {
     /// Dial Hub, complete `node.hello`, and spawn the session loop.
     pub async fn connect(config: WssConfig) -> Result<Self, NodeError> {
-        Self::connect_inner(config, None).await
+        Self::connect_inner(config, None, None).await
     }
 
     /// Dial Hub and dispatch `instance.*` into a local [`DevNode`], streaming its journal.
     pub async fn connect_runtime(config: WssConfig, node: DevNode) -> Result<Self, NodeError> {
-        Self::connect_inner(config, Some(node)).await
+        Self::connect_inner(config, Some(node), None).await
     }
 
-    async fn connect_inner(config: WssConfig, runtime: Option<DevNode>) -> Result<Self, NodeError> {
+    /// Connect a daemon runtime under a revocable controller lease.
+    /// The caller retains the lease and shuts this link down when it is revoked.
+    #[cfg(unix)]
+    pub async fn connect_runtime_controlled(
+        config: WssConfig,
+        node: DevNode,
+        lease: crate::DaemonWssLease,
+    ) -> Result<Self, NodeError> {
+        Self::connect_inner(config, Some(node), Some(lease.fence())).await
+    }
+
+    /// Persist the decoded enrollment result before exposing or cancelling hello.
+    #[cfg(unix)]
+    pub async fn connect_runtime_controlled_persisting(
+        config: WssConfig,
+        node: DevNode,
+        lease: crate::DaemonWssLease,
+        data_dir: std::path::PathBuf,
+    ) -> Result<Self, NodeError> {
+        let mut fence = lease.fence();
+        fence.enrollment_dir = Some(data_dir);
+        Self::connect_inner(config, Some(node), Some(fence)).await
+    }
+
+    async fn connect_inner(
+        config: WssConfig,
+        runtime: Option<DevNode>,
+        controller: Option<RuntimeController>,
+    ) -> Result<Self, NodeError> {
         let token = config.token.clone();
         let host_id = config.host_id.clone();
         let (journal_tx, journal_rx) = mpsc::channel(config.journal_queue.max(1));
@@ -258,10 +301,12 @@ impl WssLink {
             tx: journal_tx,
             metrics: metrics.clone(),
         };
-        let task = tokio::spawn(session_task(
+        let fence = controller.clone();
+        let session = session_task(
             config,
             token,
             runtime,
+            controller,
             journal.clone(),
             journal_rx,
             hub_tx,
@@ -270,8 +315,24 @@ impl WssLink {
             control_rx,
             Some(ready_tx),
             metrics.clone(),
-        ));
+        );
+        let task = tokio::spawn(async move {
+            #[cfg(unix)]
+            if let Some(fence) = fence {
+                tokio::select! {
+                    biased;
+                    _ = fence.revoked() => {},
+                    _ = session => {},
+                }
+                return;
+            }
+            #[cfg(not(unix))]
+            let _ = fence;
+            session.await;
+        });
+        let mut connecting = ConnectingTask(Some(task));
         let hello = ready_rx.await.map_err(|_| NodeError::Disconnected)??;
+        let task = connecting.0.take().ok_or(NodeError::Disconnected)?;
         let node_token = hello
             .get("nodeToken")
             .and_then(Value::as_str)
@@ -442,33 +503,52 @@ async fn perform_hello(
     node_epoch: &Id,
     watermarks: &HashMap<String, SeqWatermark>,
     ids: &AtomicU64,
+    runtime: Option<&runtime_wss::RuntimeLink>,
 ) -> Result<Value, NodeError> {
     let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
-    send_ws(
-        stream,
-        &rpc_request(
-            &id,
-            METHOD_NODE_HELLO,
-            encode_hello_params(config, node_epoch, watermarks),
-        ),
-    )
-    .await?;
+    let mut params = encode_hello_params(config, node_epoch, watermarks);
+    if let Some(runtime) = runtime.filter(|runtime| runtime.controller.is_some()) {
+        params["daemon"] = json!(true);
+        params["durable"] = json!(true);
+        params["instances"] = serde_json::to_value(runtime.node.list_instances()?.items)?;
+        #[cfg(unix)]
+        if let Some(controller) = &runtime.controller {
+            params["controllerGeneration"] = json!(controller.generation().to_string());
+        }
+    }
+    send_ws(stream, &rpc_request(&id, METHOD_NODE_HELLO, params)).await?;
     let Some(frame) = recv_ws(stream).await? else {
         return Err(NodeError::Disconnected);
     };
     if let Some(err) = take_rpc_error(&frame) {
         return Err(err);
     }
-    frame
+    let result = frame
         .get("result")
         .cloned()
-        .ok_or_else(|| NodeError::Transport("hello missing result".into()))
+        .ok_or_else(|| NodeError::Transport("hello missing result".into()))?;
+    #[cfg(unix)]
+    if let Some(data_dir) = runtime
+        .and_then(|runtime| runtime.controller.as_ref())
+        .and_then(|controller| controller.enrollment_dir.as_ref())
+    {
+        if let Some(token) = result
+            .get("nodeToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+        {
+            crate::enroll::persist_host_token(data_dir, token)?;
+        }
+        crate::enroll::apply_hello_result(data_dir, &result)?;
+    }
+    Ok(result)
 }
 
 async fn session_task(
     mut config: WssConfig,
     mut token: String,
     runtime: Option<DevNode>,
+    controller: Option<RuntimeController>,
     journal: JournalSender,
     mut journal_rx: mpsc::Receiver<JournalJob>,
     hub_tx: mpsc::Sender<HubRequest>,
@@ -483,7 +563,13 @@ async fn session_task(
     let mut attempt = 0_u32;
     let watermarks = Arc::new(Mutex::new(HashMap::new()));
     let pumps = Arc::new(Mutex::new(HashSet::new()));
-    let Ok(node_epoch) = Id::new("epoch") else {
+    let node_epoch = Id::new("epoch");
+    #[cfg(unix)]
+    let node_epoch = controller
+        .as_ref()
+        .map(|controller| Ok(controller.epoch()))
+        .unwrap_or(node_epoch);
+    let Ok(node_epoch) = node_epoch else {
         if let Some(ready) = ready {
             let _ = ready.send(Err(NodeError::InvalidConfig(
                 "could not allocate node epoch".into(),
@@ -492,6 +578,7 @@ async fn session_task(
         return;
     };
     let runtime = runtime.map(|node| runtime_wss::RuntimeLink {
+        controller,
         node,
         journal,
         watermarks: watermarks.clone(),
@@ -507,7 +594,16 @@ async fn session_task(
         }
     };
     let snapshot = runtime_wss::snapshot_watermarks(&watermarks);
-    let hello = match perform_hello(&mut stream, &config, &node_epoch, &snapshot, &ids).await {
+    let hello = match perform_hello(
+        &mut stream,
+        &config,
+        &node_epoch,
+        &snapshot,
+        &ids,
+        runtime.as_ref(),
+    )
+    .await
+    {
         Ok(hello) => {
             observe_clock_skew(&hello, &metrics);
             hello
@@ -534,6 +630,10 @@ async fn session_task(
         .map(str::to_owned);
     if let Some(ready) = ready {
         let _ = ready.send(Ok(hello.clone()));
+    }
+    if let Some(runtime) = runtime.as_ref() {
+        runtime_wss::apply_resume_watermarks(runtime, &hello);
+        runtime_wss::resume_runtime_journals(runtime);
     }
 
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
@@ -576,6 +676,14 @@ async fn session_task(
             }
             job = journal_rx.recv() => {
                 let Some(job) = job else { break; };
+                // Buffered events may have become durable while this session
+                // was reconnecting. The Hub hello watermark is authoritative.
+                if let Some(seq) = job.seq
+                    && let Some(mark) = runtime_wss::snapshot_watermarks(&watermarks).get(&job.instance_id)
+                    && seq <= mark.seq {
+                    let _ = job.reply.send(Ok(json!({"durableSeq":mark.seq.to_string()})));
+                    continue;
+                }
                 let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
                 let frame = rpc_request(
                     &id,
@@ -642,7 +750,11 @@ fn spawn_wss_tty_pump(node: crate::DevNode, tx: mpsc::Sender<TtyWire>) {
     tokio::spawn(async move {
         let mut events = node.tty().subscribe();
         loop {
-            match events.recv().await {
+            let event = tokio::select! {
+                _ = tx.closed() => break,
+                event = events.recv() => event,
+            };
+            match event {
                 Ok(crate::TtyEvent::Open {
                     instance_id,
                     stream_id,
@@ -918,7 +1030,7 @@ async fn reconnect(
         let snapshot = runtime_wss::snapshot_watermarks(watermarks);
         match dial(&config.url, token).await {
             Ok(mut next) => {
-                match perform_hello(&mut next, config, node_epoch, &snapshot, ids).await {
+                match perform_hello(&mut next, config, node_epoch, &snapshot, ids, runtime).await {
                     Ok(hello) => {
                         if let Some(new_token) = hello.get("nodeToken").and_then(Value::as_str) {
                             *token = new_token.to_owned();
@@ -936,6 +1048,7 @@ async fn reconnect(
                         *attempt = 0;
                         observe_clock_skew(&hello, metrics);
                         if let Some(runtime) = runtime {
+                            runtime_wss::apply_resume_watermarks(runtime, &hello);
                             runtime_wss::resume_runtime_journals(runtime);
                         }
                         return Ok(());
@@ -982,12 +1095,18 @@ pub(crate) fn already_durable(error: &NodeError, seq: i64) -> bool {
             if message == &format!("journal duplicate seq {seq}") {
                 return true;
             }
-            if !message.contains("journal gap") {
+            let Some((_, gap)) = message.split_once("journal gap: expected ") else {
                 return false;
+            };
+            let Some((expected, got)) = gap.split_once(", got ") else {
+                return false;
+            };
+            match (expected.trim().parse::<i64>(), got.trim().parse::<i64>()) {
+                // Older Hubs used a gap error for an already retained prefix.
+                // A future gap proves this append was rejected, never durable.
+                (Ok(expected), Ok(got)) => got == seq && seq < expected,
+                _ => false,
             }
-            message
-                .rsplit_once("got ")
-                .is_some_and(|(_, got)| got.trim() == seq.to_string())
         }
         _ => false,
     }
@@ -1086,6 +1205,29 @@ mod tests {
         };
         assert!(already_durable(&dup, 4));
         assert!(!already_durable(&dup, 40));
+        for message in [
+            "journal gap: expected 17, got 18",
+            "id: journal gap: expected 17, got 18",
+            "journal gap: expected 18, got 18",
+            "journal gap: expected invalid, got 18",
+            "journal gap: expected 19, got 180",
+        ] {
+            let rejected = NodeError::HubRpc {
+                code: -32602,
+                message: message.into(),
+            };
+            assert!(
+                !already_durable(&rejected, 18),
+                "{message} must not promote seq18"
+            );
+        }
+        assert!(already_durable(
+            &NodeError::HubRpc {
+                code: -32602,
+                message: "id: journal gap: expected 19, got 18".into()
+            },
+            18
+        ));
     }
 
     #[test]

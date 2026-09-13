@@ -235,16 +235,22 @@ export function Composer({
             <span>{contextLabel ?? "—"}</span>
           </span>
         ) : null}
-        {caps.permission && onPermission ? (
-          <button
-            type="button"
-            className={css.chip}
-            data-testid="permission-chip"
-            aria-expanded={menu === "permission"}
-            onClick={() => toggle("permission")}
-          >
-            {mobile ? permLabel : `权限 ${permLabel}`} ▾
-          </button>
+        {caps.permission ? (
+          onPermission ? (
+            <button
+              type="button"
+              className={css.chip}
+              data-testid="permission-chip"
+              aria-expanded={menu === "permission"}
+              onClick={() => toggle("permission")}
+            >
+              {mobile ? permLabel : `权限 ${permLabel}`} ▾
+            </button>
+          ) : (
+            <span className={css.chip} data-testid="permission-chip" data-readonly="1">
+              {permLabel}
+            </span>
+          )
         ) : null}
         <span className={css.barSpacer} />
         {mobile ? null : (

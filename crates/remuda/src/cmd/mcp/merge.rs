@@ -20,6 +20,7 @@ pub(super) fn tools() -> Vec<Tool> {
                     "affected": { "type": "boolean", "default": true },
                     "full": { "type": "boolean", "description": "Test the full workspace" },
                     "web": { "type": "boolean" },
+                    "webE2e": { "type": "boolean", "description": "Run the live Hub Playwright suite" },
                     "noPush": { "type": "boolean" },
                     "repo": { "type": "string" },
                     "targetDir": { "type": "string" },

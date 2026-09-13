@@ -1,0 +1,22 @@
+{
+	email {$ACME_EMAIL}
+	admin 127.0.0.1:2019
+	servers {
+		timeouts {
+			read_header 10s
+			idle 5m
+		}
+	}
+}
+
+import /etc/caddy/Caddyfile.routes
+
+{$HUB_DOMAIN} {
+	# HTTP-01 on port 80; HTTPS is served on 443. DNS-01 needs a provider module.
+	tls {
+		issuer acme {
+			disable_tlsalpn_challenge
+		}
+	}
+	import hub_routes
+}

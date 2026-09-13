@@ -183,6 +183,23 @@ pub struct InstanceRecord {
     /// Provider profile id persisted from the create spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_profile_id: Option<String>,
+    /// Current model id from create / `instance.configure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Native effort tier name.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortName"
+    )]
+    pub effort_name: Option<String>,
+    /// Native effort tier index.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortIndex"
+    )]
+    pub effort_index: Option<u32>,
     /// Journal id (`obj_…`).
     pub journal_id: String,
     /// Durable seq as decimal string.
@@ -707,6 +724,7 @@ impl Store {
                     connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
                  WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
                     SELECT id FROM hosts WHERE state != 'online' AND
+                    (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
                     (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
                  )",
                 params![now_rfc3339(), grace_ms.min(i64::MAX as u64) as i64],
@@ -950,6 +968,56 @@ impl Store {
     ) -> Result<Option<InstanceRecord>, StoreError> {
         self.run(move |conn| load_instance(conn, &instance_id))
             .await
+    }
+
+    /// Merge model / effort into the instance spec so reload and list rows see them.
+    pub async fn patch_instance_configure(
+        &self,
+        instance_id: String,
+        payload: Value,
+    ) -> Result<InstanceRecord, StoreError> {
+        self.run(move |conn| {
+            let spec_raw: String = conn.query_row(
+                "SELECT spec_json FROM instances WHERE id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )?;
+            let spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+            let Some(mut object) = spec.as_object().cloned() else {
+                return load_instance(conn, &instance_id)?
+                    .ok_or_else(|| StoreError::Id("unknown instance".into()));
+            };
+            if let Some(model) = payload
+                .get("model")
+                .or_else(|| payload.get("modelId"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert("model".into(), json!(model));
+            }
+            if let Some(effort) = payload.get("effort") {
+                object.insert("effort".into(), effort.clone());
+            } else if payload.get("effortName").is_some() || payload.get("effortIndex").is_some() {
+                object.insert(
+                    "effort".into(),
+                    json!({
+                        "name": payload.get("effortName"),
+                        "index": payload.get("effortIndex"),
+                    }),
+                );
+            }
+            if let Some(mode) = payload.get("permissionMode").and_then(Value::as_str) {
+                object.insert("permissionMode".into(), json!(mode));
+            }
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE instances SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![Value::Object(object).to_string(), now, instance_id],
+            )?;
+            load_instance(conn, &instance_id)?
+                .ok_or_else(|| StoreError::Id("unknown instance".into()))
+        })
+        .await
     }
 
     /// Queue a command. Same `command_id` or idempotency key returns the original row.
@@ -2538,6 +2606,75 @@ mod tests {
         assert_eq!(instances[0].host_id, listed[0].host_id);
     }
 
+    #[tokio::test]
+    async fn instance_configure_is_queued_and_persisted_on_the_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: enroll_token(&store, "enroll-configure").await,
+                    hello_host_id: Some(host.clone()),
+                    label: Some("configure-test".into()),
+                    node_version: None,
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "claude".into(),
+                "claude-print".into(),
+                Some("configure".into()),
+                json!({ "model": "haiku" }),
+            )
+            .await
+            .unwrap();
+        let payload = json!({
+            "instanceId": instance.instance_id,
+            "model": "opus",
+            "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
+        });
+        let (command, created) = store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host,
+                "instance.configure".into(),
+                payload.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(command.operation, "instance.configure");
+        assert_eq!(command.state, "queued");
+        assert_eq!(command.payload["effort"]["name"], json!("ultracode"));
+        assert_eq!(command.payload["effort"]["index"], json!(3));
+        let patched = store
+            .patch_instance_configure(instance.instance_id.clone(), payload)
+            .await
+            .unwrap();
+        assert_eq!(patched.model.as_deref(), Some("opus"));
+        assert_eq!(patched.effort_name.as_deref(), Some("ultracode"));
+        assert_eq!(patched.effort_index, Some(3));
+        let reloaded = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.model.as_deref(), Some("opus"));
+        assert_eq!(reloaded.effort_name.as_deref(), Some("ultracode"));
+        assert_eq!(reloaded.effort_index, Some(3));
+        let listed = store.list_instances(None).await.unwrap();
+        assert_eq!(listed[0].effort_name.as_deref(), Some("ultracode"));
+    }
+
     async fn enroll_labeled(store: &Store, host_id: String, label: &str) {
         let token = enroll_token(store, &format!("enroll-{host_id}")).await;
         let outcome = store
@@ -2768,6 +2905,29 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .get("providerProfileId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let model = spec
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let effort = spec.get("effort");
+            let effort_name = effort
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    spec.get("effortName")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            let effort_index = effort
+                .and_then(|value| value.get("index"))
+                .and_then(Value::as_u64)
+                .map(|n| n as u32)
+                .or_else(|| {
+                    spec.get("effortIndex")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as u32)
+                });
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 host_id: row.get(1)?,
@@ -2782,6 +2942,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 cwd,
                 delegation,
                 provider_profile_id,
+                model,
+                effort_name,
+                effort_index,
                 journal_id: row.get(9)?,
                 durable_seq: durable.to_string(),
                 created_at: row.get(11)?,

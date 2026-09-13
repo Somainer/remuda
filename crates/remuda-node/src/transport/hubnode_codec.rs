@@ -210,6 +210,7 @@ pub async fn dispatch_method(
     match HubNodeMethod::parse(method) {
         Some(HubNodeMethod::InstanceCreate) => dispatch_create(node, params).await,
         Some(HubNodeMethod::InstanceSend) => dispatch_send(node, params).await,
+        Some(HubNodeMethod::InstanceConfigure) => dispatch_configure(node, params).await,
         Some(HubNodeMethod::InstanceCancel) => dispatch_cancel(node, params).await,
         Some(HubNodeMethod::InstanceRespond | HubNodeMethod::InteractionRespond) => {
             dispatch_respond(node, params).await
@@ -379,6 +380,36 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
     .await
 }
 
+async fn dispatch_configure(node: &DevNode, params: Value) -> Result<Value, NodeError> {
+    let instance_id = params
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            NodeError::InvalidRequest("instance.configure requires instanceId".into())
+        })?;
+    let instance_id = InstanceId::from_str(instance_id)?;
+    let command_id = params.get("commandId").and_then(Value::as_str);
+    let result = node
+        .submit_command(
+            &instance_id,
+            InstanceCommandRequest {
+                command_id: command_id.map(str::parse).transpose()?,
+                operation: CommandAction::Configure,
+                prompt: None,
+                run_id: None,
+                interaction_id: None,
+                answer: None,
+                keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
+            }
+            .with_configure(&params),
+        )
+        .await?;
+    serde_json::to_value(result).map_err(NodeError::from)
+}
+
 async fn dispatch_cancel(node: &DevNode, params: Value) -> Result<Value, NodeError> {
     let parsed: InstanceCancelParams = serde_json::from_value(params)?;
     let instance_id = InstanceId::from_str(&parsed.instance_id)?;
@@ -511,6 +542,9 @@ async fn submit(
                 interaction_id: interaction_id.map(str::parse).transpose()?,
                 answer,
                 keys,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;

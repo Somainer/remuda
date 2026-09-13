@@ -1093,3 +1093,11 @@ Remaining dependency: this base has no production `shell-pty` driver. Managed SS
 `claude-print` can run without Herdr. Automatic Codex/Grok fallback still requires
 x-term's shell driver and the related launch/tty integration; this commit does
 not claim it is implemented. The real PONG acceptance used existing remote Herdr.
+
+## 2026-09-13 c-deploy: intranet Caddy restart approval
+
+Hub is healthy on the existing Docker network; DNS and the inactive Caddy
+change are prepared. The active Caddyfile is restored, with no Caddy restart
+or recreation executed. Live apply/rollback and browser/Node acceptance await
+explicit approval. See [intranet-hub-1](evidence/intranet-hub-1.md) for artifact
+identity, guard checks and exact commands. Status: `BLOCKED awaiting-caddy-restart-approval`.

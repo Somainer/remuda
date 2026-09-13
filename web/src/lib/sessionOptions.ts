@@ -33,6 +33,14 @@ export function ptyYoloHint(kind: keyof typeof PTY_YOLO_FLAGS): string {
   return `generic-pty · Node applies ${PTY_YOLO_FLAGS[kind]} (server-side yolo preset)`;
 }
 
+/** Short chip label for the read-only pty permission control. */
+export function ptyYoloChipLabel(kind: string): string {
+  if (kind === "grok") return "always-approve";
+  if (kind === "codex") return "bypass";
+  if (kind === "agy") return "bypass";
+  return "skip-permissions";
+}
+
 export function normalizePermissionMode(value: string | undefined): PermissionModeId {
   if (value === "bypassPermissions") return "bypassPermissions";
   if (value === "dontAsk") return "dontAsk";
@@ -48,4 +56,27 @@ export function normalizeDelegation(value: string | undefined): DelegationId {
 export function providerProfileForDelegation(delegation: DelegationId, defaultGatewayId?: string): string {
   if (delegation === "gateway") return defaultGatewayId || "gateway";
   return "none";
+}
+
+export type ClaudeHostAuth = "gateway-native" | "logged_in" | "none";
+
+export function claudeHostAuth(
+  cli: Array<{ kind?: string; auth?: string; nativeGateway?: boolean }> | undefined,
+): ClaudeHostAuth {
+  const entry = (cli ?? []).find((item) => item.kind === "claude");
+  if (!entry) return "none";
+  if (entry.nativeGateway || entry.auth === "gateway-native") return "gateway-native";
+  if (entry.auth === "logged_in") return "logged_in";
+  return "none";
+}
+
+/** Informational New Session hint. Does not change Provider defaults. */
+export function claudeProviderHint(
+  kind: string,
+  cli: Array<{ kind?: string; auth?: string; nativeGateway?: boolean }> | undefined,
+): string | null {
+  if (kind !== "claude") return null;
+  const auth = claudeHostAuth(cli);
+  if (auth === "gateway-native" || auth === "logged_in") return null;
+  return "此主机未配置 Claude 登录/网关，请选择 Provider";
 }

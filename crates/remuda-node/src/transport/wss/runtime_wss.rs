@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
 pub(crate) struct RuntimeLink {
+    pub controller: Option<super::RuntimeController>,
     pub node: DevNode,
     pub journal: JournalSender,
     pub watermarks: Arc<Mutex<HashMap<String, SeqWatermark>>>,
@@ -23,6 +24,7 @@ pub(crate) struct RuntimeLink {
 impl RuntimeLink {
     fn clone_link(&self) -> Self {
         Self {
+            controller: self.controller.clone(),
             node: self.node.clone(),
             journal: self.journal.clone(),
             watermarks: self.watermarks.clone(),
@@ -59,11 +61,60 @@ pub(crate) fn resume_runtime_journals(runtime: &RuntimeLink) {
     });
 }
 
+pub(crate) fn apply_resume_watermarks(runtime: &RuntimeLink, hello: &Value) {
+    if hello.get("instanceWatermarks").is_some() || hello.get("resumeCursors").is_some() {
+        match runtime.watermarks.lock() {
+            Ok(mut marks) => marks.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    }
+    for entry in ["instanceWatermarks", "resumeCursors"]
+        .into_iter()
+        .filter_map(|key| hello.get(key).and_then(Value::as_array))
+        .flatten()
+    {
+        let instance_id = entry
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                let journal = entry.get("journalId").and_then(Value::as_str)?;
+                let journal = journal.parse().ok()?;
+                runtime
+                    .node
+                    .instance_for_journal(&journal)
+                    .ok()
+                    .map(|id| id.as_id().to_string())
+            });
+        let seq = entry
+            .get("durableSeq")
+            .or_else(|| entry.get("afterSeq"))
+            .or_else(|| entry.get("seq"))
+            .and_then(super::value_i64);
+        if let (Some(id), Some(seq)) = (instance_id, seq) {
+            record_watermark(
+                &runtime.watermarks,
+                &id,
+                entry
+                    .get("journalId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                seq,
+            );
+        }
+    }
+}
+
 async fn dispatch_hub(
     runtime: &RuntimeLink,
     method: &str,
     params: Value,
 ) -> Result<Value, NodeError> {
+    #[cfg(unix)]
+    let _controller = match &runtime.controller {
+        Some(controller) => Some(controller.dispatch_guard().await?),
+        None => None,
+    };
     if crate::interactions::is_interaction_method(method) {
         let result = runtime.node.dispatch_interaction(method, params).await?;
         if let Ok(page) = runtime.node.list_instances() {
@@ -84,6 +135,20 @@ async fn dispatch_hub(
         }
         Some(HubNodeMethod::InstanceSend) => {
             let (instance_id, result) = send_from_params(&runtime.node, params).await?;
+            catch_up(runtime, &instance_id).await?;
+            Ok(result)
+        }
+        Some(HubNodeMethod::InstanceConfigure) => {
+            let instance_id = params
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    NodeError::InvalidRequest("instance.configure requires instanceId".into())
+                })?;
+            let instance_id = InstanceId::try_from(instance_id.to_owned())
+                .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
+            let result =
+                crate::transport::hubnode::dispatch_method(&runtime.node, method, params).await?;
             catch_up(runtime, &instance_id).await?;
             Ok(result)
         }
@@ -247,6 +312,9 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 interaction_id: None,
                 answer: None,
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -283,6 +351,9 @@ async fn cancel_from_params(
                 interaction_id: None,
                 answer: None,
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -315,6 +386,9 @@ async fn close_from_params(
                 interaction_id: None,
                 answer: None,
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -372,6 +446,9 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 interaction_id: None,
                 answer: None,
                 keys: Some(keys),
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -416,6 +493,9 @@ async fn respond_from_params(
                 interaction_id,
                 answer: Some(answer),
                 keys: None,
+                model: None,
+                effort_name: None,
+                effort_index: None,
             },
         )
         .await?;
@@ -505,20 +585,30 @@ fn ensure_pump(runtime: &RuntimeLink, instance_id: &InstanceId) {
     let runtime = runtime.clone_link();
     let instance_id = instance_id.clone();
     tokio::spawn(async move {
-        let _ = flush_journal(&runtime, &instance_id).await;
-        pump_live(&runtime, instance_id, rx).await;
+        let needs_replay = flush_journal(&runtime, &instance_id).await.is_err();
+        pump_live(&runtime, instance_id, rx, needs_replay).await;
     });
 }
 
 async fn flush_journal(runtime: &RuntimeLink, instance_id: &InstanceId) -> Result<(), NodeError> {
     let instance = runtime.node.get_instance(instance_id)?;
-    let after = current_watermark(&runtime.watermarks, instance_id.as_id().as_str());
-    let after_seq = (after > 0).then_some(U64(u64::try_from(after).unwrap_or(0)));
-    let page = runtime
-        .node
-        .read_journal(&instance.journal_id, after_seq, 256)?;
-    for event in page.events {
-        forward_event(runtime, instance_id, &event).await?;
+    loop {
+        let after = current_watermark(&runtime.watermarks, instance_id.as_id().as_str());
+        let after_seq = (after > 0).then_some(U64(u64::try_from(after).unwrap_or(0)));
+        let page = runtime
+            .node
+            .read_journal(&instance.journal_id, after_seq, 256)?;
+        if page.events.is_empty() {
+            break;
+        }
+        for event in page.events {
+            forward_event(runtime, instance_id, &event).await?;
+        }
+        if current_watermark(&runtime.watermarks, instance_id.as_id().as_str())
+            >= i64::try_from(page.durable_seq.0).unwrap_or(i64::MAX)
+        {
+            break;
+        }
     }
     Ok(())
 }
@@ -527,16 +617,31 @@ async fn pump_live(
     runtime: &RuntimeLink,
     instance_id: InstanceId,
     mut rx: broadcast::Receiver<JournalEvent>,
+    mut needs_replay: bool,
 ) {
+    let mut retry = tokio::time::interval(std::time::Duration::from_millis(250));
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match rx.recv().await {
+        let event = tokio::select! {
+            biased;
+            _ = runtime.journal.tx.closed() => break,
+            _ = retry.tick(), if needs_replay => {
+                needs_replay = flush_journal(runtime, &instance_id).await.is_err();
+                continue;
+            }
+            event = rx.recv(), if !needs_replay => event,
+        };
+        match event {
             Ok(event) => {
                 if let Err(error) = forward_event(runtime, &instance_id, &event).await {
                     tracing::debug!(%error, "journal pump forward failed");
+                    // The last event may have no later broadcast to wake us.
+                    // Retry only durable journal rows from the confirmed ACK.
+                    needs_replay = true;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {
-                let _ = flush_journal(runtime, &instance_id).await;
+                needs_replay = true;
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
@@ -638,6 +743,87 @@ fn lock_set(set: &Arc<Mutex<HashSet<String>>>) -> std::sync::MutexGuard<'_, Hash
 mod tests {
     use super::*;
     use crate::DevServerConfig;
+
+    #[tokio::test]
+    async fn failed_final_event_replays_from_confirmed_watermark_without_new_broadcast() {
+        let dir = tempfile::tempdir().expect("data directory");
+        let node = crate::compose(&crate::ServeConfig::fake(
+            DevServerConfig::loopback(0),
+            dir.path().to_path_buf(),
+        ))
+        .expect("node");
+        let created = node
+            .create_instance(
+                serde_json::from_value(json!({"prompt":"final event retry"})).expect("request"),
+            )
+            .await
+            .expect("create");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let command = node
+                    .get_command(&created.command.command_id)
+                    .expect("command");
+                if serde_json::to_value(command).expect("command JSON")["state"] == "settled" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake instance settles");
+        let page = node
+            .read_journal(&created.instance.journal_id, None, 256)
+            .expect("journal");
+        let last = page.events.last().expect("final durable event").clone();
+        let seq = i64::try_from(last.position().1.0).expect("sequence");
+        let key = created.instance.meta.id.as_id().to_string();
+        let watermarks = Arc::new(Mutex::new(HashMap::new()));
+        record_watermark(&watermarks, &key, None, seq - 1);
+        let (journal, mut jobs, _) = super::super::journal_channel(4);
+        let runtime = RuntimeLink {
+            controller: None,
+            node: node.clone(),
+            journal,
+            watermarks: watermarks.clone(),
+            pumps: Arc::new(Mutex::new(HashSet::new())),
+        };
+        let (live, receiver) = broadcast::channel(2);
+        let instance_id = created.instance.meta.id;
+        let pump = tokio::spawn(async move {
+            pump_live(&runtime, instance_id, receiver, false).await;
+        });
+        live.send(last).expect("last event broadcast");
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(2), jobs.recv())
+            .await
+            .expect("first send")
+            .expect("append");
+        assert_eq!(failed.seq, Some(seq));
+        failed
+            .reply
+            .send(Err(NodeError::Disconnected))
+            .expect("failed ACK");
+        let retried = tokio::time::timeout(std::time::Duration::from_secs(2), jobs.recv())
+            .await
+            .expect("replay without another broadcast")
+            .expect("append retry");
+        assert_eq!(retried.seq, Some(seq));
+        assert_eq!(
+            current_watermark(&watermarks, &key),
+            seq - 1,
+            "failed append must not promote ACK"
+        );
+        retried
+            .reply
+            .send(Ok(json!({"durableSeq":seq.to_string()})))
+            .expect("durable ACK");
+        drop(jobs);
+        tokio::time::timeout(std::time::Duration::from_secs(2), pump)
+            .await
+            .expect("closed transport stops replay")
+            .expect("pump task");
+        assert_eq!(current_watermark(&watermarks, &key), seq);
+        node.shutdown().await.expect("shutdown");
+    }
 
     #[tokio::test]
     async fn create_params_preserve_native_model_permission_and_allowlisted_args() {

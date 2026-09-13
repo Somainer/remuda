@@ -1,10 +1,11 @@
 //! Host inventory for `node.hello` / heartbeat (Hub-canonical JSON).
 //!
 //! Hub (`remuda-hub::inventory`) stores `cli[]` as `{kind,version,path,auth}`
-//! with `auth` in `{logged_in,logged_out,unknown}`, `herdr` as
+//! with `auth` in `{gateway-native,logged_in,logged_out,unknown}`, `herdr` as
 //! `{version,socket,path}`, and `resources` as `{cpuPct,memPct}`. Extra fields
-//! (`sha256`, `cpuCount`, `os`/`kernel`/`libc`) are advertised for Node use;
-//! Hub ignores unknown keys.
+//! (`sha256`, `installed`, `nativeGateway`, `cpuCount`, `os`/`kernel`/`libc`)
+//! are advertised for Node use; Hub ignores unknown keys. Auth never carries
+//! secret values.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -24,10 +25,17 @@ pub const CLI_KINDS: [&str; 5] = ["claude", "codex", "grok", "agy", "gemini"];
 /// Default cache lifetime for PATH/--version/sha256/auth probes.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
 
-/// Login heuristic result. Serialized as Hub `auth` (`logged_in` / `logged_out` / `unknown`).
+/// Login heuristic result. Serialized as Hub `auth`.
+///
+/// Claude may also report `gateway-native` when `~/.claude/settings.json`
+/// configures an API gateway (env keys or `apiKeyHelper` present). Values of
+/// those keys are never serialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CliAuth {
+    /// `~/.claude/settings.json` has a native API gateway.
+    #[serde(rename = "gateway-native")]
+    GatewayNative,
     /// A non-secret local marker indicates a logged-in CLI.
     LoggedIn,
     /// Binary is present and the login marker is absent.
@@ -50,6 +58,11 @@ pub struct CliEntry {
     pub path: Option<PathBuf>,
     /// Login heuristic; never a secret value.
     pub auth: CliAuth,
+    /// Binary was resolved on PATH.
+    pub installed: bool,
+    /// Claude-only: `settings.json` configures a native API gateway (boolean).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_gateway: Option<bool>,
     /// `sha256:` + 64 hex digits of the executable, when hashed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
@@ -311,13 +324,17 @@ fn probe(env: &ProbeEnv) -> ProbeParts {
 
 fn probe_cli(kind: &str, env: &ProbeEnv) -> CliEntry {
     let path = find_executable(kind, &env.path);
+    let installed = path.is_some();
     let version = path.as_deref().and_then(binary_version);
     let sha256 = path.as_deref().and_then(hash_file);
-    let auth = cli_auth(kind, &env.home, path.is_some());
+    let native_gateway = (kind == "claude").then(|| claude_native_gateway_configured(&env.home));
+    let auth = cli_auth(kind, &env.home, installed, native_gateway.unwrap_or(false));
     tracing::debug!(
         kind,
         path = path.as_deref().map(|p| p.display().to_string()),
         version = version.as_deref(),
+        installed,
+        native_gateway,
         ?auth,
         "cli inventory"
     );
@@ -326,16 +343,19 @@ fn probe_cli(kind: &str, env: &ProbeEnv) -> CliEntry {
         version,
         path,
         auth,
+        installed,
+        native_gateway,
         sha256,
     }
 }
 
-fn cli_auth(kind: &str, home: &Path, installed: bool) -> CliAuth {
+fn cli_auth(kind: &str, home: &Path, installed: bool, native_gateway: bool) -> CliAuth {
     if !installed {
         return CliAuth::Unknown;
     }
     match kind {
-        "claude" => claude_auth(home),
+        "claude" if native_gateway => CliAuth::GatewayNative,
+        "claude" => claude_oauth_auth(home),
         "codex" => marker_auth(&home.join(".codex").join("auth.json")),
         "grok" => marker_auth(&home.join(".grok").join("auth.json")),
         "agy" => agy_auth(home),
@@ -343,8 +363,53 @@ fn cli_auth(kind: &str, home: &Path, installed: bool) -> CliAuth {
     }
 }
 
+/// Whether `~/.claude/settings.json` configures a native API gateway.
+///
+/// True when `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN` are both
+/// present, or when `apiKeyHelper` is a non-empty string. Values are never
+/// returned or logged.
+#[must_use]
+pub fn claude_native_gateway_configured(home: &Path) -> bool {
+    settings_json_has_native_gateway(&home.join(".claude").join("settings.json"))
+}
+
+fn settings_json_has_native_gateway(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    if let Some(helper) = value.get("apiKeyHelper") {
+        match helper {
+            Value::String(text) if !text.trim().is_empty() => return true,
+            Value::Array(items)
+                if items
+                    .iter()
+                    .any(|item| item.as_str().is_some_and(|text| !text.trim().is_empty())) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    let Some(env) = value.get("env").and_then(Value::as_object) else {
+        return false;
+    };
+    env_key_present(env, "ANTHROPIC_BASE_URL") && env_key_present(env, "ANTHROPIC_AUTH_TOKEN")
+}
+
+fn env_key_present(env: &serde_json::Map<String, Value>, key: &str) -> bool {
+    match env.get(key) {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Number(_)) => true,
+        Some(Value::Bool(true)) => true,
+        _ => false,
+    }
+}
+
 /// `~/.claude.json`: only the presence of the `oauthAccount` object key.
-fn claude_auth(home: &Path) -> CliAuth {
+fn claude_oauth_auth(home: &Path) -> CliAuth {
     let path = home.join(".claude.json");
     match std::fs::read(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => CliAuth::LoggedOut,
@@ -695,6 +760,8 @@ mod tests {
         let path = claude_ent.path.as_ref().expect("path");
         assert!(path.is_absolute(), "{path:?}");
         assert_eq!(claude_ent.auth, CliAuth::LoggedOut);
+        assert!(claude_ent.installed);
+        assert_eq!(claude_ent.native_gateway, Some(false));
         let gemini = snap.cli.iter().find(|c| c.kind == "gemini").unwrap();
         assert_eq!(gemini.version.as_deref(), Some("gemini 1.2.3"));
         assert_eq!(gemini.auth, CliAuth::Unknown);
@@ -751,6 +818,87 @@ mod tests {
         let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
         let snap = collector.snapshot(&config_with(&[], None));
         assert_eq!(auth_of(&snap, "claude"), CliAuth::LoggedOut);
+    }
+
+    #[test]
+    fn claude_settings_env_gateway_is_gateway_native_without_leaking_values() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_stub(bin.path(), "claude", "claude 1");
+        let secret = "sk-fake-gateway-DO-NOT-LEAK-zzzz";
+        let base = "https://gateway.example.invalid/v1";
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude").join("settings.json"),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": base,
+                    "ANTHROPIC_AUTH_TOKEN": secret
+                },
+                "model": "passthrough/auto"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let encoded = serde_json::to_string(&snap).unwrap();
+        assert!(!encoded.contains(secret), "token leaked: {encoded}");
+        assert!(!encoded.contains(base), "base url leaked: {encoded}");
+        let claude = snap.cli.iter().find(|c| c.kind == "claude").unwrap();
+        assert_eq!(claude.auth, CliAuth::GatewayNative);
+        assert_eq!(claude.native_gateway, Some(true));
+        assert!(claude.installed);
+        assert_eq!(hub_auth(&snap, "claude"), "gateway-native");
+        assert!(claude_native_gateway_configured(home.path()));
+    }
+
+    #[test]
+    fn claude_settings_api_key_helper_is_gateway_native() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_stub(bin.path(), "claude", "claude 1");
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude").join("settings.json"),
+            json!({ "apiKeyHelper": "/usr/local/bin/gateway-helper" }).to_string(),
+        )
+        .unwrap();
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        assert_eq!(auth_of(&snap, "claude"), CliAuth::GatewayNative);
+        assert_eq!(
+            snap.cli
+                .iter()
+                .find(|c| c.kind == "claude")
+                .unwrap()
+                .native_gateway,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn claude_settings_without_gateway_keys_is_not_native() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_stub(bin.path(), "claude", "claude 1");
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude").join("settings.json"),
+            json!({ "env": { "CLAUDE_CODE_SIMPLE": "1" }, "theme": "dark" }).to_string(),
+        )
+        .unwrap();
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        assert_eq!(auth_of(&snap, "claude"), CliAuth::LoggedOut);
+        assert_eq!(
+            snap.cli
+                .iter()
+                .find(|c| c.kind == "claude")
+                .unwrap()
+                .native_gateway,
+            Some(false)
+        );
     }
 
     #[test]

@@ -483,7 +483,7 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 | `online, lastSeenAt, rttMs?` | 心跳（Hub 所见 Host.state 的投影） |
 | `agentVersion` | Node Agent |
 | `resources?` | cpu/mem，缺则不画仪表 |
-| `cli[]` | `{kind, version, path, auth: logged_in\|logged_out\|unknown}` — **绝对路径+版本**，按主机盘点 |
+| `cli[]` | `{kind, version, path, auth: gateway-native\|logged_in\|logged_out\|unknown}` — **绝对路径+版本**，按主机盘点。Claude `gateway-native` 只报布尔，不含 token |
 | `instanceCount` | |
 
 添加主机第一阶段：登记 Node 出站身份；开发期可填 SSH config 名。Tailcat 不做。

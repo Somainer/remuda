@@ -71,6 +71,24 @@ export function effortAt(kind: EffortKind | string, index: number): EffortSelect
   return { index: i, name, kind: (kind as EffortKind) || "claude" };
 }
 
+/** Rebuild a selection from an instance record after reload. */
+export function effortFromRecord(
+  kind: EffortKind | string,
+  name?: string | null,
+  index?: number | null,
+): EffortSelection | undefined {
+  if (name == null && (index == null || Number.isNaN(index))) return undefined;
+  const table = effortTable(kind);
+  const harness = (kind as EffortKind) || "claude";
+  if (name) {
+    const found = table.findIndex((tier) => tier.name === name);
+    if (found >= 0) return { index: found, name, kind: harness };
+    if (index != null) return { index, name, kind: harness };
+  }
+  if (index != null) return effortAt(harness, index);
+  return undefined;
+}
+
 export function mapEffort(current: EffortSelection, nextKind: EffortKind | string): EffortSelection {
   const from = effortTable(current.kind);
   const to = effortTable(nextKind);
@@ -98,13 +116,10 @@ export function effortCaps(kind: EffortKind | string): {
   if (kind === "terminal" || kind === "generic") {
     return { harness: true, model: false, effort: false, context: false, permission: false };
   }
-  if (kind === "claude") {
-    return { harness: true, model: true, effort: true, context: true, permission: true };
-  }
   if (kind === "agy") {
-    return { harness: true, model: false, effort: true, context: true, permission: false };
+    return { harness: true, model: false, effort: true, context: true, permission: true };
   }
-  return { harness: true, model: true, effort: true, context: true, permission: false };
+  return { harness: true, model: true, effort: true, context: true, permission: true };
 }
 
 export const HARNESS_META: { id: EffortKind; label: string; mark: string }[] = [

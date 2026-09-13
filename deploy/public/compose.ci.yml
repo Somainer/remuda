@@ -1,0 +1,28 @@
+# Isolated local test only; Docker Compose >= 2.24.4 supports !override/!reset.
+services:
+  init-data:
+    image: busybox:1.37
+    user: "0:0"
+    command: [sh, -c, "chown 65532:65532 /data && chmod 0700 /data"]
+    volumes: [hub_data:/data]
+    network_mode: none
+  remuda-hub:
+    environment:
+      REMUDA_PUBLIC_ORIGIN: https://localhost
+    # Keep the Hub from dynamically taking Caddy's reserved proxy address.
+    networks:
+      hub_proxy:
+        ipv4_address: ${CI_HUB_IP:-172.30.29.3}
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+  caddy:
+    ports: !override
+      - target: 443
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - ./Caddyfile.ci:/etc/caddy/Caddyfile:ro
+volumes:
+  hub_data:
+    driver_opts: !reset {}

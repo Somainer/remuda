@@ -428,11 +428,15 @@ fn reply_legacy(enrollment: &Enrollment, frame: &Value) -> Value {
     }
 }
 
-fn spawn_stdio_tty_pump(node: DevNode, output: mpsc::Sender<Value>) {
+pub(crate) fn spawn_stdio_tty_pump(node: DevNode, output: mpsc::Sender<Value>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = node.tty().subscribe();
         loop {
-            match events.recv().await {
+            let event = tokio::select! {
+                _ = output.closed() => break,
+                event = events.recv() => event,
+            };
+            match event {
                 Ok(crate::TtyEvent::Open {
                     instance_id,
                     stream_id,
@@ -477,7 +481,7 @@ fn spawn_stdio_tty_pump(node: DevNode, output: mpsc::Sender<Value>) {
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    })
 }
 
 fn ensure_journal_pump(

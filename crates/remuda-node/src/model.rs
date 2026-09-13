@@ -177,6 +177,9 @@ pub enum CommandAction {
     /// Write logical keys (`tty.write` / `instance.keys`).
     #[serde(rename = "tty.write", alias = "instance.keys")]
     WriteTty,
+    /// Switch model / effort (`instance.configure`).
+    #[serde(rename = "instance.configure", alias = "configure")]
+    Configure,
 }
 
 /// Command body for the local REST surface.
@@ -203,4 +206,36 @@ pub struct InstanceCommandRequest {
     /// Logical keys for `tty.write`.
     #[serde(default)]
     pub keys: Option<Vec<String>>,
+    /// Model id for `instance.configure`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Native effort name for `instance.configure`.
+    #[serde(default)]
+    pub effort_name: Option<String>,
+    /// Native effort index for `instance.configure`.
+    #[serde(default)]
+    pub effort_index: Option<u32>,
+}
+
+impl InstanceCommandRequest {
+    /// Fill optional configure fields after setting the operation.
+    pub fn with_configure(mut self, params: &serde_json::Value) -> Self {
+        self.model = params
+            .get("model")
+            .or_else(|| params.get("modelId"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if let Some(effort) = params.get("effort") {
+            self.effort_name = effort
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            self.effort_index = effort
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as u32);
+        }
+        self
+    }
 }

@@ -1,0 +1,11 @@
+{
+	admin 127.0.0.1:2019
+	skip_install_trust
+}
+
+import /etc/caddy/Caddyfile.routes
+
+localhost {
+	tls internal
+	import hub_routes
+}

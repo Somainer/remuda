@@ -1,0 +1,40 @@
+# Hub only; attach to the existing Caddy network without changing its project.
+name: remuda-intranet
+
+services:
+  remuda-hub:
+    image: ${HUB_IMAGE:?Set HUB_IMAGE to the imported explicit release tag}
+    command: ["hub", "--listen", "0.0.0.0:8080"]
+    user: "${HUB_UID:-65532}:${HUB_GID:-65532}"
+    working_dir: /data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      REMUDA_DATA_DIR: /data
+      REMUDA_HUB_LISTEN: 0.0.0.0:8080
+      REMUDA_PUBLIC_ORIGIN: https://${HUB_DOMAIN:?Set the dedicated Hub hostname}
+      # JSON array containing only the existing Caddy container's exact peer IP.
+      REMUDA_TRUSTED_PROXIES: ${REMUDA_TRUSTED_PROXIES:?Set trusted Caddy peer IPs as a JSON array}
+      REMUDA_COOKIE_SECURE: "true"
+    volumes:
+      # Create mode 0700 and assign to HUB_UID:HUB_GID before starting.
+      - ${DATA_DIR:-/data00/remuda/hub}:/data
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    healthcheck:
+      test: [CMD, /usr/local/bin/remuda, hub, --healthcheck]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      deploy_default:
+        aliases: [remuda-intranet-hub]
+
+networks:
+  deploy_default:
+    external: true
+    name: deploy_default

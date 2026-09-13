@@ -514,6 +514,17 @@ journals.set(journalQuestion, [
   obs(insQuestion, journalQuestion, 2, "interaction.requested", { interaction: questionInteraction }),
 ]);
 
+const journalGrok = id("obj_");
+const insGrok = id("ins_");
+instances.push({
+  ...instanceBase(insGrok, journalGrok, "ready", known("idle")),
+  kind: "grok",
+  driver: "generic-pty",
+  capabilities: ptyCapabilities("generic-pty"),
+  activeRunIds: [],
+});
+journals.set(journalGrok, []);
+
 const titles = new Map<Id, string>([
   [insBlocked, "清一下 /tmp/coord-media"],
   [insWorking, "看 TaskManager spill 这段为啥抖"],
@@ -521,6 +532,7 @@ const titles = new Map<Id, string>([
   [insQuestion, "spill 从哪改？"],
   [insStarting, "正在启动"],
   [insExited, "失败会话"],
+  [insGrok, "Grok 会话"],
 ]);
 
 const summaries = new Map<Id, string>([
@@ -1062,11 +1074,78 @@ export function mockSend(instanceId: Id, prompt: string): CommandResult {
   return { command, relatedCommandIds: [] };
 }
 
-export function mockConfigure(instanceId: Id, permission: string): CommandResult {
+const MOCK_CONFIGURE_KEY = "remuda.mock.configure";
+
+type MockConfigurePatch = {
+  permission?: string;
+  model?: string;
+  effort?: { name: string; index: number };
+};
+
+function readConfigurePatches(): Record<string, MockConfigurePatch> {
+  if (typeof sessionStorage === "undefined") return {};
+  try {
+    return JSON.parse(sessionStorage.getItem(MOCK_CONFIGURE_KEY) || "{}") as Record<string, MockConfigurePatch>;
+  } catch {
+    return {};
+  }
+}
+
+function writeConfigurePatch(instanceId: Id, patch: MockConfigurePatch) {
+  if (typeof sessionStorage === "undefined") return;
+  const next = { ...readConfigurePatches(), [instanceId]: { ...readConfigurePatches()[instanceId], ...patch } };
+  sessionStorage.setItem(MOCK_CONFIGURE_KEY, JSON.stringify(next));
+}
+
+function applyConfigurePatches() {
+  const patches = readConfigurePatches();
+  for (const inst of instances) {
+    const patch = patches[inst.id];
+    if (!patch) continue;
+    if (patch.permission) permissionMode.set(inst.id, patch.permission);
+    if (patch.model) inst.model = patch.model;
+    if (patch.effort) {
+      inst.effortName = patch.effort.name;
+      inst.effortIndex = patch.effort.index;
+    }
+  }
+}
+
+export function mockConfigure(
+  instanceId: Id,
+  permission: string,
+  extras?: { model?: string; effort?: { name: string; index: number } },
+): CommandResult {
   const inst = instances.find((i) => i.id === instanceId);
   if (!inst) throw new Error("INSTANCE_NOT_FOUND");
   permissionMode.set(instanceId, permission);
+  if (extras?.model) inst.model = extras.model;
+  if (extras?.effort) {
+    inst.effortName = extras.effort.name;
+    inst.effortIndex = extras.effort.index;
+  }
+  writeConfigurePatch(instanceId, {
+    permission,
+    model: extras?.model ?? inst.model ?? undefined,
+    effort: extras?.effort ?? (inst.effortName != null && inst.effortIndex != null
+      ? { name: inst.effortName, index: inst.effortIndex }
+      : undefined),
+  });
   const commandId = id("cmd_");
+  const events = journals.get(inst.journalId) ?? [];
+  const seq = events.length + 1;
+  events.push(
+    obs(inst.id, inst.journalId, seq, "lifecycle", {
+      topic: "entity",
+      entityType: "command",
+      entityId: commandId,
+      state: "accepted",
+      operation: "instance.configure",
+      effort: extras?.effort ?? null,
+      model: extras?.model ?? null,
+    }),
+  );
+  journals.set(inst.journalId, events);
   return {
     command: {
       ...meta(commandId),
@@ -1290,3 +1369,5 @@ export function mockDeviceRevoke(token: string | undefined, deviceId: string): {
   writeJson(DEVICES_KEY, next);
   return { ok: true };
 }
+
+applyConfigurePatches();

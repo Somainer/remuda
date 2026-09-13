@@ -37,3 +37,24 @@ docs/                      # design/ research/
 | D-015 | 2026-09-13 | **D0 herdr 对标达成**（main `30e4abe` / dogfood-3）：一次真实 haiku coordinator 会话对 codex+grok `generic-pty` 得到 `codexDone=true`、`grokDone=true`（wait `line:(?m)^DONE` `condition-met`）。Fable 级模型（Claude Fable 及同级 coordinator）**只做统领**，不执行仓库改动；执行面是 **codex / grok / opus**（用户规则）。结构化次级驱动仍留 M4（D-014）。已知缺口不挡 D0：grok 有时要跟发一次 send；`instance stop` 不回收 herdr workspace；Node shutdown 可能打 `driver shutdown did not settle` | 用户 | [dogfood.md](./dogfood.md) D0 验收结果；[dogfood-3-report.md](./dogfood-3-report.md) |
 | D-016 | 2026-09-13 | **Remote terminal**：Web 合同见 [remote-terminal.md](./remote-terminal.md)（文首）。输出 = `tty.frame` binary channel `1`；输入 = binary channel `3` 原字节（键盘+鼠标，不过滤）；resize = JSON `tty.resize {cols,rows}`；attach = `GET /v1/follow?tty=1` 先重放 ≤256 KiB / 全屏 ANSI snapshot。`generic-pty` / `claude-pty` 仍经 herdr `terminal session observe/control`（D-010）；新 kind `terminal` + driver `shell-pty` 用 `portable-pty` 跑 login `$SHELL`，并作为无法识别的 agent CLI 的 fallback。写权限 = 能发 instance commands 的设备；`maxTtyInputBytes` 限长。 | 用户 | [remote-terminal.md](./remote-terminal.md)；herdr-herdrx §7.2；protocol.md §7.4 |
 | D-018 | 2026-09-13 | **Bootstrap/enroll 拆分**（security-review-2 A2/A1，任务 12）：`bootstrap-token` 从此只是 **设备配对 access code**——默认 24h TTL（`bootstrapTtlHours`，`0` 关闭）、可用 `remuda hub rotate-bootstrap` 轮换（已配对设备的 device token 不受影响）。它**不再**认证 Node。刻意**不做** one-shot-per-deviceName：`deviceName` 由调用方提供且未经认证，拒绝重名挡不住攻击者（换个名字即可），却会打断合法的重复登录——`HubClient` 只在内存里保存 device token，所以每次 CLI 调用和 `hub --with-dispatcher` 组合模式都会以固定名字重新登录。真正的一次性配对需要客户端先持久化 device token，在那之前 A2 可执行的部分是 TTL + 轮换。**Node enrollment** 改用独立的 enroll token：由已认证设备 `POST /v1/hosts/enroll-token` 铸造（默认 60 分钟 TTL `enrollTokenTtlMinutes`、单次使用、只存 Argon2 hash、明文只返回一次），Node 以 `REMUDA_ENROLL_TOKEN` 呈现；**已注册 host 只能用自己存储的 node token 重新上报**，enroll token 命中已存在的 `host_id` 一律拒绝（关闭 A1 的冒名路径）。`remuda dev` 同时铸造两者供本地使用。同进程组合模式（`hub --with-dispatcher`、`remuda dev`）不再持有 access code 调 API：`RunningHub::mint_device_token` 在进程内直接写一条 device 行，dispatcher 拿到的是可撤销的 scoped device token（设备名 `remuda-dispatcher`），与 F13 对 standalone 路径的要求一致，而不是给它开例外。迁移：新增 `enroll_tokens` 表；旧 data dir 缺 `bootstrap-issued-at` 时按首次读取时间补写，不会把运维人员锁在门外。 | 用户 | [security-review-2.md](./security-review-2.md) A2/A1、任务 12 |
+| D-019 | 2026-09-13 | **Remote Node 生命周期独立于控制连接**：主路径为持久 Node daemon 主动 WSS 连接公网可达 Hub，以 D-018 一次性 enroll token 换取持久 host token，退避重连并按 Hub 已确认 seq watermark 重放 SQLite journal。后备路径为同一个 daemon 加 Hub 托管 SSH **bridge**（stdio ↔ 本地 `0600` Unix socket），SSH 仅 bootstrap/转发，断线不终止 daemon 或实例；新 bridge takeover 后恢复 journal 并对账实例状态。既有 `node --stdio` 仅开发用、进程不持久；`remuda dev` 保留进程内 Node。此决策替代 D-013 的 connection-bound SSH 启动方式。 | 用户 | [remote-modes.md](./remote-modes.md)；[remote-daemon-1.md](./evidence/remote-daemon-1.md) |
+| D-020 | 2026-09-13 | **公开部署改为公网 VPS 上的 Hub + Caddy**，取代 D-006 的内网 Hub + Cloudflare Tunnel。SG 宿主机没有公网 IP，现有 Caddy/网关域名解析到内网地址；企业风控禁止 cloudflared、frp、ngrok、长期 `ssh -R` 等隧道/内网穿透。所有 Node（SG、devbox、笔记本）按 D-019 主模式以常驻 daemon + 出站 WSS/HTTPS 连接公网 Hub，首次接入用 D-018 一次性 enroll token；手机 HTTPS 直达公网 Hub。内网 provider 网关只由对应 Node 直接访问，配置和凭证按主机保存，Hub 不访问内网 provider。`deploy/public/` 是支持的部署包；旧 M1 Tunnel 操作步骤不再适用。仅记录、未实现的替代方案：内网 Hub 与客户端都主动连接薄公网自定义 WSS relay（Tailcat 风格，无第三方隧道软件），以保留内网 Hub 持久化，代价是额外组件、协议和延迟。 | 用户 | [deploy-public.md](./deploy-public.md)、[deploy/public](../../deploy/public/README.md)；本次为部署包、runbook 和测试，不执行部署或 SSH |
+
+### D-020 优先级调整（同日，用户后续指示）
+
+当前先在 SG 内网运行 Hub，复用现有 Caddy 的 DNS-01，为 `remuda.<zone>`
+配置内网 A 记录，只追加独立站点 include 和必要的 import，不修改既有网关站点。
+`deploy/intranet/` 与 [deploy-runbook.md](./deploy-runbook.md) 为当前操作入口；
+`deploy/public/` 保留为后续公网 VPS 变体。此调整授权了内网实施，取代上表
+本轮仅准备包的执行范围；实际执行结果以 [内网实施证据](./evidence/intranet-hub-1.md)
+为准。禁止隧道的约束保持不变；DNS-01 证书不产生公网可达性，内网 Hub
+只承诺具备内网路由的客户端可达，普通蜂窝网络访问需后续公网方案。
+
+### D-020 执行边界调整（同日，最新用户指示）
+
+当前仅准备内网变更，状态为 `awaiting-caddy-restart-approval`。准备一次性
+apply/rollback 脚本：apply 添加 Remuda import，并将全局 admin 改为
+`localhost:2019`，验证后重启现有 Caddy，再检查网关与 Hub；rollback 恢复
+原 import/admin 设置，验证后重启并检查网关。两个路径中的重启均须等待明确
+批准，当前不执行，也不继续 Node 验收。之前的临时 reload/恢复结果只记入
+实施证据，不代表对最新执行边界的继续授权。

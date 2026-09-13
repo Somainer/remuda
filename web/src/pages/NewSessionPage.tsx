@@ -9,6 +9,7 @@ import {
   PTY_YOLO_FLAGS,
   YOLO_ACK,
   YOLO_HINT,
+  claudeProviderHint,
   normalizeDelegation,
   normalizePermissionMode,
   providerProfileForDelegation,
@@ -129,6 +130,7 @@ export function NewSessionPage() {
   const activeKind: CreateKind = kindEnabled(kind)
     ? kind
     : (KINDS.find((item) => kindEnabled(item.id))?.id ?? "claude");
+  const claudeHint = claudeProviderHint(activeKind, hostView?.cli ?? host?.cli);
   const plainTerminal = activeKind === "terminal";
   const driver: DriverKind = plainTerminal
     ? "shell-pty"
@@ -463,6 +465,11 @@ export function NewSessionPage() {
                 {defaultGateway
                   ? `${defaultGateway.name} · ${defaultGateway.defaultModel || defaultGateway.models[0] || "model"}`
                   : "请先在 Provider 页配置网关"}
+              </span>
+            ) : null}
+            {claudeHint ? (
+              <span className={css.hint} data-testid="new-session-claude-auth-hint">
+                {claudeHint}
               </span>
             ) : null}
           </fieldset>

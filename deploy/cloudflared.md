@@ -1,5 +1,12 @@
 # Cloudflare Tunnel → existing Caddy :443
 
+> **Not applicable: superseded by [D-020](../docs/design/deploy-public.md).**
+> Corporate risk control prohibits this Tunnel path and equivalent intranet
+> penetration software. The following text is historical, not an operator
+> procedure. Use the [intranet runbook](../docs/design/deploy-runbook.md) now;
+> [deploy/public](public/README.md) retains the future public VPS variant.
+> Nodes initiate ordinary outbound WSS/HTTPS in both supported topologies.
+
 Phone and bot callbacks need a public HTTPS name. The Hub host already
 terminates TLS on Caddy (`0.0.0.0:443`) with Let's Encrypt via Cloudflare
 DNS-01, but the A record is a private address, so cellular networks cannot

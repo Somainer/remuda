@@ -82,19 +82,55 @@ pub fn load_or_create(data_dir: &Path) -> Result<Enrollment, NodeError> {
 pub fn save(data_dir: &Path, enrollment: &Enrollment) -> Result<(), NodeError> {
     std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join(ENROLLMENT_FILE);
+    let temporary = data_dir.join(format!(".enrollment-{}.tmp", uuid::Uuid::new_v4()));
     let encoded = serde_json::to_vec_pretty(enrollment)?;
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&path)?;
-    file.write_all(&encoded)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
+    let result = (|| -> Result<(), NodeError> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&encoded)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(data_dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+pub(crate) fn persist_host_token(data_dir: &Path, token: &str) -> Result<(), NodeError> {
+    let directory = data_dir.join("node");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("host-token");
+    let temporary = directory.join(format!(".host-token-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<(), NodeError> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(token.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 /// Merge Hub `node.hello` result (`hostId` / `nodeToken`) into the enrollment file.

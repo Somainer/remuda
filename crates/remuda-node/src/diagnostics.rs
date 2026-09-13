@@ -92,14 +92,30 @@ pub fn doctor_snapshot(context: &DoctorContext, env: ProbeEnv) -> DoctorReport {
         );
         report.check(
             &format!("login.{}", cli.kind),
-            if cli.auth == crate::CliAuth::LoggedIn {
+            if matches!(
+                cli.auth,
+                crate::CliAuth::LoggedIn | crate::CliAuth::GatewayNative
+            ) {
                 "ok"
             } else {
                 "warning"
             },
             "login-marker heuristic; credentials were not validated with the provider",
-            json!({"state":cli.auth,"evidence":"local-marker"}),
+            json!({"state":cli.auth,"installed":cli.installed,"evidence":"local-marker"}),
         );
+        if cli.kind == "claude" {
+            let configured = cli.native_gateway.unwrap_or(false);
+            report.check(
+                "gateway.claude",
+                if configured { "ok" } else { "warning" },
+                if configured {
+                    "native API gateway configured in settings.json (values not reported)"
+                } else {
+                    "no native API gateway in ~/.claude/settings.json"
+                },
+                json!({"configured":configured,"installed":cli.installed}),
+            );
+        }
     }
     if installed == 0 {
         report.check(
@@ -450,5 +466,68 @@ mod tests {
                 .contains("dummy-credential-never-returned")
         );
         assert!(!data.join("enrollment.json").exists());
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "gateway.claude" && c.status == "warning")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_native_gateway_is_reported_without_settings_values() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let home = dir.path().join("home");
+        let data = dir.path().join("data");
+        for path in [&bin, &home, &data] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nprintf 'claude fixture-1.0\\n'\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(home.join(".claude")).unwrap();
+        let secret = "sk-fake-doctor-gateway-zzzz";
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://gateway.example.invalid/v1",
+                    "ANTHROPIC_AUTH_TOKEN": secret
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let report = doctor_snapshot(
+            &DoctorContext {
+                data_dir: Some(data),
+                listeners: Vec::new(),
+            },
+            ProbeEnv {
+                path: bin.into_os_string(),
+                home,
+                hostname: Some("fixture".into()),
+                herdr_socket_env: None,
+                xdg_config_home: None,
+            },
+        );
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains(secret), "token leaked: {encoded}");
+        assert!(
+            !encoded.contains("gateway.example.invalid"),
+            "base url leaked: {encoded}"
+        );
+        assert_eq!(report.inventory["cli"][0]["auth"], "gateway-native");
+        let gateway = report
+            .checks
+            .iter()
+            .find(|c| c.name == "gateway.claude")
+            .expect("gateway.claude");
+        assert_eq!(gateway.status, "ok");
+        assert_eq!(gateway.details["configured"], true);
+        assert_eq!(gateway.details["installed"], true);
     }
 }

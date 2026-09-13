@@ -3059,6 +3059,26 @@
         }
       ]
     },
+    "EffortSelection": {
+      "description": "Native effort tier stored on `instance.configure`.",
+      "properties": {
+        "index": {
+          "description": "Index into the harness-native table.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Native tier name (`think`, `high`, `max`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "name"
+      ],
+      "type": "object"
+    },
     "ElicitationAction": {
       "description": "ElicitationAction wire values; `protocol.md` §5.4.",
       "oneOf": [
@@ -5167,15 +5187,35 @@
       "properties": {
         "effective": {
           "$ref": "#/$defs/ModelEffective",
+          "default": "next-turn",
           "description": "`effective`; protocol §7.2."
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffortSelection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native effort tier (index + name)."
         },
         "instanceId": {
           "$ref": "#/$defs/InstanceId",
           "description": "`instance_id`; protocol §7.2."
         },
         "modelId": {
+          "default": "",
           "description": "`model_id`; protocol §7.2.",
           "type": "string"
+        },
+        "permissionMode": {
+          "description": "Optional permission mode for print drivers.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -9402,6 +9442,13 @@
         "effective": {
           "$ref": "#/$defs/ModelEffective",
           "description": "`effective`; protocol §3.1."
+        },
+        "effort": {
+          "description": "Native effort tier name when the driver supports a runtime switch.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "modelId": {
           "description": "`model_id`; protocol §3.1.",

@@ -1,0 +1,38 @@
+(hub_proxy) {
+	reverse_proxy remuda-hub:8080 {
+		# Replace client-supplied forwarding headers at this sole public edge.
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto {http.request.scheme}
+		header_up X-Forwarded-Host {http.request.host}
+		header_up -Forwarded
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 3m
+		}
+		# Caddy handles WebSocket upgrade automatically. Nodes reconnect at expiry.
+		stream_timeout 24h
+		stream_close_delay 5m
+		flush_interval -1
+	}
+}
+
+(hub_routes) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+	# Includes /v1/follow, /node/v1/connect and the current /v1/node carrier.
+	@api path /v1 /v1/* /node/v1 /node/v1/*
+	handle @api {
+		import hub_proxy
+	}
+	# /healthz and embedded Web UI use the same upstream.
+	handle {
+		import hub_proxy
+	}
+}

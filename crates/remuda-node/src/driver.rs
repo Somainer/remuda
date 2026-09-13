@@ -60,6 +60,15 @@ pub enum DriverRequest {
         /// Normalized key names (`enter`, `esc`, `ctrl+c`, …).
         keys: Vec<String>,
     },
+    /// Switch model / effort on a live driver (`instance.configure`).
+    Configure {
+        /// Requested model id, when present.
+        model: Option<String>,
+        /// Native effort tier name.
+        effort: Option<String>,
+        /// Native effort index.
+        effort_index: Option<u32>,
+    },
 }
 
 /// Structured output emitted by a local driver operation.
@@ -266,6 +275,22 @@ impl Driver for FakeDriver {
                     status: keys.join(" "),
                     severity: Severity::Info,
                 }]),
+                DriverRequest::Configure {
+                    model,
+                    effort,
+                    effort_index,
+                } => Ok(vec![DriverEmission::NativeLifecycle {
+                    name: "instance.configure".to_owned(),
+                    status: format!(
+                        "applied model={} effort={} index={}",
+                        model.as_deref().unwrap_or("-"),
+                        effort.as_deref().unwrap_or("-"),
+                        effort_index
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    ),
+                    severity: Severity::Info,
+                }]),
             }
         })
     }
@@ -401,6 +426,7 @@ impl Driver for NativeShellAdapter {
                         .map_err(|error| DriverError::Failed(error.to_string()))?;
                 }
                 DriverRequest::RespondInteraction { .. } => {}
+                DriverRequest::Configure { .. } => {}
             }
             Ok(Vec::new())
         })

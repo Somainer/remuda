@@ -620,6 +620,13 @@ impl Driver for GenericPtyDriver {
     }
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
+        if let DriverInput::ModelSwitch(switch) = &input {
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "generic-pty has no runtime model/effort command; requested model={} effort={}",
+                switch.model_id,
+                switch.effort.as_deref().unwrap_or("-"),
+            )));
+        }
         self.wait_control().await?;
         let text = prompt_text(&input)?;
         let (client, agent_name) = self.live_client().await?;

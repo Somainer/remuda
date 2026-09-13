@@ -124,7 +124,11 @@ struct Live {
     recipe: LaunchRecipe,
 }
 
+#[path = "claude_print_stream.rs"]
+mod stream;
+
 struct Mapper {
+    stream: stream::StreamState,
     ids: NativeIds,
     seq: u64,
     instance_id: InstanceId,
@@ -139,7 +143,6 @@ struct Mapper {
 struct NativeIds {
     messages: HashMap<String, (Id, u64)>,
     tools: HashMap<String, Id>,
-    thoughts: HashMap<String, Id>,
     workflows: HashMap<String, Id>,
     phases: HashMap<String, Id>,
 }
@@ -161,15 +164,6 @@ impl NativeIds {
         }
         let id = Id::new("obj")?;
         self.tools.insert(native.to_owned(), id.clone());
-        Ok(id)
-    }
-
-    fn thought(&mut self, native: &str) -> DriverResult<Id> {
-        if let Some(id) = self.thoughts.get(native) {
-            return Ok(id.clone());
-        }
-        let id = Id::new("obj")?;
-        self.thoughts.insert(native.to_owned(), id.clone());
         Ok(id)
     }
 
@@ -217,6 +211,7 @@ impl ClaudePrintDriver {
             inner: Arc::new(Inner {
                 live: Mutex::new(None),
                 mapper: Mutex::new(Mapper {
+                    stream: stream::StreamState::default(),
                     ids: NativeIds::default(),
                     seq: 0,
                     instance_id: InstanceId::new(),
@@ -319,6 +314,7 @@ impl ClaudePrintDriver {
         {
             let mut mapper = self.inner.mapper.lock().await;
             *mapper = Mapper {
+                stream: stream::StreamState::default(),
                 ids: NativeIds::default(),
                 seq: 0,
                 instance_id: instance_id.clone(),
@@ -735,10 +731,10 @@ fn map_outbound(mapper: &mut Mapper, frame: &Outbound) -> DriverResult<Vec<Obser
     match frame {
         Outbound::KeepAlive => Ok(Vec::new()),
         Outbound::System(system) => map_system(mapper, system),
-        Outbound::Assistant(msg) => map_assistant(mapper, msg),
+        Outbound::Assistant(msg) => stream::map_assistant(mapper, msg),
         Outbound::User(msg) => map_user(mapper, msg),
         Outbound::Result(result) => map_result(mapper, result),
-        Outbound::StreamEvent(event) => map_stream(mapper, event),
+        Outbound::StreamEvent(event) => stream::map_stream(mapper, event),
         Outbound::ControlRequest(_) | Outbound::ControlResponse(_) => Ok(Vec::new()),
         Outbound::ControlCancelRequest { .. } => Ok(Vec::new()),
         Outbound::RateLimitEvent(_) => {
@@ -819,133 +815,6 @@ fn map_init(mapper: &mut Mapper, init: &SystemInit) -> DriverResult<Vec<Observat
     )?])
 }
 
-fn map_assistant(mapper: &mut Mapper, msg: &AssistantMessage) -> DriverResult<Vec<Observation>> {
-    let native_msg = msg
-        .message
-        .get("id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| msg.uuid.clone());
-    let content = msg
-        .message
-        .get("content")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    let has_tool = content
-        .iter()
-        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
-    for (index, block) in content.iter().enumerate() {
-        match block.get("type").and_then(Value::as_str).unwrap_or("") {
-            "thinking" | "redacted_thinking" => {
-                let key = native_msg
-                    .clone()
-                    .unwrap_or_else(|| format!("thought-{index}"));
-                let id = mapper.ids.thought(&key)?;
-                let redacted =
-                    block.get("type").and_then(Value::as_str) == Some("redacted_thinking");
-                out.push(
-                    mapper.observation(
-                        Completeness::Structured,
-                        NativeRequestKey::None,
-                        ObservationPayload::Thought(Box::new(ThoughtPayload {
-                            mutation: NodeMutation {
-                                node_id: id.clone(),
-                                revision: U64(1),
-                                operation: MutationOperation::Open,
-                                base_revision: None,
-                            },
-                            thought_id: id,
-                            representation: if redacted {
-                                ThoughtRepresentation::Redacted
-                            } else {
-                                ThoughtRepresentation::Text
-                            },
-                            text: block
-                                .get("thinking")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
-                            part_index: index as u32,
-                            status: ContentStatus::Complete,
-                        })),
-                    )?,
-                );
-            }
-            "text" => {
-                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-                let key = native_msg.clone().unwrap_or_else(|| format!("msg-{index}"));
-                let (id, rev, op) = mapper.ids.message(&key)?;
-                out.push(mapper.observation(
-                    Completeness::Structured,
-                    NativeRequestKey::None,
-                    ObservationPayload::Message(Box::new(MessagePayload {
-                        mutation: NodeMutation {
-                            node_id: id.clone(),
-                            revision: rev,
-                            operation: op,
-                            base_revision: None,
-                        },
-                        message_id: id,
-                        role: MessageRole::Assistant,
-                        phase: if has_tool {
-                            MessagePhase::Commentary
-                        } else {
-                            MessagePhase::Final
-                        },
-                        blocks: vec![ContentBlock::Text(Box::new(TextBlock {
-                            text: text.to_owned(),
-                        }))],
-                        target_block: None,
-                        parent_tool_call_id: None,
-                        native_origin: known_or_unknown(native_msg.as_deref()),
-                        status: ContentStatus::Complete,
-                    })),
-                )?);
-            }
-            "tool_use" => {
-                let tool_use_id = block.get("id").and_then(Value::as_str).unwrap_or("");
-                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                let id = mapper.ids.tool(tool_use_id)?;
-                out.push(mapper.observation(
-                    Completeness::Structured,
-                    NativeRequestKey::None,
-                    ObservationPayload::ToolCall(Box::new(ToolCallPayload {
-                        mutation: NodeMutation {
-                            node_id: id.clone(),
-                            revision: U64(1),
-                            operation: MutationOperation::Open,
-                            base_revision: None,
-                        },
-                        tool_call_id: id,
-                        parent_tool_call_id: None,
-                        tool_name: Knowledge::Known {
-                            value: name.to_owned(),
-                        },
-                        display_title: Knowledge::Known {
-                            value: name.to_owned(),
-                        },
-                        category: tool_category(name),
-                        input: match block.get("input") {
-                            Some(input) => Knowledge::Known {
-                                value: input.clone(),
-                            },
-                            None => unknown("missing-input"),
-                        },
-                        input_text_delta: None,
-                        state: ToolCallState::Proposed,
-                        executor: Knowledge::NotApplicable,
-                    })),
-                )?);
-            }
-            other => {
-                out.extend(mapper.opaque(other, OpaqueReason::UnmappedFields, block)?);
-            }
-        }
-    }
-    Ok(out)
-}
-
 fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observation>> {
     let mut out = Vec::new();
     match &msg.message.content {
@@ -983,6 +852,8 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     let id = mapper.ids.tool(tool_use_id)?;
+                    let (result_id, revision, operation) =
+                        mapper.ids.message(&format!("tool-result:{tool_use_id}"))?;
                     let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
                     let text = match block.get("content") {
                         Some(Value::String(s)) => s.clone(),
@@ -994,10 +865,14 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                         NativeRequestKey::None,
                         ObservationPayload::ToolResult(Box::new(ToolResultPayload {
                             mutation: NodeMutation {
-                                node_id: id.clone(),
-                                revision: U64(1),
-                                operation: MutationOperation::Open,
-                                base_revision: None,
+                                node_id: result_id,
+                                revision,
+                                operation: if operation == MutationOperation::Open {
+                                    operation
+                                } else {
+                                    MutationOperation::Replace
+                                },
+                                base_revision: (revision.0 > 1).then_some(U64(revision.0 - 1)),
                             },
                             tool_call_id: id,
                             stage: ResultStage::Final,
@@ -1097,41 +972,6 @@ fn usage_from_result(
             })),
         )?,
     ))
-}
-
-fn map_stream(mapper: &mut Mapper, event: &StreamEventMessage) -> DriverResult<Vec<Observation>> {
-    let delta = event
-        .event
-        .pointer("/delta/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if delta.is_empty() {
-        return Ok(Vec::new());
-    }
-    let key = event.uuid.clone().unwrap_or_else(|| "stream".into());
-    let (id, rev, op) = mapper.ids.message(&key)?;
-    Ok(vec![mapper.observation(
-        Completeness::Structured,
-        NativeRequestKey::None,
-        ObservationPayload::Message(Box::new(MessagePayload {
-            mutation: NodeMutation {
-                node_id: id.clone(),
-                revision: rev,
-                operation: op,
-                base_revision: None,
-            },
-            message_id: id,
-            role: MessageRole::Assistant,
-            phase: MessagePhase::Final,
-            blocks: vec![ContentBlock::Text(Box::new(TextBlock {
-                text: delta.to_owned(),
-            }))],
-            target_block: Some(0),
-            parent_tool_call_id: None,
-            native_origin: known_or_unknown(event.uuid.as_deref()),
-            status: ContentStatus::Streaming,
-        })),
-    )?])
 }
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
@@ -1808,6 +1648,7 @@ pub mod review {
     pub fn map_stdout_json(value: Value) -> DriverResult<Vec<Observation>> {
         let frame = Outbound::from_value(value);
         let mut mapper = Mapper {
+            stream: stream::StreamState::default(),
             ids: NativeIds::default(),
             seq: 0,
             instance_id: InstanceId::new(),

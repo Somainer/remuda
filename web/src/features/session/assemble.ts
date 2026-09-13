@@ -1,4 +1,6 @@
 import type {
+  ContentBlock,
+  NodeMutation,
   Observation,
   ToolCallPayload,
   ToolResultPayload,
@@ -10,7 +12,6 @@ import type {
 import type { Interaction } from "../../types/generated";
 import { knowledgeValue } from "../../types/command";
 import { familyFor, type ToolFamily } from "./toolRegistry";
-import { observationText } from "../../lib/api";
 import type { LocalBubble } from "../../lib/store";
 
 export type DiffState = "proposed" | "applied" | "unknown";
@@ -54,7 +55,31 @@ export function diffState(call: ToolCallPayload, result: ToolResultPayload | nul
   return "unknown";
 }
 
+function newerMutation(next: NodeMutation, current?: NodeMutation): boolean {
+  if (!current) return true;
+  if (BigInt(next.revision) <= BigInt(current.revision)) return false;
+  // Snapshots can recover a missing prefix, but deltas need their exact base.
+  return next.operation !== "append" || next.baseRevision === current.revision;
+}
+
+function messageBlocks(current: ContentBlock[], next: ContentBlock[], operation: NodeMutation["operation"], target: number | null): ContentBlock[] {
+  if (operation === "close" && next.length === 0) return current;
+  if (operation !== "append") return next;
+  if (target === null) return current.concat(next);
+  const block = current[target];
+  if (block?.type !== "text" || next.some((delta) => delta.type !== "text")) return current;
+  const blocks = current.slice();
+  blocks[target] = { type: "text", text: block.text + next.map((delta) => delta.type === "text" ? delta.text : "").join("") };
+  return blocks;
+}
+
+function blocksText(blocks: ContentBlock[]): string {
+  return blocks.flatMap((block) => block.type === "text" && block.text ? [block.text] : []).join("\n");
+}
+
 export function assembleTranscript(events: Observation[], bubbles: LocalBubble[] = []): TranscriptNode[] {
+  const messages = new Map<string, { mutation: NodeMutation; blocks: ContentBlock[]; node: Extract<TranscriptNode, { type: "message" }> }>();
+  const thoughts = new Map<string, { mutation: NodeMutation; node: Extract<TranscriptNode, { type: "thought" }> }>();
   const tools = new Map<string, ToolNode>();
   const workflows = new Map<
     string,
@@ -70,32 +95,42 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
 
   for (const ev of events) {
     if (ev.kind === "message") {
-      const text = observationText(ev);
-      const role = ev.payload.role;
-      if (role === "user") seenUser.add(text);
-      nodes.push({
-        type: "message",
-        id: ev.eventId,
-        role,
-        text,
-        status: ev.payload.status,
-      });
+      const payload = ev.payload;
+      const existing = messages.get(`message:${payload.messageId}`) ?? messages.get(`node:${payload.nodeId}`);
+      if (!newerMutation(payload, existing?.mutation)) continue;
+      const blocks = existing ? messageBlocks(existing.blocks, payload.blocks, payload.operation, payload.targetBlock) : payload.blocks;
+      const node = existing?.node ?? { type: "message" as const, id: payload.messageId, role: payload.role, text: "", status: payload.status };
+      node.text = blocksText(blocks);
+      node.role = payload.role;
+      node.status = payload.status;
+      const current = existing ?? { mutation: payload, blocks, node };
+      current.mutation = payload;
+      current.blocks = blocks;
+      messages.set(`message:${payload.messageId}`, current);
+      messages.set(`node:${payload.nodeId}`, current);
+      if (!existing) nodes.push(node);
       continue;
     }
     if (ev.kind === "thought") {
       const payload = ev.payload;
-      nodes.push({
-        type: "thought",
-        id: ev.eventId,
-        text: payload.text ?? "",
-        completeness: ev.completeness,
-      });
+      const existing = thoughts.get(`thought:${payload.thoughtId}`) ?? thoughts.get(`node:${payload.nodeId}`);
+      if (!newerMutation(payload, existing?.mutation)) continue;
+      const node = existing?.node ?? { type: "thought" as const, id: payload.thoughtId, text: "", completeness: ev.completeness };
+      if (payload.operation === "append") node.text += payload.text ?? "";
+      else if (payload.operation !== "close" || payload.text !== null) node.text = payload.text ?? "";
+      node.completeness = ev.completeness;
+      const current = existing ?? { mutation: payload, node };
+      current.mutation = payload;
+      thoughts.set(`thought:${payload.thoughtId}`, current);
+      thoughts.set(`node:${payload.nodeId}`, current);
+      if (!existing) nodes.push(node);
       continue;
     }
     if (ev.kind === "tool_call") {
       const call = ev.payload;
       const name = knowledgeValue(call.toolName) ?? "tool";
       const existing = tools.get(call.toolCallId);
+      if (!newerMutation(call, existing?.call)) continue;
       const node: ToolNode = {
         type: "tool",
         id: call.toolCallId,
@@ -108,7 +143,11 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
         diffState: diffState(call, existing?.result ?? null, ev.completeness),
       };
       if (existing) {
-        existing.call = call;
+        existing.call = call.operation === "append" ? {
+          ...call,
+          input: call.input.state === "known" ? call.input : existing.call.input,
+          inputTextDelta: (existing.call.inputTextDelta ?? "") + (call.inputTextDelta ?? ""),
+        } : call;
         existing.name = name;
         existing.family = node.family;
         existing.completeness = ev.completeness;
@@ -122,6 +161,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       const result = ev.payload;
       const existing = tools.get(result.toolCallId);
       if (existing) {
+        if (!newerMutation(result, existing.result ?? undefined)) continue;
         existing.result = result;
         existing.diffState = diffState(existing.call, result, ev.completeness);
         if (ev.completeness === "partial") existing.completeness = "partial";
@@ -192,6 +232,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     });
   }
 
+  for (const node of nodes) {
+    if (node.type === "message" && node.role === "user") seenUser.add(node.text);
+  }
   for (const bubble of bubbles) {
     if (bubble.state === "settled") continue;
     if (seenUser.has(bubble.text) && bubble.state !== "queued") continue;

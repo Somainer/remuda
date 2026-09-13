@@ -18,6 +18,7 @@ use remuda_protocol::{
     NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend,
     PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
 };
+use sha2::{Digest as _, Sha256};
 use std::future::Future;
 use std::pin::Pin;
 use std::{
@@ -38,11 +39,11 @@ pub struct NativeDriverConfig {
     pub claude_native_home: Option<PathBuf>,
     /// Let claude-print inherit the host user's default Claude login/config.
     pub claude_print_inherit_default_config: bool,
-    /// Explicit Herdr socket directory for PTY/background attach support.
+    /// Herdr socket directory; defaults to `data_dir/herdr` for PTY/background support.
     pub herdr_socket_dir: Option<PathBuf>,
     /// Explicit Herdr executable for PTY operations.
     pub herdr_binary: Option<PathBuf>,
-    /// Named, isolated Herdr session.
+    /// Isolated Herdr session, derived from `data_dir` unless explicitly configured.
     pub herdr_session: String,
     /// Close unknown panes on startup; disable only for deliberate manual recovery.
     pub herdr_orphan_sweep: bool,
@@ -61,6 +62,9 @@ impl NativeDriverConfig {
         if let Ok(script) = std::env::var("FAKE_CLAUDE_SCRIPT") {
             extra_env.insert("FAKE_CLAUDE_SCRIPT".to_owned(), script);
         }
+        let herdr_session =
+            node_herdr_session(&data_dir, std::env::var("REMUDA_HERDR_SESSION").ok());
+        let herdr_socket_dir = Some(data_dir.join("herdr"));
         Self {
             data_dir,
             claude_binary: std::env::var_os("REMUDA_CLAUDE_BIN")
@@ -73,12 +77,11 @@ impl NativeDriverConfig {
                 "REMUDA_CLAUDE_INHERIT_DEFAULT_CONFIG",
             )
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true")),
-            herdr_socket_dir: None,
+            herdr_socket_dir,
             herdr_binary: std::env::var_os("REMUDA_HERDR_BIN")
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
-            herdr_session: std::env::var("REMUDA_HERDR_SESSION")
-                .unwrap_or_else(|_| "remuda-node".to_owned()),
+            herdr_session,
             herdr_orphan_sweep: !std::env::var("REMUDA_HERDR_ORPHAN_SWEEP")
                 .is_ok_and(|v| matches!(v.as_str(), "0" | "false")),
             auto_trust_registered_workspaces: true,
@@ -107,6 +110,19 @@ impl NativeDriverConfig {
         self.claude_print_inherit_default_config = true;
         self
     }
+}
+
+fn node_herdr_session(data_dir: &Path, configured: Option<String>) -> String {
+    configured.unwrap_or_else(|| {
+        let digest = Sha256::digest(data_dir.as_os_str().as_encoded_bytes());
+        // Keep named-session fallback sockets short, stable across restarts, and
+        // distinct from the legacy shared `remuda-node` session.
+        let suffix: String = digest[..12]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("remuda-node-{suffix}")
+    })
 }
 
 /// Register `claude-print`, `claude-pty`, and `claude-bg` as per-instance factories.
@@ -814,6 +830,84 @@ mod tests {
     use super::*;
     use crate::runtime::fixture_instance;
     use remuda_protocol::{AgentKind, HostId, InstanceId, WorkspaceId};
+
+    #[test]
+    fn herdr_defaults_isolate_data_roots_and_preserve_explicit_session() {
+        let first_dir = PathBuf::from("/tmp/remuda-isolation/first");
+        let second_dir = PathBuf::from("/tmp/remuda-isolation/second");
+        let first = NativeDriverConfig::new(first_dir.clone());
+        let second = NativeDriverConfig::new(second_dir.clone());
+        assert_eq!(first.herdr_socket_dir, Some(first_dir.join("herdr")));
+        assert_eq!(second.herdr_socket_dir, Some(second_dir.join("herdr")));
+        let first_name = node_herdr_session(&first_dir, None);
+        let second_name = node_herdr_session(&second_dir, None);
+        assert_eq!(first_name, node_herdr_session(&first_dir, None));
+        assert_ne!(first_name, second_name);
+        assert_ne!(first_name, "remuda-node");
+        assert_ne!(first_name, "default");
+        assert_ne!(
+            remuda_herdr::session_sockets(&first_name).api,
+            remuda_herdr::session_sockets("remuda-node").api,
+        );
+        assert_ne!(
+            remuda_herdr::session_sockets(&first_name).api,
+            remuda_herdr::session_sockets(&second_name).api,
+        );
+        assert_eq!(
+            node_herdr_session(&first_dir, Some("operator-session".into())),
+            "operator-session",
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_leaves_another_nodes_workspace_untouched() {
+        use remuda_herdr::{Client, WorkspaceCreateParams};
+        use remuda_testing::{FakeHerdrOptions, FakeHerdrServer};
+
+        let root = tempfile::tempdir().unwrap();
+        let mut servers = Vec::new();
+        let mut clients = Vec::new();
+        for name in ["first", "second"] {
+            let config = NativeDriverConfig::new(root.path().join(name));
+            let socket_dir = config.herdr_socket_dir.unwrap();
+            std::fs::create_dir_all(&socket_dir).unwrap();
+            let socket = socket_dir.join("herdr.sock");
+            servers.push(FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap());
+            let client = Client::connect(socket);
+            client
+                .workspace_create(WorkspaceCreateParams {
+                    label: Some(format!("{name}-workspace")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            clients.push(client);
+        }
+        let other_before = clients[1].session_snapshot().await.unwrap();
+        let first_dir = root.path().join("first");
+        let node = crate::compose(&crate::ServeConfig::native(
+            crate::DevServerConfig::loopback(0).with_workspace_root(first_dir.clone()),
+            first_dir,
+        ))
+        .unwrap();
+        node.reconcile_herdr().await.unwrap();
+        assert!(
+            clients[0]
+                .session_snapshot()
+                .await
+                .unwrap()
+                .workspaces
+                .is_empty()
+        );
+        let other_after = clients[1].session_snapshot().await.unwrap();
+        assert_eq!(other_after.workspaces.len(), 1);
+        assert_eq!(
+            other_after.workspaces[0].workspace_id,
+            other_before.workspaces[0].workspace_id,
+        );
+        assert_eq!(other_after.panes.len(), other_before.panes.len());
+        node.shutdown().await.unwrap();
+    }
 
     #[test]
     fn automatic_trust_requires_canonical_registered_containment() {

@@ -1101,3 +1101,30 @@ change are prepared. The active Caddyfile is restored, with no Caddy restart
 or recreation executed. Live apply/rollback and browser/Node acceptance await
 explicit approval. See [intranet-hub-1](evidence/intranet-hub-1.md) for artifact
 identity, guard checks and exact commands. Status: `BLOCKED awaiting-caddy-restart-approval`.
+
+### 2026-09-13 — Intranet Mac enrollment blocked by deployed Hub version
+
+Device pairing and the cookie session on `https://remuda.<zone>` passed, including
+one-time pairing-code reuse rejection. Authenticated `POST /v1/hosts/enroll-token`
+returned HTTP 405: the deployed `remuda-hub:e3a4133` predates D-018. No Node daemon
+was installed and no SG/bolt persistent change was made under this milestone.
+The Mac Herdr default isolation fix and remaining acceptance/remote install plan
+are recorded in [intranet-enroll-1.md](./evidence/intranet-enroll-1.md).
+An approved compatible Hub upgrade is required before enrollment can continue.
+
+### 2026-09-13 — Intranet upgrade and Mac acceptance continuation
+
+The approved Hub-only upgrade to `9dd7ec7` resolved the prior D-018 HTTP 405.
+Certificate-verified health, login/pairing, secure cookies and enrollment now pass.
+The new Mac launchd Node uses isolated Herdr defaults and an optimized binary;
+host identity and credential persisted across its binary upgrade. Shell prompt/reply
+and stop passed. A controlled WSS interruption replayed four offline journal events
+from Hub watermark 7 to 11 with the same PID and host ID. Caddy and the existing
+demo remained untouched; no SG/bolt Node was installed.
+
+Remaining blocker: `native-claude-sessionstart`. Bounded Claude PTY attempts
+(including 180 seconds on the optimized release) launched Claude but produced no
+current SessionStart metadata or reply; inputs stayed queued. Acceptance instances
+were stopped. See [intranet-enroll-1.md](./evidence/intranet-enroll-1.md) for exact
+artifacts, failed probes, replay evidence, preserved invariants and the remote Node
+installation plan. No startup/readiness safety guard was bypassed.

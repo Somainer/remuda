@@ -90,6 +90,7 @@ fn public_wire_types_are_registered_for_generation() {
         "WorkspaceRegistryResult",
         "InstanceCreateParams",
         "InstanceSendParams",
+        "AttachmentRef",
         "InstanceCancelParams",
         "InstanceRespondParams",
         "JournalAppendParams",

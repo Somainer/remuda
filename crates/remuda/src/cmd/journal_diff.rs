@@ -283,7 +283,7 @@ impl Whitelist {
         self.rules.iter().find(|rule| {
             !rule.ignore
                 && rule.selects(kind, topic)
-                && rule.field.as_deref() == Some(field)
+                && rule.covers(field)
                 && match &rule.allow {
                     // An unconstrained rule accepts whatever this field holds.
                     None => true,
@@ -321,6 +321,19 @@ impl Rule {
             return false;
         }
         self.lifecycle.is_some() || self.kind.is_some() || self.topic.is_some()
+    }
+
+    /// Whether this rule's `field` covers a canonical leaf path. A rule on
+    /// `cost` also covers `cost.amount`, so whitelisting a composite value
+    /// does not require enumerating its leaves.
+    fn covers(&self, path: &str) -> bool {
+        let Some(field) = &self.field else {
+            return false;
+        };
+        path == field
+            || path
+                .strip_prefix(field.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
     }
 }
 
@@ -381,7 +394,7 @@ impl Aliases {
     }
 }
 
-/// Mutation replay state for one message / thought node.
+/// Mutation replay state for one message / thought / tool node.
 #[derive(Default)]
 struct Node {
     /// Position of this node's `open` in the canonical stream.
@@ -396,11 +409,23 @@ struct Node {
     snapshotted: bool,
 }
 
+/// Kinds whose `open`/`append`/`replace`/`close` chain folds into one event,
+/// with the payload field holding the node id and the alias prefix to use.
+fn chained(kind: &str) -> Option<(&'static str, &'static str)> {
+    match kind {
+        "message" => Some(("messageId", "msg")),
+        "thought" => Some(("thoughtId", "tht")),
+        "tool_call" => Some(("toolCallId", "tool")),
+        "tool_result" => Some(("toolCallId", "tool")),
+        _ => None,
+    }
+}
+
 /// Normalize one dump: strip volatile fields, collapse chains, order by turn.
 fn canonicalize(events: &[Value], whitelist: &Whitelist) -> Result<Vec<Canon>> {
     let mut aliases = Aliases::default();
     let mut out: Vec<Option<Canon>> = Vec::new();
-    // messageId / thoughtId -> replay state, so append chains fold into place.
+    // `kind`+alias -> replay state, so every append chain folds into its slot.
     let mut nodes: BTreeMap<String, Node> = BTreeMap::new();
 
     for event in events {
@@ -415,38 +440,27 @@ fn canonicalize(events: &[Value], whitelist: &Whitelist) -> Result<Vec<Canon>> {
             continue;
         }
 
-        match kind.as_str() {
-            "message" | "thought" => {
-                let id_field = if kind == "message" {
-                    "messageId"
-                } else {
-                    "thoughtId"
-                };
-                let prefix = if kind == "message" { "msg" } else { "tht" };
-                let key = aliases.alias(prefix, payload.get(id_field).unwrap_or(&Value::Null));
-                let slot = nodes.entry(key.clone()).or_insert_with(|| {
+        if let Some((id_field, prefix)) = chained(&kind) {
+            let alias = aliases.alias(prefix, payload.get(id_field).unwrap_or(&Value::Null));
+            // tool_call and tool_result share an id; the kind keeps them apart.
+            let node = nodes
+                .entry(format!("{kind}\u{1}{alias}"))
+                .or_insert_with(|| {
                     out.push(None);
                     Node {
                         slot: out.len() - 1,
                         ..Node::default()
                     }
                 });
-                apply(slot, &kind, &payload);
-                let position = slot.slot;
-                let canon = finish(
-                    &kind,
-                    &topic,
-                    &key,
-                    nodes.get(&key).unwrap_or(&Node::default()),
-                );
-                out[position] = Some(canon);
-            }
-            _ => out.push(Some(Canon {
+            apply(node, &kind, &payload);
+            out[node.slot] = Some(finish(&kind, &topic, &alias, node));
+        } else {
+            out.push(Some(Canon {
                 key: key_of(&kind, &payload, &mut aliases),
-                body: body_of(&kind, &payload, &mut aliases),
+                body: body_of(&kind, &payload),
                 kind,
                 topic,
-            })),
+            }));
         }
     }
     Ok(out.into_iter().flatten().collect())
@@ -458,18 +472,25 @@ fn apply(node: &mut Node, kind: &str, payload: &Value) {
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("open");
-    let incoming = if kind == "message" {
-        payload
+    let incoming = match kind {
+        "message" | "tool_result" => payload
             .get("blocks")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default()
-    } else {
-        // Thoughts carry plain text; wrap it so both kinds replay identically.
-        match payload.get("text") {
+            .unwrap_or_default(),
+        "tool_call" => {
+            // Print streams the argument JSON as `inputTextDelta`; the PTY path
+            // gets one completed item. Replay both as text so they converge.
+            match payload.get("inputTextDelta") {
+                Some(Value::String(delta)) => vec![json!({"type": "text", "text": delta})],
+                _ => Vec::new(),
+            }
+        }
+        // Thoughts carry plain text; wrap it so every kind replays identically.
+        _ => match payload.get("text") {
             Some(Value::String(text)) => vec![json!({"type": "text", "text": text})],
             _ => Vec::new(),
-        }
+        },
     };
 
     match operation {
@@ -508,6 +529,17 @@ fn apply(node: &mut Node, kind: &str, payload: &Value) {
         "representation",
         "parentToolCallId",
         "nativeOrigin",
+        "toolName",
+        "displayTitle",
+        "category",
+        "input",
+        "state",
+        "executor",
+        "stage",
+        "outcome",
+        "exitCode",
+        "structuredResult",
+        "changes",
     ] {
         if let Some(value) = payload.get(field)
             && !value.is_null()
@@ -517,28 +549,72 @@ fn apply(node: &mut Node, kind: &str, payload: &Value) {
     }
 }
 
+/// Read one latest field off a replayed node.
+fn field(node: &Node, name: &str) -> Value {
+    node.fields.get(name).cloned().unwrap_or(Value::Null)
+}
+
 /// Project a replayed node into its canonical event.
 fn finish(kind: &str, topic: &str, key: &str, node: &Node) -> Canon {
     let mut body = Map::new();
-    if kind == "message" {
-        body.insert(
-            "role".into(),
-            node.fields.get("role").cloned().unwrap_or(Value::Null),
-        );
-        body.insert(
-            "phase".into(),
-            node.fields.get("phase").cloned().unwrap_or(Value::Null),
-        );
-    } else {
-        body.insert(
-            "representation".into(),
-            node.fields
-                .get("representation")
-                .cloned()
-                .unwrap_or(Value::Null),
-        );
+    match kind {
+        "message" => {
+            body.insert("role".into(), field(node, "role"));
+            body.insert("phase".into(), field(node, "phase"));
+        }
+        "thought" => {
+            body.insert("representation".into(), field(node, "representation"));
+        }
+        "tool_call" => {
+            body.insert("toolName".into(), knowledge(node.fields.get("toolName")));
+            body.insert(
+                "displayTitle".into(),
+                knowledge(node.fields.get("displayTitle")),
+            );
+            body.insert("category".into(), field(node, "category"));
+            // A completed `input` outranks the reassembled delta text; the
+            // delta only stands in while the arguments are still arriving.
+            body.insert(
+                "input".into(),
+                match node.fields.get("input") {
+                    Some(input) => knowledge(Some(input)),
+                    None => Value::String(text_of(&node.blocks)),
+                },
+            );
+            body.insert("state".into(), field(node, "state"));
+        }
+        "tool_result" => {
+            body.insert("stage".into(), field(node, "stage"));
+            body.insert("outcome".into(), field(node, "outcome"));
+            body.insert("exitCode".into(), knowledge(node.fields.get("exitCode")));
+            body.insert(
+                "structuredResult".into(),
+                knowledge(node.fields.get("structuredResult")),
+            );
+            body.insert(
+                "changes".into(),
+                match node.fields.get("changes").and_then(Value::as_array) {
+                    Some(changes) => Value::Array(
+                        changes
+                            .iter()
+                            .map(|change| {
+                                json!({
+                                    "path": change.get("path").cloned().unwrap_or(Value::Null),
+                                    "application": change.get("application").cloned()
+                                        .unwrap_or(Value::Null),
+                                })
+                            })
+                            .collect(),
+                    ),
+                    None => Value::Array(Vec::new()),
+                },
+            );
+        }
+        _ => {}
     }
-    body.insert("text".into(), Value::String(text_of(&node.blocks)));
+    if kind != "tool_call" {
+        body.insert("text".into(), Value::String(text_of(&node.blocks)));
+    }
     let attachments: Vec<Value> = node
         .blocks
         .iter()
@@ -553,10 +629,9 @@ fn finish(kind: &str, topic: &str, key: &str, node: &Node) -> Canon {
     if !attachments.is_empty() {
         body.insert("attachments".into(), Value::Array(attachments));
     }
-    body.insert(
-        "status".into(),
-        node.fields.get("status").cloned().unwrap_or(Value::Null),
-    );
+    if matches!(kind, "message" | "thought") {
+        body.insert("status".into(), field(node, "status"));
+    }
     body.insert("granularity".into(), Value::String(granularity(node)));
 
     Canon {
@@ -620,19 +695,10 @@ fn topic_of(kind: &str, payload: &Value) -> String {
     }
 }
 
-/// Alignment key for the non-chained kinds.
+/// Alignment key for the kinds that arrive as one self-contained event.
 fn key_of(kind: &str, payload: &Value, aliases: &mut Aliases) -> String {
     let null = Value::Null;
     match kind {
-        "tool_call" => aliases.alias("tool", payload.get("toolCallId").unwrap_or(&null)),
-        "tool_result" => format!(
-            "{}/{}",
-            aliases.alias("tool", payload.get("toolCallId").unwrap_or(&null)),
-            payload
-                .get("stage")
-                .and_then(Value::as_str)
-                .unwrap_or("final")
-        ),
         "interaction.requested" => aliases.alias(
             "int",
             payload
@@ -680,34 +746,14 @@ fn key_of(kind: &str, payload: &Value, aliases: &mut Aliases) -> String {
     }
 }
 
-/// Canonical body for the non-chained kinds. Ids become aliases, `Knowledge`
-/// collapses to its value, and revisions/cursors drop out entirely.
-fn body_of(kind: &str, payload: &Value, aliases: &mut Aliases) -> Value {
+/// Canonical body for the kinds that arrive as one self-contained event. Ids
+/// become aliases, `Knowledge` collapses to its value, and revisions and
+/// cursors drop out entirely.
+fn body_of(kind: &str, payload: &Value) -> Value {
     let get = |field: &str| payload.get(field).cloned().unwrap_or(Value::Null);
     let known = |field: &str| knowledge(payload.get(field));
     let null = Value::Null;
     match kind {
-        "tool_call" => json!({
-            "toolName": known("toolName"),
-            "category": get("category"),
-            "input": known("input"),
-            "state": get("state"),
-            "displayTitle": known("displayTitle"),
-            "parent": payload.get("parentToolCallId").filter(|id| !id.is_null())
-                .map(|id| Value::String(aliases.alias("tool", id))).unwrap_or(Value::Null),
-        }),
-        "tool_result" => json!({
-            "outcome": get("outcome"),
-            "text": text_of(payload.get("blocks").and_then(Value::as_array).map_or(&[][..], |blocks| blocks)),
-            "exitCode": known("exitCode"),
-            "structuredResult": known("structuredResult"),
-            "changes": payload.get("changes").and_then(Value::as_array).map(|changes| {
-                changes.iter().map(|change| json!({
-                    "path": change.get("path").cloned().unwrap_or(Value::Null),
-                    "application": change.get("application").cloned().unwrap_or(Value::Null),
-                })).collect::<Vec<_>>()
-            }).unwrap_or_default(),
-        }),
         "interaction.requested" => {
             let interaction = payload.get("interaction").unwrap_or(&null);
             json!({
@@ -1029,16 +1075,13 @@ fn render(report: &Report, args: &DiffArgs, left: usize, right: usize, color: bo
     let _ = writeln!(
         out,
         "{}",
-        paint(
-            "1m",
-            &format!("--- {} ({left} events)", args.left.display())
-        )
+        paint("1", &format!("--- {} ({left} events)", args.left.display()))
     );
     let _ = writeln!(
         out,
         "{}",
         paint(
-            "1m",
+            "1",
             &format!("+++ {} ({right} events)", args.right.display())
         )
     );

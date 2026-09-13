@@ -27,6 +27,16 @@ reason = """
 Same as assistant text: print emits `thinking_delta`, the PTY path reconstructs
 thoughts from whole transcript blocks."""
 
+[[rule]]
+kind = "tool_call"
+field = "granularity"
+allow = ["record-level", "token-level", "snapshot", "single"]
+reason = """
+§7: print streams tool arguments as `input_json_delta` and settles them with a
+`replace`; codex and the PTY transcript only ever expose the completed item
+(**[V]** no text deltas in 97 rollout records). The resolved `input` is still
+compared field by field — only the arrival shape is excused."""
+
 # --- usage: estimated on the PTY side until UsageAdapter reports ------------
 
 [[rule]]

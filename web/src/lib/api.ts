@@ -348,6 +348,17 @@ export type WorktreeCreateSpec = {
 
 export type PtyKey = "enter" | "esc" | "ctrl+c";
 
+/** Resume target: keep the structured transcript, or continue in a terminal (D-026). */
+export type ResumeMode = "structured" | "terminal";
+
+/** Where a resume landed: the new instance the caller should navigate to. */
+export type ResumeResult = {
+  instanceId: Id;
+  mode: ResumeMode;
+  /** True when an earlier resume for this target was reused. */
+  replayed: boolean;
+};
+
 /** Hub GET `/v1/providers` row. Auth token is never present. */
 export type HubProviderRow = {
   id: string;
@@ -394,7 +405,7 @@ export type HubApi = {
   worktreeCreate(spec: WorktreeCreateSpec): Promise<WorktreeRecord>;
   screenRead(instanceId: Id, lines?: number): Promise<ScreenRead>;
   instanceClose(instanceId: Id): Promise<CommandResult>;
-  instanceResume(instanceId: Id): Promise<CommandResult>;
+  instanceResume(instanceId: Id, mode?: ResumeMode): Promise<ResumeResult>;
   /** `DELETE /v1/instances/{id}`; `force` stops a live Instance first. */
   instanceDelete(instanceId: Id, force?: boolean): Promise<InstanceDeleted>;
   instanceConfigure(instanceId: Id, permissionMode: string, extras?: InstanceConfigurePatch): Promise<CommandResult>;
@@ -644,8 +655,8 @@ function createMockApi(): HubApi {
     async instanceClose(instanceId) {
       return mockClose(instanceId);
     },
-    async instanceResume(instanceId) {
-      return mockResume(instanceId);
+    async instanceResume(instanceId, mode = "structured") {
+      return mockResume(instanceId, mode);
     },
     async instanceDelete(instanceId, force) {
       return mockDelete(instanceId, force);
@@ -1023,8 +1034,16 @@ function createLiveApi(): HubApi {
     async instanceClose(instanceId) {
       return command(instanceId, "instance.close", {});
     },
-    async instanceResume(instanceId) {
-      return command(instanceId, "instance.resume", {});
+    async instanceResume(instanceId, mode = "structured") {
+      const body = await rest<HubJson<"/v1/instances/{id}/resume", "post">>(
+        `/v1/instances/${instanceId}/resume`,
+        { method: "POST", body: JSON.stringify({ mode }) },
+      );
+      return {
+        instanceId: body.instance.instanceId as Id,
+        mode: body.mode,
+        replayed: Boolean(body.replayed),
+      };
     },
     async instanceDelete(instanceId, force) {
       // `force=1` is what stops a live Instance — the Hub stops and deletes

@@ -58,41 +58,13 @@ pub(crate) fn instance_mcp(
     )
 }
 
-pub(crate) fn instance_env(
-    launch: &crate::DriverLaunch,
-    extra_env: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut env = extra_env.clone();
-    env.insert(
-        "REMUDA_INSTANCE_ID".into(),
-        launch.instance.meta.id.as_id().as_str().to_string(),
-    );
-    env.insert(
-        "REMUDA_HOST_ID".into(),
-        launch.instance.host_id.as_id().as_str().to_string(),
-    );
-    // An instance's future calls are Agent even when its creator was Human.
-    // Never leave an inherited operator token in the launched process.
-    env.insert(
-        "REMUDA_TOKEN".into(),
-        launch
-            .request
-            .agent_credential
-            .as_ref()
-            .map(|credential| credential.token.clone())
-            .unwrap_or_default(),
-    );
-    env.insert("REMUDA_BOOTSTRAP_TOKEN".into(), String::new());
-    env.insert("REMUDA_ENROLL_TOKEN".into(), String::new());
-    if let Some(hub) = launch
-        .request
-        .agent_credential
-        .as_ref()
-        .and_then(|credential| credential.hub.as_ref())
-    {
-        env.insert("REMUDA_HUB".into(), hub.clone());
-    }
-    env
+/// Keep the unredacted options map free of caller identity and credentials.
+pub(crate) fn instance_env(extra_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    extra_env
+        .iter()
+        .filter(|(name, _)| !remuda_driver::child_env::is_denied(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// Ephemeral instance-bound device token, received only on the authenticated
@@ -141,21 +113,20 @@ mod tests {
                 workspace_root: ".".into(),
                 registered_workspace_root: ".".into(),
             };
-            let env = instance_env(&launch, &inherited);
-            assert_eq!(env["REMUDA_BOOTSTRAP_TOKEN"], "");
-            assert_eq!(env["REMUDA_ENROLL_TOKEN"], "");
-            assert_eq!(
-                env["REMUDA_TOKEN"],
-                credential.as_ref().map_or("", |_| "scoped-agent-token")
-            );
-            assert_eq!(
-                env["REMUDA_INSTANCE_ID"],
-                launch.instance.meta.id.as_id().as_str()
-            );
-            assert_eq!(
-                env["REMUDA_HOST_ID"],
-                launch.instance.host_id.as_id().as_str()
-            );
+            let env = instance_env(&inherited);
+            assert!(!env.keys().any(|name| name.starts_with("REMUDA_")));
+            let rendered = format!("{env:?} {:?}", instance_mcp(&launch));
+            for secret in [
+                "scoped-agent-token",
+                "human-token",
+                "pairing-code",
+                "enrollment-token",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "credential leaked through Debug"
+                );
+            }
             assert_eq!(env["FAKE_CLAUDE_SCRIPT"], "ok");
         }
     }

@@ -3,7 +3,7 @@
 //!
 //! The proof is end-to-end rather than a check on the map the driver builds.
 //! A "node" process is spawned holding real secrets in its environment; it
-//! launches an agent through `ClaudePrintDriver`, and the agent binary dumps
+//! launches through `ClaudePrintDriver` and `ShellPtyDriver`; the agent binary dumps
 //! the environment it actually received. A regression that drops `env_clear`,
 //! or adds a spawn site that forgets it, fails here.
 //!
@@ -12,12 +12,14 @@
 //! with the secrets set. The crate forbids `unsafe`, so the environment is
 //! established with `Command::env` on that re-exec rather than `set_var`.
 
+use remuda_driver::agent_mcp::AgentMcpContext;
 use remuda_driver::child_env;
 use remuda_driver::claude_print::{ClaudePrintDriver, ClaudePrintOptions};
+use remuda_driver::shell_pty::{ShellPtyDriver, ShellPtyOptions};
 use remuda_driver::{
     BinaryPin, BinarySource, Delegation, Driver, ProviderHealth, ProviderKind, ProviderProfile,
 };
-use remuda_protocol::{Digest, InstanceSpec};
+use remuda_protocol::{Digest, HostId, InstanceId, InstanceSpec};
 use remuda_testing::install_executable;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,8 @@ const NODE_MARKER: &str = "REMUDA_S1_ISOLATION_NODE";
 /// planting it in a live process is safe on both Linux and macOS.
 const NODE_SECRETS: &[(&str, &str)] = &[
     ("REMUDA_BOOTSTRAP_TOKEN", "rmd-bootstrap-leak-canary"),
+    ("REMUDA_ENROLL_TOKEN", "rmd-enroll-leak-canary"),
+    ("REMUDA_TOKEN", "rmd-operator-leak-canary"),
     ("REMUDA_HOST_TOKEN", "rmd-host-leak-canary"),
     ("ANTHROPIC_API_KEY", "sk-ant-leak-canary"),
     ("ANTHROPIC_AUTH_TOKEN", "sk-auth-leak-canary"),
@@ -79,7 +83,8 @@ fn env_dump_binary(dir: &Path, dump: &Path) -> PathBuf {
     let script = format!(
         "#!/bin/sh\n\
          if [ \"$1\" = \"--version\" ]; then echo '2.1.268 (Claude Code)'; exit 0; fi\n\
-         env > '{}'\n\
+         env > '{0}.pending'\n\
+         mv '{0}.pending' '{0}'\n\
          exit 0\n",
         dump.display()
     );
@@ -115,7 +120,11 @@ fn read_dump(path: &Path) -> BTreeMap<String, String> {
 }
 
 /// Launch one agent child and return the environment it actually received.
-async fn spawn_and_capture_env(extra_env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+async fn spawn_and_capture_env(
+    extra_env: BTreeMap<String, String>,
+    shell: bool,
+    context: Option<AgentMcpContext>,
+) -> BTreeMap<String, String> {
     let tmp = tempfile::tempdir().unwrap();
     let dump = tmp.path().join("env-dump.txt");
     let launch = tmp.path().join("launch");
@@ -133,14 +142,34 @@ async fn spawn_and_capture_env(extra_env: BTreeMap<String, String>) -> BTreeMap<
         version: "2.1.268 (Claude Code)".into(),
         sha256: dummy_digest(),
     };
-    let mut options = ClaudePrintOptions::new(profile(), launch, home, BinarySource::Pinned(pin));
-    options.extra_env = extra_env;
-    options.handshake_timeout = Duration::from_secs(10);
-    let driver = ClaudePrintDriver::new(options);
+    let driver: Box<dyn Driver> = if shell {
+        let mut options = ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.args = vec![binary.to_string_lossy().into_owned()];
+        options.extra_env = extra_env;
+        options.agent_mcp = context;
+        assert!(!format!("{options:?}").contains("trusted-scope-test-token"));
+        Box::new(ShellPtyDriver::new(options))
+    } else {
+        let mut options =
+            ClaudePrintOptions::new(profile(), launch, home, BinarySource::Pinned(pin));
+        options.extra_env = extra_env;
+        options.agent_mcp = context;
+        options.handshake_timeout = Duration::from_secs(10);
+        assert!(
+            !format!("{:?} {:?}", options.extra_env, options.agent_mcp)
+                .contains("trusted-scope-test-token")
+        );
+        Box::new(ClaudePrintDriver::new(options))
+    };
 
     // The stub exits at once so the handshake fails, but it has already
     // written its environment — which is the whole assertion.
-    let startup = driver.start(load_spec(tmp.path())).await;
+    let mut spec = load_spec(tmp.path());
+    if shell {
+        spec.driver = remuda_protocol::DriverKind::ShellPty;
+        spec.kind = remuda_protocol::AgentKind::Terminal;
+    }
+    let startup = driver.start(spec).await;
 
     for _ in 0..40 {
         if dump.is_file() {
@@ -173,48 +202,73 @@ async fn agent_child_is_isolated() {
         );
     }
 
-    let env = spawn_and_capture_env(BTreeMap::new()).await;
+    for shell in [false, true] {
+        for trusted in [false, true] {
+            let instance = InstanceId::new();
+            let host = HostId::new();
+            let context = trusted.then(|| {
+                AgentMcpContext::new(
+                    instance.clone(),
+                    host.clone(),
+                    "trusted-scope-test-token".into(),
+                    Some("http://hub.example".into()),
+                )
+            });
+            let env = spawn_and_capture_env(BTreeMap::new(), shell, context).await;
 
-    // S1: no Node secret reaches the child, by name or by value. These are
-    // names this test set itself, so the assertion is about our own code and
-    // not about whatever the platform injects.
-    for (name, value) in NODE_SECRETS {
-        assert!(
-            !env.contains_key(*name),
-            "child inherited {name}; full env: {env:#?}"
-        );
-        assert!(
-            !env.values().any(|actual| actual.contains(value)),
-            "the value of {name} reached the child under another name: {env:#?}"
-        );
-    }
-    assert!(
-        !env.keys().any(|name| name.starts_with("REMUDA_")),
-        "a REMUDA_* variable reached the child: {env:#?}"
-    );
+            // S1: no Node secret reaches the child, by name or by value. These are
+            // names this test set itself, so the assertion is about our own code and
+            // not about whatever the platform injects.
+            for (name, value) in NODE_SECRETS {
+                if !trusted || *name != "REMUDA_TOKEN" {
+                    assert!(
+                        !env.contains_key(*name),
+                        "child inherited {name}; full env: {env:#?}"
+                    );
+                }
+                assert!(
+                    !env.values().any(|actual| actual.contains(value)),
+                    "the value of {name} reached the child under another name: {env:#?}"
+                );
+            }
+            if trusted {
+                assert_eq!(env["REMUDA_TOKEN"], "trusted-scope-test-token");
+                assert_eq!(env["REMUDA_INSTANCE_ID"], instance.as_id().as_str());
+                assert_eq!(env["REMUDA_HOST_ID"], host.as_id().as_str());
+                assert_eq!(env["REMUDA_HUB"], "http://hub.example");
+            } else {
+                assert!(
+                    !env.keys().any(|name| name.starts_with("REMUDA_")),
+                    "{env:#?}"
+                );
+            }
 
-    // S2: no proxy or TLS override reaches the child. Loader variables are
-    // covered by `loader_names_are_denied_by_the_filter` — see HOSTILE_LOADER
-    // for why they must not be planted in a live process.
-    for (name, _) in HOSTILE_INERT {
-        assert!(
-            !env.contains_key(*name),
-            "child inherited {name}; full env: {env:#?}"
-        );
-    }
+            // S2: no proxy or TLS override reaches the child. Loader variables are
+            // covered by `loader_names_are_denied_by_the_filter` — see HOSTILE_LOADER
+            // for why they must not be planted in a live process.
+            for (name, _) in HOSTILE_INERT {
+                assert!(
+                    !env.contains_key(*name),
+                    "child inherited {name}; full env: {env:#?}"
+                );
+            }
 
-    // An empty environment would pass the checks above while breaking every
-    // real launch, so assert the child is still usable.
-    for required in ["PATH", "HOME"] {
-        assert!(
-            env.contains_key(required),
-            "child is missing {required}; full env: {env:#?}"
-        );
+            // An empty environment would pass the checks above while breaking every
+            // real launch, so assert the child is still usable.
+            for required in ["PATH", "HOME"] {
+                assert!(
+                    env.contains_key(required),
+                    "child is missing {required}; full env: {env:#?}"
+                );
+            }
+            if !shell {
+                assert!(
+                    env.contains_key("CLAUDE_CONFIG_DIR"),
+                    "the materialized native home did not reach the child: {env:#?}"
+                );
+            }
+        }
     }
-    assert!(
-        env.contains_key("CLAUDE_CONFIG_DIR"),
-        "the materialized native home did not reach the child: {env:#?}"
-    );
 }
 
 /// Spawn the node half with a Node-like environment and require it to pass.
@@ -285,16 +339,26 @@ async fn extra_env_cannot_reintroduce_a_denied_name() {
     extra.insert("LD_PRELOAD".to_owned(), "/tmp/injected.so".to_owned());
     extra.insert("HTTPS_PROXY".to_owned(), "http://injected:8080".to_owned());
     extra.insert("FAKE_CLAUDE_SCRIPT".to_owned(), "/tmp/script".to_owned());
-    let env = spawn_and_capture_env(extra).await;
+    extra.insert("REMUDA_TOKEN".into(), "forged-overlay-token".into());
+    for shell in [false, true] {
+        let context = AgentMcpContext::new(
+            InstanceId::new(),
+            HostId::new(),
+            "trusted-scope-test-token".into(),
+            None,
+        );
+        let env = spawn_and_capture_env(extra.clone(), shell, Some(context)).await;
+        assert_eq!(env["REMUDA_TOKEN"], "trusted-scope-test-token");
 
-    assert!(!env.contains_key("LD_PRELOAD"), "{env:#?}");
-    assert!(!env.contains_key("HTTPS_PROXY"), "{env:#?}");
-    // A benign overlay still works — the denylist is not a blanket ban.
-    assert_eq!(
-        env.get("FAKE_CLAUDE_SCRIPT").map(String::as_str),
-        Some("/tmp/script"),
-        "a permitted extra_env entry was dropped: {env:#?}"
-    );
+        assert!(!env.contains_key("LD_PRELOAD"), "{env:#?}");
+        assert!(!env.contains_key("HTTPS_PROXY"), "{env:#?}");
+        // A benign overlay still works — the denylist is not a blanket ban.
+        assert_eq!(
+            env.get("FAKE_CLAUDE_SCRIPT").map(String::as_str),
+            Some("/tmp/script"),
+            "a permitted extra_env entry was dropped: {env:#?}"
+        );
+    }
 }
 
 #[test]

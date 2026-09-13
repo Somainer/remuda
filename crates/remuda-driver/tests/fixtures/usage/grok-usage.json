@@ -1,0 +1,11 @@
+{
+  "grok-4.6-build": {
+    "inputTokens": 26512,
+    "outputTokens": 35,
+    "cacheReadInputTokens": 640,
+    "cacheCreationInputTokens": 0,
+    "reasoningTokens": 30,
+    "modelCalls": 1,
+    "costUSD": 0.00910418
+  }
+}

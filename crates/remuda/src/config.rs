@@ -99,6 +99,8 @@ pub(crate) struct Node {
     pub workspace_roots: Option<Vec<PathBuf>>,
     #[serde(alias = "autoTrustRegisteredWorkspaces")]
     pub auto_trust_registered_workspaces: bool,
+    #[serde(alias = "promoteTerminalAgents")]
+    pub promote_terminal_agents: bool,
     #[serde(alias = "webOrigins")]
     pub web_origins: Vec<String>,
 }
@@ -390,6 +392,7 @@ impl Default for Node {
             workspaces: Vec::new(),
             workspace_roots: None,
             auto_trust_registered_workspaces: true,
+            promote_terminal_agents: true,
             web_origins: vec![
                 "http://localhost:5173".into(),
                 "http://127.0.0.1:5173".into(),
@@ -518,6 +521,13 @@ impl Config {
                 "1" | "true" => true,
                 "0" | "false" => false,
                 _ => bail!("REMUDA_AUTO_TRUST_REGISTERED_WORKSPACES must be true, false, 1 or 0"),
+            };
+        }
+        if let Some(value) = env_text(env, "REMUDA_PROMOTE_TERMINAL_AGENTS")? {
+            self.node.promote_terminal_agents = match value.as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => bail!("REMUDA_PROMOTE_TERMINAL_AGENTS must be true, false, 1 or 0"),
             };
         }
         if let Some(value) = env_text(env, "REMUDA_MAX_INSTANCES")? {

@@ -57,6 +57,18 @@ pub trait LocalStore: Send + Sync {
         lifecycle: Option<InstanceLifecycle>,
         activity: Option<Knowledge<Activity>>,
     ) -> Result<Instance, NodeError>;
+    /// Apply a terminal → agent promotion or demotion (D-025).
+    ///
+    /// `kind` is the agent now holding the PTY's foreground (`terminal` on
+    /// demotion) and `mode` says how it got there. Idempotent: applying the
+    /// same pair twice does not bump the revision.
+    fn set_instance_promotion(
+        &self,
+        instance_id: &InstanceId,
+        kind: remuda_protocol::AgentKind,
+        mode: remuda_protocol::InstanceMode,
+        promoted_at: Option<remuda_protocol::Timestamp>,
+    ) -> Result<Instance, NodeError>;
     /// Mark the instance failed and record `lastError`.
     fn set_instance_failure(
         &self,
@@ -487,6 +499,40 @@ impl LocalStore for MemoryStore {
         ) {
             record.instance.active_run_ids.clear();
         }
+        record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
+        record.instance.meta.updated_at = now;
+        let instance = record.instance.clone();
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&instance)?;
+        }
+        Ok(instance)
+    }
+
+    fn set_instance_promotion(
+        &self,
+        instance_id: &InstanceId,
+        kind: remuda_protocol::AgentKind,
+        mode: remuda_protocol::InstanceMode,
+        promoted_at: Option<remuda_protocol::Timestamp>,
+    ) -> Result<Instance, NodeError> {
+        let now = timestamp_now()?;
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let record = state
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        let unchanged = record.instance.kind == kind
+            && record.instance.mode == Some(mode)
+            && record.instance.promoted_at == promoted_at;
+        if unchanged {
+            return Ok(record.instance.clone());
+        }
+        record.instance.kind = kind;
+        record.instance.mode = Some(mode);
+        record.instance.promoted_at = promoted_at;
+        // The native identity now points at the promoted agent, not the shell.
+        record.instance.native_ref.kind = kind;
         record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
         record.instance.meta.updated_at = now;
         let instance = record.instance.clone();

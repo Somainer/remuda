@@ -609,6 +609,16 @@ fn spawn_observation_pump(
             if let Some(reason) = native_failure_reason(&observation) {
                 record_task_exit(store.as_ref(), &instance_id, &reason);
             }
+            if let Some(promotion) = promotion_change(&observation)
+                && let Err(error) = store.set_instance_promotion(
+                    &instance_id,
+                    promotion.kind,
+                    promotion.mode,
+                    promotion.promoted_at,
+                )
+            {
+                tracing::warn!(%error, "instance promotion not applied");
+            }
             match store.append_driver_observation(&instance_id, observation) {
                 Ok(committed) => {
                     if let Err(error) = interactions.ingest(&committed).await {
@@ -971,6 +981,55 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
         append_instance_lifecycle(store, instance_id, Some("ready"), "failed", reason)
     {
         tracing::error!(%error, "failed to append task-exit lifecycle event");
+    }
+}
+
+/// A terminal → agent promotion or demotion read off a driver lifecycle (D-025).
+struct PromotionChange {
+    kind: AgentKind,
+    mode: remuda_protocol::InstanceMode,
+    promoted_at: Option<remuda_protocol::Timestamp>,
+}
+
+/// Recognize the driver's `agent_promoted` / `agent_demoted` lifecycle.
+///
+/// Only these two names move `kind`. The accompanying `agent_detected`
+/// diagnostic is journal-only: it explains *why* to a human reading the
+/// journal, and must not be a second path into the entity.
+fn promotion_change(observation: &remuda_protocol::Observation) -> Option<PromotionChange> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    let mode = match native.native_name.as_str() {
+        "agent_promoted" => remuda_protocol::InstanceMode::Promoted,
+        "agent_demoted" => remuda_protocol::InstanceMode::Native,
+        _ => return None,
+    };
+    let kind = agent_kind(native.related_ids.get("kind")?)?;
+    let promoted_at = native
+        .related_ids
+        .get("promotedAt")
+        .filter(|_| mode == remuda_protocol::InstanceMode::Promoted)
+        .and_then(|value| remuda_protocol::Timestamp::try_from(value.clone()).ok());
+    Some(PromotionChange {
+        kind,
+        mode,
+        promoted_at,
+    })
+}
+
+fn agent_kind(wire: &str) -> Option<AgentKind> {
+    match wire {
+        "claude" => Some(AgentKind::Claude),
+        "codex" => Some(AgentKind::Codex),
+        "grok" => Some(AgentKind::Grok),
+        "agy" => Some(AgentKind::Agy),
+        "generic" => Some(AgentKind::Generic),
+        "terminal" => Some(AgentKind::Terminal),
+        _ => None,
     }
 }
 
@@ -1511,6 +1570,9 @@ pub(crate) fn fixture_instance(
         durable_seq: U64(0),
         exit: Knowledge::NotApplicable,
         last_error: None,
+        // Created as this kind; promotion (D-025) is what changes both.
+        mode: Some(remuda_protocol::InstanceMode::Native),
+        promoted_at: None,
     })
 }
 

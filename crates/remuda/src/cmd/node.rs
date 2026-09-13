@@ -142,6 +142,7 @@ pub(crate) async fn run(
     if args.stdio {
         let mut native = remuda_node::NativeDriverConfig::new(config.data_dir.clone());
         native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
+        native.promote_terminal_agents = config.node.promote_terminal_agents;
         native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
         native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
         let runtime = compose(&ServeConfig {
@@ -177,6 +178,7 @@ pub(crate) async fn run(
     let mut service = ServeConfig::native(http, config.data_dir.clone());
     if let remuda_node::LocalDrivers::Native(native) = &mut service.drivers {
         native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
+        native.promote_terminal_agents = config.node.promote_terminal_agents;
         native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
     }
     let runtime = compose(&service)?;

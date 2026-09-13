@@ -330,6 +330,7 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     }
     opts.driver = normalize_driver(&opts.driver);
     if let Some(wt_name) = opts.worktree.clone() {
+        worktree::require_operator_environment()?;
         worktree::validate_name(&wt_name)?;
         let record = worktree::ensure(&wt_name, None)?;
         if opts.cwd.is_none() {
@@ -404,7 +405,11 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
 }
 
 pub(crate) async fn list_instances(client: &HubClient, host: Option<&str>) -> Result<Value> {
-    let hosts = client.list_hosts().await.unwrap_or_default();
+    let hosts = if client.caller_context().await?.origin == remuda_hub_client::CallerOrigin::Agent {
+        Vec::new()
+    } else {
+        client.list_hosts().await.unwrap_or_default()
+    };
     let items = list_instance_items(client, host).await?;
     let projected: Vec<Value> = items
         .iter()
@@ -414,6 +419,17 @@ pub(crate) async fn list_instances(client: &HubClient, host: Option<&str>) -> Re
 }
 
 async fn list_instance_items(client: &HubClient, host: Option<&str>) -> Result<Vec<Value>> {
+    let caller = client.caller_context().await?;
+    if caller.origin == remuda_hub_client::CallerOrigin::Agent {
+        let mut items = Vec::new();
+        for id in caller.instance_id.iter().chain(&caller.children) {
+            let item = client.get(&format!("/v1/instances/{id}")).await?;
+            if host.is_none_or(|host| host.is_empty() || item["hostId"] == host) {
+                items.push(item);
+            }
+        }
+        return Ok(items);
+    }
     let path = match host {
         Some(id) if !id.is_empty() => format!("/v1/instances?hostId={id}"),
         _ => "/v1/instances".into(),
@@ -630,7 +646,7 @@ pub(crate) async fn resolve_instance_id(client: &HubClient, id_or_name: &str) ->
     if id_or_name.starts_with("ins_") {
         return Ok(id_or_name.to_string());
     }
-    let items = client.list_instances().await?;
+    let items = list_instance_items(client, None).await?;
     let mut matches = Vec::new();
     for item in &items {
         let id = item.get("instanceId").and_then(Value::as_str).unwrap_or("");
@@ -648,11 +664,7 @@ pub(crate) async fn resolve_instance_id(client: &HubClient, id_or_name: &str) ->
 }
 
 async fn instance_snapshot(client: &HubClient, instance_id: &str) -> Result<Value> {
-    let items = client.list_instances().await?;
-    Ok(items
-        .into_iter()
-        .find(|item| item.get("instanceId").and_then(Value::as_str) == Some(instance_id))
-        .unwrap_or(json!({})))
+    Ok(client.get(&format!("/v1/instances/{instance_id}")).await?)
 }
 
 pub(crate) fn project_instance(item: &Value, hosts: &[Value]) -> Value {

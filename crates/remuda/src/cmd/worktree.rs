@@ -90,6 +90,9 @@ struct Catalog {
 
 /// Run a `remuda worktree` subcommand.
 pub(crate) fn run(command: WorktreeCommand) -> Result<()> {
+    if !matches!(command, WorktreeCommand::Ls { .. }) {
+        require_operator_environment()?;
+    }
     match command {
         WorktreeCommand::Ls { repo, json } => {
             let items = list(repo.as_deref())?;
@@ -147,6 +150,15 @@ pub(crate) fn run(command: WorktreeCommand) -> Result<()> {
     }
 }
 
+/// Local mutations have no instance-scoped execution or approval boundary.
+pub(crate) fn require_operator_environment() -> Result<()> {
+    ensure!(
+        std::env::var_os("REMUDA_INSTANCE_ID").is_none(),
+        "worktree mutation requires a Human/Bot coordinator; REMUDA_INSTANCE_ID is set"
+    );
+    Ok(())
+}
+
 /// Create (or reuse) a worktree named `name`.
 pub(crate) fn create(
     name: &str,
@@ -154,6 +166,7 @@ pub(crate) fn create(
     path: Option<&Path>,
     repo: Option<&Path>,
 ) -> Result<WorktreeRecord> {
+    require_operator_environment()?;
     validate_name(name)?;
     let repo_root = repo_root(repo)?;
     let git_common = git_common_dir(&repo_root)?;
@@ -215,6 +228,7 @@ pub(crate) fn create(
 
 /// Look up a recorded worktree, creating one with defaults when missing.
 pub(crate) fn ensure(name: &str, repo: Option<&Path>) -> Result<WorktreeRecord> {
+    require_operator_environment()?;
     if let Ok(found) = lookup(name, repo)
         && Path::new(&found.path).exists()
     {
@@ -423,6 +437,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 pub(crate) fn remove(name: &str, repo: Option<&Path>, force: bool) -> Result<serde_json::Value> {
+    require_operator_environment()?;
     let root = repo_root(repo)?;
     let common = git_common_dir(&root)?;
     let _lock = catalog_lock(&common)?;
@@ -472,6 +487,7 @@ pub(crate) fn remove(name: &str, repo: Option<&Path>, force: bool) -> Result<ser
 }
 
 pub(crate) fn prune(repo: Option<&Path>, dry_run: bool) -> Result<serde_json::Value> {
+    require_operator_environment()?;
     let root = repo_root(repo)?;
     let common = git_common_dir(&root)?;
     let _lock = catalog_lock(&common)?;

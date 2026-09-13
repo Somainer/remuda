@@ -170,6 +170,50 @@ fn default_provider_scope() -> String {
     "universal".into()
 }
 
+/// One staged attachment (D-027). Bytes live in the same row; the MVP keeps
+/// them in SQLite rather than adding a second storage path to operate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ObjectRecord {
+    /// `obj_…`.
+    pub object_id: String,
+    /// Instance this attachment is staged for; also the read-authorization key.
+    pub instance_id: String,
+    /// Host of that instance, so a Node can only read its own attachments.
+    pub host_id: String,
+    /// Sniffed media type; the caller's `Content-Type` never overrides it.
+    pub media_type: String,
+    /// Derived `<obj_id>.<ext>` name. Original filenames are discarded.
+    pub stored_name: String,
+    /// Lowercase hex SHA-256 of the bytes.
+    pub digest: String,
+    /// Stored length.
+    pub byte_len: i64,
+    /// RFC3339 expiry; a row at or past it reads as absent.
+    pub expires_at: String,
+}
+
+/// Arguments for [`Store::insert_object`].
+pub struct NewObject {
+    /// Target instance.
+    pub instance_id: String,
+    /// Host owning that instance.
+    pub host_id: String,
+    /// Sniffed media type.
+    pub media_type: String,
+    /// Extension for the derived stored name.
+    pub extension: String,
+    /// Lowercase hex SHA-256.
+    pub digest: String,
+    /// Image bytes.
+    pub bytes: Vec<u8>,
+    /// Uploading device, for the audit line.
+    pub device_id: String,
+    /// Staging lifetime in seconds.
+    pub ttl_seconds: i64,
+    /// Per-instance byte ceiling.
+    pub instance_budget: i64,
+}
+
 /// Instance index row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -756,6 +800,129 @@ impl Store {
                 ],
             )?;
             Ok(id)
+        })
+        .await
+    }
+
+    /// Stage one attachment, deduplicating by `(instance_id, digest)` (D-027).
+    ///
+    /// Re-uploading identical bytes for the same instance returns the existing
+    /// row and refreshes its expiry, so a retried upload never doubles the
+    /// instance's quota. Expired rows for that instance are swept first, which
+    /// is the whole of the MVP's garbage collection — no cron.
+    pub async fn insert_object(&self, new: NewObject) -> Result<ObjectRecord, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM objects WHERE instance_id = ?1 AND expires_at <= ?2",
+                params![new.instance_id, now],
+            )?;
+            let expires_at = rfc3339_after(new.ttl_seconds);
+            if let Some(existing) = load_object_by_digest(&tx, &new.instance_id, &new.digest)? {
+                tx.execute(
+                    "UPDATE objects SET expires_at = ?1 WHERE id = ?2",
+                    params![expires_at, existing.object_id],
+                )?;
+                tx.commit()?;
+                return Ok(ObjectRecord {
+                    expires_at,
+                    ..existing
+                });
+            }
+            let staged: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(byte_len), 0) FROM objects WHERE instance_id = ?1",
+                params![new.instance_id],
+                |row| row.get(0),
+            )?;
+            let byte_len = i64::try_from(new.bytes.len()).unwrap_or(i64::MAX);
+            if staged.saturating_add(byte_len) > new.instance_budget {
+                return Err(StoreError::Id(format!(
+                    "RESOURCE_LIMIT: instance already stages {staged} bytes; the limit is {}",
+                    new.instance_budget
+                )));
+            }
+            let object_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
+            // Derived, never caller-supplied: no traversal is representable.
+            let stored_name = format!("{object_id}.{}", new.extension);
+            tx.execute(
+                "INSERT INTO objects
+                    (id, instance_id, host_id, media_type, stored_name, digest, byte_len,
+                     bytes, created_by, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    object_id,
+                    new.instance_id,
+                    new.host_id,
+                    new.media_type,
+                    stored_name,
+                    new.digest,
+                    byte_len,
+                    new.bytes,
+                    new.device_id,
+                    now,
+                    expires_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(ObjectRecord {
+                object_id,
+                instance_id: new.instance_id,
+                host_id: new.host_id,
+                media_type: new.media_type,
+                stored_name,
+                digest: new.digest,
+                byte_len,
+                expires_at,
+            })
+        })
+        .await
+    }
+
+    /// Attachment metadata without its bytes.
+    pub async fn get_object(&self, id: String) -> Result<Option<ObjectRecord>, StoreError> {
+        self.run(move |conn| load_object(conn, &id)).await
+    }
+
+    /// Staged bytes, or `None` when the row is gone.
+    pub async fn read_object_bytes(&self, id: String) -> Result<Option<Vec<u8>>, StoreError> {
+        self.run(move |conn| {
+            conn.query_row(
+                "SELECT bytes FROM objects WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Resolve a Bearer token to a host id, using the same prefix index and
+    /// verifier as the `/v1/node` handshake (D-027). `None` means the token is
+    /// not a host token, leaving the device path free to try.
+    pub async fn find_host_by_token<F>(
+        &self,
+        token: String,
+        verify: F,
+    ) -> Result<Option<String>, StoreError>
+    where
+        F: Fn(&str, &str) -> bool + Send + 'static,
+    {
+        self.run(move |conn| {
+            let Some(prefix) = crate::auth::token_prefix(&token) else {
+                return Ok(None);
+            };
+            let candidate = conn
+                .query_row(
+                    "SELECT id, token_hash FROM hosts WHERE token_prefix = ?1",
+                    params![prefix],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(candidate
+                .filter(|(_, hash)| verify(&token, hash))
+                .map(|(id, _)| id))
         })
         .await
     }
@@ -2302,6 +2469,22 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             max_instances INTEGER NOT NULL DEFAULT 8,
             hostname TEXT
         );
+        CREATE TABLE IF NOT EXISTS objects (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            stored_name TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            byte_len INTEGER NOT NULL,
+            bytes BLOB NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS objects_instance_digest
+            ON objects(instance_id, digest);
+        CREATE INDEX IF NOT EXISTS objects_expires_at ON objects(expires_at);
         CREATE TABLE IF NOT EXISTS ssh_hosts (
             host_id TEXT PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
             target TEXT NOT NULL UNIQUE,
@@ -2568,6 +2751,14 @@ fn apply_instance_projection(
              WHERE id = ?5",
             params![seq, lifecycle, last_error, now, instance_id],
         )?;
+        // D-027: a terminal instance can never consume a staged attachment
+        // again, and the Node drops its own copy at the same point.
+        if matches!(lifecycle, "exited" | "failed") {
+            conn.execute(
+                "DELETE FROM objects WHERE instance_id = ?1",
+                params![instance_id],
+            )?;
+        }
     } else {
         conn.execute(
             "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
@@ -3644,6 +3835,61 @@ fn dedup_duplicate_hosts(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
     Ok(())
+}
+
+fn object_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
+    Ok(ObjectRecord {
+        object_id: row.get(0)?,
+        instance_id: row.get(1)?,
+        host_id: row.get(2)?,
+        media_type: row.get(3)?,
+        stored_name: row.get(4)?,
+        digest: row.get(5)?,
+        byte_len: row.get(6)?,
+        expires_at: row.get(7)?,
+    })
+}
+
+const OBJECT_COLUMNS: &str =
+    "id, instance_id, host_id, media_type, stored_name, digest, byte_len, expires_at";
+
+fn load_object(conn: &Connection, id: &str) -> Result<Option<ObjectRecord>, StoreError> {
+    conn.query_row(
+        &format!("SELECT {OBJECT_COLUMNS} FROM objects WHERE id = ?1"),
+        params![id],
+        object_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn load_object_by_digest(
+    conn: &Connection,
+    instance_id: &str,
+    digest: &str,
+) -> Result<Option<ObjectRecord>, StoreError> {
+    conn.query_row(
+        &format!("SELECT {OBJECT_COLUMNS} FROM objects WHERE instance_id = ?1 AND digest = ?2"),
+        params![instance_id, digest],
+        object_from_row,
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// RFC3339 UTC `secs` from now.
+fn rfc3339_after(secs: i64) -> String {
+    let t = time::OffsetDateTime::now_utc() + time::Duration::seconds(secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
 }
 
 pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreError> {

@@ -15,6 +15,7 @@
     { "name": "fleet" },
     { "name": "devices" },
     { "name": "providers" },
+    { "name": "objects" },
     { "name": "push" },
     { "name": "realtime" }
   ],
@@ -597,6 +598,67 @@
             }
           },
           "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/objects": {
+      "post": {
+        "tags": ["objects"],
+        "operationId": "objectUpload",
+        "summary": "Stage one image for a later instance.send (D-027)",
+        "description": "Raw image bytes with a Content-Type. Human or Bot devices only; an Agent-origin caller is refused. The media type is sniffed from the bytes and must agree with the declared Content-Type. Limits: 5 MiB per attachment, 64 MiB staged per instance, 4 attachments per send.",
+        "parameters": [
+          {
+            "name": "instanceId",
+            "in": "query",
+            "required": true,
+            "description": "Instance this attachment is staged for; it also scopes who may read it back.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "image/png": { "schema": { "type": "string", "format": "binary" } },
+            "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+            "image/gif": { "schema": { "type": "string", "format": "binary" } },
+            "image/webp": { "schema": { "type": "string", "format": "binary" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Staged object metadata",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/AttachmentUpload" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/objects/{id}": {
+      "get": {
+        "tags": ["objects"],
+        "operationId": "objectRead",
+        "summary": "Read staged attachment bytes",
+        "description": "Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance — a Node cannot read another host's attachments — or as a Human/Bot device. Expired objects read as 404.",
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": {
+            "description": "Raw image bytes, served as an attachment with nosniff",
+            "content": {
+              "image/png": { "schema": { "type": "string", "format": "binary" } },
+              "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+              "image/gif": { "schema": { "type": "string", "format": "binary" } },
+              "image/webp": { "schema": { "type": "string", "format": "binary" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" }
         }
       }
@@ -1671,6 +1733,37 @@
           "instance": { "$ref": "#/components/schemas/InstanceRecord" },
           "command": { "$ref": "#/components/schemas/CommandRecord" },
           "hostId": { "type": "string" }
+        }
+      },
+      "AttachmentUpload": {
+        "type": "object",
+        "description": "Staged attachment metadata (D-027). The media type and name are the Hub's own: the type is sniffed from the bytes and the name is derived as <objectId>.<ext>, so a caller-supplied filename never survives.",
+        "required": [
+          "objectId",
+          "mediaType",
+          "size",
+          "digest",
+          "name",
+          "instanceId",
+          "expiresAt"
+        ],
+        "properties": {
+          "objectId": { "type": "string" },
+          "mediaType": {
+            "type": "string",
+            "enum": ["image/png", "image/jpeg", "image/gif", "image/webp"]
+          },
+          "size": { "type": "integer" },
+          "digest": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 of the stored bytes."
+          },
+          "name": { "type": "string" },
+          "instanceId": { "type": "string" },
+          "expiresAt": {
+            "type": "string",
+            "description": "RFC3339. Staging is lazily expired, not swept by a job."
+          }
         }
       },
       "CommandRequest": {

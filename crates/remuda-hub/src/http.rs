@@ -607,6 +607,9 @@ pub async fn post_command(
         &mut payload,
     )
     .await?;
+    if body.operation == "instance.send" {
+        crate::objects::validate_send_attachments(&state, &device, &instance, &mut payload).await?;
+    }
     let (command, created) = state
         .store
         .queue_command(

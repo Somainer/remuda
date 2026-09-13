@@ -23,6 +23,7 @@ mod instances;
 mod interactions;
 mod inventory;
 mod maintenance;
+mod objects;
 mod placement;
 mod provider_resolve;
 mod providers;
@@ -342,6 +343,7 @@ pub fn router(state: AppState) -> Router {
         .merge(devices::routes())
         .merge(providers::routes())
         .merge(agent_scope::routes())
+        .merge(objects::routes())
         .merge(workspaces::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

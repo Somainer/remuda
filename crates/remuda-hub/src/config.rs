@@ -194,3 +194,9 @@ pub fn secret_eq(left: &str, right: &str) -> bool {
 pub fn new_id(prefix: &str) -> Result<String, remuda_protocol::WireValueError> {
     remuda_protocol::Id::new(prefix).map(|id| id.to_string())
 }
+
+/// Lowercase hex SHA-256, used to deduplicate staged attachments (D-027).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}

@@ -30,7 +30,10 @@ pub use fake_herdr::{
     herdr_frames_path, herdr_session_ok_path, run_fake_herdr, write_observe_frames,
 };
 pub use flags::ClaudeFlags;
-pub use paths::{FIXED_SESSION_ID, ScriptKind, fixtures_dir, script_kind_from_name, script_path};
+pub use paths::{
+    FIXED_SESSION_ID, ScriptKind, fixtures_dir, hook_session_fixture, hook_session_path,
+    script_kind_from_name, script_path,
+};
 pub use script::{load_script, load_script_from_env};
 pub use stub::install_executable;
 

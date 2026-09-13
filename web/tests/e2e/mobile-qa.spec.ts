@@ -6,7 +6,10 @@ const TTY_LAB = "ins_01993ab0-0000-7000-8000-00000000aa01";
 const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence");
 
 test.describe("mobile visual QA", () => {
-  test.use({ viewport: { width: 390, height: 844 } });
+  // `hasTouch` matters, not just the width: the terminal hands the keyboard to
+  // the on-screen dock on a coarse pointer, so a narrow *desktop* window (no
+  // touch) deliberately stays in 直连 and has no 发送 button.
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
   test("composer stays above the bottom bar", async ({ page }) => {
     await page.goto("/sessions");

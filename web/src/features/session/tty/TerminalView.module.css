@@ -164,7 +164,9 @@
 .viewport {
   flex: 1;
   min-height: 240px;
-  overflow: auto;
+  /* A4: the terminal owns its scrollback; the outer box must never scroll,
+     or a wheel gesture near the bottom edge moves this div instead. */
+  overflow: hidden;
   position: relative;
   background: var(--ink-0, #0f1319);
 }
@@ -173,6 +175,9 @@
   height: 100%;
   min-height: 240px;
   padding: 16px 20px;
+  /* A4: without this, `height: 100%` is the *content* box and the padding is
+     added on top, so the host is always taller than `.viewport`. */
+  box-sizing: border-box;
 }
 
 .host :global(.xterm) {
@@ -312,6 +317,10 @@
 
 .preview {
   position: absolute;
+  /* A4: without an anchor these sit at their static position (below `.host`)
+     and stretch the viewport's scroll box past its own height. */
+  top: 0;
+  left: 0;
   width: 1px;
   height: 1px;
   overflow: hidden;

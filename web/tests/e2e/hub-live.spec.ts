@@ -68,6 +68,62 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   expect(followUrls.every((url) => !new URL(url).searchParams.has("token"))).toBe(true);
 });
 
+/**
+ * D-027: an image pasted into the composer is staged on the Hub and its
+ * metadata reaches the Node, with the bytes never entering a command frame.
+ */
+test("paste an image: it stages on the Hub and its metadata reaches the Node", async ({ page }) => {
+  test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+  await login(page);
+
+  await page.getByTitle("新建", { exact: true }).click();
+  await expect(page.getByTestId("new-session-sheet")).toBeVisible();
+  await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
+  const host = await page
+    .getByTestId("new-session-host")
+    .locator("option")
+    .filter({ hasText: "e2e-fake-node" })
+    .getAttribute("value");
+  await page.getByTestId("new-session-host").selectOption(host!);
+  await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0);
+  await page.getByTestId("new-session-prompt").fill("attachment session");
+  await page.getByTestId("new-session-start").click();
+  await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+  await expect(page.getByTestId("session-page")).toBeVisible();
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+
+  // A real 1x1 red PNG, pasted the way a browser delivers one.
+  const uploads: number[] = [];
+  page.on("response", (response) => {
+    if (new URL(response.url()).pathname === "/v1/objects") uploads.push(response.status());
+  });
+  await page.getByTestId("composer-input").fill("what colour is the image?");
+  await page.evaluate(async () => {
+    const base64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const file = new File([bytes], "red.png", { type: "image/png" });
+    const data = new DataTransfer();
+    data.items.add(file);
+    const area = document.querySelector("[data-testid='composer-input']");
+    area?.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true }));
+  });
+
+  // The chip appears, the upload succeeds, and only then can the send go.
+  await expect(page.getByTestId("attachment-chip")).toBeVisible({ timeout: 20_000 });
+  await expect.poll(() => uploads, { timeout: 20_000 }).toContain(200);
+  await expect(page.getByTestId("composer-send")).toBeEnabled({ timeout: 20_000 });
+  await page.getByTestId("composer-send").click();
+
+  // The Node echoes the resolved media type, proving the metadata arrived.
+  await expect(
+    page.getByTestId("message").filter({ hasText: "[attachments: image/png]" }),
+  ).toBeVisible({ timeout: 20_000 });
+  // The chip is consumed by the send and the bubble keeps the thumbnail.
+  await expect(page.getByTestId("attachment-chip")).toHaveCount(0);
+  await expect(page.getByTestId("sent-attachments").first()).toBeVisible();
+});
+
 test("real Node: register a project, create a shell in it, close and unregister", async ({ page }) => {
   test.skip(process.env.HUB_E2E_EXTERNAL !== "1", "Requires the operator's remuda dev");
   const path = process.env.HUB_E2E_WORKSPACE;

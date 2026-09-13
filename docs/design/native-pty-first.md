@@ -29,7 +29,7 @@
 - **生命周期五件事必须在 native 路径上重建**（§5）：新建 Session、发送消息、停止（打断 turn / 停进程两义）、删除、退出检测，外加 resume。herdr 今天替我们做的是**整个 agent 抽象**，不是一个 PTY 库。
 - **采纳信号分层**：`Hook > File(tail) > OSC > Screen`，每条 `Observation` 带 `SourceChannel`，UI 能解释「凭什么说它 blocked」。
 - **结构化视图必须实时流式**（§7）：claude 走 `MessageDisplay` hook 的行级 delta + transcript 块级权威值，grok 走 `updates.jsonl` 的 ACP chunk，codex 只有 completed item——**能力诚实上报，不拿 record 级冒充 token 级**。
-- **保留 `codex-appserver` / `grok-acp` 枚举与 wire crate**（`remuda-codex-wire` 已 D-013 freeze，含类型化审批），它们是 codex 审批风险的唯一已知解法。
+- **保留 `codex-appserver` / `grok-acp` 枚举与 wire crate**（`remuda-codex-wire` 已 D-013 freeze，含类型化审批）：codex 审批已由 hooks 路径实测打通（§3、§14 风险 3 已解除），它们降为**旁路后备**；而 **grok 的结构化作答目前没有别的出路**（§14 风险 15），它们仍是唯一候选。
 - **`claude-print` 按条件退役，不按日程退役**（见 §12），先降为非 TTY 宿主的 legacy。
 - **跨 Node 重启存活是唯一没有廉价替代的 herdr 能力**（§8）：本轮**先接受丢失**（方案 A），把 `remuda-ptyd`（方案 B）排到 P8。**用户已拍板（2026-09-14）：先接受丢失，持有进程放后面做。**
 - 工期：约 26 人日，4 worker 并行约 12–14 个工作日（不含 P8）。
@@ -67,13 +67,13 @@ herdr 剩下的**唯一不可替代价值是跨 Node 重启存活**（以及现�
 
 ## 3 各 harness 结构化信号矩阵
 
-标注规则：**[V]** = 本轮实测验证；**[U]** = 未验证。
+标注规则：**[V]** = 已实测验证；**[U]** = 未验证。本轮三份实机证据：[codex-signals-1](./evidence/codex-signals-1.md)（codex-cli 0.154.0）、[grok-signals-1](./evidence/grok-signals-1.md)（grok 1.0.30）、[claude-queue-steer-1](./evidence/claude-queue-steer-1.md)（claude 2.1.270）。下表凡标 [V] 并给出证据文件的，以该文件的实机记录为准；模型响应由本地确定性服务提供，测的是 client 侧信号与控制，不是托管模型行为。
 
 | harness | A 可直接作答 | B 结构化观测 | C OSC（地板） | D 屏幕签名 |
 |---|---|---|---|---|
 | **claude** | **[V]** `PermissionRequest` hook 阻塞返回 `{"behavior":"allow"｜"deny"}`，无需按键；`Elicitation` 可返回 `action` | **[V]** 二进制内含 **33 个 hook 事件**（远超公开的 9 个），含 `MessageDisplay`（行级 delta）、`Notification`、`SessionEnd`、`StopFailure`、`PostToolBatch`；payload 直接给 `transcript_path`；transcript JSONL 追加 | **[V]** `OSC 9;4;3/0`、`OSC 0` 标题、`OSC 777;notify` | 兜底 |
-| **grok** | **[U]** hook 无已验证裁决通道；ACP 有 `session/request_permission`，作答仍靠按键 | **[V]** `updates.jsonl` 是 **ACP `session/update` 逐字帧**（`remuda-acp-wire` 可直接解）+ `events.jsonl`（`turn_started`/`phase_changed`/`first_token`）+ `usage.json`；`active_sessions.json` 认 pid | **[U]** 同类 OSC 未逐项验证（`4;1;-1` / `4;0;0` 来自规则表注释） | 作答路径 |
-| **codex** | **[U]** 需 app-server 或 `hooks.json` 的 `PermissionRequest`（第三方集成已在用，**[V]** 存在，Remuda 侧未实测） | **[V]** rollout JSONL（`task_started`/`task_complete`/`item_completed`/`response_item`/`token_usage_record`）实时追加 + `session_index.jsonl`；**[V-BLOCKED]** `hooks.json` 的 `trusted_hash` 四种哈希假设全失败 | **[U]** | **审批目前只能靠它** |
+| **grok** | **[V]** **没有 `PermissionRequest` hook**：该事件名注册时被静默忽略，相邻条目照常加载；但 `PreToolUse` 返回 `{"decision":"deny"｜"ask"}` **[V]** 生效（deny 连 `--always-approve` 都拦得住，`ask` 能逼出可见审批框）——**只能拦，不能替用户答**；**[V]** ACP `session/request_permission` **不写进 `updates.jsonl`**（54 帧全是 `session/update` / `_x.ai/session/update`），作答仍靠按键（[grok-signals-1](./evidence/grok-signals-1.md) A3/A5） | **[V]** `updates.jsonl` 是 **ACP `session/update` 逐字帧**（`remuda-acp-wire` 可直接解，含 `turn_completed{stop_reason,elapsed_ms}`）+ `events.jsonl`（`turn_started`/`phase_changed`/`first_token`/**`turn_ended{outcome}`**/`permission_requested`/`permission_resolved`）+ `usage.json`；**[V]** `active_sessions.json` 的 `pid` 就是 TUI 进程本身（不是 recorder、不是父 shell），但**条目在 shutdown 时先于进程退出被移除** → 只能当发现路径，**不能当 liveness**（同上 A1/A2） | **[V]** 原始 PTY 抓包实测到 `OSC 0` 标题（载荷含 `⚠ Action Required` / `Thinking` / `Running: <tool>`）与 `OSC 9;4;1;-1` / `9;4;0;0`，72 个去重样本；**herdr 的 rendered-ansi 已把这些控制序列吃掉**，必须抓原始字节（同上 A4） | 作答路径 |
+| **codex** | **[V]** `hooks.json` 的 `PermissionRequest` **同步阻塞并返回真实裁决**：`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"｜"deny"}}}`，allow/deny 双向实测落地（deny 侧 rollout 记 `Rejected(...)`，allow 侧记 exit 0）；**stdin 无 `tool_use_id`**、tool 名被归一成 `Bash` → **不得复用 `PreToolUse`/`PostToolUse` 的关联 schema**（[codex-signals-1](./evidence/codex-signals-1.md) A1） | **[V]** rollout JSONL（`task_started`/`task_complete`/`item_completed`/`response_item`/`token_usage_record`/`turn_aborted`/`turn_context`）实时追加 + `session_index.jsonl`（**[V]** 只是 append-only 的**名字索引**，不是 PID 注册表，也不是全量线程目录）；**[V]** **hooks trust gate 已破**：`[features] hooks = true` 是开关，**per-handler canonical hash**（handler 归一 → 补 snake_case `event_name` → TOML → JSON 递归排序 → compact → `sha256:`）写进 `hooks.state` 即持久化 trust，无需任何 bypass | **[U]** | tier D 兜底（**不再是审批的唯一出路**） |
 | **agy** | — | **[V]** hook 只有 namespace 化的 `PreInvocation`/`PostInvocation`；transcript 是 SQLite + protobuf blob，无 schema 不可读 | **[V]** 二进制内含 `OSC 9;4` 进度发射 | 状态与作答 |
 
 ### 3.1 已验证的坑
@@ -81,9 +81,12 @@ herdr 剩下的**唯一不可替代价值是跨 Node 重启存活**（以及现�
 - **[V]** claude 的 `permissionDecision` 键（`PreToolUse` 用的）在 `PermissionRequest` 上被静默忽略；必须用 `{"behavior": …}` 形状。
 - **[V]** **confined session 里 allow 无效**：二进制明确告知「受限会话只接受命令行上的授权」。→ 审批链路必须能回落按键，否则会出现「点了批准但没动」。
 - **[V]** `SubagentStop` 在没有 subagent 时也会触发（recap/summary），**绝不能当作 working**。
-- **[V]** grok 即使重定向 `GROK_HOME`，仍会吃 `~/.claude/settings.json` 里的 hook 条目 → hook 脚本必须按 `$0`/env 自辨 harness 并幂等去重。
+- **[V]** grok 即使重定向 `GROK_HOME`，仍会吃 `~/.claude/settings.json` 里的 hook 条目 → hook 脚本必须按 `$0`/env 自辨 harness 并幂等去重。**[V]** `CLAUDE_CONFIG_DIR` **重定向不了**这条发现路径（实测失败），唯一有效的中和开关是 **`GROK_CLAUDE_HOOKS_ENABLED=0`**（实测把 26 条 Claude hook 从 `enabled` 变 `disabled`）；它只停用**激活**，不阻止 grok 继续读 Claude 配置做清单。
 - **[V]** grok 的 `--plugin-dir`（文档称「始终受信」）仅 `grok agent` 子命令可用，顶层交互式被拒。
 - **[V]** codex 0.154 的排队键是 **Tab**，`Ctrl+;` 已移除；帮助文本原话是「任务运行时按 Tab 排队，否则立即发送」。
+- **[V]** codex 的 hook trust key 必须用 `hooks/list` 返回的那一条（macOS 会把 `/tmp` 规范成 `/private/tmp`），**不能自己拼路径**；RPC 的 `eventName` 是 camelCase，**不是**参与哈希的拼写。哈希只认 **handler 配置**，**不认脚本内容**——脚本被换掉仍然是 trusted。
+- **[V]** codex 的 `--dangerously-bypass-hook-trust` 放在 `app-server` 前面时**不生效**（未受信 hook 照样不执行）；实测只有 `codex exec` 路径能绕。因此 Remuda 必须走「写 `hooks.state` 持久化 trust」这条正路。
+- **[V]** grok 的 `turn_completed` **不等于成功**：被取消的 turn 同样发这个 tag，必须读 `stop_reason`（`end_turn` vs `cancelled`）与 `events.jsonl` 的 `turn_ended.outcome`。
 - **[V]** 各家 headless 专属开关（`--output-format stream-json` / `--include-partial-messages`）在交互式 PTY 下不可用——这正是要走 hook + 文件 tail 的原因。
 
 ---
@@ -240,27 +243,44 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 
 ## 6 steer / 排队 / 打断
 
-用户要求：「agent 正在工作时，composer 要能 **发送（steer）/ 排队 / 打断**，并且能力要诚实」。三者的键位按 harness 不同，**未验证的绝不冒充已支持**。
+用户要求：「agent 正在工作时，composer 要能 **发送（steer）/ 排队 / 打断**，并且能力要诚实」。三家的键位语义**已逐一实测**（agy 仍未验证），**三家互不相同，且都不是「Enter 立刻插话」这么简单**。
 
 | harness | turn 中打字 + Enter | 排队 | 打断 turn | 证据 / 缺口 |
 |---|---|---|---|---|
-| **claude** | **[U] 必须实测**：是 queue 还是 steer，判据是 transcript 里有没有 `queue-operation{enqueue}` 记录——有即排队，没有且立刻出现新的 `user` record 即 steer | `queue-operation` 的 `enqueue`/`dequeue`/`remove`/`popAll` 是权威账本（**未文档化**） | `Esc` | `queue-operation` 记录已在实机 transcript 中观测到 [V]，但它对应的**按键语义**未验证 |
-| **codex** | **[V]** Enter 立即发送（footer「to submit message」） | **[V]** `Tab`（0.154 起；`Ctrl+;` 已移除） | **[V]** `Esc` | 帮助文本原话见 §3.1 |
-| **grok** | **[U]** | **[U]** 未发现任何排队记录 | **[U]** footer 在 blocked 态给 `Ctrl+c:cancel`；正常 turn 的打断键未验证 | 需要一次实机取证 |
+| **claude** | **[V] 入队 + 边界 steer**：Enter 把消息交给原生队列（`queue-operation{enqueue}`），在**当前工具结果返回之后、下一次工具调用之前**被消费（`remove{reason:"absorbed_mid_turn"}` + 追加一条 `attachment.queued_command`）——**既不打断正在跑的工具，也不等整个 turn 结束**（实测：三次 `sleep 20` 的 turn 中，插入项在第 1 次结果后 6 ms 被吸收，第 2 次 sleep 照常开始）。`UserPromptSubmit` 在**入队时**触发（+53…91 ms）→ 它只证明「composer 已接纳」，**不是投递回执** | **[V]** 同一条路径就是队列；`Ctrl+X`+Enter（`chat:queueSubmit`）绑定确实存在，但一次性发键与分键两种发法**都**在工具边界被吸收，**没有「只在 turn 结束后才投」的保证**。`Tab` **[V]** 什么都不做（文本留在 composer，无 hook、无 enqueue） | **[V]** `Esc`：既能打断重试中的请求，也能打断正在跑的工具（实测 `sleep` 进程消失、Claude 进程存活）；**队列里的文本不会被清掉**，会作为新 `user` record 自动接着跑 → `Esc` ≠「全停了」 | [claude-queue-steer-1](./evidence/claude-queue-steer-1.md)（2.1.270）。另 **[V]**：bracketed paste 里含 CR **不提交**、body+CR 一次写也**不提交**，必须分两次写（呼应 §5.2）；未观测到 `popAll`，不得臆造 |
+| **codex** | **[V]** **立即 steer**：消息进入**当前 turn**（与基础消息共享同一 `turn_id`），在工具 yield 边界被提交；**不打断正在跑的工具** | **[V]** `Tab` = **排到下一个 turn**（实测排队项在上一个 `task_complete` 之后才开新 turn）；`Ctrl+;` 0.154 已移除 | **[V]** `Esc` → `event_msg/turn_aborted{reason:"interrupted"}`，该 turn 无 `task_complete`；但**已启动的工具进程不一定随之结束**（实测 `sleep 20` 事后仍以**旧 `turn_id`** 落了一条完成 item）→ 打断 turn ≠ 杀掉工具 | [codex-signals-1](./evidence/codex-signals-1.md) A5 |
+| **grok** | **[V]** **默认排队**（footer `Enter:queue`）：当前 turn 结束后 +32 ms 才开新 turn。**[V]** 排队后在**空 composer** 上再按 Enter = **取消当前 turn 并立刻发出已排队项**（`turn_ended{outcome:"cancelled",trigger:"send_now"}`，下一 turn 带 `redirect_kind:"queued_after_cancel"`）——这是**唯一实测到的 send-now 传输**，代价是丢掉当前 turn | **[V]** 即 Enter；但**没有普通入队记录**，只有取消后重投的 `redirect_kind`（`cancel_then_send` / `queued_after_cancel`）可事后佐证 | **[V]** `Esc` **不是打断键**：它保留正在跑的 turn **与草稿**，只提示「Press Ctrl+c to cancel the turn」。第一次 `Ctrl+C` **只清草稿**，第二次才取消（`turn_ended{outcome:"cancelled",trigger:"ctrl_c"}`）→ **一次 `Ctrl+C` 不是打断回执** | [grok-signals-1](./evidence/grok-signals-1.md) A4。footer 另标 `Ctrl+Enter:send now` / `Ctrl+;:queue`，这两个物理组合键**未单独验证**；键位可配置，规则表须按 footer 实况校准 |
 | **agy** | **[U]** | **[U]** | **[U]** | 信号面最弱，v1 只承诺打断进程 |
+
+**composer 三个动作 → 每 harness 的实现**（`native` = 用 harness 自己的语义，`emulated` = Remuda 代劳）：
+
+| composer 动作 | claude | codex | grok | agy |
+|---|---|---|---|---|
+| **发送**（尽快交给模型） | **native（边界 steer）**：Enter → 入队 + 下一个工具边界消费。UI 文案说「下一个工具边界」，**不承诺瞬时** | **native（立即）**：Enter | **无原生 send-now**。Remuda **不得**把「发送」偷偷实现成「取消+发送」；只有用户显式选 **打断并发送** 时才走 emulated 的「空 Enter = 取消当前 turn → 发出排队项」 | **[U]** |
+| **排队**（等这轮结束再投） | **emulated**：Remuda 自持队列，收到 `Stop` 后投递（原生 Enter 与 `Ctrl+X`+Enter 都没有 after-turn-only 保证） | **native**：`Tab` | **emulated**：Remuda 自持队列，收到 `turn_ended` / `turn_completed` 后投递（原生 Enter 虽然也排队，但账本在 harness 内部且无 enqueue 记录，无法增删改） | **[U]** |
+| **打断** | **native**：`Esc` | **native**：`Esc` | **emulated 序列**：`Ctrl+C`（清草稿）→ `Ctrl+C`（取消）；**`Esc` 不是打断键** | 仅停进程（§5.3） |
+
+映射规则（三条，逐条对应上表）：
+
+1. **发送 = harness 原生的 send-now，有才用**：codex 用 Enter，claude 用 Enter 但语义是**边界 steer**，grok **没有**——缺失时 Remuda 不自作主张，由用户在 UI 上显式选「打断并发送」。
+2. **排队 = Remuda 自持队列 + 在 harness 的 turn 结束信号上投递**（claude `Stop` / codex `task_complete` / grok `turn_ended`）——**唯一例外是 codex 的 `Tab`**，那是原生的，直接用原生。
+3. **打断 = `Esc`（claude / codex）或 grok 的取消序列**；三家都必须等到原生终止证据才算成功（§5.3 验收列）。
+
+**协议面**：今天 `PromptMode` 只有 `new-turn` 一个变体，`steer` 在 `DriverInput` 里存在但没有任何 node 代码读 `mode`；排队实际由 D-022 的 `pty_queue` 完成。新增 `queue` 语义与 `steer` 的 PTY 实现由**协议 worker 一次性增量落地**（§13 冲突规避规则②）。**capabilities 必须逐 harness 分别标出 `steer` / `queue` / `interrupt` 三项各自是 `native | emulated | unknown`**（而不是一个笼统的 bool），UI 据此说明「排队由 Remuda 代持」还是「harness 原生排队」。
 
 **协议面**：今天 `PromptMode` 只有 `new-turn` 一个变体，`steer` 在 `DriverInput` 里存在但没有任何 node 代码读 `mode`；排队实际由 D-022 的 `pty_queue` 完成。新增 `queue` 语义与 `steer` 的 PTY 实现由**协议 worker 一次性增量落地**（§13 冲突规避规则②）。
 
-**composer 三态 UI**：
+**composer 三态 UI**（主按钮由上表的「发送」一列决定）：
 
 | 实例状态 | 主按钮 | 次按钮 | 已排队内容 |
 |---|---|---|---|
 | idle | 发送 | — | — |
-| working 且 harness 支持排队 | 排队 | 打断 | 队列 chip（来自 `queue-operation` 或 `pty_queue`），可 remove |
-| working 且 harness 支持 steer | 发送（立即） | 打断 | — |
+| working，有原生 send-now（codex） | 发送（立即） | 排队（原生 `Tab`）· 打断 | 队列 chip（`pty_queue`），可 remove |
+| working，发送 = 边界 steer（claude） | 发送（下一个工具边界） | 排队（Remuda 代持）· 打断 | 队列 chip（`pty_queue` 为准，`queue-operation` 对账），可 remove |
+| working，无原生 send-now（grok） | 排队 | 打断并发送 · 打断 | 队列 chip（`pty_queue`），可 remove |
 | blocked（等审批/等输入） | 发送（进 D-022 队列） | 打断 | 队列 chip |
 
-**诚实性规则**：`steer` capability 在实测前保持 `unknown`，调用返回 `CAPABILITY_UNKNOWN`，UI 显示「尚未验证」而不是灰按钮假装不支持；未发出即被取消的消息按 protocol §5.2 更新为 `status: "interrupted"`，不留在 `queued` 里骗人。
+**诚实性规则**：claude / codex / grok 的 `steer` / `queue` / `interrupt` 现已有实测结论（上表），capability 直接上报 `native` 或 `emulated`；**agy 三项仍为 `unknown`**，调用返回 `CAPABILITY_UNKNOWN`，UI 显示「尚未验证」而不是灰按钮假装不支持。**emulated 必须在 UI 上可见**（「排队由 Remuda 代持」「打断并发送会取消当前 turn」），不得包装成原生；未发出即被取消的消息按 protocol §5.2 更新为 `status: "interrupted"`，不留在 `queued` 里骗人。
 
 ---
 
@@ -270,10 +290,17 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 
 | harness | 主通道（实时） | 权威通道（最终值） | 能承诺的粒度 |
 |---|---|---|---|
-| **claude** | `MessageDisplay` hook：`turn_id` / `message_id` / `index` / `final` / `delta`，**按 flush 给整行** | transcript JSONL 的 content block | **行级**（非 token 级，不夸大） |
-| **grok** | `updates.jsonl` 的 `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update` | `chat_history.jsonl` 全量对账 | **chunk 级** |
-| **codex** | rollout JSONL 的 `item_completed` / `response_item` | 同一文件 | **item 级，无 delta**——UI 必须显式说明 |
+| **claude** | `MessageDisplay` hook：`turn_id` / `message_id` / `index` / `final` / `delta`，**按 flush 给整行** | transcript JSONL 的 content block | **行级**（非 token 级，不夸大）。`MessageDisplay` 的实时行为**本轮未覆盖**（[claude-queue-steer-1](./evidence/claude-queue-steer-1.md) 明确把它排除在范围外）→ P3 落地前仍按未验证对待 |
+| **grok** | `updates.jsonl` 的 `agent_message_chunk` / `agent_thought_chunk` / `tool_call` / `tool_call_update` | `chat_history.jsonl` 全量对账 | **chunk 级** **[V]**（记录形状确为 chunk）。但本轮服务端分两段发出的 `SPIKE_` / `COMPLETE` **落盘成一条** `agent_message_chunk` → **不得据此承诺「每个 SSE token 都落盘」**，只能承诺 chunk 粒度（[grok-signals-1](./evidence/grok-signals-1.md) A1） |
+| **codex** | rollout JSONL 的 `item_completed` / `response_item` | 同一文件 | **item 级，只有 completed，无 delta**——**[V]** 97 条记录的完整清单里没有任何文本 delta 记录（[codex-signals-1](./evidence/codex-signals-1.md) A3）；UI 必须显式说明「本 harness 无逐字流」 |
 | **agy** | 无实用通道 | SQLite blob（需 proto schema） | 仅屏幕 |
+
+**队列账本的出处（三家不对称，必须写进 adapter 契约）**：
+
+- **claude [V]**：transcript 里有原生 `queue-operation`（`enqueue` / `dequeue` / `remove{reason:"absorbed_mid_turn"}`；本轮 9 enqueue、4 dequeue、5 remove，**未观测到 `popAll`，不得臆造**）。投递时还会追加一条 `attachment.queued_command` 记录——**它不是 `user` record**，只 tail `user`/`assistant` 的 mapper 会整条漏掉。另：`queued_command` 保留的是**入队时**的时间戳，部分 `remove` 的物理写入又早于工具结果记录 → **按文件顺序读，按时间戳全局排序会伪造投递顺序**。
+- **codex [V]（反向证据）**：97 条记录的完整清单里**没有**任何 enqueue / queued_message / steer / keypress 记录；投递后的消息就是普通 message / item，只能靠 `turn_id` 异同区分「同 turn steer」与「下一 turn 排队」，**无法证明某条消息当初是被 `Tab` 排进去的**。
+- **grok [V]（反向证据）**：完整文件里**没有**普通入队记录，只有取消后重投的 `redirect_kind`（`cancel_then_send` / `queued_after_cancel`），无法还原按键时刻的入队 / 编辑 / 删除。
+- **结论**：**Remuda 自己的 `pty_queue` 是队列的唯一权威来源**——codex / grok 必然如此，claude 则把原生 `queue-operation` 用作**对账与投递证据**，而不是替代。队列 chip 的增删改一律以 Remuda 账本为准（呼应 §6 的 emulated 映射）。
 
 **映射到 protocol §5.2**：`MessageDisplay` / ACP chunk → `append`（`status: "streaming"`）；transcript / rollout 的完整块到达 → `replace` + `close`（`status: "complete"`）。低信息来源不得把高信息值改成空值（§5.2 既有规则）。
 
@@ -281,7 +308,7 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 
 1. Claude transcript **一条记录只装一个 content block**，同一 `message.id` 会被 2–7 条连续记录共享（`apiBlockIndex` 标位）。现有 mapper 把每条记录当成一条「完整 assistant message」喂给 stdout mapper，于是按 message 分组的 tool-call 记账整体错位。→ **按 `(requestId, message.id)` 缓冲，按 `apiBlockIndex` 重组 `content`，在 `stop_reason` 出现时一次性发出**。
 2. mapper 取的 `parentToolUseId` 键**在 transcript 里根本不存在**（0 次出现）；真正的链接是 `sourceToolUseID` / `sourceToolAssistantUUID`。→ 换键，subagent 与 tool→result 的父子关系才不再是 unknown。
-3. mapper 丢弃所有非 `user`/`assistant` 记录。→ **保留 `queue-operation`（§6 的队列账本）、`permission-mode`（模式漂移）、`toolUseResult`（工具富结果）**。
+3. mapper 丢弃所有非 `user`/`assistant` 记录。→ **保留 `queue-operation`（§6 的队列账本）、`attachment.queued_command`（**[V]** 排队消息的投递证据，且它不是 `user` record）、`permission-mode`（模式漂移）、`toolUseResult`（工具富结果）**。
 
 该 mapper 今天只被 promoted 终端使用，`claude-pty` 记下了 `transcript_path` 却从不 tail 它——native 路径统一后**两条路径共用同一个 tailer**，这本身就是统一原则的回归测试。
 
@@ -390,9 +417,9 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 | **P1** | launch shim + overlay materializer + hook socket + `SignalBus`，**先只在 promoted shell-pty 的 claude 上开** | **用户手敲 `claude` 即产生 hook 事件**；零协议变更、零 herdr | 3 | **W2**：`crates/remuda-signal/*`、`crates/remuda-driver/src/child_env.rs`、`launch/*`、Node 监听端 |
 | **P2** | `AgentPty`：kind/driver 矩阵、New Session 预填、per-kind recipe + yolo、effort/tui overlay、生命周期五件事（§5） | **两条路径的 journal diff 为空**（仅 `launchedBy` 不同）；停进程后进程组确实消失；agent 崩溃 ≤2 s 内落 `exited` | 4 | **W3**（`remuda-protocol/*`、`materializer.rs`、`flags.rs`、`capabilities.rs`、enums）+ **W2**（driver 实现） |
 | **P3** | 实时流式：`MessageDisplay` 接入 + `TranscriptMapper` 重组修复 + grok `updates.jsonl` 解码 | 结构视图**行级**增量出现；tool-call 与 tool-result 配对 100%；`queue-operation` 进 journal | 3 | **W2**：`claude_print.rs` 的 mapper 段、`shell_pty/promotion.rs` |
-| **P4** | steer / 排队 / 打断：逐 harness 实测键位 + composer 三态 + 诚实 capabilities | claude 的 queue-vs-steer 有实测结论；codex Tab/Esc 生效；未验证项显示「尚未验证」而非假灰 | 2 | **W1**（`web/src/features/session/*`）+ **W3**（`PromptMode` 增量） |
+| **P4** | steer / 排队 / 打断：按 §6 已实测的键位落地 + native/emulated 映射 + composer 三态 + 诚实 capabilities | claude Enter = 入队 + 工具边界消费（`enqueue` → `remove{absorbed_mid_turn}`）、`Esc` 打断后队列存活；codex Enter steer / `Tab` 排队 / `Esc` 打断；grok Enter 排队、**空 Enter 取消并发送**、**双 `Ctrl+C`** 取消（`Esc` 不是打断键）；`steer`/`queue`/`interrupt` 三项逐 harness 标 `native｜emulated`，agy 显示「尚未验证」而非假灰 | 2 | **W1**（`web/src/features/session/*`）+ **W3**（`PromptMode` 增量） |
 | **P5** | `PermissionRequest` 裁决 + hook 路径 `respond_interaction` | allow/deny 均生效；超时 deny；confined 会话能回落按键 | 3 | **W2** |
-| **P6** | codex / grok adapter + `UsageAdapter` + MCP 附件 | 三家 lifecycle 来自结构化通道；usage 覆盖三家；图片三家可读 | 4 | **W4a** `codex_adapter.rs`、**W4b** `grok_adapter.rs`（各自独立文件） |
+| **P6** | codex adapter（**hooks `PermissionRequest` 阻塞裁决 + rollout tail**，trust 由 Remuda 写 `hooks.state`）/ grok adapter（**`events.jsonl` + `updates.jsonl` + `active_sessions.json` 发现**）+ `UsageAdapter` + MCP 附件 | 三家 lifecycle 来自结构化通道（codex `task_started`/`task_complete`/`turn_aborted`；grok `turn_ended{outcome}` + `turn_completed{stop_reason}`）；codex 审批走 hook allow/deny 且超时 deny；**grok 审批如实上报为屏幕作答（emulated）**；usage 覆盖三家；图片三家可读 | 4 | **W4a** `codex_adapter.rs`、**W4b** `grok_adapter.rs`（各自独立文件） |
 | **P7** | 规则表移植 + capabilities 运行时化 + web 去 driver 分支 + parity gate + 逐 harness 翻默认 + print→legacy / herdr→optional | 规则表带版本；UI 门禁改看 `signalTier`；parity 连续 3 次全绿方可翻默认 | 4 | **W1**（规则表/引擎、web）+ **W3**（capabilities、enums、feature gate） |
 | **P8** | `remuda-ptyd`：跨 Node 重启存活（已拍板排后，§8） | Node 重启后终端与结构视图无感续接；孤儿清扫可验证 | 5+ | **W5**：`crates/remuda-ptyd/*` + Node adopt 路径 |
 
@@ -412,11 +439,11 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 |---|---|---|
 | 1 | **confined session 的 allow 无效**（**[V]**） | P5 前置验收：allow 必须能回落按键，否则出现「点了批准但没动」 |
 | 2 | **shim 劫持 PATH**：`which claude` 显示 Remuda 路径、可能撞用户 wrapper、非 login shell 注入失败、用户用绝对路径绕开 | 透明 `exec`、提供 `REMUDA_SHIM=off`、失败自动降到 tier C/D 并在 UI 明示降级原因 |
-| 3 | **codex 审批无结构化通道**（hooks trust gate 未破 **[V-BLOCKED]**，app-server 未验 **[U]**） | P6 前半天 spike；失败报 **degraded** 而非 unsupported，保留 appserver driver 作旁路 |
+| 3 | ~~**codex 审批无结构化通道**~~ → **已解除（RESOLVED）** | [codex-signals-1](./evidence/codex-signals-1.md) A1 实测：`[features] hooks = true` + **per-handler canonical hash** 写进 `hooks.state` 即持久化 trust，`PermissionRequest` **阻塞返回 allow/deny 双向生效**。**残留约束**（转为实现细则，不再是风险 P）：stdin **无 `tool_use_id`**（须另建关联，不得复用 `PreToolUse` schema）、**超时 deny 策略未验**（本轮在 60 s 超时前就给了答案）、哈希**不认脚本内容变更**、`--dangerously-bypass-hook-trust` 对 `app-server` 无效。app-server（`turn/steer`、`turn/interrupt`，**源码可见、本轮未实跑**）保留为旁路 |
 | 4 | **模拟器内存/CPU 未测量**（N × maxInstances） | P0 必须带基准并限制 scrollback 行数 |
 | 5 | **跨 Node 重启存活**（§8） | **已拍板**：A 为过渡态（Hub 标 `node-epoch-changed` + Resume 兜底），herdr 保留 optional，B 排 P8 |
-| 6 | **claude 的 queue-vs-steer 语义未验证**（**[U]**） | P4 以 `queue-operation` 记录为判据实测；未出结论前 `steer` 保持 `unknown` |
-| 7 | **grok / agy 的排队与打断键位全未验证** | v1 只承诺「打断进程」；composer 对应按钮显示「尚未验证」 |
+| 6 | ~~claude 的 queue-vs-steer 语义未验证~~ → **已实测**（[claude-queue-steer-1](./evidence/claude-queue-steer-1.md)）：Enter = 入队 + **工具边界**消费 | 残留风险是**表述**：不得宣传成「瞬时 steer」，也不得把 `Ctrl+X`+Enter 宣传成「turn 结束后才投」（无此保证）；`UserPromptSubmit` 只证明入队、**不是投递回执**，多条排队消息还会共享同一个 `prompt_id`（不可当去重键） |
+| 7 | ~~grok~~ 已实测（§6）；**agy 的排队与打断键位仍全未验证** | grok 按 §6 的 native/emulated 映射落地（**`Esc` 不是打断键**，必须双 `Ctrl+C`；send-now 只能靠「取消当前 turn」）；agy v1 只承诺「打断进程」，composer 对应按钮显示「尚未验证」 |
 | 8 | **cost 为本地价目表换算**，与 print 的 `total_cost_usd` 可能偏差 | UI 标注「估算」，并在 parity gate 白名单中显式列出该差异 |
 | 9 | **无 PTY 宿主**：`pty.fork` 在 stdio / SSH-stdio 宿主上可用性 **[U]**；Windows 无 `tcgetpgrp` | 降为模拟器-only 检测；**未验证前不得删 print** |
 | 10 | **hook socket 鉴权** | per-instance、0600、driver 注入、凭据独立、超时 deny；是否需要比设备凭据更窄的专用凭据，待安全评审 |
@@ -424,6 +451,7 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 | 12 | **grok / agy 屏幕签名覆盖率目前为零**（现有检测只认 claude banner） | P7 规则表移植时补齐；证据夹具需指派产出人 |
 | 13 | **parity gate 长期不过**则 P7 的翻默认无限期推迟 | 这是**刻意设计**：print 退役由数据决定，不由日程决定 |
 | 14 | **`/effort` 在 PTY 内的实际驱动未实测**（**[U]**） | 回读不到即记 `degraded` + effective 置 unknown，绝不谎报 |
+| 15 | **grok 没有审批裁决通道**（**[V]**，新增）：`PermissionRequest` hook 名被静默忽略；`PreToolUse` 只有 `deny`/`ask`（**能拦不能替用户答**）；ACP `session/request_permission` 的原始 RPC **不落 `updates.jsonl`** → 无法从文件重建并回答原始请求 | 作答路径**只能是屏幕 + 按键**（tier D，D-022 全套不变量适用：写前置 `attempted`、`answerable &= !screen_truncated`、单次自动 trust）；capability 标注为**屏幕作答（emulated）**，**不得**冒充 hook 裁决。`events.jsonl` 的 `permission_requested` / `permission_resolved` 只能做**事后对账**（`wait_ms=0` 不代表没阻塞，`permissionMode: auto` 也不等于 `--always-approve`）。要拿到结构化作答，须另起一个真正的 ACP client（与 D-013 的 `remuda-acp-wire` 同族），排在 P6 之后单独评估 |
 
 ---
 
@@ -469,7 +497,7 @@ print 承担两件全仓独有的事：**唯一 cost/usage 发射点**、**唯�
 |---|---|---|---|---|
 | 1 | native PTY 为一等载体；退役 print；统一「终端里启动」与「直接开 Session」 | §1.0 统一原则 + §4.1 + §12 | P2 / P7 | 设计已定 |
 | 2 | 无 herdr 后补齐：新建 / 停止 / 删除 Session、发送消息 | §5 全章（新建、发送、停止两义、删除、退出检测、resume） | P2 | 设计已定 |
-| 3 | 工作中 composer：steer / 排队 / 打断，逐 harness 键位，能力诚实 | §6（键位表 + composer 三态 + `unknown` 诚实上报） | P4 | 部分 **[U]**，待实测 |
+| 3 | 工作中 composer：steer / 排队 / 打断，逐 harness 键位，能力诚实 | §6（键位表 + native/emulated 映射 + composer 三态 + `unknown` 诚实上报） | P4 | **已实测三家**（claude / codex / grok，证据见 §6 末列）；agy 仍 **[U]** |
 | 4 | 结构化视图实时流式（文本/思考/工具增量） | §7（`MessageDisplay` 行级 + ACP chunk + mapper 重组修复） | P3 | 设计已定 |
 | 5 | effort：5 档 + ultracode；`--effort` + `/effort`；显示 effective vs requested | §9.1 | P2 | 部分 **[U]**（PTY 内 `/effort` 未实测） |
 | 6 | 滚动 + 全屏 TUI：真字节修 scrollback；overlay 钉 `tui`；保留 `--setting-sources` | §4.6 + §9.2 | P0 / P2 | 设计已定 |

@@ -226,7 +226,11 @@ both the user's and the overlay's hooks run. `instance.purge` removes the
 instance directory and never touches `~/.claude`.
 
 **Opting out.** `REMUDA_PTY_HOOKS` is off by default: no socket, no overlay, no
-shim. `REMUDA_SHIM=off` disables the shim while keeping the rest. An absolute
+shim. `REMUDA_SHIM=off` disables the shim while keeping the rest, and is
+honoured in two places — the generated script reads it at run time, so a
+session already under way degrades cleanly, and the driver reads it at
+materialize time, so an operator who set it before the Node started gets
+nothing on `PATH` and no rc redirection rather than a dormant shim. An absolute
 path (`/usr/local/bin/claude`) bypasses the shim entirely — a documented
 degradation, not a defect: the signal tier drops to screen and the UI must say
 so.

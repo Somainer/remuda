@@ -805,6 +805,13 @@ export interface components {
             name: string;
             token: string;
         };
+        /** @description Native effort selection (D-028 §9.1): five Claude levels plus an orthogonal ultracode boolean. Legacy tier names (default / think / think-hard / ultracode) are accepted and normalized by NAME — never by index, because the old per-harness tables differed in length. */
+        EffortSelection: {
+            /** @description low | medium | high | xhigh | max, or a legacy tier name to be normalized. */
+            name: string;
+            /** @description Dynamic workflow. Equivalent to xhigh plus dynamic workflow; session-only, never persisted as a level. */
+            ultracode?: boolean;
+        };
         EnrollToken: {
             enrollTokenId: string;
             /** Format: date-time */
@@ -957,6 +964,7 @@ export interface components {
             cwd?: string;
             delegation?: string;
             driver?: string;
+            effort?: components["schemas"]["EffortSelection"];
             hostId?: string;
             kind?: string;
             maxBudgetUsd?: string | number;
@@ -1011,12 +1019,24 @@ export interface components {
             delegation?: string | null;
             driver: string;
             durableSeq: string;
+            /** @description Legacy per-harness table index. Preserved for older clients; never used to derive the tier, because the old tables differed in length per harness. */
             effortIndex?: number | null;
-            effortName?: string | null;
+            /**
+             * @description Normalized D-028 §9.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default→low, think→high, think-hard→xhigh, ultracode→xhigh with effortUltracode true).
+             * @enum {string|null}
+             */
+            effortName?: "low" | "medium" | "high" | "xhigh" | "max" | null;
+            /** @description Dynamic-workflow flag (`--effort ultracode`). Session-only; it is xhigh plus dynamic workflow, not a sixth level. */
+            effortUltracode?: boolean | null;
             hostId: string;
             instanceId: string;
             journalId: string;
             kind: string;
+            /**
+             * @description Who ran the launch command (D-028 §1.0 rule 4). Provenance only, never a capability level: a user-launched session is entitled to exactly the same signals as a Remuda-launched one. Derived from mode/promotedAt for rows written before D-028.
+             * @enum {string|null}
+             */
+            launchedBy?: "remuda" | "user" | null;
             /**
              * @description Derived from Node lifecycle observations in journal.append. Create default is requested, not running.
              * @enum {string}

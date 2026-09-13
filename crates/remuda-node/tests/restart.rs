@@ -43,6 +43,7 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         provider_auth_token: None,
         resume_session_id: None,
         resumed_from: None,
+        effort: None,
     }
 }
 

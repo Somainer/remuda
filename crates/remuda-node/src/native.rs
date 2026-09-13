@@ -1120,6 +1120,7 @@ mod tests {
                 provider_auth_token: None,
                 resume_session_id: None,
                 resumed_from: None,
+                effort: None,
             };
             let driver = registry
                 .build(
@@ -1240,6 +1241,7 @@ mod tests {
             provider_auth_token: None,
             resume_session_id: None,
             resumed_from: None,
+            effort: None,
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -1286,6 +1288,7 @@ mod tests {
             provider_auth_token: None,
             resume_session_id: None,
             resumed_from: None,
+            effort: None,
         };
         registry
             .build(
@@ -1335,6 +1338,7 @@ mod tests {
             provider_auth_token: None,
             resume_session_id: None,
             resumed_from: None,
+            effort: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -1392,6 +1396,7 @@ mod tests {
             provider_auth_token: Some("sk-fake-host-scoped".into()),
             resume_session_id: None,
             resumed_from: None,
+            effort: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,

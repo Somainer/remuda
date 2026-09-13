@@ -188,9 +188,9 @@ export type CapabilityEvidence = ({
 });
 
 /** CapabilityName wire values; `protocol.md` §3.2. */
-export type CapabilityName = ("resume" | "steer" | "model-switch" | "fork" | "structured-workflow" | "artifact" | "tty-attach" | "hooks" | "interactive-approval" | "question" | "plan-review" | "elicitation" | "live-attach" | "completion-native-turn" | "completion-task");
+export type CapabilityName = ("resume" | "steer" | "queue" | "interrupt" | "model-switch" | "fork" | "structured-workflow" | "artifact" | "tty-attach" | "hooks" | "interactive-approval" | "question" | "plan-review" | "elicitation" | "live-attach" | "completion-native-turn" | "completion-task");
 
-/** Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid. */
+/** Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid.  D-028 §6 added `queue` / `interrupt` alongside `steer`. They are `#[serde(default)]` to an `unknown` [`Capability`] so a snapshot written by a pre-D-028 peer still parses; "absent" is read as "not verified", never as unsupported. */
 export type CapabilitySet = ({
   "artifact": Capability;
   "completion-native-turn": Capability;
@@ -199,10 +199,12 @@ export type CapabilitySet = ({
   "fork": Capability;
   "hooks": Capability;
   "interactive-approval": Capability;
+  "interrupt": Capability;
   "live-attach": Capability;
   "model-switch": Capability;
   "plan-review": Capability;
   "question": Capability;
+  "queue": Capability;
   "resume": Capability;
   "steer": Capability;
   "structured-workflow": Capability;
@@ -660,10 +662,13 @@ export type DriverInput = (PromptInput & ({
 /** DriverKind wire values; `protocol.md` §3.1. */
 export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
 
-/** Native effort tier stored on `instance.configure`. */
+/** EffortName wire values; `protocol.md` §4.1. */
+export type EffortName = ("low" | "medium" | "high" | "xhigh" | "max");
+
+/** Native effort selection; `protocol.md` §4.1 (D-028 §9.1).  Five Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only, and is never persisted as a level name.  Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes legacy tier **names**, so a stored row or an old client keeps working:  | legacy `name` | normalized | | --- | --- | | `default` | `low` | | `think` | `high` | | `think-hard` | `xhigh` | | `ultracode` | `xhigh` + `ultracode: true` | | anything unrecognized | `high` (the documented default tier) |  Normalization is by **name**, never by index: the legacy tables had different lengths per harness, so index 3 meant `ultracode` for Claude and `ultra` for Codex. `index` on the wire is therefore ignored on read and not written back. */
 export type EffortSelection = ({
-  "index": (number);
-  "name": (string);
+  "name": EffortName;
+  "ultracode": (boolean);
   [key: string]: unknown;
 });
 
@@ -1104,6 +1109,7 @@ export type Instance = ({
   "kind": AgentKind;
   "lastError"?: (string | null);
   "launchId": Knowledge15;
+  "launchedBy"?: (LaunchedBy | (null));
   "lifecycle": InstanceLifecycle;
   "mode"?: (InstanceMode | (null));
   "nativeRef": NativeRef;
@@ -1256,6 +1262,7 @@ export type InstanceSpec = ({
   "completionScope": CompletionScope;
   "cwd": (string);
   "driver": DriverKind;
+  "effort"?: (EffortSelection | (null));
   "env": ({
   [key: string]: EnvBinding;
 });
@@ -1821,6 +1828,9 @@ export type Knowledge9 = (({
   [key: string]: unknown;
 }));
 
+/** LaunchedBy wire values; `protocol.md` §2.3. */
+export type LaunchedBy = ("remuda" | "user");
+
 /** LifecycleEntity; `protocol.md` §5.5. */
 export type LifecycleEntity = (({
   "entity": Host;
@@ -2142,6 +2152,7 @@ export type NativeLocator = ({
 export type NativeRef = ({
   "acp"?: (AcpRef | (null));
   "agy"?: (AgyRef | (null));
+  "capabilities"?: ((RuntimeCapability)[]);
   "claude"?: (ClaudeRef | (null));
   "claudeBg"?: (ClaudeBgRef | (null));
   "codex"?: (CodexRef | (null));
@@ -2150,6 +2161,7 @@ export type NativeRef = ({
   "kind": AgentKind;
   "nativeStoreId": Id;
   "sessionId": Knowledge2;
+  "signalTier"?: (SignalTier | (null));
   "transcript": Knowledge4;
   [key: string]: unknown;
 });
@@ -2611,7 +2623,7 @@ export type PromptInput = ({
 });
 
 /** PromptMode wire values; `protocol.md` §3.1. */
-export type PromptMode = ("new-turn");
+export type PromptMode = ("new-turn" | "steer" | "queue");
 
 /** ProtocolRange; `protocol.md` §7.1. */
 export type ProtocolRange = ({
@@ -3170,6 +3182,15 @@ export type RunWaitResult = ({
   [key: string]: unknown;
 });
 
+/** One capability this live session actually reached, with the tier that proves it; `protocol.md` §1.3 (D-028 §4.3).  A runtime entry outranks the static `DriverKind` matrix for the same name. It carries its own `state`, so a session may report a capability as `unknown` just as truthfully as `supported`. */
+export type RuntimeCapability = ({
+  "name": CapabilityName;
+  "reasonCode": (string);
+  "state": CapabilityState;
+  "tier": SignalTier;
+  [key: string]: unknown;
+});
+
 /** RuntimeCursor; `protocol.md` §5.1. */
 export type RuntimeCursor = ({
   "ledgerRevision": U64;
@@ -3234,6 +3255,9 @@ export type SettlementOutcome = ("completed" | "rejected" | "cancelled" | "expir
 /** Severity wire values; `protocol.md` §5.5. */
 export type Severity = ("info" | "warning" | "error");
 
+/** SignalTier wire values; `protocol.md` §1.3. */
+export type SignalTier = ("hook" | "file" | "osc" | "screen" | "none");
+
 /** Snapshot; `protocol.md` §7.3. */
 export type Snapshot = (InstanceSnapshot & ({
   "scope": "instance";
@@ -3247,7 +3271,7 @@ export type Snapshot = (InstanceSnapshot & ({
 export type SnapshotMode = ("required" | "if-needed" | "none");
 
 /** SourceChannel wire values; `protocol.md` §5.1. */
-export type SourceChannel = ("stdout" | "stderr" | "transcript" | "workflow-journal" | "hook" | "rpc" | "pty" | "herdr" | "runtime");
+export type SourceChannel = ("stdout" | "stderr" | "transcript" | "workflow-journal" | "hook" | "rpc" | "pty" | "herdr" | "runtime" | "file" | "osc" | "screen");
 
 /** SourceCursor; `protocol.md` §5.1. */
 export type SourceCursor = (StreamCursor & ({

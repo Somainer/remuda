@@ -3658,18 +3658,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(patched.model.as_deref(), Some("opus"));
-        assert_eq!(patched.effort_name.as_deref(), Some("ultracode"));
-        assert_eq!(patched.effort_index, Some(3));
+        // D-028 §9.1: the legacy `ultracode` tier normalizes to the level it
+        // is equivalent to plus the flag. It is not a sixth level, so it is
+        // never stored as one.
+        assert_eq!(patched.effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(patched.effort_ultracode, Some(true));
         let reloaded = store
             .get_instance(instance.instance_id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.model.as_deref(), Some("opus"));
-        assert_eq!(reloaded.effort_name.as_deref(), Some("ultracode"));
-        assert_eq!(reloaded.effort_index, Some(3));
+        assert_eq!(reloaded.effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(reloaded.effort_ultracode, Some(true));
         let listed = store.list_instances(None).await.unwrap();
-        assert_eq!(listed[0].effort_name.as_deref(), Some("ultracode"));
+        assert_eq!(listed[0].effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(listed[0].effort_ultracode, Some(true));
+    }
+
+    /// Open a store with one authenticated host, for tests that only need a
+    /// place to hang instances.
+    async fn store_with_host(tag: &str) -> (tempfile::TempDir, Store, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: enroll_token(&store, tag).await,
+                    hello_host_id: Some(host.clone()),
+                    label: Some(tag.into()),
+                    node_version: None,
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .unwrap();
+        (dir, store, host)
+    }
+
+    /// D-028 §9.1: every legacy tier name maps to a level by NAME, and a row
+    /// written before D-028 reads back as the level it meant — including the
+    /// ones whose index would have pointed somewhere else.
+    #[tokio::test]
+    async fn legacy_effort_tier_names_normalize_by_name_not_index() {
+        let (_dir, store, host) = store_with_host("enroll-legacy-effort").await;
+        for (legacy, index, level, ultracode) in [
+            ("default", 0, "low", false),
+            ("think", 1, "high", false),
+            ("think-hard", 2, "xhigh", false),
+            ("ultracode", 3, "xhigh", true),
+            // Codex's index 3 was `ultra`, not `ultracode` — normalizing by
+            // index instead of name would silently turn it into ultracode.
+            ("ultra", 3, "high", false),
+            ("max", 4, "max", false),
+        ] {
+            let instance = store
+                .insert_instance(
+                    host.clone(),
+                    None,
+                    "claude".into(),
+                    "claude-print".into(),
+                    Some(format!("legacy-{legacy}")),
+                    json!({ "effortName": legacy, "effortIndex": index }),
+                )
+                .await
+                .unwrap();
+            let reloaded = store
+                .get_instance(instance.instance_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.effort_name.as_deref(), Some(level), "{legacy}");
+            assert_eq!(reloaded.effort_ultracode, Some(ultracode), "{legacy}");
+            // The legacy index survives for older clients but never decided
+            // the tier above.
+            assert_eq!(reloaded.effort_index, Some(index), "{legacy}");
+        }
+    }
+
+    /// D-028 §1.0 rule 4: `launchedBy` is populated for rows that predate it.
+    #[tokio::test]
+    async fn launched_by_is_derived_from_mode_for_legacy_rows() {
+        let (_dir, store, host) = store_with_host("enroll-launched-by").await;
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "terminal".into(),
+                "shell-pty".into(),
+                Some("legacy".into()),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        // No `mode` stored at all: Remuda's own launch path is what creates
+        // rows, so that is what an absent mode means.
+        let reloaded = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.launched_by.as_deref(), Some("remuda"));
+        // Promotion means an agent CLI took over a login shell's foreground,
+        // which only happens because a person typed the command.
+        let promoted_id = instance.instance_id.clone();
+        store
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3 WHERE id = ?4",
+                    params!["claude", "promoted", now_rfc3339(), promoted_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let promoted = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.launched_by.as_deref(), Some("user"));
     }
 
     /// Backdate a row so time-window behaviour is testable without sleeping.

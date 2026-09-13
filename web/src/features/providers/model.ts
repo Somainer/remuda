@@ -1,5 +1,17 @@
 export type Delegation = "none" | "gateway" | "direct";
 
+/** One entry of a profile's model catalog. `enabled` gates New Session. */
+export type ProviderModel = {
+  id: string;
+  enabled: boolean;
+  label?: string | null;
+  contextWindow?: number | null;
+  tags?: string[];
+};
+
+/** Hub wire shape: a bare id (legacy) or a structured entry. */
+export type ProviderModelInput = string | Partial<ProviderModel> & { id: string };
+
 export type ProviderHealth = {
   ok: boolean;
   status?: number | null;
@@ -25,7 +37,7 @@ export type ProviderProfile = {
   health: ProviderHealth | null;
   secret: ProviderSecretView;
   secretRef: string | null;
-  models: string[];
+  models: ProviderModel[];
   defaultModel: string | null;
   defaultGateway: boolean;
   /** `universal` or `host:<hostId>`. */
@@ -43,7 +55,7 @@ export type ProviderCreate = {
   name: string;
   kind: "gateway" | "direct";
   baseUrl: string;
-  models: string[];
+  models: ProviderModel[];
   defaultModel?: string;
   headers?: Record<string, string>;
   authToken: string;
@@ -55,7 +67,7 @@ export type ProviderPatch = {
   name?: string;
   kind?: "gateway" | "direct";
   baseUrl?: string;
-  models?: string[];
+  models?: ProviderModel[];
   defaultModel?: string | null;
   headers?: Record<string, string>;
   authToken?: string;
@@ -69,7 +81,15 @@ export type ProviderTestResult = {
   status?: number | null;
   latencyMs?: number;
   message: string;
-  models?: string[];
+  models?: ProviderModel[];
+};
+
+/** `POST /v1/providers/discover` body. The token is sent once, never stored. */
+export type ProviderDiscoverBody = {
+  baseUrl?: string;
+  headers?: Record<string, string>;
+  token?: string;
+  profileId?: string;
 };
 
 export const DELEGATION_COPY: Record<Delegation, { title: string; hint: string }> = {
@@ -138,11 +158,77 @@ export function defaultGatewayProfile(profiles: ProviderProfile[]): ProviderProf
     ?? profiles.find((p) => p.delegation === "gateway" && p.available);
 }
 
-export function parseModels(raw: string): string[] {
-  return raw
-    .split(/[\n,]/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+/** Parse a comma/newline list into enabled catalog entries (manual entry). */
+export function parseModels(raw: string): ProviderModel[] {
+  const out: ProviderModel[] = [];
+  for (const part of raw.split(/[\n,]/)) {
+    const id = part.trim();
+    if (!id || out.some((m) => m.id === id)) continue;
+    out.push({ id, enabled: true });
+  }
+  return out;
+}
+
+/** Accept the Hub's structured entries or a legacy `["id", …]` list. */
+export function normalizeModels(raw: ProviderModelInput[] | undefined | null): ProviderModel[] {
+  const out: ProviderModel[] = [];
+  for (const item of raw ?? []) {
+    const entry = typeof item === "string" ? { id: item } : item;
+    const id = entry?.id?.trim();
+    if (!id || out.some((m) => m.id === id)) continue;
+    out.push({
+      id,
+      enabled: entry.enabled ?? true,
+      ...(entry.label ? { label: entry.label } : {}),
+      ...(entry.contextWindow ? { contextWindow: entry.contextWindow } : {}),
+      ...(entry.tags?.length ? { tags: entry.tags } : {}),
+    });
+  }
+  return out;
+}
+
+/** Ids New Session may offer. */
+export function enabledModels(models: ProviderModel[]): ProviderModel[] {
+  return models.filter((m) => m.enabled);
+}
+
+/**
+ * Fold a discovery result into the current list.
+ *
+ * Saved entries keep their `enabled` choice and gain freshly reported
+ * metadata; models the gateway newly reports arrive enabled and flagged so the
+ * UI can mark them. Manual ids the gateway does not list are kept — a gateway
+ * that lists nothing must not silently drop them.
+ */
+export function mergeDiscovered(
+  current: ProviderModel[],
+  discovered: ProviderModel[],
+): { models: ProviderModel[]; added: string[] } {
+  const added: string[] = [];
+  const merged = current.map((existing) => {
+    const found = discovered.find((m) => m.id === existing.id);
+    if (!found) return existing;
+    return {
+      ...existing,
+      ...(found.label ? { label: found.label } : {}),
+      ...(found.contextWindow ? { contextWindow: found.contextWindow } : {}),
+      ...(found.tags?.length ? { tags: found.tags } : {}),
+    };
+  });
+  for (const model of discovered) {
+    if (merged.some((m) => m.id === model.id)) continue;
+    merged.push({ ...model, enabled: true });
+    added.push(model.id);
+  }
+  return { models: merged, added };
+}
+
+/** `1m` / `200k` chip text for a context window. */
+export function contextChip(tokens: number | null | undefined): string | null {
+  if (!tokens || tokens <= 0) return null;
+  if (tokens >= 1_000_000) return `${Math.round(tokens / 100_000) / 10}m`;
+  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}k`;
+  return String(tokens);
 }
 
 type HubProvider = {
@@ -150,7 +236,7 @@ type HubProvider = {
   name: string;
   kind: "gateway" | "direct" | string;
   baseUrl?: string | null;
-  models?: string[];
+  models?: ProviderModelInput[];
   defaultModel?: string | null;
   headers?: Record<string, string>;
   defaultGateway?: boolean;
@@ -180,7 +266,7 @@ export function fromHub(row: HubProvider): ProviderProfile {
       fingerprint: row.secret?.fingerprint ?? null,
     },
     secretRef: last4,
-    models: row.models ?? [],
+    models: normalizeModels(row.models),
     defaultModel: row.defaultModel ?? null,
     defaultGateway: Boolean(row.defaultGateway),
     scope: row.scope && row.scope.length ? row.scope : "universal",

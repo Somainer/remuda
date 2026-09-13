@@ -43,6 +43,7 @@ uuid.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
+rusqlite.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite.workspace = true

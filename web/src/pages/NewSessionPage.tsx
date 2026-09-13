@@ -30,7 +30,7 @@ import {
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
-import { defaultGatewayProfile, fromHub, type ProviderProfile } from "../features/providers";
+import { defaultGatewayProfile, enabledModels, fromHub, type ProviderProfile } from "../features/providers";
 import { api } from "../lib/api";
 import { WorkspaceRegistration } from "../features/workspaces/WorkspaceRegistration";
 import { workspaceCwd } from "../features/workspaces/path";
@@ -92,6 +92,9 @@ export function NewSessionPage() {
   }, [hostId]);
 
   const defaultGateway = defaultGatewayProfile(gatewayProfiles);
+  // Only a gateway run is constrained to the profile's catalog; native and
+  // direct sessions keep the free-text model box.
+  const gatewayModels = delegation === "gateway" ? enabledModels(defaultGateway?.models ?? []) : [];
 
   const pickerHosts = sortHostsOnlineFirst(
     hub.hosts.filter((h) => !isStaleOffline(h)),
@@ -365,12 +368,32 @@ export function NewSessionPage() {
               <label className={css.field}>
                 <span className={css.label}>模型</span>
                 <div className={css.selectWrap}>
-                  <input
-                    className={css.select}
-                    data-testid="new-session-model"
-                    value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                  />
+                  {gatewayModels.length ? (
+                    // A gateway profile publishes a catalog; offer only the
+                    // models it exposes rather than a free-text box.
+                    <select
+                      className={css.select}
+                      data-testid="new-session-model"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                    >
+                      {gatewayModels.some((m) => m.id === model) ? null : (
+                        <option value={model}>{model}</option>
+                      )}
+                      {gatewayModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label ? `${m.id} · ${m.label}` : m.id}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      className={css.select}
+                      data-testid="new-session-model"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                    />
+                  )}
                 </div>
               </label>
             )}
@@ -465,7 +488,12 @@ export function NewSessionPage() {
                   data-testid={`new-session-delegation-${opt.id}`}
                   onClick={() => {
                     setDelegation(opt.id);
-                    if (opt.id === "gateway" && defaultGateway?.defaultModel) setModel(defaultGateway.defaultModel);
+                    if (opt.id === "gateway" && defaultGateway) {
+                      const enabled = enabledModels(defaultGateway.models);
+                      const next = defaultGateway.defaultModel || enabled[0]?.id;
+                      // Keep a model the catalog still exposes; otherwise prefill.
+                      if (next && !enabled.some((m) => m.id === model)) setModel(next);
+                    }
                   }}
                 >
                   {opt.label}
@@ -475,7 +503,7 @@ export function NewSessionPage() {
             {delegation === "gateway" ? (
               <span className={css.hint} data-testid="new-session-gateway-profile">
                 {defaultGateway
-                  ? `${defaultGateway.name} · ${defaultGateway.defaultModel || defaultGateway.models[0] || "model"}`
+                  ? `${defaultGateway.name} · ${defaultGateway.defaultModel || gatewayModels[0]?.id || "model"}`
                   : "请先在 Provider 页配置网关"}
               </span>
             ) : null}

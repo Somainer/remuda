@@ -6,7 +6,14 @@ import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import { mapWorkspace } from "../features/workspaces/registry";
 import { followWorkspaces } from "../features/workspaces/follow";
-import type { ProviderCreate, ProviderPatch, ProviderTestResult } from "../features/providers";
+import type {
+  ProviderCreate,
+  ProviderDiscoverBody,
+  ProviderModel,
+  ProviderModelInput,
+  ProviderPatch,
+  ProviderTestResult,
+} from "../features/providers";
 import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import type { components, paths } from "./api.generated";
 import { printCapabilities, ptyCapabilities } from "./capabilities";
@@ -365,7 +372,7 @@ export type HubProviderRow = {
   name: string;
   kind: "gateway" | "direct" | string;
   baseUrl: string;
-  models: string[];
+  models: ProviderModelInput[];
   defaultModel?: string | null;
   headers?: Record<string, string>;
   defaultGateway: boolean;
@@ -427,6 +434,8 @@ export type HubApi = {
   providerPatch(id: string, body: ProviderPatch): Promise<HubProviderRow>;
   providerDelete(id: string): Promise<{ ok: boolean }>;
   providerTest(id: string): Promise<ProviderTestResult>;
+  /** Probe a gateway's `/v1/models` before the profile is saved. */
+  providerDiscover(body: ProviderDiscoverBody): Promise<ProviderTestResult>;
   eventsRead: JournalRead;
   eventsSubscribe(
     journalId: Id,
@@ -505,6 +514,21 @@ async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+/** Dummy URLs stand in for a gateway that is not listening. */
+function mockUnreachable(baseUrl: string): boolean {
+  return /127\.0\.0\.1:1|:1$|invalid|example/.test(baseUrl);
+}
+
+/** A fake gateway catalog so the mock exercises the discovery checklist. */
+function mockDiscovered(baseUrl: string): ProviderModel[] {
+  if (mockUnreachable(baseUrl)) return [];
+  return [
+    { id: "passthrough/auto", enabled: true, label: "Auto", contextWindow: 1_048_576, tags: ["1m"] },
+    { id: "passthrough/auto_model", enabled: true, label: "Auto model" },
+    { id: "passthrough/fast", enabled: true, label: "Fast", contextWindow: 200_000 },
+  ];
 }
 
 function seedMockProviders(): HubProviderRow[] {
@@ -722,7 +746,7 @@ function createMockApi(): HubApi {
         kind: body.kind,
         baseUrl: body.baseUrl,
         models: body.models,
-        defaultModel: body.defaultModel ?? body.models[0] ?? null,
+        defaultModel: body.defaultModel ?? body.models.find((m) => m.enabled)?.id ?? null,
         headers: body.headers ?? {},
         defaultGateway: Boolean(body.defaultGateway && body.kind === "gateway"),
         scope: body.scope ?? "universal",
@@ -770,11 +794,34 @@ function createMockApi(): HubApi {
       const dummy = /127\.0\.0\.1:1|:1$|invalid|example/.test(found.baseUrl);
       const result: ProviderTestResult = dummy
         ? { ok: false, reachable: false, message: `unreachable: connection refused (${found.baseUrl}/v1/models)`, models: [] }
-        : { ok: true, reachable: true, status: 200, latencyMs: 12, message: "reachable (200); 1 models", models: found.models };
+        : { ok: true, reachable: true, status: 200, latencyMs: 12, message: "reachable (200); 1 models", models: mockDiscovered(found.baseUrl) };
       found.health = dummy
         ? { ok: false, message: result.message }
         : { ok: true, status: 200, latencyMs: 12, message: result.message, checkedAt: now() };
       return result;
+    },
+    async providerDiscover(body) {
+      const saved = body.profileId ? mockProviders.find((p) => p.id === body.profileId) : undefined;
+      if (body.profileId && !saved) throw new Error("NOT_FOUND");
+      const baseUrl = body.baseUrl?.trim() || saved?.baseUrl || "";
+      if (!baseUrl) throw new Error("gateway profiles require a baseUrl");
+      if (mockUnreachable(baseUrl)) {
+        return {
+          ok: false,
+          reachable: false,
+          message: `unreachable: connection refused (${baseUrl}/v1/models)`,
+          models: [],
+        };
+      }
+      const models = mockDiscovered(baseUrl);
+      return {
+        ok: true,
+        reachable: true,
+        status: 200,
+        latencyMs: 12,
+        message: `reachable (200); ${models.length} models`,
+        models,
+      };
     },
     async workspaceList(hostId) {
       const items = hostId ? mockDb.workspaces.filter((w) => w.hostId === hostId) : mockDb.workspaces;
@@ -1154,6 +1201,9 @@ function createLiveApi(): HubApi {
     },
     async providerTest(providerId) {
       return rest<ProviderTestResult>(`/v1/providers/${providerId}/test`, { method: "POST", body: "{}" });
+    },
+    async providerDiscover(body) {
+      return rest<ProviderTestResult>("/v1/providers/discover", { method: "POST", body: JSON.stringify(body) });
     },
     async workspaceList(hostId) {
       const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;

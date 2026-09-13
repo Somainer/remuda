@@ -1079,6 +1079,31 @@
         }
       }
     },
+    "/v1/providers/discover": {
+      "post": {
+        "tags": ["providers"],
+        "operationId": "providerDiscover",
+        "summary": "Probe a gateway's model list before the profile is saved",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/ProviderDiscover" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Probe result with the normalized model catalog",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ProviderTestResult" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/providers/{id}": {
       "get": {
         "tags": ["providers"],
@@ -1402,6 +1427,32 @@
           "latencyMs": { "type": ["integer", "null"] }
         }
       },
+      "ProviderModel": {
+        "type": "object",
+        "required": ["id"],
+        "description": "One catalog entry. `enabled` is what New Session may offer.",
+        "properties": {
+          "id": { "type": "string" },
+          "enabled": { "type": "boolean", "default": true },
+          "label": { "type": ["string", "null"] },
+          "contextWindow": { "type": ["integer", "null"] },
+          "tags": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "ProviderModelInput": {
+        "description": "A model id, or a structured entry. Bare strings migrate to enabled entries.",
+        "oneOf": [{ "type": "string" }, { "$ref": "#/components/schemas/ProviderModel" }]
+      },
+      "ProviderDiscover": {
+        "type": "object",
+        "description": "Probe a gateway before the profile exists. The token is used once and never echoed.",
+        "properties": {
+          "baseUrl": { "type": "string", "description": "Required unless profileId supplies one." },
+          "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+          "token": { "type": "string", "description": "Auth token for an unsaved profile. Never returned." },
+          "profileId": { "type": "string", "description": "Reuse this saved profile's stored token, base URL and headers." }
+        }
+      },
       "ProviderProfile": {
         "type": "object",
         "required": ["id", "name", "kind", "baseUrl", "models", "defaultGateway", "revision", "secret"],
@@ -1410,8 +1461,8 @@
           "name": { "type": "string" },
           "kind": { "type": "string", "enum": ["gateway", "direct"] },
           "baseUrl": { "type": "string" },
-          "models": { "type": "array", "items": { "type": "string" } },
-          "defaultModel": { "type": ["string", "null"] },
+          "models": { "type": "array", "items": { "$ref": "#/components/schemas/ProviderModel" } },
+          "defaultModel": { "type": ["string", "null"], "description": "Must be one of the enabled models." },
           "headers": { "type": "object", "additionalProperties": { "type": "string" } },
           "defaultGateway": { "type": "boolean" },
           "scope": { "type": "string", "description": "universal or host:<hostId>" },
@@ -1437,8 +1488,8 @@
           "name": { "type": "string" },
           "kind": { "type": "string", "enum": ["gateway", "direct"] },
           "baseUrl": { "type": "string" },
-          "models": { "type": "array", "items": { "type": "string" } },
-          "defaultModel": { "type": "string" },
+          "models": { "type": "array", "items": { "$ref": "#/components/schemas/ProviderModelInput" } },
+          "defaultModel": { "type": "string", "description": "Must be one of the enabled models." },
           "headers": { "type": "object", "additionalProperties": { "type": "string" } },
           "authToken": { "type": "string" },
           "defaultGateway": { "type": "boolean" },
@@ -1451,8 +1502,8 @@
           "name": { "type": "string" },
           "kind": { "type": "string", "enum": ["gateway", "direct"] },
           "baseUrl": { "type": "string" },
-          "models": { "type": "array", "items": { "type": "string" } },
-          "defaultModel": { "type": ["string", "null"] },
+          "models": { "type": "array", "items": { "$ref": "#/components/schemas/ProviderModelInput" } },
+          "defaultModel": { "type": ["string", "null"], "description": "Must be one of the enabled models." },
           "headers": { "type": "object", "additionalProperties": { "type": "string" } },
           "authToken": { "type": "string", "description": "Rotate the stored token." },
           "defaultGateway": { "type": "boolean" },
@@ -1468,7 +1519,7 @@
           "status": { "type": ["integer", "null"] },
           "latencyMs": { "type": "integer" },
           "message": { "type": "string" },
-          "models": { "type": "array", "items": { "type": "string" } }
+          "models": { "type": "array", "items": { "$ref": "#/components/schemas/ProviderModel" } }
         }
       },
       "PairRedeem": {

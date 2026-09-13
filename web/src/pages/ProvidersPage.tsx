@@ -5,11 +5,15 @@ import { Modal } from "../components/Modal";
 import {
   DELEGATION_COPY,
   NATIVE_PROFILE,
+  contextChip,
+  enabledModels,
   formatSecret,
   fromHub,
   healthLine,
   shouldAvoidUnhealthy,
   type ProviderCreate,
+  type ProviderDiscoverBody,
+  type ProviderModel,
   type ProviderProfile,
   type ProviderTestResult,
 } from "../features/providers";
@@ -20,6 +24,13 @@ import type { Host } from "../types/instance";
 
 function healthDot(ok: boolean | undefined) {
   return <span className={`${css.dot} ${ok === false ? css.dotOff : ""}`} aria-hidden />;
+}
+
+/** Probe a gateway for its catalog; the token is sent once and never stored. */
+async function discoverModels(input: ProviderDiscoverBody): Promise<ProviderModel[]> {
+  const result = await api.providerDiscover(input);
+  if (!result.reachable || !result.ok) throw new Error(result.message);
+  return result.models ?? [];
 }
 
 function useProviderList() {
@@ -126,6 +137,7 @@ export function ProvidersPage() {
           busy={busy}
           error={formError}
           hosts={hosts}
+          onDiscover={discoverModels}
           onCancel={() => setCreating(false)}
           onSubmit={(body) => {
             setBusy(true);
@@ -246,7 +258,15 @@ export function ProviderDetailPage() {
               {formatSecret(p.secret)} last4
             </div>
             <div className={css.label}>models</div>
-            <div className={css.value}>{p.models.length ? `${p.models.length} 个 · discovery 开` : "由 CLI 原生目录决定"}</div>
+            <div className={css.value} data-testid="provider-model-summary">
+              {p.models.length
+                ? `${enabledModels(p.models).length}/${p.models.length} 已启用`
+                : "由 CLI 原生目录决定"}
+            </div>
+            <div className={css.label}>默认模型</div>
+            <div className={css.value} data-testid="provider-default-model">
+              {p.defaultModel ?? "—"}
+            </div>
             <div className={css.label}>lastError</div>
             <div className={css.value}>{p.lastError ?? "—"}</div>
           </div>
@@ -256,11 +276,22 @@ export function ProviderDetailPage() {
           <div>
             <div className={css.sectionLabel}>模型名原样透传</div>
             <div className={css.models}>
-              {p.models.map((m) => (
-                <span key={m} className={css.chip}>
-                  {m}
-                </span>
-              ))}
+              {p.models.map((m) => {
+                const context = contextChip(m.contextWindow);
+                return (
+                  <span
+                    key={m.id}
+                    className={css.chip}
+                    data-testid="provider-model-chip"
+                    data-enabled={m.enabled ? "1" : "0"}
+                    style={m.enabled ? undefined : { opacity: 0.5 }}
+                  >
+                    {m.id}
+                    {context ? ` · ${context}` : ""}
+                    {m.id === p.defaultModel ? " · 默认" : ""}
+                  </span>
+                );
+              })}
             </div>
           </div>
         ) : null}
@@ -359,6 +390,7 @@ export function ProviderDetailPage() {
           busy={busy}
           error={formError}
           hosts={hosts}
+          onDiscover={discoverModels}
           onCancel={() => setEditing(false)}
           onSubmit={(body) => save(body, false)}
         />

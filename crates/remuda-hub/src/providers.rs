@@ -4,6 +4,7 @@ use crate::AppState;
 use crate::auth::{require_device, require_origin};
 use crate::error::HubError;
 use crate::http::map_store;
+use crate::provider_models::{self, ProviderModel};
 use crate::provider_resolve::{self, ResolveInput};
 use crate::store::{HostRecord, ProviderRecord};
 use axum::Json;
@@ -23,6 +24,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(8);
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/providers", get(list_providers).post(create_provider))
+        .route("/v1/providers/discover", post(discover_models))
         .route(
             "/v1/providers/{id}",
             get(get_provider)
@@ -41,7 +43,7 @@ struct CreateBody {
     #[serde(default)]
     base_url: String,
     #[serde(default)]
-    models: Vec<String>,
+    models: Value,
     #[serde(default)]
     default_model: Option<String>,
     #[serde(default)]
@@ -68,7 +70,7 @@ struct PatchBody {
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
-    models: Option<Vec<String>>,
+    models: Option<Value>,
     #[serde(default)]
     default_model: Option<Option<String>>,
     #[serde(default)]
@@ -79,6 +81,22 @@ struct PatchBody {
     default_gateway: Option<bool>,
     #[serde(default)]
     scope: Option<String>,
+}
+
+/// `POST /v1/providers/discover` body: probe a gateway before it is saved.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoverBody {
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    /// Token for an unsaved profile. Never echoed back.
+    #[serde(default)]
+    token: Option<String>,
+    /// Reuse a saved profile's stored token instead of sending one.
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -143,14 +161,8 @@ async fn create_provider(
         .ok_or_else(|| HubError::BadRequest("authToken is required on create".into()))?;
     let default_gateway = body.default_gateway && kind == "gateway";
     let scope = validate_scope(&state, body.scope.as_deref()).await?;
-    let models = sanitize_models(body.models);
-    let default_model = body
-        .default_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| models.first().cloned());
+    let models = provider_models::from_value(&body.models);
+    let default_model = resolve_default_model(body.default_model.as_deref(), &models)?;
     let (fingerprint, last4) = fingerprint_secret(token.as_bytes());
     let id = crate::config::new_id("pvp").map_err(|err| HubError::Internal(err.to_string()))?;
     let secret_name = vault_name(&id);
@@ -209,7 +221,20 @@ async fn patch_provider(
         None => None,
     };
     let headers_map = body.headers.map(sanitize_headers).transpose()?;
-    let models = body.models.map(sanitize_models);
+    let models = body.models.as_ref().map(provider_models::from_value);
+    // `defaultModel` must name an enabled model of whichever catalog ends up
+    // stored: the patched one when models are being replaced, else the saved one.
+    let effective = models.as_deref().unwrap_or(&existing.models);
+    let default_model = match (&body.default_model, &models) {
+        (Some(requested), _) => Some(resolve_default_model(requested.as_deref(), effective)?),
+        // Replacing the catalog can orphan the saved default; carry it forward
+        // only while it is still enabled.
+        (None, Some(_)) => Some(carry_default_model(
+            existing.default_model.as_deref(),
+            effective,
+        )),
+        (None, None) => None,
+    };
     let default_gateway = body.default_gateway.map(|flag| flag && kind == "gateway");
     let scope = match body.scope.as_deref() {
         Some(raw) => Some(validate_scope(&state, Some(raw)).await?),
@@ -245,7 +270,7 @@ async fn patch_provider(
             body.kind.map(|_| kind),
             base_url,
             models,
-            body.default_model,
+            default_model,
             headers_map,
             default_gateway,
             scope,
@@ -292,7 +317,12 @@ async fn test_provider(
         .await?
         .ok_or(HubError::NotFound)?;
     let secret = load_secret(&state.secrets, &profile)?;
-    let result = probe_gateway(&profile, secret.expose_str().ok()).await;
+    let result = probe_models(
+        &profile.base_url,
+        &profile.headers,
+        secret.expose_str().ok(),
+    )
+    .await;
     let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let message = result
         .get("message")
@@ -301,6 +331,97 @@ async fn test_provider(
         .to_string();
     let _ = state.store.record_provider_test(id, ok, message).await;
     Ok(Json(result))
+}
+
+/// `POST /v1/providers/discover`
+///
+/// Probes a gateway's model list **before** the profile exists, so the form can
+/// offer a checklist instead of a free-text box. Operator devices only; the
+/// supplied token is used for the one request and never echoed back.
+async fn discover_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DiscoverBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    crate::agent_scope::require_operator(&state, &headers).await?;
+    // An existing profile supplies its base URL, headers and stored token when
+    // the operator re-probes without retyping the secret.
+    let saved = match body
+        .profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => Some(
+            state
+                .store
+                .get_provider(id.to_string())
+                .await?
+                .ok_or(HubError::NotFound)?,
+        ),
+        None => None,
+    };
+    let raw_base = match (body.base_url.trim(), saved.as_ref()) {
+        ("", Some(profile)) => profile.base_url.clone(),
+        (base, _) => base.to_string(),
+    };
+    let base_url = validate_base_url(&raw_base, "gateway")?;
+    let headers_map = if body.headers.is_empty() {
+        saved
+            .as_ref()
+            .map(|profile| profile.headers.clone())
+            .unwrap_or_default()
+    } else {
+        sanitize_headers(body.headers)?
+    };
+    let supplied = body
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let stored = match (&supplied, saved.as_ref()) {
+        (None, Some(profile)) => load_secret(&state.secrets, profile).ok(),
+        _ => None,
+    };
+    let token = supplied
+        .as_deref()
+        .or_else(|| stored.as_ref().and_then(|s| s.expose_str().ok()));
+    Ok(Json(probe_models(&base_url, &headers_map, token).await))
+}
+
+/// `defaultModel` must be one of the enabled models; empty falls back to the
+/// first enabled one so a catalog always has a usable prefill.
+fn resolve_default_model(
+    requested: Option<&str>,
+    models: &[ProviderModel],
+) -> Result<Option<String>, HubError> {
+    let enabled = provider_models::enabled_ids(models);
+    let Some(requested) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(enabled.first().map(|id| (*id).to_string()));
+    };
+    if enabled.is_empty() {
+        // No catalog at all: the operator types the model in New Session.
+        return Ok(Some(requested.to_string()));
+    }
+    if !enabled.contains(&requested) {
+        return Err(HubError::BadRequest(format!(
+            "defaultModel {requested} is not one of the enabled models"
+        )));
+    }
+    Ok(Some(requested.to_string()))
+}
+
+/// Keep the saved default when the replacement catalog still enables it,
+/// otherwise fall back to the first enabled model. Never an error: replacing
+/// the catalog is a legitimate way to retire the old default.
+fn carry_default_model(saved: Option<&str>, models: &[ProviderModel]) -> Option<String> {
+    let enabled = provider_models::enabled_ids(models);
+    match saved.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(saved) if enabled.contains(&saved) => Some(saved.to_string()),
+        _ => enabled.first().map(|id| (*id).to_string()),
+    }
 }
 
 /// D-021 Claude waterfall for a chosen host, then attach overlay metadata (never the token).
@@ -525,18 +646,6 @@ fn sanitize_headers(
     Ok(out)
 }
 
-fn sanitize_models(models: Vec<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    for model in models {
-        let model = model.trim();
-        if model.is_empty() || out.iter().any(|existing: &String| existing == model) {
-            continue;
-        }
-        out.push(model.to_string());
-    }
-    out
-}
-
 fn strip_provider_secrets(spec: &mut Value) {
     let Some(obj) = spec.as_object_mut() else {
         return;
@@ -560,8 +669,14 @@ fn models_url(base_url: &str) -> String {
     }
 }
 
-async fn probe_gateway(profile: &ProviderRecord, token: Option<&str>) -> Value {
-    let url = models_url(&profile.base_url);
+/// Probe `{baseUrl}/v1/models` and normalize the catalog. Shared by `/test`
+/// and `/discover` so both report the same shape and the same timeouts.
+async fn probe_models(
+    base_url: &str,
+    extra_headers: &BTreeMap<String, String>,
+    token: Option<&str>,
+) -> Value {
+    let url = models_url(base_url);
     let started = Instant::now();
     let client = match reqwest::Client::builder()
         .timeout(TEST_TIMEOUT)
@@ -588,7 +703,7 @@ async fn probe_gateway(profile: &ProviderRecord, token: Option<&str>) -> Value {
             .header("x-api-key", token)
             .header("anthropic-version", "2023-06-01");
     }
-    for (name, value) in &profile.headers {
+    for (name, value) in extra_headers {
         request = request.header(name, value);
     }
     match request.send().await {
@@ -596,7 +711,7 @@ async fn probe_gateway(profile: &ProviderRecord, token: Option<&str>) -> Value {
             let latency = started.elapsed().as_millis() as u64;
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            let models = parse_model_ids(&body);
+            let models = provider_models::normalize_catalog(&body);
             let reachable = true;
             let ok = (200..300).contains(&status);
             let message = if ok {
@@ -616,7 +731,7 @@ async fn probe_gateway(profile: &ProviderRecord, token: Option<&str>) -> Value {
                 "status": status,
                 "latencyMs": latency,
                 "message": message,
-                "models": models,
+                "models": models.iter().map(ProviderModel::to_json).collect::<Vec<_>>(),
             })
         }
         Err(err) => {
@@ -646,31 +761,4 @@ fn sanitize_probe_error(err: &reqwest::Error, token: Option<&str>) -> String {
         text = text.replace(token, "[redacted]");
     }
     text
-}
-
-fn parse_model_ids(body: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return Vec::new();
-    };
-    let mut ids = Vec::new();
-    if let Some(data) = value.get("data").and_then(Value::as_array) {
-        for item in data {
-            if let Some(id) = item.get("id").and_then(Value::as_str) {
-                ids.push(id.to_string());
-            }
-        }
-    }
-    if ids.is_empty()
-        && let Some(models) = value.get("models").and_then(Value::as_array)
-    {
-        for item in models {
-            if let Some(id) = item
-                .as_str()
-                .or_else(|| item.get("id").and_then(Value::as_str))
-            {
-                ids.push(id.to_string());
-            }
-        }
-    }
-    ids
 }

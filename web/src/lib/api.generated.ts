@@ -601,6 +601,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/providers/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Probe a gateway's model list before the profile is saved */
+        post: operations["providerDiscover"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/providers/{id}": {
         parameters: {
             query?: never;
@@ -1018,16 +1035,29 @@ export interface components {
             authToken: string;
             baseUrl?: string;
             defaultGateway?: boolean;
+            /** @description Must be one of the enabled models. */
             defaultModel?: string;
             headers?: {
                 [key: string]: string;
             };
             /** @enum {string} */
             kind?: "gateway" | "direct";
-            models?: string[];
+            models?: components["schemas"]["ProviderModelInput"][];
             name: string;
             /** @description universal or host:<hostId> */
             scope?: string;
+        };
+        /** @description Probe a gateway before the profile exists. The token is used once and never echoed. */
+        ProviderDiscover: {
+            /** @description Required unless profileId supplies one. */
+            baseUrl?: string;
+            headers?: {
+                [key: string]: string;
+            };
+            /** @description Reuse this saved profile's stored token, base URL and headers. */
+            profileId?: string;
+            /** @description Auth token for an unsaved profile. Never returned. */
+            token?: string;
         };
         ProviderHealth: {
             checkedAt?: string | null;
@@ -1036,6 +1066,17 @@ export interface components {
             ok: boolean;
             status?: number | null;
         };
+        /** @description One catalog entry. `enabled` is what New Session may offer. */
+        ProviderModel: {
+            contextWindow?: number | null;
+            /** @default true */
+            enabled: boolean;
+            id: string;
+            label?: string | null;
+            tags?: string[];
+        };
+        /** @description A model id, or a structured entry. Bare strings migrate to enabled entries. */
+        ProviderModelInput: string | components["schemas"]["ProviderModel"];
         ProviderPage: {
             items: components["schemas"]["ProviderProfile"][];
             nextCursor?: string | null;
@@ -1045,13 +1086,14 @@ export interface components {
             authToken?: string;
             baseUrl?: string;
             defaultGateway?: boolean;
+            /** @description Must be one of the enabled models. */
             defaultModel?: string | null;
             headers?: {
                 [key: string]: string;
             };
             /** @enum {string} */
             kind?: "gateway" | "direct";
-            models?: string[];
+            models?: components["schemas"]["ProviderModelInput"][];
             name?: string;
             /** @description universal or host:<hostId> */
             scope?: string;
@@ -1060,6 +1102,7 @@ export interface components {
             baseUrl: string;
             createdAt?: string;
             defaultGateway: boolean;
+            /** @description Must be one of the enabled models. */
             defaultModel?: string | null;
             headers?: {
                 [key: string]: string;
@@ -1068,7 +1111,7 @@ export interface components {
             id: string;
             /** @enum {string} */
             kind: "gateway" | "direct";
-            models: string[];
+            models: components["schemas"]["ProviderModel"][];
             name: string;
             revision: string;
             /** @description universal or host:<hostId> */
@@ -1084,7 +1127,7 @@ export interface components {
         ProviderTestResult: {
             latencyMs?: number;
             message: string;
-            models?: string[];
+            models?: components["schemas"]["ProviderModel"][];
             ok: boolean;
             reachable: boolean;
             status?: number | null;
@@ -2314,6 +2357,34 @@ export interface operations {
             };
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
+        };
+    };
+    providerDiscover: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderDiscover"];
+            };
+        };
+        responses: {
+            /** @description Probe result with the normalized model catalog */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderTestResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     providerGet: {

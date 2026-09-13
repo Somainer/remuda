@@ -81,8 +81,12 @@ fn fixture() -> Result<Fixture> {
     let dir = tempfile::tempdir()?;
     let data_dir = dir.path().join("node-data");
     std::fs::create_dir_all(&data_dir)?;
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace)?;
     let node = compose(&ServeConfig::fake(
-        DevServerConfig::loopback(0),
+        DevServerConfig::loopback(0)
+            .with_workspace_root(workspace)
+            .with_workspace_roots(vec![std::env::temp_dir()]),
         data_dir.clone(),
     ))?;
     Ok(Fixture {

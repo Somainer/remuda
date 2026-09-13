@@ -425,7 +425,12 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
     let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("data")))
         .await
         .expect("hub");
-    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("dev node");
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_workspace_roots(vec![std::env::temp_dir()]),
+    )
+    .expect("dev node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let mut config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
     config.heartbeat_interval = Duration::from_millis(80);
@@ -1435,7 +1440,12 @@ async fn runtime_hello_always_reports_the_instance_inventory() {
     let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("data")))
         .await
         .expect("hub");
-    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("dev node");
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_workspace_roots(vec![std::env::temp_dir()]),
+    )
+    .expect("dev node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let mut config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
     config.backoff = Backoff {

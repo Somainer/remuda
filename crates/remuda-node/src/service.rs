@@ -171,7 +171,8 @@ mod tests {
     async fn serve_binds_ephemeral_port_and_stops_cleanly() {
         let data_dir = tempfile::tempdir().expect("data dir");
         let running = serve(ServeConfig::fake(
-            DevServerConfig::loopback(0),
+            DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
             data_dir.path().to_path_buf(),
         ))
         .await
@@ -193,7 +194,11 @@ mod tests {
     #[tokio::test]
     async fn compose_reuses_the_persisted_host_identity() {
         let data_dir = tempfile::tempdir().expect("data dir");
-        let config = ServeConfig::fake(DevServerConfig::loopback(0), data_dir.path().to_path_buf());
+        let config = ServeConfig::fake(
+            DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+            data_dir.path().to_path_buf(),
+        );
         let first = compose(&config).expect("first Node").host().meta.id;
         let second = compose(&config).expect("second Node").host().meta.id;
         assert_eq!(first, second);

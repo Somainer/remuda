@@ -2038,7 +2038,8 @@ mod tests {
 
     #[tokio::test]
     async fn driver_panic_is_contained_and_marks_dispatch_unknown() {
-        let config = crate::DevServerConfig::loopback(0);
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]);
         let store = Arc::new(MemoryStore::new(8));
         let drivers = DriverRegistry::default();
         drivers
@@ -2107,7 +2108,11 @@ mod tests {
 
     #[tokio::test]
     async fn tty_write_dispatches_send_keys_on_fake_driver() {
-        let node = DevNode::new(&crate::DevServerConfig::loopback(0)).expect("node");
+        let node = DevNode::new(
+            &crate::DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        )
+        .expect("node");
         let created = node
             .create_instance(
                 serde_json::from_value(serde_json::json!({
@@ -2165,7 +2170,11 @@ mod tests {
 
     #[tokio::test]
     async fn instance_configure_is_forwarded_and_applied_on_fake_claude() {
-        let node = DevNode::new(&crate::DevServerConfig::loopback(0)).expect("node");
+        let node = DevNode::new(
+            &crate::DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        )
+        .expect("node");
         let created = node
             .create_instance(
                 serde_json::from_value(serde_json::json!({
@@ -2312,7 +2321,11 @@ mod tests {
 
     #[tokio::test]
     async fn tty_write_rpc_rejects_entire_invalid_batch_before_dispatch() {
-        let node = DevNode::new(&crate::DevServerConfig::loopback(0)).expect("node");
+        let node = DevNode::new(
+            &crate::DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        )
+        .expect("node");
         let created = node
             .create_instance(
                 serde_json::from_value(serde_json::json!({

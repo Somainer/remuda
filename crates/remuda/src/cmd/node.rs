@@ -500,7 +500,11 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_reaches_the_driver_and_waits_for_close_settlement() {
-        let node = DevNode::new(&remuda_node::DevServerConfig::loopback(0)).expect("fake node");
+        let node = DevNode::new(
+            &remuda_node::DevServerConfig::loopback(0)
+                .with_workspace_roots(vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+        )
+        .expect("fake node");
         let request = serde_json::from_str(r#"{"prompt":"synthetic shutdown fixture"}"#)
             .expect("fixture request");
         let instance = node

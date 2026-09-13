@@ -965,6 +965,7 @@ async fn dispatch_rpc(
                         command_id: optional_id_field(&params, "commandId")?,
                         operation: CommandAction::WriteTty,
                         prompt: None,
+                        attachments: Vec::new(),
                         run_id: None,
                         interaction_id: None,
                         answer: None,
@@ -1029,6 +1030,9 @@ async fn submit_rpc_command(
                 origin: remuda_protocol::InputOrigin::Human,
                 command_id: optional_id_field(params, "commandId")?,
                 operation,
+                // The local development REST surface stages no attachments;
+                // those arrive via the Hub (D-027).
+                attachments: Vec::new(),
                 prompt,
                 run_id: optional_id_field(params, "runId")?,
                 interaction_id: None,

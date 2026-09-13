@@ -334,15 +334,27 @@ impl Driver for ShellPtyDriver {
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
         let text = match input {
-            DriverInput::Prompt(prompt) => prompt
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    remuda_protocol::ContentBlock::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+            DriverInput::Prompt(prompt) => {
+                let mut text = prompt
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        remuda_protocol::ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // D-027: this is a raw shell, not an agent. Nothing here can
+                // read an image, so an attachment only contributes its path —
+                // shell-quoted, because these bytes are typed into a terminal.
+                for attachment in crate::attachment::attachments_of(&prompt.blocks) {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&shell_quote(&attachment.display_path()));
+                }
+                text
+            }
             _ => {
                 return Err(DriverError::CapabilityUnsupported(
                     "shell-pty only accepts prompt input as typed bytes".into(),
@@ -576,6 +588,12 @@ fn prompt_writes(text: &str, promoted: bool) -> (Vec<u8>, Option<Vec<u8>>) {
     (bytes, Some(vec![b'\r']))
 }
 
+/// Single-quote a path for a POSIX shell, closing and reopening the quote
+/// around any embedded single quote.
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,5 +630,20 @@ mod tests {
         let (body, submit) = prompt_writes("hello\n", true);
         assert_eq!(body, b"hello".to_vec(), "the terminator becomes the submit");
         assert_eq!(submit, Some(b"\r".to_vec()));
+    }
+
+    #[test]
+    fn paths_are_quoted_for_a_posix_shell() {
+        assert_eq!(shell_quote("/data/shot.png"), "'/data/shot.png'");
+        assert_eq!(
+            shell_quote("/data/a b/shot.png"),
+            "'/data/a b/shot.png'",
+            "a space must not split the argument"
+        );
+        assert_eq!(
+            shell_quote("/data/it's.png"),
+            "'/data/it'\\''s.png'",
+            "an embedded quote must not end the quoting"
+        );
     }
 }

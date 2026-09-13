@@ -429,9 +429,13 @@ impl Driver for NativeAdapter {
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
         Box::pin(async move {
             match request {
-                DriverRequest::Send { prompt, origin } => {
+                DriverRequest::Send {
+                    prompt,
+                    attachments,
+                    origin,
+                } => {
                     self.native
-                        .send(prompt_input(prompt, origin))
+                        .send(prompt_input(prompt, &attachments, origin))
                         .await
                         .map_err(map_driver_error)?;
                 }
@@ -508,10 +512,52 @@ impl Driver for NativeAdapter {
     }
 }
 
-fn prompt_input(prompt: String, origin: InputOrigin) -> DriverInput {
+/// Build the driver-facing prompt.
+///
+/// Each materialized attachment contributes an `image` [`MediaBlock`] naming
+/// the Hub object, immediately followed by a `resource` block carrying the
+/// local `file://` path. The split is deliberate: `MediaBlock` has no path
+/// field, and a driver that can inline bytes (claude-print) needs the path to
+/// read them while a driver that can only mention a path (the PTY family)
+/// needs the same path as text. The text block stays last so the prompt reads
+/// naturally after the attachments.
+fn prompt_input(
+    prompt: String,
+    attachments: &[crate::attachments::MaterializedAttachment],
+    origin: InputOrigin,
+) -> DriverInput {
+    let mut blocks = Vec::with_capacity(attachments.len() * 2 + 1);
+    for attachment in attachments {
+        let object_id = remuda_protocol::Id::try_from(attachment.object_id.clone());
+        let Ok(object_id) = object_id else {
+            // An id the protocol will not brand cannot be referenced; the
+            // resource block below still carries the usable local path.
+            tracing::warn!(object_id = %attachment.object_id, "attachment id is not a protocol Id");
+            continue;
+        };
+        blocks.push(ContentBlock::Image(Box::new(remuda_protocol::MediaBlock {
+            object_id: object_id.clone(),
+            media_type: attachment.media_type.clone(),
+            name: attachment
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+        })));
+        blocks.push(ContentBlock::Resource(Box::new(
+            remuda_protocol::ResourceBlock {
+                uri: format!("file://{}", attachment.path.display()),
+                media_type: remuda_protocol::Knowledge::Known {
+                    value: attachment.media_type.clone(),
+                },
+                object_id: Some(object_id),
+            },
+        )));
+    }
+    blocks.push(ContentBlock::Text(Box::new(TextBlock { text: prompt })));
     DriverInput::Prompt(Box::new(PromptInput {
         mode: PromptMode::NewTurn,
-        blocks: vec![ContentBlock::Text(Box::new(TextBlock { text: prompt }))],
+        blocks,
         origin,
         native_client_message_id: uuid::Uuid::now_v7().to_string(),
     }))
@@ -1010,10 +1056,56 @@ mod tests {
     #[test]
     fn native_prompt_preserves_each_submitting_origin() {
         for origin in [InputOrigin::Human, InputOrigin::Bot, InputOrigin::Agent] {
-            let DriverInput::Prompt(prompt) = prompt_input("new input".into(), origin) else {
+            let DriverInput::Prompt(prompt) = prompt_input("new input".into(), &[], origin) else {
                 panic!("prompt expected")
             };
             assert_eq!(prompt.origin, origin);
+            assert_eq!(prompt.blocks.len(), 1, "a text-only send carries one block");
+        }
+    }
+
+    /// D-027: each attachment contributes an image block naming the Hub object
+    /// plus a resource block carrying the local path, and the text stays last.
+    #[test]
+    fn attachments_become_image_and_resource_blocks_before_the_text() {
+        let attachment = crate::attachments::MaterializedAttachment {
+            object_id: remuda_protocol::Id::new("obj").expect("id").to_string(),
+            media_type: "image/png".into(),
+            path: PathBuf::from("/tmp/remuda-node-test/attachments/shot.png"),
+            byte_len: 64,
+        };
+        let DriverInput::Prompt(prompt) = prompt_input(
+            "what colour?".into(),
+            std::slice::from_ref(&attachment),
+            InputOrigin::Human,
+        ) else {
+            panic!("prompt expected")
+        };
+        assert_eq!(prompt.blocks.len(), 3);
+        match &prompt.blocks[0] {
+            ContentBlock::Image(media) => {
+                assert_eq!(media.object_id.to_string(), attachment.object_id);
+                assert_eq!(media.media_type, "image/png");
+                assert_eq!(media.name.as_deref(), Some("shot.png"));
+            }
+            other => panic!("expected an image block, got {other:?}"),
+        }
+        match &prompt.blocks[1] {
+            ContentBlock::Resource(resource) => {
+                assert_eq!(
+                    resource.uri, "file:///tmp/remuda-node-test/attachments/shot.png",
+                    "a driver that can only mention a path needs it verbatim"
+                );
+                assert_eq!(
+                    resource.object_id.as_ref().map(ToString::to_string),
+                    Some(attachment.object_id.clone())
+                );
+            }
+            other => panic!("expected a resource block, got {other:?}"),
+        }
+        match &prompt.blocks[2] {
+            ContentBlock::Text(text) => assert_eq!(text.text, "what colour?"),
+            other => panic!("expected the text last, got {other:?}"),
         }
     }
 

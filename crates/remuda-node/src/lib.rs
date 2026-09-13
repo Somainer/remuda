@@ -1,5 +1,6 @@
 //! Node instance management and outbound Hub connection.
 
+mod attachments;
 mod carrier;
 mod config;
 #[cfg(unix)]
@@ -30,6 +31,11 @@ mod workspace;
 mod workspace_access;
 mod worktree;
 
+pub use attachments::{
+    HubObjectSource, MaterializedAttachment, ObjectSource, attachments_dir,
+    cleanup as cleanup_attachments, materialize as materialize_attachments,
+    sweep_orphans as sweep_attachment_orphans,
+};
 pub use carrier::{
     AuthState, CarrierFuture, CarrierKind, CliInventory, HerdrInventory, HostInventory,
     HostInventoryConfig, HubCarrier, NodeHello, NodeHelloParams, NodeHelloProtocol,

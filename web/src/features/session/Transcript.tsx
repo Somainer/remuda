@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import type { Observation } from "../../types/observation";
 import { MarkdownText } from "../../components/MarkdownText";
 import type { LocalBubble } from "../../lib/store";
+import { SentAttachments } from "./AttachmentChips";
 import { hubStore } from "../../lib/store";
 import ui from "../../styles/ui.module.css";
 import { assembleTranscript, compactTranscript, type TranscriptNode } from "./assemble";
@@ -248,6 +249,9 @@ function renderNode(
           {node.local ? ` · ${node.local.state}` : ""}
         </div>
         {node.role === "assistant" ? <MarkdownText text={node.text} /> : <p className={session.bubble}>{node.text}</p>}
+        {node.local?.attachments?.length ? (
+          <SentAttachments attachments={node.local.attachments} />
+        ) : null}
         {node.local?.state === "queued" ? (
           <button className={ui.chip} onClick={() => hubStore.retract(node.local!.id)}>
             撤回

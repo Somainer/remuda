@@ -223,6 +223,22 @@ enum Control {
     Shutdown,
 }
 
+/// Give the runtime a Hub object source built from the dial URL and the
+/// current host token (D-027). A Node that cannot derive one still runs; it
+/// refuses sends that carry attachments rather than dropping the images.
+fn attach_object_source(runtime: Option<&runtime_wss::RuntimeLink>, ws_url: &str, token: &str) {
+    let Some(link) = runtime else {
+        return;
+    };
+    match crate::attachments::HubObjectSource::from_ws_url(ws_url, token) {
+        Ok(source) => link.node.set_object_source(Arc::new(source)),
+        Err(error) => tracing::warn!(
+            %error,
+            "Node cannot derive a Hub object URL; sends with attachments will be refused"
+        ),
+    }
+}
+
 enum TtyWire {
     Json(Value),
     Binary(Vec<u8>),
@@ -635,6 +651,11 @@ async fn session_task(
         token = new_token.to_owned();
         config.token = token.clone();
     }
+    // D-027: now that the durable host token is known — it is minted by this
+    // very hello on first enroll — point the runtime at the Hub's object
+    // store. The same credential authenticates this socket and
+    // `GET /v1/objects/{id}`, so no second secret is introduced.
+    attach_object_source(runtime.as_ref(), &config.url, &token);
     let mut connection_id = hello
         .get("connectionId")
         .and_then(Value::as_str)
@@ -1055,6 +1076,7 @@ async fn reconnect(
                             *token = new_token.to_owned();
                             config.token = token.clone();
                         }
+                        attach_object_source(runtime.as_ref().copied(), &config.url, token);
                         *connection_id = hello
                             .get("connectionId")
                             .and_then(Value::as_str)

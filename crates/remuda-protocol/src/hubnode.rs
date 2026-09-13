@@ -378,6 +378,26 @@ pub struct InstanceCreateParams {
     pub workspace_id: Option<String>,
 }
 
+/// One staged attachment referenced by an `instance.send` command (D-027).
+///
+/// Metadata only. The bytes live behind `GET /v1/objects/{objectId}` on the
+/// Hub and are pulled by the Node before dispatch, because a command frame is
+/// capped at 1 MiB and the prompt itself at 64 KiB.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRef {
+    /// Hub object identity (`obj_…`).
+    pub object_id: String,
+    /// Sniffed media type (`image/png`, `image/jpeg`, `image/gif`, `image/webp`).
+    pub media_type: String,
+    /// Display name for the UI. Never used to build a local path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Stored byte length, for local budget checks before the pull.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
 /// `instance.send` params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -396,6 +416,10 @@ pub struct InstanceSendParams {
     /// Flattened prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Staged attachment metadata (D-027). Additive: an older Node that does
+    /// not know this field simply degrades the send to text-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
 }
 
 /// `instance.cancel` params.
@@ -823,6 +847,20 @@ impl InstanceSendParams {
             })
             .or(self.prompt.as_deref())
     }
+
+    /// Staged attachments from the flattened field or an `input.attachments`
+    /// wrapper, whichever the caller used.
+    #[must_use]
+    pub fn attachments(&self) -> Vec<AttachmentRef> {
+        if !self.attachments.is_empty() {
+            return self.attachments.clone();
+        }
+        self.input
+            .as_ref()
+            .and_then(|input| input.get("attachments"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// Decode a v1 binary tty/object envelope.
@@ -929,6 +967,53 @@ mod tests {
         assert_eq!(value["jsonrpc"], "2.0");
         let decoded = HubNodeRequest::from_value(&value).expect("de");
         assert_eq!(decoded.method_kind(), Some(HubNodeMethod::NodeHello));
+    }
+
+    /// D-027: the field is additive, so a legacy frame with no `attachments`
+    /// decodes cleanly and reports none.
+    #[test]
+    fn send_params_without_attachments_decode_as_text_only() {
+        let params: InstanceSendParams =
+            serde_json::from_value(json!({"instanceId":"ins_1", "prompt":"hi"})).expect("de");
+        assert!(params.attachments().is_empty());
+        assert_eq!(params.prompt_text(), Some("hi"));
+        // An empty list must not appear on the wire either.
+        let value = serde_json::to_value(&params).expect("ser");
+        assert!(value.get("attachments").is_none());
+    }
+
+    /// Attachment metadata survives a round trip and is also accepted inside
+    /// the `input` wrapper, matching how `prompt_text` reads both shapes.
+    #[test]
+    fn send_params_carry_attachment_metadata() {
+        let flat: InstanceSendParams = serde_json::from_value(json!({
+            "instanceId": "ins_1",
+            "prompt": "what colour is this?",
+            "attachments": [{
+                "objectId": "obj_1",
+                "mediaType": "image/png",
+                "name": "shot.png",
+                "size": 1234,
+            }],
+        }))
+        .expect("de");
+        let refs = flat.attachments();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].object_id, "obj_1");
+        assert_eq!(refs[0].media_type, "image/png");
+        assert_eq!(refs[0].size, Some(1234));
+        assert_eq!(
+            serde_json::to_value(&flat).expect("ser")["attachments"][0]["objectId"],
+            "obj_1"
+        );
+
+        let wrapped: InstanceSendParams = serde_json::from_value(json!({
+            "instanceId": "ins_1",
+            "input": {"text":"hi", "attachments":[{"objectId":"obj_2", "mediaType":"image/jpeg"}]},
+        }))
+        .expect("de");
+        assert_eq!(wrapped.attachments()[0].object_id, "obj_2");
+        assert_eq!(wrapped.attachments()[0].name, None);
     }
 
     #[test]

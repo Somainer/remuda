@@ -167,7 +167,7 @@ Hub 侧 24 h TTL，MVP 采**惰性删除**（读到 `expires_at < now` 即 404�
 
 ## 8 未决问题
 
-1. **（阻塞 MVP）Node 是否持有可用的 Hub HTTP base URL + token**——WSS-only 部署下 enroll 是否持久化了这些。若没有，MVP 第 2 项必须换成 channel 2 `ObjectChunk`，+2~3 天，MVP 破 5 天。**开工前第一件事验证。**
+1. ~~**（阻塞 MVP）Node 是否持有可用的 Hub HTTP base URL + token**~~ —— **已验证解决（2026-09-13，x-clip）。结论：持有，走 §5.1 的 HTTP 回拉主路径，不需要 channel 2 fallback。** 见下 §8.1 验证记录与 [decisions.md](./decisions.md) D-027。
 2. Claude CLI 把 `source.type:"file"` 降级为文本——称已实测，未在本仓库留下证据。
 3. CLI 单图 512 KB 内部重压阈值的确切语义与 API 侧真实上限。
 4. Claude Read tool 对 png/jpg/gif/webp 转 image block——称已验证，未复核。
@@ -178,3 +178,33 @@ Hub 侧 24 h TTL，MVP 采**惰性删除**（读到 `expires_at < now` 即 404�
 9. `purpose: input|settings|answer` 仅在 protocol.md 有描述、无代码语义；MVP 硬编码 `input`。
 10. 对象绑定单 instance 还是账号内可复用（跨会话转发）；远端 pasteboard 覆盖 Node 宿主用户剪贴板是否默认开启；图片是否永久进 journal（与 GC/配额冲突）——三项需在 v2 前定。
 11. 本文引用的 `docs/design/protocol.md` 行号与部分 driver 行号未逐条复核；已复核项见 §2 表格中标 VERIFIED 者。
+
+### 8.1 验证记录（2026-09-13，x-clip，开工第一件事）
+
+**问题**：WSS-only 部署下 Node 是否持有可用的 Hub HTTP base URL + token，足以 `GET /v1/objects/{id}` 回拉附件字节。
+
+**结论：持有。MVP 按 §5.1 原样实施 HTTP 回拉，不改用 channel 2 `ObjectChunk`。**
+
+证据（均为本仓库源码复核，VERIFIED）：
+
+| 事实 | 位置 |
+|---|---|
+| `WssConfig.url` 就是 Hub 的 `ws(s)://<authority>/v1/node`，`WssConfig.token` 是持久 host token | `crates/remuda-node/src/transport/wss.rs:52-56` |
+| 生产 Node 从 `config.node.hub_url` 与 `<data_dir>/node/host-token` 填这两个字段；daemon 同理（崩溃后优先用持久 host token，不用已消费的 enroll token） | `crates/remuda/src/cmd/node.rs:188-198`、`crates/remuda/src/cmd/node/daemon.rs:103-130` |
+| `remuda dev` 的进程内 Node 走 `WssConfig::loopback(hub_addr, node_token, host_id)`，同样两者齐备 | `crates/remuda/src/cmd/dev.rs:165` |
+| host token 经 `node.hello` 由 Hub 回发并落盘 `0600` | `crates/remuda-node/src/enroll.rs:107-133`、`transport/wss.rs`（`nodeToken`） |
+| **Hub 已经用同一个 token 认证 WS 握手**：`presented_token(headers)` 读 `Authorization: Bearer` → `Store::authenticate_host` 按 `token_prefix` 索引 + Argon2 校验 | `crates/remuda-hub/src/ws.rs:161`、`crates/remuda-hub/src/store.rs:616-660` |
+| ws→http 的 scheme 换算已有现成先例 | `crates/remuda-node/src/carrier.rs:73-84` |
+
+因此缺的不是凭据也不是地址，只是两段管道：
+
+1. Hub 侧一个 HTTP 版的 `require_host` 提取器——复用 `presented_token` + `Store::authenticate_host` 的同一条查询，不新增凭据种类、不新增信任边界；
+2. Node 侧一个 HTTP 客户端（`reqwest`，已在 workspace lock 内，`remuda-hub-client` / `remuda-feishu` 已依赖）。
+
+两项合计远小于 channel 2 的 +2~3 天，§7 的 5 人日预算不变。
+
+**代价与边界**（记录以便 v2 复查）：
+
+- Node 必须能对 Hub 发起**出站 HTTPS**，而不只是出站 WSS。D-020 的部署形态（Node 主动出站连公网/内网 Hub）本就要求出站 HTTPS，所以这不是新增网络要求；但若将来出现「只开 WSS 端口、HTTP 被策略拦截」的部署，回退路径仍然是 v2 的 channel 2 `ObjectChunk`（§7 v2 ①），届时 Node 侧 materialize 接口保持不变，只换取字节的来源。
+- `GET /v1/objects/{id}` 对 host 凭据放行，等于让 host token 多了一个读权限。因此该路由对 host 调用方做双重绑定：对象必须绑定在某个 instance 上，且该 instance 的 `host_id` 必须等于认证出来的 host——一台 Node 读不到别台 Node 的附件。
+

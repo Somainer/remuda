@@ -15,7 +15,9 @@ describe("Composer shortcuts", () => {
     await user.keyboard("{Enter}");
     expect(onSend).not.toHaveBeenCalled();
     await user.keyboard("{Meta>}{Enter}{/Meta}");
-    expect(onSend).toHaveBeenCalledWith("hello");
+    // The shortcut is what this asserts; a send now also carries its (empty)
+    // attachment lists.
+    expect(onSend.mock.calls[0][0]).toBe("hello");
   });
 
   it("does not send Cmd+Enter on mobile", async () => {

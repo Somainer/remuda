@@ -36,6 +36,7 @@ import {
 } from "./mock";
 import { digestPlaceholder, id, now } from "./ids";
 import { parseScreenBody, type ScreenRead } from "./screen";
+import type { AttachmentRef } from "./attachments";
 import { HubHttpError } from "./httpError";
 import { readSession, type DeviceSession, type PairCode, type PairedDevice } from "./session";
 import { coerceObservation, coerceObservationList } from "./hubJournal";
@@ -384,7 +385,9 @@ export type HubApi = {
   instanceList(q?: { hostId?: string; workspaceId?: string; kind?: string }): Promise<Page<Instance>>;
   instanceGet(instanceId: Id): Promise<Instance>;
   instanceCreate(spec: InstanceCreateSpec): Promise<{ command: CommandResult["command"]; instance: Instance }>;
-  instanceSend(instanceId: Id, prompt: string): Promise<CommandResult>;
+  instanceSend(instanceId: Id, prompt: string, attachments?: AttachmentRef[]): Promise<CommandResult>;
+  /** Stage one image for a later send (D-027). Returns its `obj_…` id. */
+  objectUpload(instanceId: Id, blob: Blob, mediaType: string): Promise<{ objectId: string; size: number }>;
   instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
   fleetBroadcast(body: FleetBroadcastBody): Promise<FleetBroadcastResult>;
   worktreeList(hostId?: string): Promise<WorktreePage>;
@@ -600,6 +603,12 @@ function createMockApi(): HubApi {
     },
     async instanceSend(instanceId, prompt) {
       return mockSend(instanceId, prompt);
+    },
+    async objectUpload(_instanceId, blob, mediaType) {
+      // The mock Hub stages nothing; a deterministic id keeps the composer
+      // exercisable offline.
+      void mediaType;
+      return { objectId: id("obj_"), size: blob.size };
     },
     async instanceKeys(instanceId, key) {
       return mockKeys(instanceId, key);
@@ -950,8 +959,42 @@ function createLiveApi(): HubApi {
       titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
       return { instance, command: mapCommand(created.command, instance.id) };
     },
-    async instanceSend(instanceId, prompt) {
-      return command(instanceId, "instance.send", { prompt });
+    async instanceSend(instanceId, prompt, attachments) {
+      const payload = attachments?.length ? { prompt, attachments } : { prompt };
+      return command(instanceId, "instance.send", payload);
+    },
+    async objectUpload(instanceId, blob, mediaType) {
+      // Raw body plus Content-Type: no multipart, and the bytes never pass
+      // through JSON. `rest` always sends application/json, so this posts
+      // directly.
+      const session = readSession();
+      const res = await fetch(
+        `${hubBase()}/v1/objects?instanceId=${encodeURIComponent(instanceId)}`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "content-type": mediaType,
+            ...(session ? { "X-Remuda-Device-Id": session.deviceId } : {}),
+          },
+          body: blob,
+        },
+      );
+      if (!res.ok) {
+        const text = await res.text();
+        let code = `HTTP_${res.status}`;
+        let message = text || `HTTP ${res.status}`;
+        try {
+          const body = JSON.parse(text) as { code?: string; error?: string };
+          if (body.code) code = body.code;
+          if (body.error) message = body.error;
+        } catch {
+          /* raw */
+        }
+        throw new HubHttpError(res.status, code, message, []);
+      }
+      const body = (await res.json()) as { objectId: string; size: number };
+      return { objectId: body.objectId, size: body.size };
     },
     async instanceKeys(instanceId, key) {
       return command(instanceId, "tty.write", { keys: [key], source: "ui" });

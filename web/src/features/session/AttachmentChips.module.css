@@ -1,0 +1,86 @@
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  max-width: 220px;
+}
+
+.chip[data-state="failed"] {
+  border-color: var(--danger, #d46a6a);
+}
+
+.thumb {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex: none;
+}
+
+.meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.name {
+  font-size: 12px;
+  color: var(--paper);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.chip[data-state="failed"] .status {
+  color: var(--danger, #d46a6a);
+}
+
+.remove {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px;
+  border-radius: 4px;
+}
+
+.remove:hover {
+  color: var(--paper);
+}
+
+/* Thumbnails under a sent message bubble. */
+.sent {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.sentThumb {
+  width: 96px;
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  display: block;
+}

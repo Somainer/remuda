@@ -346,10 +346,19 @@ pub async fn restrict_agent_routes(
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, HubError> {
     let path = request.uri().path();
-    if !matches!(
-        path,
-        "/v1/node" | "/node/v1/connect" | "/v1/login" | "/v1/devices/pair" | "/healthz"
-    ) && auth::presented_token(request.headers()).is_some()
+    // D-027: a Node pulls `GET /v1/objects/{id}` with its *host* token, which
+    // is not a device and would fail `caller` here with 401 before the handler
+    // ever runs. The handler authorizes that route itself, and its device
+    // branch is strictly stronger than this one (operator only, so Agent
+    // origin is refused there too), so skipping it loses no check.
+    let node_object_read =
+        request.method() == axum::http::Method::GET && path.starts_with("/v1/objects/");
+    if !node_object_read
+        && !matches!(
+            path,
+            "/v1/node" | "/node/v1/connect" | "/v1/login" | "/v1/devices/pair" | "/healthz"
+        )
+        && auth::presented_token(request.headers()).is_some()
     {
         let device = caller(&state, request.headers()).await?;
         if origin(&device) == InputOrigin::Agent {

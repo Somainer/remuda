@@ -124,10 +124,14 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
         data_dir: Some(config.data_dir.clone()),
         listeners: Vec::new(),
     })?;
-    Ok(match &config.drivers {
+    let node = match &config.drivers {
         LocalDrivers::Native(native) => node.with_herdr_config(native.clone())?,
         LocalDrivers::Fake => node,
-    })
+    };
+    // D-027: attachments materialize under the Node data dir regardless of
+    // which driver family is composed.
+    node.set_attachment_root(config.data_dir.clone());
+    Ok(node)
 }
 
 /// Bind and spawn a durable local Node service.

@@ -5,6 +5,7 @@ import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
+import type { AttachmentRef } from "./attachments";
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import { api, observationText, type InstanceCreateSpec, type PtyKey, type WorktreeCreateSpec } from "./api";
 import {
@@ -42,7 +43,15 @@ export type LocalBubble = {
   commandId: Id;
   state: Command["state"] | "unknown";
   createdAt: string;
+  /**
+   * Thumbnails for images sent with this message (D-027). Held locally
+   * because the Hub does not echo attachments back onto the journal yet.
+   */
+  attachments?: BubbleAttachment[];
 };
+
+/** One image shown under a sent bubble. */
+export type BubbleAttachment = { objectId: string; name: string; previewUrl: string };
 
 const COMPACT_KEY = "runtime.compact";
 
@@ -414,19 +423,20 @@ class HubStore {
     return this.state.instances.find((i) => i.id === result.instance.id) ?? result.instance;
   }
 
-  async send(instanceId: Id, prompt: string) {
+  async send(instanceId: Id, prompt: string, attachments: AttachmentRef[] = [], previews: BubbleAttachment[] = []) {
     const localId = id("local_");
     const bubble: LocalBubble = {
       id: localId,
       instanceId,
       text: prompt,
+      ...(previews.length ? { attachments: previews } : {}),
       commandId: localId,
       state: "queued",
       createdAt: now(),
     };
     this.emit({ bubbles: this.state.bubbles.concat(bubble) });
     try {
-      const result = await api.instanceSend(instanceId, prompt);
+      const result = await api.instanceSend(instanceId, prompt, attachments);
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
           b.id === localId ? { ...b, state: result.command.state, commandId: result.command.commandId } : b,

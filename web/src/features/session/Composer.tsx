@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from
 import { readDraft, writeDraft } from "../../lib/drafts";
 import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
+import { AttachButtons, AttachmentChips } from "./AttachmentChips";
 import { EffortSlider } from "./EffortSlider";
 import {
   effortCaps,
@@ -12,6 +13,8 @@ import {
   type EffortKind,
   type EffortSelection,
 } from "./effort";
+import { useAttachments } from "./useAttachments";
+import type { AttachmentRef, Attachment } from "../../lib/attachments";
 import css from "./session.module.css";
 
 type MenuId = "effort" | "permission" | null;
@@ -38,7 +41,7 @@ export function Composer({
   mobile: boolean;
   disabled?: boolean;
   sending?: boolean;
-  onSend: (text: string) => Promise<void> | void;
+  onSend: (text: string, attachments?: AttachmentRef[], staged?: Attachment[]) => Promise<void> | void;
   permissionMode?: string;
   onPermission?: (mode: string) => void;
   kind?: EffortKind | string;
@@ -55,6 +58,7 @@ export function Composer({
   const [menu, setMenu] = useState<MenuId>(null);
   const [placement, setPlacement] = useState<Placement>("down");
   const rootRef = useRef<HTMLFormElement>(null);
+  const images = useAttachments(instanceId);
   const barRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   // The harness is fixed for the life of a session; it is chosen on New Session.
@@ -71,10 +75,19 @@ export function Composer({
 
   const submit = async () => {
     const value = text.trim();
-    if (!value || disabled || sending) return;
+    // An image on its own is a legitimate message, so an empty box is only a
+    // blocker when there is nothing attached either.
+    if ((!value && images.attachments.length === 0) || disabled || sending) return;
+    // Never send while an upload is still in flight: the reference would not
+    // resolve on the Hub yet.
+    if (images.uploading) return;
+    const refs = images.refs();
+    const staged = images.attachments;
     writeDraft(instanceId, "");
     setText("");
-    await onSend(value);
+    // Hand the chips to the sent bubble, which takes over their preview URLs.
+    images.handOff();
+    await onSend(value, refs, staged);
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -137,7 +150,30 @@ export function Composer({
         void submit();
       }}
     >
-      <div className={css.composer}>
+      <AttachmentChips
+        attachments={images.attachments}
+        onRemove={images.remove}
+        onRetry={images.retry}
+      />
+      {images.notice ? (
+        <div className={css.attachNotice} data-testid="attachment-notice">
+          {images.notice}
+        </div>
+      ) : null}
+      <div
+        className={css.composer}
+        onDragOver={(event) => {
+          if (Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
+        }}
+        onDrop={(event) => {
+          const dropped = Array.from(event.dataTransfer.files).filter((file) =>
+            file.type.startsWith("image/"),
+          );
+          if (dropped.length === 0) return;
+          event.preventDefault();
+          images.add(dropped);
+        }}
+      >
         <textarea
           className={css.input}
           data-testid="composer-input"
@@ -148,6 +184,11 @@ export function Composer({
             setText(e.target.value);
             writeDraft(instanceId, e.target.value);
           }}
+          onPaste={(event) => {
+            // Only swallow the paste when an image was actually taken:
+            // otherwise plain-text pasting and the iOS caret both break.
+            if (images.onPaste(event.clipboardData)) event.preventDefault();
+          }}
           onKeyDown={onKeyDown}
         />
         {mobile ? (
@@ -156,7 +197,7 @@ export function Composer({
             className={css.sendIcon}
             data-testid="composer-send"
             aria-label="送出"
-            disabled={disabled || sending || !text.trim()}
+            disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
             onClick={() => void submit()}
           >
             ↑
@@ -164,6 +205,13 @@ export function Composer({
         ) : null}
       </div>
       <div className={css.controlBar} ref={barRef} data-testid="composer-bar">
+        <AttachButtons
+          className={css.chip}
+          disabled={disabled}
+          mobile={mobile}
+          onFiles={images.add}
+          onPasteClick={() => void images.pasteFromClipboard()}
+        />
         {caps.harness ? (
           <span className={css.chip} data-testid="harness-chip" data-readonly="1">
             <span className={css.chipMark}>{harnessChip.mark}</span>
@@ -220,7 +268,7 @@ export function Composer({
         ) : null}
         <span className={css.barSpacer} />
         {mobile ? null : (
-          <button type="button" className={css.send} data-testid="composer-send" disabled={disabled || sending || !text.trim()} onClick={() => void submit()}>
+          <button type="button" className={css.send} data-testid="composer-send" disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)} onClick={() => void submit()}>
             {sending ? "发送中" : "送出"}
           </button>
         )}

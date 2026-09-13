@@ -253,14 +253,24 @@ async fn fake_node(
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
                 append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
-                append_n = append_journal(
-                    &mut ws,
-                    &instance_id,
-                    append_n,
-                    "assistant",
-                    &format!("echo: {prompt}"),
-                )
-                .await?;
+                // D-027: echo the attachment metadata the Hub resolved, so the
+                // e2e can prove staging reached the Node without a real agent.
+                let attachments = params
+                    .get("attachments")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|item| item.get("mediaType").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let reply = if attachments.is_empty() {
+                    format!("echo: {prompt}")
+                } else {
+                    format!("echo: {prompt} [attachments: {}]", attachments.join(","))
+                };
+                append_n =
+                    append_journal(&mut ws, &instance_id, append_n, "assistant", &reply).await?;
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
             "instance.close" | "instance.cancel" | "instance.resume" => {

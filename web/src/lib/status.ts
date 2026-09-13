@@ -20,7 +20,23 @@ export function projectStatus(instance: Instance): UiStatus {
   return "unknown";
 }
 
+/**
+ * A promoted terminal: a `shell-pty` instance whose PTY foreground is a known
+ * agent CLI (D-025). Its driver is unchanged; what changes is that the session
+ * has a real transcript and takes prompts.
+ */
+export function isPromoted(instance: Instance): boolean {
+  return instance.mode === "promoted" && instance.kind !== "terminal";
+}
+
+/**
+ * Render as a raw screen rather than a transcript.
+ *
+ * PTY-carried sessions have no structured conversation — except a promoted one,
+ * which hydrates the native transcript and therefore renders like an agent.
+ */
 export function isGenericPty(instance: Instance): boolean {
+  if (isPromoted(instance)) return false;
   return (
     instance.driver === "generic-pty" ||
     instance.driver === "shell-pty" ||

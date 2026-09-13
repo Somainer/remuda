@@ -20,6 +20,7 @@ export type Activity = "idle" | "working" | "waiting-interaction" | "draining";
 export type Connectivity = "connected" | "disconnected" | "reconciling";
 export type Ownership = "managed" | "adopted-control" | "observed-only";
 export type UiMode = "structured-only" | "tty-attachable";
+export type InstanceMode = "native" | "promoted";
 
 export type Instance = EntityMeta & {
   hostId: Id;
@@ -52,6 +53,10 @@ export type Instance = EntityMeta & {
   model?: string | null;
   effortName?: string | null;
   effortIndex?: number | null;
+  /** How this instance reached its `kind`; `promoted` = a terminal that an agent CLI took over (D-025). */
+  mode?: InstanceMode | null;
+  /** When the promotion happened. Only set while `mode` is `promoted`. */
+  promotedAt?: string | null;
 };
 
 export type HostTransport = "outbound-wss" | "ssh-dev";

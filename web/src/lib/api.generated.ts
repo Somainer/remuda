@@ -855,10 +855,17 @@ export interface components {
              * @enum {string}
              */
             lifecycle: "requested" | "starting" | "running" | "closing" | "exited" | "failed";
+            /**
+             * @description How this instance reached its kind. "promoted" means a terminal instance had a known agent CLI take over its PTY foreground (D-025); the driver stays shell-pty.
+             * @enum {string|null}
+             */
+            mode?: "native" | "promoted" | null;
             model?: string | null;
             name?: string | null;
             /** @description Immutable creator instance, recorded by the Hub from authenticated identity. */
             readonly parentInstanceId?: string | null;
+            /** @description When the terminal was promoted. Absent unless mode is "promoted". */
+            promotedAt?: string | null;
             providerProfileId?: string | null;
             providerSource?: string | null;
             providerSourceHint?: string | null;

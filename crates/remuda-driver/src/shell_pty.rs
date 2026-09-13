@@ -734,6 +734,53 @@ mod tests {
         assert_eq!(submit, Some(b"\r".to_vec()));
     }
 
+    #[tokio::test]
+    async fn a_driver_without_hooks_configured_starts_nothing() {
+        // P1 default: a Node that has not set REMUDA_PTY_HOOKS behaves exactly
+        // as it did before — no socket, no overlay, no shim.
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+        let driver = ShellPtyDriver::new(options);
+        driver.spawn().await.expect("spawns");
+        assert!(driver.hook_session().await.is_none());
+        assert!(
+            !dir.path().join("hook.sock").exists(),
+            "no hook path was configured, so none should exist"
+        );
+        let _ = Driver::close(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn a_configured_hook_path_binds_a_socket_the_child_can_reach() {
+        // The seam P2 and P3 read the native session through. Exercised here so
+        // the wiring cannot rot while it has no production caller yet.
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join("instance");
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        let driver = ShellPtyDriver::new(options);
+        driver.spawn().await.expect("spawns");
+        assert!(
+            instance_dir.join("hook.sock").exists(),
+            "socket is listening"
+        );
+        assert!(instance_dir.join("launch/settings.json").is_file());
+        assert!(instance_dir.join("launch/bin/claude").is_file());
+        // Nothing has reported a session yet.
+        assert!(driver.hook_session().await.is_none());
+        let _ = Driver::close(&driver).await;
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "close must unbind the socket"
+        );
+    }
+
     #[test]
     fn paths_are_quoted_for_a_posix_shell() {
         assert_eq!(shell_quote("/data/shot.png"), "'/data/shot.png'");

@@ -147,10 +147,14 @@ mod tests {
         session: Option<&str>,
         related: &[(&str, &str)],
     ) -> Observation {
-        let unknown = || Knowledge::Unknown {
-            reason: "not-emitted".into(),
-            evidence_event_ids: Vec::new(),
-        };
+        // Generic, not a closure: inference would otherwise pin it to whichever
+        // `Knowledge<T>` it is first used at.
+        fn unknown<T>() -> Knowledge<T> {
+            Knowledge::Unknown {
+                reason: "not-emitted".into(),
+                evidence_event_ids: Vec::new(),
+            }
+        }
         Observation {
             schema_version: SchemaVersion,
             event_id: EventId::new(),

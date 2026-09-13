@@ -49,6 +49,7 @@ export function buildBroadcastBody(form: BroadcastForm): { body: FleetBroadcastB
     return {
       body: {
         all: true,
+        confirm: false,
         ...filters,
         operation: "instance.send",
         payload: {
@@ -61,6 +62,7 @@ export function buildBroadcastBody(form: BroadcastForm): { body: FleetBroadcastB
   return {
     body: {
       all: true,
+      confirm: false,
       ...filters,
       operation: "tty.write",
       payload: { keys: [form.key], dataBase64: base64(KEY_BYTES[form.key]), source: "ui" },

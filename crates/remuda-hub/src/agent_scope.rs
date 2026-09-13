@@ -261,6 +261,25 @@ async fn mint_token(
     ))
 }
 
+impl crate::RunningHub {
+    /// Mint a Bot device credential for an in-process dispatcher (D-017/D-018).
+    pub async fn mint_bot_device_token(&self, device_name: &str) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let token = crate::config::random_token();
+        let hash = auth::hash_secret(&token)?;
+        let prefix = auth::token_prefix(&token)
+            .ok_or_else(|| anyhow::anyhow!("generated device token is not indexable"))?
+            .to_owned();
+        store
+            .insert_device_as(device_name.into(), hash, prefix, "bot".into(), None)
+            .await?;
+        Ok(token)
+    }
+}
+
 pub async fn instance_token(
     store: crate::store::Store,
     instance_id: String,

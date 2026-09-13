@@ -40,6 +40,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .submit_command(
                     &instance_id,
                     InstanceCommandRequest {
+                        origin: crate::origin::wire_origin(&params),
                         command_id: command_id_of(&params),
                         operation: CommandAction::Configure,
                         prompt: None,

@@ -174,8 +174,10 @@ mod tests {
             wire_origin(&json!({"input":{"origin":"human"}, "spec":{"origin":"human"}})),
             InputOrigin::Agent
         );
-        let unknown: crate::CreateInstanceRequest =
-            serde_json::from_value(json!({"origin":"future"})).unwrap();
-        assert_eq!(unknown.origin, InputOrigin::Agent);
+        for params in [json!({}), json!({"origin":"future"})] {
+            let unknown: crate::CreateInstanceRequest = serde_json::from_value(params).unwrap();
+            assert_eq!(unknown.origin, InputOrigin::Agent);
+            assert_eq!(unknown.permission_mode, "manual");
+        }
     }
 }

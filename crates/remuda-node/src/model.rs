@@ -35,7 +35,7 @@ fn default_profile() -> String {
 }
 
 fn default_permission() -> String {
-    "dontAsk".to_owned()
+    "manual".to_owned()
 }
 
 /// Body accepted by `POST /v1/instances` and the local JSON-RPC `instance.create` bridge.
@@ -81,7 +81,7 @@ pub struct CreateInstanceRequest {
     /// Provider profile label used to construct the native launch profile.
     #[serde(default = "default_profile")]
     pub provider_profile_id: String,
-    /// Development permission label; the fake driver performs no tools.
+    /// Permission label; omission defaults to manual.
     #[serde(default = "default_permission")]
     pub permission_mode: String,
     /// Optional initial prompt delivered through the bounded instance task.

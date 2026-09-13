@@ -41,7 +41,7 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
     setBusy(true);
     setError(null);
     try {
-      const value = await api.fleetBroadcast(built.body);
+      const value = await api.fleetBroadcast({ ...built.body, confirm: true });
       setResult(value);
       if (form.mode === "prompt") setForm((prev) => ({ ...prev, text: "" }));
     } catch (err) {
@@ -141,7 +141,7 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
 
       <div className={ui.row} style={{ marginTop: 8, justifyContent: "flex-end" }}>
         <Button variant="primary" data-testid="broadcast-send" disabled={busy} onClick={submit}>
-          {busy ? "发送中…" : "群发"}
+          {busy ? "发送中…" : "确认群发"}
         </Button>
       </div>
 

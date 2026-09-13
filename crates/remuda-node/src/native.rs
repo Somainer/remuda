@@ -924,6 +924,8 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            origin: remuda_protocol::InputOrigin::Agent,
+            agent_credential: None,
             command_id: None,
             instance_id: Some(instance.meta.id.clone()),
             host_id: Some(instance.host_id.clone()),
@@ -968,6 +970,8 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            origin: remuda_protocol::InputOrigin::Agent,
+            agent_credential: None,
             command_id: None,
             instance_id: Some(instance.meta.id.clone()),
             host_id: Some(instance.host_id.clone()),
@@ -1014,6 +1018,8 @@ mod tests {
         )
         .expect("instance");
         let request = crate::CreateInstanceRequest {
+            origin: remuda_protocol::InputOrigin::Agent,
+            agent_credential: None,
             command_id: None,
             instance_id: Some(instance.meta.id.clone()),
             host_id: Some(instance.host_id.clone()),

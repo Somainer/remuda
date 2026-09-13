@@ -798,6 +798,7 @@ mod tests {
         let (journal, mut jobs, _) = super::super::journal_channel(4);
         let runtime = RuntimeLink {
             controller: None,
+            hub_url: "http://127.0.0.1:1".into(),
             node: node.clone(),
             journal,
             watermarks: watermarks.clone(),

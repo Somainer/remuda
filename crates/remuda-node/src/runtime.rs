@@ -1689,6 +1689,7 @@ mod tests {
             remuda_protocol::hubnode::METHOD_INSTANCE_CONFIGURE,
             serde_json::json!({
                 "instanceId": created.instance.meta.id,
+                "origin": "human",
                 "model": "opus",
                 "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
             }),
@@ -1707,6 +1708,7 @@ mod tests {
                 if command.operation == CommandOperation::InstanceConfigure
                     && command.state == CommandState::Settled
                 {
+                    assert_eq!(command.origin, CommandOrigin::Ui);
                     break;
                 }
                 tokio::task::yield_now().await;

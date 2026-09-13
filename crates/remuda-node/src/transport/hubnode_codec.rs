@@ -192,9 +192,11 @@ pub async fn dispatch_method(
         .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?;
     }
     if method == "instance.close" {
+        let origin = crate::origin::wire_origin(&params);
         let parsed: InstanceCancelParams = serde_json::from_value(params)?;
         let instance_id = InstanceId::from_str(&parsed.instance_id)?;
         return submit(
+            origin,
             node,
             &instance_id,
             CommandAction::Close,
@@ -294,7 +296,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             model: "fake".into(),
             args: Vec::new(),
             provider_profile_id: "dev-fake".into(),
-            permission_mode: "dontAsk".into(),
+            permission_mode: "manual".into(),
             prompt: String::new(),
             cwd: None,
             delegation: None,
@@ -404,6 +406,7 @@ async fn dispatch_configure(node: &DevNode, params: Value) -> Result<Value, Node
         .submit_command(
             &instance_id,
             InstanceCommandRequest {
+                origin: crate::origin::wire_origin(&params),
                 command_id: command_id.map(str::parse).transpose()?,
                 operation: CommandAction::Configure,
                 prompt: None,

@@ -31,6 +31,7 @@ describe("BroadcastBox", () => {
     expect(broadcast).toHaveBeenCalledOnce();
     const body = broadcast.mock.calls[0][0];
     expect(body.operation).toBe("instance.send");
+    expect(body.confirm).toBe(true);
     expect(body.all).toBe(true);
 
     expect(screen.getByTestId("broadcast-summary").textContent).toContain("已接受 1");
@@ -75,6 +76,7 @@ describe("BroadcastBox", () => {
     await waitFor(() => expect(broadcast).toHaveBeenCalledOnce());
     const body = broadcast.mock.calls[0][0];
     expect(body.operation).toBe("tty.write");
+    expect(body.confirm).toBe(true);
     expect((body.payload as { keys: string[] }).keys).toEqual(["esc"]);
     broadcast.mockRestore();
   });

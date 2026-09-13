@@ -135,12 +135,12 @@ async fn spawn_and_capture_env(extra_env: BTreeMap<String, String>) -> BTreeMap<
     };
     let mut options = ClaudePrintOptions::new(profile(), launch, home, BinarySource::Pinned(pin));
     options.extra_env = extra_env;
-    options.handshake_timeout = Duration::from_millis(1500);
+    options.handshake_timeout = Duration::from_secs(10);
     let driver = ClaudePrintDriver::new(options);
 
     // The stub exits at once so the handshake fails, but it has already
     // written its environment — which is the whole assertion.
-    let _ = driver.start(load_spec(tmp.path())).await;
+    let startup = driver.start(load_spec(tmp.path())).await;
 
     for _ in 0..40 {
         if dump.is_file() {
@@ -150,7 +150,7 @@ async fn spawn_and_capture_env(extra_env: BTreeMap<String, String>) -> BTreeMap<
     }
     assert!(
         dump.is_file(),
-        "the stub never ran; nothing to assert about its environment"
+        "the stub never ran; nothing to assert about its environment; startup={startup:?}"
     );
     read_dump(&dump)
 }

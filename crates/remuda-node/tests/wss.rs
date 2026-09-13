@@ -1024,6 +1024,16 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     assert_eq!(context["origin"], "agent");
     assert_eq!(context["instanceId"], parent_id);
 
+    let (status, denied_enrollment) = request(
+        hub.addr,
+        agent,
+        "/v1/hosts/enroll-token",
+        Some(json!({})),
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "{denied_enrollment}");
+
     let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
     assert_eq!(status, 200, "{child}");
     assert_eq!(child["instance"]["parentInstanceId"], parent_id);
@@ -1218,7 +1228,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     let remote_id = HostId::new().as_id().as_str().to_string();
     let remote = WssLink::connect(WssConfig::loopback(
         hub.addr,
-        &hub.bootstrap_token,
+        enroll_token(&hub).await,
         remote_id.clone(),
     ))
     .await
@@ -1255,9 +1265,10 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
             .contains("not allowed")
     );
 
+    let dispatcher = hub.mint_bot_device_token("dispatcher").await.unwrap();
     let (status, sent) = request(
         hub.addr,
-        bot,
+        &dispatcher,
         &child_path,
         Some(
             json!({"operation":"instance.send","payload":{"prompt":"bot-origin","origin":"human"}}),

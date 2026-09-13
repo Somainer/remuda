@@ -4,7 +4,10 @@ use anyhow::{Result, bail};
 use remuda_hub_client::{CallerContext, CallerOrigin};
 use serde_json::{Value, json};
 
-use super::{HubClient, args::{opt_str, reject_removed_args, required_str, string_list}};
+use super::{
+    HubClient,
+    args::{opt_str, reject_removed_args, required_str, string_list},
+};
 
 pub(super) fn tool_schema(name: &str, schema: &mut Value) {
     if matches!(

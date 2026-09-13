@@ -299,6 +299,7 @@ export function SessionPage({
                   void hubStore.configure(instance.id, mode);
                 }
           }
+          effortDisabled={status === "exited" || instance.ownership === "observed-only"}
           onEffort={(next) => {
             void hubStore.setEffort(instance.id, next);
           }}

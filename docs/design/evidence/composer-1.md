@@ -36,8 +36,9 @@ Spec: `docs/design/claude-design/Remuda UI Spec v0.2.dc.html` boards 1b / 1k / 1
 | `harness-menu` | popover; `data-placement=up\|down` |
 | `harness-option-{claude,codex,grok,agy,terminal}` | row; `data-installed=0\|1` |
 | `model-effort-chip` | collapsed model+effort; `data-ember=0\|1` |
-| `effort-menu` | popover; header/footer copy from the spec |
-| `effort-tier-{name}` | one row per native tier; `data-ember=1` on the top tier |
+| `effort-menu` | popover; slider + footer copy from the spec |
+| `effort-slider` | snapping track; `data-tiers` `data-name` `data-index` `data-ember` |
+| `effort-title` / `effort-hint` / `effort-reset` / `effort-knob` | slider chrome |
 | `model-option-{short}` | model list inside the effort popover |
 | `context-chip` | plain text percent or `—` |
 | `permission-chip` | collapsed permission |

@@ -14,8 +14,46 @@ async function shot(page: Page, name: string) {
   await page.screenshot({ path: path.join(evidence, name), animations: "disabled" });
 }
 
+async function shotComposer(page: Page, name: string) {
+  await mkdir(evidence, { recursive: true });
+  const composer = page.getByTestId("composer");
+  const menu = page.getByTestId("effort-menu");
+  await expect(menu).toBeVisible();
+  const a = await composer.boundingBox();
+  const b = await menu.boundingBox();
+  expect(a).toBeTruthy();
+  expect(b).toBeTruthy();
+  const viewport = page.viewportSize() ?? { width: 1440, height: 900 };
+  const x = Math.max(0, Math.floor(Math.min(a!.x, b!.x)));
+  const y = Math.max(0, Math.floor(Math.min(a!.y, b!.y)));
+  const right = Math.min(viewport.width, Math.ceil(Math.max(a!.x + a!.width, b!.x + b!.width)));
+  const bottom = Math.min(viewport.height, Math.ceil(Math.max(a!.y + a!.height, b!.y + b!.height)));
+  await page.screenshot({
+    path: path.join(evidence, name),
+    animations: "disabled",
+    clip: { x, y, width: Math.max(1, right - x), height: Math.max(1, bottom - y) },
+  });
+}
+
 function noOverlap(a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }) {
   return a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y;
+}
+
+async function openEffort(page: Page) {
+  await page.getByTestId("model-effort-chip").click();
+  await expect(page.getByTestId("effort-slider")).toBeVisible();
+}
+
+async function dragSlider(page: Page, at: "start" | "end") {
+  const slider = page.getByTestId("effort-slider");
+  const box = await slider.boundingBox();
+  expect(box).toBeTruthy();
+  const x = at === "end" ? box!.x + box!.width - 3 : box!.x + 3;
+  const y = box!.y + box!.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x, y, { steps: 2 });
+  await page.mouse.up();
 }
 
 async function assertSingleLine(chip: Locator) {
@@ -49,25 +87,27 @@ test.describe("composer control bar and effort", () => {
     }
   });
 
-  test("effort popover lists native tables and selecting a tier updates the chip", async ({ page }) => {
+  test("effort popover is a snapping slider and selecting a tier updates the chip", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
-    await page.getByTestId("model-effort-chip").click();
+    await openEffort(page);
     const menu = page.getByTestId("effort-menu");
     await expect(menu).toBeVisible();
-    await expect(menu).toContainText("EFFORT · 本回合生效，发 Command 不只改本地");
-    await expect(page.getByTestId("effort-tier-default")).toBeVisible();
-    await expect(page.getByTestId("effort-tier-think")).toBeVisible();
-    await expect(page.getByTestId("effort-tier-think-hard")).toBeVisible();
-    await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ember", "1");
+    const slider = page.getByTestId("effort-slider");
+    await expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
+    await expect(slider).toHaveAttribute("data-name", /think|default/);
+    await expect(page.getByTestId("effort-title")).toBeVisible();
+    await expect(page.getByTestId("effort-hint")).toContainText(/默认档|不额外思考|跨文件|最高档/);
+    await expect(page.getByTestId("effort-tier-ultracode")).toHaveCount(0);
     await expect(menu).toContainText("切换只影响后续回合，不重写已发出的 prompt");
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-effort-menu.png");
     }
-    await page.getByTestId("effort-tier-ultracode").click();
+    await dragSlider(page, "end");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
     await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
     await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
+    await expect(slider).toHaveAttribute("data-ember", "1");
   });
 
   test("codex and grok popovers use native names", async ({ page }) => {
@@ -81,22 +121,17 @@ test.describe("composer control bar and effort", () => {
     const grok = page.getByTestId("harness-option-grok");
     if ((await grok.getAttribute("data-installed")) === "1") {
       await grok.click();
-      await page.getByTestId("model-effort-chip").click();
-      await expect(page.getByTestId("effort-tier-quick")).toBeVisible();
-      await expect(page.getByTestId("effort-tier-standard")).toBeVisible();
-      await expect(page.getByTestId("effort-tier-max")).toHaveAttribute("data-ember", "1");
-      await expect(page.getByTestId("effort-tier-think")).toHaveCount(0);
+      await openEffort(page);
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "quick,standard,max");
+      await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("data-tiers", /think/);
     }
     await page.keyboard.press("Escape");
     await page.getByTestId("harness-chip").click();
     const codex = page.getByTestId("harness-option-codex");
     if ((await codex.getAttribute("data-installed")) === "1") {
       await codex.click();
-      await page.getByTestId("model-effort-chip").click();
-      await expect(page.getByTestId("effort-tier-low")).toBeVisible();
-      await expect(page.getByTestId("effort-tier-medium")).toBeVisible();
-      await expect(page.getByTestId("effort-tier-high")).toBeVisible();
-      await expect(page.getByTestId("effort-tier-ultra")).toHaveAttribute("data-ember", "1");
+      await openEffort(page);
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,ultra");
     } else {
       await expect(codex).toContainText("+");
     }
@@ -105,8 +140,9 @@ test.describe("composer control bar and effort", () => {
   test("switching harness remaps the tier by index", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
-    await page.getByTestId("model-effort-chip").click();
-    await page.getByTestId("effort-tier-ultracode").click();
+    await openEffort(page);
+    await page.getByTestId("effort-slider").focus();
+    await page.keyboard.press("End");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
     await page.getByTestId("harness-chip").click();
     const grok = page.getByTestId("harness-option-grok");
@@ -189,8 +225,9 @@ test.describe("composer control bar and effort", () => {
   test("effort selection persists after reload", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
-    await page.getByTestId("model-effort-chip").click();
-    await page.getByTestId("effort-tier-ultracode").click();
+    await openEffort(page);
+    await page.getByTestId("effort-slider").focus();
+    await page.keyboard.press("End");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
     await page.reload();
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
@@ -210,5 +247,39 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("context-chip")).toBeVisible();
     await expect(page.getByTestId("permission-chip")).toHaveAttribute("data-readonly", "1");
     await expect(page.getByTestId("permission-chip")).toContainText(/always-approve/);
+  });
+
+  test("effort slider evidence: night/ledger at 1440 and 390", async ({ page }, info) => {
+    test.skip(info.project.name !== "chromium", "evidence shots from chromium only");
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    await expect(page.getByTestId("composer-bar")).toBeVisible();
+    for (const theme of ["night", "ledger"] as const) {
+      await page.evaluate((next) => {
+        document.documentElement.setAttribute("data-theme", next);
+      }, theme);
+      for (const [width, height, tag] of [
+        [1440, 900, "1440"],
+        [390, 844, "390"],
+      ] as const) {
+        await page.setViewportSize({ width, height });
+        await page.keyboard.press("Escape");
+        await openEffort(page);
+        await expect(page.getByTestId("effort-slider")).toBeVisible();
+        await expect(page.getByTestId("effort-knob")).toBeVisible();
+        const box = await page.getByTestId("effort-menu").boundingBox();
+        expect(box).toBeTruthy();
+        expect(box!.width).toBeLessThanOrEqual(width);
+        await shotComposer(page, `composer-slider-1-${theme}-${tag}.png`);
+      }
+    }
+    await page.setViewportSize({ width: 400, height: 844 });
+    await page.keyboard.press("Escape");
+    await openEffort(page);
+    const menu = await page.getByTestId("effort-menu").boundingBox();
+    expect(menu).toBeTruthy();
+    expect(menu!.width).toBeLessThanOrEqual(400);
+    await expect(page.getByTestId("effort-slider")).toBeVisible();
   });
 });

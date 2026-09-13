@@ -142,3 +142,61 @@ test("real Node: register a project, create a shell in it, close and unregister"
   await hostPicker.selectOption(hostId);
   await expect(page.getByTestId("new-session-workspace").locator(`option[value="${workspace.workspaceId}"]`)).toHaveCount(0);
 });
+
+test("effort slider drag and keyboard send instance.configure", async ({ page }) => {
+  test.skip(process.env.HUB_E2E_EXTERNAL === "1", "External Node is covered by the real shell workspace flow");
+  await login(page);
+  await page.locator('a[href="/sessions/new"]').first().click();
+  await expect(page.getByTestId("new-session-sheet")).toBeVisible();
+  await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
+  const host = await page
+    .getByTestId("new-session-host")
+    .locator("option")
+    .filter({ hasText: "e2e-fake-node" })
+    .getAttribute("value");
+  await page.getByTestId("new-session-host").selectOption(host!);
+  await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0);
+  await page.getByTestId("new-session-prompt").fill("effort slider e2e");
+  await page.getByTestId("new-session-start").click();
+  await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+  await expect(page.getByTestId("composer-bar")).toBeVisible();
+  await expect(page.getByTestId("model-effort-chip")).toBeVisible();
+
+  const configureBodies: { operation?: string; payload?: { effort?: { name?: string; index?: number } } }[] = [];
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return;
+    if (!new URL(request.url()).pathname.endsWith("/commands")) return;
+    const body = request.postDataJSON() as (typeof configureBodies)[number] | null;
+    if (body) configureBodies.push(body);
+  });
+
+  await page.getByTestId("model-effort-chip").click();
+  const slider = page.getByTestId("effort-slider");
+  await expect(slider).toBeVisible();
+  await expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
+  const box = await slider.boundingBox();
+  expect(box).toBeTruthy();
+  await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2, { steps: 3 });
+  await page.mouse.up();
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+  await expect
+    .poll(() =>
+      configureBodies.some(
+        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "ultracode",
+      ),
+    )
+    .toBeTruthy();
+
+  await slider.focus();
+  await page.keyboard.press("Home");
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "default");
+  await expect
+    .poll(() =>
+      configureBodies.some(
+        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "default",
+      ),
+    )
+    .toBeTruthy();
+});

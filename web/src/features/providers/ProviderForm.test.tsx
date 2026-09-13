@@ -69,7 +69,11 @@ describe("ProviderForm", () => {
     });
     const rows = screen.getAllByTestId("provider-model-row");
     expect(rows[0]).toHaveAttribute("data-model", "gw/a");
-    expect(within(rows[0]).getByTestId("provider-model-tag")).toHaveTextContent("1m");
+    // A 1M window shows once, as the context chip, not also as a "1m" tag.
+    expect(within(rows[0]).getByTestId("provider-model-context")).toHaveTextContent("1m");
+    expect(within(rows[0]).queryAllByTestId("provider-model-tag")).toHaveLength(0);
+    // A first probe has no prior catalog, so nothing is "new".
+    expect(screen.queryAllByTestId("provider-model-new")).toHaveLength(0);
     expect(screen.getByTestId("provider-models-count")).toHaveTextContent("2/2 已启用");
 
     // Untick the second model: it stays listed but must not be exposed.

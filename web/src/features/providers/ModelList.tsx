@@ -92,6 +92,9 @@ export function ModelList({
           {models.map((model) => {
             const isNew = discovered.includes(model.id);
             const context = contextChip(model.contextWindow);
+            // The Hub tags a 1M window "1m", which the context chip already
+            // shows; render each fact once.
+            const tags = model.tags?.filter((tag) => tag !== context) ?? [];
             return (
               <li
                 key={model.id}
@@ -111,8 +114,12 @@ export function ModelList({
                   <span className={css.modelId}>{model.id}</span>
                 </label>
                 {model.label ? <span className={css.modelLabel}>{model.label}</span> : null}
-                {context ? <span className={css.chipSmall}>{context}</span> : null}
-                {model.tags?.map((tag) => (
+                {context ? (
+                  <span className={css.chipSmall} data-testid="provider-model-context">
+                    {context}
+                  </span>
+                ) : null}
+                {tags.map((tag) => (
                   <span key={tag} className={css.chipSmall} data-testid="provider-model-tag">
                     {tag}
                   </span>

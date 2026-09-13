@@ -46,7 +46,7 @@ test.describe("providers bots settings", () => {
     await expect(page.getByTestId("provider-model-row")).toHaveCount(3);
     await expect(page.getByTestId("provider-models-count")).toContainText("3/3 已启用");
     const auto = page.locator('[data-testid=provider-model-row][data-model="passthrough/auto"]');
-    await expect(auto.getByTestId("provider-model-tag")).toHaveText("1m");
+    await expect(auto.getByTestId("provider-model-context")).toHaveText("1m");
     // The token is never rendered back into the page.
     await expect(page.locator("body")).not.toContainText("sk-fake-probe-pppp");
 

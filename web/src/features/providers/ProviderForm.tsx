@@ -72,7 +72,9 @@ export function ProviderForm({
       });
       const { models: merged, added } = mergeDiscovered(models, found);
       setModels(merged);
-      setDiscovered(added);
+      // Badging every row on a first probe says nothing; "new" only means new
+      // relative to a catalog that already existed.
+      setDiscovered(models.length ? added : []);
       if (!defaultModel) {
         setDefaultModel(merged.find((m) => m.enabled)?.id ?? "");
       }

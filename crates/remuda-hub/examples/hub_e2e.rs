@@ -16,6 +16,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const BOOTSTRAP: &str = "e2e-bootstrap-token";
 const LISTEN: &str = "127.0.0.1:18787";
+/// Fake Anthropic-Messages gateway for provider discovery.
+const UPSTREAM_LISTEN: &str = "127.0.0.1:18788";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -69,17 +71,62 @@ async fn main() -> Result<()> {
     let (ready_tx, ready_rx) = oneshot::channel();
     let node = tokio::spawn(fake_node(addr, enroll, host_id.clone(), pending, ready_tx));
     ready_rx.await.context("fake node hello")?;
+    // A stand-in Anthropic-Messages gateway so provider discovery has a real
+    // /v1/models to read without reaching any live endpoint.
+    let upstream_listen =
+        std::env::var("HUB_E2E_UPSTREAM_LISTEN").unwrap_or_else(|_| UPSTREAM_LISTEN.into());
+    let upstream = tokio::net::TcpListener::bind(&upstream_listen)
+        .await
+        .context("fake upstream")?;
+    let upstream_addr = upstream.local_addr()?;
+    let upstream_task = tokio::spawn(fake_upstream(upstream));
     let line = json!({
         "hub": format!("http://{addr}"),
         "token": BOOTSTRAP,
         "hostId": host_id.as_id().as_str(),
+        "upstream": format!("http://{upstream_addr}"),
     });
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
     tokio::signal::ctrl_c().await.ok();
     node.abort();
+    upstream_task.abort();
     drop(hub);
     Ok(())
+}
+
+/// Serve a fixed Anthropic-style `/v1/models` catalog, with display names and
+/// one long-context entry so the discovery checklist has metadata to render.
+async fn fake_upstream(listener: tokio::net::TcpListener) {
+    const CATALOG: &str = r#"{"data":[
+        {"type":"model","id":"e2e/auto","display_name":"E2E Auto","context_window":1048576},
+        {"type":"model","id":"e2e/fast","display_name":"E2E Fast","context_window":200000},
+        {"type":"model","id":"e2e/plain"}
+    ],"has_more":false}"#;
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
+            let head = String::from_utf8_lossy(&buf[..n]);
+            let (code, body) = if head.starts_with("GET /v1/models") {
+                (200, CATALOG)
+            } else {
+                (404, "{}")
+            };
+            let response = format!(
+                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+    }
 }
 
 async fn mint_enroll_via_device(addr: SocketAddr, bootstrap: &str) -> Result<String> {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AddHostForm,
@@ -14,6 +14,8 @@ import { fromHub, type ProviderProfile } from "../features/providers";
 import { hubStore, useHub } from "../lib/store";
 import { api } from "../lib/api";
 import { HostDiagnostics } from "../features/hosts/HostDiagnostics";
+import { WorkspaceList } from "../features/workspaces/WorkspaceList";
+import type { Workspace } from "../types/workspace";
 import ui from "../styles/ui.module.css";
 import css from "../features/hosts/hosts.module.css";
 
@@ -67,8 +69,8 @@ export function HostsPage() {
         </button>
       </header>
       {visible.map((host) => (
+        <Fragment key={host.id}>
         <Link
-          key={host.id}
           to={`/hosts/${host.id}`}
           className={css.row}
           data-testid="host-row"
@@ -102,6 +104,8 @@ export function HostsPage() {
             ›
           </span>
         </Link>
+        <WorkspaceList hostId={host.id} online={host.online} workspaces={hub.workspaces.filter((w) => w.hostId === host.id)} />
+        </Fragment>
       ))}
       <AddHostForm open={adding} onClose={() => setAdding(false)} />
     </div>
@@ -116,10 +120,10 @@ export function HostDetailPage() {
   const host = hosts.find((h) => h.id === hostId);
   if (!host) return <p style={{ padding: 16 }}>主机不存在</p>;
   const workspaces = hub.workspaces.filter((w) => w.hostId === host.id);
-  return <HostDetail host={host} workspaces={workspaces.map((w) => ({ label: w.label, path: w.rootPath }))} />;
+  return <HostDetail host={host} workspaces={workspaces} />;
 }
 
-function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label: string; path: string }[] }) {
+function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspace[] }) {
   const navigate = useNavigate();
   const [removing, setRemoving] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
@@ -218,21 +222,7 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: { label:
             ))}
           </div>
         </div>
-        <div>
-          <div className={css.sectionLabel}>Workspace · 最近 cwd</div>
-          <div className={css.chips}>
-            {workspaces.length ? (
-              workspaces.map((row) => (
-                <span key={row.path} className={css.chip}>
-                  {row.label}
-                  <span className={css.chipPath}>{row.path}</span>
-                </span>
-              ))
-            ) : (
-              <span className={css.chip}>最近 cwd —</span>
-            )}
-          </div>
-        </div>
+        <WorkspaceList hostId={host.id} workspaces={workspaces} online={host.online} />
         <HostDiagnostics hostId={host.id} online={host.online} />
         <div className={css.fields}>
           <label className={ui.field}>

@@ -255,7 +255,9 @@ mod tests {
     async fn inaccessible_workspace_is_rejected_before_registration_or_instance_acceptance() {
         let parent = tempfile::tempdir().unwrap();
         let workspace = parent.path().join("workspace");
-        let config = crate::DevServerConfig::loopback(0).with_workspace_root(workspace.clone());
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_root(workspace.clone())
+            .with_workspace_roots(vec![parent.path().to_path_buf()]);
         assert!(crate::DevNode::new(&config).is_err());
         std::fs::create_dir(&workspace).unwrap();
         let node = crate::DevNode::new(&config).unwrap();

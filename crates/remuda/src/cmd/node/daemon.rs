@@ -7,8 +7,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use remuda_node::{
-    Backoff, CarrierKind, DaemonControl, DevNode, DevServerConfig, HostInventoryConfig, NodeHello,
-    ServeConfig, StdioOptions, WssConfig, WssLink, compose,
+    Backoff, CarrierKind, DaemonControl, DevNode, HostInventoryConfig, NodeHello, ServeConfig,
+    StdioOptions, WssConfig, WssLink, compose,
 };
 use std::time::Duration;
 use tokio::sync::watch;
@@ -19,9 +19,8 @@ pub(super) async fn run(config: Config, args: Args, mut shutdown: Shutdown) -> R
     native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
     native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
     native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
-    remuda_node::prepare_workspace(&config.node.workspace)?;
     let runtime = compose(&ServeConfig {
-        http: DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone()),
+        http: super::super::workspace_config(&config, 0),
         data_dir: config.data_dir.clone(),
         drivers: remuda_node::LocalDrivers::Native(native),
     })?;

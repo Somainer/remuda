@@ -359,6 +359,7 @@ pub(crate) async fn handle_node_method(
                     params.get("capabilities").cloned(),
                 )
                 .await?;
+            crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             if params["daemon"] == true {
                 state
                     .store
@@ -402,6 +403,7 @@ pub(crate) async fn handle_node_method(
                     params.get("capabilities").cloned(),
                 )
                 .await?;
+            crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             let expires = lease_expires();
             let result = HeartbeatResult {
                 server_time: ts(&now_rfc3339())?,
@@ -429,6 +431,7 @@ pub(crate) async fn handle_node_method(
                     params.get("capabilities").cloned(),
                 )
                 .await?;
+            crate::workspaces::observe_inventory(state, &host.host_id, &params).await?;
             Ok(Some(json!({
                 "hostRevision": "1",
                 "registrySeq": "1",

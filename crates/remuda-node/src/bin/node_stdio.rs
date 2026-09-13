@@ -46,6 +46,12 @@ struct NodeArgs {
     transport: String,
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+    /// Absolute projects merged into the persistent workspace registry.
+    #[arg(long = "workspace", global = true)]
+    workspaces: Vec<PathBuf>,
+    /// Allowed parent directories for workspace registration (default: HOME).
+    #[arg(long = "workspace-root", global = true)]
+    workspace_roots: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -130,6 +136,12 @@ async fn start_daemon(args: &NodeArgs, data_dir: &std::path::Path) -> anyhow::Re
     for label in &args.labels {
         command.arg("--label").arg(label);
     }
+    for workspace in &args.workspaces {
+        command.arg("--workspace").arg(workspace);
+    }
+    for root in &args.workspace_roots {
+        command.arg("--workspace-root").arg(root);
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -193,12 +205,25 @@ async fn run_node(args: NodeArgs) -> anyhow::Result<()> {
         None
     };
     let labels = parse_labels(&args.labels)?;
-    remuda_node::prepare_workspace(&data_dir.join("workspace"))?;
     std::fs::create_dir_all(data_dir.join("herdr"))?;
     let mut native = NativeDriverConfig::new(data_dir.clone());
     native.herdr_socket_dir = Some(data_dir.join("herdr"));
+    let initial = args
+        .workspaces
+        .first()
+        .cloned()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .context(
+            "Node HOME is unavailable; provide an absolute --workspace and --workspace-root",
+        )?;
+    let mut http = DevServerConfig::loopback(0)
+        .with_workspace_root(initial)
+        .with_workspaces(args.workspaces);
+    if !args.workspace_roots.is_empty() {
+        http = http.with_workspace_roots(args.workspace_roots);
+    }
     let node = compose(&ServeConfig {
-        http: DevServerConfig::loopback(0).with_workspace_root(data_dir.join("workspace")),
+        http,
         data_dir: data_dir.clone(),
         drivers: LocalDrivers::Native(native),
     })?;

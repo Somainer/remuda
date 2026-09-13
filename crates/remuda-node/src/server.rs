@@ -797,27 +797,25 @@ async fn dispatch_rpc(
             serde_json::to_value(host).map_err(NodeError::from)
         }
         "workspace.list" => {
-            let workspace = node.workspace();
-            if let Some(raw_host) = params.get("hostId").and_then(Value::as_str) {
-                let host_id = remuda_protocol::HostId::from_str(raw_host)?;
-                if workspace.host_id != host_id {
-                    return Ok(json!({"items": [], "nextCursor": null}));
-                }
-            }
-            Ok(json!({"items": [workspace], "nextCursor": null}))
+            let mut snapshot = node.workspace_snapshot()?;
+            snapshot["items"] = serde_json::to_value(node.workspaces()?)?;
+            snapshot["nextCursor"] = Value::Null;
+            Ok(snapshot)
         }
+        "workspace.register" | "workspace.unregister" => node.workspace_rpc(method, params),
         "workspace.get" => {
             let requested = parse_id_field::<WorkspaceId>(&params, "workspaceId")?;
-            let workspace = node.workspace();
-            if requested != workspace.meta.id {
-                return Err(NodeError::NotFound {
+            let workspace = node
+                .workspaces()?
+                .into_iter()
+                .find(|workspace| requested == workspace.meta.id)
+                .ok_or_else(|| NodeError::NotFound {
                     entity: "workspace",
                     id: requested.as_id().to_string(),
-                });
-            }
+                })?;
             serde_json::to_value(workspace).map_err(NodeError::from)
         }
-        "worktree.list" => node.list_worktrees(),
+        "worktree.list" => node.worktree_rpc(method, &params),
         "host.doctor" => node.doctor().await,
         "worktree.create" => node.create_worktree(&params),
         "instance.list" => {

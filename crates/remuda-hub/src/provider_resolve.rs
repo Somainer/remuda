@@ -332,6 +332,8 @@ mod tests {
 
     fn host_rec(id: &str, binding: &str, native: bool) -> HostRecord {
         HostRecord {
+            workspaces: Vec::new(),
+            workspace_revision: 0,
             ssh: None,
             last_error: None,
             host_id: id.into(),

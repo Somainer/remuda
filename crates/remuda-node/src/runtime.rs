@@ -45,6 +45,7 @@ pub(crate) struct DevNodeInner {
     queue_capacity: usize,
     host: Host,
     workspace: Workspace,
+    pub(crate) workspace_registry: std::sync::RwLock<crate::workspace::WorkspaceRegistry>,
     projection_epoch: Id,
     tty: TtyRegistry,
     diagnostics: std::sync::RwLock<crate::DoctorContext>,
@@ -93,9 +94,15 @@ impl DevNode {
                 "instance queue capacity must be positive".to_owned(),
             ));
         }
-        let workspace_id = WorkspaceId::new();
         let host = fixture_host(host_id.clone())?;
-        let workspace = fixture_workspace(workspace_id, host_id, &config.workspace_root)?;
+        let workspace_registry = crate::workspace::WorkspaceRegistry::open(config, host_id)?;
+        let workspace = workspace_registry
+            .workspaces()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                NodeError::InvalidConfig("initial workspace registry is empty".into())
+            })?;
         let interactions = InteractionRuntime::spawn(Arc::clone(&store))?;
         Ok(Self {
             inner: Arc::new(DevNodeInner {
@@ -111,6 +118,7 @@ impl DevNode {
                 queue_capacity: config.instance_queue_capacity,
                 host,
                 workspace,
+                workspace_registry: std::sync::RwLock::new(workspace_registry),
                 projection_epoch: Id::new("epoch")?,
                 tty: TtyRegistry::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
@@ -152,9 +160,17 @@ impl DevNode {
             .read()
             .map_err(|_| NodeError::InvalidConfig("diagnostics lock poisoned".into()))?
             .clone();
-        let workspace = std::path::PathBuf::from(&self.inner.workspace.root_path);
+        let workspaces = self
+            .workspaces()?
+            .into_iter()
+            .map(|workspace| std::path::PathBuf::from(workspace.root_path))
+            .collect::<Vec<_>>();
         let report = tokio::task::spawn_blocking(move || {
-            crate::doctor_with_workspace(&context, &workspace, crate::ProbeEnv::from_process())
+            crate::diagnostics::doctor_with_workspaces(
+                &context,
+                &workspaces,
+                crate::ProbeEnv::from_process(),
+            )
         })
         .await
         .map_err(|error| NodeError::InvalidRequest(error.to_string()))?;
@@ -182,24 +198,25 @@ impl DevNode {
         self.inner.store.get_instance(instance_id)
     }
 
-    /// Catalog of git worktrees under the Node workspace root.
+    /// Catalog of git worktrees under the first registered workspace root.
     pub fn list_worktrees(&self) -> Result<Value, NodeError> {
-        crate::worktree::handle_rpc(
-            Path::new(&self.inner.workspace.root_path),
-            "worktree.list",
-            &serde_json::json!({}),
-        )
-        .ok_or_else(|| NodeError::InvalidRequest("worktree.list".into()))?
+        self.worktree_rpc("worktree.list", &serde_json::json!({}))
     }
 
-    /// Create or reuse a git worktree (`git worktree add -b wt/<name>/…`).
+    /// Create or reuse a git worktree under the selected registered workspace.
     pub fn create_worktree(&self, params: &Value) -> Result<Value, NodeError> {
-        crate::worktree::handle_rpc(
-            Path::new(&self.inner.workspace.root_path),
-            "worktree.create",
-            params,
-        )
-        .ok_or_else(|| NodeError::InvalidRequest("worktree.create".into()))?
+        self.worktree_rpc("worktree.create", params)
+    }
+
+    pub(crate) fn worktree_rpc(&self, method: &str, params: &Value) -> Result<Value, NodeError> {
+        let selected = params
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(str::parse)
+            .transpose()?;
+        let (workspace, _) = self.resolve_workspace_cwd(selected.as_ref(), None)?;
+        crate::worktree::handle_rpc(Path::new(&workspace.root_path), method, params)
+            .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?
     }
 
     /// Durably accept an Instance create, then materialize it in its worker.
@@ -223,18 +240,12 @@ impl DevNode {
             .host_id
             .clone()
             .unwrap_or_else(|| self.inner.host.meta.id.clone());
-        let workspace_id = request
-            .workspace_id
-            .clone()
-            .unwrap_or_else(|| self.inner.workspace.meta.id.clone());
+        let (workspace, workspace_root) =
+            self.resolve_workspace_cwd(request.workspace_id.as_ref(), request.cwd.as_deref())?;
+        let workspace_id = workspace.meta.id.clone();
         if host_id != self.inner.host.meta.id {
             return Err(NodeError::InvalidRequest(
                 "create hostId is not the local development Host".to_owned(),
-            ));
-        }
-        if workspace_id != self.inner.workspace.meta.id {
-            return Err(NodeError::InvalidRequest(
-                "create workspaceId is not the local development Workspace".to_owned(),
             ));
         }
 
@@ -245,17 +256,13 @@ impl DevNode {
             workspace_id,
             request.driver,
         )?;
-        let workspace_root = crate::worktree::resolve_instance_cwd(
-            Path::new(&self.inner.workspace.root_path),
-            request.cwd.as_deref(),
-        )?;
         let driver = self.inner.drivers.build(
             request.driver,
             DriverLaunch {
                 instance: instance.clone(),
                 request: request.clone(),
                 workspace_root,
-                registered_workspace_root: self.inner.workspace.root_path.clone().into(),
+                registered_workspace_root: workspace.root_path.into(),
             },
         )?;
         self.inner.store.insert_instance(instance)?;
@@ -1410,7 +1417,7 @@ fn fixture_host(host_id: HostId) -> Result<Host, NodeError> {
     })
 }
 
-fn fixture_workspace(
+pub(crate) fn fixture_workspace(
     workspace_id: WorkspaceId,
     host_id: HostId,
     root: &Path,

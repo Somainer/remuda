@@ -24,7 +24,8 @@
 //! MAX_INSTANCES, PROVIDER_PROFILES (JSON object), SHUTDOWN_TIMEOUT_SECS,
 //! BOOTSTRAP_TOKEN, WEB_PASSWORD_FILE, COOKIE_SECURE, WEB_ROOT,
 //! ALLOWED_ORIGINS, WEB_ORIGINS (JSON arrays), COMMAND_ACCEPT_TIMEOUT_MS, and
-//! CREATE_SETTLE_TIMEOUT_MS, AUTO_TRUST_REGISTERED_WORKSPACES, all prefixed `REMUDA_`.
+//! CREATE_SETTLE_TIMEOUT_MS, AUTO_TRUST_REGISTERED_WORKSPACES, WORKSPACE_ROOTS
+//! (JSON path array), all prefixed `REMUDA_`.
 //! Direct token environment variables take precedence over token-file variables.
 
 use anyhow::{Context, bail, ensure};
@@ -91,6 +92,11 @@ pub(crate) struct Node {
     #[serde(alias = "herdrSocket")]
     pub herdr_socket: Option<PathBuf>,
     pub workspace: PathBuf,
+    /// Additional startup roots merged into the persistent Node registry.
+    pub workspaces: Vec<PathBuf>,
+    /// Registration boundary; omitted means the Node user's HOME directory.
+    #[serde(alias = "workspaceRoots")]
+    pub workspace_roots: Option<Vec<PathBuf>>,
     #[serde(alias = "autoTrustRegisteredWorkspaces")]
     pub auto_trust_registered_workspaces: bool,
     #[serde(alias = "webOrigins")]
@@ -381,6 +387,8 @@ impl Default for Node {
             max_instances: 8,
             herdr_socket: None,
             workspace: ".".into(),
+            workspaces: Vec::new(),
+            workspace_roots: None,
             auto_trust_registered_workspaces: true,
             web_origins: vec![
                 "http://localhost:5173".into(),
@@ -435,6 +443,18 @@ impl Config {
         );
         self.data_dir = absolute(base, &self.data_dir);
         self.node.workspace = absolute(base, &self.node.workspace);
+        for path in self
+            .node
+            .workspaces
+            .iter_mut()
+            .chain(self.node.workspace_roots.iter_mut().flatten())
+        {
+            ensure!(
+                !path.as_os_str().is_empty(),
+                "workspace path must not be empty"
+            );
+            *path = absolute(base, path);
+        }
         for path in [&mut self.hub.web_root, &mut self.node.herdr_socket]
             .into_iter()
             .flatten()
@@ -484,6 +504,14 @@ impl Config {
         }
         if let Some(value) = env_text(env, "REMUDA_HUB_URL")? {
             self.node.hub_url = Some(value);
+        }
+        if let Some(value) = env_text(env, "REMUDA_WORKSPACE_ROOTS")? {
+            let paths: Vec<PathBuf> = parse_json_env(&value, "REMUDA_WORKSPACE_ROOTS")?;
+            ensure!(
+                paths.iter().all(|path| path.is_absolute()),
+                "REMUDA_WORKSPACE_ROOTS entries must be absolute paths"
+            );
+            self.node.workspace_roots = Some(paths);
         }
         if let Some(value) = env_text(env, "REMUDA_AUTO_TRUST_REGISTERED_WORKSPACES")? {
             self.node.auto_trust_registered_workspaces = match value.as_str() {
@@ -815,6 +843,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn workspace_allowlist_paths_and_environment_overrides() {
+        assert!(Config::default().node.workspace_roots.is_none());
+        let fixture = Fixture::new(
+            "[node]\nworkspace = 'project'\nworkspaces = ['second']\nworkspace_roots = ['.']\n",
+        );
+        let config = fixture.load(&[]).unwrap();
+        assert!(config.node.workspace.is_absolute());
+        assert!(config.node.workspaces[0].is_absolute());
+        assert!(config.node.workspace_roots.unwrap()[0].is_absolute());
+        let config = fixture
+            .load(&[("REMUDA_WORKSPACE_ROOTS", "[\"/tmp/remuda-allowed\"]")])
+            .unwrap();
+        assert_eq!(
+            config.node.workspace_roots,
+            Some(vec![PathBuf::from("/tmp/remuda-allowed")])
+        );
+        assert!(
+            fixture
+                .load(&[("REMUDA_WORKSPACE_ROOTS", "[\"relative\"]")])
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .load(&[("REMUDA_WORKSPACE_ROOTS", "[]")])
+                .unwrap()
+                .node
+                .workspace_roots,
+            Some(Vec::new())
+        );
     }
 
     #[test]

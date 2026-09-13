@@ -266,6 +266,7 @@ async fn pty_approval_hub_cas_settlement_and_restart_do_not_replay() {
     let store = Arc::new(MemoryStore::open_journaled(&node_path, 128).unwrap());
     let mut node_config = DevServerConfig::loopback(0);
     node_config.workspace_root = dir.path().to_path_buf();
+    node_config.workspace_roots = Some(vec![std::env::temp_dir()]);
     let node = DevNode::with_parts(
         &node_config,
         store.clone(),

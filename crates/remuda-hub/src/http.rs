@@ -128,6 +128,7 @@ pub struct WorktreeListQuery {
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorktreeBody {
     host_id: Option<String>,
+    workspace_id: Option<String>,
     name: String,
     #[serde(default)]
     base: Option<String>,
@@ -295,7 +296,7 @@ pub async fn create_instance(
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
     let title = body.title.clone().or(body.name.clone());
-    let workspace_id = body.workspace_id.clone().or(body.cwd.clone());
+    let workspace_id = body.workspace_id.clone();
     let mut spec = json!({
         "kind": body.kind,
         "driver": body.driver,
@@ -514,6 +515,7 @@ pub async fn create_worktree(
     let params = json!({
         "hostId": host.host_id,
         "name": body.name,
+        "workspaceId": body.workspace_id,
         "base": body.base.as_deref().unwrap_or("main"),
     });
     let created = call_node(&state, &host.host_id, "worktree.create", params).await?;

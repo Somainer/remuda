@@ -69,6 +69,8 @@ pub(crate) fn host_view(host: &HostRecord) -> Value {
         "ssh": host.ssh,
         "lastError": host.last_error,
         "providerBinding": host.provider_binding,
+        "workspaces": host.workspaces,
+        "workspaceRevision": host.workspace_revision,
     })
 }
 

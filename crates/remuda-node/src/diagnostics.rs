@@ -102,8 +102,20 @@ pub fn doctor_with_workspace(
     workspace: &Path,
     env: ProbeEnv,
 ) -> DoctorReport {
+    doctor_with_workspaces(context, &[workspace.to_path_buf()], env)
+}
+
+/// Probe each current registered root, then perform config preflight and inventory once.
+/// An empty registry still receives the same guarded config and inventory checks.
+pub(crate) fn doctor_with_workspaces(
+    context: &DoctorContext,
+    workspaces: &[PathBuf],
+    env: ProbeEnv,
+) -> DoctorReport {
     let mut preflight = DoctorReport::empty();
-    doctor_workspace(&mut preflight, workspace, &env);
+    for workspace in workspaces {
+        doctor_workspace(&mut preflight, workspace, &env);
+    }
     if preflight.exit_code != 0 {
         return preflight;
     }
@@ -481,6 +493,105 @@ pub fn doctor_port(report: &mut DoctorReport, name: &str, address: SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_doctor_uses_current_registry_and_checks_all_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let initial = fixture.path().join("initial");
+        let missing = fixture.path().join("missing");
+        let accessible = fixture.path().join("accessible");
+        for path in [&initial, &missing, &accessible] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let node = crate::DevNode::new(
+            &crate::DevServerConfig::loopback(0)
+                .with_workspace_root(initial.clone())
+                .with_workspaces(vec![missing.clone(), accessible.clone()])
+                .with_workspace_roots(vec![fixture.path().to_owned()]),
+        )
+        .unwrap();
+        let roots = node.workspaces().unwrap();
+        for phase in ["prepare", "commit"] {
+            node.workspace_rpc(
+                "workspace.unregister",
+                json!({"commandId":"remove-initial", "path":roots[0].root_path, "phase":phase}),
+            )
+            .unwrap();
+        }
+        std::fs::remove_dir(initial).unwrap();
+        std::fs::remove_dir(missing).unwrap();
+        let report = node.doctor().await.unwrap();
+        let checks = report["checks"].as_array().unwrap();
+        let access: Vec<_> = checks
+            .iter()
+            .filter(|check| check["name"] == "workspace.access")
+            .collect();
+        assert_eq!(access.len(), 2);
+        assert_eq!(access[0]["details"]["path"], roots[1].root_path);
+        assert_eq!(access[0]["status"], "blocker");
+        assert_eq!(access[1]["details"]["path"], roots[2].root_path);
+        assert_eq!(access[1]["status"], "ok");
+        assert!(report["inventory"].is_null());
+        node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn empty_registry_and_multiple_roots_collect_one_inventory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let env = ProbeEnv {
+            path: fixture.path().join("no-binaries").into_os_string(),
+            home: fixture.path().join("home"),
+            hostname: Some("fixture".into()),
+            herdr_socket_env: None,
+            xdg_config_home: None,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        for path in [&env.home, &first, &second] {
+            std::fs::create_dir(path).unwrap();
+        }
+        for roots in [Vec::new(), vec![first, second]] {
+            let report = doctor_with_workspaces(&DoctorContext::default(), &roots, env.clone());
+            assert!(!report.inventory.is_null());
+            assert_eq!(
+                report
+                    .checks
+                    .iter()
+                    .filter(|check| check.name == "binary.cargo")
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                report
+                    .checks
+                    .iter()
+                    .filter(|check| check.name == "workspace.access")
+                    .count(),
+                roots.len(),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_registry_retains_claude_config_preflight() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join(".claude"), "not a directory").unwrap();
+        let mut env = ProbeEnv::from_process();
+        env.home = fixture.path().to_owned();
+        let report = doctor_with_workspaces(&DoctorContext::default(), &[], env);
+        assert_eq!(report.exit_code, 1);
+        assert!(report.inventory.is_null());
+        assert!(report.checks.iter().any(|check| {
+            check.name.starts_with("config.claude.") && check.status == "blocker"
+        }));
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.name != "workspace.access")
+        );
+    }
 
     #[test]
     fn missing_workspace_short_circuits_inventory() {

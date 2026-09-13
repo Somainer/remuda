@@ -1,6 +1,9 @@
 import { expect, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
 
-export const bootstrapToken = process.env.HUB_E2E_TOKEN ?? "e2e-bootstrap-token";
+export const bootstrapToken = process.env.HUB_E2E_ACCESS_CODE_FILE
+  ? readFileSync(process.env.HUB_E2E_ACCESS_CODE_FILE, "utf8").trim()
+  : process.env.HUB_E2E_ACCESS_CODE ?? process.env.HUB_E2E_TOKEN ?? "e2e-bootstrap-token";
 
 export async function expectCookieSession(page: Page) {
   const cookie = (await page.context().cookies()).find((item) => item.name === "remuda_device");

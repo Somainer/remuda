@@ -324,6 +324,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/{id}/workspaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List acknowledged Node workspaces, including cached roots while offline
+         * @description Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.
+         */
+        get: operations["hostWorkspaceList"];
+        put?: never;
+        /**
+         * Register an absolute project directory after Node validation
+         * @description Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.
+         */
+        post: operations["hostWorkspaceRegister"];
+        /**
+         * Unregister a directory without deleting files or stopping sessions
+         * @description Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.
+         */
+        delete: operations["hostWorkspaceUnregister"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances": {
         parameters: {
             query?: never;
@@ -746,8 +774,25 @@ export interface components {
             } | null;
             state: string;
             transport?: string;
+            workspaceRevision?: number;
+            workspaces?: components["schemas"]["HostWorkspace"][];
         } & {
             [key: string]: unknown;
+        };
+        HostWorkspace: {
+            hostId: string;
+            root: string;
+            workspaceId: string;
+        };
+        HostWorkspaceList: {
+            /** @description Canonical target workspace for a mutation */
+            workspaceId?: string;
+            workspaceRevision: number;
+            workspaces: components["schemas"]["HostWorkspace"][];
+        };
+        HostWorkspacePath: {
+            /** @description Absolute path on the Node, within its configured workspace roots */
+            path: string;
         };
         InstanceCreate: {
             claudeConfigDir?: string;
@@ -969,6 +1014,8 @@ export interface components {
             base?: string;
             hostId?: string;
             name: string;
+            /** @description Registered workspace containing the repository; omitted selects the Node default. */
+            workspaceId?: string;
         };
         WorktreePage: {
             hostId?: string;
@@ -1566,6 +1613,95 @@ export interface operations {
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
             500: components["responses"]["Error"];
+        };
+    };
+    hostWorkspaceList: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Acknowledged workspace registry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostWorkspaceList"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    hostWorkspaceRegister: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HostWorkspacePath"];
+            };
+        };
+        responses: {
+            /** @description Acknowledged workspace registry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostWorkspaceList"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    hostWorkspaceUnregister: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HostWorkspacePath"];
+            };
+        };
+        responses: {
+            /** @description Acknowledged workspace registry */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostWorkspaceList"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     instanceList: {

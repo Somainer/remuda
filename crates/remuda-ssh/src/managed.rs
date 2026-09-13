@@ -168,8 +168,11 @@ pub async fn prepare_managed_node(
         .map(|arg| sh_single_quote(arg))
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
+    // D-023: the transport's private /tmp directory is not a project boundary.
+    // Both the full CLI and uploaded Node start with a root inside the default
+    // HOME allowlist; operators can register additional projects after enrollment.
     let launch = format!(
-        "cd {qdir}/workspace && exec env CODEX_HOME={qdir}/codex REMUDA_DATA_DIR={qdir} REMUDA_CONFIG={qdir}/remuda.toml {command}"
+        "cd {qdir}/workspace && exec env CODEX_HOME={qdir}/codex REMUDA_DATA_DIR={qdir} REMUDA_CONFIG={qdir}/remuda.toml {command} --workspace \"$HOME\""
     );
     let status = client
         .exec(&["sh", "-c", &format!("{launch} status")], None, timeout)

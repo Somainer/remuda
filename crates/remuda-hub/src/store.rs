@@ -154,6 +154,12 @@ pub struct HostRecord {
     /// Provider binding: `auto` | `native` | `profile:<id>` (D-021).
     #[serde(default = "default_provider_binding")]
     pub provider_binding: String,
+    /// Last acknowledged Node workspace registry.
+    #[serde(default)]
+    pub workspaces: Vec<Value>,
+    /// Monotonic revision of the acknowledged workspace registry.
+    #[serde(default)]
+    pub workspace_revision: u64,
 }
 
 fn default_provider_binding() -> String {
@@ -2101,6 +2107,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS devices_token_prefix ON devices(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
+    crate::workspaces::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;
     Ok(conn)
 }
@@ -2989,6 +2996,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         ),
         None => (None, None),
     };
+    let (workspace_revision, workspaces) = crate::workspaces::load_snapshot(conn, id)?;
     Ok(Some(HostRecord {
         ssh,
         last_error,
@@ -3008,6 +3016,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         max_instances,
         hostname,
         provider_binding,
+        workspaces,
+        workspace_revision: workspace_revision.max(0) as u64,
     }))
 }
 

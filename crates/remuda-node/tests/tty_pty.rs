@@ -23,6 +23,7 @@ async fn mouse_escape_round_trips_on_shell_pty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = DevServerConfig::loopback(0);
     config.workspace_root = dir.path().to_path_buf();
+    config.workspace_roots = Some(vec![std::env::temp_dir()]);
     let node = DevNode::new(&config).expect("node");
     let created = node
         .create_instance(
@@ -80,6 +81,7 @@ async fn snapshot_on_attach_replays_prior_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = DevServerConfig::loopback(0);
     config.workspace_root = dir.path().to_path_buf();
+    config.workspace_roots = Some(vec![std::env::temp_dir()]);
     let node = DevNode::new(&config).expect("node");
     let created = node
         .create_instance(

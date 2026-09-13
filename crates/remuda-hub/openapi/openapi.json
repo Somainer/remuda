@@ -223,6 +223,163 @@
         }
       }
     },
+    "/v1/hosts/{id}/workspaces": {
+      "get": {
+        "tags": [
+          "hosts"
+        ],
+        "operationId": "hostWorkspaceList",
+        "summary": "List acknowledged Node workspaces, including cached roots while offline",
+        "description": "Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Acknowledged workspace registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostWorkspaceList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "hosts"
+        ],
+        "operationId": "hostWorkspaceRegister",
+        "summary": "Register an absolute project directory after Node validation",
+        "description": "Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Acknowledged workspace registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostWorkspaceList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostWorkspacePath"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "hosts"
+        ],
+        "operationId": "hostWorkspaceUnregister",
+        "summary": "Unregister a directory without deleting files or stopping sessions",
+        "description": "Human and Bot operator credentials only; Agent callers receive 403. Mutations prepare and commit on the Node; HTTP success requires settlement, journal persistence, and updated host projection.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Acknowledged workspace registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostWorkspaceList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostWorkspacePath"
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/hosts/{id}/doctor": {
       "get": {
         "tags": ["hosts"],
@@ -1199,11 +1356,67 @@
           "nativeGateway": { "type": "boolean" }
         }
       },
+      "HostWorkspace": {
+        "type": "object",
+        "required": [
+          "workspaceId",
+          "hostId",
+          "root"
+        ],
+        "properties": {
+          "workspaceId": {
+            "type": "string"
+          },
+          "hostId": {
+            "type": "string"
+          },
+          "root": {
+            "type": "string"
+          }
+        }
+      },
+      "HostWorkspaceList": {
+        "type": "object",
+        "required": [
+          "workspaces",
+          "workspaceRevision"
+        ],
+        "properties": {
+          "workspaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HostWorkspace"
+            }
+          },
+          "workspaceRevision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "workspaceId": {
+            "type": "string",
+            "description": "Canonical target workspace for a mutation"
+          }
+        }
+      },
+      "HostWorkspacePath": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute path on the Node, within its configured workspace roots"
+          }
+        }
+      },
       "HostView": {
         "type": "object",
         "additionalProperties": true,
         "required": ["hostId", "label", "state", "online"],
         "properties": {
+          "workspaceRevision": { "type": "integer", "minimum": 0 },
+          "workspaces": { "type": "array", "items": { "$ref": "#/components/schemas/HostWorkspace" } },
           "ssh": {
             "type": [
               "object",
@@ -1358,6 +1571,7 @@
         "required": ["name"],
         "properties": {
           "hostId": { "type": "string" },
+          "workspaceId": { "type": "string", "description": "Registered workspace containing the repository; omitted selects the Node default." },
           "name": { "type": "string" },
           "base": { "type": "string", "description": "Start-point (default main)." }
         }

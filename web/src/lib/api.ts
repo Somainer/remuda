@@ -3,7 +3,9 @@ import type { Host, HostCli, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
-import type { Workspace } from "../types/workspace";
+import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
+import { mapWorkspace } from "../features/workspaces/registry";
+import { followWorkspaces } from "../features/workspaces/follow";
 import type { ProviderCreate, ProviderPatch, ProviderTestResult } from "../features/providers";
 import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import type { components, paths } from "./api.generated";
@@ -137,6 +139,8 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
     createdAt: h.lastSeenAt ?? "",
     updatedAt: h.lastSeenAt ?? "",
     label: h.label || h.name || id,
+    workspaces: h.workspaces ?? [],
+    workspaceRevision: h.workspaceRevision ?? 0,
     ownerPrincipalId: "" as Id,
     state,
     transport: { mode: transport, endpointRef: id },
@@ -325,6 +329,7 @@ export type WorktreePage = {
 
 export type WorktreeCreateSpec = {
   hostId?: string;
+  workspaceId?: string;
   name: string;
   base?: string;
 };
@@ -386,6 +391,9 @@ export type HubApi = {
   hostGet(hostId: Id): Promise<Host>;
   hostPatch(hostId: Id, body: { name?: string; labels?: string[]; maxInstances?: number; providerBinding?: string }): Promise<Host>;
   workspaceList(hostId?: Id): Promise<Page<Workspace>>;
+  workspaceRegister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceId?: string; workspaceRevision?: number }>;
+  workspaceUnregister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceRevision?: number }>;
+  hostWorkspaceSubscribe(onSnapshot: (snapshot: WorkspaceSnapshot) => void, refresh: () => void): () => void;
   providerList(q?: { hostId?: string }): Promise<{ items: HubProviderRow[]; nextCursor?: string | null }>;
   providerGet(id: string): Promise<HubProviderRow>;
   providerCreate(body: ProviderCreate): Promise<HubProviderRow>;
@@ -638,7 +646,8 @@ function createMockApi(): HubApi {
     async hostSshAdd() { throw new Error("演示模式无法连接真实 SSH 主机"); },
     async hostRemove() { throw new Error("演示模式无法移除真实 SSH 主机"); },
     async hostList() {
-      return mockPage(mockDb.hosts);
+      return mockPage(mockDb.hosts.map((host) => ({ ...host, workspaces: mockDb.workspaces
+        .filter((w) => w.hostId === host.id).map((w) => ({ workspaceId: w.id, hostId: w.hostId, root: w.rootPath })) })));
     },
     async hostGet(hostId) {
       const found = mockDb.hosts.find((h) => h.id === hostId);
@@ -735,6 +744,19 @@ function createMockApi(): HubApi {
       const items = hostId ? mockDb.workspaces.filter((w) => w.hostId === hostId) : mockDb.workspaces;
       return mockPage(items);
     },
+    async workspaceRegister(hostId, path) {
+      if (!path.startsWith("/")) throw new Error("Workspace path must be absolute");
+      if (!mockDb.workspaces.some((w) => w.hostId === hostId && w.rootPath === path)) {
+        mockDb.workspaces.push(mapWorkspace({ workspaceId: id("wsp_"), hostId, root: path }));
+      }
+      const page = await this.workspaceList(hostId);
+      return { ...page, workspaceId: page.items.find((w) => w.rootPath === path)?.id };
+    },
+    async workspaceUnregister(hostId, path) {
+      mockDb.workspaces = mockDb.workspaces.filter((w) => w.hostId !== hostId || w.rootPath !== path);
+      return this.workspaceList(hostId);
+    },
+    hostWorkspaceSubscribe() { return () => undefined; },
     eventsRead: async ({ journalId, afterSeq, limit }) => mockReadJournal(journalId, afterSeq, limit),
     async eventsSubscribe(journalId, _afterSeq, onBatch) {
       const instance = mockDb.instances.find((i) => i.journalId === journalId);
@@ -1046,34 +1068,25 @@ function createLiveApi(): HubApi {
     },
     async workspaceList(hostId) {
       const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;
-      const trees = await this.worktreeList(hostId).catch(() => ({ items: [] as WorktreeRecord[], workspaceRoot: null as string | null }));
-      const fromHosts: Workspace[] = listed.map((h) => ({
-        id: h.id,
-        revision: "1",
-        createdAt: h.createdAt,
-        updatedAt: h.updatedAt,
-        hostId: h.id,
-        label: h.label,
-        rootPath: h.ssh?.workspaceRoot || trees.workspaceRoot || "/",
-        writePolicy: "default",
-        canonicalRoot: h.ssh?.workspaceRoot ? known(h.ssh.workspaceRoot) : trees.workspaceRoot ? known(trees.workspaceRoot) : unknownKnowledge("none"),
-      }));
-      const fromTrees: Workspace[] = trees.items.map((row) => ({
-        id: row.path as Id,
-        revision: "1",
-        createdAt: "",
-        updatedAt: "",
-        hostId: (row.hostId ?? listed[0]?.id ?? "") as Id,
-        label: row.name,
-        rootPath: row.path,
-        writePolicy: "isolated-worktree",
-        canonicalRoot: known(row.path),
-        worktreeLabel: row.name,
-        branch: row.branch,
-      }));
-      const items = [...fromTrees, ...fromHosts.filter((h) => !fromTrees.some((t) => t.hostId === h.hostId && t.rootPath === h.rootPath))];
+      const items = listed.flatMap((h) => (h.workspaces ?? []).map(mapWorkspace));
+      for (const [key, value] of workspaces) if (!hostId || value.hostId === hostId) workspaces.delete(key);
       for (const w of items) workspaces.set(w.id, w);
       return { items, nextCursor: null };
+    },
+    async workspaceRegister(hostId, path) {
+      const response = await rest<HubJson<"/v1/hosts/{id}/workspaces", "post">>(`/v1/hosts/${encodeURIComponent(hostId)}/workspaces`, {
+        method: "POST", body: JSON.stringify({ path }),
+      });
+      return { items: response.workspaces.map(mapWorkspace), workspaceId: response.workspaceId, workspaceRevision: response.workspaceRevision, nextCursor: null };
+    },
+    async workspaceUnregister(hostId, path) {
+      const response = await rest<HubJson<"/v1/hosts/{id}/workspaces", "delete">>(`/v1/hosts/${encodeURIComponent(hostId)}/workspaces`, {
+        method: "DELETE", body: JSON.stringify({ path }),
+      });
+      return { items: response.workspaces.map(mapWorkspace), workspaceRevision: response.workspaceRevision, nextCursor: null };
+    },
+    hostWorkspaceSubscribe(onSnapshot, refresh) {
+      return followWorkspaces(wsUrl("/v1/follow"), onSnapshot, refresh);
     },
     eventsRead: async (args) => {
       const instanceId = instanceIdOf(args.journalId);

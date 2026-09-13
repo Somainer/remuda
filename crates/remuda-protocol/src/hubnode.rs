@@ -28,6 +28,12 @@ pub const METHOD_NODE_HEARTBEAT: &str = "node.heartbeat";
 pub const METHOD_RUNTIME_HELLO: &str = "runtime.hello";
 /// Alias accepted by Hub for [`METHOD_NODE_HEARTBEAT`].
 pub const METHOD_RUNTIME_HEARTBEAT: &str = "runtime.heartbeat";
+/// Read registered workspace membership on the Node.
+pub const METHOD_WORKSPACE_LIST: &str = "workspace.list";
+/// Prepare or commit persistent workspace registration.
+pub const METHOD_WORKSPACE_REGISTER: &str = "workspace.register";
+/// Prepare or commit persistent workspace removal.
+pub const METHOD_WORKSPACE_UNREGISTER: &str = "workspace.unregister";
 /// Create an Instance on the Node.
 pub const METHOD_INSTANCE_CREATE: &str = "instance.create";
 /// Submit a prompt to an Instance.
@@ -120,6 +126,12 @@ pub enum HubNodeMethod {
     NodeHeartbeat,
     /// [`METHOD_RUNTIME_HEARTBEAT`].
     RuntimeHeartbeat,
+    /// [`METHOD_WORKSPACE_LIST`].
+    WorkspaceList,
+    /// [`METHOD_WORKSPACE_REGISTER`].
+    WorkspaceRegister,
+    /// [`METHOD_WORKSPACE_UNREGISTER`].
+    WorkspaceUnregister,
     /// [`METHOD_INSTANCE_CREATE`].
     InstanceCreate,
     /// [`METHOD_INSTANCE_SEND`].
@@ -144,6 +156,59 @@ pub enum HubNodeMethod {
     TtyResize,
     /// [`METHOD_TTY_ATTACH`].
     TtyAttach,
+}
+
+/// An explicitly sequenced phase of a workspace mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceMutationPhase {
+    /// Validate and persist command intent without changing membership.
+    Prepare,
+    /// Revalidate and persist membership before acknowledging settlement.
+    Commit,
+}
+
+/// `workspace.register` / `workspace.unregister` input (D-023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceMutationParams {
+    /// Stable idempotency identity reused for both phases.
+    pub command_id: String,
+    /// Absolute directory on the Node filesystem.
+    pub path: String,
+    /// Required: commit without a durable prepare is rejected.
+    pub phase: WorkspaceMutationPhase,
+}
+
+/// Registered root projected into a host's inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredWorkspace {
+    /// Stable identity persisted by the Node.
+    pub workspace_id: String,
+    /// Owning Node identity.
+    pub host_id: String,
+    /// Canonical absolute root.
+    pub root: String,
+}
+
+/// Authoritative result of `workspace.list` and workspace mutation phases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRegistryResult {
+    /// Monotonic membership revision for inventory race reconciliation.
+    pub workspace_revision: u64,
+    /// Complete membership snapshot, including an empty registry.
+    pub workspaces: Vec<RegisteredWorkspace>,
+    /// Target workspace identity; absent on reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Echo of the mutation identity; absent on reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// `prepared` or `settled`; absent on reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// `node.auth` params (stdio first frame).
@@ -212,6 +277,12 @@ pub struct NodeHostInventory {
     /// Host identity when not at the params root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_id: Option<String>,
+    /// Authoritative registered workspace snapshot, including an empty registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspaces: Option<Vec<RegisteredWorkspace>>,
+    /// Monotonic Node membership revision for stale inventory rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<u64>,
     /// Best-effort hostname.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -556,6 +627,9 @@ impl HubNodeMethod {
             Self::RuntimeHello => METHOD_RUNTIME_HELLO,
             Self::NodeHeartbeat => METHOD_NODE_HEARTBEAT,
             Self::RuntimeHeartbeat => METHOD_RUNTIME_HEARTBEAT,
+            Self::WorkspaceList => METHOD_WORKSPACE_LIST,
+            Self::WorkspaceRegister => METHOD_WORKSPACE_REGISTER,
+            Self::WorkspaceUnregister => METHOD_WORKSPACE_UNREGISTER,
             Self::InstanceCreate => METHOD_INSTANCE_CREATE,
             Self::InstanceSend => METHOD_INSTANCE_SEND,
             Self::InstanceConfigure => METHOD_INSTANCE_CONFIGURE,
@@ -580,6 +654,9 @@ impl HubNodeMethod {
             METHOD_RUNTIME_HELLO => Self::RuntimeHello,
             METHOD_NODE_HEARTBEAT => Self::NodeHeartbeat,
             METHOD_RUNTIME_HEARTBEAT => Self::RuntimeHeartbeat,
+            METHOD_WORKSPACE_LIST => Self::WorkspaceList,
+            METHOD_WORKSPACE_REGISTER => Self::WorkspaceRegister,
+            METHOD_WORKSPACE_UNREGISTER => Self::WorkspaceUnregister,
             METHOD_INSTANCE_CREATE => Self::InstanceCreate,
             METHOD_INSTANCE_SEND => Self::InstanceSend,
             METHOD_INSTANCE_CONFIGURE => Self::InstanceConfigure,
@@ -826,6 +903,8 @@ mod tests {
             protocol: None,
             host: Some(NodeHostInventory {
                 host_id: Some("hst_01993ab0-0000-7000-8000-000000000004".into()),
+                workspaces: None,
+                workspace_revision: None,
                 hostname: Some("devbox".into()),
                 labels: Some(json!({"region":"sg"})),
                 max_instances: Some(8),

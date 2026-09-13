@@ -165,6 +165,7 @@ where
     if let Some(object) = host.as_object_mut() {
         object.insert("hostId".into(), json!(enrollment.host_id));
     }
+    node.advertise_workspaces(&mut host)?;
     let display_label = opts.display_label.as_deref().unwrap_or(&default_label);
 
     if let Some(token) = token.as_deref() {
@@ -367,7 +368,8 @@ async fn handle_stdio_frame(
                 pump_instance,
             })
         }
-        _ if request.method == "host.doctor"
+        _ if crate::workspace::is_workspace_method(request.method.as_str())
+            || request.method == "host.doctor"
             || crate::worktree::is_worktree_method(request.method.as_str()) =>
         {
             let result =

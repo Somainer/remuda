@@ -179,7 +179,8 @@ pub fn resolve_instance_cwd(
             NodeError::InvalidRequest(format!("workspace root is unusable: {error}"))
         });
     };
-    let candidate = path_guard::absolutize(&workspace_root, Path::new(raw));
+    let expanded = expand_home(raw, std::env::var_os("HOME").as_deref().map(Path::new))?;
+    let candidate = path_guard::absolutize(&workspace_root, &expanded);
     crate::workspace_access_check(&candidate).map_err(|error| {
         NodeError::InvalidRequest(format!(
             "cwd is not a directory or is inaccessible: {error}"
@@ -204,6 +205,25 @@ pub fn resolve_instance_cwd(
         )));
     }
     Ok(resolved)
+}
+
+pub(crate) fn expand_home(raw: &str, home: Option<&Path>) -> Result<PathBuf, NodeError> {
+    let suffix = raw
+        .strip_prefix('~')
+        .filter(|tail| tail.is_empty() || tail.starts_with('/'))
+        .or_else(|| {
+            raw.strip_prefix("$HOME")
+                .filter(|tail| tail.is_empty() || tail.starts_with('/'))
+        });
+    let Some(suffix) = suffix else {
+        return Ok(PathBuf::from(raw));
+    };
+    let home = home.filter(|home| home.is_absolute()).ok_or_else(|| {
+        NodeError::InvalidRequest(
+            "cannot expand cwd: Node HOME is unavailable or not absolute".into(),
+        )
+    })?;
+    Ok(home.join(suffix.trim_start_matches('/')))
 }
 
 fn validate_name(name: &str) -> Result<(), NodeError> {

@@ -171,6 +171,9 @@ async fn worktree_list_and_create_forward_to_node() -> Result<()> {
                 continue;
             }
             if frame.get("method").and_then(Value::as_str) == Some("worktree.create") {
+                assert_eq!(frame["params"]["workspaceId"], "wsp_project_b");
+                assert!(frame["params"].get("repo").is_none());
+                assert!(frame["params"].get("path").is_none());
                 let id = frame.get("id").cloned().unwrap_or(Value::Null);
                 let name = frame["params"]["name"].as_str().unwrap_or("agent");
                 let _ = node
@@ -210,7 +213,8 @@ async fn worktree_list_and_create_forward_to_node() -> Result<()> {
     assert_eq!(listed["items"][0]["name"], json!("existing"));
     assert_eq!(listed["workspaceRoot"], json!("/tmp/repo"));
 
-    let body = json!({ "name": "agent1", "base": "main" }).to_string();
+    let body =
+        json!({ "name": "agent1", "base": "main", "workspaceId": "wsp_project_b" }).to_string();
     let (status, _, created) = http(
         hub.addr,
         "POST",

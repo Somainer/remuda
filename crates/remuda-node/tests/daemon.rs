@@ -121,7 +121,9 @@ fn native_fixture(path: &Path) -> (ServeConfig, std::path::PathBuf, std::path::P
         ("FAKE_CLAUDE_SCRIPT".into(), "ok".into()),
     ]);
     let config = ServeConfig {
-        http: DevServerConfig::loopback(0).with_workspace_root(path.to_path_buf()),
+        http: DevServerConfig::loopback(0)
+            .with_workspace_root(path.to_path_buf())
+            .with_workspace_roots(vec![std::env::temp_dir()]),
         data_dir: path.to_path_buf(),
         drivers: LocalDrivers::Native(native),
     };

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { randomUUID } from "node:crypto";
 import { bootstrapToken, expectCookieSession, login, logout } from "./hub-auth";
 
 test.describe("device pairing", () => {
@@ -43,6 +44,8 @@ test.describe("device pairing", () => {
   });
 
   test("mobile flow: issue pair code, logout, redeem on login", async ({ page }) => {
+    const deviceName = `phone-${randomUUID()}`;
+    const deviceRow = page.getByTestId("settings-device-row").filter({ hasText: deviceName });
     await page.goto("/settings");
     await expect(page.getByTestId("settings-devices")).toBeVisible();
     await page.getByTestId("settings-pair-code").click();
@@ -53,14 +56,17 @@ test.describe("device pairing", () => {
     await expect(page.getByTestId("login-page")).toBeVisible();
     await page.getByTestId("login-tab-pair").click();
     await page.getByTestId("login-pair-code").fill(code);
-    await page.getByTestId("login-device-name").fill("phone");
+    await page.getByTestId("login-device-name").fill(deviceName);
     await page.getByTestId("login-submit").click();
     await expect(page.getByTestId("login-page")).toHaveCount(0);
     await page.goto("/settings");
-    await expect(page.getByTestId("settings-device-row").filter({ hasText: "phone" })).toBeVisible();
+    await expect(deviceRow).toHaveCount(1);
+    await expect(deviceRow).toBeVisible();
     await expectCookieSession(page);
     await page.reload();
-    await expect(page.getByTestId("settings-device-row").filter({ hasText: "phone" })).toBeVisible();
+    await expect(deviceRow).toHaveCount(1);
+    await expect(deviceRow).toBeVisible();
+    await logout(page);
   });
 });
 

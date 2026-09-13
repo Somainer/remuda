@@ -507,6 +507,12 @@ async fn perform_hello(
 ) -> Result<Value, NodeError> {
     let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
     let mut params = encode_hello_params(config, node_epoch, watermarks);
+    if let Some(runtime) = runtime {
+        if !params["host"].is_object() {
+            params["host"] = json!({});
+        }
+        runtime.node.advertise_workspaces(&mut params["host"])?;
+    }
     if let Some(runtime) = runtime.filter(|runtime| runtime.controller.is_some()) {
         params["daemon"] = json!(true);
         params["durable"] = json!(true);
@@ -668,11 +674,15 @@ async fn session_task(
             _ = heartbeat.tick() => {
                 let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
                 let snapshot = runtime_wss::snapshot_watermarks(&watermarks);
-                let frame = rpc_request(
-                    &id,
-                    METHOD_NODE_HEARTBEAT,
-                    encode_heartbeat_params(&config, connection_id.as_deref(), lease_id.as_deref(), &snapshot),
-                );
+                let mut params = encode_heartbeat_params(&config, connection_id.as_deref(), lease_id.as_deref(), &snapshot);
+                if let Some(runtime) = runtime.as_ref() {
+                    if !params["host"].is_object() { params["host"] = json!({}); }
+                    if let Err(error) = runtime.node.advertise_workspaces(&mut params["host"]) {
+                        tracing::error!(%error, "cannot read workspace inventory");
+                        break;
+                    }
+                }
+                let frame = rpc_request(&id, METHOD_NODE_HEARTBEAT, params);
                 if send_ws(&mut stream, &frame).await.is_err()
                     && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err()
                 {

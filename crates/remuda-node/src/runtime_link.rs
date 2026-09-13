@@ -23,6 +23,9 @@ pub async fn attach_runtime(mut link: WssLink, node: DevNode) -> Result<(), Node
 }
 
 async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, NodeError> {
+    if crate::workspace::is_workspace_method(method) {
+        return node.workspace_rpc(method, params);
+    }
     if crate::interactions::is_interaction_method(method) {
         return node.dispatch_interaction(method, params).await;
     }
@@ -130,12 +133,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
         "tty.write" | "instance.keys" | "tty.resize" | "tty.attach" => {
             crate::transport::hubnode::dispatch_method(node, method, params).await
         }
-        method if crate::worktree::is_worktree_method(method) => crate::worktree::handle_rpc(
-            std::path::Path::new(&node.workspace().root_path),
-            method,
-            &params,
-        )
-        .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?,
+        method if crate::worktree::is_worktree_method(method) => node.worktree_rpc(method, &params),
         _ => Ok(json!({ "ok": true })),
     }
 }
@@ -207,7 +205,9 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         .or_else(|| {
             spec.get("workspaceId")
                 .and_then(Value::as_str)
-                .filter(|raw| !raw.is_empty() && !raw.starts_with("ws_"))
+                .filter(|raw| {
+                    !raw.is_empty() && raw.parse::<remuda_protocol::WorkspaceId>().is_err()
+                })
         })
         .map(str::to_string);
     let mut request = CreateInstanceRequest {
@@ -220,7 +220,12 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         command_id: command_id_of(params),
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
-        workspace_id: None,
+        workspace_id: spec
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .filter(|raw| raw.parse::<remuda_protocol::WorkspaceId>().is_ok())
+            .map(str::parse)
+            .transpose()?,
         kind,
         driver,
         model: spec

@@ -35,6 +35,7 @@ mod store;
 mod transport;
 mod tty;
 mod web;
+mod workspaces;
 mod ws;
 
 use crate::alerts::{BlockedWatch, Followers};
@@ -301,7 +302,8 @@ pub fn router(state: AppState) -> Router {
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(providers::routes())
-        .merge(agent_scope::routes());
+        .merge(agent_scope::routes())
+        .merge(workspaces::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }

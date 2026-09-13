@@ -365,11 +365,16 @@ async fn daemon_wss_doctor_returns_workspace_access_report_through_hub() {
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
     let hub = remuda_hub::spawn(HubConfig::for_test(fixture.path().join("hub")))
         .await
         .unwrap();
-    let node =
-        DevNode::new(&DevServerConfig::loopback(0).with_workspace_root(workspace.clone())).unwrap();
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(workspace.clone())
+            .with_workspace_roots(vec![fixture.path().to_path_buf()]),
+    )
+    .unwrap();
     let host_id = node.host().meta.id.as_id().to_string();
     let control = DaemonControl::new().unwrap();
     let lease = control.acquire_outbound().await.unwrap();
@@ -631,6 +636,7 @@ async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     let mut node_config = DevServerConfig::loopback(0);
     node_config.workspace_root = workspace;
+    node_config.workspace_roots = Some(vec![std::env::temp_dir()]);
     let mut native = NativeDriverConfig::new(dir.path().join("node"))
         .with_claude_binary(ensure_workspace_bin("fake-claude"));
     native.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
@@ -792,6 +798,7 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
         .expect("hub");
     let mut node_http = DevServerConfig::loopback(0);
     node_http.workspace_root = workspace;
+    node_http.workspace_roots = Some(vec![std::env::temp_dir()]);
     let mut native = NativeDriverConfig::new(dir.path().join("node"))
         .with_claude_binary(ensure_workspace_bin("fake-claude"));
     native.extra_env.insert(
@@ -1011,7 +1018,9 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         .unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let config = DevServerConfig::loopback(0).with_workspace_root(workspace);
+    let config = DevServerConfig::loopback(0)
+        .with_workspace_root(workspace)
+        .with_workspace_roots(vec![std::env::temp_dir()]);
     let native = NativeDriverConfig::new(dir.path().join("node"))
         .with_claude_binary(ensure_workspace_bin("fake-claude"));
     let node = DevNode::with_parts(

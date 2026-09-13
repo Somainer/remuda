@@ -131,6 +131,8 @@ async fn inbound_fixture_creates_instance_and_posts_progress_card() {
                     kernel: None,
                     libc: None,
                     label: Some("fake-node".into()),
+                    workspaces: None,
+                    workspace_revision: None,
                 }),
                 capabilities: None,
                 cli: None,

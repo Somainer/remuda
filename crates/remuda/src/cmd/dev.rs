@@ -8,9 +8,8 @@ use crate::{
 use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 use remuda_node::{
-    DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, WssConfig, WssLink,
-    apply_hello_result, dev_router, load_or_create_enrollment, native_driver_registry,
-    save_enrollment,
+    DevNode, MemoryStore, NativeDriverConfig, WssConfig, WssLink, apply_hello_result, dev_router,
+    load_or_create_enrollment, native_driver_registry, save_enrollment,
 };
 use remuda_protocol::HostId;
 use serde_json::json;
@@ -47,9 +46,12 @@ pub(crate) struct Args {
     /// Allowed development browser origin; repeatable.
     #[arg(long = "web-origin")]
     web_origins: Vec<String>,
-    /// Workspace root advertised by the local Node.
-    #[arg(long)]
-    workspace: Option<PathBuf>,
+    /// Existing absolute workspace root merged into the registry; repeatable.
+    #[arg(long = "workspace")]
+    workspaces: Vec<PathBuf>,
+    /// Allowed absolute registration root; repeatable. Defaults to Node HOME.
+    #[arg(long = "workspace-root")]
+    workspace_roots: Vec<PathBuf>,
     /// Serve Hub web assets from this directory (typically `web/dist`).
     #[arg(long)]
     web_root: Option<PathBuf>,
@@ -76,9 +78,7 @@ impl Args {
         if let Some(path) = &self.access_code_file {
             config.hub.bootstrap_token = Some(SecretRef::File(path.clone()));
         }
-        if let Some(root) = &self.workspace {
-            config.node.workspace = root.clone();
-        }
+        node::apply_workspaces(config, &self.workspaces, &self.workspace_roots)?;
         if let Some(root) = &self.web_root {
             config.hub.web_root = Some(root.clone());
         }
@@ -125,8 +125,8 @@ pub(crate) async fn run(
     let mut origins = config.node.web_origins.clone();
     origins.push(format!("http://{}", running_hub.addr));
     origins.push(format!("http://localhost:{}", running_hub.addr.port()));
-    let mut node_config = DevServerConfig::loopback(config.node.listen.port())
-        .with_workspace_root(config.node.workspace.clone())
+    let mut node_config = node::workspace_config(&config, config.node.listen.port())
+        .with_workspace_registry(config.data_dir.join("node"))
         .with_allowed_origins(origins)?
         .with_access_code(running_hub.bootstrap_token.clone())?;
     node_config.bind_addr = config.node.listen;
@@ -349,7 +349,8 @@ mod tests {
             dev_bind_lan: false,
             access_code_file: None,
             web_origins: Vec::new(),
-            workspace: None,
+            workspaces: Vec::new(),
+            workspace_roots: Vec::new(),
             web_root: None,
             labels: Vec::new(),
         };

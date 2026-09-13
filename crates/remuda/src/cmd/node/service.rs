@@ -191,6 +191,9 @@ fn daemon_config(config: &Config) -> Result<PathBuf> {
     #[derive(serde::Serialize)]
     struct PersistedNode<'a> {
         workspace: &'a Path,
+        workspaces: &'a [PathBuf],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_roots: Option<&'a [PathBuf]>,
         auto_trust_registered_workspaces: bool,
         labels: &'a BTreeMap<String, String>,
         max_instances: usize,
@@ -214,6 +217,8 @@ fn daemon_config(config: &Config) -> Result<PathBuf> {
         shutdown_timeout_secs: config.shutdown_timeout_secs,
         node: PersistedNode {
             workspace: &config.node.workspace,
+            workspaces: &config.node.workspaces,
+            workspace_roots: config.node.workspace_roots.as_deref(),
             auto_trust_registered_workspaces: config.node.auto_trust_registered_workspaces,
             labels: &config.node.labels,
             max_instances: config.node.max_instances,
@@ -276,12 +281,13 @@ async fn install_service(mut config: Config, args: Args, install: InstallArgs) -
     let launchd = install.manager.launchd()?;
     if launchd {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        if let Some(message) = remuda_node::macos_workspace_guidance(
-            &config.node.workspace,
-            home.as_deref(),
-            &std::env::current_exe()?,
-        ) {
-            eprintln!("warning: {message}");
+        let executable = std::env::current_exe()?;
+        for workspace in std::iter::once(&config.node.workspace).chain(&config.node.workspaces) {
+            if let Some(message) =
+                remuda_node::macos_workspace_guidance(workspace, home.as_deref(), &executable)
+            {
+                eprintln!("warning: {message}");
+            }
         }
     }
     if let Some(hub) = install.hub {
@@ -551,10 +557,14 @@ mod tests {
             ..Config::default()
         };
         config.node.host_token = Some(SecretRef::File(fixture.path().join("node/host-token")));
+        config.node.workspaces = vec![fixture.path().join("project")];
+        config.node.workspace_roots = Some(vec![fixture.path().to_owned()]);
         let path = daemon_config(&config).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let loaded: Config = toml::from_str(&text).unwrap();
         assert_eq!(loaded.node.host_token, config.node.host_token);
+        assert_eq!(loaded.node.workspaces, config.node.workspaces);
+        assert_eq!(loaded.node.workspace_roots, config.node.workspace_roots);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

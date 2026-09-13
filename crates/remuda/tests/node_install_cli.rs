@@ -21,6 +21,8 @@ async fn macos_install_warns_for_protected_workspaces_before_starting_a_service(
                 .arg("--data-dir")
                 .arg(&data)
                 .args(["node", "install", "--launchd", "--workspace"])
+                .arg(home.join("src"))
+                .arg("--workspace")
                 .arg(home.join(folder).join("workspace"))
                 .args(["--hub", "invalid://fixture"])
                 .kill_on_drop(true)

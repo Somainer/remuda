@@ -120,6 +120,9 @@ async fn dispatch_hub(
     if method == "host.doctor" {
         return runtime.node.doctor().await;
     }
+    if crate::workspace::is_workspace_method(method) {
+        return runtime.node.workspace_rpc(method, params);
+    }
     if crate::interactions::is_interaction_method(method) {
         let result = runtime.node.dispatch_interaction(method, params).await?;
         if let Ok(page) = runtime.node.list_instances() {
@@ -181,12 +184,9 @@ async fn dispatch_hub(
             catch_up(runtime, &instance_id).await?;
             Ok(result)
         }
-        _ if crate::worktree::is_worktree_method(method) => crate::worktree::handle_rpc(
-            std::path::Path::new(&runtime.node.workspace().root_path),
-            method,
-            &params,
-        )
-        .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?,
+        _ if crate::worktree::is_worktree_method(method) => {
+            runtime.node.worktree_rpc(method, &params)
+        }
         _ => Ok(json!({ "ok": true })),
     }
 }
@@ -261,7 +261,12 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .map_err(|err| NodeError::InvalidRequest(err.to_string()))?,
         instance_id,
         host_id: Some(node.host().meta.id.clone()),
-        workspace_id: None,
+        workspace_id: spec
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .filter(|raw| raw.parse::<remuda_protocol::WorkspaceId>().is_ok())
+            .map(str::parse)
+            .transpose()?,
         kind,
         driver,
         model,
@@ -541,7 +546,7 @@ fn cwd_of(spec: &Value) -> Option<String> {
         let Some(raw) = spec.get(key).and_then(Value::as_str) else {
             continue;
         };
-        if raw.is_empty() || raw.starts_with("ws_") {
+        if raw.is_empty() || raw.parse::<remuda_protocol::WorkspaceId>().is_ok() {
             continue;
         }
         return Some(raw.to_owned());

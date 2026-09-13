@@ -26,6 +26,7 @@ mod stdio;
 mod store;
 mod transport;
 mod tty;
+mod workspace;
 mod workspace_access;
 mod worktree;
 

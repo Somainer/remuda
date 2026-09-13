@@ -141,6 +141,7 @@ async fn fake_node(
             .context("authorization header")?,
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    let workspaces = json!([{ "workspaceId": "wsp_e2e", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e" }]);
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
@@ -152,6 +153,8 @@ async fn fake_node(
                 "label": "e2e-fake-node",
                 "host": {
                     "hostname": "e2e-fake-node.local",
+                    "workspaceRevision": 1,
+                    "workspaces": workspaces,
                     "labels": { "role": "e2e" },
                     "maxInstances": 4,
                     "cli": [{
@@ -199,6 +202,14 @@ async fn fake_node(
             .unwrap_or("")
             .to_string();
         match method {
+            "workspace.list" => {
+                send_rpc_ok(
+                    &mut ws,
+                    id,
+                    json!({"workspaceRevision": 1, "workspaces": workspaces}),
+                )
+                .await?;
+            }
             "instance.create" => {
                 let prompt = params
                     .pointer("/initialInput/text")

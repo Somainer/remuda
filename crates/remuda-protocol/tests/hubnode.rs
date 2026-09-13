@@ -128,3 +128,36 @@ fn ws_bearer_and_stdio_auth_are_documented() {
         Some("secret")
     );
 }
+
+#[test]
+fn workspace_methods_require_explicit_mutation_phase() {
+    use remuda_protocol::hubnode::{
+        WorkspaceMutationParams, WorkspaceMutationPhase, WorkspaceRegistryResult,
+    };
+    for method in [
+        "workspace.list",
+        "workspace.register",
+        "workspace.unregister",
+    ] {
+        let kind = HubNodeMethod::parse(method).unwrap();
+        assert_eq!(kind.as_str(), method);
+        assert!(!kind.is_instance());
+    }
+    let params: WorkspaceMutationParams = serde_json::from_value(serde_json::json!({
+        "commandId":"cmd-workspace", "path":"/home/dev/project", "phase":"prepare"
+    }))
+    .unwrap();
+    assert_eq!(params.phase, WorkspaceMutationPhase::Prepare);
+    assert!(
+        serde_json::from_value::<WorkspaceMutationParams>(serde_json::json!({
+            "commandId":"cmd-workspace", "path":"/home/dev/project"
+        }))
+        .is_err()
+    );
+    let result: WorkspaceRegistryResult = serde_json::from_value(serde_json::json!({
+        "workspaceRevision":2, "workspaces":[], "commandId":"cmd-workspace", "phase":"settled"
+    }))
+    .unwrap();
+    assert_eq!(result.workspace_revision, 2);
+    assert_eq!(result.phase.as_deref(), Some("settled"));
+}

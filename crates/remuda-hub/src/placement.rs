@@ -402,6 +402,8 @@ mod tests {
 
     fn host(id: &str, online: bool, labels: &[&str], herdr: bool, max: i64) -> HostRecord {
         HostRecord {
+            workspaces: Vec::new(),
+            workspace_revision: 0,
             ssh: None,
             last_error: None,
             host_id: id.into(),

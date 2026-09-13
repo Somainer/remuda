@@ -180,16 +180,14 @@ pub async fn dispatch_method(
     method: &str,
     params: Value,
 ) -> Result<Value, NodeError> {
+    if crate::workspace::is_workspace_method(method) {
+        return node.workspace_rpc(method, params);
+    }
     if method == "host.doctor" {
         return node.doctor().await;
     }
     if crate::worktree::is_worktree_method(method) {
-        return crate::worktree::handle_rpc(
-            std::path::Path::new(&node.workspace().root_path),
-            method,
-            &params,
-        )
-        .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?;
+        return node.worktree_rpc(method, &params);
     }
     if method == "instance.close" {
         let origin = crate::origin::wire_origin(&params);
@@ -274,7 +272,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
         if obj
             .get("workspaceId")
             .and_then(Value::as_str)
-            .is_some_and(|raw| !raw.starts_with("ws_"))
+            .is_some_and(|raw| raw.parse::<remuda_protocol::WorkspaceId>().is_err())
         {
             obj.remove("workspaceId");
         }
@@ -308,6 +306,13 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
         },
     };
     request.apply_spec_launch_fields(&spec);
+    if request.workspace_id.is_none() {
+        request.workspace_id = spec
+            .get("workspaceId")
+            .or_else(|| params.get("workspaceId"))
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse().ok());
+    }
     request.origin = crate::origin::wire_origin(&params);
     request.agent_credential = params
         .get("agentCredential")
@@ -322,7 +327,9 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             .or_else(|| {
                 spec.get("workspaceId")
                     .and_then(Value::as_str)
-                    .filter(|raw| !raw.is_empty() && !raw.starts_with("ws_"))
+                    .filter(|raw| {
+                        !raw.is_empty() && raw.parse::<remuda_protocol::WorkspaceId>().is_err()
+                    })
             })
             .map(str::to_string);
     }
@@ -367,7 +374,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
     }
     // Hub routed this RPC to this Node; bind create to the local Host/Workspace.
     request.host_id = Some(node.host().meta.id.clone());
-    request.workspace_id = Some(node.workspace().meta.id.clone());
+    // Preserve a selected registered workspace; absent selection resolves from cwd.
     serde_json::to_value(node.create_instance(request).await?).map_err(NodeError::from)
 }
 

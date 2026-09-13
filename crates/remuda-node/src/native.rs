@@ -902,7 +902,9 @@ mod tests {
         let other_before = clients[1].session_snapshot().await.unwrap();
         let first_dir = root.path().join("first");
         let node = crate::compose(&crate::ServeConfig::native(
-            crate::DevServerConfig::loopback(0).with_workspace_root(first_dir.clone()),
+            crate::DevServerConfig::loopback(0)
+                .with_workspace_root(first_dir.clone())
+                .with_workspace_roots(vec![root.path().to_path_buf()]),
             first_dir,
         ))
         .unwrap();

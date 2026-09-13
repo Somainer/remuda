@@ -15,6 +15,12 @@ pub struct DevServerConfig {
     pub allowed_origins: Vec<String>,
     /// Workspace exposed by the single development registry entry.
     pub workspace_root: PathBuf,
+    /// Additional startup roots merged into the persistent registry.
+    pub workspaces: Vec<PathBuf>,
+    /// Allowed registration parents; absent defaults to the Node HOME.
+    pub workspace_roots: Option<Vec<PathBuf>>,
+    /// Data directory containing the persistent workspace registry.
+    pub workspace_registry: Option<PathBuf>,
     /// Capacity of each instance's independent driver command queue.
     pub instance_queue_capacity: usize,
     /// Capacity of each instance's journal broadcast ring.
@@ -32,6 +38,9 @@ impl DevServerConfig {
                 "http://127.0.0.1:5173".to_owned(),
             ],
             workspace_root: PathBuf::from("."),
+            workspaces: Vec::new(),
+            workspace_roots: None,
+            workspace_registry: None,
             instance_queue_capacity: 32,
             follow_buffer_capacity: 256,
             access_code: None,
@@ -60,6 +69,24 @@ impl DevServerConfig {
     /// Set the development workspace root advertised by the local registry.
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = root;
+        self
+    }
+
+    /// Merge additional operator-configured workspace roots at startup.
+    pub fn with_workspaces(mut self, roots: Vec<PathBuf>) -> Self {
+        self.workspaces = roots;
+        self
+    }
+
+    /// Bound registration to canonical descendants of these absolute directories.
+    pub fn with_workspace_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.workspace_roots = Some(roots);
+        self
+    }
+
+    /// Persist workspace membership and command receipts in this Node data directory.
+    pub fn with_workspace_registry(mut self, data_dir: PathBuf) -> Self {
+        self.workspace_registry = Some(data_dir);
         self
     }
 

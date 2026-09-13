@@ -43,9 +43,12 @@ pub(crate) struct Args {
     /// Explicit Herdr server socket included in the inventory.
     #[arg(long, global = true)]
     herdr_socket: Option<PathBuf>,
-    /// Directory registered for Instances managed by this Node.
-    #[arg(long, global = true)]
-    workspace: Option<PathBuf>,
+    /// Existing absolute workspace path to merge into the registry; repeatable.
+    #[arg(long = "workspace", global = true)]
+    workspaces: Vec<PathBuf>,
+    /// Allowed absolute registration root; repeatable. Defaults to Node HOME.
+    #[arg(long = "workspace-root", global = true)]
+    workspace_roots: Vec<PathBuf>,
 }
 
 impl Args {
@@ -62,16 +65,41 @@ impl Args {
         if let Some(path) = &self.herdr_socket {
             config.node.herdr_socket = Some(path.clone());
         }
-        if let Some(path) = &self.workspace {
-            ensure!(!path.as_os_str().is_empty(), "workspace cannot be empty");
-            config.node.workspace = if path.is_absolute() {
-                path.clone()
-            } else {
-                std::env::current_dir()?.join(path)
-            };
-        }
+        apply_workspaces(config, &self.workspaces, &self.workspace_roots)?;
         config.node.labels.extend(parse_labels(&self.labels)?);
         config.validate()
+    }
+}
+
+pub(crate) fn apply_workspaces(
+    config: &mut Config,
+    workspaces: &[PathBuf],
+    roots: &[PathBuf],
+) -> anyhow::Result<()> {
+    ensure!(
+        workspaces
+            .iter()
+            .chain(roots)
+            .all(|path| path.is_absolute()),
+        "--workspace and --workspace-root require absolute paths"
+    );
+    if let Some((first, rest)) = workspaces.split_first() {
+        config.node.workspace = first.clone();
+        config.node.workspaces.extend_from_slice(rest);
+    }
+    if !roots.is_empty() {
+        config.node.workspace_roots = Some(roots.to_vec());
+    }
+    Ok(())
+}
+
+pub(crate) fn workspace_config(config: &Config, port: u16) -> DevServerConfig {
+    let http = DevServerConfig::loopback(port)
+        .with_workspace_root(config.node.workspace.clone())
+        .with_workspaces(config.node.workspaces.clone());
+    match &config.node.workspace_roots {
+        Some(roots) => http.with_workspace_roots(roots.clone()),
+        None => http,
     }
 }
 
@@ -116,9 +144,8 @@ pub(crate) async fn run(
         native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
         native.herdr_orphan_sweep &= !args.no_herdr_orphan_sweep;
         native.herdr_socket_dir = Some(config.data_dir.join("herdr"));
-        remuda_node::prepare_workspace(&config.node.workspace)?;
         let runtime = compose(&ServeConfig {
-            http: DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone()),
+            http: workspace_config(&config, 0),
             data_dir: config.data_dir.clone(),
             drivers: remuda_node::LocalDrivers::Native(native),
         })?;
@@ -146,7 +173,7 @@ pub(crate) async fn run(
         .resolve()
         .context("node requires a host token or bootstrap secret reference")?
         .into_string();
-    let http = DevServerConfig::loopback(0).with_workspace_root(config.node.workspace.clone());
+    let http = workspace_config(&config, 0);
     let mut service = ServeConfig::native(http, config.data_dir.clone());
     if let remuda_node::LocalDrivers::Native(native) = &mut service.drivers {
         native.auto_trust_registered_workspaces = config.node.auto_trust_registered_workspaces;
@@ -434,12 +461,39 @@ mod tests {
             labels: vec!["region=cli".into()],
             max_instances: Some(3),
             herdr_socket: None,
-            workspace: None,
+            workspaces: Vec::new(),
+            workspace_roots: Vec::new(),
         };
         args.apply(&mut config).expect("CLI overrides");
         assert_eq!(config.node.labels["region"], "cli");
         assert_eq!(config.node.labels["gpu"], "none");
         assert_eq!(config.node.max_instances, 3);
+    }
+
+    #[test]
+    fn workspace_flags_merge_roots_and_reject_relative_paths() {
+        let mut config = Config::default();
+        config.node.workspaces = vec!["/tmp/remuda-existing".into()];
+        apply_workspaces(
+            &mut config,
+            &["/tmp/remuda-first".into(), "/tmp/remuda-second".into()],
+            &["/tmp".into()],
+        )
+        .unwrap();
+        assert_eq!(config.node.workspace, PathBuf::from("/tmp/remuda-first"));
+        assert_eq!(
+            config.node.workspaces,
+            vec![
+                PathBuf::from("/tmp/remuda-existing"),
+                PathBuf::from("/tmp/remuda-second")
+            ]
+        );
+        assert_eq!(
+            config.node.workspace_roots,
+            Some(vec![PathBuf::from("/tmp")])
+        );
+        assert!(apply_workspaces(&mut config, &["relative".into()], &[]).is_err());
+        assert!(apply_workspaces(&mut config, &[], &["relative".into()]).is_err());
     }
 
     #[tokio::test]

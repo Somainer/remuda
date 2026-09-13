@@ -62,10 +62,18 @@ pub struct HubConfig {
     /// Offline grace before stale instances exit with reason host-lost (default ten minutes).
     #[serde(default = "default_host_lost_grace_ms")]
     pub host_lost_grace_ms: u64,
+    /// How long a `requested` instance may wait for a Node receipt before it
+    /// expires to `failed` and stops holding a placement slot (default five minutes).
+    #[serde(default = "default_requested_grace_ms")]
+    pub requested_grace_ms: u64,
 }
 
 fn default_host_lost_grace_ms() -> u64 {
     600_000
+}
+
+fn default_requested_grace_ms() -> u64 {
+    crate::store::REQUESTED_SLOT_WINDOW_MS
 }
 
 fn default_push_block_ms() -> u64 {
@@ -111,6 +119,7 @@ impl Default for HubConfig {
             command_accept_timeout_ms: default_command_accept_timeout_ms(),
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
+            requested_grace_ms: default_requested_grace_ms(),
         }
     }
 }
@@ -135,6 +144,7 @@ impl HubConfig {
             command_accept_timeout_ms: default_command_accept_timeout_ms(),
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
+            requested_grace_ms: default_requested_grace_ms(),
         }
     }
 

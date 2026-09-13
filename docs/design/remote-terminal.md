@@ -55,6 +55,42 @@ On attach the Hub/Node **replays a snapshot first**, then live frames.
 - Snapshot = a full-screen ANSI paint (herdr `terminal.frame` with `full: true`) **or** a bounded replay of the last **256 KiB** of PTY/ANSI bytes.
 - The client **must reset the emulator** before writing snapshot bytes, then treat later frames as live.
 - Snapshot and live frames use the same binary output envelope. The first output frame after attach has `offset = availableFrom`. Live frames continue from `nextOffset`.
+- When the Node cannot be reached (offline, `tty.attach` failed), the Hub falls back to **its own** bounded output cache and sends it as a JSON text frame, because with no `streamId` from the Node there is no UUID to address a binary frame to:
+
+  ```json
+  { "type": "tty.snapshot", "instanceId": "ins_…", "source": "hub-cache", "dataBase64": "…" }
+  ```
+
+  Treat it exactly like a snapshot: reset the emulator, write the decoded bytes, then wait for live frames. It is a last resort — a live attach always wins — and it is the only snapshot frame that is not binary.
+
+### Diagnostics
+
+Input and resize failures are reported instead of being dropped. The Hub sends a JSON text frame on the follow socket:
+
+```json
+{ "type": "tty.diagnostic", "instanceId": "ins_…", "operation": "tty.write",
+  "reason": "node-offline", "detail": "no live Node session for this host" }
+```
+
+`operation` is `tty.write` or `tty.resize`. `reason` is one of:
+
+| `reason` | Meaning |
+| --- | --- |
+| `malformed-frame` | the binary input frame did not decode |
+| `wrong-channel` | input arrived on a channel other than `3` |
+| `payload-too-large` | payload exceeds `limits.maxTtyInputBytes` |
+| `unbound-stream` | no instance is bound to that stream UUID and nothing is subscribed |
+| `unknown-instance` | the Hub has no record of the instance |
+| `lookup-failed` | the Hub could not read the instance row |
+| `node-offline` | no live Node session for the owning host |
+| `node-error` | the Node rejected the call; `detail` carries its message |
+| `call-failed` | the Hub→Node RPC itself failed |
+
+A client that ignores these frames behaves exactly as before; a client that shows them tells the user why the keyboard stopped working. Every case also logs a `tracing::warn!` on the Hub with the instance, host, and operation.
+
+### Stream binding across a Node reconnect
+
+The stream UUID → instance binding is held by the Hub against the **host**, not against the Node socket. A Node restart replaces the socket but keeps the host id, so a follow socket that was already open keeps receiving output as soon as the Node re-announces its streams (`tty.frame` with a `streamId`, i.e. `TtyEvent::Open`) — a re-attach also re-binds. A different host can still never push onto a stream it did not register.
 
 ### Instance kind
 
@@ -84,6 +120,58 @@ All three hit the same PTY write with `acceptance.scope = tty-bytes`. ACK does n
 ### Resize
 
 `tty.resize` is a state setting, not a Command. Older `resizeRevision` values (when present) are ignored; a body of `{cols, rows}` is enough on the follow socket. Default size before the first resize is 80×24.
+
+### Placement capacity
+
+A terminal is an Instance, so it is subject to the host's `maxInstances` ceiling. Two rules keep that ceiling honest:
+
+- **Only Node-confirmed instances hold a slot** — `preparing`, `starting`, `ready`/`running`, `closing`, `reconciling`. A `requested` row is a Hub-side intent the Node has not acknowledged; counting those let stale creates wedge a host at its cap indefinitely. A `requested` row still counts inside the insert guard while it is younger than five minutes, so a burst of concurrent creates cannot overshoot.
+- **Unacknowledged creates expire.** A `requested` instance with no Node receipt after `requestedGraceMs` (default five minutes) becomes `failed` with `lastError: "create-never-acknowledged"` and a Hub-authored journal diagnostic. The Hub also sweeps once at startup, so a restart does not inherit yesterday's zombies.
+
+The operator ceiling is set with `PATCH /v1/hosts/{id} {"maxInstances": N}`. It is stored separately from the value a Node advertises in its inventory, so neither a `node.hello`/heartbeat nor a Hub restart resets it.
+
+### Deleting a session
+
+`DELETE /v1/instances/{id}` permanently removes a session. Human and Bot
+devices only — agents receive `403`, including for their own instance, so an
+agent can never erase its own trail.
+
+| Condition | Result |
+| --- | --- |
+| lifecycle `exited` / `failed` / `closed` | deleted |
+| still live, no `force` | `409`, nothing removed |
+| still live, `?force=1` | stopped (settled `exited`, `lastError: deleted-by-operator`) then deleted |
+| already deleted | `404` — a repeated `DELETE` is idempotent |
+
+What is removed:
+
+- **Hub**: the instance row, its journal, queued commands, interactions, and
+  fleet membership. Leaving any of them behind would resurrect the session in a
+  list view or keep a command queued against an id that no longer exists.
+- **Node**, via `instance.purge`: its own instance/command/recipe rows and the
+  per-instance data directory (`<data_dir>/instances/<id>`: launch artifacts,
+  overlays, pty logs).
+- **Never**: the agent's own native transcripts under the user's home
+  (`~/.claude`, `~/.codex`, …). Deleting a Remuda session must not delete the
+  user's own agent history.
+
+A Node that is offline or rejects the purge does not block the delete — the Hub
+row is what the user asked to remove, and the response reports which happened
+in `nodePurge` (`purged` / `node-offline` / `node-rejected` / `purge-failed`).
+
+Because the delete removes the journal, the record of *who* deleted it goes to
+the Hub's `audit_log` table instead: device id, action `instance.delete`,
+subject, and whether it was forced.
+
+### Lost instances after a Node restart
+
+A Node restart loses every in-memory instance while the Hub still holds `running` rows for them. Those rows never settle, never release their slot, and a later stop hangs. Three mechanisms close that:
+
+1. **Reconcile on hello.** When `node.hello` announces a `nodeEpoch` different from the one recorded for the host *and* carries an `instances` inventory, every live Hub row the Node no longer lists becomes `exited` with `lastError: "node-epoch-changed"` plus a journal diagnostic `node_epoch_changed` (`payload.origin = "hub"`). A hello without an inventory reconciles nothing — a stateless Node must not wipe rows it simply never enumerates.
+2. **Stops always settle.** If the Node answers `instance.close` / `instance.cancel` with a not-found error (`-32004`), the Hub projects the row to `exited` with `lastError: "node-lost-instance"` and marks the command `settled`. The caller gets an answer instead of a command that hangs forever.
+3. **Requested rows expire** (see above).
+
+All three are Hub-owned projections: they set the Hub's view and append a `payload.origin = "hub"` diagnostic, and never forge a Node journal cursor or a native completion. That is safe precisely because the Node that owned those rows will never emit another observation for them.
 
 ### Permissions
 

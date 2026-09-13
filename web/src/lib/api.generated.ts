@@ -378,7 +378,11 @@ export interface paths {
         get: operations["instanceGet"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Permanently delete a session
+         * @description Removes the Hub record (journal, commands, interactions, fleet membership) and asks the owning Node to purge its per-instance data directory. The agent's own native transcripts under the user's home are never touched. Human and Bot devices only; agents receive 403. A live Instance is refused with 409 unless `force=1`, which stops it and settles it as `exited` first. A repeated delete returns 404, so the call is idempotent.
+         */
+        delete: operations["instanceDelete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -821,6 +825,16 @@ export interface components {
             command: components["schemas"]["CommandRecord"];
             hostId?: string;
             instance: components["schemas"]["InstanceRecord"];
+        };
+        InstanceDeleted: {
+            /** @constant */
+            deleted: true;
+            instanceId: string;
+            /**
+             * @description Outcome of the Node `instance.purge` call; the Hub record is deleted either way.
+             * @enum {string}
+             */
+            nodePurge?: "purged" | "node-offline" | "node-rejected" | "purge-failed";
         };
         InstanceMcpToken: {
             /** @constant */
@@ -1806,6 +1820,35 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    instanceDelete: {
+        parameters: {
+            query?: {
+                /** @description `force=1` stops a live Instance before deleting it. */
+                force?: 1;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceDeleted"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     instanceCommand: {

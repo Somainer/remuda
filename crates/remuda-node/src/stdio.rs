@@ -368,6 +368,14 @@ async fn handle_stdio_frame(
                 pump_instance,
             })
         }
+        _ if request.method == "instance.purge" => {
+            let result =
+                hubnode_codec::dispatch_method(node, request.method.as_str(), params).await;
+            Ok(FrameOutcome {
+                response: response_for(id, result),
+                pump_instance: None,
+            })
+        }
         _ if crate::workspace::is_workspace_method(request.method.as_str())
             || request.method == "host.doctor"
             || crate::worktree::is_worktree_method(request.method.as_str()) =>

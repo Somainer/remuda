@@ -1419,3 +1419,130 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     link.shutdown().await;
     hub.shutdown().await;
 }
+
+/// A runtime Node must announce its instance inventory on **every** hello, not
+/// only when it is a daemon.
+///
+/// Without it the Hub sees a new `nodeEpoch` with nothing to compare against and
+/// refuses to reconcile (it must not wipe rows a stateless Node simply never
+/// enumerates), so instances the Node lost stay `running` forever and keep
+/// holding placement slots — the zombie wedge seen on the demo.
+#[tokio::test]
+async fn runtime_hello_always_reports_the_instance_inventory() {
+    use remuda_node::{DevNode, DevServerConfig};
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("data")))
+        .await
+        .expect("hub");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("dev node");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let mut config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
+    config.backoff = Backoff {
+        initial: Duration::from_millis(5),
+        max: Duration::from_millis(20),
+        jitter_ppt: 0,
+    };
+
+    let link = tokio::time::timeout(
+        TIMEOUT,
+        WssLink::connect_runtime(config.clone(), node.clone()),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("runtime connect");
+    let token = link
+        .node_token
+        .clone()
+        .expect("first hello returns a host token");
+
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+    let create = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "claude-print",
+        "model": "haiku",
+        "prompt": "inventory"
+    })
+    .to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        Some(&create),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim()).expect("create json");
+    let known = created["instance"]["instanceId"]
+        .as_str()
+        .expect("instanceId")
+        .to_owned();
+
+    // Take the link down, then create a second instance the Node can never
+    // learn about: the Hub indexes the row, but the create is not forwarded.
+    tokio::time::timeout(TIMEOUT, link.shutdown())
+        .await
+        .expect("shutdown timeout");
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        Some(&create),
+    )
+    .await;
+    let orphan = match status {
+        200 => serde_json::from_str::<Value>(body.trim())
+            .ok()
+            .and_then(|value| value["instance"]["instanceId"].as_str().map(str::to_string)),
+        _ => None,
+    };
+
+    // Reconnect as a plain runtime Node — no daemon controller anywhere — so
+    // the reconcile can only work if a non-daemon hello carries `instances`.
+    config.token = token;
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(config, node.clone()))
+        .await
+        .expect("reconnect timeout")
+        .expect("reannounce");
+
+    let instance_state = |id: String| {
+        let cookie = cookie.clone();
+        let addr = hub.addr;
+        async move {
+            let (status, body) = http(
+                addr,
+                "GET",
+                &format!("/v1/instances/{id}"),
+                &[("Cookie", cookie.as_str())],
+                None,
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str::<Value>(body.trim()).expect("instance json")
+        }
+    };
+
+    // The instance the Node still holds must survive the reconcile.
+    let kept = instance_state(known.clone()).await;
+    assert_ne!(
+        kept["lifecycle"], "exited",
+        "a reported instance must survive the reconcile: {kept}"
+    );
+
+    // The one it never received must be reconciled away, which only happens
+    // when the hello actually carried an inventory to compare against.
+    if let Some(orphan) = orphan {
+        let row = instance_state(orphan.clone()).await;
+        assert_eq!(
+            row["lifecycle"], "exited",
+            "an instance the node never received must be reconciled: {row}"
+        );
+        assert_eq!(row["lastError"], "node-epoch-changed", "{row}");
+    }
+
+    link.shutdown().await;
+    hub.shutdown().await;
+}

@@ -891,6 +891,12 @@ async fn dispatch_rpc(
             let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
             submit_rpc_command(node, &params, instance_id, CommandAction::Close, None).await
         }
+        "instance.purge" => {
+            // Hub-driven session deletion. Idempotent: purging an Instance this
+            // Node never had reports `purged: false` rather than failing.
+            let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
+            node.purge_instance(&instance_id).await
+        }
         "command.get" => {
             let command_id = parse_id_field::<CommandId>(&params, "commandId")?;
             serde_json::to_value(node.get_command(&command_id)?).map_err(NodeError::from)

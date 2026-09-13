@@ -205,9 +205,15 @@ fn consider(
         .map(|(_, n)| *n)
         .unwrap_or(host.instance_count);
     if running_n >= host.max_instances {
+        // `running_n` counts only Node-confirmed live instances plus creates
+        // still inside their acknowledgement window, so this is a real
+        // ceiling, not a pile of stale `requested` rows (see
+        // `store::LIVE_INSTANCE_COUNT_SQL`). Raise it with
+        // `PATCH /v1/hosts/{id} {"maxInstances":N}`, which now persists across
+        // Node hello and Hub restarts.
         return Err(format!(
-            "{}: at maxInstances {}",
-            host.host_id, host.max_instances
+            "{}: at maxInstances {} ({running_n} live); raise it with PATCH /v1/hosts/{}",
+            host.host_id, host.max_instances, host.host_id
         ));
     }
     if host.ssh.is_some() && spec.driver == "generic-pty" && !has_herdr(host) {

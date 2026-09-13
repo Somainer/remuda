@@ -189,6 +189,19 @@ pub async fn dispatch_method(
     if crate::worktree::is_worktree_method(method) {
         return node.worktree_rpc(method, &params);
     }
+    if method == "instance.purge" {
+        // Hub-driven session deletion: remove this Node's own rows and data
+        // directory for a stopped Instance. Idempotent.
+        let instance_id = params
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                NodeError::InvalidRequest("instance.purge requires instanceId".to_owned())
+            })?;
+        return node
+            .purge_instance(&InstanceId::from_str(instance_id)?)
+            .await;
+    }
     if method == "instance.close" {
         let origin = crate::origin::wire_origin(&params);
         let parsed: InstanceCancelParams = serde_json::from_value(params)?;

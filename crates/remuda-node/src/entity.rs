@@ -80,6 +80,20 @@ impl EntityDb {
         Ok(out)
     }
 
+    /// Remove an Instance and everything keyed to it.
+    ///
+    /// Node-owned rows only: commands, its launch recipe, and the instance
+    /// itself. The agent's own native transcripts live under the user's home
+    /// and are never touched here.
+    pub fn remove_instance(&self, instance_id: &InstanceId) -> Result<bool, NodeError> {
+        let id = instance_id.as_id().as_str();
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM commands WHERE instance_id = ?1", params![id])?;
+        conn.execute("DELETE FROM recipes WHERE instance_id = ?1", params![id])?;
+        let removed = conn.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    }
+
     /// Insert or replace a Command row.
     pub fn put_command(
         &self,

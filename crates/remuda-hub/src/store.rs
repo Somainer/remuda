@@ -296,6 +296,36 @@ pub struct JournalRecord {
     pub observed_at: String,
 }
 
+/// Default window a `requested` instance may wait for a Node receipt (ms).
+///
+/// Past it the row stops holding a placement slot and the sweeper fails it.
+pub const REQUESTED_SLOT_WINDOW_MS: u64 = 300_000;
+
+/// Instances holding a placement slot on a host.
+///
+/// Only Node-confirmed lifecycles count. `requested` is deliberately excluded:
+/// it is a Hub-side intent the Node has not acknowledged, so stale ones (Node
+/// restarted, create never settled) would pin a host at `maxInstances` forever
+/// — the failure seen on the demo. [`Store::expire_stale_requested`] fails
+/// those rows outright once their window passes.
+const LIVE_INSTANCE_COUNT_SQL: &str = "SELECT COUNT(*) FROM instances
+     WHERE host_id = ?1 AND lifecycle IN
+        ('preparing', 'starting', 'ready', 'running', 'closing', 'reconciling')";
+
+/// Backstop count used inside the writer thread when inserting an instance.
+///
+/// Same live set as [`LIVE_INSTANCE_COUNT_SQL`] plus `requested` rows younger
+/// than [`REQUESTED_SLOT_WINDOW_MS`]. Placement has already passed by then;
+/// this only stops a burst of concurrent creates from blowing past the cap in
+/// the instant before any of them reports ready. It is bounded by age, so it
+/// can never wedge a host the way the old unbounded predicate did.
+const INSERT_SLOT_COUNT_SQL: &str = "SELECT COUNT(*) FROM instances
+     WHERE host_id = ?1 AND (
+        lifecycle IN ('preparing', 'starting', 'ready', 'running', 'closing', 'reconciling')
+        OR (lifecycle = 'requested' AND
+            (julianday('now') - julianday(created_at)) * 86400000 < ?2)
+     )";
+
 /// Result of [`Store::append_journal`].
 #[derive(Clone, Debug)]
 pub struct JournalAppend {
@@ -800,6 +830,297 @@ impl Store {
         }).await
     }
 
+    /// Record an operator action that outlives the entity it acted on.
+    ///
+    /// Deleting a session removes its journal, so the record of *who* deleted
+    /// it has to live somewhere else. This table is that somewhere.
+    pub async fn append_audit(
+        &self,
+        device_id: String,
+        action: String,
+        subject: Option<String>,
+        detail: Value,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO audit_log (device_id, action, subject, detail_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    device_id,
+                    action,
+                    subject,
+                    detail.to_string(),
+                    now_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Audit rows for one subject, oldest first (tests and support queries).
+    pub async fn audit_for(&self, subject: String) -> Result<Vec<Value>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT device_id, action, subject, detail_json, created_at
+                 FROM audit_log WHERE subject = ?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![subject], |row| {
+                    Ok(json!({
+                        "deviceId": row.get::<_, String>(0)?,
+                        "action": row.get::<_, String>(1)?,
+                        "subject": row.get::<_, Option<String>>(2)?,
+                        "detail": serde_json::from_str::<Value>(&row.get::<_, String>(3)?)
+                            .unwrap_or(Value::Null),
+                        "createdAt": row.get::<_, String>(4)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Permanently delete an Instance and everything the Hub keeps for it.
+    ///
+    /// Only a stopped Instance can be deleted; the caller is responsible for
+    /// stopping it first (`force`). Returns `false` when the row is already
+    /// gone, which is what makes `DELETE` idempotent, and an
+    /// [`StoreError::Id`] naming the lifecycle when it is still live.
+    ///
+    /// Journal rows, queued commands, interactions, and fleet membership go
+    /// with it: leaving any of them behind would resurrect the session in a
+    /// list view or keep a command queued against an id that no longer exists.
+    pub async fn delete_instance(&self, instance_id: String) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            let Some(instance) = load_instance(conn, &instance_id)? else {
+                return Ok(false);
+            };
+            if !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") {
+                return Err(StoreError::Id(format!(
+                    "instance is {}; stop it before deleting",
+                    instance.lifecycle
+                )));
+            }
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM journal WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM commands WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM interactions WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute(
+                "DELETE FROM fleet_members WHERE instance_id = ?1",
+                params![&instance_id],
+            )?;
+            tx.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
+            // Tombstone: a Node command that is still draining will keep
+            // appending journal events for this id, and `ensure_instance`
+            // would happily recreate the row. A deleted session must stay
+            // deleted, so the id is refused from here on.
+            tx.execute(
+                "INSERT OR REPLACE INTO deleted_instances (instance_id, deleted_at)
+                 VALUES (?1, ?2)",
+                params![&instance_id, now_rfc3339()],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Append a Hub-authored terminal diagnostic to an instance journal.
+    ///
+    /// Only for instances the Node has abandoned (epoch changed, create never
+    /// acknowledged, stop for an instance the Node does not know): the Hub
+    /// takes the next seq, which is safe precisely because that Node will never
+    /// emit another observation for the row. The event carries
+    /// `payload.origin = "hub"` so a reader never mistakes it for a Node
+    /// observation. Returns the appended record, or `None` when the instance is
+    /// gone.
+    pub async fn append_hub_diagnostic(
+        &self,
+        instance_id: String,
+        native_name: String,
+        message: String,
+    ) -> Result<Option<JournalRecord>, StoreError> {
+        self.run(move |conn| {
+            let Some(instance) = load_instance(conn, &instance_id)? else {
+                return Ok(None);
+            };
+            let seq = instance.durable_seq.parse::<i64>().unwrap_or(0) + 1;
+            if load_journal_row(conn, &instance_id, seq)?.is_some() {
+                return Ok(None);
+            }
+            let event_id = new_id("evt").map_err(|e| StoreError::Id(e.to_string()))?;
+            let now = now_rfc3339();
+            let event = json!({
+                "eventId": event_id,
+                "seq": seq.to_string(),
+                "instanceId": instance_id,
+                "kind": "lifecycle",
+                "payload": {
+                    "type": "native",
+                    "topic": "diagnostic",
+                    "origin": "hub",
+                    "nativeName": native_name,
+                    "severity": "warning",
+                    "message": message,
+                },
+            });
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![instance_id, seq, event_id, event.to_string(), now],
+            )?;
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
+                params![seq, now, instance_id],
+            )?;
+            Ok(Some(JournalRecord {
+                instance_id,
+                seq,
+                event_id,
+                event,
+                observed_at: now,
+            }))
+        })
+        .await
+    }
+
+    /// Record the epoch announced in `node.hello`, reporting a Node restart.
+    ///
+    /// Returns `true` only when a *different* non-empty epoch was already
+    /// stored: a first announcement is not a restart, and a Node that omits
+    /// `nodeEpoch` never claims one.
+    pub async fn record_node_epoch(
+        &self,
+        host_id: String,
+        epoch: Option<String>,
+    ) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            let Some(epoch) = epoch.filter(|value| !value.is_empty()) else {
+                return Ok(false);
+            };
+            let previous: Option<String> = conn
+                .query_row(
+                    "SELECT node_epoch FROM hosts WHERE id = ?1",
+                    params![&host_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            conn.execute(
+                "UPDATE hosts SET node_epoch = ?1 WHERE id = ?2",
+                params![&epoch, &host_id],
+            )?;
+            Ok(previous.is_some_and(|prev| !prev.is_empty() && prev != epoch))
+        })
+        .await
+    }
+
+    /// Instances this Hub still counts as live that the Node no longer reports.
+    ///
+    /// Hub-owned projection only: the rows move to `exited` with `last_error`
+    /// set, and no Node journal seq is forged (the Node stays the authority for
+    /// its own cursor, as in [`Store::expire_lost_hosts`]).
+    pub async fn reconcile_reported_instances(
+        &self,
+        host_id: String,
+        reported: Vec<String>,
+        reason: String,
+    ) -> Result<Vec<String>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM instances
+                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
+            )?;
+            let live: Vec<String> = stmt
+                .query_map(params![&host_id], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            let lost: Vec<String> = live
+                .into_iter()
+                .filter(|id| !reported.iter().any(|seen| seen == id))
+                .collect();
+            let now = now_rfc3339();
+            for id in &lost {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
+                        last_error = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![&reason, &now, id],
+                )?;
+            }
+            Ok(lost)
+        })
+        .await
+    }
+
+    /// Expire `requested` instances that never produced a Node receipt.
+    ///
+    /// A create the Node never acknowledged keeps occupying a placement slot
+    /// forever otherwise. Returns `(host_id, instance_id)` for each expiry so
+    /// the caller can publish a diagnostic.
+    pub async fn expire_stale_requested(
+        &self,
+        window_ms: u64,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            let window = window_ms.min(i64::MAX as u64) as i64;
+            let mut stmt = conn.prepare(
+                "SELECT id, host_id FROM instances
+                 WHERE lifecycle = 'requested' AND durable_seq = 0 AND
+                    (julianday(?1) - julianday(created_at)) * 86400000 >= ?2",
+            )?;
+            let stale: Vec<(String, String)> = stmt
+                .query_map(params![&now, window], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            for (id, _) in &stale {
+                conn.execute(
+                    "UPDATE instances SET lifecycle = 'failed', activity = 'idle',
+                        last_error = 'create-never-acknowledged', updated_at = ?1
+                     WHERE id = ?2 AND lifecycle = 'requested'",
+                    params![&now, id],
+                )?;
+            }
+            Ok(stale
+                .into_iter()
+                .map(|(id, host)| (host, id))
+                .collect::<Vec<_>>())
+        })
+        .await
+    }
+
+    /// Settle a stop/close for an instance the Node does not know.
+    ///
+    /// Hub projection only: the row moves to `exited` so the slot is released
+    /// and the caller never waits on a receipt that will not arrive.
+    pub async fn settle_instance_exited(
+        &self,
+        instance_id: String,
+        reason: String,
+    ) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            let changed = conn.execute(
+                "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
+                    last_error = ?1, updated_at = ?2
+                 WHERE id = ?3 AND lifecycle NOT IN ('exited', 'failed')",
+                params![reason, now_rfc3339(), instance_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     /// Heartbeat / hello: lastSeen + optional inventory (D-013).
     pub async fn apply_inventory(
         &self,
@@ -920,9 +1241,8 @@ impl Store {
             let host =
                 load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
             let running: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM instances
-                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
-                params![host_id],
+                INSERT_SLOT_COUNT_SQL,
+                params![host_id, REQUESTED_SLOT_WINDOW_MS as i64],
                 |row| row.get(0),
             )?;
             if running >= host.max_instances {
@@ -976,6 +1296,11 @@ impl Store {
         instance_id: String,
     ) -> Result<InstanceRecord, StoreError> {
         self.run(move |conn| {
+            if is_deleted_instance(conn, &instance_id)? {
+                return Err(StoreError::Id(format!(
+                    "instance {instance_id} was deleted"
+                )));
+            }
             if let Some(existing) = load_instance(conn, &instance_id)? {
                 if existing.host_id != host_id {
                     return Err(StoreError::Id("instance belongs to another host".into()));
@@ -1457,8 +1782,11 @@ impl Store {
                 )?;
             }
             if let Some(max_instances) = max_instances {
+                // Operator intent lives in its own column: `apply_inventory`
+                // keeps overwriting `max_instances` from every Node hello, so
+                // writing there would be reset on the next reconnect.
                 conn.execute(
-                    "UPDATE hosts SET max_instances = ?1 WHERE id = ?2",
+                    "UPDATE hosts SET max_instances_override = ?1 WHERE id = ?2",
                     params![max_instances, host_id],
                 )?;
             }
@@ -1474,15 +1802,16 @@ impl Store {
     }
 
     /// Instances that still occupy a concurrency slot.
+    ///
+    /// Only instances the Node has actually confirmed are live count
+    /// (ready/running, plus the `preparing`/`starting`/`closing` transitions
+    /// that hold a real slot). A `requested` row the Node never acknowledged is
+    /// a Hub-side intent; counting those let stale creates wedge a host at
+    /// `maxInstances` forever.
     pub async fn running_count(&self, host_id: String) -> Result<i64, StoreError> {
         self.run(move |conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM instances
-                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
-                params![host_id],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::from)
+            conn.query_row(LIVE_INSTANCE_COUNT_SQL, params![host_id], |row| row.get(0))
+                .map_err(StoreError::from)
         })
         .await
     }
@@ -2017,6 +2346,19 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             observed_at TEXT NOT NULL,
             PRIMARY KEY (instance_id, seq)
         );
+        CREATE TABLE IF NOT EXISTS deleted_instances (
+            instance_id TEXT PRIMARY KEY,
+            deleted_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            subject TEXT,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS audit_log_subject ON audit_log(subject);
         CREATE TABLE IF NOT EXISTS fleets (
             id TEXT PRIMARY KEY,
             spec_json TEXT NOT NULL,
@@ -2106,6 +2448,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "instances", "mode", "TEXT")?;
     ensure_column(&conn, "instances", "promoted_at", "TEXT")?;
+    // Operator ceiling survives Node hello/heartbeat inventory and Hub restarts.
+    ensure_column(&conn, "hosts", "max_instances_override", "INTEGER")?;
+    // Last `nodeEpoch` announced by this host, used to detect a Node restart.
+    ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
@@ -2332,6 +2678,18 @@ where
         return Ok(None);
     }
     Ok(Some(id))
+}
+
+/// True when this instance id has been deleted and must never come back.
+fn is_deleted_instance(conn: &Connection, instance_id: &str) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM deleted_instances WHERE instance_id = ?1",
+            params![instance_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn ensure_column(
@@ -2855,6 +3213,332 @@ mod tests {
         assert_eq!(listed[0].effort_name.as_deref(), Some("ultracode"));
     }
 
+    /// Backdate a row so time-window behaviour is testable without sleeping.
+    async fn backdate_instance(store: &Store, instance_id: &str, minutes: i64) {
+        let instance_id = instance_id.to_owned();
+        store
+            .run(move |conn| {
+                let then = time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes);
+                let stamp = format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+                    then.year(),
+                    u8::from(then.month()),
+                    then.day(),
+                    then.hour(),
+                    then.minute(),
+                    then.second()
+                );
+                conn.execute(
+                    "UPDATE instances SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                    params![stamp, instance_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("backdate");
+    }
+
+    async fn seed_instance(store: &Store, host_id: &str) -> InstanceRecord {
+        store
+            .insert_instance(
+                host_id.to_owned(),
+                None,
+                "terminal".into(),
+                "shell-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .expect("insert instance")
+    }
+
+    /// The demo wedge: stale `requested` rows must stop holding placement slots,
+    /// and the sweeper must eventually fail them outright.
+    #[tokio::test]
+    async fn stale_requested_instances_free_their_placement_slot_and_expire() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+
+        let fresh = seed_instance(&store, &host).await;
+        let stale = seed_instance(&store, &host).await;
+        backdate_instance(&store, &stale.instance_id, 60).await;
+        assert_eq!(
+            store.running_count(host.clone()).await.expect("count"),
+            0,
+            "placement counts only Node-confirmed instances"
+        );
+
+        let expired = store
+            .expire_stale_requested(REQUESTED_SLOT_WINDOW_MS)
+            .await
+            .expect("sweep");
+        assert_eq!(
+            expired,
+            vec![(host.clone(), stale.instance_id.clone())],
+            "only the aged row expires"
+        );
+        let stale = store
+            .get_instance(stale.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(stale.lifecycle, "failed");
+        assert_eq!(
+            stale.last_error.as_deref(),
+            Some("create-never-acknowledged")
+        );
+        let fresh = store
+            .get_instance(fresh.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(fresh.lifecycle, "requested", "a fresh create is untouched");
+        assert_eq!(store.running_count(host).await.expect("count"), 0);
+        store.close().await;
+    }
+
+    /// `ready`/`running`/`blocked` rows keep counting; `exited`/`failed` never do.
+    #[tokio::test]
+    async fn placement_slots_count_node_confirmed_lifecycles_only() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+
+        let running = seed_instance(&store, &host).await;
+        store
+            .append_journal(
+                host.clone(),
+                running.instance_id.clone(),
+                Some(1),
+                json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+            )
+            .await
+            .expect("ready");
+        // A blocked instance is still occupying its slot.
+        store
+            .append_journal(
+                host.clone(),
+                running.instance_id.clone(),
+                Some(2),
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","nativeName":"agent_status",
+                    "status":{"state":"known","value":"blocked"}}}),
+            )
+            .await
+            .expect("blocked");
+        let blocked = store
+            .get_instance(running.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(blocked.lifecycle, "running");
+        assert_eq!(blocked.activity, "blocked");
+        assert_eq!(store.running_count(host.clone()).await.expect("count"), 1);
+
+        let gone = seed_instance(&store, &host).await;
+        store
+            .append_journal(
+                host.clone(),
+                gone.instance_id.clone(),
+                Some(1),
+                json!({"kind":"lifecycle","payload":{"type":"entity","state":"exited"}}),
+            )
+            .await
+            .expect("exited");
+        assert_eq!(
+            store.running_count(host.clone()).await.expect("count"),
+            1,
+            "an exited instance releases its slot"
+        );
+
+        // The insert guard still fences a burst: fresh `requested` rows count
+        // there, so a host at its ceiling refuses another create…
+        store
+            .patch_host(host.clone(), None, None, Some(2), None)
+            .await
+            .expect("cap 2");
+        let pending = seed_instance(&store, &host).await;
+        let refused = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "terminal".into(),
+                "shell-pty".into(),
+                None,
+                json!({}),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Id(ref message)) if message.contains("maxInstances")),
+            "{refused:?}"
+        );
+        // …but an aged one no longer blocks anything.
+        backdate_instance(&store, &pending.instance_id, 60).await;
+        store
+            .insert_instance(
+                host,
+                None,
+                "terminal".into(),
+                "shell-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .expect("a stale requested row must not hold the last slot");
+        store.close().await;
+    }
+
+    /// Node restart: rows the Node no longer lists exit, the rest are kept.
+    #[tokio::test]
+    async fn node_epoch_change_reconciles_only_unreported_instances() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "epoch-node").await;
+
+        assert!(
+            !store
+                .record_node_epoch(host.clone(), Some("epoch_a".into()))
+                .await
+                .expect("first epoch"),
+            "the first epoch a host announces is not a restart"
+        );
+        assert!(
+            !store
+                .record_node_epoch(host.clone(), Some("epoch_a".into()))
+                .await
+                .expect("same epoch"),
+            "a reconnect on the same epoch is not a restart"
+        );
+        assert!(
+            store
+                .record_node_epoch(host.clone(), Some("epoch_b".into()))
+                .await
+                .expect("new epoch"),
+            "a different epoch is a Node restart"
+        );
+
+        let kept = seed_instance(&store, &host).await;
+        let lost = seed_instance(&store, &host).await;
+        let reconciled = store
+            .reconcile_reported_instances(
+                host.clone(),
+                vec![kept.instance_id.clone()],
+                "node-epoch-changed".into(),
+            )
+            .await
+            .expect("reconcile");
+        assert_eq!(reconciled, vec![lost.instance_id.clone()]);
+        let lost = store
+            .get_instance(lost.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(lost.lifecycle, "exited");
+        assert_eq!(lost.last_error.as_deref(), Some("node-epoch-changed"));
+        let kept = store
+            .get_instance(kept.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(kept.lifecycle, "requested");
+        store.close().await;
+    }
+
+    /// A stop the Node cannot honour settles instead of hanging forever.
+    #[tokio::test]
+    async fn settling_an_unknown_instance_releases_its_slot_once() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "stop-node").await;
+        let instance = seed_instance(&store, &host).await;
+
+        assert!(
+            store
+                .settle_instance_exited(instance.instance_id.clone(), "node-lost-instance".into())
+                .await
+                .expect("settle")
+        );
+        assert!(
+            !store
+                .settle_instance_exited(instance.instance_id.clone(), "node-lost-instance".into())
+                .await
+                .expect("settle again"),
+            "an already-exited row is not re-settled"
+        );
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        assert_eq!(row.last_error.as_deref(), Some("node-lost-instance"));
+        assert_eq!(store.running_count(host).await.expect("count"), 0);
+
+        let diagnostic = store
+            .append_hub_diagnostic(
+                instance.instance_id.clone(),
+                "node_lost_instance".into(),
+                "settled as exited".into(),
+            )
+            .await
+            .expect("diagnostic")
+            .expect("record");
+        assert_eq!(diagnostic.event["payload"]["origin"], json!("hub"));
+        assert_eq!(diagnostic.event["payload"]["topic"], json!("diagnostic"));
+        let (events, durable) = store
+            .read_journal(instance.instance_id, 0)
+            .await
+            .expect("journal");
+        assert_eq!(durable, diagnostic.seq);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event["payload"]["nativeName"] == json!("node_lost_instance")),
+            "{events:?}"
+        );
+        store.close().await;
+    }
+
+    /// The operator ceiling must outlive Node inventory and a Hub restart.
+    #[tokio::test]
+    async fn operator_max_instances_override_survives_hello_and_restart() {
+        let dir = tempfile::tempdir().expect("dir");
+        let host = new_id("hst").expect("host");
+        {
+            let store = Store::open(dir.path()).expect("store");
+            enroll_labeled(&store, host.clone(), "cap-node").await;
+            let patched = store
+                .patch_host(host.clone(), None, None, Some(32), None)
+                .await
+                .expect("patch");
+            assert_eq!(patched.max_instances, 32);
+
+            // A Node hello re-advertising its own ceiling must not undo it.
+            let inventory = crate::inventory::from_node_params(&json!({"maxInstances": 8}));
+            let after_hello = store
+                .apply_inventory(host.clone(), inventory, None)
+                .await
+                .expect("inventory");
+            assert_eq!(
+                after_hello.max_instances, 32,
+                "node hello must not reset the operator ceiling"
+            );
+            store.close().await;
+        }
+        let store = Store::open(dir.path()).expect("reopen");
+        let reloaded = store.get_host(host).await.expect("get").expect("host");
+        assert_eq!(
+            reloaded.max_instances, 32,
+            "the override must survive a Hub restart"
+        );
+        store.close().await;
+    }
+
     async fn enroll_labeled(store: &Store, host_id: String, label: &str) {
         let token = enroll_token(store, &format!("enroll-{host_id}")).await;
         let outcome = store
@@ -2966,7 +3650,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
     let row = conn
         .query_row(
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
-                    labels_json, herdr_json, resources_json, max_instances, hostname, provider_binding
+                    labels_json, herdr_json, resources_json,
+                    COALESCE(max_instances_override, max_instances), hostname, provider_binding
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {

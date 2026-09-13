@@ -512,14 +512,18 @@ async fn perform_hello(
             params["host"] = json!({});
         }
         runtime.node.advertise_workspaces(&mut params["host"])?;
-    }
-    if let Some(runtime) = runtime.filter(|runtime| runtime.controller.is_some()) {
-        params["daemon"] = json!(true);
-        params["durable"] = json!(true);
+        // Always announce the instance inventory, daemon or not. The Hub needs
+        // it to reconcile rows this Node no longer owns after a restart; a
+        // hello without one leaves those rows running forever, holding
+        // placement slots nothing can release.
         params["instances"] = serde_json::to_value(runtime.node.list_instances()?.items)?;
-        #[cfg(unix)]
-        if let Some(controller) = &runtime.controller {
-            params["controllerGeneration"] = json!(controller.generation().to_string());
+        if runtime.controller.is_some() {
+            params["daemon"] = json!(true);
+            params["durable"] = json!(true);
+            #[cfg(unix)]
+            if let Some(controller) = &runtime.controller {
+                params["controllerGeneration"] = json!(controller.generation().to_string());
+            }
         }
     }
     send_ws(stream, &rpc_request(&id, METHOD_NODE_HELLO, params)).await?;

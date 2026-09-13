@@ -19,7 +19,7 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
     timeout: 20_000,
   });
 
-  await page.locator('a[href="/sessions/new"]').first().click();
+  await page.getByTitle("新建", { exact: true }).click();
   await expect(page.getByTestId("new-session-sheet")).toBeVisible();
   await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
   const host = await page.getByTestId("new-session-host").locator("option").filter({ hasText: "e2e-fake-node" }).getAttribute("value");
@@ -146,7 +146,7 @@ test("real Node: register a project, create a shell in it, close and unregister"
 test("effort slider drag and keyboard send instance.configure", async ({ page }) => {
   test.skip(process.env.HUB_E2E_EXTERNAL === "1", "External Node is covered by the real shell workspace flow");
   await login(page);
-  await page.locator('a[href="/sessions/new"]').first().click();
+  await page.getByTitle("新建", { exact: true }).click();
   await expect(page.getByTestId("new-session-sheet")).toBeVisible();
   await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
   const host = await page

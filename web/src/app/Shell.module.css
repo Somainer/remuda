@@ -8,8 +8,12 @@
   box-sizing: border-box;
 }
 
-.shell[data-layout="session"] {
+.shell[data-spaces="1"] {
   grid-template-columns: var(--rail) var(--list) minmax(0, 1fr);
+}
+
+.shell[data-spaces="1"][data-panel-collapsed="true"] {
+  grid-template-columns: var(--rail) 52px minmax(0, 1fr);
 }
 
 .install {
@@ -49,7 +53,7 @@
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
-  height: 100%;
+  height: 0;
 }
 
 .bar {

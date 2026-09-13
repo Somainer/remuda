@@ -7,7 +7,7 @@ const origin = `http://127.0.0.1:${webPort}`;
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /hub-live\.spec\.ts|pairing\.spec\.ts/,
+  testMatch: /(?:hub-live|spaces-hub-live|pairing)\.spec\.ts/,
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),

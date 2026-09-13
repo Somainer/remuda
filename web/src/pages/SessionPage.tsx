@@ -18,6 +18,7 @@ import { ScreenView } from "../features/session/ScreenView";
 import { nativeShort, isGenericPty, projectStatus, uiMode } from "../lib/status";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
+import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import ui from "../styles/ui.module.css";
 import session from "../features/session/session.module.css";
 
@@ -28,9 +29,12 @@ export function SessionPage({
 }) {
   const { instanceId = "" } = useParams();
   const hub = useHub();
+  const { active: space, newHref } = useSpaceWorkbench();
   const navigate = useNavigate();
   const { mobile, offsetTop } = useWorkbenchViewport();
-  const [sending, setSending] = useState(false);
+  const [sendingIds, setSendingIds] = useState<string[]>([]);
+  const sending = sendingIds.includes(instanceId);
+  const setSending = (value: boolean) => setSendingIds((ids) => value ? [...new Set([...ids, instanceId])] : ids.filter((id) => id !== instanceId));
   const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
   const hostViews = useHostViews(hub.hosts, hub.instances);
   const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
@@ -64,7 +68,7 @@ export function SessionPage({
   const cost = usage && usage.cost.state === "known" ? `$${usage.cost.value.amount}` : "—";
   const canResume = instance.capabilities.capabilities.resume?.state === "supported";
   const connLabel = journalStatus === "live" ? hub.connection : journalStatus;
-  const workspace = hubStore.workspaceOf(instance.workspaceId)?.label;
+  const workspace = space?.name;
   const title = hubStore.titleOf(instance.id);
   const structuredOnly = uiMode(instance) === "structured-only";
   const genericPty = isGenericPty(instance);
@@ -138,7 +142,7 @@ export function SessionPage({
                 Resume
               </Button>
             ) : (
-              <Link to={`/sessions/new?host=${instance.hostId}&workspace=${instance.workspaceId}`}>开新会话继承 cwd</Link>
+              <Link to={newHref}>开新会话继承 cwd</Link>
             )
           ) : (
             <button

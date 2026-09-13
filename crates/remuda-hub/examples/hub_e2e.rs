@@ -141,7 +141,10 @@ async fn fake_node(
             .context("authorization header")?,
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
-    let workspaces = json!([{ "workspaceId": "wsp_e2e", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e" }]);
+    let workspaces = json!([
+        { "workspaceId": "wsp_e2e", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e" },
+        { "workspaceId": "wsp_e2e_second", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e-second" }
+    ]);
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
@@ -156,7 +159,8 @@ async fn fake_node(
                     "workspaceRevision": 1,
                     "workspaces": workspaces,
                     "labels": { "role": "e2e" },
-                    "maxInstances": 4,
+                    // The shared Hub, slider and spaces scenarios create five instances.
+                    "maxInstances": 8,
                     "cli": [{
                         "kind": "claude",
                         "version": "2.1.268",

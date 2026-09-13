@@ -1,9 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { isSessionRoute, MORE_NAV } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
-import { SessionList } from "../features/session/SessionList";
+import { SpacesPanel } from "../features/spaces/SpacesPanel";
+import { SpacesMobile } from "../features/spaces/SpacesMobile";
+import { SpaceTabs } from "../features/spaces/SpaceTabs";
+import { spaceStore } from "../features/spaces/store";
+import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { SessionsPage } from "../pages/SessionsPage";
 import { InstallBar } from "./InstallBar";
 import css from "./Shell.module.css";
@@ -22,9 +26,12 @@ export function Shell() {
   const navigate = useNavigate();
   const pending = hub.interactions.filter((i) => i.state === "pending").length;
   const onSessions = isSessionRoute(location.pathname);
-  const onSessionPage = location.pathname.startsWith("/s/");
   const onNew = location.pathname === "/sessions/new";
-  const showSidebarList = !mobile && onSessionPage;
+  const workbench = useSpaceWorkbench();
+  const activeSpaceId = workbench.active?.id;
+  const activeInstanceId = workbench.instanceId;
+  const knownInstance = hub.instances.some((i) => i.id === activeInstanceId);
+  const showSidebarList = !mobile && onSessions;
   const moreActive = MORE_NAV.some((item) => location.pathname.startsWith(item.to));
   const [moreOpen, setMoreOpen] = useState(false);
   const [morePath, setMorePath] = useState(location.pathname);
@@ -32,6 +39,39 @@ export function Shell() {
     setMorePath(location.pathname);
     setMoreOpen(false);
   }
+
+  useEffect(() => {
+    if (activeSpaceId && activeInstanceId && knownInstance) {
+      spaceStore.selectTab(activeSpaceId, activeInstanceId);
+    }
+  }, [activeSpaceId, activeInstanceId, knownInstance]);
+
+  useLayoutEffect(() => {
+    if (mobile || !onSessions || onNew) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.isComposing || event.repeat) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"], .xterm')) return;
+      if (event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        spaceStore.setCollapsed(!workbench.prefs.collapsed);
+      } else if (/^[1-9]$/.test(event.key)) {
+        const tab = workbench.tabs[Number(event.key) - 1];
+        if (!tab || !workbench.active) return;
+        event.preventDefault();
+        spaceStore.selectTab(workbench.active.id, tab.id);
+        navigate(`/s/${tab.id}`);
+      } else if (event.code === "BracketLeft" || event.code === "BracketRight") {
+        if (!workbench.spaces.length) return;
+        event.preventDefault();
+        const index = workbench.spaces.findIndex((s) => s.id === workbench.active?.id);
+        const step = event.code === "BracketLeft" ? -1 : 1;
+        workbench.select(workbench.spaces[(index + step + workbench.spaces.length) % workbench.spaces.length]);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mobile, onSessions, onNew, workbench, navigate]);
 
   useEffect(() => {
     const onVis = () => {
@@ -52,7 +92,7 @@ export function Shell() {
   }, [hub.toast]);
 
   return (
-    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layoutOf(location.pathname)}>
+    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layoutOf(location.pathname)} data-spaces={showSidebarList ? "1" : "0"} data-panel-collapsed={workbench.prefs.collapsed}>
       <div className={css.install}>
         <InstallBar />
       </div>
@@ -68,7 +108,7 @@ export function Shell() {
           ◆
           {pending ? <span className={css.badge}>{pending}</span> : null}
         </Link>
-        <Link className={css.icon} to="/sessions/new" title="新建">
+        <Link className={css.icon} to={onSessions ? workbench.newHref : "/sessions/new"} title="新建">
           <span className={css.plusBox}>＋</span>
         </Link>
         <div className={css.more}>
@@ -89,10 +129,12 @@ export function Shell() {
       </nav>
       {showSidebarList ? (
         <aside className={css.list}>
-          <SessionList variant="compact" />
+          <SpacesPanel spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} collapsed={workbench.prefs.collapsed} onSelect={workbench.select} />
         </aside>
       ) : null}
       <main className={css.main}>
+        {onSessions && mobile ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} onSelect={workbench.select} /> : null}
+        {onSessions ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
         {onNew ? <SessionsPage dimmed /> : null}
         <Outlet />
       </main>
@@ -106,7 +148,7 @@ export function Shell() {
           {pending ? <span className={css.barBadge}>{pending}</span> : null}
           审批
         </Link>
-        <button type="button" onClick={() => navigate("/sessions/new")} aria-label="新建">
+        <button type="button" onClick={() => navigate(onSessions ? workbench.newHref : "/sessions/new")} aria-label="新建">
           <span className={css.barPlus}>＋</span>
         </button>
         <button

@@ -142,6 +142,20 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 
 ---
 
+### 1.4 Space / Tabs 项目工作台（D-024）
+
+本节为 2026-09-13 的信息架构增补，优先于 §1.3 中会话索引始终展开、手机不使用抽屉的旧约定。借鉴 herdr 的 workspace → tabs → panes，当前实现前两个维度：**Space = 一个项目，Tabs = 该项目的 agent 会话**；仍不做多 pane 分屏。
+
+- Space 来源是 D-023 的主机已注册 Workspace，以 `(hostId, workspaceId)` 区分；注册 wire 字段为 `workspaceId / hostId / root`，现有 UI 投影保持 `id / hostId / rootPath / label`。默认名称取根目录 basename，客户端重命名不会修改注册目录或后端 Workspace。实例严格按 host 与 workspace 两个 ID 归属，未注册、取消注册或无匹配的实例统一进「其他」。
+- 桌面左侧 Spaces/Sessions 面板列出 space 与组内 sessions，组可展开/折叠；即使折叠，仍显示 live/blocked 数量。面板有持续可达的折叠按钮，收起后保留 space 首字母窄轨。显示名、手动顺序、分组展开状态和面板折叠写入本设备 `localStorage`，不跨设备同步。
+- 当前 space 的 tabs 位于会话内容上方，显示标题、harness 字形、活动状态点和关闭入口。每个 space 分别记住最后选中的 tab；切换项目恢复其选择，不能把上一个项目的选中实例或新建默认值带过来。关闭入口沿用现有会话关闭命令，请求成功后隐藏本地 tab，失败则保留并提示；实际退出仍以 Instance/journal 更新为准。会话可从列表或深链重新打开，这不自动 resume；会话内 Stop 控制仍可使用。
+- `/s/:instanceId` 及其子视图路由保持有效，直接打开会同时选中实例所属 space 和 tab。当前 space 的「新建」入口带入 host/workspace，cwd 默认该注册根目录；「其他」不虚构注册根。被移除或关闭的选中 tab 回退到该 space 可用 tab，无 tab 时显示该 space 的会话列表或空态。
+- 桌面快捷键：⌘/Ctrl+B 折叠面板，⌘/Ctrl+1..9 选择当前 space 的相应 tab，⌘/Ctrl+[ / ] 切换前后 space。约 400px 手机上显示可横向滚动的 space chips 与 tabs，左侧面板通过抽屉访问；使用现有 viewport 和 Night Corral 主题 tokens，深浅主题保持一致的布局及状态含义。
+
+本节只作用于会话工作台。fleet 与全局 approvals 的范围和入口不变，composer 继续以当前实例为控制目标。验收与桌面/400px、深浅主题截图见 [spaces-1.md](./evidence/spaces-1.md)。
+
+---
+
 ## 2. 关键屏
 
 每屏：ASCII 线框、状态清单、数据字段。字段名跟 `protocol.md`：Instance / Command / Interaction / NativeRef / Workspace。列表上的 `status` 点是 `lifecycle × activity × connectivity` 的投影，不是单独的 wire 枚举。

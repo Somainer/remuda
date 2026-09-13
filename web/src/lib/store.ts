@@ -311,6 +311,8 @@ class HubStore {
       afterSeq = page.events[page.events.length - 1].seq;
       if (history.length >= 8192) break;
     }
+    // Another mount may finish loading this journal while this read is pending.
+    if (this.journals.has(instance.journalId)) return;
     this.emit({
       events: { ...this.state.events, [instanceId]: history },
     });

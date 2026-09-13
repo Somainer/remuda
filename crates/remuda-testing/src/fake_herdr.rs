@@ -61,6 +61,10 @@ pub enum FakeHerdrScript {
     StartFail,
     /// `agent.start` succeeds with launch still pending; becomes idle after a short delay.
     SlowStart,
+    /// `agent.start` reports **idle** on Claude's first-run onboarding wizard,
+    /// exactly as Herdr does for a TUI sitting at a menu. Each `send_keys`
+    /// advances one step; the composer only appears after the last one.
+    Onboarding,
 }
 
 impl FakeHerdrScript {
@@ -75,6 +79,7 @@ impl FakeHerdrScript {
             "trust" | "trust-dialog" | "blocked" => Some(Self::Trust),
             "start-fail" | "start_fail" | "crash" | "die" => Some(Self::StartFail),
             "slow-start" | "slow_start" | "slow" => Some(Self::SlowStart),
+            "onboarding" | "first-run" => Some(Self::Onboarding),
             _ => None,
         }
     }
@@ -381,7 +386,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
 fn print_help() {
     eprintln!(
         "fake-herdr — Herdr JSON-RPC test double\n\n\
-         Usage:\n  fake-herdr [--socket PATH] [--script ok|trust|start-fail|slow-start] [--frames PATH]\n  \
+         Usage:\n  fake-herdr [--socket PATH] [--script ok|trust|onboarding|start-fail|slow-start] [--frames PATH]\n  \
          fake-herdr terminal [session] observe <pane> [--cols N] [--rows N] [--frames PATH]\n"
     );
 }
@@ -480,6 +485,8 @@ struct State {
     dead_agents: HashSet<String>,
     shell_panes: HashSet<String>,
     slow_until: HashMap<String, Instant>,
+    /// Index into [`ONBOARDING_STEPS`] per agent, for the `onboarding` script.
+    onboarding_step: HashMap<String, usize>,
 }
 
 impl State {
@@ -506,6 +513,7 @@ impl State {
             dead_agents: HashSet::new(),
             shell_panes: HashSet::new(),
             slow_until: HashMap::new(),
+            onboarding_step: HashMap::new(),
         }
     }
 
@@ -963,6 +971,7 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
         .map(|(n, _)| n.clone())
     {
         unblock_if_needed(st, &name);
+        advance_onboarding(st, &name);
     }
     ok()
 }
@@ -1026,6 +1035,7 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
             | FakeHerdrScript::TextQuestion
     );
     let slow = st.script == FakeHerdrScript::SlowStart;
+    let onboarding = st.script == FakeHerdrScript::Onboarding;
     let status = if blocked {
         AgentStatus::Blocked
     } else if slow {
@@ -1042,6 +1052,10 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
             _ => TRUST_DIALOG,
         }
         .to_string()
+    } else if onboarding {
+        // Herdr reports a wizard as an idle, interactive-ready agent: it is a
+        // TUI at a menu, and only the viewport says otherwise.
+        ONBOARDING_STEPS[0].to_string()
     } else {
         idle_screen("")
     };
@@ -1082,6 +1096,9 @@ fn agent_start(st: &mut State, params: &Value) -> Result<Value, (&'static str, S
         pane.revision = 1;
     }
     st.agents.insert(start.name.clone(), agent.clone());
+    if onboarding {
+        st.onboarding_step.insert(start.name.clone(), 0);
+    }
     emit_status(st, &agent);
     if blocked {
         return Err((
@@ -1309,6 +1326,7 @@ fn agent_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static st
             .or_insert(line);
     }
     unblock_if_needed(st, &name);
+    advance_onboarding(st, &name);
     // Keep an observable receipt after the prompt clears.
     if let Some(agent) = st.agents.get(&name)
         && let Some(screen) = st.screens.get_mut(&agent.pane_id)
@@ -1316,6 +1334,33 @@ fn agent_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static st
         screen.push_str(&format!("\nKEYS {}", keys.join(" ")));
     }
     ok()
+}
+
+/// Advance the `onboarding` wizard one step, as a key press would.
+///
+/// The agent stays `idle` throughout — that is the whole point of the defect
+/// this script reproduces. Only the last step is a real prompt composer.
+fn advance_onboarding(st: &mut State, name: &str) {
+    if st.script != FakeHerdrScript::Onboarding {
+        return;
+    }
+    let Some(step) = st.onboarding_step.get_mut(name) else {
+        return;
+    };
+    if *step + 1 >= ONBOARDING_STEPS.len() {
+        return;
+    }
+    *step += 1;
+    let screen = ONBOARDING_STEPS[*step].to_string();
+    let done = *step + 1 == ONBOARDING_STEPS.len();
+    set_status(st, name, AgentStatus::Idle, &screen);
+    if let Some(agent) = st.agents.get_mut(name) {
+        agent.launch_pending = !done;
+        agent.interactive_ready = true;
+        if done {
+            agent.agent_session = Some(session_ref(agent.agent.as_deref().unwrap_or("claude")));
+        }
+    }
 }
 
 fn unblock_if_needed(st: &mut State, name: &str) {
@@ -1460,6 +1505,15 @@ fn idle_screen(reply: &str) -> String {
         format!("{reply}\n❯ \n")
     }
 }
+
+/// Claude Code 2.1.270's first-run flow, in source order, ending at a real
+/// composer. See `tests/fixtures/SOURCES.md` for how these were derived.
+const ONBOARDING_STEPS: &[&str] = &[
+    include_str!("../tests/fixtures/claude-onboarding-theme.txt"),
+    include_str!("../tests/fixtures/claude-onboarding-security.txt"),
+    include_str!("../tests/fixtures/claude-onboarding-terminal-setup.txt"),
+    include_str!("../tests/fixtures/claude-prompt-composer.txt"),
+];
 
 const TRUST_DIALOG: &str = "\
  Quick safety check: Is this a project you created or one you trust?\

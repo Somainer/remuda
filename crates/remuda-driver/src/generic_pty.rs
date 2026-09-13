@@ -392,11 +392,13 @@ impl GenericPtyDriver {
             .map_err(map_herdr)?;
         let client = bind_client(&server, &self.options)?;
         let mut env = HashMap::new();
-        // Only pin CLAUDE_CONFIG_DIR when the native home already has a login
-        // file. An empty isolated dir makes Claude 2.1 report "Not logged in"
-        // even when the host user is authenticated.
-        let login = std::path::Path::new(&recipe.native_home).join(".claude.json");
-        if login.is_file() {
+        // Only pin CLAUDE_CONFIG_DIR when the native home actually holds a
+        // login. An isolated dir without one makes Claude 2.1 report "Not
+        // logged in" even when the host user is authenticated. The test is
+        // credential evidence, not the presence of `.claude.json`: claude-pty
+        // seeds that file with onboarding flags and no credentials, and a
+        // config dir the two drivers share must not be mistaken for a login.
+        if crate::claude_onboarding::has_login_material(std::path::Path::new(&recipe.native_home)) {
             env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
         }
         for (key, value) in &self.options.extra_env {

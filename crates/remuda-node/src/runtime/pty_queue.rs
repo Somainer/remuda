@@ -71,6 +71,12 @@ pub(super) async fn run(
                     }
                     execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone()).await?;
                     if close_after && store.get_instance(&instance_id)?.lifecycle == InstanceLifecycle::Exited {
+                        // The Instance is exited, so nothing may still hold a
+                        // pane in the operator's Herdr session. The driver's
+                        // own close() covers the panes it tracks in memory;
+                        // this covers the durable ownership rows, which are
+                        // what survive a rebuilt or adopted driver (DEFECT B).
+                        crate::reclaim::reclaim_instance_carriers(store.as_ref(), &instance_id).await;
                         receiver.close();
                         while let Some(queued) = receiver.recv().await {
                             let command = store.get_command(&queued.command_id)?;

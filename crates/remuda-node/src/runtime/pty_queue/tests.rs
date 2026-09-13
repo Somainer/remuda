@@ -360,6 +360,72 @@ async fn pty_pending_bound_preserves_control_access() {
     node.shutdown().await.unwrap();
 }
 
+/// DEFECT B: twelve idle `rmd-*` panes survived instances stopped through
+/// `POST /v1/instances/{id}/stop`. A driver only reclaims the Herdr resources
+/// it holds **in memory**, and the durable `pty_resources` row — the only
+/// record that outlives a rebuilt or adopted driver — was consulted at startup
+/// and shutdown but never on a stop. So the stop settled, the Instance went
+/// `exited`, and the pane stayed in the operator's session until the Node was
+/// restarted. A carrier whose driver has no in-memory record stands in here
+/// for the rebuilt-driver case.
+#[tokio::test]
+async fn stopping_a_pty_instance_reclaims_its_durable_carrier_ownership() {
+    use remuda_driver::PtyResource;
+    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer};
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("herdr.sock");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+    let client = remuda_herdr::Client::connect(&socket);
+    let (node, driver) = node(DriverKind::ClaudePty, 4);
+    let created = create(&node, DriverKind::ClaudePty).await;
+
+    // A pane this Instance owns, recorded durably exactly as a real launch
+    // does — and unknown to the driver's own in-memory resource list.
+    let workspace = client
+        .workspace_create(remuda_herdr::WorkspaceCreateParams {
+            label: Some("remuda-stop-probe".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    node.inner
+        .store
+        .put_pty_resource(&PtyResource {
+            instance_id: Some(created.instance.meta.id.clone()),
+            socket_path: socket.clone(),
+            session: "remuda-stop-test".into(),
+            workspace_id: workspace.workspace.workspace_id.clone(),
+            workspace_label: workspace.workspace.label.clone(),
+            tab_id: workspace.tab.tab_id.clone(),
+            pane_id: workspace.root_pane.pane_id.clone(),
+        })
+        .unwrap();
+    assert_eq!(client.session_snapshot().await.unwrap().panes.len(), 1);
+
+    let close = submit(&node, &created, serde_json::json!({"operation": "close"})).await;
+    wait(|| node.get_command(&close.command_id).unwrap().state == CommandState::Settled).await;
+    assert_accepted(&node, &close);
+    assert_eq!(
+        node.get_instance(&created.instance.meta.id)
+            .unwrap()
+            .lifecycle,
+        InstanceLifecycle::Exited
+    );
+
+    // Reclamation follows the settlement rather than gating it: the stop is
+    // already durable, and a carrier that is slow to die must not hold the
+    // command open. It is prompt, not deferred to the next Node restart.
+    wait(|| node.inner.store.pty_resources().unwrap().is_empty()).await;
+    let snapshot = client.session_snapshot().await.unwrap();
+    assert!(
+        snapshot.panes.is_empty() && snapshot.workspaces.is_empty(),
+        "a settled stop must leave no pane behind: {snapshot:?}"
+    );
+    let _ = driver;
+    node.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn rejected_pty_close_keeps_worker_available_for_send_and_close_retry() {
     let (node, driver) = node(DriverKind::ClaudePty, 4);

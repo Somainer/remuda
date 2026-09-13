@@ -6,7 +6,7 @@ use crate::claude_pty::{ObsCtx, emit_on, map_herdr, now_ts};
 use crate::{DriverAck, DriverError, DriverResult};
 use remuda_herdr::{AgentReadParams, AgentStatus, Client, ReadFormat, ReadSource};
 use remuda_protocol::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -53,12 +53,39 @@ struct Pending {
     attempted: bool,
 }
 
-#[derive(Default)]
+/// Startup-watch budget: 250 ms per poll, so ~3 minutes. This only bounds a
+/// carrier whose driver never reports a successful start; the normal path
+/// disarms the watch as soon as the native session is real.
+const STARTUP_POLL_BUDGET: u32 = 720;
+
 struct State {
     pending: Option<Pending>,
     status: Option<AgentStatus>,
     closed: bool,
     trust_attempted: bool,
+    /// One automatic answer per recognised first-run screen, per carrier.
+    onboarding_attempted: BTreeSet<&'static str>,
+    /// Screens already journalled, so a wizard step that lingers across polls
+    /// produces one diagnostic rather than four per second.
+    onboarding_reported: BTreeSet<&'static str>,
+    /// Polls left in the startup watch. The watch reads the viewport while the
+    /// pane is *idle*, which is the only way a first-run wizard is visible at
+    /// all; the driver disarms it once the carrier has really started.
+    startup_polls_left: u32,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            status: None,
+            closed: false,
+            trust_attempted: false,
+            onboarding_attempted: BTreeSet::new(),
+            onboarding_reported: BTreeSet::new(),
+            startup_polls_left: STARTUP_POLL_BUDGET,
+        }
+    }
 }
 
 pub(crate) struct PtyInteractions {
@@ -185,6 +212,10 @@ impl PtyInteractions {
                 self.clear(state, InteractionState::Resolved, "native-cleared")
                     .await?;
             }
+            // Herdr calls a first-run wizard idle: it is a TUI at a menu, not a
+            // blocked agent. Only a viewport read tells the two apart, and
+            // without this the D-022 queue would type a prompt into the wizard.
+            self.watch_startup(state, status).await?;
             return Ok(());
         }
         let (screen, screen_truncated) = self.screen().await?;
@@ -264,6 +295,95 @@ impl PtyInteractions {
             result?;
         }
         Ok(())
+    }
+
+    /// True while a recognised first-run screen is on the viewport.
+    ///
+    /// [`prompt_ready`] consults this so the D-022 queue keeps waiting instead
+    /// of typing a prompt into a wizard that Herdr reports as idle.
+    pub(crate) async fn startup_dialog_pending(&self) -> bool {
+        let state = self.state.lock().await;
+        state.startup_polls_left > 0 && !state.onboarding_reported.is_empty()
+    }
+
+    /// Stop reading the viewport for first-run screens.
+    ///
+    /// Called once the carrier has really started (Claude's own SessionStart
+    /// hook fired), so ordinary model output can never be mistaken for a
+    /// wizard later in the session.
+    pub(crate) async fn disarm_startup_watch(&self) {
+        self.state.lock().await.startup_polls_left = 0;
+    }
+
+    /// Look for a first-run screen on an otherwise-idle pane.
+    ///
+    /// Answers the steps whose default is safe and journals every recognised
+    /// screen exactly once. Screens that carry a real decision (login, the
+    /// bypass disclaimer) are only reported: Remuda never accepts those for a
+    /// human.
+    async fn watch_startup(&self, state: &mut State, status: AgentStatus) -> DriverResult<()> {
+        if self.ctx.driver != DriverKind::ClaudePty || state.startup_polls_left == 0 {
+            return Ok(());
+        }
+        state.startup_polls_left -= 1;
+        // An `unknown` pane has no readable viewport yet; spend the budget
+        // rather than an RPC round-trip per tick.
+        if status == AgentStatus::Unknown {
+            return Ok(());
+        }
+        let (screen, truncated) = self.screen().await?;
+        let Some(dialog) = crate::claude_onboarding::startup_dialog(&screen) else {
+            return Ok(());
+        };
+        let first_sighting = state.onboarding_reported.insert(dialog.name);
+        // Only the exact, whole screen is answerable: a truncated viewport may
+        // hide a further option or a different cursor position. One attempt per
+        // screen per carrier, even if an ACK is lost.
+        let answerable = !truncated && !state.onboarding_attempted.contains(dialog.name);
+        if let Some(keys) = dialog.keys.filter(|_| answerable) {
+            // Mark before I/O: a lost ACK must never replay Enter.
+            state.onboarding_attempted.insert(dialog.name);
+            let (status, severity) = match self.write(keys).await {
+                Ok(_) => (
+                    format!("{} auto-answered (default)", dialog.name),
+                    Severity::Info,
+                ),
+                Err(error) => (
+                    format!("{} automatic answer delivery unknown: {error}", dialog.name),
+                    Severity::Warning,
+                ),
+            };
+            return self.report_startup_dialog(&status, severity).await;
+        }
+        if !first_sighting {
+            return Ok(());
+        }
+        let status = if truncated {
+            format!("{} detected; screen truncated, not answered", dialog.name)
+        } else {
+            format!("{} needs a human; not answered", dialog.name)
+        };
+        self.report_startup_dialog(&status, Severity::Warning).await
+    }
+
+    async fn report_startup_dialog(&self, status: &str, severity: Severity) -> DriverResult<()> {
+        self.emit(ObservationPayload::Lifecycle(Box::new(
+            LifecyclePayload::Native(Box::new(NativeLifecycle {
+                topic: LifecycleTopic::Diagnostic,
+                native_name: "claude-onboarding".into(),
+                native_id: Knowledge::Known {
+                    value: self.target.clone(),
+                },
+                status: Knowledge::Known {
+                    value: status.to_owned(),
+                },
+                related_ids: BTreeMap::new(),
+                data_ref: None,
+                severity,
+                affects_completion: false,
+            })),
+        )))
+        .await
     }
 
     async fn clear(
@@ -435,6 +555,23 @@ pub(crate) async fn prompt_ready(client: &Client, target: &str) -> DriverResult<
     if !matches!(agent.agent_status, AgentStatus::Idle | AgentStatus::Done)
         || !agent.interactive_ready
     {
+        return Err(DriverError::ControlUnavailable);
+    }
+    Ok(())
+}
+
+/// The same query, plus the first-run screens Herdr reports as idle.
+///
+/// A wizard step is `idle` and `interactive_ready` to Herdr — it is a TUI at a
+/// menu — so `prompt_ready` alone would let the D-022 queue type a prompt into
+/// the theme picker.
+pub(crate) async fn prompt_ready_for(
+    client: &Client,
+    target: &str,
+    interactions: &PtyInteractions,
+) -> DriverResult<()> {
+    prompt_ready(client, target).await?;
+    if interactions.startup_dialog_pending().await {
         return Err(DriverError::ControlUnavailable);
     }
     Ok(())

@@ -393,3 +393,156 @@ async fn claude_trust_is_auto_answered_only_when_node_enabled_it() {
         driver.close().await.unwrap();
     }
 }
+
+/// DEFECT A: a fresh Node-scoped config dir makes Claude run its first-run
+/// wizard. Herdr calls that pane **idle and interactive-ready**, so without a
+/// viewport check the D-022 queue would type the user's prompt into the theme
+/// picker, and no SessionStart hook would ever fire.
+#[tokio::test]
+async fn claude_onboarding_is_detected_answered_and_blocks_prompt_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join("herdr");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
+    fake_options.script = FakeHerdrScript::Onboarding;
+    let _fake = FakeHerdrServer::spawn(fake_options).unwrap();
+    let bin = install_executable(dir.path(), "native-stub", "#!/bin/sh\necho 'stub 1.0'\n");
+    let profile = ProviderProfile {
+        id: Id::new("pvp").unwrap(),
+        kind: ProviderKind::Anthropic,
+        base_url: String::new(),
+        delegation: Delegation::None,
+        secret_ref: None,
+        models: vec!["default".into()],
+        health: ProviderHealth::Healthy,
+    };
+    let mut options = ClaudePtyOptions::new(
+        profile,
+        dir.path().join("launch"),
+        dir.path().join("home"),
+        BinarySource::Pinned(pin_binary(&bin).unwrap()),
+    );
+    options.socket_dir = Some(socket_dir.clone());
+    options.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
+    let driver = ClaudePtyDriver::new(options);
+    let mut spec: InstanceSpec =
+        serde_json::from_str(include_str!("fixtures/instance-spec.json")).unwrap();
+    spec.driver = DriverKind::ClaudePty;
+    spec.cwd = dir.path().to_string_lossy().into_owned();
+    let mut handle = driver.start(spec).await.unwrap();
+
+    // Seeding runs before agent.start and says what it wrote, without values.
+    let seeded = std::fs::read_to_string(dir.path().join("home/.claude.json")).unwrap();
+    assert!(
+        seeded.contains("\"hasCompletedOnboarding\": true"),
+        "{seeded}"
+    );
+
+    // The pane is idle, so the pre-D-022 readiness probe would have said "go".
+    let client = remuda_herdr::Client::connect(socket_dir.join("herdr.sock"));
+    let pane = handle.ack().native_ids["paneId"].clone();
+    let agent = client.agent_get(&pane).await.unwrap().agent;
+    assert_eq!(agent.agent_status, remuda_herdr::AgentStatus::Idle);
+    assert!(agent.interactive_ready);
+    assert!(
+        matches!(
+            driver.wait_control().await,
+            Err(remuda_driver::DriverError::ControlUnavailable)
+        ),
+        "a wizard step must never accept a queued prompt"
+    );
+
+    // Every step is journalled and answered with its safe default.
+    let mut answered = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while answered.len() < 3 {
+            let observation = handle.recv().await.unwrap();
+            let ObservationPayload::Lifecycle(payload) = observation.body else {
+                continue;
+            };
+            let LifecyclePayload::Native(native) = *payload else {
+                continue;
+            };
+            if native.native_name != "claude-onboarding" {
+                continue;
+            }
+            let Knowledge::Known { value } = native.status else {
+                panic!("diagnostic status must be known");
+            };
+            if value.contains("auto-answered") {
+                assert_eq!(native.severity, Severity::Info);
+                answered.push(value);
+            }
+        }
+    })
+    .await
+    .expect("onboarding steps answered");
+    assert!(answered[0].starts_with("onboarding-theme"), "{answered:?}");
+    assert!(
+        answered[1].starts_with("onboarding-security"),
+        "{answered:?}"
+    );
+    assert!(
+        answered[2].starts_with("onboarding-terminal-setup"),
+        "{answered:?}"
+    );
+
+    // Enter would have rewritten the operator's terminal profile; escape skips.
+    let screen = client
+        .agent_read(remuda_herdr::AgentReadParams {
+            target: pane.clone(),
+            source: remuda_herdr::ReadSource::Visible,
+            lines: Some(32),
+            format: remuda_herdr::ReadFormat::Text,
+            strip_ansi: true,
+        })
+        .await
+        .unwrap();
+    assert!(screen.text().contains("KEYS escape"), "{}", screen.text());
+
+    // The composer is reached, but delivery still waits for SessionStart.
+    assert!(matches!(
+        driver.wait_control().await,
+        Err(remuda_driver::DriverError::ControlUnavailable)
+    ));
+    std::fs::write(
+        dir.path().join("launch/session-meta.json"),
+        serde_json::json!({
+            "session_id": "fixture-session",
+            "transcript_path": dir.path().join("transcript.jsonl"),
+            "hook_event_name": "SessionStart",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while driver.wait_control().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("prompt delivery unblocks once the real session starts");
+    driver.close().await.unwrap();
+}
+
+/// A screen that needs a person is reported, never answered.
+#[tokio::test]
+async fn a_human_only_startup_screen_is_reported_and_left_alone() {
+    for (screen, expected) in [
+        (
+            include_str!("../../remuda-testing/tests/fixtures/claude-onboarding-login.txt"),
+            "login",
+        ),
+        (
+            include_str!("../../remuda-testing/tests/fixtures/claude-bypass-disclaimer.txt"),
+            "bypass-disclaimer",
+        ),
+    ] {
+        let dialog = remuda_driver::startup_dialog(screen).expect("detected");
+        assert_eq!(dialog.name, expected);
+        assert!(
+            dialog.keys.is_none(),
+            "{expected} must not be auto-answered"
+        );
+    }
+}

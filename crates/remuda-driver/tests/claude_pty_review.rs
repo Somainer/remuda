@@ -439,6 +439,8 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
         inherit_default_config: false,
         settings_overlay_path: None,
         auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        host_claude_config: None,
     });
 
     let mut spec = pty_spec(&cwd, "opus-review");

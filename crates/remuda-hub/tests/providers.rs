@@ -828,6 +828,131 @@ async fn discover_normalizes_both_upstream_shapes_without_echoing_the_token() ->
     Ok(())
 }
 
+/// A gateway that answers `/v1/models` differently depending on the headers
+/// (astergate: a broad OpenAI-style list for a plain Bearer GET, a short
+/// `claude-*` subset once `anthropic-version` is set). Probing one surface
+/// under-reports, so `/discover` and `/test` must union both.
+struct PerHeaderUpstream {
+    addr: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PerHeaderUpstream {
+    async fn serve() -> Result<Self> {
+        const OPENAI: &str = r#"{"object":"list","data":[
+            {"id":"passthrough/ark/seed-evolving"},
+            {"id":"cursor/gpt-5"},
+            {"id":"claude-opus-5"}
+        ]}"#;
+        const ANTHROPIC: &str = r#"{"data":[
+            {"type":"model","id":"claude-opus-5","display_name":"Opus 5","context_window":1048576},
+            {"type":"model","id":"claude-haiku-4-5","display_name":"Haiku 4.5"}
+        ],"has_more":false}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    let (code, payload) = if head.starts_with("get /v1/models") {
+                        if head.contains("anthropic-version:") {
+                            (200, ANTHROPIC)
+                        } else {
+                            (200, OPENAI)
+                        }
+                    } else {
+                        (404, "{}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Ok(Self { addr, task })
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for PerHeaderUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn discover_unions_the_two_catalogs_a_gateway_serves_per_header() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+
+    let upstream = PerHeaderUpstream::serve().await?;
+    let token = "sk-fake-per-header-zzzz";
+    let body = json!({ "baseUrl": upstream.base_url(), "token": token }).to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &auth,
+        Some(&body),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "discover {status} {rest}");
+    assert!(!rest.contains(token), "discover echoed the token: {rest}");
+    let result: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(result["ok"], true);
+    let models = result["models"].as_array().context("models")?;
+    let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
+    // Every id from either listing, nothing filtered by prefix.
+    assert_eq!(
+        ids,
+        vec![
+            "passthrough/ark/seed-evolving",
+            "cursor/gpt-5",
+            "claude-opus-5",
+            "claude-haiku-4-5",
+        ]
+    );
+    // The overlapping id records both surfaces and keeps the richer metadata
+    // that only the anthropic listing reported.
+    let shared = models.iter().find(|m| m["id"] == "claude-opus-5").unwrap();
+    assert_eq!(shared["surfaces"], json!(["openai", "anthropic"]));
+    assert_eq!(shared["label"], "Opus 5");
+    assert_eq!(shared["contextWindow"], 1_048_576);
+    assert_eq!(
+        models[0]["surfaces"],
+        json!(["openai"]),
+        "an id only the plain listing serves is tagged openai"
+    );
+    assert_eq!(
+        models[3]["surfaces"],
+        json!(["anthropic"]),
+        "an id only the anthropic listing serves is still offered"
+    );
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("openai+anthropic"),
+        "message names both surfaces: {}",
+        result["message"]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn discover_reuses_a_saved_profile_token_and_test_returns_the_same_shape() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;

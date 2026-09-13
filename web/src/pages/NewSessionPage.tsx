@@ -30,7 +30,13 @@ import {
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
-import { defaultGatewayProfile, enabledModels, fromHub, type ProviderProfile } from "../features/providers";
+import {
+  defaultGatewayProfile,
+  enabledModels,
+  fromHub,
+  resolveGatewayModel,
+  type ProviderProfile,
+} from "../features/providers";
 import { api } from "../lib/api";
 import { WorkspaceRegistration } from "../features/workspaces/WorkspaceRegistration";
 import { workspaceCwd } from "../features/workspaces/path";
@@ -95,6 +101,14 @@ export function NewSessionPage() {
   // Only a gateway run is constrained to the profile's catalog; native and
   // direct sessions keep the free-text model box.
   const gatewayModels = delegation === "gateway" ? enabledModels(defaultGateway?.models ?? []) : [];
+  // The catalog is the source of truth, so derive the choice during render
+  // rather than repairing it in the delegation button's click handler: on a
+  // slow runner the profile lands after the click, and a model the catalog
+  // hides would otherwise linger as an extra option.
+  const gatewayModel =
+    delegation === "gateway" && defaultGateway
+      ? resolveGatewayModel(defaultGateway.models, defaultGateway.defaultModel, model)
+      : null;
 
   const pickerHosts = sortHostsOnlineFirst(
     hub.hosts.filter((h) => !isStaleOffline(h)),
@@ -147,6 +161,9 @@ export function NewSessionPage() {
         : "claude-pty"
       : "generic-pty";
   const sessionEffort = effort.kind === activeKind ? effort : mapEffort(effort, activeKind as EffortKind);
+  // Launch and remember what the picker shows, not a remembered id the
+  // catalog has since stopped exposing.
+  const launchModel = gatewayModel ?? model;
   const close = () => navigate("/sessions");
 
   return (
@@ -178,7 +195,7 @@ export function NewSessionPage() {
               workspaceId: workspace?.id,
               kind: activeKind,
               driver,
-              model,
+              model: launchModel,
               providerProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
               permissionMode: activeKind === "claude" ? permissionMode : "bypassPermissions",
               delegation: delegation === "host" ? undefined : delegation,
@@ -195,7 +212,7 @@ export function NewSessionPage() {
             rememberNewSessionSuccess({
               hostId,
               workspaceId: workspace?.id ?? cwd,
-              model,
+              model: launchModel,
               permissionMode,
               driver,
               delegation,
@@ -374,12 +391,9 @@ export function NewSessionPage() {
                     <select
                       className={css.select}
                       data-testid="new-session-model"
-                      value={model}
+                      value={gatewayModel ?? model}
                       onChange={(e) => setModel(e.target.value)}
                     >
-                      {gatewayModels.some((m) => m.id === model) ? null : (
-                        <option value={model}>{model}</option>
-                      )}
                       {gatewayModels.map((m) => (
                         <option key={m.id} value={m.id}>
                           {m.label ? `${m.id} · ${m.label}` : m.id}
@@ -486,15 +500,7 @@ export function NewSessionPage() {
                   type="button"
                   className={`${css.choice} ${delegation === opt.id ? css.choiceOn : ""}`}
                   data-testid={`new-session-delegation-${opt.id}`}
-                  onClick={() => {
-                    setDelegation(opt.id);
-                    if (opt.id === "gateway" && defaultGateway) {
-                      const enabled = enabledModels(defaultGateway.models);
-                      const next = defaultGateway.defaultModel || enabled[0]?.id;
-                      // Keep a model the catalog still exposes; otherwise prefill.
-                      if (next && !enabled.some((m) => m.id === model)) setModel(next);
-                    }
-                  }}
+                  onClick={() => setDelegation(opt.id)}
                 >
                   {opt.label}
                 </button>

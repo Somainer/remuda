@@ -11,6 +11,7 @@ export {
   normalizeModels,
   parseModels,
   redactSecretRef,
+  resolveGatewayModel,
   shouldAvoidUnhealthy,
   type Delegation,
   type ProviderCreate,

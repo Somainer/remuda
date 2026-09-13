@@ -95,13 +95,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Serve a fixed Anthropic-style `/v1/models` catalog, with display names and
-/// one long-context entry so the discovery checklist has metadata to render.
+/// Serve `/v1/models`, answering **differently per header** the way astergate
+/// does: a plain Bearer GET returns the broad OpenAI-style list, while an
+/// `anthropic-version` GET returns only the short `claude-*` subset. Discovery
+/// must union both, so the checklist sees every id from either listing.
 async fn fake_upstream(listener: tokio::net::TcpListener) {
-    const CATALOG: &str = r#"{"data":[
+    /// Plain `Authorization: Bearer` listing (OpenAI shape).
+    const OPENAI_CATALOG: &str = r#"{"object":"list","data":[
+        {"id":"e2e/auto","context_length":1048576},
+        {"id":"e2e/fast","context_length":200000},
+        {"id":"e2e/plain"},
+        {"id":"cursor/e2e-wide"}
+    ]}"#;
+    /// `anthropic-version` listing (Anthropic shape): a short overlapping set
+    /// plus one id the plain listing never mentions.
+    const ANTHROPIC_CATALOG: &str = r#"{"data":[
         {"type":"model","id":"e2e/auto","display_name":"E2E Auto","context_window":1048576},
         {"type":"model","id":"e2e/fast","display_name":"E2E Fast","context_window":200000},
-        {"type":"model","id":"e2e/plain"}
+        {"type":"model","id":"claude-e2e-only","display_name":"Claude E2E"}
     ],"has_more":false}"#;
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -115,7 +126,12 @@ async fn fake_upstream(listener: tokio::net::TcpListener) {
             };
             let head = String::from_utf8_lossy(&buf[..n]);
             let (code, body) = if head.starts_with("GET /v1/models") {
-                (200, CATALOG)
+                // Header names are case-insensitive on the wire.
+                if head.to_ascii_lowercase().contains("anthropic-version:") {
+                    (200, ANTHROPIC_CATALOG)
+                } else {
+                    (200, OPENAI_CATALOG)
+                }
             } else {
                 (404, "{}")
             };

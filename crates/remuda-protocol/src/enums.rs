@@ -85,6 +85,11 @@ wire_enum!(Activity, "2.3", {
     Draining => "draining",
 });
 
+wire_enum!(InstanceMode, "2.3", {
+    Native => "native",
+    Promoted => "promoted",
+});
+
 wire_enum!(Connectivity, "2.3", {
     Connected => "connected",
     Disconnected => "disconnected",

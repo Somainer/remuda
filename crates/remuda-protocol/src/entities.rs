@@ -255,6 +255,13 @@ pub struct Instance {
     /// Driver or native diagnostic when [`InstanceLifecycle::Failed`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// `mode`; protocol §2.3. How this Instance arrived at its current `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<InstanceMode>,
+    /// `promoted_at`; protocol §2.3. Set only while `mode` is
+    /// [`InstanceMode::Promoted`] (D-025).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<Timestamp>,
 }
 
 /// RunCause; `protocol.md` §2.4.

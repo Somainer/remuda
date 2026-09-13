@@ -1,6 +1,6 @@
 //! Argon2id verifiers, cookies, and Origin/Host checks.
 
-use crate::config::{DEVICE_COOKIE, HubConfig, random_token};
+use crate::config::{DEVICE_COOKIE, HubConfig, now_rfc3339, random_token};
 use crate::error::HubError;
 use crate::store::{Device, Store};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -54,29 +54,38 @@ pub fn verify_secret(secret: &str, hash: &str) -> bool {
         .is_some()
 }
 
-/// Persist a generated bootstrap token at `0600`.
+/// Persist a generated bootstrap access code at `0600`.
+///
+/// Writes a sibling `bootstrap-issued-at` stamp so the TTL survives restart
+/// (D-018). The code itself keeps its historical filename so existing tooling
+/// and `remuda dev` keep working.
 pub fn persist_bootstrap(data_dir: &Path, token: &str) -> Result<(), HubError> {
     std::fs::create_dir_all(data_dir)
         .map_err(|err| HubError::Internal(format!("data dir: {err}")))?;
-    let path = data_dir.join("bootstrap-token");
+    write_private(&data_dir.join("bootstrap-token"), token)?;
+    write_private(&data_dir.join("bootstrap-issued-at"), &now_rfc3339())?;
+    Ok(())
+}
+
+fn write_private(path: &Path, contents: &str) -> Result<(), HubError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&path)
+        .open(path)
         .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?;
-    file.write_all(token.as_bytes())
+    file.write_all(contents.as_bytes())
         .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?;
     file.sync_all()
         .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?;
     let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(&path, perms)
+    std::fs::set_permissions(path, perms)
         .map_err(|err| HubError::Internal(format!("bootstrap mode: {err}")))?;
     Ok(())
 }
 
-/// Resolve the bootstrap token, generating one when the config is empty.
+/// Resolve the bootstrap access code, generating one when the config is empty.
 pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
     let path = config.data_dir.join("bootstrap-token");
     if config.bootstrap_token.is_empty() {
@@ -85,6 +94,12 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
                 .map_err(|err| HubError::Internal(format!("bootstrap: {err}")))?
                 .trim()
                 .to_string();
+            // Pre-D-018 data dirs have no stamp; treat first sight as issue time
+            // rather than expiring an operator's working code on upgrade.
+            let stamp = config.data_dir.join("bootstrap-issued-at");
+            if !stamp.is_file() {
+                write_private(&stamp, &now_rfc3339())?;
+            }
             return Ok(());
         }
         config.bootstrap_token = random_token();
@@ -93,6 +108,47 @@ pub fn resolve_bootstrap(config: &mut HubConfig) -> Result<(), HubError> {
         persist_bootstrap(&config.data_dir, &config.bootstrap_token)?;
     }
     Ok(())
+}
+
+/// Replace the bootstrap access code with a freshly generated one (D-018).
+///
+/// Returns the new code. Devices already paired keep their device tokens; only
+/// future pairing is affected.
+pub fn rotate_bootstrap(data_dir: &Path) -> Result<String, HubError> {
+    let token = random_token();
+    persist_bootstrap(data_dir, &token)?;
+    Ok(token)
+}
+
+/// When the stored bootstrap code was issued, if the stamp is present.
+#[must_use]
+pub fn bootstrap_issued_at(data_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(data_dir.join("bootstrap-issued-at"))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// Whether the bootstrap access code is still inside its TTL.
+///
+/// A missing stamp fails **open** for one reason only: it means a pre-D-018
+/// data dir whose stamp `resolve_bootstrap` could not write. A malformed or
+/// future-dated stamp is treated as expired.
+#[must_use]
+pub fn bootstrap_within_ttl(data_dir: &Path, ttl_hours: u64) -> bool {
+    if ttl_hours == 0 {
+        return true;
+    }
+    let Some(issued) = bootstrap_issued_at(data_dir) else {
+        return true;
+    };
+    let Ok(issued) =
+        time::OffsetDateTime::parse(&issued, &time::format_description::well_known::Rfc3339)
+    else {
+        return false;
+    };
+    let age = time::OffsetDateTime::now_utc() - issued;
+    age < time::Duration::hours(ttl_hours as i64)
 }
 
 /// Persist the bound Hub URL so `remuda mcp` can discover it without env edits.
@@ -254,5 +310,57 @@ mod tests {
         assert!(!origin_allowed(&headers, &config));
         config.cookie_secure = false;
         assert!(origin_allowed(&headers, &config));
+    }
+
+    /// D-018: the access code expires, and rotating it issues a fresh stamp.
+    #[test]
+    fn bootstrap_ttl_expires_and_rotation_resets_it() {
+        let dir = tempfile::tempdir().expect("data dir");
+        persist_bootstrap(dir.path(), "code-1").expect("persist");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+        // A zero TTL disables expiry entirely.
+        assert!(bootstrap_within_ttl(dir.path(), 0));
+
+        // Backdate the stamp past the TTL.
+        write_private(
+            &dir.path().join("bootstrap-issued-at"),
+            "2000-01-01T00:00:00.000Z",
+        )
+        .expect("stamp");
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
+
+        let rotated = rotate_bootstrap(dir.path()).expect("rotate");
+        assert_ne!(rotated, "code-1");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+        let stored = std::fs::read_to_string(dir.path().join("bootstrap-token")).expect("read");
+        assert_eq!(stored.trim(), rotated);
+    }
+
+    /// A malformed stamp is treated as expired rather than silently trusted.
+    #[test]
+    fn unparseable_bootstrap_stamp_is_expired() {
+        let dir = tempfile::tempdir().expect("data dir");
+        persist_bootstrap(dir.path(), "code-2").expect("persist");
+        write_private(&dir.path().join("bootstrap-issued-at"), "not-a-timestamp").expect("stamp");
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
+    }
+
+    /// A pre-D-018 data dir (code, no stamp) keeps working and gains a stamp.
+    #[test]
+    fn legacy_data_dir_without_stamp_is_accepted_and_stamped() {
+        let dir = tempfile::tempdir().expect("data dir");
+        write_private(&dir.path().join("bootstrap-token"), "legacy-code").expect("code");
+        assert!(
+            bootstrap_within_ttl(dir.path(), 24),
+            "a missing stamp must not lock an operator out"
+        );
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(config.bootstrap_token, "legacy-code");
+        assert!(
+            bootstrap_issued_at(dir.path()).is_some(),
+            "resolve must backfill the issued-at stamp"
+        );
     }
 }

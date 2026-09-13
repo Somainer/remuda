@@ -502,6 +502,8 @@ async fn connect_once(
     ));
     let mut host_id = None;
     let mut hello_done = false;
+    // Per-session tty stream ownership, as on the WS path (T2).
+    let mut tty_streams = std::collections::HashSet::new();
     let mut params = hello["params"].clone();
     params["label"] = json!(record.label);
     params["transport"] = json!("ssh-stdio");
@@ -515,6 +517,7 @@ async fn connect_once(
         &mut host_id,
         &mut hello_done,
         generation,
+        &mut tty_streams,
         "node.hello",
         params,
         &out_tx,
@@ -554,7 +557,7 @@ async fn connect_once(
                     continue;
                 }
                 let method = frame["method"].as_str().unwrap_or("");
-                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, generation, method, frame["params"].clone(), &out_tx, &pending).await;
+                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, generation, &mut tty_streams, method, frame["params"].clone(), &out_tx, &pending).await;
                 if let Some(id) = frame.get("id").filter(|id| !id.is_null()) {
                     let reply = match result { Ok(Some(value)) => crate::error::rpc_ok(id.clone(), value), Ok(None) => continue, Err(error) => crate::error::rpc_error(id.clone(), -32000, &error.to_string()) };
                     tokio::time::timeout(Duration::from_secs(15), carrier.send_json(&reply)).await??;

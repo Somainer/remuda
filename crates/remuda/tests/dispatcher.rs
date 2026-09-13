@@ -89,11 +89,20 @@ async fn hub_with_dispatcher_uses_local_auth_and_sigterm_stops_both_consumers() 
         })
         .await
         .context("combined mode readiness")??;
+        // Pairing a fresh device with the access code is what the code is for
+        // (D-018); it is not what the dispatcher itself uses.
         let client = HubClient::new(format!("http://{address}"), None, Some(BOOTSTRAP.into()))?;
         client
             .list_hosts()
             .await
             .context("local Hub serves authenticated requests")?;
+        // The dispatcher must hold its own scoped device token, minted in
+        // process at startup, rather than carrying the pairing access code.
+        let devices = get_json(&address, "/v1/devices", BOOTSTRAP).await?;
+        ensure!(
+            devices.contains("remuda-dispatcher"),
+            "dispatcher did not mint a scoped device token: {devices}"
+        );
         ensure!(
             dir.path().join("data/dispatcher/sessions.sqlite").is_file(),
             "session map missing"
@@ -204,4 +213,42 @@ async fn standalone_refuses_a_bootstrap_token() -> Result<()> {
         "consume started despite a refused credential"
     );
     Ok(())
+}
+
+/// Pair a throwaway device over HTTP and GET `path` with its device token.
+async fn get_json(address: &str, path: &str, bootstrap: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn send(address: &str, request: &str) -> Result<String> {
+        let mut stream = tokio::net::TcpStream::connect(address).await?;
+        stream.write_all(request.as_bytes()).await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        Ok(String::from_utf8_lossy(&buf).to_string())
+    }
+
+    let body =
+        format!(r#"{{"bootstrapToken":"{bootstrap}","deviceName":"dispatcher-test-probe"}}"#);
+    let login = send(
+        address,
+        &format!(
+            "POST /v1/login HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await?;
+    let token = login
+        .split_once("\"token\":\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(token, _)| token.to_owned())
+        .context("probe device token")?;
+    send(
+        address,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\n\
+             Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await
 }

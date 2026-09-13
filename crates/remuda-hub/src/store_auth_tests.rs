@@ -180,11 +180,30 @@ async fn device_lookup_is_indexed_and_legacy_migration_verifies_only_the_named_r
 fn host_request(token: String, host_id: Option<String>) -> HostAuthRequest {
     HostAuthRequest {
         presented: token,
-        bootstrap: "bootstrap".into(),
         hello_host_id: host_id,
         label: None,
         node_version: None,
     }
+}
+
+/// D-018: mint a single-use enroll token whose stored "hash" is its plaintext,
+/// so these tests keep counting only the verifier calls they care about.
+async fn mint_enroll(store: &Store, label: &str) -> String {
+    // Real tokens are 64 hex chars; the prefix index only applies to those.
+    let mut hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+    hex.truncate(64);
+    let plaintext = format!("{hex:0<64}");
+    let plaintext = plaintext.as_str();
+    store
+        .insert_enroll_token(
+            plaintext.to_string(),
+            crate::auth::token_prefix(plaintext).map(str::to_string),
+            "dev_test".into(),
+            "2099-01-01T00:00:00.000Z".into(),
+        )
+        .await
+        .unwrap();
+    plaintext.to_string()
 }
 
 #[tokio::test]
@@ -193,13 +212,14 @@ async fn host_lookup_and_legacy_host_id_migration_are_bounded_and_bound_to_the_s
     let store = Store::open(dir.path()).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let mut hosts = Vec::new();
-    for _ in 0..32 {
+    for i in 0..32 {
+        let enroll = mint_enroll(&store, &format!("enroll-{i}")).await;
         let HostAuthOutcome::Authenticated {
             host,
             node_token: Some(token),
         } = store
             .authenticate_host(
-                host_request("bootstrap".into(), None),
+                host_request(enroll, None),
                 count_verifies(&calls),
                 |token| Ok(token.into()),
             )
@@ -210,11 +230,15 @@ async fn host_lookup_and_legacy_host_id_migration_are_bounded_and_bound_to_the_s
         };
         hosts.push((host.host_id, token));
     }
+    // Exactly one Argon2 verify per enrollment: the presented enroll token is
+    // found by its prefix index. A scan of live tokens or enrolled hosts would
+    // be quadratic here (0+1+…+31 = 496), not linear (A4).
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        0,
-        "bootstrap must not scan enrolled hosts"
+        32,
+        "enrollment must verify once, not scan"
     );
+    calls.store(0, Ordering::SeqCst);
     assert!(matches!(
         store
             .authenticate_host(

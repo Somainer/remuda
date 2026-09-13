@@ -63,15 +63,10 @@ impl HubCarrier for OutboundWssCarrier {
             let token = enrollment
                 .node_token
                 .clone()
-                .or_else(|| {
-                    std::env::var("REMUDA_BOOTSTRAP_TOKEN")
-                        .ok()
-                        .map(|token| token.trim().to_owned())
-                        .filter(|token| !token.is_empty())
-                })
+                .or_else(crate::enroll::enroll_token_from_env)
                 .ok_or_else(|| {
                     NodeError::InvalidConfig(format!(
-                        "outbound WSS {} requires REMUDA_BOOTSTRAP_TOKEN or enrollment.json",
+                        "outbound WSS {} requires REMUDA_ENROLL_TOKEN or enrollment.json",
                         self.endpoint
                     ))
                 })?;
@@ -143,12 +138,10 @@ impl HubCarrier for StdioCarrier {
             let enrollment = crate::enroll::load_or_create(&data_dir)?;
             let mut input = BufReader::new(tokio::io::stdin()).lines();
             let mut output = tokio::io::stdout();
-            let token = enrollment.node_token.clone().or_else(|| {
-                std::env::var("REMUDA_BOOTSTRAP_TOKEN")
-                    .ok()
-                    .map(|token| token.trim().to_owned())
-                    .filter(|token| !token.is_empty())
-            });
+            let token = enrollment
+                .node_token
+                .clone()
+                .or_else(crate::enroll::enroll_token_from_env);
             if let Some(token) = token.as_deref() {
                 write_ndjson(
                     &mut output,

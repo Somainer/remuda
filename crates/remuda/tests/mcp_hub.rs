@@ -37,16 +37,19 @@ where
     }
 }
 
+/// D-018: a Node enrolls with a single-use enroll token, not the device
+/// pairing access code. The in-process Hub mints one directly.
 async fn enroll_fake_node(
-    addr: std::net::SocketAddr,
-    bootstrap: &str,
+    hub: &remuda_hub::RunningHub,
     host_id: &str,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    let addr = hub.addr;
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await?;
     let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
     node.send(Message::Text(
         json!({
@@ -182,7 +185,7 @@ async fn mcp_tools_list_and_instance_create_against_in_process_hub() -> Result<(
     let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
     let bootstrap = hub.bootstrap_token.clone();
     let host_id = HostId::new();
-    let node = enroll_fake_node(hub.addr, &bootstrap, host_id.as_id().as_str()).await?;
+    let node = enroll_fake_node(&hub, host_id.as_id().as_str()).await?;
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let hub_url = format!("http://{}", hub.addr);
@@ -268,7 +271,7 @@ async fn doctor_routes_to_the_registered_host_and_mcp_marks_offline_hosts_as_err
     let dir = tempfile::tempdir()?;
     let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
     let host_id = HostId::new();
-    let node = enroll_fake_node(hub.addr, &hub.bootstrap_token, host_id.as_id().as_str()).await?;
+    let node = enroll_fake_node(&hub, host_id.as_id().as_str()).await?;
     let hub_url = format!("http://{}", hub.addr);
     let config = dir.path().join("remuda.toml");
     std::fs::write(

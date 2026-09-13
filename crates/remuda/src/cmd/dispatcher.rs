@@ -106,13 +106,17 @@ pub(crate) async fn run_configured(
     settings.validate()?;
     let consume = consume_settings(settings)?;
     let client = match local_hub {
-        // Combined mode: the credential never leaves this process, and the Hub it
-        // authenticates to is the one we just started.
-        Some(hub) => HubClient::new(
-            local_hub_url(hub.addr),
-            None,
-            Some(hub.bootstrap_token.clone()),
-        )?,
+        // Combined mode: mint a scoped device token in-process (D-018). The
+        // bootstrap access code pairs devices and does not authenticate the
+        // API, so the dispatcher holds a real revocable token — matching F13's
+        // rule for the standalone path rather than making an exception to it.
+        Some(hub) => {
+            let token = hub
+                .mint_device_token("remuda-dispatcher")
+                .await
+                .context("mint dispatcher device token")?;
+            HubClient::new(local_hub_url(hub.addr), Some(token), None)?
+        }
         None => {
             // F13: no bootstrap fallback. `Settings::validate` already rejects
             // `bootstrap_token`; this is the matching refusal at the point of use.
@@ -454,13 +458,18 @@ mod tests {
         let stopped_dir = dir.path().to_owned();
         let stop = async move {
             entered.notified().await;
-            // Both subscriptions have restarted before requesting shutdown.
+            // Both subscriptions have restarted *and* finished replaying before
+            // requesting shutdown. `.starts` is bumped before the replay begins,
+            // so waiting on it alone races the replayed `continue` line into the
+            // channel against `events.close()` — under load the accepted prompt
+            // could then never be dispatched. `.replayed` is written only after
+            // every line has been flushed, so the events are already queued.
             for key in [
                 remuda_feishu::EVENT_IM_RECEIVE,
                 remuda_feishu::EVENT_CARD_ACTION,
             ] {
-                let path = stopped_dir.join(format!("{key}.starts"));
-                tokio::time::timeout(Duration::from_secs(5), async {
+                let path = stopped_dir.join(format!("{key}.replayed"));
+                tokio::time::timeout(Duration::from_secs(30), async {
                     loop {
                         if std::fs::read_to_string(&path).ok().as_deref() == Some("2") {
                             break;
@@ -469,7 +478,7 @@ mod tests {
                     }
                 })
                 .await
-                .expect("consume restarted");
+                .expect("consume restarted and replayed");
             }
             tokio::spawn(async move {
                 wait_for(&stopped_dir.join("im.message.receive_v1.stopped")).await;

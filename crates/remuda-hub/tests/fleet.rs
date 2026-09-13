@@ -64,6 +64,24 @@ fn cookie_from(head: &str) -> Option<String> {
     None
 }
 
+/// Mint a single-use Node enroll token with a paired device's cookie (D-018).
+async fn enroll_token(addr: std::net::SocketAddr, cookie: &str) -> Result<String> {
+    let (status, _, rest) = http(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", cookie)],
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "enroll-token {status} {rest}");
+    let value: Value = serde_json::from_str(rest.trim())?;
+    value["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("enroll token")
+}
+
 async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<String> {
     let body = json!({ "bootstrapToken": bootstrap, "deviceName": "fleet-test" }).to_string();
     let (status, head, rest) = http(addr, "POST", "/v1/login", &[], Some(&body)).await?;
@@ -146,7 +164,7 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
 
     let (_sg_ws, _) = connect_node(
         hub.addr,
-        &bootstrap,
+        &enroll_token(hub.addr, &cookie).await?,
         &sg_id,
         "sg-node",
         json!({ "region": "sg", "egress": "gateway" }),
@@ -155,7 +173,7 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
     .await?;
     let (mut cn_ws, cn_token) = connect_node(
         hub.addr,
-        &bootstrap,
+        &enroll_token(hub.addr, &cookie).await?,
         &cn_id,
         "cn-node",
         json!({ "region": "cn" }),
@@ -344,7 +362,7 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
 
     let (sg_ws, _) = connect_node(
         hub.addr,
-        &bootstrap,
+        &enroll_token(hub.addr, &cookie).await?,
         &sg_id,
         "sg-node",
         json!({ "region": "sg" }),
@@ -353,7 +371,7 @@ async fn broadcast_fans_out_with_filters_and_idempotency() -> Result<()> {
     .await?;
     let (cn_ws, _) = connect_node(
         hub.addr,
-        &bootstrap,
+        &enroll_token(hub.addr, &cookie).await?,
         &cn_id,
         "cn-node",
         json!({ "region": "cn" }),

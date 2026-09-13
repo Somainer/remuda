@@ -59,13 +59,17 @@ async fn inbound_fixture_creates_instance_and_posts_progress_card() {
     let bootstrap = hub.bootstrap_token.clone();
     let addr = hub.addr;
 
+    // D-018: the access code pairs devices; a Node enrolls with a single-use
+    // enroll token. The in-process Hub mints one directly.
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .unwrap();
     let mut req = format!("ws://{addr}/v1/node")
         .into_client_request()
         .unwrap();
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {bootstrap}").parse().unwrap(),
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
     let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     let (sink, mut stream) = ws.split();
     let sink = Arc::new(Mutex::new(sink));

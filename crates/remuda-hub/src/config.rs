@@ -11,6 +11,10 @@ pub const DEVICE_COOKIE: &str = "remuda_device";
 pub const DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS: u64 = 5_000;
 /// Minimum create settlement deadline; native cold starts must fit inside it.
 pub const MIN_CREATE_SETTLE_TIMEOUT_MS: u64 = 120_000;
+/// Default lifetime of the bootstrap device access code (D-018).
+pub const DEFAULT_BOOTSTRAP_TTL_HOURS: u64 = 24;
+/// Default lifetime of a minted node enroll token (D-018).
+pub const DEFAULT_ENROLL_TOKEN_TTL_MINUTES: u64 = 60;
 
 /// How Hub binds and authenticates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,8 +27,14 @@ pub struct HubConfig {
     pub data_dir: PathBuf,
     /// HTTP/WS bind address.
     pub listen: SocketAddr,
-    /// One-time enrollment secret for devices and Nodes. Empty means generate.
+    /// Device pairing access code. Empty means generate. Never enrolls a Node (D-018).
     pub bootstrap_token: String,
+    /// Bootstrap access-code lifetime in hours; `0` disables expiry.
+    #[serde(default = "default_bootstrap_ttl_hours")]
+    pub bootstrap_ttl_hours: u64,
+    /// Lifetime of a minted node enroll token, in minutes.
+    #[serde(default = "default_enroll_token_ttl_minutes")]
+    pub enroll_token_ttl_minutes: u64,
     /// Set the `Secure` flag on the device cookie (production HTTPS).
     pub cookie_secure: bool,
     /// Canonical externally visible HTTP(S) origin, without a path.
@@ -62,6 +72,14 @@ fn default_push_block_ms() -> u64 {
     30_000
 }
 
+fn default_bootstrap_ttl_hours() -> u64 {
+    DEFAULT_BOOTSTRAP_TTL_HOURS
+}
+
+fn default_enroll_token_ttl_minutes() -> u64 {
+    DEFAULT_ENROLL_TOKEN_TTL_MINUTES
+}
+
 fn default_follow_buffer_events() -> usize {
     256
 }
@@ -81,6 +99,8 @@ impl Default for HubConfig {
             data_dir: PathBuf::from("./data"),
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             bootstrap_token: String::new(),
+            bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
+            enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: true,
             public_origin: None,
             trusted_proxies: Vec::new(),
@@ -103,6 +123,8 @@ impl HubConfig {
             data_dir,
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             bootstrap_token: format!("boot-{}", Uuid::new_v4().simple()),
+            bootstrap_ttl_hours: default_bootstrap_ttl_hours(),
+            enroll_token_ttl_minutes: default_enroll_token_ttl_minutes(),
             cookie_secure: false,
             public_origin: None,
             trusted_proxies: Vec::new(),

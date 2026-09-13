@@ -31,6 +31,7 @@ mod recipe;
 mod secrets;
 pub mod shell_pty;
 pub mod tty;
+pub mod usage;
 
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;

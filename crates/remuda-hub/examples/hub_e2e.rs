@@ -95,10 +95,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// A catalog big enough to need the bulk controls, served under `/bulk/v1`.
+///
+/// Three prefix groups and 44 ids — the shape of a real gateway's listing,
+/// where ticking one box at a time is the thing operators complained about.
+/// Both surfaces answer with the same body, so the union is exactly these 44
+/// in this order on every run.
+fn bulk_catalog() -> String {
+    let groups = [("cursor", 18), ("openai", 14), ("anthropic", 12)];
+    let mut items: Vec<String> = Vec::new();
+    for (prefix, count) in groups {
+        for n in 1..=count {
+            // Zero-padded so the ids sort and read the same everywhere.
+            items.push(format!(r#"{{"id":"{prefix}/model-{n:02}"}}"#));
+        }
+    }
+    format!(r#"{{"object":"list","data":[{}]}}"#, items.join(","))
+}
+
 /// Serve `/v1/models`, answering **differently per header** the way astergate
 /// does: a plain Bearer GET returns the broad OpenAI-style list, while an
 /// `anthropic-version` GET returns only the short `claude-*` subset. Discovery
 /// must union both, so the checklist sees every id from either listing.
+///
+/// `/bulk/v1/models` is the same endpoint with a 44-id catalog behind it, for
+/// the group and bulk-selection flows.
 async fn fake_upstream(listener: tokio::net::TcpListener) {
     /// Plain `Authorization: Bearer` listing (OpenAI shape).
     const OPENAI_CATALOG: &str = r#"{"object":"list","data":[
@@ -125,15 +146,19 @@ async fn fake_upstream(listener: tokio::net::TcpListener) {
                 return;
             };
             let head = String::from_utf8_lossy(&buf[..n]);
-            let (code, body) = if head.starts_with("GET /v1/models") {
+            let (code, body) = if head.starts_with("GET /bulk/v1/models") {
+                // One catalog for both surfaces: the union is then exactly the
+                // 44 ids, in one order, however the two probes interleave.
+                (200, bulk_catalog())
+            } else if head.starts_with("GET /v1/models") {
                 // Header names are case-insensitive on the wire.
                 if head.to_ascii_lowercase().contains("anthropic-version:") {
-                    (200, ANTHROPIC_CATALOG)
+                    (200, ANTHROPIC_CATALOG.to_string())
                 } else {
-                    (200, OPENAI_CATALOG)
+                    (200, OPENAI_CATALOG.to_string())
                 }
             } else {
-                (404, "{}")
+                (404, "{}".to_string())
             };
             let response = format!(
                 "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

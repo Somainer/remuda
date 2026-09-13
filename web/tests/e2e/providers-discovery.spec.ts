@@ -12,7 +12,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const evidence = process.env.REMUDA_EVIDENCE === "1";
 const shotDir = evidence
   ? path.join(here, "../../../docs/design/evidence")
-  : path.join(here, "../../test-results/providers-2");
+  : path.join(here, "../../test-results/providers-3");
 /** Fake Anthropic-Messages gateway started by the hub_e2e harness. */
 const upstream = process.env.VITE_E2E_UPSTREAM ?? "http://127.0.0.1:58881";
 const token = "sk-fake-e2e-discover-qqqq";
@@ -149,4 +149,83 @@ test("discovery against a dead gateway reports unreachable inline", async ({ pag
   await expect(page.getByTestId("provider-discover-error")).toContainText("unreachable");
   await expect(page.getByTestId("provider-models-empty")).toBeVisible();
   await shot(page, "providers-2-unreachable-1440.png");
+});
+
+test("bulk and group controls tame a 44-model catalog", async ({ page }) => {
+  await login(page, "e2e-providers-bulk");
+  await page.goto("/providers");
+  await page.getByTestId("provider-add").click();
+  await page.getByTestId("provider-name").fill("e2e-bulk-upstream");
+  // The harness serves 44 ids in 3 prefix groups under /bulk/v1.
+  await page.getByTestId("provider-base-url").fill(`${upstream}/bulk/v1`);
+  await page.getByTestId("provider-token").fill(token);
+  await page.getByTestId("provider-discover").click();
+
+  await expect(page.getByTestId("provider-models-count")).toContainText("44/44 已启用");
+  await expect(page.getByTestId("provider-model-group")).toHaveCount(3);
+  const cursor = page.locator('[data-testid=provider-model-group][data-group="cursor/"]');
+  const openai = page.locator('[data-testid=provider-model-group][data-group="openai/"]');
+  await expect(cursor.getByTestId("provider-model-group-count")).toHaveText("18/18 已启用");
+  await expect(cursor).toHaveAttribute("data-state", "all");
+  await shot(page, "providers-3-groups-1440.png");
+
+  // A long id keeps its row on one line: the × sits level with the checkbox.
+  const row = cursor.getByTestId("provider-model-row").first();
+  const box = await row.boundingBox();
+  const remove = await row.getByTestId("provider-model-remove").boundingBox();
+  expect(box!.height).toBeLessThan(34);
+  expect(remove!.y).toBeGreaterThanOrEqual(box!.y);
+  expect(remove!.y + remove!.height).toBeLessThanOrEqual(box!.y + box!.height + 1);
+
+  // The group box turns off 18 models at once and reports the tri-state.
+  await cursor.getByTestId("provider-model-group-enabled").uncheck();
+  await expect(page.getByTestId("provider-models-count")).toContainText("26/44 已启用");
+  await expect(cursor).toHaveAttribute("data-state", "none");
+  await expect(page.getByTestId("provider-models-undo")).toContainText("已停用 cursor/ 的 18 个模型");
+
+  // Undo restores all 18 in one step.
+  await page.getByTestId("provider-models-undo-button").click();
+  await expect(page.getByTestId("provider-models-count")).toContainText("44/44 已启用");
+  await expect(page.getByTestId("provider-models-undo")).toHaveCount(0);
+
+  // 全不选 clears everything, then search + 全选 re-enables one group only.
+  await page.getByTestId("provider-models-none").click();
+  await expect(page.getByTestId("provider-models-count")).toContainText("0/44 已启用");
+  await page.getByTestId("provider-model-search").fill("openai/");
+  await expect(page.getByTestId("provider-model-row")).toHaveCount(14);
+  await expect(page.getByTestId("provider-models-all")).toContainText("全选（筛选结果 14）");
+  await page.getByTestId("provider-models-all").click();
+  await expect(page.getByTestId("provider-models-count")).toContainText("14/44 已启用");
+  await page.getByTestId("provider-model-search").fill("");
+  await expect(openai).toHaveAttribute("data-state", "all");
+  await expect(cursor).toHaveAttribute("data-state", "none");
+
+  // A collapsed group hides its rows but still reports its count.
+  await cursor.getByTestId("provider-model-group-toggle").click();
+  await expect(cursor).toHaveAttribute("data-collapsed", "1");
+  await expect(page.getByTestId("provider-model-row")).toHaveCount(26);
+  await expect(cursor.getByTestId("provider-model-group-count")).toHaveText("0/18 已启用");
+  await shot(page, "providers-3-bulk-1440.png");
+
+  // The default must name an enabled model: 全不选 moved it off cursor/model-01.
+  await page.getByTestId("provider-save").click();
+  await expect(page.getByTestId("provider-form")).toHaveCount(0);
+  await page.getByText("e2e-bulk-upstream").click();
+  await expect(page.getByTestId("provider-model-summary")).toContainText("14/44 已启用");
+  await expect(page.getByTestId("provider-default-model")).toContainText("openai/model-01");
+
+  // 400px: the row still fits on one line and nothing overflows sideways.
+  await page.setViewportSize({ width: 400, height: 900 });
+  await page.getByTestId("provider-edit").click();
+  const narrow = page
+    .locator('[data-testid=provider-model-row][data-model="openai/model-01"]')
+    .first();
+  await expect(narrow).toBeVisible();
+  const narrowBox = await narrow.boundingBox();
+  expect(narrowBox!.height).toBeLessThan(34);
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  expect(overflow).toBeLessThanOrEqual(0);
+  await shot(page, "providers-3-bulk-400.png");
 });

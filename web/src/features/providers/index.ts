@@ -9,13 +9,18 @@ export {
   fromHub,
   groupModels,
   healthLine,
+  invertEnabled,
   mergeDiscovered,
   modelGroupKey,
+  nextDefaultModel,
   normalizeModels,
   parseModels,
   redactSecretRef,
   resolveGatewayModel,
+  setEnabled,
   shouldAvoidUnhealthy,
+  splitModelId,
+  triState,
   type Delegation,
   type ModelGroup,
   type ProviderCreate,
@@ -26,7 +31,9 @@ export {
   type ProviderPatch,
   type ProviderProfile,
   type ProviderTestResult,
+  type TriState,
 } from "./model";
 export { PROVIDER_PROFILES, profileById } from "./fixtures";
 export { ProviderForm } from "./ProviderForm";
 export { ModelList } from "./ModelList";
+export { readCollapsedGroups, writeCollapsedGroups } from "./groupPrefs";

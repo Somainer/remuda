@@ -265,13 +265,17 @@
   border-radius: var(--radius);
 }
 
+/* One line per model: the id is the only part allowed to shrink, so the
+   default radio and the × never wrap onto a second row (they did, on the
+   long `passthrough/ark/...` ids a real gateway serves). */
 .modelRow {
   display: flex;
   align-items: center;
   gap: 7px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   padding: 6px 8px;
   border-bottom: 1px solid var(--line);
+  min-width: 0;
 }
 
 .modelGroup {
@@ -282,12 +286,30 @@
   border-bottom: 0;
 }
 
+/* The tri-state box and the collapse control are separate hit targets: one
+   toggles 15 models, the other only folds them away. */
 .modelGroupHead {
   display: flex;
   align-items: center;
   gap: 7px;
-  width: 100%;
   padding: 5px 8px;
+  background: var(--ink-1);
+}
+
+.modelGroupPick {
+  display: flex;
+  align-items: center;
+  flex: none;
+  cursor: pointer;
+}
+
+.modelGroupToggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
   border: 0;
   background: transparent;
   cursor: pointer;
@@ -297,13 +319,79 @@
   color: var(--mute);
 }
 
+/* A group of one model renders as a plain row — no header worth a line. */
+.modelGroupSolo {
+  border-bottom: 1px solid var(--line);
+}
+
+.modelGroupSolo:last-child {
+  border-bottom: 0;
+}
+
+.modelBulk {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.modelBulkBtn {
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 11px;
+  min-height: 26px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+
+.modelBulkBtn:hover:not(:disabled),
+.modelBulkBtn:focus-visible {
+  color: var(--paper);
+  border-color: var(--dust);
+}
+
+.modelBulkBtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* One undo affordance for the last bulk action; row-by-row edits keep the
+   list uncluttered and are cheap to reverse by hand. */
+.modelUndo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--dust);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--dust) 10%, transparent);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--paper);
+}
+
+.modelUndo > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .modelGroupKey {
   color: var(--paper);
-  overflow-wrap: anywhere;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .modelGroupCount {
   margin-left: auto;
+  flex: none;
+  white-space: nowrap;
 }
 
 .modelGroupList {
@@ -343,16 +431,56 @@
   cursor: pointer;
 }
 
+.modelPick input {
+  flex: none;
+}
+
+/* Middle-truncated: the head ellipsizes, the tail — the part that actually
+   distinguishes two ids in the same family — always stays on screen. The
+   full id is the row's title attribute. */
 .modelId {
+  display: flex;
+  min-width: 0;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--paper);
-  overflow-wrap: anywhere;
+}
+
+.modelIdHead {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelIdTail {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* Chips and the label give way before the id does. */
+.modelMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+
+.modelTail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  margin-left: auto;
 }
 
 .modelLabel {
   font-size: 11.5px;
   color: var(--mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chipSmall {
@@ -401,6 +529,25 @@
 .modelAdd input {
   flex: 1 1 auto;
   min-width: 0;
+}
+
+/* At 400px the id and the trailing controls are all that fit; the human
+   label and the surface chips are the first things to go, and the bulk row
+   drops below the count instead of squeezing it. */
+@media (max-width: 480px) {
+  .modelLabel,
+  .chipSurface {
+    display: none;
+  }
+
+  .modelBulk {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .modelBulkBtn {
+    flex: 1 1 auto;
+  }
 }
 
 @media (max-width: 767px) {

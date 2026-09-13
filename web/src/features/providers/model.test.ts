@@ -10,13 +10,18 @@ import {
   fromHub,
   groupModels,
   healthLine,
+  invertEnabled,
   mergeDiscovered,
   modelGroupKey,
+  nextDefaultModel,
   normalizeModels,
   parseModels,
   redactSecretRef,
   resolveGatewayModel,
+  setEnabled,
   shouldAvoidUnhealthy,
+  splitModelId,
+  triState,
 } from "./model";
 
 describe("provider profiles D-012", () => {
@@ -244,5 +249,101 @@ describe("catalog grouping and filtering", () => {
     );
     expect(models[0].surfaces).toEqual(["anthropic"]);
     expect(models[0].enabled).toBe(false);
+  });
+});
+
+describe("bulk enable/disable math", () => {
+  const catalog = normalizeModels([
+    { id: "cursor/gpt-5", enabled: true },
+    { id: "cursor/gpt-5-mini", enabled: false },
+    { id: "cursor/sonic", enabled: false },
+    { id: "openai/o3", enabled: true },
+  ]);
+
+  it("reads a group as all, some or none", () => {
+    expect(triState(catalog.slice(0, 3))).toBe("some");
+    expect(triState(catalog.slice(1, 3))).toBe("none");
+    expect(triState([catalog[0], catalog[3]])).toBe("all");
+    // An empty group is not "all"; a box for nothing must render unticked.
+    expect(triState([])).toBe("none");
+  });
+
+  it("enables only the named ids and leaves the rest of the catalog alone", () => {
+    const next = setEnabled(catalog, ["cursor/gpt-5-mini", "cursor/sonic"], true);
+    expect(next.map((m) => m.enabled)).toEqual([true, true, true, true]);
+    // Order is preserved, and untouched entries keep their identity so React
+    // does not remount every row of a 300-model list.
+    expect(next.map((m) => m.id)).toEqual(catalog.map((m) => m.id));
+    expect(next[0]).toBe(catalog[0]);
+    expect(next[3]).toBe(catalog[3]);
+  });
+
+  it("disables a group without touching a model outside it", () => {
+    const cursor = catalog.filter((m) => m.id.startsWith("cursor/")).map((m) => m.id);
+    const next = setEnabled(catalog, cursor, false);
+    expect(next.filter((m) => m.enabled).map((m) => m.id)).toEqual(["openai/o3"]);
+  });
+
+  it("inverts exactly the ids it is given", () => {
+    const next = invertEnabled(catalog, ["cursor/gpt-5", "cursor/sonic"]);
+    expect(next.map((m) => [m.id, m.enabled])).toEqual([
+      ["cursor/gpt-5", false],
+      ["cursor/gpt-5-mini", false],
+      ["cursor/sonic", true],
+      ["openai/o3", true],
+    ]);
+  });
+
+  it("select-all over a filtered view touches only the matching rows", () => {
+    // What the header button does: filter first, then flip that id set.
+    const shown = filterModels(catalog, "cursor");
+    const next = setEnabled(catalog, shown.map((m) => m.id), true);
+    expect(next.filter((m) => m.enabled)).toHaveLength(4);
+
+    const off = setEnabled(catalog, filterModels(catalog, "sonic").map((m) => m.id), false);
+    // Only sonic was in view, so gpt-5 and o3 keep their enabled choice.
+    expect(off.filter((m) => m.enabled).map((m) => m.id)).toEqual(["cursor/gpt-5", "openai/o3"]);
+  });
+});
+
+describe("nextDefaultModel", () => {
+  const catalog = normalizeModels([
+    { id: "a", enabled: false },
+    { id: "b", enabled: true },
+    { id: "c", enabled: true },
+  ]);
+
+  it("keeps a default the catalog still offers", () => {
+    expect(nextDefaultModel(catalog, "c")).toBe("c");
+  });
+
+  it("moves to the first enabled model when the default is disabled", () => {
+    expect(nextDefaultModel(catalog, "a")).toBe("b");
+  });
+
+  it("moves on when the default was removed from the catalog outright", () => {
+    expect(nextDefaultModel(catalog, "gone")).toBe("b");
+  });
+
+  it("empties the default when a bulk disable leaves nothing enabled", () => {
+    expect(nextDefaultModel(setEnabled(catalog, ["b", "c"], false), "b")).toBe("");
+    expect(nextDefaultModel([], "b")).toBe("");
+  });
+
+  it("adopts the first enabled model when there is no default yet", () => {
+    expect(nextDefaultModel(catalog, "")).toBe("b");
+    expect(nextDefaultModel(catalog, null)).toBe("b");
+  });
+});
+
+describe("splitModelId", () => {
+  it("keeps the tail, where ids in one family actually differ", () => {
+    const [head, tail] = splitModelId("passthrough/ark/seed-evolving-250918");
+    expect(head + tail).toBe("passthrough/ark/seed-evolving-250918");
+    expect(tail).toBe("ing-250918");
+  });
+
+  it("leaves a short id whole rather than splitting it for no gain", () => {
+    expect(splitModelId("e2e/auto")).toEqual(["e2e/auto", ""]);
   });
 });

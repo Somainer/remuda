@@ -6,7 +6,9 @@ This follow-up makes the native PTY renderer a launch preference and reports its
 
 The starting main was `6f7dfe8`, the merge of `wt/c-hookgap/promoted-claude-hook-events`. The first twenty commits included that merge and its hook-binding fixes. The explicit-settings shim therefore already merged a caller's relay overlay; new executed-shim tests assert that both renderer values and both terminal signal keys win that merge.
 
-The ux-b merge was absent at task start. `NewSessionPage.tsx` received only an additive renderer state, request field, and control inside its existing advanced block. Host settings persist `defaultTui`; creation resolves session value, then host value, then `fullscreen`. Resume preserves the requested renderer.
+The ux-b merge was absent at task start, so the initial `NewSessionPage.tsx` change was limited to additive renderer state, a request field, and a control inside its existing advanced block. The final branch was rebased onto main `9df9099`, which includes ux-b. The resolved page preserves batch B's Sheet layout, draft restore/persistence, guarded create flow, and distinct confirmed/uncertain create outcomes. Its existing create payload carries an explicit renderer choice; an untouched choice stays omitted so the host default still applies. Host settings persist `defaultTui`; creation resolves session value, then host value, then `fullscreen`. Resume preserves the requested renderer.
+
+The rebase also exposed an inherited macOS filename collision between `QuickFind.tsx` and the `quickFind.ts` helper. Renaming the helper to `quickFindSearch.ts` and updating its two imports removed that collision before the final web gates.
 
 The renderer pin/release mechanism applies to native shell/agent PTY with hook overlays enabled (`REMUDA_PTY_HOOKS=1`). Actual mode requires the terminal emulator (`REMUDA_PTY_EMULATOR=1`); raw-ring fallback is unknown. Legacy print/herdr launch paths do not have this authenticated binding/release mechanism. The web indicator never converts the request into an actual-mode claim.
 
@@ -43,4 +45,19 @@ Node sends actual mode edges without building an extra repaint for every output 
 
 ## Acceptance
 
-Validation results are recorded after the final gates. Hub e2e uses the isolated fake Node and fake harness on `127.0.0.1:58580` with web port `58589`. The coordinator demo was not used. Screenshots, if retained by the test runner, contain synthetic fixture output; this evidence package contains no real-terminal screenshot.
+The final web gates were run after the rebase onto main `9df9099` and the batch B integration:
+
+| Gate | Result |
+|---|---|
+| `pnpm --dir web lint` | **VERIFIED**: passed with seven existing React warnings |
+| `pnpm --dir web exec tsc -b` | **VERIFIED**: passed |
+| `pnpm --dir web test` | **VERIFIED**: 83 test files and 656 tests passed |
+| `cargo fmt --all -- --check` | **VERIFIED**: passed |
+| `cargo clippy --locked -p remuda-driver -p remuda-node -p remuda-hub -p remuda-protocol --all-targets -- -D warnings` | **VERIFIED**: passed |
+| `cargo test --locked -p remuda-driver -p remuda-node -p remuda-hub -p remuda-protocol` | **VERIFIED**: 900 passed, zero failed, 11 existing ignored cases |
+| `cargo test --locked -p remuda-testing --test fake_harness` | **VERIFIED**: full rerun passed all 21 cases, including two renderer relaunches |
+| Hub e2e | **PENDING**: final result to be recorded after completion |
+
+Hub e2e uses the isolated fake Node and fake harness on `127.0.0.1:58580` with web port `58589`. The coordinator demo was not used. Screenshots, if retained by the test runner, contain synthetic fixture output; this evidence package contains no real-terminal screenshot.
+
+The Rust suite used a short worktree-local temporary directory and two test threads. An earlier cold run exceeded macOS's Unix socket path limit with a longer temporary directory; a process-group exit assertion also passed on focused rerun. The first full fake-harness run timed out in the existing body-plus-CR batching test; both its focused rerun and the full 21-case rerun passed. A delayed reader combining the two writes is the source-supported explanation, not a captured runtime fact. No input parser or production process-lifecycle behavior was changed to bypass these failures.

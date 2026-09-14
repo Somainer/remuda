@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -84,8 +84,20 @@ async function stopNode(node: ChildProcess) {
  */
 test("promoted Claude: hooks drive activity and 打断 sends a native Esc without closing", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
-  // Keep Unix socket paths below sockaddr_un's macOS limit.
-  const dir = await realpath(await mkdtemp("/tmp/hge-"));
+  // Keep fixture writes inside this worktree. macOS's existing volfs alias
+  // addresses the same directory by inode without adding an external symlink,
+  // keeping the hook socket pathname below sockaddr_un's length limit.
+  const scratch = path.join(root, "target", "hub-e2e");
+  await mkdir(scratch, { recursive: true });
+  const dir = await realpath(await mkdtemp(path.join(scratch, "hge-")));
+  const dataDir = path.join(dir, "data");
+  await mkdir(dataDir);
+  const dataStat = await stat(dataDir);
+  // Linux's existing procfs alias needs the runner's directory handle kept
+  // open through cleanup; PTY children need not inherit that descriptor.
+  const dataHandle = process.platform === "linux" ? await open(dataDir, "r") : undefined;
+  const dataPath = process.platform === "darwin" ? `/.vol/${dataStat.dev}/${dataStat.ino}`
+    : dataHandle ? `/proc/${process.pid}/fd/${dataHandle.fd}` : dataDir;
   const bin = path.join(dir, "bin");
   const workspace = path.join(dir, "workspace");
   const claudeHome = path.join(dir, "claude-home");
@@ -124,6 +136,10 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     });
   });
   try {
+    // volfs supports filesystem access but not realpath; identity is the
+    // device/inode pair. The alias must address our own worktree directory.
+    const aliasStat = await stat(dataPath);
+    expect([aliasStat.dev, aliasStat.ino]).toEqual([dataStat.dev, dataStat.ino]);
     await Promise.all([mkdir(bin), mkdir(workspace), mkdir(claudeHome)]);
     // The detector sees the real foreground executable named claude. This is
     // still fake-harness --kind claude, with its production-shaped TUI/hooks.
@@ -156,7 +172,7 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
       "--label", "test=promoted-hooks", "--no-herdr-orphan-sweep"], {
       cwd: dir,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, REMUDA_DATA_DIR: path.join(dir, "data"),
+      env: { ...process.env, REMUDA_DATA_DIR: dataPath,
         REMUDA_PTY_EMULATOR: "1", REMUDA_PTY_HOOKS: "1", REMUDA_SHIM: "on",
         REMUDA_CLAUDE_BIN: path.join(bin, "claude"), REMUDA_CLAUDE_CONFIG_DIR: claudeHome,
         CLAUDE_CONFIG_DIR: claudeHome, SHELL: shell, PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
@@ -335,6 +351,7 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
       .replaceAll(dir, "$TEST_DIR").replaceAll(process.env.HOME || "__unused__", "$HOME")
       .replaceAll(hostname(), "test-host"));
     await testInfo.attach("native-node.log", { path: logPath, contentType: "text/plain" });
+    await dataHandle?.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

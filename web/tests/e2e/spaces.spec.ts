@@ -3,7 +3,12 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/spaces-1");
+// Committed evidence is refreshed only on request (REMUDA_EVIDENCE=1); every other run —
+// including the merge gate, whose verify-tree step rejects a dirty worktree — writes
+// the same screenshots under the gitignored test-results/ instead.
+const evidence = process.env.REMUDA_EVIDENCE === "1"
+  ? path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/spaces-1")
+  : path.join(path.dirname(fileURLToPath(import.meta.url)), "../../test-results/evidence/spaces-1");
 
 function space(page: Page, name: string) {
   return page.getByTestId("spaces-panel").getByTestId("space-select").filter({ hasText: name });

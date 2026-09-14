@@ -1290,3 +1290,287 @@ mod shell_pty_agent {
         );
     }
 }
+
+/// Binary override: every containment, traversal, and mode rule.
+///
+/// The escalation this defends against is an agent that can write its own cwd
+/// dropping a script there and naming it as the executable, so the negative
+/// cases matter more than the positive one. Each rejection happens before the
+/// file is exec'd, which also keeps these cases honest on `noexec` CI volumes.
+mod binary_override {
+    use super::*;
+    use remuda_driver::{BinaryOverrideGuard, validate_binary_override};
+
+    /// A stub owned by us, mode 0755, outside every guarded root.
+    fn good_binary(dir: &Path) -> PathBuf {
+        install_executable(dir, "claude", b"#!/bin/sh\necho 'stub-1.0.0'\n")
+    }
+
+    fn guard(instance_dir: &Path, cwd: &Path) -> BinaryOverrideGuard {
+        BinaryOverrideGuard {
+            instance_dir: Some(instance_dir.to_path_buf()),
+            cwd: Some(cwd.to_path_buf()),
+            extra: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn binary_override_must_be_absolute_executable_outside_the_instance_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let instance = tmp.path().join("instance");
+        let launch = instance.join("launch");
+        let cwd = tmp.path().join("work");
+        let elsewhere = tmp.path().join("opt");
+        fs::create_dir_all(&launch).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let guard = guard(&instance, &cwd);
+
+        // A relative path never reaches the filesystem.
+        let error = validate_binary_override("bin/claude", &guard, None).unwrap_err();
+        assert!(error.to_string().contains("absolute"), "{error}");
+
+        // Nor does one with traversal segments, even if it would resolve.
+        let sneaky = format!("{}/../opt/claude", cwd.display());
+        let error = validate_binary_override(&sneaky, &guard, None).unwrap_err();
+        assert!(error.to_string().contains(". or .."), "{error}");
+
+        // Whitespace and metacharacters are refused: the value is also baked
+        // into the generated shim, which is `sh`.
+        for raw in ["/opt/my claude", "/opt/claude;rm -rf /", "/opt/c$(id)"] {
+            let error = validate_binary_override(raw, &guard, None).unwrap_err();
+            assert!(
+                error.to_string().contains("whitespace")
+                    || error.to_string().contains("metacharacters"),
+                "{raw} -> {error}"
+            );
+        }
+
+        // A directory is not an executable.
+        let error =
+            validate_binary_override(&elsewhere.to_string_lossy(), &guard, None).unwrap_err();
+        assert!(error.to_string().contains("regular file"), "{error}");
+
+        // A non-executable regular file is refused.
+        let plain = elsewhere.join("notes.txt");
+        fs::write(&plain, b"not a binary").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = validate_binary_override(&plain.to_string_lossy(), &guard, None).unwrap_err();
+        assert!(error.to_string().contains("not executable"), "{error}");
+
+        // Group- or world-writable makes the pin meaningless.
+        let loose = good_binary(&elsewhere);
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o777)).unwrap();
+        let error = validate_binary_override(&loose.to_string_lossy(), &guard, None).unwrap_err();
+        assert!(error.to_string().contains("writable"), "{error}");
+
+        // Inside the instance dir, the launch dir, and the cwd: all refused.
+        for (label, dir) in [
+            ("instance", instance.clone()),
+            ("launch", launch.clone()),
+            ("cwd", cwd.clone()),
+        ] {
+            let inside = good_binary(&dir);
+            let error =
+                validate_binary_override(&inside.to_string_lossy(), &guard, None).unwrap_err();
+            assert!(
+                error.to_string().contains("must not resolve inside"),
+                "{label}: {error}"
+            );
+        }
+
+        // A symlink pointing back into the cwd is caught, because the checks
+        // run against the canonicalized target rather than the name given.
+        let target = good_binary(&cwd);
+        let link = elsewhere.join("claude-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = validate_binary_override(&link.to_string_lossy(), &guard, None).unwrap_err();
+        assert!(
+            error.to_string().contains("must not resolve inside"),
+            "symlink out: {error}"
+        );
+
+        // A missing path is named, not silently replaced by PATH `claude`.
+        let error =
+            validate_binary_override(&elsewhere.join("absent").to_string_lossy(), &guard, None)
+                .unwrap_err();
+        assert!(matches!(error, DriverError::BinaryNotFound(_)), "{error:?}");
+    }
+
+    /// The happy path, and the digest gate on top of it.
+    ///
+    /// Skipped where the temp volume is `noexec`: pinning runs `--version`,
+    /// and that is the environment, not the code, failing.
+    #[test]
+    fn binary_override_sha_mismatch_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let instance = tmp.path().join("instance");
+        let cwd = tmp.path().join("work");
+        let opt = tmp.path().join("opt");
+        fs::create_dir_all(instance.join("launch")).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let binary = good_binary(&opt);
+        let guard = guard(&instance, &cwd);
+        let raw = binary.to_string_lossy().into_owned();
+
+        let Ok(pin) = validate_binary_override(&raw, &guard, None) else {
+            eprintln!("skipping: temp volume cannot exec, so --version cannot be probed");
+            return;
+        };
+        assert_eq!(pin.version, "stub-1.0.0");
+        assert_eq!(
+            pin.abs_path,
+            fs::canonicalize(&binary).unwrap().to_string_lossy()
+        );
+
+        // The recorded digest matching is the whole point of recording it.
+        validate_binary_override(&raw, &guard, Some(&pin.sha256)).expect("matching digest");
+
+        // A digest from different bytes means the file changed underneath.
+        let other = install_executable(&opt, "claude", b"#!/bin/sh\necho 'stub-2.0.0'\n");
+        let other_pin = validate_binary_override(&other.to_string_lossy(), &guard, None).unwrap();
+        assert_ne!(
+            other_pin.sha256, pin.sha256,
+            "stubs must differ to test this"
+        );
+        let error = validate_binary_override(&raw, &guard, Some(&other_pin.sha256)).unwrap_err();
+        assert!(
+            matches!(error, DriverError::InvalidLaunchSpec(ref m) if m.contains("digest mismatch")),
+            "{error:?}"
+        );
+    }
+
+    /// A dispatcher or an instance never inherits operator authority, so it
+    /// picks neither its own flags nor its own executable (D-011).
+    #[test]
+    fn bot_origin_cannot_set_args_or_binary_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = stub_binary(tmp.path(), "stub-1.0.0");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let profile = native_profile();
+
+        for origin in [LaunchOrigin::Bot, LaunchOrigin::Agent] {
+            let mut spec = load_spec();
+            spec.args = vec!["--effort".into(), "high".into()];
+            let mut req = request(
+                &spec,
+                &profile,
+                &tmp.path().join("launch-args"),
+                &home,
+                pin_source(&binary),
+            );
+            req.origin = origin;
+            let error = materialize(&req).unwrap_err();
+            assert!(
+                matches!(error, DriverError::InvalidLaunchSpec(ref m) if m.contains("launch args")),
+                "{origin:?} args: {error:?}"
+            );
+
+            let mut spec = load_spec();
+            spec.args = vec![];
+            spec.binary_path = Some("/opt/claude".into());
+            let mut req = request(
+                &spec,
+                &profile,
+                &tmp.path().join("launch-bin"),
+                &home,
+                pin_source(&binary),
+            );
+            req.origin = origin;
+            let error = materialize(&req).unwrap_err();
+            assert!(
+                matches!(error, DriverError::InvalidLaunchSpec(ref m) if m.contains("binaryPath")),
+                "{origin:?} binaryPath: {error:?}"
+            );
+        }
+
+        // The same spec from a human is accepted, so the gate is the origin
+        // and not the fields being rejected outright.
+        let mut spec = load_spec();
+        spec.args = vec!["--effort".into(), "high".into()];
+        let recipe = materialize(&request(
+            &spec,
+            &profile,
+            &tmp.path().join("launch-human"),
+            &home,
+            pin_source(&binary),
+        ))
+        .expect("human origin may set args");
+        assert!(recipe.argv.iter().any(|token| token == "--effort"));
+    }
+
+    /// A bad override fails before anything is written: no overlay, no shim,
+    /// nothing to clean up.
+    #[test]
+    fn a_refused_override_writes_no_launch_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = stub_binary(tmp.path(), "stub-1.0.0");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let launch = tmp.path().join("instance").join("launch");
+        let mut spec = load_spec();
+        spec.binary_path = Some("relative/claude".into());
+        let error = materialize(&request(
+            &spec,
+            &native_profile(),
+            &launch,
+            &home,
+            pin_source(&binary),
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("absolute"), "{error}");
+        assert!(
+            !launch.exists(),
+            "a refused override must not leave a launch dir behind"
+        );
+    }
+
+    /// The audit records that the executable was the caller's choice, so a
+    /// reader can tell a stock launch from an overridden one without diffing
+    /// paths against whatever the host default happened to be.
+    #[test]
+    fn recipe_audit_records_binary_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_binary = stub_binary(tmp.path(), "stub-default");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let profile = native_profile();
+
+        // No override: the flag is false and the pin is the default.
+        let spec = load_spec();
+        let plain = materialize(&request(
+            &spec,
+            &profile,
+            &tmp.path().join("launch-plain"),
+            &home,
+            pin_source(&default_binary),
+        ))
+        .unwrap();
+        assert!(!plain.audit.binary_override);
+
+        // With an override the flag flips and the pin is the named file.
+        let opt = tmp.path().join("opt");
+        let chosen = good_binary(&opt);
+        let mut spec = load_spec();
+        spec.binary_path = Some(chosen.to_string_lossy().into_owned());
+        let launch = tmp.path().join("instance").join("launch");
+        let result = materialize(&request(
+            &spec,
+            &profile,
+            &launch,
+            &home,
+            pin_source(&default_binary),
+        ));
+        let Ok(recipe) = result else {
+            eprintln!("skipping: temp volume cannot exec, so --version cannot be probed");
+            return;
+        };
+        assert!(recipe.audit.binary_override);
+        assert_eq!(
+            recipe.binary.abs_path,
+            fs::canonicalize(&chosen).unwrap().to_string_lossy()
+        );
+        assert_ne!(recipe.binary.abs_path, plain.binary.abs_path);
+    }
+}

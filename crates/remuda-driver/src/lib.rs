@@ -40,7 +40,10 @@ pub mod usage;
 mod fake;
 
 pub use attachment::{PromptAttachment, attachments_of, text_with_path_mentions};
-pub use binary::{BinaryPin, default_command, hash_file, pin_binary, resolve_binary};
+pub use binary::{
+    BinaryOverrideGuard, BinaryPin, default_command, hash_file, pin_binary, resolve_binary,
+    validate_binary_override,
+};
 pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
 };

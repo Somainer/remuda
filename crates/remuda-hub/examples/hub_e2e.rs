@@ -607,8 +607,11 @@ fn workflow_kind(prompt: &str) -> Option<&'static str> {
     let tail = prompt[PREFIX.len()..].trim();
     Some(match tail {
         "fold" => "fold",
+        "fold running" => "fold-running",
         "fail" => "fail",
         "legacy" => "legacy",
+        "demo running" => "demo-running",
+        "demo done" => "demo-done",
         _ => "demo",
     })
 }
@@ -705,7 +708,12 @@ async fn append_workflow_scenario(
     mut n: u64,
     kind: &str,
 ) -> Result<u64> {
-    let tag = kind;
+    // Stable workflow ids across the running/done two-prompt scenarios.
+    let tag = match kind {
+        "demo-running" | "demo-done" => "demo",
+        "fold-running" => "fold",
+        other => other,
+    };
     let workflow_id = format!("obj_wf_{tag}");
     let tool_id = format!("obj_wft_{tag}");
     let phase = |i: u8| format!("obj_wfp_{tag}_{i}");
@@ -813,7 +821,104 @@ async fn append_workflow_scenario(
         return Ok(n);
     }
 
-    if kind == "demo" {
+    // Terminal half of the demo scenario (second prompt after "demo running"):
+    // only completion revisions, same workflow/tool ids.
+    if kind == "demo-done" {
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(2),
+                &phase(1),
+                "review:security",
+                "completed",
+                2,
+                Some("opus-5[1m]"),
+                Some("Grep"),
+                Some(44_000),
+                Some(8),
+                Some(122_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(3),
+                &phase(2),
+                "verify:auth.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Bash"),
+                Some(31_000),
+                Some(5),
+                Some(80_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(4),
+                &phase(2),
+                "verify:api.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Read"),
+                Some(27_000),
+                Some(4),
+                Some(65_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Review", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(2), "Verify", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "completed",
+                2,
+                totals(4, 0, 0, 0, 4, true, 412_000, 106, 298_000),
+                live_done("Dynamic workflow \"card-demo\" completed"),
+                None,
+            ),
+        )
+        .await?;
+        return Ok(n);
+    }
+
+    if kind == "demo-running" || kind == "demo" {
+        let running_only = kind == "demo-running";
         n = append_event(
             ws,
             instance_id,
@@ -924,6 +1029,9 @@ async fn append_workflow_scenario(
             ),
         )
         .await?;
+        if running_only {
+            return Ok(n);
+        }
         tokio::time::sleep(Duration::from_millis(900)).await;
         n = append_event(
             ws,

@@ -195,7 +195,11 @@ function FoldToggle({
 }
 
 function PhaseBlock({ phase }: { phase: WfPhaseView }) {
-  const [open, setOpen] = useState(phase.expandedByDefault);
+  // Follow `expandedByDefault` until the user toggles, then remember it.
+  // Following the prop matters because the phase head mounts before members
+  // stream in: an initializer would lock it to "0 agents → collapsed" forever.
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  const open = toggled ?? phase.expandedByDefault;
   const [showFolded, setShowFolded] = useState(false);
   const bodyId = useMemo(() => `wf-phase-${phase.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`, [phase.id]);
   const laid = useMemo(() => layoutRows(phase.agents), [phase]);
@@ -206,7 +210,7 @@ function PhaseBlock({ phase }: { phase: WfPhaseView }) {
     // the app boundary keeps Escape/Tab in the xterm).
     if (event.key === "Escape" && open) {
       event.stopPropagation();
-      setOpen(false);
+      setToggled(false);
     }
   };
 
@@ -217,7 +221,7 @@ function PhaseBlock({ phase }: { phase: WfPhaseView }) {
         className={css.phaseHead}
         aria-expanded={open}
         aria-controls={bodyId}
-        onClick={() => setOpen(!open)}
+        onClick={() => setToggled(!open)}
         onKeyDown={onKey}
       >
         <Chevron />

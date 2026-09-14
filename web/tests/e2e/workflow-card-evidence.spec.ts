@@ -35,9 +35,6 @@ test.describe("workflow card evidence", () => {
       .locator('[data-evidence="failed"] [data-testid="workflow-phase"] button')
       .first()
       .click();
-    // Same for the 36-agent running section: open Validate so the second grid shows.
-    const phaseHeads = page.locator('[data-evidence="fold"] [data-testid="workflow-phase"] button');
-    await phaseHeads.nth(1).click();
 
     for (const width of [1440, 768, 390]) {
       await shot(page, "running", width, 760);

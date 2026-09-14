@@ -7,8 +7,6 @@ import { login } from "./hub-auth";
  * crates/remuda-hub/examples/hub_e2e.rs). No real models.
  */
 
-test.describe.configure({ mode: "serial" });
-
 // Release every instance this spec creates. The hub suite is serial against one
 // fake Node capped at maxInstances 8; leaving a live row spends a slot for
 // every later spec (force is a u8 query param, not a boolean).
@@ -74,26 +72,8 @@ async function openWorkflowSession(page: Page, prompt: string): Promise<string> 
   return instanceId;
 }
 
-test.describe.configure({ mode: "serial" });
-
-// The fake Node caps instances at 8, shared across the serial hub suite — free
-// every slot this spec takes (force is a u8 query param).
-test.afterEach(async ({ context }) => {
-  for (const page of context.pages()) {
-    const m = page.url().match(/\/s\/([^/?#]+)/);
-    if (!m) continue;
-    await page.evaluate(async (id) => {
-      try {
-        await fetch(`/v1/instances/${id}?force=1`, { method: "DELETE", credentials: "include" });
-      } catch {
-        // teardown is best-effort
-      }
-    }, m[1]);
-  }
-});
-
 test("card runs live then auto-collapses to the one-line summary", async ({ page }) => {
-  const instanceId = await openWorkflowSession(page, "workflow card demo");
+  const instanceId = await openWorkflowSession(page, "workflow card demo running");
   void instanceId;
   const card = page.getByTestId("workflow-card").first();
   // Expanded and live while running: chip + 当前 line + a running agent row.
@@ -101,6 +81,10 @@ test("card runs live then auto-collapses to the one-line summary", async ({ page
   await expect(card.locator("button").first()).toHaveAttribute("aria-expanded", "true");
   await expect(card.getByText("当前")).toBeVisible();
   await expect(page.getByTestId("workflow-agent").filter({ hasText: "review:security" })).toBeVisible();
+
+  // Drive the terminal half deterministically (same workflow/tool ids).
+  await page.getByTestId("composer-input").fill("workflow card demo done");
+  await page.getByTestId("composer-send").click();
 
   // Terminal state auto-collapses the card; the header keeps the summary.
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
@@ -148,8 +132,11 @@ test("a failed agent row is never folded", async ({ page }) => {
 
 test("at 390px every agent stays on one line; model/tool meta hidden", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await openWorkflowSession(page, "workflow card demo");
+  await openWorkflowSession(page, "workflow card demo running");
   const card = page.getByTestId("workflow-card").first();
+  await expect(card).toHaveAttribute("data-status", "running", { timeout: 20_000 });
+  await page.getByTestId("composer-input").fill("workflow card demo done");
+  await page.getByTestId("composer-send").click();
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
   await card.locator("button").first().click();
   const phase = page.getByTestId("workflow-phase");
@@ -176,7 +163,7 @@ test("no detail degrades to a flat row with an explanation note", async ({ page 
 });
 
 test("Escape in the terminal / outside the card never closes the open card", async ({ page }) => {
-  await openWorkflowSession(page, "workflow card demo");
+  await openWorkflowSession(page, "workflow card demo running");
   const card = page.getByTestId("workflow-card").first();
   await expect(card).toHaveAttribute("data-status", "running", { timeout: 20_000 });
   const head = card.locator("button").first();

@@ -198,7 +198,7 @@ function PhaseBlock({ phase }: { phase: WfPhaseView }) {
   const [open, setOpen] = useState(phase.expandedByDefault);
   const [showFolded, setShowFolded] = useState(false);
   const bodyId = useMemo(() => `wf-phase-${phase.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`, [phase.id]);
-  const laid = useMemo(() => layoutRows([...phase.pinned, ...phase.head, ...phase.folded]), [phase]);
+  const laid = useMemo(() => layoutRows(phase.agents), [phase]);
 
   const onKey = (event: React.KeyboardEvent) => {
     // Only a button the user is focused on can collapse; keys sent to an

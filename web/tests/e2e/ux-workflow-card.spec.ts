@@ -7,6 +7,18 @@ import { login } from "./hub-auth";
  * crates/remuda-hub/examples/hub_e2e.rs). No real models.
  */
 
+test.describe.configure({ mode: "serial" });
+
+// Release every instance this spec creates. The hub suite is serial against one
+// fake Node capped at maxInstances 8; leaving a live row spends a slot for
+// every later spec (force is a u8 query param, not a boolean).
+test.afterEach(async ({ page }) => {
+  const m = page.url().match(/\/s\/([^/?#]+)/);
+  if (!m) return;
+  const res = await page.request.delete(`/v1/instances/${m[1]}?force=1`);
+  expect(res.ok() || res.status() === 404).toBeTruthy();
+});
+
 async function answerPending(page: Page, instanceId: string) {
   await expect
     .poll(

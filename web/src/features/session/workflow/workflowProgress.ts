@@ -65,6 +65,8 @@ export interface WfTotals {
 export interface WfPhaseView {
   id: string;
   title: string;
+  /** All agents in index order. */
+  agents: WfAgent[];
   /** Index-ordered agents; running/failed always retained here. */
   pinned: WfAgent[];
   /** Quiet (done/queued) agents kept before the fold, in index order. */
@@ -271,6 +273,7 @@ function projectPhase(id: string, title: string, agents: WfAgent[]): WfPhaseView
   return {
     id,
     title,
+    agents,
     ...foldAgents(agents),
     grid,
     canFold,

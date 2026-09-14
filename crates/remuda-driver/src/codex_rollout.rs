@@ -106,6 +106,17 @@ pub enum CodexRolloutEvent {
     },
     /// Context compaction occurred.
     Compacted,
+    /// A turn was aborted before completion (`event_msg/turn_aborted`).
+    ///
+    /// P6: the file adapter needs the turn id and reason (observed
+    /// `reason:"interrupted"` after `Esc`) to journal an authoritative turn
+    /// boundary — an aborted turn emits no `task_complete`.
+    TurnAborted {
+        /// Turn id carried by the record.
+        turn_id: Option<String>,
+        /// Abort reason, e.g. `interrupted`.
+        reason: Option<String>,
+    },
     /// A record outside this parser's recognized subset.
     Unknown {
         /// Nested payload type for event/response records, outer type otherwise.
@@ -200,6 +211,10 @@ fn parse_event(payload: &Value) -> CodexRolloutEvent {
             data: payload.clone(),
         },
         "context_compacted" => CodexRolloutEvent::Compacted,
+        "turn_aborted" => CodexRolloutEvent::TurnAborted {
+            turn_id: string(payload, "turn_id"),
+            reason: string(payload, "reason"),
+        },
         _ => CodexRolloutEvent::Unknown {
             r#type: kind.into(),
         },

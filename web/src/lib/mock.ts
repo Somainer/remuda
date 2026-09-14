@@ -28,6 +28,7 @@ export type MockPasskey = {
 };
 import { thisDeviceId } from "./interactionStatus";
 import { LONG_EVENT_COUNT, LONG_SESSION_TITLE, buildLongObservations } from "../fixtures/session/longEvents";
+import { BATCH_E_EVENT_COUNT, BATCH_E_TITLE, buildBatchEObservations } from "../fixtures/session/batchE";
 
 const ts = now();
 
@@ -637,9 +638,11 @@ titles.set(insPaused, "离线主机上的审批");
 const journalGap = "obj_mock_gap" as Id;
 const journalStale = "obj_mock_stale" as Id;
 const journalLong = "obj_mock_long" as Id;
+const journalBatchE = "obj_mock_batch_e" as Id;
 const insGap = "ins_mock_gap" as Id;
 const insStale = "ins_mock_stale" as Id;
 const insLong = "ins_mock_long" as Id;
+const insBatchE = "ins_mock_batch_e" as Id;
 
 export const GAP_HISTORY_SEQ = 4;
 export const GAP_TAIL_SEQ = 10;
@@ -759,15 +762,19 @@ function gapJournalEvents(instanceId: Id, journalId: Id): Observation[] {
 instances.push({ ...instanceBase(insGap, journalGap, "ready", known("working")), activeRunIds: [] });
 instances.push({ ...instanceBase(insStale, journalStale, "ready", known("working")), activeRunIds: [] });
 instances.push({ ...instanceBase(insLong, journalLong, "ready", known("idle")), activeRunIds: [] });
+instances.push({ ...instanceBase(insBatchE, journalBatchE, "ready", known("working")), activeRunIds: [] });
 journals.set(journalGap, gapJournalEvents(insGap, journalGap));
 journals.set(journalStale, gapJournalEvents(insStale, journalStale));
 journals.set(journalLong, []);
+journals.set(journalBatchE, []);
 titles.set(insGap, "补页缺口会话");
 titles.set(insStale, "只读缺口会话");
 titles.set(insLong, LONG_SESSION_TITLE);
+titles.set(insBatchE, BATCH_E_TITLE);
 summaries.set(insGap, "mock gap backfill");
 summaries.set(insStale, "mock fill fail");
 summaries.set(insLong, `${LONG_EVENT_COUNT} events`);
+summaries.set(insBatchE, `${BATCH_E_EVENT_COUNT} events`);
 
 const screens = new Map<Id, string[]>();
 
@@ -866,6 +873,12 @@ function ensureLongJournal() {
   journals.set(journalLong, buildLongObservations({ instanceId: insLong, journalId: journalLong, hostId }));
 }
 
+function ensureBatchEJournal() {
+  const cur = journals.get(journalBatchE);
+  if (cur && cur.length >= BATCH_E_EVENT_COUNT) return;
+  journals.set(journalBatchE, buildBatchEObservations({ instanceId: insBatchE, journalId: journalBatchE, hostId }));
+}
+
 /** Lifecycles a broadcast skips; mirrors the Hub's `is_broadcast_target`. */
 const BROADCAST_SKIP: ReadonlySet<string> = new Set(["exited", "failed", "closing"]);
 
@@ -951,6 +964,7 @@ export const mockDb: MockDb = { hosts, workspaces, instances, interactions, jour
 
 export function mockReadJournal(journalId: Id, afterSeq?: U64, limit = 128) {
   if (journalId === journalLong) ensureLongJournal();
+  if (journalId === journalBatchE) ensureBatchEJournal();
   const after = afterSeq ? Number(afterSeq) : 0;
   if (journalId === journalStale && after > 0) {
     throw new Error("GAP_FILL_FAILED");
@@ -958,7 +972,8 @@ export function mockReadJournal(journalId: Id, afterSeq?: U64, limit = 128) {
   const all = journals.get(journalId) ?? [];
   const truncated = (journalId === journalGap || journalId === journalStale) && after === 0;
   const source = truncated ? all.filter((e) => Number(e.seq) <= GAP_HISTORY_SEQ) : all.filter((e) => Number(e.seq) > after);
-  const cap = journalId === journalLong ? Math.max(limit, LONG_EVENT_COUNT) : limit;
+  const bigJournal = journalId === journalLong || journalId === journalBatchE;
+  const cap = bigJournal ? Math.max(limit, LONG_EVENT_COUNT, BATCH_E_EVENT_COUNT) : limit;
   const events = source.slice(0, cap);
   const durableSeq = all.length ? all[all.length - 1].seq : "0";
   return { events, durableSeq, floorSeq: "1" as U64 };
@@ -981,6 +996,7 @@ export function mockGappedTail(journalId: Id): EventsBatch["params"] | null {
 
 export function mockSnapshot(instance: Instance): Snapshot {
   if (instance.journalId === journalLong) ensureLongJournal();
+  if (instance.journalId === journalBatchE) ensureBatchEJournal();
   const events = journals.get(instance.journalId) ?? [];
   const gapped = instance.id === insGap || instance.id === insStale;
   const asOf = gapped ? String(GAP_HISTORY_SEQ) : events.length ? events[events.length - 1].seq : "0";

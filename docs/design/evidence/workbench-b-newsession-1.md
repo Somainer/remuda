@@ -25,7 +25,7 @@
 
 ## 2 · 截图（合成 fixture）
 
-`VITE_MOCK=1` 的示例主机/目录/会话数据；Playwright chromium，`animations: "disabled"`；无个人路径、无主机名（fixture 自带的 `devbox-sg`/`sfe-root` 是 mock 数据）。
+`VITE_MOCK=1` 的示例主机/目录/会话数据；Playwright chromium，`animations: "disabled"`；画面里的主机名与目录全部是 mock 夹具自带数据，无个人路径或真实主机名。
 
 ### 首层：要做什么 · 工作目录 · 执行 agent · 权限 · effort · 模型来源
 
@@ -60,7 +60,7 @@
   - hub-live（fake Hub + fake Node，`playwright.hub.config.ts`，串行单 worker）：纯键盘创建恰好一次 POST；**未知 ACK**——`page.route` 先 `route.fetch()` 让真实 Hub/fake Node 完成创建再回 504，客户端显示 `状态待确认`、POST 恰好 1 次、刷新只读不重发，服务端 `GET /v1/instances` 只多出恰好 1 个实例；390px 软键盘几何。
   - 该 spec 同时在两个 Playwright config 下运行：hub config 在进程内设置 `REMUDA_E2E_BACKEND=hub`，spec 据此跳过不属于当前后端的 describe；hub config 的 testMatch 增加 `new-session`。
 
-### 本机运行记录（devbox-sg，2026-09-14）
+### 本机运行记录（共享开发机，2026-09-14）
 
 - `pnpm --dir web lint` / `tsc -b`：通过；`pnpm --dir web test`：74 文件 513 例通过。
 - mock e2e（chromium via `ws://127.0.0.1:3177`）：本 spec 19 通过 / 2 失败；失败用例均为「kind terminal uses shell-pty」（chromium 与 mobile-webkit 同一原因），在未改动的 origin/main 上同样失败（已知的 mock-backed 基线问题，见本机 devbox 记录；根因在 `SessionPage` 的 baseView 选择，本批未触碰），与本批改动无关。

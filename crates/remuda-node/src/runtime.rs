@@ -38,6 +38,15 @@ pub(crate) struct DevNodeInner {
     interactions: Arc<InteractionRuntime>,
     senders: RwLock<BTreeMap<InstanceId, mpsc::Sender<QueuedCommand>>>,
     pub(crate) workers: tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>,
+    /// Observation pumps, one per started instance.
+    ///
+    /// Tracked rather than detached because a pump owns an `Arc<dyn LocalStore>`
+    /// and writes to it. A pump that outlives its Node keeps that store — and
+    /// therefore the journal's SQLite handle and its in-memory `durable_seq`
+    /// mirror — alive after a second Node has reopened the same data dir, and
+    /// the two then allocate the same sequence number. That surfaces as
+    /// `UNIQUE constraint failed: events.instance_id, events.seq`.
+    pub(crate) pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
     pub(crate) instance_drivers: RwLock<BTreeMap<InstanceId, Arc<dyn Driver>>>,
     pub(crate) stopping: std::sync::atomic::AtomicBool,
     pub(crate) mutations: RwLock<()>,
@@ -118,6 +127,7 @@ impl DevNode {
                 interactions,
                 senders: RwLock::new(BTreeMap::new()),
                 workers: Default::default(),
+                pumps: Default::default(),
                 instance_drivers: Default::default(),
                 stopping: Default::default(),
                 mutations: Default::default(),
@@ -653,6 +663,7 @@ impl DevNode {
         let data_dir = self.data_dir();
         let worker_instance = instance_id.clone();
         let carrier = self.carrier_supervisor();
+        let pumps = Arc::clone(&self.inner.pumps);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(materialize_instance(
@@ -666,6 +677,7 @@ impl DevNode {
                 initial_prompt,
                 data_dir,
                 carrier,
+                pumps,
             ))
             .catch_unwind()
             .await;
@@ -779,7 +791,7 @@ fn spawn_observation_pump(
     instance_id: InstanceId,
     mut observations: mpsc::Receiver<remuda_protocol::Observation>,
     driver: Arc<dyn Driver>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(observation) = observations.recv().await {
             // §5.5 before the generic failure fold: a clean exit carries
@@ -840,7 +852,7 @@ fn spawn_observation_pump(
                 }
             }
         }
-    });
+    })
 }
 
 async fn materialize_instance(
@@ -855,6 +867,11 @@ async fn materialize_instance(
     // Node data dir, so this worker can drop its attachments on the way out.
     data_dir: Option<std::path::PathBuf>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
+    // Where this instance's observation pump is registered so a shutdown can
+    // stop it. Just the map, not the whole Node: the pump outliving its Node is
+    // the bug being fixed, and handing this worker a Node handle to fix it
+    // would be a second way to do the same thing.
+    pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
 ) -> Result<(), NodeError> {
     let observations = match driver.start().await {
         Ok(observations) => observations,
@@ -891,13 +908,14 @@ async fn materialize_instance(
         return Ok(());
     }
     if let Some(observations) = observations {
-        spawn_observation_pump(
+        let pump = spawn_observation_pump(
             Arc::clone(&store),
             Arc::clone(&interactions),
             instance_id.clone(),
             observations,
             Arc::clone(&driver),
         );
+        pumps.lock().await.insert(instance_id.clone(), pump);
     }
     if let Some(recipe) = driver.launch_recipe() {
         store.put_launch_recipe(&instance_id, &recipe)?;

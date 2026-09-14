@@ -376,6 +376,10 @@ impl DevNode {
         for worker in workers.values() {
             worker.abort();
         }
+        // Before the drivers, not after: closing a driver makes it emit its
+        // §5.5 exit, and a pump still running would journal that — into a store
+        // this Node is about to stop owning.
+        self.stop_pumps().await;
         let drivers: Vec<_> = self
             .inner
             .instance_drivers
@@ -390,6 +394,31 @@ impl DevNode {
         self.inner.instance_drivers.write().await.clear();
     }
 
+    /// Abort every observation pump and wait for it to actually stop.
+    ///
+    /// A pump owns an `Arc<dyn LocalStore>` and writes through it. Left running
+    /// past its Node it keeps that store — and so the journal's SQLite handle
+    /// and its in-memory `durable_seq` mirror — alive while a *second* Node has
+    /// reopened the same data dir. Both then read the same watermark and
+    /// allocate the same sequence number, which SQLite rejects as
+    /// `UNIQUE constraint failed: events.instance_id, events.seq`. That is a
+    /// restart-shaped race, so it showed up first in the restart test, but any
+    /// two Nodes over one data dir can hit it.
+    ///
+    /// Awaited rather than fired and forgotten: `abort()` only schedules
+    /// cancellation, and a pump already inside `append_observation` runs to the
+    /// end of that call. Returning before it does would leave exactly the
+    /// overlap this exists to prevent.
+    async fn stop_pumps(&self) {
+        let pumps = std::mem::take(&mut *self.inner.pumps.lock().await);
+        for pump in pumps.values() {
+            pump.abort();
+        }
+        for (_, pump) in pumps {
+            let _ = pump.await;
+        }
+    }
+
     /// Stop workers, close every retained driver and sweep durable ownership.
     /// Finished workers count as settled even when their command queue is gone.
     pub async fn shutdown(&self) -> Result<(), NodeError> {
@@ -402,6 +431,7 @@ impl DevNode {
         for (_, worker) in workers {
             let _ = worker.await;
         }
+        self.stop_pumps().await;
         let mut tasks = tokio::task::JoinSet::new();
         for instance in self.inner.store.list_instances()? {
             let node = self.clone();

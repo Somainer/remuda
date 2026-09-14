@@ -141,6 +141,20 @@ describe("notify — collapsing and caps", () => {
     expect(store.getState().info).toHaveLength(0);
   });
 
+  it("an entry pushed out by the cap does not take a later one with it", () => {
+    // Each info gets its own expiry timer. When the cap evicts an entry early,
+    // its timer still fires later — it must not remove whatever took its slot.
+    for (let i = 0; i < INFO_LIMIT + 1; i++) {
+      store.notify({ subject: `会话 ${i}`, stage: "保存", severity: "info" });
+      vi.advanceTimersByTime(10);
+    }
+    expect(store.getState().info).toHaveLength(INFO_LIMIT);
+
+    // Let the evicted entry's timer fire, but not the survivors'.
+    vi.advanceTimersByTime(INFO_TTL_MS - 100);
+    expect(store.getState().info).toHaveLength(INFO_LIMIT);
+  });
+
   it("dismissAllBlocking clears the standing area only", () => {
     blocking("错误 a");
     blocking("错误 b");

@@ -123,10 +123,10 @@ e2e `a blocking error stays visible after a later success` 现在直接比较两
 
 | 检查 | 结果 |
 |---|---|
-| `pnpm --dir web test`（全量单测） | 72 files / 496 tests 通过 |
+| `pnpm --dir web test`（全量单测） | 72 files / 498 tests 通过 |
 | `commandStatus.test.ts` | 32 通过（八行 + 未知不成功 + 无 resend + 并发/二次提交） |
-| `notify.test.ts` | 21 通过 |
-| `Shell.test.tsx` | 13 通过 |
+| `notify.test.ts` | 22 通过（含 cap 淘汰不带走后来条目的计时器安全） |
+| `Shell.test.tsx` | 13 通过（含 live region 卫生与 landmark） |
 | `interactionStatus.test.ts` | 增补后全通过 |
 | `pnpm --dir web lint` | 我的文件 0 warning |
 | `pnpm --dir web exec tsc -b` | 0 error |
@@ -146,13 +146,21 @@ fake node 自身无法产生的故障——被拒绝的命令、`nodePurge !== "
 `/commands`、`/input`、`/interrupt`、`/interactions/*/answer` 的写请求，
 断线刷新后断言增量为 0；被拒绝的命令在 2 秒后断言计数未变。
 
-### 一个必须记录的坑
+### 两个必须记录的坑
 
-fake node 宣告 `maxInstances: 8`，而 hub 配置串行跑所有 spec、共用一个 Hub。
-我的 spec 每个用例建一个会话却不回收，跑到第三个用例就撞上配额，
-失败现象是「创建会话没有跳转」——和 host 过载的表现一模一样。
-`afterEach` 里 `DELETE ?force=1` 回收后消失。
-（`force=1` 是 `u8`，不是 `force=true`；写错会 409。）
+1. **fake node 宣告 `maxInstances: 8`**，而 hub 配置串行跑所有 spec、共用一个
+   Hub。本 spec 的用例跑到一半就撞配额（更早的 spec 也占着槽位），
+   失败现象是 `POST /v1/instances` 返回 422 `PLACEMENT_UNSATISFIABLE`，
+   在 UI 上就是「创建会话没有跳转」——和 host 过载 flake 的表现一模一样。
+   两层处理：`afterEach` 用 `DELETE ?force=1` 回收自己建的会话（`force=1` 是
+   `u8`，不是 `force=true`，写错会 409）；`beforeEach` 通过
+   `PATCH /v1/hosts/{id}` 把**这个 fake fixture** 的 `maxInstances` 临时抬到 24，
+   `afterAll` 还原。抬的是测试夹具的容量，不是被测的容量断言。
+2. **fake node 每次 `instance.create` 都会挂一个待处理 approval**，使
+   `activity: waiting-interaction`、composer 被禁用。要发送的用例必须先用
+   `clearPendingApprovals()`（`POST /v1/interactions/{id}/answer`）清掉它，
+   否则 `composer.fill` 会在 disabled textarea 上超时 90 s。
+   封装成 `createReadySession()`。
 
 ### 与已知基线 flake 的关系
 
@@ -167,11 +175,11 @@ fake node 宣告 `maxInstances: 8`，而 hub 配置串行跑所有 spec、共用
 | `web/src/lib/commandStatus.ts` | 八行投影 + 词汇常量 + `projectDeletion` |
 | `web/src/lib/commandStatus.test.ts` | 32 用例 |
 | `web/src/lib/notify.ts` | 通知契约、store、`formatDiagnostic`、`toastAdapter` |
-| `web/src/lib/notify.test.ts` | 21 用例 |
+| `web/src/lib/notify.test.ts` | 22 用例 |
 | `web/src/lib/interactionStatus.ts` | `canSubmitAnswer` / `answerPendingNative` / `nativeCleared` |
 | `web/src/app/Shell.tsx` | `ShellNotify` 两个区域、遗留 toast 桥接、`__notifyLab` 测试缝 |
 | `web/src/app/shellNotify.module.css` | 单一 flex 栈布局 |
-| `web/src/app/Shell.test.tsx` | 12 用例（含 live region 卫生） |
+| `web/src/app/Shell.test.tsx` | 13 用例（含 live region 卫生与 landmark） |
 | `web/src/features/session/Transcript.tsx` | 根节点 `aria-live="off"`（单属性） |
 | `web/tests/e2e/ux-status.spec.ts` | 8 个 e2e |
 | `web/playwright.hub.config.ts` | `testMatch` 加入 `ux-status` |

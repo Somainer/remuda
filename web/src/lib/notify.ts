@@ -190,6 +190,16 @@ export class NotifyStore {
     const info = [...kept, notification].slice(-INFO_LIMIT);
     this.emit({ ...this.state, info });
 
+    // Drop timers for entries the cap evicted; otherwise they linger in the
+    // map and fire harmlessly later, holding memory for the page's lifetime.
+    const liveKeys = new Set(info.map((n) => n.key));
+    for (const [existingKey, timer] of this.timers) {
+      if (!liveKeys.has(existingKey)) {
+        clearTimeout(timer);
+        this.timers.delete(existingKey);
+      }
+    }
+
     const previous = this.timers.get(key);
     if (previous) clearTimeout(previous);
     const timer = setTimeout(() => {

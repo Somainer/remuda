@@ -167,6 +167,8 @@ pub struct HostLaunchDefaultsPatch {
     pub default_launch_args: Option<Option<Vec<String>>>,
     /// Per-host default claude executable. `Some(None)` clears it.
     pub claude_binary_path: Option<Option<String>>,
+    /// Per-host renderer preference. `Some(None)` restores fullscreen.
+    pub default_tui: Option<Option<remuda_protocol::TuiMode>>,
 }
 
 /// Host index row (Hub projection).
@@ -221,6 +223,9 @@ pub struct HostRecord {
     /// Per-host default claude executable. Stored as given; the Node validates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_binary_path: Option<String>,
+    /// Per-host requested renderer; absent means fullscreen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tui: Option<remuda_protocol::TuiMode>,
     /// Last acknowledged Node workspace registry.
     #[serde(default)]
     pub workspaces: Vec<Value>,
@@ -326,6 +331,9 @@ pub struct InstanceRecord {
     /// Current model id from create / `instance.configure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Requested launch renderer; actual mode comes from the tty snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui: Option<remuda_protocol::TuiMode>,
     /// Native effort tier name.
     ///
     /// Normalized to a D-028 §9.1 level (`low` … `max`) on read, so a row
@@ -2345,6 +2353,7 @@ impl Store {
         let HostLaunchDefaultsPatch {
             default_launch_args,
             claude_binary_path,
+            default_tui,
         } = launch_defaults;
         self.run(move |conn| {
             if load_host(conn, &host_id)?.is_none() {
@@ -2395,6 +2404,16 @@ impl Store {
                 conn.execute(
                     "UPDATE hosts SET claude_binary_path = ?1 WHERE id = ?2",
                     params![path, host_id],
+                )?;
+            }
+            if let Some(tui) = default_tui {
+                let encoded = tui
+                    .map(|tui| serde_json::to_string(&tui))
+                    .transpose()
+                    .map_err(|error| StoreError::Id(error.to_string()))?;
+                conn.execute(
+                    "UPDATE hosts SET default_tui = ?1 WHERE id = ?2",
+                    params![encoded, host_id],
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
@@ -3074,6 +3093,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // default", which is different from "an empty arg list".
     ensure_column(&conn, "hosts", "default_launch_args", "TEXT")?;
     ensure_column(&conn, "hosts", "claude_binary_path", "TEXT")?;
+    ensure_column(&conn, "hosts", "default_tui", "TEXT")?;
     ensure_column(
         &conn,
         "provider_profiles",
@@ -4761,7 +4781,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
                     labels_json, herdr_json, resources_json,
                     COALESCE(max_instances_override, max_instances), hostname, provider_binding,
-                    default_launch_args, claude_binary_path
+                    default_launch_args, claude_binary_path, default_tui
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -4784,6 +4804,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                         .unwrap_or_else(|| "auto".into()),
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
                 ))
             },
         )
@@ -4805,6 +4826,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         provider_binding,
         default_launch_args,
         claude_binary_path,
+        default_tui,
     )) = row
     else {
         return Ok(None);
@@ -4864,6 +4886,9 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             .as_deref()
             .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
         claude_binary_path: claude_binary_path.filter(|value| !value.trim().is_empty()),
+        default_tui: default_tui
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
         workspaces,
         workspace_revision: workspace_revision.max(0) as u64,
     }))
@@ -4980,6 +5005,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_source,
                 provider_source_hint,
                 model,
+                tui: spec
+                    .get("tui")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok()),
                 effort_name,
                 effort_ultracode,
                 effort_index,

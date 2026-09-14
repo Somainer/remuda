@@ -538,6 +538,45 @@ pub(crate) async fn handle_node_method(
                 "watermark": { "durableSeq": appended.durable_seq.to_string() },
             })))
         }
+        "tty.mode" => {
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            let instance_id = params
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HubError::BadRequest("tty.mode requires instanceId".into()))?;
+            let stream_id = params
+                .get("streamId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HubError::BadRequest("tty.mode requires streamId".into()))?;
+            let alt_screen = params
+                .get("altScreen")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    HubError::BadRequest("tty.mode requires boolean altScreen".into())
+                })?;
+            let uuid = stream_uuid_of(stream_id)
+                .ok_or_else(|| HubError::BadRequest("tty.mode has invalid streamId".into()))?;
+            let instance = state
+                .store
+                .get_instance(instance_id.to_owned())
+                .await?
+                .ok_or(HubError::NotFound)?;
+            if instance.host_id != *host_id
+                || state.tty.instance_for_host(&uuid, host_id).as_deref() != Some(instance_id)
+            {
+                return Err(HubError::Forbidden);
+            }
+            state.bus.publish(FollowEvent::json(
+                instance_id,
+                0,
+                json!({ "type": "tty.mode", "params": {
+                    "instanceId": instance_id,
+                    "streamId": stream_id,
+                    "altScreen": alt_screen,
+                }}),
+            ));
+            Ok(Some(json!({ "ok": true })))
+        }
         "tty.frame" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             let typed: Option<TtyFrameParams> = serde_json::from_value(params.clone()).ok();
@@ -988,6 +1027,9 @@ async fn follow_session(
                             {
                                 continue;
                             }
+                            if !want_tty && event.event["type"] == "tty.mode" {
+                                continue;
+                            }
                             let send = if want_tty && let Some(binary) = event.binary {
                                 FollowMsg::Binary(binary)
                             } else if event.binary.is_some() {
@@ -1102,6 +1144,7 @@ async fn send_tty_snapshot(
                     let notice = json!({
                         "type": "tty.mode",
                         "instanceId": instance_id,
+                        "streamId": cached_stream_id,
                         "altScreen": alt_screen,
                     });
                     out_tx

@@ -107,6 +107,7 @@ pub fn schema_document() -> Value {
         DriverKind,
         EffortName,
         EffortSelection,
+        TuiMode,
         ElicitationAction,
         ElicitationAnswer,
         ElicitationMode,

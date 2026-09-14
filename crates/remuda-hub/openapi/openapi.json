@@ -1886,6 +1886,11 @@
           "transport": { "type": "string" },
           "hostname": { "type": ["string", "null"] },
           "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" },
+          "defaultTui": {
+            "type": ["string", "null"],
+            "enum": ["fullscreen", "default", null],
+            "description": "Per-host requested renderer. Null restores the fullscreen default."
+          },
           "defaultLaunchArgs": {
             "type": ["array", "null"],
             "items": { "type": "string" },
@@ -1912,6 +1917,11 @@
           "labels": { "type": "array", "items": { "type": "string" } },
           "maxInstances": { "type": "integer" },
           "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" },
+          "defaultTui": {
+            "type": ["string", "null"],
+            "enum": ["fullscreen", "default", null],
+            "description": "Per-host requested renderer. Null restores the fullscreen default."
+          },
           "defaultLaunchArgs": {
             "type": ["array", "null"],
             "items": { "type": "string" },
@@ -1998,6 +2008,11 @@
           "providerSource": { "type": ["string", "null"] },
           "providerSourceHint": { "type": ["string", "null"] },
           "model": { "type": ["string", "null"] },
+          "tui": {
+            "$ref": "#/components/schemas/TuiMode",
+            "readOnly": true,
+            "description": "Requested launch renderer. Actual mode is reported by tty snapshot altScreen."
+          },
           "effortName": {
             "type": ["string", "null"],
             "enum": ["low", "medium", "high", "xhigh", "max", null],
@@ -2093,8 +2108,16 @@
             "type": "string",
             "description": "Expected sha256: digest of binaryPath. The launch is refused when the Node's pin disagrees."
           },
-          "effort": { "$ref": "#/components/schemas/EffortSelection" }
+          "effort": { "$ref": "#/components/schemas/EffortSelection" },
+          "tui": {
+            "$ref": "#/components/schemas/TuiMode",
+            "description": "Requested renderer. Omission inherits the host default, then fullscreen."
+          }
         }
+      },
+      "TuiMode": {
+        "type": "string",
+        "enum": ["fullscreen", "default"]
       },
       "EffortSelection": {
         "type": "object",

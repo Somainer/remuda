@@ -363,6 +363,7 @@ mod tests {
             provider_binding: binding.into(),
             default_launch_args: None,
             claude_binary_path: None,
+            default_tui: None,
         }
     }
 

@@ -2069,6 +2069,54 @@ impl TranscriptMapper {
 pub mod review {
     use super::*;
 
+    /// A stdout mapper that keeps its state across frames.
+    ///
+    /// [`map_stdout_json`] builds a fresh mapper per call, so native ids never
+    /// correlate — a `tool_result` in a later frame cannot find the
+    /// `tool_use` that preceded it. That is fine for checking one frame's
+    /// shape, but a multi-frame scenario (the D-028 §12 parity gate) needs the
+    /// same mapper throughout, exactly as the live reader has.
+    pub struct StdoutMapper {
+        mapper: Mapper,
+    }
+
+    impl Default for StdoutMapper {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl StdoutMapper {
+        /// A mapper stamping `claude-print` / `stdout` observations.
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                mapper: Mapper {
+                    stream: stream::StreamState::default(),
+                    ids: NativeIds::default(),
+                    seq: 0,
+                    instance_id: InstanceId::new(),
+                    run_id: RunId::new(),
+                    journal_id: fallback_obj(),
+                    host_id: fallback_host(),
+                    session_id: "review-session".into(),
+                    pin: BinaryPin {
+                        abs_path: String::new(),
+                        version: "review".into(),
+                        sha256: dummy_digest(),
+                    },
+                    driver_kind: DriverKind::ClaudePrint,
+                    channel: SourceChannel::Stdout,
+                },
+            }
+        }
+
+        /// Map one stdout frame, carrying identity forward.
+        pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+            map_outbound(&mut self.mapper, &Outbound::from_value(value))
+        }
+    }
+
     /// Map one stdout JSON object the same way the live reader does.
     pub fn map_stdout_json(value: Value) -> DriverResult<Vec<Observation>> {
         let frame = Outbound::from_value(value);

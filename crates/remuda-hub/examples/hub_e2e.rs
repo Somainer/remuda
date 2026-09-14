@@ -1,6 +1,7 @@
 //! In-process Hub plus a fake Node for Playwright live-hub e2e.
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use remuda_hub::{DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, spawn};
 use remuda_protocol::{HostId, InteractionId};
@@ -306,6 +307,12 @@ async fn fake_node(
     );
     let _ = ready.send(());
     let mut append_n = 0u64;
+    // Minimal PTY harness for the QuickFind xterm e2e. It exists only while
+    // this fake node is connected: a terminal session is registered on create,
+    // tty.attach returns its stream + screen, and tty.write records raw bytes
+    // (so the test can prove an Escape reached the process rather than being
+    // swallowed by the browser) and echoes a visible marker back.
+    let mut ttys: HashMap<String, TtyFake> = HashMap::new();
     while let Some(msg) = ws.next().await {
         let Ok(Message::Text(text)) = msg else {
             continue;
@@ -313,6 +320,8 @@ async fn fake_node(
         let Ok(frame) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        // Journal append acknowledgements share this socket with Hub requests.
+        // Only this loop reads frames so concurrent RPCs are never discarded.
         if frame.get("method").is_none() {
             continue;
         }
@@ -334,6 +343,24 @@ async fn fake_node(
                 .await?;
             }
             "instance.create" => {
+                let kind = params
+                    .pointer("/spec/kind")
+                    .or_else(|| params.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("claude");
+                if kind == "terminal" {
+                    // A raw terminal has no agent prompt, approval or journal
+                    // turns; its surface is the PTY stream the QuickFind test
+                    // attaches to.
+                    ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "instanceId": instance_id }),
+                    )
+                    .await?;
+                    continue;
+                }
                 let prompt = params
                     .pointer("/initialInput/text")
                     .or_else(|| params.get("prompt"))
@@ -486,12 +513,98 @@ async fn fake_node(
                 )
                 .await?;
             }
+            "tty.attach" => {
+                // The Hub asks for the live PTY stream when a follower opens
+                // the terminal tab. Registering lazily keeps resume onto a
+                // session created before this node connection behaved.
+                let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                send_rpc_ok(
+                    &mut ws,
+                    id,
+                    json!({
+                        "ok": true,
+                        "streamId": tty.stream_id,
+                        "snapshotBase64": base64::engine::general_purpose::STANDARD
+                            .encode(&tty.screen),
+                        "availableFrom": "0",
+                    }),
+                )
+                .await?;
+            }
+            "tty.write" => {
+                // Raw keyboard bytes from the browser. Every byte is recorded
+                // (the e2e reads the Escape back out of here indirectly via
+                // the echoed marker) and printable input is echoed like a
+                // cooked PTY would.
+                let bytes = params
+                    .get("dataBase64")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
+                    .unwrap_or_default();
+                let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                tty.received.extend_from_slice(&bytes);
+                let mut reply = Vec::new();
+                for byte in &bytes {
+                    // ESC is a control byte for the process, not display text.
+                    if *byte != 0x1b {
+                        reply.push(*byte);
+                    }
+                }
+                if bytes.contains(&0x1b) {
+                    reply.extend_from_slice(b"\r\nQUICKFIND_ESC_RECEIVED\r\n$ ");
+                }
+                if !reply.is_empty() {
+                    tty.screen.extend_from_slice(&reply);
+                    ws.send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "tty.frame",
+                            "params": {
+                                "instanceId": instance_id,
+                                "streamId": tty.stream_id,
+                                "dataBase64": base64::engine::general_purpose::STANDARD
+                                    .encode(&reply),
+                            },
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                }
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
+            "tty.resize" => {
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
             _ => {
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
         }
     }
     Ok(())
+}
+
+/// A script-free PTY double for the QuickFind xterm test.
+///
+/// It models only what that test needs: a stable stream id the Hub binds the
+/// follower to, a one-screen buffer, and a raw byte log. Receiving an ESC byte
+/// is acknowledged with an on-screen marker (`QUICKFIND_ESC_RECEIVED`) so a
+/// browser test can prove the keystroke reached the process instead of being
+/// eaten by a panel's key handler.
+struct TtyFake {
+    stream_id: String,
+    screen: Vec<u8>,
+    received: Vec<u8>,
+}
+
+impl TtyFake {
+    fn new() -> Self {
+        Self {
+            stream_id: format!("tty_{}", uuid::Uuid::now_v7()),
+            screen: b"fake-harness terminal\r\n$ ".to_vec(),
+            received: Vec::new(),
+        }
+    }
 }
 
 async fn send_rpc_ok(
@@ -538,8 +651,6 @@ async fn append_journal(
         .into(),
     ))
     .await?;
-    // Drain the Hub RPC result so it is not mistaken for a later request.
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 
@@ -598,7 +709,6 @@ async fn append_stream_chunks(
             .into(),
         ))
         .await?;
-        let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     }
     Ok(seq)
 }
@@ -633,7 +743,6 @@ async fn append_native_status(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 

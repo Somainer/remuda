@@ -1244,7 +1244,12 @@ mod tests {
                 cwd: None,
                 delegation: None,
                 settings_overlay_path: None,
-                claude_config_dir: None,
+                claude_config_dir: Some(
+                    dir.path()
+                        .join("native-config")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 max_budget_usd: None,
                 provider_overlay: None,
                 provider_auth_token: None,

@@ -6,11 +6,15 @@ const webPort = process.env.HUB_E2E_WEB_PORT ?? "58889";
 const origin = `http://127.0.0.1:${webPort}`;
 /** Fake Anthropic-Messages gateway the provider-discovery spec probes. */
 const upstream = process.env.HUB_E2E_UPSTREAM_LISTEN ?? "127.0.0.1:58881";
+// Visible to spec modules (same runner process): lets a spec that runs under
+// both configs (new-session.spec.ts) separate its hub-live cases from the
+// mock-backed ones.
+process.env.REMUDA_E2E_BACKEND = "hub";
 
 export default defineConfig({
   testDir: "./tests/e2e",
   testMatch: [
-    /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status)\.spec\.ts/,
+    /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|ux-quickfind|new-session)\.spec\.ts/,
     /\.hub\.spec\.ts$/,
   ],
   fullyParallel: false,

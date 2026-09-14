@@ -85,3 +85,127 @@ it("keeps concurrent follows of distinct journals independent", async () => {
   expect(hubStore.getSnapshot().events[first.instance.id]).toEqual([first.event]);
   expect(hubStore.getSnapshot().events[second.instance.id]).toEqual([second.event]);
 });
+
+it("applies authoritative turn activity from follow immediately and fences an older HTTP poll", async () => {
+  const fixture_ = fixture("hook_activity");
+  const instance: Instance = { ...fixture_.instance, durableSeq: "1", activity: { state: "known", value: "idle" } };
+  vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "1", floorSeq: "1" });
+  let deliver!: Parameters<typeof api.eventsSubscribe>[2];
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_journalId, _after, onBatch) => {
+    deliver = onBatch;
+    return subscription(instance);
+  });
+  await hubStore.follow(instance.id);
+
+  const event = (seq: string, activity: "working" | "idle"): Observation => ({
+    ...fixture_.event, seq, eventId: `evt_hook_activity_${seq}`, kind: "lifecycle",
+    payload: {
+      type: "entity", entityType: "instance", entityId: instance.id,
+      revision: seq, previousState: null, state: "ready", reasonCode: "hook-activity", evidenceEventIds: [],
+      entity: { ...instance, revision: seq, activity: { state: "known", value: activity },
+        nativeRef: { ...instance.nativeRef, signalTier: "hook" } },
+    },
+  } as unknown as Observation);
+  const receive = (observation: Observation) => deliver({
+    subscriptionId: `sub_${instance.id}`, journalId: instance.journalId,
+    fromSeq: observation.seq, toSeq: observation.seq, durableSeq: observation.seq, events: [observation],
+  });
+  const current = () => hubStore.getSnapshot().instances.find((row) => row.id === instance.id)!;
+
+  receive(event("2", "working"));
+  expect(current().activity).toEqual({ state: "known", value: "working" });
+  expect(current().nativeRef.signalTier).toBe("hook");
+  const stale = { ...current() };
+  const pending = deferred<Awaited<ReturnType<typeof api.instanceList>>>();
+  vi.spyOn(api, "instanceList").mockReturnValue(pending.promise);
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  const refresh = hubStore.refresh();
+
+  receive(event("3", "idle"));
+  expect(current().activity).toEqual({ state: "known", value: "idle" });
+  pending.resolve({ items: [stale], nextCursor: null });
+  await refresh;
+  expect(current().activity).toEqual({ state: "known", value: "idle" });
+  expect(current().durableSeq).toBe("3");
+});
+
+it("applies Node-validated native activity before its full Instance and ignores unvalidated or foreign events", async () => {
+  const fixture_ = fixture("validated_native_activity");
+  const instance: Instance = {
+    ...fixture_.instance, driver: "shell-pty", durableSeq: "1",
+    activity: { state: "known", value: "idle" },
+    nativeRef: { ...fixture_.instance.nativeRef, signalTier: "hook" },
+  };
+  vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "1", floorSeq: "1" });
+  let deliver!: Parameters<typeof api.eventsSubscribe>[2];
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_journalId, _after, onBatch) => {
+    deliver = onBatch;
+    return subscription(instance);
+  });
+  await hubStore.follow(instance.id);
+  const native = (seq: string, nativeName: string, activity?: string, instanceId = instance.id): Observation => ({
+    ...fixture_.event, seq, instanceId, eventId: `evt_validated_native_${seq}`, kind: "lifecycle",
+    observedAt: "2026-09-14T00:00:01.000Z",
+    payload: {
+      type: "native", nativeName, topic: "turn", severity: "info", affectsCompletion: false,
+      nativeId: { state: "not-applicable" }, dataRef: null,
+      status: { state: "known", value: activity ?? "working" },
+      relatedIds: activity ? { remudaActivity: activity } : {},
+    },
+  } as Observation);
+  const receive = (observation: Observation) => deliver({
+    subscriptionId: `sub_${instance.id}`, journalId: instance.journalId,
+    fromSeq: observation.seq, toSeq: observation.seq, durableSeq: observation.seq, events: [observation],
+  });
+  const current = () => hubStore.getSnapshot().instances.find((row) => row.id === instance.id)!;
+
+  const prompt = native("2", "UserPromptSubmit", "working");
+  receive(prompt);
+  expect(current().activity).toEqual({ state: "known", value: "working" });
+  expect(current().activityEvidenceEventIds).toEqual([prompt.eventId]);
+  expect(current().updatedAt).toBe(prompt.observedAt);
+  expect(current().nativeRef).toBe(instance.nativeRef);
+  expect(current().durableSeq).toBe("2");
+
+  receive(native("3", "Stop"));
+  receive(native("4", "Stop", "idle", "ins_foreign_native_activity"));
+  expect(current().activity).toEqual({ state: "known", value: "working" });
+  expect(current().durableSeq).toBe("2");
+
+  receive({
+    ...fixture_.event, seq: "5", eventId: "evt_validated_native_instance", kind: "lifecycle",
+    payload: {
+      type: "entity", entityType: "instance", entityId: instance.id,
+      revision: "2", previousState: null, state: "ready", reasonCode: "hook-activity", evidenceEventIds: [],
+      entity: { ...current(), revision: "2" },
+    },
+  } as unknown as Observation);
+  expect(current().activity).toEqual({ state: "known", value: "working" });
+  expect(current().durableSeq).toBe("5");
+
+  const interrupted = native("6", "interrupted", "idle");
+  receive(interrupted);
+  expect(current().activity).toEqual({ state: "known", value: "idle" });
+  expect(current().activityEvidenceEventIds).toEqual([interrupted.eventId]);
+  expect(current().nativeRef).toEqual(instance.nativeRef);
+  receive(native("7", "SubagentStop", "working"));
+  receive(native("8", "UserPromptSubmit", "invalid"));
+  receive(native("9", "UserPromptSubmit"));
+  expect(current().activity).toEqual({ state: "known", value: "idle" });
+  expect(current().durableSeq).toBe("6");
+
+  const list = vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ ...current(), durableSeq: "10" }], nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  await hubStore.refresh();
+  receive(native("10", "UserPromptSubmit", "working"));
+  expect(current().activity).toEqual({ state: "known", value: "idle" });
+  list.mockResolvedValue({ items: [{ ...current(), driver: "claude-print" }], nextCursor: null });
+  await hubStore.refresh();
+  receive(native("11", "UserPromptSubmit", "working"));
+  expect(current().activity).toEqual({ state: "known", value: "idle" });
+  expect(current().durableSeq).toBe("10");
+});

@@ -2056,6 +2056,12 @@
             "readOnly": true,
             "description": "Native transcript path, when a driver reported one (D-026)."
           },
+          "signalTier": {
+            "type": ["string", "null"],
+            "enum": ["hook", "file", "osc", "screen", "none", null],
+            "readOnly": true,
+            "description": "Signal tier confirmed by the Node for the current native session. Absent until a tier has been observed."
+          },
           "resumedFrom": {
             "type": ["string", "null"],
             "readOnly": true,

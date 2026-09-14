@@ -1191,6 +1191,11 @@ export interface components {
             providerSourceHint?: string | null;
             /** @description Exited instance whose conversation this instance continues (D-026). */
             readonly resumedFrom?: string | null;
+            /**
+             * @description Signal tier confirmed by the Node for the current native session. Absent until a tier has been observed.
+             * @enum {string|null}
+             */
+            readonly signalTier?: "hook" | "file" | "osc" | "screen" | "none" | null;
             title?: string | null;
             updatedAt?: string;
             workspaceId?: string | null;

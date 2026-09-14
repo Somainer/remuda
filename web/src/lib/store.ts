@@ -137,6 +137,51 @@ const initial: HubState = {
 
 type Listener = () => void;
 
+/** Only Node-validated activity or its full Instance can change turn state. */
+function applyInstanceActivity(instances: Instance[], events: Observation[]): Instance[] {
+  return instances.map((instance) => {
+    let current = instance;
+    for (const event of events) {
+      if (event.instanceId !== current.id || event.kind !== "lifecycle"
+        || BigInt(event.seq) <= BigInt(current.durableSeq)) continue;
+      if (event.payload.type === "native") {
+        const activity = event.payload.relatedIds?.remudaActivity;
+        if (current.driver !== "shell-pty" || event.payload.nativeName === "SubagentStop"
+          || (activity !== "working" && activity !== "idle")) continue;
+        current = {
+          ...current,
+          activity: { state: "known", value: activity },
+          activityEvidenceEventIds: [event.eventId],
+          updatedAt: event.observedAt,
+          durableSeq: event.seq,
+        };
+        continue;
+      }
+      if (event.payload.type !== "entity" || event.payload.entityType !== "instance"
+        || event.payload.entity.id !== current.id) continue;
+      const entity = event.payload.entity;
+      current = {
+        ...current,
+        activity: entity.activity,
+        activityEvidenceEventIds: entity.activityEvidenceEventIds,
+        nativeRef: { ...current.nativeRef, signalTier: entity.nativeRef.signalTier ?? undefined },
+        updatedAt: entity.updatedAt,
+        durableSeq: event.seq,
+      };
+    }
+    return current;
+  });
+}
+
+/** An HTTP poll started before a followed turn boundary cannot undo it. */
+function mergeInstanceSnapshots(incoming: Instance[], current: Instance[]): Instance[] {
+  const previous = new Map(current.map((instance) => [instance.id, instance]));
+  return incoming.map((instance) => {
+    const newer = previous.get(instance.id);
+    return newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq) ? newer : instance;
+  });
+}
+
 class HubStore {
   private state: HubState = initial;
   private listeners = new Set<Listener>();
@@ -423,7 +468,10 @@ class HubStore {
 
   async refresh() {
     const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
-    this.emit({ instances: instances.items, interactions });
+    this.emit({
+      instances: mergeInstanceSnapshots(instances.items, this.state.instances),
+      interactions,
+    });
     this.hydrateEffortEffective(instances.items);
   }
 
@@ -446,6 +494,7 @@ class HubStore {
     // Another mount may finish loading this journal while this read is pending.
     if (this.journals.has(instance.journalId)) return;
     this.emit({
+      instances: applyInstanceActivity(this.state.instances, history),
       events: { ...this.state.events, [instanceId]: history },
     });
     // §9.1: the Hub record usually already carries the latest effective level;
@@ -469,6 +518,7 @@ class HubStore {
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
         this.emit({
+          instances: applyInstanceActivity(this.state.instances, events),
           events: { ...this.state.events, [instanceId]: next },
           bubbles: settleBubbles(this.state.bubbles, instanceId, next),
           screens: screen.lines.length

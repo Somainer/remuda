@@ -97,6 +97,7 @@ pub trait LocalStore: Send + Sync {
         last_error: &str,
     ) -> Result<Instance, NodeError>;
     /// Record the native session identity a driver observed (D-026).
+    /// A supplied signal tier must be proven for that session; absent preserves it.
     ///
     /// Returns the revised Instance when anything changed; `None` when the
     /// observation repeated what `nativeRef` already held, so callers do not
@@ -106,6 +107,7 @@ pub trait LocalStore: Send + Sync {
         instance_id: &InstanceId,
         session_id: &str,
         transcript_path: Option<&str>,
+        signal_tier: Option<remuda_protocol::SignalTier>,
     ) -> Result<Option<Instance>, NodeError>;
     /// Atomically insert a command, returning false for a matching idempotent replay.
     fn insert_command(&self, instance_id: &InstanceId, command: Command)
@@ -630,6 +632,7 @@ impl LocalStore for MemoryStore {
         record.instance.promoted_at = promoted_at;
         // The native identity now points at the promoted agent, not the shell.
         record.instance.native_ref.kind = kind;
+        record.instance.native_ref.signal_tier = None;
         record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
         record.instance.meta.updated_at = now;
         let instance = record.instance.clone();
@@ -671,6 +674,7 @@ impl LocalStore for MemoryStore {
         instance_id: &InstanceId,
         session_id: &str,
         transcript_path: Option<&str>,
+        signal_tier: Option<remuda_protocol::SignalTier>,
     ) -> Result<Option<Instance>, NodeError> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -699,7 +703,11 @@ impl LocalStore for MemoryStore {
             (Some(path), Knowledge::Known { value }) => value.source_path == path,
             (Some(_), _) => false,
         };
-        if session_known && claude_known && transcript_known {
+        if session_known
+            && claude_known
+            && transcript_known
+            && signal_tier.is_none_or(|tier| native.signal_tier == Some(tier))
+        {
             return Ok(None);
         }
         native.session_id = Knowledge::Known {
@@ -708,6 +716,9 @@ impl LocalStore for MemoryStore {
         native.claude = Some(remuda_protocol::ClaudeRef {
             session_id: session_id.to_owned(),
         });
+        if let Some(tier) = signal_tier {
+            native.signal_tier = Some(tier);
+        }
         if let Some(path) = transcript_path {
             native.transcript = Knowledge::Known {
                 value: remuda_protocol::TranscriptRef {

@@ -100,6 +100,8 @@ async fn start(
 }
 
 fn native_fixture(path: &Path) -> (ServeConfig, std::path::PathBuf, std::path::PathBuf) {
+    // Fake model runs must never preflight the developer's personal config.
+    std::fs::create_dir_all(path.join("claude-config")).unwrap();
     let wrapper = path.join("fake-claude-gated");
     std::fs::write(&wrapper, include_bytes!("fixtures/daemon-fake-claude.sh")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -155,7 +157,7 @@ async fn killed_bridge_keeps_fake_claude_alive_and_replays_completion_after_wate
         "second daemon must be rejected before native reconciliation"
     );
     let mut first = Peer::connect(dir.path(), false, json!([])).await;
-    first.send(json!({"jsonrpc":"2.0","id":"create","method":"instance.create","params":{"spec":{"kind":"claude","driver":"claude-print","model":"fake","prompt":"Reply with the fixture result"}}})).await;
+    first.send(json!({"jsonrpc":"2.0","id":"create","method":"instance.create","params":{"spec":{"kind":"claude","driver":"claude-print","claudeConfigDir":dir.path().join("claude-config"),"model":"fake","prompt":"Reply with the fixture result"}}})).await;
     let created = loop {
         let frame = first.next().await;
         if frame["id"] == "create" {
@@ -328,6 +330,7 @@ async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
     let address = listener.local_addr().unwrap();
     let (disconnected, offline) = tokio::sync::oneshot::channel();
     let (resume, resumed) = tokio::sync::oneshot::channel();
+    let claude_config = dir.path().join("claude-config");
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut first = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -336,7 +339,7 @@ async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
         assert_eq!(hello["params"]["daemon"], true);
         assert_eq!(hello["params"]["durable"], true);
         first.send(Message::Text(json!({"jsonrpc":"2.0","id":hello["id"],"result":{"instanceWatermarks":[],"nodeToken":"fixture-host-token"}}).to_string().into())).await.unwrap();
-        first.send(Message::Text(json!({"jsonrpc":"2.0","id":"create","method":"instance.create","params":{"spec":{"kind":"claude","driver":"claude-print","model":"fake","prompt":"Return the fixture result"}}}).to_string().into())).await.unwrap();
+        first.send(Message::Text(json!({"jsonrpc":"2.0","id":"create","method":"instance.create","params":{"spec":{"kind":"claude","driver":"claude-print","claudeConfigDir":claude_config,"model":"fake","prompt":"Return the fixture result"}}}).to_string().into())).await.unwrap();
         let mut watermark = 0_u64;
         let mut instance_id = String::new();
         let mut tick = tokio::time::interval(Duration::from_millis(10));

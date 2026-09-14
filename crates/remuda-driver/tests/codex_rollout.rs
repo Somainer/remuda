@@ -78,6 +78,9 @@ fn real_interactive_rollout_keeps_tool_turn_usage_and_interruption_evidence() {
             Event::Unknown { r#type } if r#type == "turn_aborted" => {
                 aborted = Some(raw["payload"]["turn_id"].as_str().unwrap().to_owned());
             }
+            Event::TurnAborted { turn_id, .. } => {
+                aborted = turn_id;
+            }
             _ => {}
         }
     }
@@ -165,7 +168,19 @@ fn lifecycle_records_do_not_hide_completion_errors_or_item_fields() {
             item
         }
     );
-    for kind in ["turn_aborted", "queued_message", "new_event_type"] {
+    // `turn_aborted` is now typed (P6: the interrupt evidence); other event
+    // names stay Unknown.
+    assert_eq!(
+        event(
+            "event_msg",
+            json!({"type":"turn_aborted","turn_id":"turn-a","reason":"interrupted"})
+        ),
+        Event::TurnAborted {
+            turn_id: Some("turn-a".into()),
+            reason: Some("interrupted".into()),
+        }
+    );
+    for kind in ["queued_message", "new_event_type"] {
         assert_eq!(
             event("event_msg", json!({"type":kind})),
             Event::Unknown {

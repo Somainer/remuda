@@ -390,6 +390,60 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
     }
 
     #[test]
+    fn foreground_group_is_selected_separately_from_the_shell_session() {
+        // These jobs share the shell's SID 100, but Claude's foreground PGID
+        // is 200. Numeric `ps -g 200` on Linux would select SID 200 instead.
+        let output = concat!(
+            " 100 100 /bin/sh\n",
+            " 101 101 /tmp/claude --resume another-session\n",
+            " 200 200 /tmp/claude --model opus\n",
+            " 200 201 /tmp/remuda hook emit --event SessionStart\n",
+            " 200 invalid /tmp/claude\n",
+            " invalid 202 /tmp/claude\n",
+            " 200 203\n",
+        );
+        let foreground = parse_grouped_rows(output, 200);
+        assert_eq!(
+            foreground.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![200, 201]
+        );
+        assert_eq!(foreground[0].args, "/tmp/claude --model opus");
+        assert_eq!(detect(&foreground).unwrap().pid, 200);
+        assert!(detect(&parse_grouped_rows(output, 100)).is_none());
+        assert!(parse_grouped_rows(output, 300).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_process_table_finds_a_job_in_its_own_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // setpgid(0, 0) creates a foreground-job-shaped group in our existing
+        // session. Its PGID is the child PID, not the inherited session ID.
+        let child = OwnedChild(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn owned process group"),
+        );
+        let pid = i32::try_from(child.0.id()).expect("child PID fits i32");
+        let rows = SystemProcessTable.process_group(pid);
+        assert!(
+            rows.iter().any(|row| row.pid == pid),
+            "the process group lookup must find its child even when PGID differs from SID"
+        );
+    }
+
+    #[test]
     fn claude_in_the_foreground_group_promotes_with_its_session_id() {
         let table = FakeTable(rows(&[
             (100, "/bin/zsh -l"),

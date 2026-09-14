@@ -16,8 +16,9 @@ use remuda_protocol::{
     ObservationPayload, ObservationSource, RunId, RuntimeCursor, SchemaVersion, SourceChannel,
     SourceCursor, SourceDelivery, Timestamp, U64,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 /// Identity every Observation this bus emits is stamped with.
@@ -59,6 +60,14 @@ pub struct SignalBus {
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     binding: std::sync::Mutex<Option<SessionBinding>>,
+    turn_active: std::sync::Mutex<VecDeque<TurnState>>,
+    interrupt_pid: Arc<AtomicI32>,
+}
+
+struct TurnState {
+    pid: i32,
+    session_id: Option<String>,
+    active: Option<bool>,
 }
 
 impl SignalBus {
@@ -74,7 +83,79 @@ impl SignalBus {
             events,
             seq,
             binding: std::sync::Mutex::new(None),
+            turn_active: std::sync::Mutex::new(VecDeque::new()),
+            interrupt_pid: Arc::new(AtomicI32::new(0)),
         }
+    }
+
+    /// Share a pending interrupt with the PTY's screen observer. Zero means no
+    /// pending request; a native turn end or new interruption marker claims it
+    /// once. Writing an interrupt key alone never proves that the turn ended.
+    #[must_use]
+    pub fn with_interrupt_tracker(mut self, pending: Arc<AtomicI32>) -> Self {
+        self.interrupt_pid = pending;
+        self
+    }
+
+    /// Last hook turn boundary for this exact foreground process, if observed.
+    #[must_use]
+    pub fn turn_active(&self, pid: i32) -> Option<bool> {
+        self.turn_active.lock().ok().and_then(|slots| {
+            slots
+                .iter()
+                .find(|slot| slot.pid == pid)
+                .and_then(|slot| slot.active)
+        })
+    }
+
+    /// A pending cancel was confirmed by fresh native screen evidence. Keep
+    /// the driver's idle guard in sync even when Claude emits no Stop hook.
+    pub fn confirm_screen_interrupt(&self, pid: i32) {
+        if let Ok(mut slots) = self.turn_active.lock()
+            && let Some(slot) = slots.iter_mut().find(|slot| slot.pid == pid)
+        {
+            slot.active = Some(false);
+        }
+    }
+
+    // A background CLI shares the terminal's hook socket, but its turn must
+    // not replace the foreground CLI's cancellation guard. Bound retained
+    // processes to 32 and reject another session's boundary for a known PID.
+    fn record_turn(&self, pid: i32, session_id: Option<String>, active: Option<bool>) -> bool {
+        let Ok(mut slots) = self.turn_active.lock() else {
+            return false;
+        };
+        if let Some(index) = slots.iter().position(|slot| slot.pid == pid) {
+            if active.is_some()
+                && slots[index].session_id.is_some()
+                && slots[index].session_id != session_id
+            {
+                return false;
+            }
+            let Some(previous) = slots.remove(index) else {
+                return false;
+            };
+            let active = if active.is_none() && previous.session_id == session_id {
+                previous.active
+            } else {
+                active
+            };
+            slots.push_back(TurnState {
+                pid,
+                session_id: session_id.or(previous.session_id),
+                active,
+            });
+        } else {
+            slots.push_back(TurnState {
+                pid,
+                session_id,
+                active,
+            });
+        }
+        while slots.len() > 32 {
+            slots.pop_front();
+        }
+        true
     }
 
     /// The session this bus has seen a `SessionStart` for, if any.
@@ -97,13 +178,68 @@ impl SignalBus {
                 transcript_path: mapped.transcript_path.clone(),
             });
         }
+        if mapped.kind == MappedKind::SessionStarted && mapped.session_id.is_some() {
+            self.record_turn(event.ppid, mapped.session_id.clone(), None);
+        }
+        let turn_matches = matches!(mapped.kind, MappedKind::TurnStarted | MappedKind::TurnEnded)
+            && self.record_turn(
+                event.ppid,
+                mapped.session_id.clone(),
+                Some(mapped.kind == MappedKind::TurnStarted),
+            );
+        if turn_matches && mapped.kind == MappedKind::TurnStarted {
+            let _ = self.interrupt_pid.compare_exchange(
+                event.ppid,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+        let interrupted = turn_matches
+            && mapped.kind == MappedKind::TurnEnded
+            && event.ppid > 0
+            && self
+                .interrupt_pid
+                .compare_exchange(event.ppid, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
         if let Err(error) = self.emit(&mapped).await {
             tracing::debug!(%error, event = %event.name, "hook observation not journaled");
+        }
+        if interrupted {
+            let mut confirmed = mapped.clone();
+            if let ObservationPayload::Lifecycle(payload) = &mut confirmed.payload
+                && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_mut()
+            {
+                native.native_name = "interrupted".into();
+                native
+                    .related_ids
+                    .insert("afterEvent".into(), event.name.clone());
+                native
+                    .related_ids
+                    .insert("requestedBy".into(), "instance.cancel".into());
+            }
+            if let Err(error) = self.emit(&confirmed).await {
+                tracing::debug!(%error, "confirmed interrupt not journaled");
+            }
         }
         // P1 observes only. Answering `PermissionRequest` is P5; until then the
         // agent's own dialog stays the single place a decision is made, so
         // there is never a moment where Remuda thinks it answered and the
         // agent thinks it did not.
+        //
+        // TODO(x-p5) D-028 P6: codex's `PermissionRequest` and grok's
+        // `PreToolUse{deny,ask}` are *blocking* hook events. The P6 adapters
+        // journal them (so the waiting interaction is visible) but the verdict
+        // transport belongs to P5's `InteractionRuntime`:
+        //   1. on a blocking event, insert a pending `InteractionRequested`
+        //      (carrier `ClaudeHook`/new `HarnessHook`) and await the broker;
+        //   2. return `{"behavior":"allow"|"deny"}` (claude) or the codex
+        //      `{"hookSpecificOutput":{"hookEventName":"PermissionRequest",
+        //      "decision":{"behavior":…},"message":…}}` wrapper;
+        //   3. on broker timeout, reply deny (§4.4: timeout is always deny).
+        // Until that lands, `{}` keeps the harness's own screen dialog as the
+        // authority — the measured grok path and the confined-session fallback
+        // both require exactly that.
         HookReply::empty()
     }
 
@@ -240,6 +376,125 @@ mod tests {
             SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0))),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn cancel_is_confirmed_only_by_a_matching_native_turn_end() {
+        let pending = Arc::new(AtomicI32::new(4242));
+        let (bus, mut rx) = bus();
+        let bus = bus.with_interrupt_tracker(Arc::clone(&pending));
+        let mut other = envelope("Stop", serde_json::json!({}));
+        other.ppid = 99;
+        bus.handle(other).await;
+        assert_eq!(
+            native_lifecycle(&rx.recv().await.unwrap().body)
+                .unwrap()
+                .native_name,
+            "Stop"
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(pending.load(Ordering::SeqCst), 4242);
+
+        bus.handle(envelope("StopFailure", serde_json::json!({})))
+            .await;
+        assert_eq!(
+            native_lifecycle(&rx.recv().await.unwrap().body)
+                .unwrap()
+                .native_name,
+            "StopFailure"
+        );
+        let confirmed = rx.recv().await.unwrap();
+        assert_eq!(confirmed.source.channel, SourceChannel::Hook);
+        let native = native_lifecycle(&confirmed.body).unwrap();
+        assert_eq!(native.native_name, "interrupted");
+        assert_eq!(native.related_ids["afterEvent"], "StopFailure");
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+        assert_eq!(bus.turn_active(4242), Some(false));
+
+        bus.handle(envelope("Stop", serde_json::json!({}))).await;
+        rx.recv().await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate Stop cannot confirm twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_cannot_settle_a_previous_turns_pending_cancel() {
+        let pending = Arc::new(AtomicI32::new(4242));
+        let (bus, mut rx) = bus();
+        let bus = bus.with_interrupt_tracker(pending);
+        bus.handle(envelope("UserPromptSubmit", serde_json::json!({})))
+            .await;
+        rx.recv().await.unwrap();
+        assert_eq!(bus.turn_active(4242), Some(true));
+        bus.handle(envelope("Stop", serde_json::json!({}))).await;
+        rx.recv().await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn background_turns_and_foreign_sessions_do_not_clear_foreground_activity() {
+        let pending = Arc::new(AtomicI32::new(0));
+        let (bus, mut rx) = bus();
+        let bus = bus.with_interrupt_tracker(Arc::clone(&pending));
+        for (name, pid, session) in [
+            ("SessionStart", 99, "background"),
+            ("UserPromptSubmit", 99, "background"),
+            ("SessionStart", 4242, "foreground"),
+            ("UserPromptSubmit", 4242, "foreground"),
+        ] {
+            let mut event = envelope(name, serde_json::json!({"session_id":session}));
+            event.ppid = pid;
+            bus.handle(event).await;
+            rx.recv().await.unwrap();
+        }
+        pending.store(4242, Ordering::SeqCst);
+        for (name, pid, session) in [
+            ("SessionStart", 4242, "foreground"),
+            ("Stop", 99, "background"),
+            ("Stop", 4242, "foreign"),
+            ("SubagentStop", 4242, "foreground"),
+        ] {
+            let mut event = envelope(name, serde_json::json!({"session_id":session}));
+            event.ppid = pid;
+            bus.handle(event).await;
+            rx.recv().await.unwrap();
+            assert!(
+                rx.try_recv().is_err(),
+                "unrelated evidence cannot settle cancel"
+            );
+            assert_eq!(bus.turn_active(4242), Some(true));
+            assert_eq!(pending.load(Ordering::SeqCst), 4242);
+        }
+        bus.handle(envelope(
+            "Stop",
+            serde_json::json!({"session_id":"foreground"}),
+        ))
+        .await;
+        rx.recv().await.unwrap();
+        assert_eq!(
+            native_lifecycle(&rx.recv().await.unwrap().body)
+                .unwrap()
+                .native_name,
+            "interrupted"
+        );
+        assert_eq!(bus.turn_active(4242), Some(false));
+        bus.handle(envelope(
+            "SessionStart",
+            serde_json::json!({"session_id":"replacement"}),
+        ))
+        .await;
+        rx.recv().await.unwrap();
+        assert_eq!(
+            bus.turn_active(4242),
+            None,
+            "a different session resets prior activity"
+        );
+        for pid in 1..=64 {
+            bus.record_turn(pid, None, Some(true));
+        }
+        assert_eq!(bus.turn_active.lock().unwrap().len(), 32);
     }
 
     #[tokio::test]

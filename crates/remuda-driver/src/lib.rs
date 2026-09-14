@@ -4,6 +4,7 @@
 //! thin [`ProviderProfile`] / [`SecretBroker`], binary pin, and a feature-gated
 //! [`FakeDriver`] that replays built-in Observations.
 
+pub mod adapters;
 pub mod agent_mcp;
 pub mod attachment;
 mod binary;

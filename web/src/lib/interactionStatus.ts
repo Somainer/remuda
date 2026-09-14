@@ -56,3 +56,43 @@ export const INTERACTION_LABEL: Record<InteractionUiState, string> = {
   superseded: "已在其它设备处理",
   paused: "主机离线，交互暂停",
 };
+
+/**
+ * Whether the native side confirmed it dropped this request.
+ *
+ * `answer-committed` only says Remuda durably recorded an answer. Until the
+ * harness clears the request, the turn has not moved on — that gap is the
+ * "回答已提交，等待处理" row in P0-3.
+ */
+export function nativeCleared(interaction: Interaction): boolean {
+  return interaction.resolution.state === "known" && interaction.resolution.value.reason === "native-cleared";
+}
+
+/**
+ * An answer is recorded but the native side has not cleared the request.
+ *
+ * The form is very likely still on screen in this state, which is exactly when
+ * a user tries to submit a second time.
+ */
+export function answerPendingNative(interaction: Interaction): boolean {
+  const committed = interaction.state === "answer-committed" || interaction.state === "resolved";
+  return committed && !nativeCleared(interaction);
+}
+
+/**
+ * Whether a human may still submit an answer.
+ *
+ * The single guard for the double-submit case P0-3 calls out (已答请求不能二次
+ * 提交). Deliberately strict: `pending` is the only submittable projection, so
+ * an in-flight local submit, an answer from another device, an expired
+ * deadline, an invalidated request and an offline host all block it. Callers
+ * should disable their submit control on `false` rather than reproduce any
+ * part of this rule.
+ */
+export function canSubmitAnswer(
+  interaction: Interaction,
+  opts: { answering?: boolean; host?: Host; connectivity?: string; deviceId?: string } = {},
+): boolean {
+  if (!interaction.answerable) return false;
+  return projectInteraction(interaction, opts) === "pending";
+}

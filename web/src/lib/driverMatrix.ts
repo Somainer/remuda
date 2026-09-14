@@ -62,14 +62,19 @@ export function shellPtyAllowed(host: HostMatrix | undefined, kind: AgentKindId 
   if (kind === "terminal") return true;
   if (!cliHasKind(host, kind)) return false;
   const inventory = matrixDrivers(host);
-  if (inventory.length === 0) return true;
+  // An unreported matrix means the Node cannot prove it launches agents inside its own PTY
+  // (D-028 P2 core not enabled) — fall back to the legacy carriers instead of typing the
+  // first prompt into a bare shell. Only a reported `shell-pty` row with launchable=true opts in.
+  if (inventory.length === 0) return false;
   const shell = inventory.find((d) => d.kind === "shell-pty");
   return Boolean(shell && shell.launchable !== false);
 }
 
 /** Legacy carriers still offered, secondary to the native PTY. */
 export function legacyDrivers(kind: AgentKindId): DriverKind[] {
-  if (kind === "claude") return ["claude-print", "claude-pty", "generic-pty"];
+  // claude-pty first: it keeps a multi-turn TUI alive; claude-print is a one-shot legacy
+  // path kept only until D-028 retires it, so it is offered last and never defaulted.
+  if (kind === "claude") return ["claude-pty", "generic-pty", "claude-print"];
   return ["generic-pty"];
 }
 
@@ -80,7 +85,7 @@ export function legacyDrivers(kind: AgentKindId): DriverKind[] {
 export function defaultDriver(host: HostMatrix | undefined, kind: AgentKindId | "terminal"): DriverKind {
   if (kind === "terminal") return "shell-pty";
   if (shellPtyAllowed(host, kind)) return "shell-pty";
-  if (kind === "claude") return "claude-print";
+  if (kind === "claude") return "claude-pty";
   return "generic-pty";
 }
 

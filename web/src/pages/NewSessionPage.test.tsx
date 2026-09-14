@@ -81,6 +81,18 @@ function renderWithCli() {
   render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
 }
 
+/** A host whose Node reports that it can launch agents inside its own PTY (D-028 P2 core). */
+function renderWithLaunchableMatrix() {
+  const launchable = {
+    ...cliHost,
+    capabilities: { ...(cliHost as { capabilities?: object }).capabilities, driverInventory: [{ kind: "shell-pty", launchable: true }] },
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [launchable], workspaces: [workspace], instances: [],
+  });
+  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+}
+
 it("mounts the inline slider (layout A, no card) with the five real levels", () => {
   renderWithCli();
   const slider = screen.getByTestId("new-session-effort-slider");
@@ -215,7 +227,7 @@ it("writes the harness-native tier after a runtime switch", async () => {
 describe("D-028 native PTY default", () => {
   it("offers 原生终端 shell-pty as the default for claude and creates with it", async () => {
     const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
-    renderWithCli();
+    renderWithLaunchableMatrix();
     const row = screen.getByTestId("new-session-driver-shell-pty");
     expect(row).toHaveAttribute("data-default", "1");
     expect(screen.getByTestId("new-session-launch-preview")).toHaveTextContent(/claude/);
@@ -226,14 +238,14 @@ describe("D-028 native PTY default", () => {
   });
 
   it("keeps claude-print selectable as a secondary choice", () => {
-    renderWithCli();
+    renderWithLaunchableMatrix();
     const print = screen.getByTestId("new-session-driver-claude-print");
     expect(print).toHaveAttribute("data-default", "0");
     fireEvent.click(print);
     expect(print.className).toMatch(/driverChoiceOn/);
   });
 
-  it("falls back to claude-print when the host's matrix says shell-pty is not launchable", () => {
+  it("falls back to claude-pty when the host's matrix says shell-pty is not launchable", () => {
     vi.mocked(store.useHub).mockReturnValue({
       ...store.hubStore.getSnapshot(),
       hosts: [
@@ -249,7 +261,7 @@ describe("D-028 native PTY default", () => {
     const shell = screen.getByTestId("new-session-driver-shell-pty");
     expect(shell).toBeDisabled();
     expect(shell).toHaveAttribute("data-default", "0");
-    expect(screen.getByTestId("new-session-driver-claude-print")).toHaveAttribute("data-default", "1");
+    expect(screen.getByTestId("new-session-driver-claude-pty")).toHaveAttribute("data-default", "1");
   });
 
   it("falls back to generic-pty for grok when the installed CLI meets a matrix refusing shell-pty", () => {

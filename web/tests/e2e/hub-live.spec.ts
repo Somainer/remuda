@@ -97,7 +97,10 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   expect(followUrls.every((url) => !new URL(url).searchParams.has("token"))).toBe(true);
   await page.reload();
   await expectCookieSession(page);
-  await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1);
+  // Reload waits for cookie-backed bootstrap and the durable journal read again.
+  await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1, {
+    timeout: 20_000,
+  });
   await expect(page.getByTestId("composer-bar")).toBeVisible();
 
   await page.goto("/approvals");
@@ -486,4 +489,59 @@ test("composer steer / queue / interrupt states on a working native session", as
   await expect(page.getByTestId("composer-interrupt")).toHaveCount(0);
   await expect(page.getByTestId("composer-queue-btn")).toHaveCount(0);
   await expect(page.getByTestId("composer-send")).toHaveAttribute("data-mode", "new-turn");
+});
+
+/**
+ * D-028 §7 in the browser: assistant text must grow in place as deltas land,
+ * and records the human did not write must not render as their bubble.
+ *
+ * «现在 Structural 的界面不是按文本流式出现的…我觉得它的实时性不够» and
+ * «结构化界面会把追加的 prompt 信息也额外展示了 … 容易让人误解是我发了这些信息».
+ */
+test("structured view streams assistant text and separates injected records", async ({ page }) => {
+  test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+  await login(page);
+  await page.goto("/sessions/new");
+  await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
+  await page.getByTestId("new-session-prompt").fill("stream please");
+  await page.getByTestId("new-session-start").click();
+  await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+  const instanceId = new URL(page.url()).pathname.split("/").pop()!;
+  await answerPendingApprovals(page, instanceId);
+
+  // The fake Node replies to a `stream ` prompt as an open/append chain. The
+  // assembler must merge it into ONE bubble carrying the whole text — a bubble
+  // per chunk is exactly the "not streaming, just re-rendering" failure.
+  await page.getByTestId("composer-input").fill("stream the reply");
+  await page.getByTestId("composer-send").click();
+  const streamed = page.getByTestId("message").filter({ hasText: "echo: stream the reply" });
+  await expect(streamed).toHaveCount(1, { timeout: 20_000 });
+
+  // Injected records are collapsed, not drawn as "You", and the toggle hides
+  // them entirely. The fake Node emits none, so assert the invariant that
+  // holds either way: nothing claiming to be the user that the user never sent.
+  const bubbles = await page.getByTestId("message").filter({ hasText: /^You/ }).allTextContents();
+  expect(bubbles.every((text) => !text.includes("<task-notification>"))).toBe(true);
+  expect(bubbles.every((text) => !text.includes("<command-name>"))).toBe(true);
+
+  await shot(page, "native-pty-web-3-structured-stream-1440.png");
+  await page.setViewportSize({ width: 400, height: 840 });
+  await shot(page, "native-pty-web-3-structured-stream-400.png");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Release the placement slot. The fake host advertises `maxInstances: 8`
+  // and the suite is serial, so a spec that leaves its instance live spends
+  // one of those slots for the rest of the run — a later spec creating
+  // several sessions then fails placement with a non-OK POST /v1/instances,
+  // far from the spec that actually leaked.
+  //
+  // The fake Node never emits an exit lifecycle (there is no real process to
+  // lose), so `instance.close` alone leaves the row `running` and the slot
+  // counted. DELETE settles to `exited` best-effort regardless, which is the
+  // cleanup path the rest of the suite relies on.
+  const deleted = await page.request.delete(`/v1/instances/${instanceId}?force=1`);
+  expect(deleted.ok()).toBe(true);
+  await expect
+    .poll(async () => (await page.request.get(`/v1/instances/${instanceId}`)).status())
+    .toBe(404);
 });

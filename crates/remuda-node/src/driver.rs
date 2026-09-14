@@ -522,6 +522,9 @@ pub(crate) fn message_payload(
         target_block: None,
         parent_tool_call_id: None,
         native_origin: unknown("fake-driver"),
+        // A Node-synthesized message is the real correspondent's text (the
+        // queued prompt, the fake driver's reply), never an injected record.
+        origin: Some(remuda_protocol::MessageOrigin::Human),
         status: ContentStatus::Complete,
     })))
 }

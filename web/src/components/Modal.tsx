@@ -1,7 +1,32 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode, type RefObject } from "react";
+import { useFocusTrap } from "./useFocusTrap";
 import ui from "../styles/ui.module.css";
 
-export function Modal({ open, onClose, children }: { open: boolean; onClose: () => void; children: ReactNode }) {
+/**
+ * The centered dialog, now on the shared overlay contract (UX plan §2).
+ *
+ * It keeps its own visual-viewport tracking — on a phone the software keyboard
+ * shrinks the viewport and the panel has to follow it — but name, focus and
+ * keyboard behaviour come from {@link useFocusTrap}, so Escape closes it, the
+ * initial focus lands inside, Tab no longer walks onto the page behind the
+ * scrim, and closing returns focus to whatever opened it.
+ */
+export function Modal({
+  open,
+  onClose,
+  labelledBy,
+  initialFocusRef,
+  returnFocusRef,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  labelledBy?: string;
+  initialFocusRef?: RefObject<HTMLElement | null>;
+  returnFocusRef?: RefObject<HTMLElement | null>;
+  children: ReactNode;
+}) {
+  const { containerRef, onKeyDown, ...aria } = useFocusTrap({ open, onClose, labelledBy, initialFocusRef, returnFocusRef });
   const [box, setBox] = useState(() => ({
     height: typeof window === "undefined" ? 800 : window.visualViewport?.height || window.innerHeight,
     top: typeof window === "undefined" ? 0 : window.visualViewport?.offsetTop || 0,
@@ -29,10 +54,11 @@ export function Modal({ open, onClose, children }: { open: boolean; onClose: () 
   return (
     <div className={ui.modal} style={{ top: box.top, height: box.height }} onClick={onClose} role="presentation">
       <div
+        {...aria}
+        ref={containerRef}
+        onKeyDown={onKeyDown}
         className={ui.modalPanel}
         onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
       >
         {children}
       </div>

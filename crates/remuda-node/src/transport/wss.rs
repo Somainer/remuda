@@ -929,6 +929,12 @@ fn encode_hello_params(
     node_epoch: &Id,
     watermarks: &HashMap<String, SeqWatermark>,
 ) -> Value {
+    // Insert the raw host value after the typed conversion: it carries
+    // `driverInventory`, which `NodeHostInventory` does not model, and
+    // `hello_capabilities` echoes it verbatim into `capabilities`. This is the
+    // outbound-WSS twin of the stdio hello — the demo regression was that only
+    // stdio advertised the inventory, so `remuda dev` never sent it.
+    let host = config.host.clone();
     let mut params = json!(NodeHelloParams {
         host_id: Some(config.host_id.clone()),
         label: Some(config.label.clone()),
@@ -942,14 +948,18 @@ fn encode_hello_params(
             "minor": PROTOCOL_VERSION.minor,
             "framing": "websocket-message",
         })),
-        host: config
-            .host
+        host: host
             .clone()
-            .and_then(|host| serde_json::from_value(host).ok()),
-        capabilities: None,
+            .and_then(|value| serde_json::from_value(value).ok()),
+        capabilities: host
+            .as_ref()
+            .and_then(crate::transport::hubnode::hello_capabilities),
         cli: Some(config.cli.clone()),
     });
     if let Some(object) = params.as_object_mut() {
+        if let Some(host) = host {
+            object.insert("host".into(), host);
+        }
         object.insert("resumeCursors".into(), json!(resume_cursors(watermarks)));
         object.insert(
             "instanceWatermarks".into(),
@@ -965,6 +975,10 @@ fn encode_heartbeat_params(
     lease_id: Option<&str>,
     watermarks: &HashMap<String, SeqWatermark>,
 ) -> Value {
+    // The Hub heartbeat handler refreshes capabilities the same way the hello
+    // handler does, so carry the same inventory on every refresh: a reconnect
+    // that never re-ran hello would otherwise leave the host view describing a
+    // stale carrier state.
     json!(NodeHeartbeatParams {
         connection_id: connection_id.map(str::to_owned),
         lease_id: lease_id.map(str::to_owned),
@@ -975,7 +989,10 @@ fn encode_heartbeat_params(
             .clone()
             .and_then(|host| serde_json::from_value(host).ok()),
         cli: Some(config.cli.clone()),
-        capabilities: None,
+        capabilities: config
+            .host
+            .as_ref()
+            .and_then(crate::transport::hubnode::hello_capabilities),
         instance_watermarks: journal_watermarks(watermarks),
     })
 }
@@ -1295,5 +1312,91 @@ mod tests {
         assert_eq!(value["resumeCursors"][0]["afterSeq"], json!("3"));
         let parsed: NodeHelloParams = serde_json::from_value(value).expect("hello");
         assert_eq!(parsed.persisted_host_id(), Some(config.host_id.as_str()));
+    }
+
+    #[test]
+    fn wss_hello_carries_the_driver_inventory_under_capabilities() {
+        // D-028 §5.1, outbound-WSS twin of the stdio test: `remuda dev` and
+        // every real outbound Node use this path. Hardcoding `capabilities:
+        // None` here was the bug that left GET /v1/hosts reporting `{}`.
+        let epoch = Id::new("epoch").expect("epoch");
+        let host_id = remuda_protocol::HostId::new();
+        let mut config = WssConfig::loopback(
+            "127.0.0.1:1".parse().expect("addr"),
+            "tok",
+            host_id.as_id().as_str().to_owned(),
+        );
+        config.host = Some(json!({
+            "hostname": "lab",
+            "driverInventory": [{"kind": "shell-pty", "launchable": true,
+                                 "reasonCode": "carrier-native"}],
+        }));
+        let value = encode_hello_params(&config, &epoch, &HashMap::new());
+        assert_eq!(
+            value["capabilities"]["driverInventory"][0]["kind"],
+            json!("shell-pty")
+        );
+        assert_eq!(
+            value["capabilities"]["driverInventory"][0]["launchable"],
+            json!(true)
+        );
+        // The raw nested host survives the typed conversion so the Hub stores
+        // the same descriptor both places.
+        assert_eq!(
+            value["host"]["driverInventory"][0]["launchable"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn wss_hello_without_inventory_sends_no_capabilities_rather_than_an_empty_claim() {
+        // Absence must read as "not reported", never as "cannot launch".
+        let epoch = Id::new("epoch").expect("epoch");
+        let host_id = remuda_protocol::HostId::new();
+        let mut config = WssConfig::loopback(
+            "127.0.0.1:1".parse().expect("addr"),
+            "tok",
+            host_id.as_id().as_str().to_owned(),
+        );
+        config.host = Some(json!({ "hostname": "lab" }));
+        let value = encode_hello_params(&config, &epoch, &HashMap::new());
+        assert!(value["capabilities"].is_null());
+
+        // No host at all (loopback config before inventory collection) still
+        // sends no capabilities.
+        let bare = WssConfig::loopback(
+            "127.0.0.1:1".parse().expect("addr"),
+            "tok",
+            host_id.as_id().as_str().to_owned(),
+        );
+        let value = encode_hello_params(&bare, &epoch, &HashMap::new());
+        assert!(value["capabilities"].is_null());
+    }
+
+    #[test]
+    fn wss_heartbeat_refreshes_the_driver_inventory() {
+        // The Hub heartbeat handler writes `capabilities` the same way the
+        // hello handler does; sending none would leave a stale carrier state
+        // in place after flag changes and reconnects.
+        let host_id = remuda_protocol::HostId::new();
+        let mut config = WssConfig::loopback(
+            "127.0.0.1:1".parse().expect("addr"),
+            "tok",
+            host_id.as_id().as_str().to_owned(),
+        );
+        config.host = Some(json!({
+            "hostname": "lab",
+            "driverInventory": [{"kind": "shell-pty", "launchable": false,
+                                 "reasonCode": "carrier-not-enabled"}],
+        }));
+        let value = encode_heartbeat_params(&config, Some("conn"), Some("lease"), &HashMap::new());
+        assert_eq!(
+            value["capabilities"]["driverInventory"][0]["launchable"],
+            json!(false)
+        );
+        assert_eq!(
+            value["capabilities"]["driverInventory"][0]["reasonCode"],
+            json!("carrier-not-enabled")
+        );
     }
 }

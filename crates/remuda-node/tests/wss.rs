@@ -936,6 +936,170 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
     link.shutdown().await;
 }
 
+/// D-028 §5.1 end-to-end proof over loopback WSS: the `driverInventory`
+/// descriptor built from `REMUDA_PTY_CARRIER` rides the WSS hello into the Hub
+/// host view. This is the path `remuda dev` and every real outbound Node use;
+/// stdio was the only path that advertised it, so `GET /v1/hosts` showed
+/// `capabilities: {}` and New Session defaulted back to the legacy herdr
+/// carrier.
+///
+/// `REMUDA_PTY_CARRIER` is read from the process environment, which is unsafe
+/// to mutate in-process (the workspace forbids `unsafe`, and the value would
+/// leak to other tests sharing the process), so the two cases each run in a
+/// re-exec of this test binary — the same pattern as
+/// `child_env_isolation.rs`.
+const HELLOCAPS_MARKER: &str = "REMUDA_HELLOCAPS_CHILD";
+const HELLOCAPS_CASE: &str = "REMUDA_HELLOCAPS_CASE";
+const CARRIER_ENV: &str = "REMUDA_PTY_CARRIER";
+const HELLOCAPS_SENTINEL: &str = "HELLOCAPS_ASSERTED";
+
+#[cfg(unix)]
+#[test]
+fn wss_hello_driver_inventory_reaches_hub_host_view() {
+    for case in ["native", "legacy"] {
+        let exe = std::env::current_exe().expect("test binary");
+        let mut command = std::process::Command::new(exe);
+        command
+            .args([
+                "--exact",
+                "wss_driver_inventory_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(HELLOCAPS_MARKER, "1")
+            .env(HELLOCAPS_CASE, case);
+        if case == "native" {
+            command.env(CARRIER_ENV, "native");
+        } else {
+            // Never inherit a flag from the developer's shell: the legacy case
+            // must prove what a Node reports with the flag genuinely absent.
+            command.env_remove(CARRIER_ENV);
+        }
+        let output = command.output().expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{case} child failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "{case} inner test did not run: {stdout}"
+        );
+        assert!(
+            stdout.contains(HELLOCAPS_SENTINEL),
+            "{case} inner assertions did not execute: {stdout}"
+        );
+    }
+}
+
+/// The child half of [`wss_hello_driver_inventory_reaches_hub_host_view`]:
+/// stands up the same Hub + collected-inventory WSS Node `remuda dev` does.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "re-executed with a controlled REMUDA_PTY_CARRIER"]
+async fn wss_driver_inventory_child() {
+    use remuda_node::{CollectRequest, DevNode, DevServerConfig, WssConfig, WssLink};
+
+    let case = std::env::var(HELLOCAPS_CASE).expect("parent sets the case");
+    assert!(
+        std::env::var(HELLOCAPS_MARKER).is_ok(),
+        "must be re-executed"
+    );
+    let expect_native = case == "native";
+    assert_eq!(
+        std::env::var(CARRIER_ENV).ok().as_deref(),
+        expect_native.then_some("native"),
+        "child carrier env must match the {case} case"
+    );
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
+        .await
+        .expect("hub");
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(workspace)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+    )
+    .expect("dev node");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let local_node = node.clone();
+
+    // Mirror `remuda dev`: loopback config plus the live PATH/host probe,
+    // which is what builds the nested `host.driverInventory`.
+    let config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone())
+        .with_collected_inventory_from(&CollectRequest::default());
+    assert!(
+        config
+            .host
+            .as_ref()
+            .and_then(|host| host.get("driverInventory"))
+            .and_then(Value::as_array)
+            .is_some_and(|rows| !rows.is_empty()),
+        "collected host inventory must describe shell-pty before hello"
+    );
+
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(config, node))
+        .await
+        .expect("connect timeout")
+        .expect("wss runtime connect");
+
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+    let (status, body) = http(
+        hub.addr,
+        "GET",
+        "/v1/hosts",
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let hosts: Value = serde_json::from_str(body.trim()).expect("hosts json");
+    let host = hosts["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["hostId"] == json!(host_id))
+        .unwrap_or_else(|| panic!("our host missing from {hosts}"));
+    let descriptor = host["capabilities"]["driverInventory"]
+        .as_array()
+        .expect("capabilities.driverInventory")
+        .iter()
+        .find(|row| row["kind"] == json!("shell-pty"))
+        .unwrap_or_else(|| panic!("shell-pty descriptor missing: {host}"));
+    assert_eq!(
+        descriptor["launchable"],
+        json!(expect_native),
+        "{case} host view: {host}"
+    );
+    if expect_native {
+        assert_eq!(descriptor["reasonCode"], json!("carrier-native"));
+    } else {
+        // A non-launchable descriptor must say *why*; silence would leave the
+        // UI unable to distinguish "off" from "unknown".
+        assert_eq!(descriptor["reasonCode"], json!("carrier-not-enabled"));
+    }
+
+    // The DevNode's own Host record agrees, so the runtime and transport never
+    // describe the host differently.
+    let local_shell_pty = local_node
+        .host()
+        .driver_inventory
+        .into_iter()
+        .find(|row| matches!(row.kind, remuda_protocol::DriverKind::ShellPty))
+        .expect("runtime host describes shell-pty");
+    assert_eq!(local_shell_pty.launchable, expect_native);
+
+    link.shutdown().await;
+    hub.shutdown().await;
+    println!("{HELLOCAPS_SENTINEL} case={case}");
+}
+
 fn journal_has_command_state(journal: &Value, command_id: &str, state: &str) -> bool {
     journal["events"].as_array().is_some_and(|events| {
         events.iter().any(|record| {
@@ -1023,6 +1187,10 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         .unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
+    // This authorization fixture must not depend on the developer's Claude
+    // configuration, skills, or macOS permissions.
+    let claude_config = dir.path().join("claude-config");
+    std::fs::create_dir_all(&claude_config).unwrap();
     let config = DevServerConfig::loopback(0)
         .with_workspace_root(workspace)
         .with_workspace_roots(remuda_testing::test_workspace_roots!());
@@ -1047,7 +1215,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"permissionMode":"bypassPermissions","prompt":"human-origin"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","prompt":"human-origin"})),
         None,
     )
     .await;
@@ -1100,7 +1268,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     .await;
     assert_eq!(status, 403, "{denied_enrollment}");
 
-    let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
+    let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"claudeConfigDir":claude_config,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
     assert_eq!(status, 200, "{child}");
     assert_eq!(child["instance"]["parentInstanceId"], parent_id);
     assert_eq!(child["command"]["payload"]["origin"], "agent");
@@ -1161,7 +1329,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"permissionMode":"manual"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"manual"})),
         None,
     )
     .await;
@@ -1380,7 +1548,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         bot,
         "/v1/instances",
-        Some(json!({"hostId":host,"permissionMode":"bypassPermissions"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions"})),
         None,
     )
     .await;

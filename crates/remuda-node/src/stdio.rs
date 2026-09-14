@@ -681,23 +681,60 @@ mod tests {
         ))
         .expect("compose");
         let enrollment = enroll::load_or_create(&opts.data_dir).expect("enrollment");
+        // This tests stdio dispatch and journal streaming, independently of
+        // personal CLI version/auth probes and their startup deadlines.
+        let hello = NodeHello {
+            jsonrpc: "2.0".into(),
+            method: METHOD_NODE_HELLO.into(),
+            params: crate::NodeHelloParams {
+                node_epoch: Id::new("epoch").expect("epoch"),
+                protocol: crate::NodeHelloProtocol {
+                    major: 1,
+                    minor: 0,
+                    framing: "ndjson".into(),
+                    max_frame_bytes: MAX_STDIO_FRAME_BYTES,
+                },
+                host: crate::HostInventory {
+                    host_id: enrollment.host_id.clone(),
+                    hostname: "stdio-fixture".into(),
+                    driver_inventory: Vec::new(),
+                    labels: BTreeMap::new(),
+                    max_instances: opts.max_instances,
+                    cli: Vec::new(),
+                    herdr: crate::HerdrInventory {
+                        absolute_path: None,
+                        version: None,
+                        socket: None,
+                    },
+                    resources: None,
+                    os: None,
+                    kernel: None,
+                    libc: None,
+                },
+            },
+        };
         let (client_in, node_out) = duplex(64 * 1024);
         let (node_in, mut client_out) = duplex(64 * 1024);
-        let session = tokio::spawn(serve_stdio(
-            node,
-            opts,
-            enrollment.clone(),
-            None,
-            None,
-            node_in,
-            node_out,
-        ));
+        let session_enrollment = enrollment.clone();
+        let session = tokio::spawn(async move {
+            serve_stdio(
+                node,
+                opts,
+                session_enrollment,
+                None,
+                Some(&hello),
+                node_in,
+                node_out,
+            )
+            .await
+        });
 
         let mut from_node = BufReader::new(client_in);
         let hello = tokio::time::timeout(Duration::from_secs(30), read_json(&mut from_node))
             .await
             .expect("hello deadline");
         assert_eq!(hello["method"], METHOD_NODE_HELLO);
+        assert_eq!(hello["params"]["host"]["hostname"], "stdio-fixture");
         assert_eq!(
             hello["params"]["hostId"],
             json!(enrollment.host_id.as_id().as_str())

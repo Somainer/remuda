@@ -26,6 +26,7 @@ mod runtime_link;
 mod server;
 mod service;
 pub mod signal;
+pub mod signal_messages;
 mod stdio;
 mod store;
 mod transport;
@@ -83,6 +84,7 @@ pub use service::{LocalDrivers, RunningNode, ServeConfig, compose, serve};
 pub use signal::{
     HOOKS_ENABLE_ENV, HookSessionEvidence, binds_instance, hook_activity, hooks_enabled,
 };
+pub use signal_messages::{MessageAssembler, MessageDelta, message_delta};
 pub use stdio::{
     StdioOptions, run_stdio, run_stdio_opts, run_stdio_runtime_opts, run_stdio_with_node,
 };

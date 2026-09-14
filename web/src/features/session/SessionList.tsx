@@ -1,14 +1,36 @@
-import { useEffect, useState, type FormEvent, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { Id } from "../../types/wire";
 import type { Instance, Kind, UiStatus } from "../../types/instance";
 import { knowledgeValue } from "../../types/command";
+import { Sheet } from "../../components/Sheet";
 import { StateDot } from "../../components/StateDot";
 import { formatListTime, shortId } from "../../lib/format";
 import { nativeShort, projectStatus, uiMode } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
+import { useWorkbenchViewport } from "../../lib/viewport";
 import { isEmberEffort } from "./effort";
 import { LaunchedByMark } from "./LaunchedBy";
+import {
+  applyFilters,
+  availableConditions,
+  clearedConditions,
+  conditionCount,
+  describeScope,
+  emptyState,
+  hasConditions,
+  KINDS,
+  pruneForScope,
+  readConditions,
+  selectedChips,
+  STATUS_LABELS,
+  STATUSES,
+  toggleValue,
+  withoutChip,
+  writeConditions,
+  type FilterConditions,
+  type SelectedChip,
+} from "./sessionFilters";
 import css from "./SessionList.module.css";
 
 const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] = [
@@ -19,20 +41,6 @@ const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] =
   // the live groups and lands here, next to its Resume button.
   { id: "exited", title: "已退出", match: (s) => s === "exited" },
 ];
-
-function csv(params: URLSearchParams, key: string): string[] {
-  return (params.get(key) ?? "").split(",").filter(Boolean);
-}
-
-function toggleCsv(params: URLSearchParams, key: string, value: string): URLSearchParams {
-  const next = new URLSearchParams(params);
-  const set = new Set(csv(params, key));
-  if (set.has(value)) set.delete(value);
-  else set.add(value);
-  if (set.size) next.set(key, [...set].join(","));
-  else next.delete(key);
-  return next;
-}
 
 function exitLabel(instance: Instance): string | null {
   if (instance.exit.state !== "known") return null;
@@ -60,39 +68,92 @@ function pendingBadge(kind: string | undefined, title: string | undefined, field
   return null;
 }
 
-export function SessionList({ instances, variant = "full", title = "会话", newHref = "/sessions/new" }: { instances?: Instance[]; variant?: "full" | "compact"; title?: string; newHref?: string }) {
+export function SessionList({
+  instances,
+  variant = "full",
+  title = "会话",
+  newHref = "/sessions/new",
+  space,
+}: {
+  instances?: Instance[];
+  variant?: "full" | "compact";
+  title?: string;
+  newHref?: string;
+  /** The Space the list is pinned to. Absent = the caller is already global. */
+  space?: { id: string; name?: string; hostId?: string; workspaceId?: string };
+}) {
   const hub = useHub();
   const location = useLocation();
+  const { mobile } = useWorkbenchViewport();
   const [params, setParams] = useSearchParams();
-  const q = (params.get("q") ?? "").trim().toLowerCase();
-  const statusFilter = csv(params, "status");
-  const hostFilter = csv(params, "host");
-  const workspaceFilter = csv(params, "workspace");
-  const kindFilter = csv(params, "kind");
-  const source = instances ?? hub.instances.filter((i) => i.parent == null);
+  const conditions = readConditions(params);
+  const global = conditions.scope === "all";
+  const scope = describeScope(conditions, space, (hostId) => hubStore.hostName(hostId as Id));
+  const allowed = availableConditions(scope);
 
-  const filtered = source.filter((instance) => {
-    const status = projectStatus(instance);
-    if (statusFilter.length && !statusFilter.includes(status)) return false;
-    if (hostFilter.length && !hostFilter.includes(instance.hostId)) return false;
-    if (workspaceFilter.length && !workspaceFilter.includes(instance.workspaceId)) return false;
-    if (kindFilter.length && !kindFilter.includes(instance.kind)) return false;
-    if (!q) return true;
-    const title = hubStore.titleOf(instance.id).toLowerCase();
-    const cwd = hub.workspaces.find((w) => w.id === instance.workspaceId && w.hostId === instance.hostId)?.rootPath.toLowerCase() ?? "";
-    const native = instance.nativeRef.sessionId.state === "known" ? instance.nativeRef.sessionId.value.toLowerCase() : "";
-    return title.includes(q) || cwd.includes(q) || native.includes(q) || instance.id.toLowerCase().includes(q);
-  });
+  // In global scope the list leaves the Space behind and searches every
+  // top-level instance the hub knows about; otherwise it renders exactly what
+  // the caller handed it.
+  const source = global ? hub.instances.filter((i) => i.parent == null) : (instances ?? hub.instances.filter((i) => i.parent == null));
 
-  const filterCount = [hostFilter, workspaceFilter, kindFilter, statusFilter].filter((f) => f.length).length;
-  const share = params.toString();
+  const filtered = useMemo(
+    () => applyFilters(source, conditions, projectStatus, { titleOf: (id) => hubStore.titleOf(id as Id), workspaces: hub.workspaces }),
+    // `conditions` is rebuilt each render from params; key the memo on the
+    // serialized params instead so it only recomputes when the URL changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [source, params.toString(), hub.workspaces],
+  );
+
+  const filterCount = conditionCount(conditions);
   const live = hub.connection === "live";
   const [selected, setSelected] = useState<string[]>([]);
   const [broadcast, setBroadcast] = useState("");
+  const [filterOpen, setFilterOpen] = useState(false);
+  const filterBtnRef = useRef<HTMLButtonElement | null>(null);
+  const filterHeadingId = "session-filter-title";
+
+  /**
+   * Explicit condition changes push a history entry, so Back undoes exactly the
+   * filter the user chose. Typing in the search box replaces instead — a
+   * keystroke is not a decision worth its own entry (P0-1 rule 3).
+   *
+   * The update is a function of the *current* params rather than the ones this
+   * render closed over: two changes in quick succession (clicking a scope and
+   * immediately typing) must compose, not clobber each other.
+   */
+  const commit = (update: (current: FilterConditions) => FilterConditions, mode: "push" | "replace") =>
+    setParams((prev) => writeConditions(prev, update(readConditions(prev))), { replace: mode === "replace" });
+
   const ptyKey = source
     .filter((instance) => uiMode(instance) === "tty-attachable")
     .map((instance) => instance.id)
     .join(",");
+
+  // Switching Space drops host/workspace conditions that the new fixed scope
+  // cannot honour, in exactly one replace, keeping text and status (§4 risk 2).
+  // Derivation runs one way: params are rewritten here, never the Space store.
+  const spaceId = space?.id;
+  const pruned = pruneForScope(conditions, scope);
+  const prunedKey = pruned.dropped.map((chip) => `${chip.key}:${chip.value}`).join(",");
+  // Keyed by Space so the message survives the rewrite that clears `prunedKey`
+  // and disappears on the next Space, rather than a render later.
+  const [droppedNotice, setDroppedNotice] = useState<{ spaceId?: string; chips: SelectedChip[] }>({ chips: [] });
+  useEffect(() => {
+    if (!prunedKey) return;
+    setDroppedNotice({ spaceId, chips: pruned.dropped });
+    // Re-read the params inside the updater: this effect runs after a commit
+    // that may itself have changed the URL (switching to global scope is one),
+    // and writing back the render's stale copy would undo it.
+    setParams((prev) => {
+      const current = readConditions(prev);
+      const verdict = pruneForScope(current, describeScope(current, space, (hostId) => hubStore.hostName(hostId as Id)));
+      return verdict.dropped.length ? writeConditions(prev, verdict.conditions) : prev;
+    }, { replace: true });
+    // Re-run only when the pruning verdict itself changes, not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spaceId, prunedKey]);
+  // The notice belongs to the Space that triggered it; a later Space retires it.
+  const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
 
   useEffect(() => {
     if (variant !== "full" || !ptyKey) return;
@@ -102,16 +163,44 @@ export function SessionList({ instances, variant = "full", title = "会话", new
     return () => window.clearInterval(timer);
   }, [variant, ptyKey]);
 
-  if (hub.hosts.length === 0) {
+  const chips = selectedChips(conditions, {
+    hostName: (id) => hubStore.hostName(id as Id),
+    workspaceLabel: (id) => hub.workspaces.find((w) => w.id === id)?.label ?? shortId(id, 8),
+    workspaceAmbiguous: (id) => {
+      const label = hub.workspaces.find((w) => w.id === id)?.label;
+      return Boolean(label) && hub.workspaces.filter((w) => w.label === label).length > 1;
+    },
+    workspaceHost: (id) => {
+      const hostId = hub.workspaces.find((w) => w.id === id)?.hostId;
+      return hostId ? hubStore.hostName(hostId) : "—";
+    },
+  });
+
+  const empty = emptyState({
+    hostCount: hub.hosts.length,
+    workspaceCount: hub.workspaces.length,
+    sourceCount: source.length,
+    matchCount: filtered.length,
+    conditions,
+  });
+
+  if (empty === "no-hosts") {
     return (
-      <p className={css.empty} data-testid="session-list">
+      <p className={css.empty} data-testid="session-list" data-empty="no-hosts">
         无主机。<Link to="/hosts">添加主机</Link>
       </p>
     );
   }
-  if (source.length === 0) {
+  if (empty === "no-workspaces") {
     return (
-      <p className={css.empty} data-testid="session-list">
+      <p className={css.empty} data-testid="session-list" data-empty="no-workspaces">
+        主机已连接，但还没有注册工作目录。<Link to="/hosts">注册工作目录</Link>
+      </p>
+    );
+  }
+  if (empty === "no-sessions") {
+    return (
+      <p className={css.empty} data-testid="session-list" data-empty="no-sessions">
         {title} 还没有会话。<Link to={newHref}>新建会话</Link>
       </p>
     );
@@ -122,7 +211,7 @@ export function SessionList({ instances, variant = "full", title = "会话", new
       <div className={css.root} data-testid="session-list">
         <header className={css.compactTop}>
           <div className={css.compactTitle}>会话</div>
-          {hostFilter.length ? <div className={css.compactHint}>host:{hostFilter.length}</div> : null}
+          {conditions.host.length ? <div className={css.compactHint}>host:{conditions.host.length}</div> : null}
         </header>
         {filtered.map((instance) => {
           const status = projectStatus(instance);
@@ -164,7 +253,16 @@ export function SessionList({ instances, variant = "full", title = "会话", new
           <span className={`${css.liveDot} ${live ? "" : css.liveOff}`} />
           {live ? "live" : hub.connection}
         </div>
-        <button type="button" className={css.filterBtn} aria-label="筛选">
+        <button
+          type="button"
+          className={css.filterBtn}
+          data-testid="session-filter-open"
+          ref={filterBtnRef}
+          aria-expanded={filterOpen}
+          aria-haspopup="dialog"
+          aria-controls={filterOpen ? "session-filter-panel" : undefined}
+          onClick={() => setFilterOpen((open) => !open)}
+        >
           筛选{filterCount ? <span className={css.filterCount}>{filterCount}</span> : null}
         </button>
         <Link className={css.newBtn} to={newHref}>
@@ -172,79 +270,182 @@ export function SessionList({ instances, variant = "full", title = "会话", new
         </Link>
       </header>
       <div className={css.toolbar}>
-        <label className={css.search}>
-          <span className={css.searchGlyph}>⌕</span>
-          <input
-            className={css.searchInput}
-            placeholder="搜索标题 / cwd / 原生 id"
-            value={params.get("q") ?? ""}
-            onChange={(e) => {
-              const next = new URLSearchParams(params);
-              if (e.target.value) next.set("q", e.target.value);
-              else next.delete("q");
-              setParams(next);
-            }}
-          />
-        </label>
-        <div className={css.chips}>
-          {hub.hosts.map((h) => (
+        <div className={css.toolbarTop}>
+          <label className={css.search}>
+            <span className={css.searchGlyph}>⌕</span>
+            <input
+              className={css.searchInput}
+              data-testid="session-search"
+              aria-label="搜索会话"
+              placeholder="搜索标题 / cwd / 原生 id"
+              value={conditions.q}
+              // Typing replaces the history entry: Back should undo the filter
+              // the user chose, not each keystroke on the way there.
+              onChange={(e) => commit((current) => ({ ...current, q: e.target.value }), "replace")}
+            />
+          </label>
+          <div className={css.scope} data-testid="session-scope" data-scope={scope.kind}>
+            {scope.label}
+          </div>
+          <div className={css.matchCount} data-testid="session-match-count">
+            {filtered.length} / {source.length} 个会话
+          </div>
+          {global ? (
             <button
-              key={h.id}
               type="button"
-              className={`${css.chip} ${hostFilter.includes(h.id) ? css.chipOn : ""}`}
-              onClick={() => setParams(toggleCsv(params, "host", h.id))}
+              className={css.scopeBtn}
+              data-testid="session-scope-space"
+              onClick={() => commit((current) => ({ ...current, scope: "space" }), "push")}
+              disabled={!space?.hostId}
             >
-              {hostFilter.includes(h.id) ? (
-                <>
-                  <span className={css.chipKey}>host:</span>
-                  {h.label}
-                  <span className={css.chipX}>✕</span>
-                </>
-              ) : (
-                h.label
-              )}
+              回到当前 Space
             </button>
-          ))}
-          {hub.workspaces.map((w) => (
+          ) : (
             <button
-              key={w.id}
               type="button"
-              className={`${css.chip} ${workspaceFilter.includes(w.id) ? css.chipOn : ""}`}
-              onClick={() => setParams(toggleCsv(params, "workspace", w.id))}
+              className={css.scopeBtn}
+              data-testid="session-scope-all"
+              onClick={() => commit((current) => ({ ...current, scope: "all" }), "push")}
             >
-              {workspaceFilter.includes(w.id) ? `${w.label} ✕` : `${w.label} ▾`}
+              搜索所有空间
             </button>
-          ))}
-          {(["claude", "codex", "grok", "agy"] as const).map((k) => (
-            <button
-              key={k}
-              type="button"
-              className={`${css.chip} ${kindFilter.includes(k) ? css.chipOn : ""}`}
-              onClick={() => setParams(toggleCsv(params, "kind", k))}
-            >
-              {kindFilter.includes(k) ? (
-                <>
-                  <span className={css.chipKey}>kind:</span>
-                  {k}
-                  <span className={css.chipX}>✕</span>
-                </>
-              ) : (
-                k
-              )}
-            </button>
-          ))}
-          {(["blocked", "working", "starting", "idle", "exited"] as const).map((s) => (
-            <button
-              key={s}
-              type="button"
-              className={`${css.chip} ${statusFilter.includes(s) ? css.chipOn : ""}`}
-              onClick={() => setParams(toggleCsv(params, "status", s))}
-            >
-              {statusFilter.includes(s) ? `${s} ✕` : s}
-            </button>
-          ))}
-          {share ? <span className={css.share}>?{share} · 可分享</span> : null}
+          )}
         </div>
+        {notice.length ? (
+          <div className={css.notice} data-testid="session-scope-notice" role="status">
+            切换 Space 已清除不适用的条件（{notice.length} 项主机 / 目录），保留了文本与状态条件。
+          </div>
+        ) : null}
+        {chips.length ? (
+          <div className={css.chips} data-testid="session-selected-chips">
+            {chips.map((chip) => (
+              <button
+                key={`${chip.key}:${chip.value}`}
+                type="button"
+                className={`${css.chip} ${css.chipOn}`}
+                data-testid="session-chip"
+                data-chip-key={chip.key}
+                aria-label={`移除条件 ${chip.label}`}
+                onClick={() => commit((current) => withoutChip(current, chip), "push")}
+              >
+                {chip.label}
+                <span className={css.chipX} aria-hidden="true">
+                  ✕
+                </span>
+              </button>
+            ))}
+            <button
+              type="button"
+              className={css.clearAll}
+              data-testid="session-clear-filters"
+              onClick={() => commit(clearedConditions, "push")}
+            >
+              清除筛选
+            </button>
+          </div>
+        ) : null}
+        <Sheet
+          open={filterOpen}
+          onClose={() => setFilterOpen(false)}
+          variant={mobile ? "sheet" : "popover"}
+          labelledBy={filterHeadingId}
+          returnFocusRef={filterBtnRef}
+          testId="session-filter-panel"
+        >
+          <div className={css.panelHead}>
+            <h2 className={css.panelTitle} id={filterHeadingId}>
+              筛选会话
+            </h2>
+            <button type="button" className={css.panelClose} data-testid="session-filter-close" onClick={() => setFilterOpen(false)}>
+              关闭
+            </button>
+          </div>
+          <p className={css.panelScope}>{scope.label}</p>
+          <fieldset className={css.panelGroup}>
+            <legend className={css.panelLegend}>状态</legend>
+            {STATUSES.map((s) => (
+              <button
+                key={s}
+                type="button"
+                className={`${css.chip} ${conditions.status.includes(s) ? css.chipOn : ""}`}
+                data-testid={`session-filter-status-${s}`}
+                aria-pressed={conditions.status.includes(s)}
+                onClick={() => commit((current) => ({ ...current, status: toggleValue(current.status, s) }), "push")}
+              >
+                {STATUS_LABELS[s] ?? s}
+              </button>
+            ))}
+          </fieldset>
+          <fieldset className={css.panelGroup}>
+            <legend className={css.panelLegend}>类型</legend>
+            {KINDS.map((k) => (
+              <button
+                key={k}
+                type="button"
+                className={`${css.chip} ${conditions.kind.includes(k) ? css.chipOn : ""}`}
+                data-testid={`session-filter-kind-${k}`}
+                aria-pressed={conditions.kind.includes(k)}
+                onClick={() => commit((current) => ({ ...current, kind: toggleValue(current.kind, k) }), "push")}
+              >
+                {k}
+              </button>
+            ))}
+          </fieldset>
+          {/* A fixed Space already pins host and workspace; offering them here
+              could only build a self-excluding query (P0-1 rule 2). */}
+          {allowed.host ? (
+            <fieldset className={css.panelGroup} data-testid="session-filter-hosts">
+              <legend className={css.panelLegend}>主机</legend>
+              {hub.hosts.map((h) => (
+                <button
+                  key={h.id}
+                  type="button"
+                  className={`${css.chip} ${conditions.host.includes(h.id) ? css.chipOn : ""}`}
+                  aria-pressed={conditions.host.includes(h.id)}
+                  onClick={() => commit((current) => ({ ...current, host: toggleValue(current.host, h.id) }), "push")}
+                >
+                  {h.label}
+                </button>
+              ))}
+            </fieldset>
+          ) : null}
+          {allowed.workspace ? (
+            <fieldset className={css.panelGroup} data-testid="session-filter-workspaces">
+              <legend className={css.panelLegend}>工作目录</legend>
+              {hub.workspaces.map((w) => {
+                const ambiguous = hub.workspaces.filter((other) => other.label === w.label).length > 1;
+                return (
+                  <button
+                    key={w.id}
+                    type="button"
+                    className={`${css.chip} ${conditions.workspace.includes(w.id) ? css.chipOn : ""}`}
+                    aria-pressed={conditions.workspace.includes(w.id)}
+                    onClick={() => commit((current) => ({ ...current, workspace: toggleValue(current.workspace, w.id) }), "push")}
+                  >
+                    {/* Same-name directories on different hosts are only
+                        distinguishable once the host is spelled out (§2.2). */}
+                    {ambiguous ? `${w.label} · ${hubStore.hostName(w.hostId)}` : w.label}
+                  </button>
+                );
+              })}
+            </fieldset>
+          ) : (
+            <p className={css.panelNote} data-testid="session-filter-scope-note">
+              当前 Space 已固定主机与工作目录。要按主机或目录筛选，请先“搜索所有空间”。
+            </p>
+          )}
+          <div className={css.panelFoot}>
+            <button
+              type="button"
+              className={css.clearAll}
+              data-testid="session-filter-clear"
+              disabled={!hasConditions(conditions)}
+              onClick={() => commit(clearedConditions, "push")}
+            >
+              清除筛选
+            </button>
+          </div>
+        </Sheet>
         {selected.length ? (
           <form
             className={css.fleet}
@@ -268,6 +469,34 @@ export function SessionList({ instances, variant = "full", title = "会话", new
           </form>
         ) : null}
       </div>
+      {empty === "no-matches" ? (
+        <div className={css.noMatches} data-testid="session-no-matches" data-empty="no-matches">
+          <p className={css.noMatchesTitle}>没有会话符合当前筛选条件。</p>
+          <p className={css.noMatchesBody}>
+            {source.length} 个会话在{scope.kind === "space" ? "当前 Space" : "所有空间"}内，但都不匹配。清除条件只改变列表显示，不会创建或关闭任何会话。
+          </p>
+          <div className={css.noMatchesActions}>
+            <button
+              type="button"
+              className={css.noMatchesBtn}
+              data-testid="session-no-matches-clear"
+              onClick={() => commit(clearedConditions, "push")}
+            >
+              清除筛选
+            </button>
+            {!global ? (
+              <button
+                type="button"
+                className={css.noMatchesBtn}
+                data-testid="session-no-matches-all"
+                onClick={() => commit((current) => ({ ...current, scope: "all" }), "push")}
+              >
+                搜索所有空间
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       {GROUPS.map((group) => {
         const items = filtered.filter((i) => group.match(projectStatus(i)));
         if (!items.length) return null;

@@ -380,6 +380,7 @@ impl NodeHello {
                     os: snapshot.as_ref().map(|s| s.os.clone()),
                     kernel: snapshot.as_ref().and_then(|s| s.kernel.clone()),
                     libc: snapshot.as_ref().and_then(|s| s.libc.clone()),
+                    driver_inventory: crate::inventory::driver_inventory(),
                 },
             },
         })
@@ -455,6 +456,11 @@ pub struct HostInventory {
     /// libc identifier when inventory was probed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub libc: Option<String>,
+    /// D-028 §5.1 driver launch inventory, echoed under hello
+    /// `capabilities.driverInventory`. Skipped when empty so silence reads as
+    /// "not reported", never as a refusal.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub driver_inventory: Vec<remuda_protocol::DriverDescriptor>,
 }
 
 /// One native CLI advertised by a Node.

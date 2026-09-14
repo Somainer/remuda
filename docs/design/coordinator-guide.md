@@ -191,6 +191,12 @@ afterwards. Do not upgrade or restart a shared `herdr` a human is using; an
 isolated `HERDR_SOCKET_PATH` plus `XDG_CONFIG_HOME` under `/tmp/remuda-*`
 gives a headless server that leaves the default session alone.
 
+`fake-herdr server` is a test-only process the driver/node tests spawn, so
+after an aborted gate `pkill -f 'fake-herdr serve[r]'` is always safe — it
+matches only the fake, never a real `herdr`, and the fake now also exits on its
+own when its parent dies. Never use a bare `herdr` kill pattern: it matches
+the real session server.
+
 ## See also
 
 - [`skills/remuda/SKILL.md`](../../skills/remuda/SKILL.md) — dispatch surface

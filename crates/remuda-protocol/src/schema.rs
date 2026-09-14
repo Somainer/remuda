@@ -209,6 +209,7 @@ pub fn schema_document() -> Value {
         LiteralEnv,
         MediaBlock,
         MessagePayload,
+        MessageOrigin,
         MessagePhase,
         MessageRole,
         MethodCall,

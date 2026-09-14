@@ -5,12 +5,13 @@
 //! types so the client can decode them.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdin};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::parent_watch;
 use remuda_herdr::{
     AgentInfo, AgentInfoResult, AgentList, AgentSessionInfo, AgentSessionRefKind, AgentStartParams,
     AgentStarted, AgentStatus, AgentWaitParams, OkResult, PaneInfo, PaneInfoResult,
@@ -81,6 +82,22 @@ impl FakeHerdrScript {
             "slow-start" | "slow_start" | "slow" => Some(Self::SlowStart),
             "onboarding" | "first-run" => Some(Self::Onboarding),
             _ => None,
+        }
+    }
+
+    /// Flag value accepted by [`Self::parse`].
+    #[must_use]
+    pub fn as_cli_name(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Approval => "approval",
+            Self::Question => "question",
+            Self::Continue => "continue",
+            Self::TextQuestion => "text-question",
+            Self::Trust => "trust",
+            Self::StartFail => "start-fail",
+            Self::SlowStart => "slow-start",
+            Self::Onboarding => "onboarding",
         }
     }
 }
@@ -159,37 +176,74 @@ pub fn fake_herdr_bin() -> PathBuf {
     crate::ensure_workspace_bin("fake-herdr")
 }
 
-/// Background fake server. Dropping it unlinks the socket and joins the thread.
+/// Background fake server.
+///
+/// The server runs as the actual `fake-herdr` binary (the same one
+/// [`fake_herdr_bin`] locates), not as an in-process thread: a real process
+/// boundary is what makes the parent-death guarantees testable. Dropping the
+/// handle closes the control pipe (EOF on the server's stdin) and sends
+/// SIGTERM, escalating to SIGKILL and reaping. Independently, the server exits
+/// by itself if this process dies first — see [`crate::parent_watch`].
 pub struct FakeHerdrServer {
     socket: PathBuf,
-    shutdown: watch::Sender<bool>,
-    join: Option<JoinHandle<Result<(), FakeHerdrError>>>,
+    child: Option<Child>,
+    /// Write end of the control pipe handed to the server as stdin. Dropping
+    /// it is an explicit EOF shutdown signal.
+    control_stdin: Option<ChildStdin>,
+    /// Held so an early startup exit can be diagnosed; drained on shutdown.
+    stderr: Option<ChildStderr>,
 }
 
 impl FakeHerdrServer {
-    /// Bind `options.socket` on a background thread.
+    /// Spawn `fake-herdr server` bound to `options.socket`.
     pub fn spawn(options: FakeHerdrOptions) -> Result<Self, FakeHerdrError> {
         if let Some(parent) = options.socket.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let _ = std::fs::remove_file(&options.socket);
-        let (shutdown, rx) = watch::channel(false);
-        let socket = options.socket.clone();
-        let join = std::thread::Builder::new()
-            .name("fake-herdr".into())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(serve(options, rx))
-            })
-            .map_err(FakeHerdrError::Io)?;
-        wait_for_socket(&socket)?;
-        Ok(Self {
-            socket,
-            shutdown,
-            join: Some(join),
-        })
+
+        let bin = fake_herdr_bin();
+        let mut command = std::process::Command::new(&bin);
+        command
+            .arg("server")
+            .arg("--socket")
+            .arg(&options.socket)
+            .arg("--script")
+            .arg(options.script.as_cli_name())
+            .arg("--frames")
+            .arg(&options.frames)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if options.unavailable_calls > 0 {
+            command
+                .arg("--unavailable-calls")
+                .arg(options.unavailable_calls.to_string());
+        }
+        if options.exit_after_unavailable {
+            command.arg("--exit-after-unavailable");
+        }
+        if options.agent_start_delay != Duration::ZERO {
+            command.env(
+                "FAKE_HERDR_START_DELAY_MS",
+                options.agent_start_delay.as_millis().to_string(),
+            );
+        }
+
+        let mut child = command
+            .spawn()
+            .map_err(|err| FakeHerdrError::Args(format!("spawn {}: {err}", bin.display())))?;
+        let control_stdin = child.stdin.take();
+        let stderr = child.stderr.take();
+
+        let mut server = Self {
+            socket: options.socket.clone(),
+            child: Some(child),
+            control_stdin,
+            stderr,
+        };
+        server.wait_for_socket()?;
+        Ok(server)
     }
 
     /// Socket path.
@@ -198,53 +252,89 @@ impl FakeHerdrServer {
         &self.socket
     }
 
-    /// Signal shutdown and wait.
+    /// Server process pid, while running.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    /// Signal shutdown (EOF + SIGTERM, escalating to SIGKILL) and reap.
     pub fn shutdown(mut self) -> Result<(), FakeHerdrError> {
-        let _ = self.shutdown.send(true);
-        if let Some(join) = self.join.take() {
-            match join.join() {
-                Ok(result) => result,
-                Err(_) => Err(FakeHerdrError::Args("fake-herdr thread panicked".into())),
+        self.terminate()
+    }
+
+    fn wait_for_socket(&mut self) -> Result<(), FakeHerdrError> {
+        for _ in 0..200 {
+            if self.socket.exists() {
+                return Ok(());
             }
-        } else {
-            Ok(())
+            if let Some(child) = self.child.as_mut()
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                let mut detail = String::new();
+                if let Some(mut stderr) = self.stderr.take() {
+                    let _ = stderr.read_to_string(&mut detail);
+                }
+                return Err(FakeHerdrError::Args(format!(
+                    "fake-herdr exited {status} before binding {}: {}",
+                    self.socket.display(),
+                    detail.trim()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        Err(FakeHerdrError::Args(format!(
+            "fake-herdr socket not ready: {}",
+            self.socket.display()
+        )))
+    }
+
+    fn terminate(&mut self) -> Result<(), FakeHerdrError> {
+        // Close stdin first: the server treats control-pipe EOF as an exit
+        // request, so a well-behaving child is already going.
+        self.control_stdin.take();
+        if let Some(mut child) = self.child.take() {
+            parent_watch::terminate_child(&mut child, Duration::from_millis(500));
+        }
+        self.stderr.take();
+        let _ = std::fs::remove_file(&self.socket);
+        Ok(())
     }
 }
 
 impl Drop for FakeHerdrServer {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-        let _ = std::fs::remove_file(&self.socket);
+        let _ = self.terminate();
     }
-}
-
-fn wait_for_socket(path: &Path) -> Result<(), FakeHerdrError> {
-    for _ in 0..200 {
-        if path.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Err(FakeHerdrError::Args(format!(
-        "fake-herdr socket not ready: {}",
-        path.display()
-    )))
 }
 
 /// CLI entry used by `fake-herdr`.
 pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
     match parse_args(std::env::args().skip(1).collect())? {
         Cli::Serve(options) => {
-            let (shutdown, rx) = watch::channel(false);
-            let _ = ctrlc_ignore(shutdown);
+            let parent_watch = parent_watch::install();
+            let socket_path = options.socket.clone();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(serve(options, rx))?;
+            rt.block_on(async move {
+                // Exit requests arrive through `parent_watch` (parent death /
+                // stdin EOF) or the scripted shutdown window in `serve`.
+                let serve = serve(options);
+                match parent_watch {
+                    Some(parent_watch) => {
+                        tokio::select! {
+                            biased;
+                            _ = parent_watch.exited() => {
+                                let _ = std::fs::remove_file(&socket_path);
+                                Ok(())
+                            }
+                            result = serve => result,
+                        }
+                    }
+                    None => serve.await,
+                }
+            })?;
             Ok(0)
         }
         Cli::Observe { frames, cols, rows } => {
@@ -256,10 +346,6 @@ pub fn run_fake_herdr() -> Result<i32, FakeHerdrError> {
             Ok(0)
         }
     }
-}
-
-fn ctrlc_ignore(_shutdown: watch::Sender<bool>) -> Result<(), FakeHerdrError> {
-    Ok(())
 }
 
 enum Cli {
@@ -296,6 +382,11 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .unwrap_or(0);
     let mut exit_after_unavailable = std::env::var("FAKE_HERDR_EXIT_AFTER_UNAVAILABLE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let agent_start_delay = std::env::var("FAKE_HERDR_START_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO);
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -372,7 +463,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             socket,
             script,
             frames,
-            agent_start_delay: Duration::ZERO,
+            agent_start_delay,
             unavailable_calls,
             exit_after_unavailable,
         }));
@@ -414,10 +505,7 @@ pub fn write_observe_frames(frames: &Path, cols: u16, rows: u16) -> Result<(), F
     Ok(())
 }
 
-async fn serve(
-    options: FakeHerdrOptions,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<(), FakeHerdrError> {
+async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
     let _ = std::fs::remove_file(&options.socket);
     if let Some(parent) = options.socket.parent() {
         std::fs::create_dir_all(parent)?;
@@ -435,16 +523,12 @@ async fn serve(
         options.unavailable_calls,
         options.exit_after_unavailable,
     )));
+    // Only the scripted shutdown window (`exit_after_unavailable`) stops the
+    // accept loop. Parent death is handled by the outer `parent_watch`
+    // select; an idle server parks in `accept()` at zero CPU.
     let (exit_tx, mut exit_rx) = watch::channel(false);
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    break;
-                }
-            }
-            // The scripted shutdown window closed: unlink and stop accepting,
-            // exactly as a real herdr server does on its way out.
             _ = exit_rx.changed() => {
                 if *exit_rx.borrow() {
                     break;

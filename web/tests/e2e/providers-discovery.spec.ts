@@ -14,7 +14,7 @@ const shotDir = evidence
   ? path.join(here, "../../../docs/design/evidence")
   : path.join(here, "../../test-results/providers-3");
 /** Fake Anthropic-Messages gateway started by the hub_e2e harness. */
-const upstream = process.env.VITE_E2E_UPSTREAM ?? "http://127.0.0.1:58881";
+const upstream = process.env.VITE_E2E_UPSTREAM ?? `http://${process.env.HUB_E2E_UPSTREAM_LISTEN ?? "127.0.0.1:58881"}`;
 const token = "sk-fake-e2e-discover-qqqq";
 
 async function shot(page: Page, name: string) {
@@ -88,7 +88,10 @@ test("discover a gateway catalog, expose two models, and launch with them", asyn
   await expect(page.getByTestId("provider-models-count")).toContainText("2/5 已启用");
   await auto.getByTestId("provider-model-default").check();
   await shot(page, "providers-2-checklist-1440.png");
+  const createdProfile = page.waitForResponse((response) =>
+    response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/providers");
   await page.getByTestId("provider-save").click();
+  expect((await createdProfile).ok()).toBe(true);
   await expect(page.getByTestId("provider-form")).toHaveCount(0);
 
   await page.getByText("e2e-fake-upstream").click();

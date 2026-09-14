@@ -1535,6 +1535,14 @@ fn validate_kind_driver(
             | (AgentKind::Generic, remuda_protocol::DriverKind::GenericPty)
             | (AgentKind::Terminal, remuda_protocol::DriverKind::ShellPty)
             | (AgentKind::Generic, remuda_protocol::DriverKind::ShellPty)
+            // D-028 §5.1: an agent CLI in a Remuda-owned native PTY. This is
+            // the same carrier a promoted `terminal` already runs on — the
+            // matrix refusing it was what forced New Session down a separate
+            // path from "the user typed `claude`", which §1.0 exists to end.
+            | (AgentKind::Claude, remuda_protocol::DriverKind::ShellPty)
+            | (AgentKind::Codex, remuda_protocol::DriverKind::ShellPty)
+            | (AgentKind::Grok, remuda_protocol::DriverKind::ShellPty)
+            | (AgentKind::Agy, remuda_protocol::DriverKind::ShellPty)
     );
     if valid {
         Ok(())
@@ -1904,6 +1912,8 @@ pub(crate) fn fixture_instance_with_session(
                 value: native_session_id.clone(),
             },
             transcript: unknown("fake-driver-no-transcript"),
+            signal_tier: None,
+            capabilities: Vec::new(),
             codex: None,
             acp: None,
             claude: Some(ClaudeRef {
@@ -1933,6 +1943,9 @@ pub(crate) fn fixture_instance_with_session(
         // Created as this kind; promotion (D-025) is what changes both.
         mode: Some(remuda_protocol::InstanceMode::Native),
         promoted_at: None,
+        // Remuda ran the launch command. Promotion flips this to `user`
+        // (D-028 §1.0 rule 4); it records provenance, never capability.
+        launched_by: Some(remuda_protocol::LaunchedBy::Remuda),
     })
 }
 
@@ -1941,6 +1954,7 @@ fn fixture_capabilities(
 ) -> Result<CapabilitySnapshot, NodeError> {
     let unknown_capability = Capability {
         state: CapabilityState::Unknown,
+        provision: remuda_protocol::CapabilityProvision::Unknown,
         scope: Vec::new(),
         reason_code: "not-verified".to_owned(),
         prerequisites: Vec::new(),
@@ -1948,6 +1962,7 @@ fn fixture_capabilities(
     };
     let unsupported = Capability {
         state: CapabilityState::Unsupported,
+        provision: remuda_protocol::CapabilityProvision::Unknown,
         scope: Vec::new(),
         reason_code: "fake-driver".to_owned(),
         prerequisites: Vec::new(),
@@ -1955,6 +1970,7 @@ fn fixture_capabilities(
     };
     let supported = Capability {
         state: CapabilityState::Supported,
+        provision: remuda_protocol::CapabilityProvision::Native,
         scope: vec!["local-fixture".to_owned()],
         reason_code: "fake-driver".to_owned(),
         prerequisites: Vec::new(),
@@ -1973,6 +1989,11 @@ fn fixture_capabilities(
         capabilities: CapabilitySet {
             resume: unsupported.clone(),
             steer: unsupported.clone(),
+            // D-028 §6: unmeasured for the fake driver as for every real
+            // one; `unknown` keeps the fixture honest rather than teaching
+            // tests that a fake can queue or interrupt.
+            queue: unknown_capability.clone(),
+            interrupt: unknown_capability.clone(),
             model_switch: unsupported.clone(),
             fork: unsupported.clone(),
             structured_workflow: unsupported.clone(),
@@ -1996,6 +2017,7 @@ fn fixture_capabilities(
             completion_native_turn: supported,
             completion_task: Capability {
                 state: CapabilityState::Unsupported,
+                provision: remuda_protocol::CapabilityProvision::Unknown,
                 scope: Vec::new(),
                 reason_code: "fake-native-turn-only".to_owned(),
                 prerequisites: Vec::new(),

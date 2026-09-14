@@ -307,3 +307,226 @@ fn interaction_answer_and_source_cursor_variants_keep_native_values() {
         round_trip::<NativeRequestKey>(json!({"type":"rpc","valueType":"number","value":"1"}));
     assert_ne!(string_id, number_id);
 }
+
+/// D-028 additive-increment compatibility. Every assertion here answers one
+/// question: **can a peer that predates D-028 still talk to us?** A payload
+/// built before this decision must parse, and must keep the meaning it had.
+mod d028 {
+    use super::*;
+
+    /// An Instance row written before D-028 has no `launchedBy`. It must still
+    /// parse, and `derived_launched_by` must recover the provenance from the
+    /// `mode` / `promotedAt` pair that D-025 already stored.
+    #[test]
+    fn instance_without_launched_by_parses_and_derives_it() {
+        let legacy = fixture("instance.json");
+        assert!(
+            legacy.get("launchedBy").is_none(),
+            "the compatibility fixture must stay pre-D-028"
+        );
+        let instance = round_trip::<Instance>(legacy.clone());
+        assert_eq!(instance.launched_by, None);
+        // No mode at all: Remuda's launch path is what creates instances.
+        assert_eq!(instance.derived_launched_by(), LaunchedBy::Remuda);
+
+        let mut promoted = legacy.clone();
+        promoted["mode"] = json!("promoted");
+        promoted["promotedAt"] = json!("2026-09-14T10:00:00.000Z");
+        let promoted = round_trip::<Instance>(promoted);
+        // A promoted terminal is one a person typed `claude` into.
+        assert_eq!(promoted.derived_launched_by(), LaunchedBy::User);
+
+        // An explicit value always wins over the derivation.
+        let mut explicit = legacy;
+        explicit["mode"] = json!("promoted");
+        explicit["launchedBy"] = json!("remuda");
+        let explicit = round_trip::<Instance>(explicit);
+        assert_eq!(explicit.derived_launched_by(), LaunchedBy::Remuda);
+    }
+
+    /// `signalTier` / `capabilities` are absent on every pre-D-028 NativeRef.
+    /// Absent must mean "nobody reported", not `none` — the difference decides
+    /// whether the static driver matrix still applies (§4.3).
+    #[test]
+    fn native_ref_without_runtime_capabilities_parses() {
+        let legacy = fixture("instance.json")["nativeRef"].clone();
+        let native_ref = round_trip::<NativeRef>(legacy);
+        assert_eq!(native_ref.signal_tier, None);
+        assert!(native_ref.capabilities.is_empty());
+
+        let runtime = json!({
+            "hostId": "hst_01993ab0-0000-7000-8000-000000000001",
+            "nativeStoreId": "obj_01993ab0-0000-7000-8000-000000000002",
+            "kind": "claude",
+            "sessionId": {"state": "known", "value": "s-1"},
+            "transcript": {"state": "unknown", "reason": "not-emitted", "evidenceEventIds": []},
+            "signalTier": "hook",
+            "capabilities": [
+                {"name": "steer", "state": "unknown", "provision": "unknown",
+                 "tier": "hook", "reasonCode": "unmeasured"},
+                {"name": "queue", "state": "supported", "provision": "emulated",
+                 "tier": "hook", "reasonCode": "remuda-ledger"},
+                {"name": "resume", "state": "supported", "provision": "native",
+                 "tier": "hook", "reasonCode": "session-meta"}
+            ]
+        });
+        let runtime = round_trip::<NativeRef>(runtime);
+        assert_eq!(runtime.signal_tier, Some(SignalTier::Hook));
+        assert_eq!(runtime.capabilities.len(), 3);
+        assert_eq!(runtime.capabilities[0].state, CapabilityState::Unknown);
+        // §6 requires the three-way native/emulated/unknown distinction to be
+        // expressible per capability: an emulated queue lives in Remuda's
+        // ledger, a native one inside the harness where we cannot edit it.
+        assert_eq!(
+            runtime.capabilities[1].provision,
+            CapabilityProvision::Emulated
+        );
+        assert_eq!(
+            runtime.capabilities[2].provision,
+            CapabilityProvision::Native
+        );
+
+        // An entry written before `provision` existed reads as `unknown`
+        // rather than silently claiming the harness provides it.
+        let legacy_entry = json!({
+            "name": "steer", "state": "supported", "tier": "hook", "reasonCode": "old-peer"
+        });
+        let decoded: RuntimeCapability =
+            from_json_slice(&serde_json::to_vec(&legacy_entry).unwrap()).unwrap();
+        assert_eq!(decoded.provision, CapabilityProvision::Unknown);
+    }
+
+    /// A CapabilitySnapshot serialized before `queue` / `interrupt` existed
+    /// must parse, and the missing names must read as `unknown` — "the old
+    /// peer did not mention it" is not evidence that it is unsupported.
+    #[test]
+    fn capability_set_without_queue_and_interrupt_reads_as_unknown() {
+        let mut legacy = fixture("instance.json")["capabilities"].clone();
+        let names = legacy["capabilities"].as_object_mut().unwrap();
+        // Roll the current fixture back to the pre-D-028 shape: a peer that
+        // predates these two names simply does not send them.
+        assert!(names.remove("queue").is_some());
+        assert!(names.remove("interrupt").is_some());
+        let snapshot: CapabilitySnapshot = from_json_slice(&serde_json::to_vec(&legacy).unwrap())
+            .expect("pre-D-028 snapshot must still parse");
+        assert_eq!(snapshot.capabilities.queue.state, CapabilityState::Unknown);
+        assert_eq!(
+            snapshot.capabilities.interrupt.state,
+            CapabilityState::Unknown
+        );
+        // §6: an old peer said nothing about who provides a capability, so
+        // neither do we. `provision` is orthogonal to `state`, and defaulting
+        // it to `native` would invent a claim the peer never made.
+        assert_eq!(
+            snapshot.capabilities.queue.provision,
+            CapabilityProvision::Unknown
+        );
+        assert_eq!(
+            snapshot.capabilities.resume.provision,
+            CapabilityProvision::Unknown
+        );
+        // Re-serializing adds the two names; that is the additive change, and
+        // it round-trips from there.
+        let reserialized = serde_json::to_value(&snapshot).unwrap();
+        assert!(reserialized["capabilities"]["queue"].is_object());
+        round_trip::<CapabilitySnapshot>(reserialized);
+    }
+
+    /// §6: the three input modes serialize as themselves, and the pre-D-028
+    /// `new-turn` still parses.
+    #[test]
+    fn prompt_mode_gains_steer_and_queue_without_moving_new_turn() {
+        for (wire, mode) in [
+            ("new-turn", PromptMode::NewTurn),
+            ("steer", PromptMode::Steer),
+            ("queue", PromptMode::Queue),
+        ] {
+            assert_eq!(round_trip::<PromptMode>(json!(wire)), mode);
+        }
+        assert!(serde_json::from_value::<PromptMode>(json!("interrupt")).is_err());
+    }
+
+    /// §4.3: the new SourceChannel variants parse and the existing ones are
+    /// untouched, so an Observation written by a pre-D-028 Node still loads.
+    #[test]
+    fn source_channel_gains_file_osc_screen() {
+        for (wire, channel) in [
+            ("file", SourceChannel::File),
+            ("osc", SourceChannel::Osc),
+            ("screen", SourceChannel::Screen),
+            ("hook", SourceChannel::Hook),
+            ("pty", SourceChannel::Pty),
+            ("herdr", SourceChannel::Herdr),
+        ] {
+            assert_eq!(round_trip::<SourceChannel>(json!(wire)), channel);
+        }
+    }
+
+    /// §9.1: legacy tier names normalize to levels by NAME. Index is ignored
+    /// on read — it was per-harness, so carrying it would change the tier.
+    #[test]
+    fn effort_selection_normalizes_legacy_tier_names() {
+        for (legacy, name, ultracode) in [
+            ("default", EffortName::Low, false),
+            ("low", EffortName::Low, false),
+            ("medium", EffortName::Medium, false),
+            ("think", EffortName::High, false),
+            ("high", EffortName::High, false),
+            ("think-hard", EffortName::Xhigh, false),
+            ("xhigh", EffortName::Xhigh, false),
+            ("max", EffortName::Max, false),
+            ("ultracode", EffortName::Xhigh, true),
+            // Unrecognized spellings fall to the documented default rather
+            // than failing a launch over a stale UI string.
+            ("ultra", EffortName::High, false),
+            ("whatever-the-ui-said", EffortName::High, false),
+        ] {
+            let expected = EffortSelection { name, ultracode };
+            assert_eq!(
+                EffortSelection::from_legacy_name(legacy),
+                expected,
+                "{legacy}"
+            );
+            // Three spellings a client might send, all landing on one value:
+            // the pre-D-028 object, a bare string, and the D-028 object.
+            for payload in [
+                json!({"index": 3, "name": legacy}),
+                json!(legacy),
+                json!({"name": legacy}),
+            ] {
+                let decoded: EffortSelection =
+                    from_json_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+                assert_eq!(decoded, expected, "{legacy} via {payload}");
+            }
+        }
+        // The canonical shape round-trips; `index` is not written back.
+        let value = json!({"name": "xhigh", "ultracode": true});
+        let decoded = round_trip::<EffortSelection>(value);
+        assert_eq!(decoded.flag_value(), "ultracode");
+        assert_eq!(decoded.level_name(), "xhigh");
+        assert_eq!(EffortSelection::DEFAULT.flag_value(), "high");
+        assert!(serde_json::from_value::<EffortSelection>(json!({"index": 3})).is_err());
+    }
+
+    /// An InstanceSpec written before D-028 has no `effort`, and absent must
+    /// stay absent: it means "the harness decides", which is not the same as
+    /// requesting the default level.
+    #[test]
+    fn instance_spec_without_effort_parses_and_stays_absent() {
+        let legacy = fixture("instance-spec.json");
+        assert!(legacy.get("effort").is_none());
+        let spec = round_trip::<InstanceSpec>(legacy.clone());
+        assert_eq!(spec.effort, None);
+
+        let mut with_effort = legacy;
+        with_effort["effort"] = json!({"name": "max", "ultracode": false});
+        let spec = round_trip::<InstanceSpec>(with_effort);
+        assert_eq!(
+            spec.effort,
+            Some(EffortSelection {
+                name: EffortName::Max,
+                ultracode: false
+            })
+        );
+    }
+}

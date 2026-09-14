@@ -122,6 +122,142 @@ pub struct NativeHome {
     pub store_id: Id,
 }
 
+/// Native effort selection; `protocol.md` §4.1 (D-028 §9.1).
+///
+/// Five Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is
+/// **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only,
+/// and is never persisted as a level name.
+///
+/// Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes
+/// legacy tier **names**, so a stored row or an old client keeps working:
+///
+/// | legacy `name` | normalized |
+/// | --- | --- |
+/// | `default` | `low` |
+/// | `think` | `high` |
+/// | `think-hard` | `xhigh` |
+/// | `ultracode` | `xhigh` + `ultracode: true` |
+/// | anything unrecognized | `high` (the documented default tier) |
+///
+/// Normalization is by **name**, never by index: the legacy tables had
+/// different lengths per harness, so index 3 meant `ultracode` for Claude and
+/// `ultra` for Codex. `index` on the wire is therefore ignored on read and not
+/// written back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EffortSelection {
+    /// One of the five Claude effort levels.
+    pub name: EffortName,
+    /// Dynamic-workflow flag (`--effort ultracode`). Session-only.
+    pub ultracode: bool,
+}
+
+impl EffortSelection {
+    /// Default tier: `high`, cost baseline 1.0 (D-028 §9.1).
+    pub const DEFAULT: Self = Self {
+        name: EffortName::High,
+        ultracode: false,
+    };
+
+    /// Normalize a legacy or current tier **name** into a selection; §9.1.
+    ///
+    /// Unrecognized names normalize to [`EffortName::High`] rather than
+    /// erroring: an effort tier is a preference, and refusing a launch over a
+    /// stale UI string would be worse than running at the documented default.
+    pub fn from_legacy_name(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "low" | "default" => Self {
+                name: EffortName::Low,
+                ultracode: false,
+            },
+            "medium" => Self {
+                name: EffortName::Medium,
+                ultracode: false,
+            },
+            "high" | "think" => Self {
+                name: EffortName::High,
+                ultracode: false,
+            },
+            "xhigh" | "think-hard" => Self {
+                name: EffortName::Xhigh,
+                ultracode: false,
+            },
+            "max" => Self {
+                name: EffortName::Max,
+                ultracode: false,
+            },
+            "ultracode" => Self {
+                name: EffortName::Xhigh,
+                ultracode: true,
+            },
+            _ => Self::DEFAULT,
+        }
+    }
+
+    /// Wire spelling of the level alone, ignoring `ultracode`; §9.1.
+    ///
+    /// This is what gets persisted: `ultracode` rides along as its own boolean
+    /// so a stored row still records which level it is equivalent to, rather
+    /// than collapsing into a name that is not one of the five.
+    pub fn level_name(&self) -> &'static str {
+        match self.name {
+            EffortName::Low => "low",
+            EffortName::Medium => "medium",
+            EffortName::High => "high",
+            EffortName::Xhigh => "xhigh",
+            EffortName::Max => "max",
+        }
+    }
+
+    /// Value for the native `--effort` flag; §9.1.
+    ///
+    /// `ultracode` replaces the level name because the native flag takes one
+    /// value and `--effort ultracode` is the documented (measured) spelling.
+    pub fn flag_value(&self) -> &'static str {
+        if self.ultracode {
+            return "ultracode";
+        }
+        self.level_name()
+    }
+}
+
+impl Default for EffortSelection {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl<'de> Deserialize<'de> for EffortSelection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            ultracode: Option<bool>,
+        }
+        // A bare string ("think") is accepted too: the Hub's instance spec has
+        // carried `effortName` as a loose string since before D-028.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(name) = value.as_str() {
+            return Ok(Self::from_legacy_name(name));
+        }
+        let wire: Wire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let Some(name) = wire.name else {
+            return Err(serde::de::Error::missing_field("name"));
+        };
+        let mut selection = Self::from_legacy_name(&name);
+        // An explicit `ultracode: true` on a level name that is not itself
+        // `ultracode` still sets the flag; `false` never clears the flag the
+        // legacy `ultracode` name implies, because that name *is* the request.
+        if wire.ultracode == Some(true) {
+            selection.ultracode = true;
+        }
+        Ok(selection)
+    }
+}
+
 /// InstanceSpec; `protocol.md` §4.1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +284,12 @@ pub struct InstanceSpec {
     /// `model_id`; protocol §4.1.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub model_id: Option<String>,
+    /// Native effort selection; §4.1 (D-028 §9.1).
+    ///
+    /// Absent means "the harness decides"; the materializer emits no
+    /// `--effort` flag at all rather than guessing a level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortSelection>,
     /// `permission_mode`; protocol §4.1.
     pub permission_mode: PermissionMode,
     /// `env`; protocol §4.1.

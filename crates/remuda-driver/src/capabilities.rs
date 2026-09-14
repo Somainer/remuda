@@ -2,8 +2,9 @@
 
 use crate::binary::BinaryPin;
 use remuda_protocol::{
-    AdapterTransport, Capability, CapabilityEvidence, CapabilityName, CapabilitySet,
-    CapabilitySnapshot, CapabilityState, DriverKind, EvidenceType, Id, Knowledge, U64,
+    AdapterTransport, Capability, CapabilityEvidence, CapabilityName, CapabilityProvision,
+    CapabilitySet, CapabilitySnapshot, CapabilityState, DriverKind, EvidenceType, Id, Knowledge,
+    NativeRef, SignalTier, U64,
 };
 
 /// Adapter version stamped on capability snapshots.
@@ -24,6 +25,14 @@ pub enum MatrixMark {
 pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
     use CapabilityName::*;
     use DriverKind::*;
+    // D-028 §6: `queue` and `interrupt` are unverified for every driver in
+    // this task — no driver behaviour changed here, and §14 risk 6/7 record
+    // that claude's queue-vs-steer semantics and grok/agy's keys are still
+    // unmeasured. `unknown` is the truthful answer for all of them; the
+    // per-harness measurements land with the worker who implements the keys.
+    if matches!(name, Queue | Interrupt) {
+        return MatrixMark::Unknown;
+    }
     match (kind, name) {
         (ClaudePrint, Resume | ModelSwitch | Fork | StructuredWorkflow | Hooks) => {
             MatrixMark::SupportedStar
@@ -38,7 +47,7 @@ pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
                 MatrixMark::Unknown
             }
         }
-        (ClaudePrint, Steer | CompletionTask) => MatrixMark::Unknown,
+        (ClaudePrint, Steer | CompletionTask | Queue | Interrupt) => MatrixMark::Unknown,
         (ClaudePty, Resume | Fork | StructuredWorkflow | Artifact | TtyAttach | Hooks) => {
             MatrixMark::SupportedStar
         }
@@ -50,7 +59,7 @@ pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
                 MatrixMark::Unknown
             }
         }
-        (ClaudePty, CompletionTask) => MatrixMark::Unknown,
+        (ClaudePty, CompletionTask | Queue | Interrupt) => MatrixMark::Unknown,
         (ClaudeBg, Resume | StructuredWorkflow | Hooks | TtyAttach | LiveAttach) => {
             MatrixMark::SupportedStar
         }
@@ -83,8 +92,13 @@ pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
         }
         (AgyPrint, _) => MatrixMark::Unknown,
         (GenericPty, TtyAttach | LiveAttach) => MatrixMark::SupportedStar,
+        (GenericPty, Steer) => MatrixMark::Unknown,
         (GenericPty, _) => MatrixMark::NotProvided,
         (ShellPty, TtyAttach | LiveAttach) => MatrixMark::SupportedStar,
+        // D-028 §6 / §14 risk 6: whether typing into a busy agent TUI steers
+        // or queues is unmeasured for every harness this carrier can host.
+        // `unsupported` would be a claim; `unknown` is what we know.
+        (ShellPty, Steer) => MatrixMark::Unknown,
         (ShellPty, _) => MatrixMark::NotProvided,
     }
 }
@@ -113,11 +127,34 @@ pub fn capability_snapshot(
     })
 }
 
-/// Materialize the full [`CapabilitySet`] for `kind`.
+/// Materialize the full [`CapabilitySet`] for `kind` from the static matrix.
 pub fn capability_set(kind: DriverKind) -> CapabilitySet {
-    CapabilitySet {
+    capability_set_with_runtime(kind, None)
+}
+
+/// [`capability_set`], with any runtime report from `native_ref` layered on top.
+///
+/// D-028 §4.3: the static matrix keys off [`DriverKind`] alone, so a promoted
+/// `shell-pty` session could never report the capabilities it actually gained
+/// by being an agent. Runtime values win when present; the matrix is the
+/// fallback, not the authority.
+///
+/// Two rules keep this honest:
+///
+/// * a runtime entry replaces the matrix cell **whatever its state** — a
+///   session that observes `steer` is unavailable says so, rather than
+///   inheriting a matrix `supported`;
+/// * a capability with no runtime entry keeps its matrix value, because
+///   "not reported" is not evidence of absence.
+pub fn capability_set_with_runtime(
+    kind: DriverKind,
+    native_ref: Option<&NativeRef>,
+) -> CapabilitySet {
+    let mut set = CapabilitySet {
         resume: cap(kind, CapabilityName::Resume),
         steer: cap(kind, CapabilityName::Steer),
+        queue: cap(kind, CapabilityName::Queue),
+        interrupt: cap(kind, CapabilityName::Interrupt),
         model_switch: cap(kind, CapabilityName::ModelSwitch),
         fork: cap(kind, CapabilityName::Fork),
         structured_workflow: cap(kind, CapabilityName::StructuredWorkflow),
@@ -131,6 +168,110 @@ pub fn capability_set(kind: DriverKind) -> CapabilitySet {
         live_attach: cap(kind, CapabilityName::LiveAttach),
         completion_native_turn: cap(kind, CapabilityName::CompletionNativeTurn),
         completion_task: cap(kind, CapabilityName::CompletionTask),
+    };
+    let Some(native_ref) = native_ref else {
+        return set;
+    };
+    // A declared tier with no explicit entries still says something: the tier
+    // itself is evidence for the capabilities it structurally provides.
+    if let Some(tier) = native_ref.signal_tier {
+        for name in tier_capabilities(tier) {
+            *slot(&mut set, *name) = tier_cap(tier);
+        }
+    }
+    // Explicit entries are more specific than the tier default, so they are
+    // applied second and win.
+    for entry in &native_ref.capabilities {
+        *slot(&mut set, entry.name) = Capability {
+            state: entry.state,
+            provision: entry.provision,
+            scope: vec![],
+            reason_code: entry.reason_code.clone(),
+            prerequisites: vec![],
+            evidence: vec![runtime_evidence(entry.tier)],
+        };
+    }
+    set
+}
+
+/// Capabilities a signal tier structurally provides; D-028 §4.3.
+///
+/// A hook socket is the only tier that can block an agent and return a verdict,
+/// which is what `interactive-approval` means; it also implies the harness is
+/// emitting hook events at all, and that a session id was reported (so
+/// `resume`) and turns are delimited (`completion-native-turn`). File tail
+/// gives the same identity and turn boundaries without the blocking channel.
+/// OSC and Screen prove neither, so they add nothing here — that is the point
+/// of ranking them lowest.
+fn tier_capabilities(tier: SignalTier) -> &'static [CapabilityName] {
+    use CapabilityName::*;
+    match tier {
+        SignalTier::Hook => &[
+            Resume,
+            Hooks,
+            StructuredWorkflow,
+            CompletionNativeTurn,
+            InteractiveApproval,
+        ],
+        SignalTier::File => &[Resume, StructuredWorkflow, CompletionNativeTurn],
+        SignalTier::Osc | SignalTier::Screen | SignalTier::None => &[],
+    }
+}
+
+fn tier_cap(tier: SignalTier) -> Capability {
+    Capability {
+        state: CapabilityState::Supported,
+        // The tier *is* the harness's own signal channel, so what it grants is
+        // native by construction. Anything Remuda stands in for is reported by
+        // an explicit entry, which carries its own provision.
+        provision: CapabilityProvision::Native,
+        scope: vec![],
+        reason_code: format!("signal-tier-{}", tier_slug(tier)),
+        prerequisites: vec![],
+        evidence: vec![runtime_evidence(tier)],
+    }
+}
+
+fn tier_slug(tier: SignalTier) -> &'static str {
+    match tier {
+        SignalTier::Hook => "hook",
+        SignalTier::File => "file",
+        SignalTier::Osc => "osc",
+        SignalTier::Screen => "screen",
+        SignalTier::None => "none",
+    }
+}
+
+fn runtime_evidence(tier: SignalTier) -> CapabilityEvidence {
+    CapabilityEvidence {
+        actor_type: EvidenceType::NativeNegotiation,
+        reference: format!("runtime:signal-tier:{}", tier_slug(tier)),
+        digest: Knowledge::Unknown {
+            reason: "not-hashed".into(),
+            evidence_event_ids: vec![],
+        },
+    }
+}
+
+fn slot(set: &mut CapabilitySet, name: CapabilityName) -> &mut Capability {
+    match name {
+        CapabilityName::Resume => &mut set.resume,
+        CapabilityName::Steer => &mut set.steer,
+        CapabilityName::Queue => &mut set.queue,
+        CapabilityName::Interrupt => &mut set.interrupt,
+        CapabilityName::ModelSwitch => &mut set.model_switch,
+        CapabilityName::Fork => &mut set.fork,
+        CapabilityName::StructuredWorkflow => &mut set.structured_workflow,
+        CapabilityName::Artifact => &mut set.artifact,
+        CapabilityName::TtyAttach => &mut set.tty_attach,
+        CapabilityName::Hooks => &mut set.hooks,
+        CapabilityName::InteractiveApproval => &mut set.interactive_approval,
+        CapabilityName::Question => &mut set.question,
+        CapabilityName::PlanReview => &mut set.plan_review,
+        CapabilityName::Elicitation => &mut set.elicitation,
+        CapabilityName::LiveAttach => &mut set.live_attach,
+        CapabilityName::CompletionNativeTurn => &mut set.completion_native_turn,
+        CapabilityName::CompletionTask => &mut set.completion_task,
     }
 }
 
@@ -168,9 +309,216 @@ fn cap(kind: DriverKind, name: CapabilityName) -> Capability {
     };
     Capability {
         state,
+        // The static matrix records native evidence only (§3.3); nothing in it
+        // describes a Remuda-emulated path, so a matrix cell never claims one.
+        // §6's native/emulated distinction arrives with the runtime report.
+        provision: match mark {
+            MatrixMark::SupportedStar => CapabilityProvision::Native,
+            MatrixMark::NotProvided | MatrixMark::Unknown => CapabilityProvision::Unknown,
+        },
         scope: vec![],
         reason_code: reason_code.into(),
         prerequisites: vec![],
         evidence,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remuda_protocol::{AgentKind, CapabilityProvision, HostId, RuntimeCapability};
+
+    fn native_ref(tier: Option<SignalTier>, entries: Vec<RuntimeCapability>) -> NativeRef {
+        NativeRef {
+            host_id: HostId::new(),
+            native_store_id: Id::new("obj").unwrap(),
+            kind: AgentKind::Claude,
+            session_id: Knowledge::Unknown {
+                reason: "test".into(),
+                evidence_event_ids: vec![],
+            },
+            transcript: Knowledge::Unknown {
+                reason: "test".into(),
+                evidence_event_ids: vec![],
+            },
+            signal_tier: tier,
+            capabilities: entries,
+            codex: None,
+            acp: None,
+            claude: None,
+            claude_bg: None,
+            agy: None,
+            herdr: None,
+        }
+    }
+
+    fn entry(name: CapabilityName, state: CapabilityState) -> RuntimeCapability {
+        RuntimeCapability {
+            name,
+            state,
+            provision: CapabilityProvision::Native,
+            tier: SignalTier::Hook,
+            reason_code: "measured".into(),
+        }
+    }
+
+    /// D-028 §4.3: with nothing reported, the static matrix is unchanged. This
+    /// is the fallback the whole override path rests on.
+    #[test]
+    fn no_runtime_report_leaves_the_static_matrix_alone() {
+        for kind in [DriverKind::ShellPty, DriverKind::ClaudePrint] {
+            assert_eq!(
+                capability_set_with_runtime(kind, None),
+                capability_set(kind),
+                "{kind:?}"
+            );
+            // An empty report is the same as no report: a NativeRef that
+            // simply has not been filled in yet must not look like a session
+            // claiming it reached no signal tier at all.
+            assert_eq!(
+                capability_set_with_runtime(kind, Some(&native_ref(None, vec![]))),
+                capability_set(kind),
+                "{kind:?} empty"
+            );
+        }
+    }
+
+    /// The structural point of the whole change: a promoted shell-pty session
+    /// can report capabilities its DriverKind says it does not have.
+    #[test]
+    fn a_signal_tier_lifts_shell_pty_above_its_static_row() {
+        let stat = capability_set(DriverKind::ShellPty);
+        assert_eq!(stat.hooks.state, CapabilityState::Unsupported);
+        assert_eq!(stat.resume.state, CapabilityState::Unsupported);
+
+        let hooked = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(Some(SignalTier::Hook), vec![])),
+        );
+        assert_eq!(hooked.hooks.state, CapabilityState::Supported);
+        assert_eq!(hooked.resume.state, CapabilityState::Supported);
+        assert_eq!(
+            hooked.interactive_approval.state,
+            CapabilityState::Supported
+        );
+        assert_eq!(hooked.hooks.reason_code, "signal-tier-hook");
+        // tty-attach was already supported and stays so: the tier adds, it
+        // does not reset the row.
+        assert_eq!(hooked.tty_attach.state, CapabilityState::Supported);
+
+        // File tail proves identity and turn boundaries but cannot block the
+        // agent for a verdict, so it must not claim interactive-approval.
+        let tailed = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(Some(SignalTier::File), vec![])),
+        );
+        assert_eq!(tailed.resume.state, CapabilityState::Supported);
+        assert_eq!(
+            tailed.interactive_approval.state,
+            CapabilityState::Unsupported
+        );
+        assert_eq!(tailed.hooks.state, CapabilityState::Unsupported);
+
+        // Screen and OSC prove neither; they are the floor for a reason.
+        for tier in [SignalTier::Osc, SignalTier::Screen, SignalTier::None] {
+            let floor = capability_set_with_runtime(
+                DriverKind::ShellPty,
+                Some(&native_ref(Some(tier), vec![])),
+            );
+            assert_eq!(floor, capability_set(DriverKind::ShellPty), "{tier:?}");
+        }
+    }
+
+    /// An explicit entry beats the tier default, in **both** directions. A
+    /// session that measured a capability as absent must be able to say so,
+    /// or "runtime override" would only ever be able to add optimism.
+    #[test]
+    fn explicit_entries_win_over_the_tier_and_may_lower_a_capability() {
+        let downgraded = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(
+                Some(SignalTier::Hook),
+                vec![entry(
+                    CapabilityName::InteractiveApproval,
+                    CapabilityState::Unsupported,
+                )],
+            )),
+        );
+        assert_eq!(
+            downgraded.interactive_approval.state,
+            CapabilityState::Unsupported
+        );
+        // Its neighbours from the same tier are untouched.
+        assert_eq!(downgraded.hooks.state, CapabilityState::Supported);
+
+        // And an entry can override a statically-supported cell downwards.
+        let print = capability_set_with_runtime(
+            DriverKind::ClaudePrint,
+            Some(&native_ref(
+                None,
+                vec![entry(CapabilityName::Resume, CapabilityState::Unknown)],
+            )),
+        );
+        assert_eq!(
+            capability_set(DriverKind::ClaudePrint).resume.state,
+            CapabilityState::Supported
+        );
+        assert_eq!(print.resume.state, CapabilityState::Unknown);
+        assert_eq!(print.resume.reason_code, "measured");
+
+        // §6: a capability Remuda stands in for reports `emulated`, and the
+        // runtime entry carries that through. The tier's own grants stay
+        // `native` — the tier *is* the harness's channel.
+        let emulated = capability_set_with_runtime(
+            DriverKind::ShellPty,
+            Some(&native_ref(
+                Some(SignalTier::Hook),
+                vec![RuntimeCapability {
+                    name: CapabilityName::Queue,
+                    state: CapabilityState::Supported,
+                    provision: CapabilityProvision::Emulated,
+                    tier: SignalTier::Hook,
+                    reason_code: "remuda-ledger".into(),
+                }],
+            )),
+        );
+        assert_eq!(emulated.queue.provision, CapabilityProvision::Emulated);
+        assert_eq!(emulated.hooks.provision, CapabilityProvision::Native);
+        // The static matrix never claims a provider: it records native
+        // evidence for `supported` cells and says nothing for the rest.
+        let stat = capability_set(DriverKind::ShellPty);
+        assert_eq!(stat.tty_attach.provision, CapabilityProvision::Native);
+        assert_eq!(stat.queue.provision, CapabilityProvision::Unknown);
+        assert_eq!(stat.resume.provision, CapabilityProvision::Unknown);
+    }
+
+    /// §6: no driver claims queue/interrupt in this task. They are unmeasured
+    /// (§14 risks 6 and 7), and `unknown` is what unmeasured means.
+    #[test]
+    fn queue_and_interrupt_are_unknown_for_every_driver() {
+        for kind in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ClaudeBg,
+            DriverKind::CodexAppserver,
+            DriverKind::GrokAcp,
+            DriverKind::AgyPrint,
+            DriverKind::GenericPty,
+            DriverKind::ShellPty,
+        ] {
+            let set = capability_set(kind);
+            assert_eq!(set.queue.state, CapabilityState::Unknown, "{kind:?} queue");
+            assert_eq!(
+                set.interrupt.state,
+                CapabilityState::Unknown,
+                "{kind:?} interrupt"
+            );
+        }
+        // steer on a PTY carrier is unknown too: whether typing into a busy
+        // agent TUI steers or queues has not been measured on any harness.
+        assert_eq!(
+            capability_set(DriverKind::ShellPty).steer.state,
+            CapabilityState::Unknown
+        );
     }
 }

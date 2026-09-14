@@ -1,11 +1,30 @@
 import type { Digest, Id, Knowledge, U64 } from "./wire";
 
+/** Highest signal layer a live session reached; protocol §1.3 (D-028 §4.3). */
+export type SignalTier = "hook" | "file" | "osc" | "screen" | "none";
+
+/** Who implements a capability: the harness natively, or Remuda on its behalf; §3.2 (D-028 §6). */
+export type CapabilityProvision = "native" | "emulated" | "unknown";
+
+/** One capability a live session reports, with the tier proving it; §1.3. */
+export type RuntimeCapability = {
+  name: CapabilityName;
+  state: Capability["state"];
+  provision?: CapabilityProvision;
+  tier: SignalTier;
+  reasonCode: string;
+};
+
 export type NativeRef = {
   hostId: Id;
   nativeStoreId: Id;
   kind: "claude" | "codex" | "grok" | "agy" | "generic" | "terminal";
   sessionId: Knowledge<string>;
   transcript: Knowledge<{ objectId: Id; sourcePath: string }>;
+  /** Absent means "nobody reported"; the static driver matrix still applies. */
+  signalTier?: SignalTier;
+  /** Runtime capability report. Outranks the matrix per name when present. */
+  capabilities?: RuntimeCapability[];
   codex?: { threadId: string };
   acp?: { sessionId: string; protocolVersion: number };
   claude?: { sessionId: string; backgroundJobId?: string };
@@ -27,6 +46,8 @@ export type NativeRequestKey =
 export type CapabilityName =
   | "resume"
   | "steer"
+  | "queue"
+  | "interrupt"
   | "model-switch"
   | "fork"
   | "structured-workflow"
@@ -43,6 +64,8 @@ export type CapabilityName =
 
 export type Capability = {
   state: "supported" | "unsupported" | "unknown";
+  /** Orthogonal to `state`: "can it be done" vs "by whom". Absent reads as unknown. */
+  provision?: CapabilityProvision;
   scope: string[];
   reasonCode: string;
   prerequisites: string[];

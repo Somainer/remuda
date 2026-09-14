@@ -193,10 +193,12 @@ fn materialize_inner(
     let input_delivery;
     let session_id;
 
-    if request.spec.driver == DriverKind::ShellPty {
-        return Err(DriverError::InvalidLaunchSpec(
-            "shell-pty does not use the Claude/generic materializer".into(),
-        ));
+    // D-028 §5.1: `shell-pty` is no longer a materializer dead end. Which
+    // recipe it gets depends on `spec.kind`, because one driver now carries
+    // two very different launches: `terminal` / `generic` is a login shell,
+    // and `claude` / `codex` / `grok` / `agy` is an agent in a native PTY.
+    if request.spec.driver == DriverKind::ShellPty && is_agent_kind(request.spec.kind) {
+        return materialize_shell_pty_agent(request, extras, setting_sources, binary);
     }
 
     match request.spec.driver {
@@ -243,12 +245,15 @@ fn materialize_inner(
             };
             argv = claude_argv(
                 request.spec.driver,
-                &permission,
-                &setting_sources,
-                settings_path.as_deref(),
-                &model,
-                &request.session,
-                &extras,
+                &ClaudeArgv {
+                    permission: &permission,
+                    setting_sources: &setting_sources,
+                    settings_path: settings_path.as_deref(),
+                    model: &model,
+                    effort: request.spec.effort,
+                    session: &request.session,
+                    extras: &extras,
+                },
             )?;
             input_delivery = match request.spec.driver {
                 DriverKind::ClaudePrint => InputDelivery::Stdio,
@@ -385,6 +390,8 @@ fn materialize_inner(
             session_id = None;
         }
         DriverKind::ShellPty => {
+            // Login `$SHELL` under kind `terminal` / `generic`. The agent
+            // kinds took the `materialize_shell_pty_agent` branch above.
             argv = extras;
             input_delivery = InputDelivery::Tty;
             session_id = None;
@@ -457,8 +464,175 @@ fn materialize_inner(
     Ok(recipe)
 }
 
+/// Kinds that name an agent CLI (everything but a bare shell).
+fn is_agent_kind(kind: AgentKind) -> bool {
+    matches!(
+        kind,
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Grok | AgentKind::Agy
+    )
+}
+
+/// D-028 §5.1: recipe for an agent CLI running in a Remuda-owned native PTY.
+///
+/// Unlike the Herdr path this produces a *complete* recipe — real env
+/// allowlist, real settings digest, real provider kind — because §5.1 step 4
+/// makes those an audit requirement rather than the stub `shell_pty.rs` used
+/// to emit. argv comes from the per-kind preset in [`crate::presets`], not
+/// from passing `spec.args` straight to the command builder.
+fn materialize_shell_pty_agent(
+    request: &MaterializeRequest<'_>,
+    extras: Vec<String>,
+    setting_sources: Vec<String>,
+    binary: BinaryPin,
+) -> DriverResult<LaunchRecipe> {
+    let preset = crate::presets::preset_for_spec(request.spec)?;
+    let (permission, debt, approval) = permission_plan(request.spec, request.origin)?;
+
+    fs::create_dir_all(&request.launch_dir)?;
+    set_dir_mode(&request.launch_dir, 0o700)?;
+
+    let mut files = Vec::new();
+    let mut env_allowlist = Vec::new();
+
+    // The overlay slot. The signal worker's hook/settings overlay lands here;
+    // until it does, a caller-supplied path is honoured and nothing is
+    // invented — an absent overlay means no `--settings` flag, not an empty
+    // file that would shadow the user's own settings.
+    let overlay = match request.settings_overlay_path.as_ref() {
+        Some(path) => {
+            let path = validate_settings_overlay(path)?;
+            let bytes = fs::read(&path)?;
+            let digest = crate::binary::hash_bytes(&bytes)?;
+            files.push(MaterializedFile {
+                path: path.to_string_lossy().into_owned(),
+                role: FileRole::Settings,
+                mode: "0600".into(),
+                content_digest: digest,
+                lifetime: FileLifetime::NativeStore,
+            });
+            Some(path)
+        }
+        None => None,
+    };
+
+    let mut argv: Vec<String> = Vec::new();
+    if preset.settings_flag {
+        argv.push("--setting-sources".into());
+        argv.push(setting_sources.join(","));
+        if let Some(path) = overlay.as_ref() {
+            argv.push("--settings".into());
+            argv.push(path.to_string_lossy().into_owned());
+        }
+    }
+    // §9.1: `--effort <name>`, and `--effort ultracode` when the flag is set.
+    // Absent effort emits nothing at all rather than pinning a default the
+    // user never chose.
+    if let Some(effort) = request.spec.effort {
+        argv.push("--effort".into());
+        argv.push(effort.flag_value().into());
+    }
+    match &request.session {
+        SessionAction::Resume { session_id } => {
+            argv.push("--resume".into());
+            argv.push(session_id.clone());
+        }
+        // §5.6: a new agent-pty session does not pin `--session-id`; the id
+        // comes back from the harness (SessionStart hook / index file), so
+        // inventing one here would create a second identity to reconcile.
+        SessionAction::New { .. } => {}
+    }
+    for token in &extras {
+        if crate::flags::is_banned_flag_token(token) {
+            return Err(DriverError::NativeFeatureDisabled(format!(
+                "refusing prohibited flag {token}"
+            )));
+        }
+    }
+    argv.extend(extras);
+    crate::presets::merge_yolo_argv(
+        &mut argv,
+        preset,
+        &request.spec.permission_mode,
+        request.origin,
+    );
+
+    if let Some(name) = preset.home_env {
+        push_env(
+            &mut env_allowlist,
+            name,
+            EnvAllowlistSource::NativeHome,
+            None,
+        );
+    }
+    collect_spec_env(request.spec, request.profile.delegation, &mut env_allowlist)?;
+
+    let settings_digest = files
+        .iter()
+        .find(|file| file.role == FileRole::Settings)
+        .map(|file| file.content_digest.clone());
+    let redacted_argv = redact_argv(&argv, &files);
+    let env_names = env_allowlist.iter().map(|e| e.name.clone()).collect();
+    let credential_refs = env_allowlist
+        .iter()
+        .filter_map(|e| e.secret_ref.clone())
+        .collect();
+
+    Ok(LaunchRecipe {
+        launch_id: request.launch_id.clone(),
+        driver: DriverKind::ShellPty,
+        binary,
+        cwd: request.spec.cwd.clone(),
+        argv,
+        env_allowlist,
+        materialized_files: files,
+        setting_sources: if preset.settings_flag {
+            setting_sources
+        } else {
+            vec![]
+        },
+        session_id: match &request.session {
+            SessionAction::Resume { session_id } => Some(session_id.clone()),
+            SessionAction::New { .. } => None,
+        },
+        native_home: request.native_home.to_string_lossy().into_owned(),
+        input_delivery: InputDelivery::Tty,
+        provider: RecipeProvider {
+            profile_id: request.profile.id.clone(),
+            kind: request.profile.kind,
+            base_url: request.profile.base_url.clone(),
+            delegation: request.profile.delegation,
+            secret_ref: request
+                .profile
+                .secret_ref
+                .as_ref()
+                .map(|secret| secret.as_str().to_string()),
+            model_requested: resolve_model(request.spec, request.profile).unwrap_or_default(),
+        },
+        permission,
+        technical_debt: debt,
+        audit: LaunchAudit {
+            env_names,
+            credential_refs,
+            redacted_argv,
+            settings_digest,
+            prohibited_options_checked: BoolLiteral,
+            // The agent owns its own TUI prompts until the hook adjudication
+            // path (D-028 §4.4 tier A) is wired; claiming runtime-hook here
+            // before then would be a lie in the audit record.
+            approval_authority: match approval {
+                ApprovalAuthority::RuntimeHost => ApprovalAuthority::NativeTty,
+                other => other,
+            },
+        },
+    })
+}
+
 fn validate_spec_profile(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult<()> {
-    if spec.driver == DriverKind::GenericPty {
+    if spec.driver == DriverKind::ShellPty {
+        // Both shapes are legal for this driver now (D-028 §5.1): a login
+        // shell under `terminal` / `generic`, or an agent CLI under its own
+        // kind. Every kind is therefore accepted, and the kind picks the arm.
+    } else if spec.driver == DriverKind::GenericPty {
         if crate::generic_pty::preset_for_spec(spec).is_err() {
             return Err(DriverError::InvalidLaunchSpec(
                 "generic-pty has no preset for this agent kind".into(),
@@ -815,15 +989,27 @@ fn maybe_write_api_key_helper(
     Ok(Some(path))
 }
 
-fn claude_argv(
-    driver: DriverKind,
-    permission: &RecipePermission,
-    setting_sources: &[String],
-    settings_path: Option<&Path>,
-    model: &str,
-    session: &SessionAction,
-    extras: &[String],
-) -> DriverResult<Vec<String>> {
+/// Everything `claude_argv` needs beyond the driver kind.
+struct ClaudeArgv<'a> {
+    permission: &'a RecipePermission,
+    setting_sources: &'a [String],
+    settings_path: Option<&'a Path>,
+    model: &'a str,
+    effort: Option<remuda_protocol::EffortSelection>,
+    session: &'a SessionAction,
+    extras: &'a [String],
+}
+
+fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<String>> {
+    let ClaudeArgv {
+        permission,
+        setting_sources,
+        settings_path,
+        model,
+        effort,
+        session,
+        extras,
+    } = *inputs;
     let mut argv = Vec::new();
     match driver {
         DriverKind::ClaudePrint => {
@@ -865,6 +1051,12 @@ fn claude_argv(
     }
     argv.push("--model".into());
     argv.push(model.to_string());
+    // §9.1: launch-time effort. `--effort ultracode` is the flag spelling for
+    // the boolean; it is not a sixth level name.
+    if let Some(effort) = effort {
+        argv.push("--effort".into());
+        argv.push(effort.flag_value().into());
+    }
     if driver != DriverKind::ClaudeBg {
         match session {
             SessionAction::New { session_id } => {

@@ -23,6 +23,7 @@ pub mod grok_session;
 pub mod interaction;
 pub mod launch;
 mod materializer;
+pub mod presets;
 mod process;
 mod profile;
 pub mod promote;
@@ -53,7 +54,7 @@ pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
 pub use claude_transcript::{TranscriptTail, encode_project_dir, locate_transcript, project_dir};
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
-pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, KindPreset, WaitUntil, preset_by_id};
+pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, WaitUntil};
 pub use launch::{
     HOOKS_ENABLE_ENV, HookOverlay, HookSession, HookSessionOptions, OverlayOptions,
     SHIM_DISABLE_ENV, ShimSet, TuiMode, materialize_overlay, materialize_shims, shim_disabled,
@@ -62,6 +63,7 @@ pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
     materialize_with_token_broker, render_api_key_helper_script,
 };
+pub use presets::{KindPreset, PRESETS, merge_yolo_argv, preset_by_id, preset_for_spec};
 pub use process::current_process_identity;
 pub use profile::{
     ClaudeProviderOverlay, Delegation, EnvFileSecretBroker, ProviderHealth, ProviderKind,

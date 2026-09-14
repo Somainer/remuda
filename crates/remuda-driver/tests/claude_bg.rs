@@ -179,6 +179,8 @@ async fn stub_bg_start_send_stop_does_not_rm() {
                 reason: "test".into(),
                 evidence_event_ids: vec![],
             },
+            signal_tier: None,
+            capabilities: Vec::new(),
             codex: None,
             acp: None,
             claude: None,

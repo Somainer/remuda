@@ -51,12 +51,18 @@ export type Instance = EntityMeta & {
   providerSource?: string | null;
   providerSourceHint?: string | null;
   model?: string | null;
+  /** Normalized D-028 §9.1 level (`low` … `max`). Legacy tiers are mapped by name on read. */
   effortName?: string | null;
+  /** Dynamic-workflow flag; session-only, not a sixth level. */
+  effortUltracode?: boolean | null;
+  /** Legacy index. Preserved for older clients; never used to derive the tier. */
   effortIndex?: number | null;
   /** How this instance reached its `kind`; `promoted` = a terminal that an agent CLI took over (D-025). */
   mode?: InstanceMode | null;
   /** When the promotion happened. Only set while `mode` is `promoted`. */
   promotedAt?: string | null;
+  /** Who ran the launch command (D-028 §1.0 rule 4). Provenance only — never a capability level. */
+  launchedBy?: "remuda" | "user" | null;
 };
 
 export type HostTransport = "outbound-wss" | "ssh-dev";

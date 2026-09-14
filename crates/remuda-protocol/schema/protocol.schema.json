@@ -811,6 +811,11 @@
           },
           "type": "array"
         },
+        "provision": {
+          "$ref": "#/$defs/CapabilityProvision",
+          "default": "unknown",
+          "description": "Who implements it: the harness, or Remuda on its behalf; §3.2 (D-028 §6).\n\nOrthogonal to `state`. `supported` answers \"can this be done\", this\nanswers \"by whom\" — and the difference is user-visible, because an\nemulated queue is held in Remuda's ledger while a native one lives\ninside the harness where Remuda cannot edit it. Defaults to\n[`CapabilityProvision::Unknown`] so a pre-D-028 payload stays truthful."
+        },
         "reasonCode": {
           "description": "`reason_code`; protocol §3.2.",
           "type": "string"
@@ -829,6 +834,7 @@
       },
       "required": [
         "state",
+        "provision",
         "scope",
         "reasonCode",
         "prerequisites",
@@ -870,6 +876,16 @@
         {
           "const": "steer",
           "description": "Wire value `steer`.",
+          "type": "string"
+        },
+        {
+          "const": "queue",
+          "description": "Wire value `queue`.",
+          "type": "string"
+        },
+        {
+          "const": "interrupt",
+          "description": "Wire value `interrupt`.",
           "type": "string"
         },
         {
@@ -939,8 +955,28 @@
         }
       ]
     },
+    "CapabilityProvision": {
+      "description": "CapabilityProvision wire values; `protocol.md` §3.2.",
+      "oneOf": [
+        {
+          "const": "native",
+          "description": "Wire value `native`.",
+          "type": "string"
+        },
+        {
+          "const": "emulated",
+          "description": "Wire value `emulated`.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Wire value `unknown`.",
+          "type": "string"
+        }
+      ]
+    },
     "CapabilitySet": {
-      "description": "Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid.",
+      "description": "Complete capability record; `protocol.md` §3.2. Missing capabilities are invalid.\n\nD-028 §6 added `queue` / `interrupt` alongside `steer`. They are\n`#[serde(default)]` to an `unknown` [`Capability`] so a snapshot written by\na pre-D-028 peer still parses; \"absent\" is read as \"not verified\", never as\nunsupported.",
       "properties": {
         "artifact": {
           "$ref": "#/$defs/Capability",
@@ -970,6 +1006,18 @@
           "$ref": "#/$defs/Capability",
           "description": "Capability `interactive-approval`; §3.2."
         },
+        "interrupt": {
+          "$ref": "#/$defs/Capability",
+          "default": {
+            "evidence": [],
+            "prerequisites": [],
+            "provision": "unknown",
+            "reasonCode": "insufficient-evidence",
+            "scope": [],
+            "state": "unknown"
+          },
+          "description": "Capability `interrupt`; §3.2 (D-028 §6). Absent on pre-D-028 payloads."
+        },
         "live-attach": {
           "$ref": "#/$defs/Capability",
           "description": "Capability `live-attach`; §3.2."
@@ -985,6 +1033,18 @@
         "question": {
           "$ref": "#/$defs/Capability",
           "description": "Capability `question`; §3.2."
+        },
+        "queue": {
+          "$ref": "#/$defs/Capability",
+          "default": {
+            "evidence": [],
+            "prerequisites": [],
+            "provision": "unknown",
+            "reasonCode": "insufficient-evidence",
+            "scope": [],
+            "state": "unknown"
+          },
+          "description": "Capability `queue`; §3.2 (D-028 §6). Absent on pre-D-028 payloads."
         },
         "resume": {
           "$ref": "#/$defs/Capability",
@@ -1006,6 +1066,8 @@
       "required": [
         "resume",
         "steer",
+        "queue",
+        "interrupt",
         "model-switch",
         "fork",
         "structured-workflow",
@@ -3064,23 +3126,51 @@
         }
       ]
     },
-    "EffortSelection": {
-      "description": "Native effort tier stored on `instance.configure`.",
-      "properties": {
-        "index": {
-          "description": "Index into the harness-native table.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "name": {
-          "description": "Native tier name (`think`, `high`, `max`, …).",
+    "EffortName": {
+      "description": "EffortName wire values; `protocol.md` §4.1.",
+      "oneOf": [
+        {
+          "const": "low",
+          "description": "Wire value `low`.",
           "type": "string"
+        },
+        {
+          "const": "medium",
+          "description": "Wire value `medium`.",
+          "type": "string"
+        },
+        {
+          "const": "high",
+          "description": "Wire value `high`.",
+          "type": "string"
+        },
+        {
+          "const": "xhigh",
+          "description": "Wire value `xhigh`.",
+          "type": "string"
+        },
+        {
+          "const": "max",
+          "description": "Wire value `max`.",
+          "type": "string"
+        }
+      ]
+    },
+    "EffortSelection": {
+      "description": "Native effort selection; `protocol.md` §4.1 (D-028 §9.1).\n\nFive Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is\n**not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only,\nand is never persisted as a level name.\n\nDeserialization accepts the pre-D-028 shape `{index, name}` and normalizes\nlegacy tier **names**, so a stored row or an old client keeps working:\n\n| legacy `name` | normalized |\n| --- | --- |\n| `default` | `low` |\n| `think` | `high` |\n| `think-hard` | `xhigh` |\n| `ultracode` | `xhigh` + `ultracode: true` |\n| anything unrecognized | `high` (the documented default tier) |\n\nNormalization is by **name**, never by index: the legacy tables had\ndifferent lengths per harness, so index 3 meant `ultracode` for Claude and\n`ultra` for Codex. `index` on the wire is therefore ignored on read and not\nwritten back.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/EffortName",
+          "description": "One of the five Claude effort levels."
+        },
+        "ultracode": {
+          "description": "Dynamic-workflow flag (`--effort ultracode`). Session-only.",
+          "type": "boolean"
         }
       },
       "required": [
-        "index",
-        "name"
+        "name",
+        "ultracode"
       ],
       "type": "object"
     },
@@ -5052,6 +5142,17 @@
           "$ref": "#/$defs/Knowledge15",
           "description": "`launch_id`; protocol §2.3."
         },
+        "launchedBy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchedBy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`launched_by`; protocol §2.3 (D-028 §1.0 rule 4). Who ran the command.\n\nRecords provenance only — **never** a capability level. A `user`-launched\nsession is entitled to exactly the same signals as a `remuda`-launched\none. Absent on pre-D-028 rows; derive it with\n[`Instance::derived_launched_by`], which reads `mode` / `promoted_at`."
+        },
         "lifecycle": {
           "$ref": "#/$defs/InstanceLifecycle",
           "description": "`lifecycle`; protocol §2.3."
@@ -5065,7 +5166,7 @@
               "type": "null"
             }
           ],
-          "description": "`mode`; protocol §2.3. How this Instance arrived at its current `kind`."
+          "description": "`mode`; protocol §2.3. How this Instance arrived at its current `kind`.\n\nKept for compatibility with pre-D-028 peers. [`Instance::launched_by`]\nis the field that answers \"who typed the command\"; `mode` keeps\nanswering \"was this kind promoted\"."
         },
         "nativeRef": {
           "$ref": "#/$defs/NativeRef",
@@ -5673,6 +5774,17 @@
         "driver": {
           "$ref": "#/$defs/DriverKind",
           "description": "`driver`; protocol §4.1."
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffortSelection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native effort selection; §4.1 (D-028 §9.1).\n\nAbsent means \"the harness decides\"; the materializer emits no\n`--effort` flag at all rather than guessing a level."
         },
         "env": {
           "additionalProperties": {
@@ -8072,6 +8184,21 @@
         }
       ]
     },
+    "LaunchedBy": {
+      "description": "LaunchedBy wire values; `protocol.md` §2.3.",
+      "oneOf": [
+        {
+          "const": "remuda",
+          "description": "Wire value `remuda`.",
+          "type": "string"
+        },
+        {
+          "const": "user",
+          "description": "Wire value `user`.",
+          "type": "string"
+        }
+      ]
+    },
     "LifecycleEntity": {
       "description": "LifecycleEntity; `protocol.md` §5.5.",
       "oneOf": [
@@ -9666,6 +9793,13 @@
           ],
           "description": "`agy`; protocol §1.3."
         },
+        "capabilities": {
+          "description": "Capabilities this session reports at runtime; §1.3 (D-028 §4.3).\n\nEmpty or absent means \"no runtime report\"; the static matrix stands.",
+          "items": {
+            "$ref": "#/$defs/RuntimeCapability"
+          },
+          "type": "array"
+        },
         "claude": {
           "anyOf": [
             {
@@ -9725,6 +9859,17 @@
         "sessionId": {
           "$ref": "#/$defs/Knowledge2",
           "description": "`session_id`; protocol §1.3."
+        },
+        "signalTier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SignalTier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Highest signal layer this session actually reached; §1.3 (D-028 §4.3).\n\nAbsent on pre-D-028 payloads and on drivers that never report one.\nAbsent is not [`SignalTier::None`]: it means \"nobody said\", so\n[`crate::CapabilitySet`] falls back to the static driver matrix."
         },
         "transcript": {
           "$ref": "#/$defs/Knowledge4",
@@ -11563,6 +11708,16 @@
         {
           "const": "new-turn",
           "description": "Wire value `new-turn`.",
+          "type": "string"
+        },
+        {
+          "const": "steer",
+          "description": "Wire value `steer`.",
+          "type": "string"
+        },
+        {
+          "const": "queue",
+          "description": "Wire value `queue`.",
           "type": "string"
         }
       ]
@@ -13861,6 +14016,40 @@
       ],
       "type": "object"
     },
+    "RuntimeCapability": {
+      "description": "One capability this live session actually reached, with the tier that\nproves it; `protocol.md` §1.3 (D-028 §4.3).\n\nA runtime entry outranks the static `DriverKind` matrix for the same name.\nIt carries its own `state`, so a session may report a capability as\n`unknown` just as truthfully as `supported`.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CapabilityName",
+          "description": "Which capability this entry overrides."
+        },
+        "provision": {
+          "$ref": "#/$defs/CapabilityProvision",
+          "default": "unknown",
+          "description": "Whether the harness provides it or Remuda emulates it; D-028 §6."
+        },
+        "reasonCode": {
+          "description": "Stable machine-readable cause (`hook-socket-open`, `no-adapter`, …).",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/CapabilityState",
+          "description": "Observed state. `unknown` is honest and stays callable-refusing."
+        },
+        "tier": {
+          "$ref": "#/$defs/SignalTier",
+          "description": "Signal tier that produced the observation."
+        }
+      },
+      "required": [
+        "name",
+        "state",
+        "provision",
+        "tier",
+        "reasonCode"
+      ],
+      "type": "object"
+    },
     "RuntimeCursor": {
       "description": "RuntimeCursor; `protocol.md` §5.1.",
       "properties": {
@@ -14146,6 +14335,36 @@
         }
       ]
     },
+    "SignalTier": {
+      "description": "SignalTier wire values; `protocol.md` §1.3.",
+      "oneOf": [
+        {
+          "const": "hook",
+          "description": "Wire value `hook`.",
+          "type": "string"
+        },
+        {
+          "const": "file",
+          "description": "Wire value `file`.",
+          "type": "string"
+        },
+        {
+          "const": "osc",
+          "description": "Wire value `osc`.",
+          "type": "string"
+        },
+        {
+          "const": "screen",
+          "description": "Wire value `screen`.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "Wire value `none`.",
+          "type": "string"
+        }
+      ]
+    },
     "Snapshot": {
       "description": "Snapshot; `protocol.md` §7.3.",
       "oneOf": [
@@ -14245,6 +14464,21 @@
         {
           "const": "runtime",
           "description": "Wire value `runtime`.",
+          "type": "string"
+        },
+        {
+          "const": "file",
+          "description": "Wire value `file`.",
+          "type": "string"
+        },
+        {
+          "const": "osc",
+          "description": "Wire value `osc`.",
+          "type": "string"
+        },
+        {
+          "const": "screen",
+          "description": "Wire value `screen`.",
           "type": "string"
         }
       ]

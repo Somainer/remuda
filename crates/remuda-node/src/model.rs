@@ -118,6 +118,13 @@ pub struct CreateInstanceRequest {
     /// Exited Instance this launch continues; recorded as `instance.parent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<InstanceId>,
+    /// Native effort selection for this launch (D-028 §9.1).
+    ///
+    /// Legacy tier names arriving from an older Hub or client are normalized
+    /// by [`remuda_protocol::EffortSelection`]'s deserializer, so this field
+    /// already holds a level + `ultracode` flag by the time argv is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<remuda_protocol::EffortSelection>,
 }
 
 impl CreateInstanceRequest {
@@ -178,6 +185,19 @@ impl CreateInstanceRequest {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .and_then(|value| InstanceId::try_from(value.to_owned()).ok());
+        }
+        if self.effort.is_none() {
+            // Accepts both the D-028 object and the legacy `effortName`
+            // string the Hub has stored on specs since before it existed.
+            self.effort = spec
+                .get("effort")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .or_else(|| {
+                    spec.get("effortName")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(remuda_protocol::EffortSelection::from_legacy_name)
+                });
         }
     }
 }

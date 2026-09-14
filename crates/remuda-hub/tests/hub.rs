@@ -291,7 +291,11 @@ async fn instance_configure_is_journaled_and_persisted() -> Result<()> {
         .as_str()
         .context("instanceId")?
         .to_string();
-    assert_eq!(created["instance"]["effortName"], json!("think"));
+    // D-028 §9.1: a pre-D-028 client still posts `{index, name: "think"}`.
+    // The Hub normalizes the tier by NAME and answers with the level, so the
+    // old client keeps working and every reader sees one vocabulary.
+    assert_eq!(created["instance"]["effortName"], json!("high"));
+    assert_eq!(created["instance"]["effortUltracode"], json!(false));
     assert_eq!(created["instance"]["effortIndex"], json!(1));
 
     let configure = json!({
@@ -338,8 +342,38 @@ async fn instance_configure_is_journaled_and_persisted() -> Result<()> {
     assert_eq!(status, 200, "{inst}");
     let inst: Value = serde_json::from_str(inst.trim())?;
     assert_eq!(inst["model"], json!("opus"));
-    assert_eq!(inst["effortName"], json!("ultracode"));
-    assert_eq!(inst["effortIndex"], json!(3));
+    // `ultracode` is xhigh plus the dynamic-workflow flag, never a level.
+    assert_eq!(inst["effortName"], json!("xhigh"));
+    assert_eq!(inst["effortUltracode"], json!(true));
+    // A D-028 client posting the new shape reaches the same stored state.
+    let configure = json!({
+        "operation": "instance.configure",
+        "payload": { "model": "opus", "effort": { "name": "xhigh", "ultracode": true } }
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/instances/{instance_id}/commands"),
+        &[("Cookie", &cookie)],
+        Some(&configure),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let (status, _, inst) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{inst}");
+    let inst: Value = serde_json::from_str(inst.trim())?;
+    assert_eq!(inst["effortName"], json!("xhigh"));
+    assert_eq!(inst["effortUltracode"], json!(true));
+    // §1.0 rule 4: provenance is reported for a Remuda-launched instance.
+    assert_eq!(inst["launchedBy"], json!("remuda"));
     Ok(())
 }
 

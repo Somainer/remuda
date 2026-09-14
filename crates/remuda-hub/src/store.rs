@@ -261,13 +261,29 @@ pub struct InstanceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Native effort tier name.
+    ///
+    /// Normalized to a D-028 §9.1 level (`low` … `max`) on read, so a row
+    /// stored with a legacy tier (`think`, `think-hard`, `default`) reads back
+    /// as the level it means. `ultracode` reads back as `xhigh` with
+    /// [`InstanceRecord::effort_ultracode`] set.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "effortName"
     )]
     pub effort_name: Option<String>,
+    /// Dynamic-workflow flag; D-028 §9.1. Session-only, never a sixth level.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortUltracode"
+    )]
+    pub effort_ultracode: Option<bool>,
     /// Native effort tier index.
+    ///
+    /// Legacy field, preserved so an older client's list row still renders.
+    /// It is **not** used to derive the tier: see the normalization note on
+    /// `effort_name`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -304,6 +320,17 @@ pub struct InstanceRecord {
         rename = "promotedAt"
     )]
     pub promoted_at: Option<String>,
+    /// `remuda` or `user` — who ran the launch command (D-028 §1.0 rule 4).
+    ///
+    /// Derived from `mode` / `promoted_at` for rows written before D-028, so
+    /// it is always populated on read even though no column stores it.
+    /// Provenance only: it never gates a capability.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "launchedBy"
+    )]
+    pub launched_by: Option<String>,
 }
 
 impl InstanceRecord {
@@ -324,6 +351,13 @@ impl InstanceRecord {
         });
         if let Some(object) = spec.as_object_mut() {
             if let Some(name) = &self.effort_name {
+                // Write the normalized D-028 shape so the resumed child never
+                // has to re-normalize, and keep the legacy keys for a Node
+                // that has not picked up the new field yet.
+                object.insert(
+                    "effort".into(),
+                    json!({ "name": name, "ultracode": self.effort_ultracode.unwrap_or(false) }),
+                );
                 object.insert("effortName".into(), json!(name));
             }
             if let Some(index) = self.effort_index {
@@ -1655,14 +1689,25 @@ impl Store {
             {
                 object.insert("model".into(), json!(model));
             }
-            if let Some(effort) = payload.get("effort") {
-                object.insert("effort".into(), effort.clone());
-            } else if payload.get("effortName").is_some() || payload.get("effortIndex").is_some() {
+            // D-028 §9.1: whatever spelling arrives — the new object, the old
+            // `{index, name}` object, a bare `effortName` string — is stored
+            // as one normalized shape, so reload and list rows agree and no
+            // consumer has to know the legacy tables.
+            let incoming = payload.get("effort").cloned().or_else(|| {
+                payload
+                    .get("effortName")
+                    .and_then(Value::as_str)
+                    .map(|name| json!(name))
+            });
+            if let Some(incoming) = incoming
+                && let Ok(selection) =
+                    serde_json::from_value::<remuda_protocol::EffortSelection>(incoming)
+            {
                 object.insert(
                     "effort".into(),
                     json!({
-                        "name": payload.get("effortName"),
-                        "index": payload.get("effortIndex"),
+                        "name": selection.level_name(),
+                        "ultracode": selection.ultracode,
                     }),
                 );
             }
@@ -3613,18 +3658,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(patched.model.as_deref(), Some("opus"));
-        assert_eq!(patched.effort_name.as_deref(), Some("ultracode"));
-        assert_eq!(patched.effort_index, Some(3));
+        // D-028 §9.1: the legacy `ultracode` tier normalizes to the level it
+        // is equivalent to plus the flag. It is not a sixth level, so it is
+        // never stored as one.
+        assert_eq!(patched.effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(patched.effort_ultracode, Some(true));
         let reloaded = store
             .get_instance(instance.instance_id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.model.as_deref(), Some("opus"));
-        assert_eq!(reloaded.effort_name.as_deref(), Some("ultracode"));
-        assert_eq!(reloaded.effort_index, Some(3));
+        assert_eq!(reloaded.effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(reloaded.effort_ultracode, Some(true));
         let listed = store.list_instances(None).await.unwrap();
-        assert_eq!(listed[0].effort_name.as_deref(), Some("ultracode"));
+        assert_eq!(listed[0].effort_name.as_deref(), Some("xhigh"));
+        assert_eq!(listed[0].effort_ultracode, Some(true));
+    }
+
+    /// Open a store with one authenticated host, for tests that only need a
+    /// place to hang instances.
+    async fn store_with_host(tag: &str) -> (tempfile::TempDir, Store, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: enroll_token(&store, tag).await,
+                    hello_host_id: Some(host.clone()),
+                    label: Some(tag.into()),
+                    node_version: None,
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .unwrap();
+        (dir, store, host)
+    }
+
+    /// D-028 §9.1: every legacy tier name maps to a level by NAME, and a row
+    /// written before D-028 reads back as the level it meant — including the
+    /// ones whose index would have pointed somewhere else.
+    #[tokio::test]
+    async fn legacy_effort_tier_names_normalize_by_name_not_index() {
+        let (_dir, store, host) = store_with_host("enroll-legacy-effort").await;
+        for (legacy, index, level, ultracode) in [
+            ("default", 0, "low", false),
+            ("think", 1, "high", false),
+            ("think-hard", 2, "xhigh", false),
+            ("ultracode", 3, "xhigh", true),
+            // Codex's index 3 was `ultra`, not `ultracode` — normalizing by
+            // index instead of name would silently turn it into ultracode.
+            ("ultra", 3, "high", false),
+            ("max", 4, "max", false),
+        ] {
+            let instance = store
+                .insert_instance(
+                    host.clone(),
+                    None,
+                    "claude".into(),
+                    "claude-print".into(),
+                    Some(format!("legacy-{legacy}")),
+                    json!({ "effortName": legacy, "effortIndex": index }),
+                )
+                .await
+                .unwrap();
+            let reloaded = store
+                .get_instance(instance.instance_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.effort_name.as_deref(), Some(level), "{legacy}");
+            assert_eq!(reloaded.effort_ultracode, Some(ultracode), "{legacy}");
+            // The legacy index survives for older clients but never decided
+            // the tier above.
+            assert_eq!(reloaded.effort_index, Some(index), "{legacy}");
+        }
+    }
+
+    /// D-028 §1.0 rule 4: `launchedBy` is populated for rows that predate it.
+    #[tokio::test]
+    async fn launched_by_is_derived_from_mode_for_legacy_rows() {
+        let (_dir, store, host) = store_with_host("enroll-launched-by").await;
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "terminal".into(),
+                "shell-pty".into(),
+                Some("legacy".into()),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        // No `mode` stored at all: Remuda's own launch path is what creates
+        // rows, so that is what an absent mode means.
+        let reloaded = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.launched_by.as_deref(), Some("remuda"));
+        // Promotion means an agent CLI took over a login shell's foreground,
+        // which only happens because a person typed the command.
+        let promoted_id = instance.instance_id.clone();
+        store
+            .run(move |conn| {
+                conn.execute(
+                    "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3 WHERE id = ?4",
+                    params!["claude", "promoted", now_rfc3339(), promoted_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let promoted = store
+            .get_instance(instance.instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.launched_by.as_deref(), Some("user"));
     }
 
     /// Backdate a row so time-window behaviour is testable without sleeping.
@@ -4261,15 +4416,28 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let effort = spec.get("effort");
-            let effort_name = effort
+            // D-028 §9.1: normalize by NAME, never by index. The legacy
+            // tables were per-harness and different lengths, so index 3 was
+            // `ultracode` for claude but `ultra` for codex — carrying the
+            // index across would silently change the tier.
+            let legacy_name = effort
                 .and_then(|value| value.get("name"))
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    spec.get("effortName")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
+                .or_else(|| effort.and_then(Value::as_str))
+                .or_else(|| spec.get("effortName").and_then(Value::as_str));
+            let effort_ultracode = effort
+                .and_then(|value| value.get("ultracode"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let normalized = legacy_name.map(|name| {
+                let mut selection = remuda_protocol::EffortSelection::from_legacy_name(name);
+                if effort_ultracode {
+                    selection.ultracode = true;
+                }
+                selection
+            });
+            let effort_name = normalized.map(|selection| selection.level_name().to_string());
+            let effort_ultracode = normalized.map(|selection| selection.ultracode);
             let effort_index = effort
                 .and_then(|value| value.get("index"))
                 .and_then(Value::as_u64)
@@ -4279,6 +4447,16 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                         .and_then(Value::as_u64)
                         .map(|n| n as u32)
                 });
+            let mode: Option<String> = row.get(15)?;
+            let promoted_at: Option<String> = row.get(16)?;
+            let launched_by = Some(
+                if mode.as_deref() == Some("promoted") || promoted_at.is_some() {
+                    "user"
+                } else {
+                    "remuda"
+                }
+                .to_string(),
+            );
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 parent_instance_id: spec
@@ -4301,6 +4479,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_source_hint,
                 model,
                 effort_name,
+                effort_ultracode,
                 effort_index,
                 native_session_id: spec
                     .get("nativeSessionId")
@@ -4322,8 +4501,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
                 last_error: row.get(14)?,
-                mode: row.get(15)?,
-                promoted_at: row.get(16)?,
+                mode,
+                promoted_at,
+                launched_by,
             })
         },
     )

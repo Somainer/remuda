@@ -41,105 +41,12 @@ use tracing::info;
 /// Last N screen lines stored on each journal snapshot.
 const SCREEN_SNAPSHOT_LINES: usize = 80;
 
-/// Per-kind PTY launch conventions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KindPreset {
-    /// Product id (`claude`, `codex`, `grok`, `agy`, `gemini`).
-    pub id: &'static str,
-    /// Default executable on PATH.
-    pub binary: &'static str,
-    /// Herdr `agent.start --kind`.
-    pub herdr_kind: &'static str,
-    /// Non-interactive / yolo argv appended when missing.
-    pub yolo_argv: &'static [&'static str],
-    /// Optional CLI flag that receives the herdr agent name.
-    pub name_flag: Option<&'static str>,
-    /// Whether SessionStart journal hooks are injected.
-    pub journals: bool,
-    /// Treat herdr `done` as wait-until idle.
-    pub done_means_idle: bool,
-}
-
-/// Built-in presets for dogfood kinds.
-pub const PRESETS: &[KindPreset] = &[
-    KindPreset {
-        id: "claude",
-        binary: "claude",
-        herdr_kind: "claude",
-        yolo_argv: &["--dangerously-skip-permissions"],
-        name_flag: None,
-        journals: true,
-        done_means_idle: true,
-    },
-    KindPreset {
-        id: "codex",
-        binary: "codex",
-        herdr_kind: "codex",
-        yolo_argv: &["--dangerously-bypass-approvals-and-sandbox"],
-        name_flag: None,
-        journals: false,
-        done_means_idle: true,
-    },
-    KindPreset {
-        id: "grok",
-        binary: "grok",
-        herdr_kind: "grok",
-        yolo_argv: &["--always-approve"],
-        name_flag: None,
-        journals: false,
-        done_means_idle: true,
-    },
-    KindPreset {
-        id: "agy",
-        binary: "agy",
-        herdr_kind: "agy",
-        yolo_argv: &["--dangerously-skip-permissions"],
-        name_flag: None,
-        journals: false,
-        done_means_idle: true,
-    },
-    KindPreset {
-        id: "gemini",
-        binary: "gemini",
-        herdr_kind: "gemini",
-        yolo_argv: &["--yolo"],
-        name_flag: None,
-        journals: false,
-        done_means_idle: true,
-    },
-];
-
-/// Look up a preset by product id.
-pub fn preset_by_id(id: &str) -> Option<&'static KindPreset> {
-    PRESETS
-        .iter()
-        .find(|preset| preset.id.eq_ignore_ascii_case(id))
-}
-
-/// Look up a preset from [`AgentKind`] (and optional spec args for gemini).
-pub fn preset_for_spec(spec: &InstanceSpec) -> DriverResult<&'static KindPreset> {
-    let id = match spec.kind {
-        AgentKind::Claude => "claude",
-        AgentKind::Codex => "codex",
-        AgentKind::Grok => "grok",
-        AgentKind::Agy => "agy",
-        AgentKind::Generic => spec
-            .args
-            .iter()
-            .find(|arg| preset_by_id(arg).is_some())
-            .map(String::as_str)
-            .or(spec.model_id.as_deref())
-            .unwrap_or("gemini"),
-        AgentKind::Terminal => {
-            return Err(DriverError::InvalidLaunchSpec(
-                "kind terminal uses driver shell-pty, not generic-pty".into(),
-            ));
-        }
-    };
-    preset_by_id(id).ok_or_else(|| {
-        DriverError::InvalidLaunchSpec(format!("no generic-pty preset for kind {id}"))
-    })
-}
+// D-028 §5.1 moved the per-kind table and yolo gating to `crate::presets` so
+// the native carrier reads the same copy. Re-exported here because
+// `generic_pty::{KindPreset, PRESETS, preset_by_id, preset_for_spec}` is the
+// spelling the rest of the tree already uses.
+use crate::presets::merge_yolo_argv;
+pub use crate::presets::{KindPreset, PRESETS, preset_by_id, preset_for_spec};
 
 /// Wait target for [`GenericPtyDriver::wait`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1295,24 +1202,6 @@ fn map_prompt_herdr(error: remuda_herdr::Error) -> DriverError {
     }
 }
 
-fn merge_yolo_argv(
-    argv: &mut Vec<String>,
-    preset: &KindPreset,
-    permission: &remuda_protocol::PermissionMode,
-    origin: LaunchOrigin,
-) {
-    if !matches!(origin, LaunchOrigin::Human | LaunchOrigin::Bot)
-        || !matches!(permission, remuda_protocol::PermissionMode::Claude(mode) if mode.mode == remuda_protocol::ClaudePermissionMode::BypassPermissions)
-    {
-        return;
-    }
-    for flag in preset.yolo_argv {
-        if !argv.iter().any(|token| token == flag) {
-            argv.push((*flag).to_string());
-        }
-    }
-}
-
 fn ensure_name_flag(argv: &mut Vec<String>, flag: &str, name: &str) {
     if argv.windows(2).any(|pair| pair[0] == flag) {
         return;
@@ -1370,19 +1259,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn presets_cover_dogfood_kinds() {
-        for id in ["claude", "codex", "grok", "agy", "gemini"] {
-            assert!(preset_by_id(id).is_some(), "{id}");
-        }
-        assert!(preset_by_id("codex").unwrap().yolo_argv[0].contains("bypass"));
-        assert!(preset_by_id("grok").unwrap().name_flag.is_none());
-        assert!(preset_by_id("codex").unwrap().name_flag.is_none());
-        assert!(preset_by_id("agy").unwrap().name_flag.is_none());
-        assert!(preset_by_id("claude").unwrap().journals);
-        assert!(!preset_by_id("codex").unwrap().journals);
-    }
-
-    #[test]
     fn done_line_matcher() {
         assert!(line_matches("hello\nDONE abc\n", "^DONE "));
         assert!(!line_matches("not yet\n", "^DONE "));
@@ -1398,43 +1274,5 @@ mod tests {
         ));
         assert!(!looks_like_shell_prompt("❯ \n"));
         assert!(!looks_like_shell_prompt("OK\n❯ \n"));
-    }
-}
-
-#[cfg(test)]
-mod origin_tests {
-    use super::*;
-    use remuda_protocol::{
-        ClaudeInteractionMode, ClaudePermission, ClaudePermissionMode, PermissionMode,
-    };
-
-    #[test]
-    fn yolo_requires_explicit_bypass_and_non_agent_origin_for_every_preset() {
-        for name in ["claude", "codex", "grok", "agy", "gemini"] {
-            let preset = preset_by_id(name).unwrap();
-            for origin in [LaunchOrigin::Human, LaunchOrigin::Bot, LaunchOrigin::Agent] {
-                for mode in [
-                    ClaudePermissionMode::Manual,
-                    ClaudePermissionMode::DontAsk,
-                    ClaudePermissionMode::BypassPermissions,
-                ] {
-                    let mut argv = vec!["--name".into(), "worker".into()];
-                    let permission = PermissionMode::Claude(Box::new(ClaudePermission {
-                        mode,
-                        interaction: ClaudeInteractionMode::NativeTty,
-                    }));
-                    merge_yolo_argv(&mut argv, preset, &permission, origin);
-                    let allowed = mode == ClaudePermissionMode::BypassPermissions
-                        && origin != LaunchOrigin::Agent;
-                    for flag in preset.yolo_argv {
-                        assert_eq!(
-                            argv.iter().any(|arg| arg == flag),
-                            allowed,
-                            "{name} {origin:?} {mode:?}"
-                        );
-                    }
-                }
-            }
-        }
     }
 }

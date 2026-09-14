@@ -405,7 +405,7 @@ of it, and a worker must not be able to violate it even by accident.
 
 | Policy | Where it came from | Enforcement point |
 |---|---|---|
-| **No tunnel tooling (D-031)**; no execution of anything under `deploy/` | owner decree after a host security monitor flagged the `cloudflared` probe | `scripts/ci/no-tunnel-scan.sh` in the gate **and** a dispatch-time command denylist in the worker sandbox; the rule is repeated in every brief today because there is no other enforcement |
+| **No tunnel tooling (D-031)**; no execution of anything under `deploy/` | owner decree after a host security monitor flagged the `<tunnel-tool>` probe | `scripts/ci/no-tunnel-scan.sh` in the gate **and** a dispatch-time command denylist in the worker sandbox; the rule is repeated in every brief today because there is no other enforcement |
 | **Never a bare `pkill herdr` / never kill a pid you did not start**; the only allowed pattern is `pkill -f 'fake-herdr serve[r]'` | a worker most likely killed the carrier of eight other workers | sandbox denylist; better, make it unnecessary by owning process lifecycle (the `r-fakeherdrleak` fix: parent-death exit + `kill_on_drop`) |
 | **Secrets never in a brief, a prompt, or a commit** | `settings.relay.json` contents, Hub bootstrap/device tokens | `brief lint` + `secret-scan` gate step + runtime resolution (`remuda mcp` resolves Hub URL and token at runtime — `docs/design/remuda-mcp.json` is committed *precisely because* it contains neither) |
 | **Workers never push to `main`, never touch files outside their worktree** | 15-agents-in-one-checkout, main red 5+ times | remote workers have no credentials at all; locally, branch protection + gate |

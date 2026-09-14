@@ -60,12 +60,12 @@
 ┌───────────────▼──────────────────────────────▼───────────────┐
 │  Hub（一个进程，部署在常驻主机/VPS）                              │
 │  · 账号/设备鉴权、推送                                          │
-│  · Host registry：多台远程主机的连接（SSH 反向隧道 / relay）        │
+│  · Host registry：多台远程主机的连接（出站 WSS / SSH stdio）        │
 │  · Session registry：跨主机的会话索引、transcript 投影、搜索        │
 │  · Provider registry：ProviderProfile + 凭据 + 轮换 + 健康        │
 │  · Dispatcher：bot 消息 → 路由规则/分类模型 → 会话                 │
 └───────────────┬──────────────────────────────────────────────┘
-                │ mTLS / SSH 转发的内部 RPC + 事件流
+                │ mTLS / SSH stdio 的内部 RPC + 事件流
 ┌───────────────▼──────────────────────────────────────────────┐
 │  Node Agent（每台执行主机一个守护进程，单二进制）                    │
 │  · Instance manager：create/send/observe/attach/stop            │
@@ -121,10 +121,10 @@
 
 ### 4.4 远程拓扑（已按 remote-topology.md 收敛）
 
-- **Hub**：部署在 `devbox-sg-host`（SG 宿主机，常开，已有 Docker + `deploy-caddy-1` + `deploy-astergate-1` + postgres/redis/minio），Docker 服务挂在现成 Caddy 后，**Cloudflare Tunnel** 出 443 给手机（PWA 安装、Web Push、飞书回调都需要 HTTPS）。Mac 只做开发/跳板，不当 Hub（合盖离网）。
+- **Hub**：部署在 `devbox-sg-host`（SG 宿主机，常开，已有 Docker + `deploy-caddy-1` + `deploy-astergate-1` + postgres/redis/minio），Docker 服务挂在现成内网 Caddy 后。公网暴露：待定；禁止隧道工具（D-031）。Mac 只做开发/跳板，不当 Hub（合盖离网）。
 - **Node Agent**：每台执行机一个 Rust 单二进制，**主动出站 WSS/gRPC 连 Hub**（Node 不暴露端口、不需要 Hub 持 SSH 钥匙；CN 与 SG 两个内网段互不可达，只有 Mac 同时能 SSH 到两边，所以 SSH 不能当生产控制面）。**第一台远程 Node 用 `devbox-sg`**（与 Hub 同机房；能出站 Cloudflare/Telegram/飞书；已 oauth 登录）。CN `devbox`（claude 2.1.268，无 oauth）**实测打不到 Cloudflare**，只能等 Hub 提供 CN 内网可达入口或走代理后再接入；`devbox-small` 能到 Cloudflare 可作 CN 备选；`devbox-gpu` 出站全断只能内网模型。Telegram 出站只有 SG 通，bot 侧放 Hub。
-- 开发期：Mac 用 SSH + unix socket 转发直连 Node（herdrx 路线），复用 `~/.ssh/config`。
-- 手机永不直连 `10.x`；官方 Remote Control 只作备选通道。
+- 开发期：Mac 用 SSH stdio 连接 Node（见 §4.6），复用 `~/.ssh/config`。
+- 手机访问内网 Hub 需要已批准的内网路由；公网访问待定（D-031）。
 - 待修：`forge-doloris` 的 ssh config `User` 字段带注释导致 GSSAPI 失败；`devbox-sg-small` 超时。
 
 ### 4.6 多主机统领与跨主机调度（D-013，M1 主线）
@@ -160,7 +160,7 @@
 | 2b | 优先级（D-013） | 次级驱动停在最小可用；**多主机统领（SSH remote + Host registry + placement + fleet + 主 agent MCP）提前为 M1 主线** |
 | 3 | PTY 底座 | **M0 = `claude-print`，不需要 PTY，也不依赖 herdr。需要 TTY 的 `claude-bg attach` / `claude-pty`（M3，或你要求提前）以每台 Node 上的 `herdr server` 为 PTY 载体**：`agent.start/prompt/wait/send_keys` + `events.subscribe` 管状态，`herdr terminal session observe/control` 给 xterm.js 原始 ANSI 流（herdrx 同款）。PTY spike 实测自建要 6–12 人周且要追 TUI 改版，不值；spike 代码留作对照 |
 | 4 | 权限默认 | **Interaction broker 询问 ✅**：`--permission-prompts host --permission-prompt-tool stdio`，`can_use_tool` 统一审批与提问；新建会话可选 **bypass（yolo）**（D-011）；bot 永不 bypass；M0 临时 dontAsk 记债 |
-| 5 | 远程拓扑 | Hub 在 `devbox-sg-host`（Docker + 现成 Caddy + Cloudflare Tunnel）；M1 第一台 Node = `devbox-sg`；CN 节点后置 |
+| 5 | 远程拓扑 | Hub 在 `devbox-sg-host`（Docker + 现成内网 Caddy；公网暴露待定，D-031）；M1 第一台 Node = `devbox-sg`；CN 节点后置 |
 | 6 | Provider 层 | **网关可选**（D-012）：默认原生登录态；有网关则用；runtime 只有薄 profile；不做多 key UI（v2） |
 | 7 | 第一个 dispatcher | 飞书独立 app（M2）；Telegram 后置 |
 | 8 | M0 范围 | 见 plan-phase0.md（待出）；核心：本机 Node 跑 print/bg 两种 spawn + journal + 最小 Web 会话页 |

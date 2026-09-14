@@ -90,7 +90,7 @@ to **1.94.1** (`rust-toolchain.toml`). Edition 2024.
 | `crates/remuda-testing` | `fake-claude` / `fake-herdr` and captured fixtures |
 | `crates/remuda` | Composition root: `remuda hub\|node\|dev\|version` |
 | `web/` | React + TypeScript + Vite PWA |
-| `deploy/` | Dockerfile, compose, Caddy, cloudflared, Node unit |
+| `deploy/` | Dockerfile, compose, intranet Caddy, Node unit; public exposure pending (D-031) |
 | `scripts/` | Acceptance and CI helpers |
 | `docs/design/` | Decisions, protocol, plan, UI spec |
 

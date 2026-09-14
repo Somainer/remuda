@@ -362,6 +362,9 @@ pub struct InstanceRecord {
     /// Native transcript path, when a driver reported one (D-026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_transcript_path: Option<String>,
+    /// Signal tier confirmed by the Node for the current native session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_tier: Option<String>,
     /// Exited instance whose conversation this one continues (D-026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<String>,
@@ -806,34 +809,72 @@ impl Store {
     where
         F: Fn(&str, &str) -> bool + Send + 'static,
     {
-        self.run(move |conn| {
-            let Some(prefix) = crate::auth::token_prefix(&token) else { return Ok(None); };
-            let read_row = |row: &rusqlite::Row<'_>| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            };
-            let mut candidate = conn.query_row(
-                "SELECT id, name, token_hash, kind, instance_id FROM devices WHERE token_prefix = ?1",
-                params![prefix], read_row,
-            ).optional()?;
-            if candidate.is_none() && let Some(id) = legacy_device_id {
-                candidate = conn.query_row(
-                    "SELECT id, name, token_hash, kind, instance_id FROM devices WHERE id = ?1 AND token_prefix IS NULL",
+        let Some(prefix) = crate::auth::token_prefix(&token).map(str::to_owned) else {
+            return Ok(None);
+        };
+        let lookup_prefix = prefix.clone();
+        let candidate = self
+            .run(move |conn| {
+                let read_row = |row: &rusqlite::Row<'_>| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                };
+                let mut candidate = conn
+                    .query_row(
+                        "SELECT id, token_hash FROM devices WHERE token_prefix = ?1",
+                        params![lookup_prefix],
+                        read_row,
+                    )
+                    .optional()?;
+                if candidate.is_none()
+                    && let Some(id) = legacy_device_id
+                {
+                    candidate = conn.query_row(
+                    "SELECT id, token_hash FROM devices WHERE id = ?1 AND token_prefix IS NULL",
                     params![id], read_row,
                 ).optional()?;
-            }
-            let Some((id, name, hash, kind, instance_id)) = candidate else { return Ok(None); };
-            if !verify(&token, &hash) { return Ok(None); }
+                }
+                Ok(candidate)
+            })
+            .await?;
+        let Some((id, hash)) = candidate else {
+            return Ok(None);
+        };
+        // Argon2 must not occupy the single SQLite writer: normal device
+        // polling would otherwise delay unrelated native journal appends.
+        let verified =
+            tokio::task::spawn_blocking(move || verify(&token, &hash).then_some((id, hash)))
+                .await
+                .map_err(|_| StoreError::Id("device verification task failed".into()))?;
+        let Some((id, hash)) = verified else {
+            return Ok(None);
+        };
+        self.run(move |conn| {
+            // Revocation or hash replacement while verification was in
+            // flight must reject. Read scope now, not from the old snapshot.
+            let device = conn
+                .query_row(
+                    "SELECT id, name, kind, instance_id FROM devices
+                 WHERE id = ?1 AND token_hash = ?2
+                   AND (token_prefix = ?3 OR token_prefix IS NULL)",
+                    params![id, hash, prefix],
+                    |row| {
+                        Ok(Device {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            kind: row.get(2)?,
+                            instance_id: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(device) = device else {
+                return Ok(None);
+            };
             conn.execute(
                 "UPDATE devices SET last_seen_at = ?1, token_prefix = ?2 WHERE id = ?3",
                 params![now_rfc3339(), prefix, id],
             )?;
-            Ok(Some(Device { id, name, kind, instance_id }))
+            Ok(Some(device))
         })
         .await
     }
@@ -3125,6 +3166,10 @@ fn apply_instance_projection(
         if let Some(entity_error) = payload.pointer("/entity/lastError").and_then(Value::as_str) {
             last_error = Some(entity_error.to_string());
         }
+        conn.execute(
+            "UPDATE instances SET spec_json = json_set(spec_json, '$.nativeSignalTier', ?1) WHERE id = ?2",
+            params![payload.pointer("/entity/nativeRef/signalTier").and_then(Value::as_str), instance_id],
+        )?;
     }
     if kind == "lifecycle" && payload_type == "native" {
         // D-025: a promoted terminal changes kind/mode on the Hub row too, so
@@ -3171,8 +3216,9 @@ fn apply_instance_projection(
                 }
                 conn.execute(
                     "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3, updated_at = ?4
+                     , spec_json = CASE WHEN ?6 = 'agent_demoted' THEN json_remove(spec_json, '$.nativeSignalTier') ELSE spec_json END
                      WHERE id = ?5",
-                    params![promoted_kind, mode, promoted_at, now, instance_id],
+                    params![promoted_kind, mode, promoted_at, now, instance_id, name],
                 )?;
             }
         }
@@ -3288,6 +3334,11 @@ fn native_session_from_event(event: &Value) -> Option<(String, Option<String>)> 
     let payload = event.get("payload")?;
     match payload.get("type").and_then(Value::as_str) {
         Some("native") => {
+            if event.pointer("/source/driverKind").and_then(Value::as_str) == Some("shell-pty")
+                && event.pointer("/source/channel").and_then(Value::as_str) == Some("hook")
+            {
+                return None;
+            }
             let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
             let name = payload
                 .get("nativeName")
@@ -4191,6 +4242,70 @@ mod tests {
             .expect("insert instance")
     }
 
+    #[tokio::test]
+    async fn promoted_hook_activity_is_mirrored_without_screen_or_subagent_override() {
+        let (_dir, store, host) = store_with_host("hook-activity").await;
+        let instance = seed_instance(&store, &host).await;
+        let id = instance.instance_id;
+        let authoritative = |activity: &str| {
+            json!({"kind":"lifecycle","payload":{
+                "type":"entity","entityType":"instance","state":"ready","entity":{
+                    "nativeRef":{"signalTier":"hook"}, "activity":{"state":"known","value":activity}
+                }
+            }})
+        };
+        let native = |name: &str, channel: &str, activity: &str| {
+            json!({
+                "kind":"lifecycle","source":{"driverKind":"shell-pty","channel":channel},
+                "payload":{"type":"native","nativeName":name,"status":{"state":"known","value":activity}}
+            })
+        };
+        let validated = |name: &str, channel: &str, activity: &str| {
+            let mut event = native(name, channel, activity);
+            event["payload"]["relatedIds"] = json!({"remudaActivity":activity});
+            event
+        };
+        for (seq, event, expected) in [
+            (1, authoritative("idle"), "idle"),
+            (2, native("UserPromptSubmit", "hook", "working"), "idle"),
+            (
+                3,
+                validated("UserPromptSubmit", "hook", "working"),
+                "working",
+            ),
+            (4, native("agent_status", "pty", "idle"), "working"),
+            (5, native("Stop", "hook", "idle"), "working"),
+            (6, authoritative("working"), "working"),
+            (7, validated("interrupted", "pty", "idle"), "idle"),
+            (8, authoritative("idle"), "idle"),
+            (9, validated("SubagentStop", "hook", "working"), "idle"),
+        ] {
+            store
+                .append_journal(host.clone(), id.clone(), Some(seq), event)
+                .await
+                .unwrap();
+            let current = store.get_instance(id.clone()).await.unwrap().unwrap();
+            assert_eq!(current.activity, expected, "seq {seq}");
+            assert_eq!(current.signal_tier.as_deref(), Some("hook"));
+        }
+        store
+            .append_journal(
+                host,
+                id.clone(),
+                Some(10),
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","nativeName":"agent_demoted","relatedIds":{"kind":"terminal"}
+                }}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_instance(id).await.unwrap().unwrap().signal_tier,
+            None
+        );
+        store.close().await;
+    }
+
     /// The demo wedge: stale `requested` rows must stop holding placement slots,
     /// and the sweeper must eventually fail them outright.
     #[tokio::test]
@@ -4878,6 +4993,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string),
+                signal_tier: spec
+                    .get("nativeSignalTier")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 resumed_from: spec
                     .get("resumedFrom")
                     .and_then(Value::as_str)
@@ -5119,11 +5238,32 @@ fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'stati
         .get("nativeName")
         .and_then(Value::as_str)
         .unwrap_or("");
+    if native_name == "SubagentStop" {
+        return (None, None);
+    }
+    if payload_type == "native"
+        && event.pointer("/source/driverKind").and_then(Value::as_str) == Some("shell-pty")
+    {
+        // Added by the Node only after current PID/session ownership was
+        // verified, so activity travels on the same causal journal event.
+        match payload
+            .pointer("/relatedIds/remudaActivity")
+            .and_then(Value::as_str)
+        {
+            Some("working") => return (Some("running"), Some("working")),
+            Some("idle") => return (Some("running"), Some("idle")),
+            _ => {}
+        }
+        if event.pointer("/source/channel").and_then(Value::as_str) == Some("hook") {
+            return (None, None);
+        }
+    }
     let entity_state = payload
         .get("state")
         .and_then(Value::as_str)
         .or_else(|| event.get("state").and_then(Value::as_str));
     let status = knowledge_value(payload.get("status"))
+        .or_else(|| knowledge_value(payload.pointer("/entity/activity")))
         .or_else(|| event.get("activity").and_then(Value::as_str));
 
     let start_failed = reason == "native-driver-start-failed"
@@ -5145,8 +5285,10 @@ fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'stati
     if let Some(state) = entity_state {
         lifecycle = normalize_lifecycle(state);
     }
-    let herdr_idle_proof =
-        native_name == "agent_status" || native_name == "session" || payload_type == "native";
+    let herdr_idle_proof = native_name == "agent_status"
+        || native_name == "session"
+        || payload_type == "native"
+        || payload.get("entityType").and_then(Value::as_str) == Some("instance");
     if herdr_idle_proof && let Some(status) = status {
         match status {
             "starting" | "started" => {
@@ -5173,13 +5315,21 @@ fn apply_instance_lifecycle(
     instance_id: &str,
     event: &Value,
 ) -> Result<(), StoreError> {
-    let (next_life, next_act) = derive_instance_state(event);
+    let (next_life, mut next_act) = derive_instance_state(event);
     if next_life.is_none() && next_act.is_none() {
         return Ok(());
     }
     let Some(current) = load_instance(conn, instance_id)? else {
         return Ok(());
     };
+    if matches!(event.pointer("/payload/nativeName").and_then(Value::as_str), Some("agent_status" | "session"))
+        && conn.query_row(
+            "SELECT json_extract(spec_json, '$.nativeSignalTier') = 'hook' FROM instances WHERE id = ?1",
+            params![instance_id], |row| row.get::<_, Option<bool>>(0),
+        )?.unwrap_or(false)
+    {
+        next_act = None;
+    }
     let now = now_rfc3339();
     let lifecycle = match next_life {
         Some(next) if lifecycle_rank(next) >= lifecycle_rank(&current.lifecycle) => next,

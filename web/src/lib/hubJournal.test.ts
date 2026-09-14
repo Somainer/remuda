@@ -45,8 +45,8 @@ describe("coerceObservation", () => {
       event: { ...row.event, eventId: row.eventId, seq: row.seq },
     }, "obj_j", "ins_1")!);
     const expected = [
-      { type: "message", id: "evt_user", role: "user", text: "hello from web hub", status: "complete" },
-      { type: "message", id: "evt_assistant", role: "assistant", text: "echo: hello from web hub", status: "complete" },
+      { type: "message", id: "evt_user", origin: "human", role: "user", text: "hello from web hub", status: "complete" },
+      { type: "message", id: "evt_assistant", origin: "human", role: "assistant", text: "echo: hello from web hub", status: "complete" },
     ];
     expect(assembleTranscript(history)).toEqual(expected);
     expect(assembleTranscript(live)).toEqual(expected);

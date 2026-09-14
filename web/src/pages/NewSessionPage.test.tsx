@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
 import { HubHttpError } from "../lib/httpError";
 import * as store from "../lib/store";
+import { notifyStore } from "../lib/notify";
 import { clearNewSessionDraft } from "../lib/newSessionDraft";
 import { mockDb } from "../lib/mock";
 import { NewSessionPage } from "./NewSessionPage";
@@ -54,7 +55,10 @@ beforeEach(() => {
     ...store.hubStore.getSnapshot(), hosts: [host], workspaces: [workspace], instances: [],
   });
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  notifyStore.reset();
+});
 
 it("creates with the registered ID and a cwd inside the chosen workspace", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
@@ -379,6 +383,13 @@ describe("idempotent submit when the ACK is unknown", () => {
     const unknown = await screen.findByTestId("new-session-unknown");
     expect(unknown).toHaveAttribute("role", "status");
     expect(unknown).toHaveTextContent("状态待确认");
+    // The same fact goes to the standing blocking region (plan §2 notify
+    // contract) so it survives navigation to the list.
+    const blocking = notifyStore.getState().blocking;
+    expect(blocking).toHaveLength(1);
+    expect(blocking[0].severity).toBe("blocking");
+    expect(blocking[0].stage).toBe("状态待确认");
+    expect(blocking[0].diagnostic?.statusKey).toBe("unconfirmed");
     // One attempt only...
     await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
     // ...and the primary action can not start a second one.
@@ -402,6 +413,8 @@ describe("idempotent submit when the ACK is unknown", () => {
     const error = await screen.findByTestId("new-session-error");
     expect(error).toHaveTextContent("主机没有空闲实例槽位");
     expect(screen.queryByTestId("new-session-unknown")).toBeNull();
+    // A fixable refusal stays inline; it does not post to the standing region.
+    expect(notifyStore.getState().blocking).toHaveLength(0);
     expect(screen.getByTestId("new-session-start")).toBeEnabled();
     fireEvent.click(screen.getByTestId("new-session-start"));
     await waitFor(() => expect(create).toHaveBeenCalledTimes(2));

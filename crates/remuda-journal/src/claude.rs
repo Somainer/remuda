@@ -6,10 +6,10 @@ use crate::source::{FileTail, MapContext, Source, SourceResume};
 use crate::util::{known, parse_timestamp, timestamp_now, unknown};
 use remuda_protocol::{
     Completeness, ContentBlock, ContentStatus, FileCursor, Id, Knowledge, LifecyclePayload,
-    LifecycleTopic, MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
-    NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource, OpaqueImpact,
-    OpaquePayload, OpaqueReason, ResultStage, Severity, SourceChannel, SourceCursor, TextBlock,
-    ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
+    LifecycleTopic, MessageOrigin, MessagePayload, MessagePhase, MessageRole, MutationOperation,
+    NativeLifecycle, NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource,
+    OpaqueImpact, OpaquePayload, OpaqueReason, ResultStage, Severity, SourceChannel, SourceCursor,
+    TextBlock, ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
     ToolOutcome, ToolResultPayload, U64,
 };
 use serde_json::{Map, Value};
@@ -625,6 +625,70 @@ fn map_attachment(
     }
 }
 
+/// Who actually wrote a `user` record (protocol §5.2 `origin`).
+///
+/// Claude files skill bodies, slash-command expansions, local command output,
+/// hook context and compaction summaries under `role: "user"`, so the role
+/// alone cannot separate the human's words from text injected on their behalf.
+/// This mirrors the driver-side classifier in
+/// `remuda-driver::claude_transcript_records`; the two read the same file
+/// format and must agree.
+///
+/// Anything unrecognised stays `Human`: showing one row too many is
+/// recoverable, silently hiding what someone said is not.
+fn user_origin(value: &Value) -> MessageOrigin {
+    if value.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+        return MessageOrigin::Compaction;
+    }
+    if value
+        .get("sourceToolUseID")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return MessageOrigin::ToolResult;
+    }
+    // Claude's own statement, where it makes one, outranks the text shape.
+    if let Some(kind) = value.pointer("/origin/kind").and_then(Value::as_str) {
+        match kind {
+            "human" | "coordinator" | "peer" => return MessageOrigin::Human,
+            "task-notification" => return MessageOrigin::HookContext,
+            _ => {}
+        }
+    }
+    match value.get("promptSource").and_then(Value::as_str) {
+        Some("typed" | "sdk" | "queued") => return MessageOrigin::Human,
+        Some("system") => return MessageOrigin::HookContext,
+        _ => {}
+    }
+    if value.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return MessageOrigin::InjectedSkill;
+    }
+    let text = match value.pointer("/message/content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let head = text.trim_start();
+    if head.starts_with("<command-message>")
+        || head.starts_with("<command-name>")
+        || head.starts_with("<command-args>")
+    {
+        MessageOrigin::InjectedSkill
+    } else if head.starts_with("<local-command-stdout>")
+        || head.starts_with("<local-command-stderr>")
+    {
+        MessageOrigin::InjectedCommandOutput
+    } else if head.starts_with("<system-reminder>") || head.starts_with("<task-notification>") {
+        MessageOrigin::HookContext
+    } else {
+        MessageOrigin::Human
+    }
+}
+
 fn user_message(
     ctx: &MapContext,
     ids: &mut NativeIds,
@@ -662,6 +726,7 @@ fn user_message(
             target_block: None,
             parent_tool_call_id: None,
             native_origin: known("claude-jsonl".into()),
+            origin: Some(user_origin(value)),
             status: ContentStatus::Complete,
         })),
     )
@@ -705,6 +770,8 @@ fn assistant_message(
             target_block: None,
             parent_tool_call_id: parent_tool(ids, value),
             native_origin: known("claude-jsonl".into()),
+            // Assistant output is never an injected user record.
+            origin: Some(MessageOrigin::Human),
             status: ContentStatus::Complete,
         })),
     )

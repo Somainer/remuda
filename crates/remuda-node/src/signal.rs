@@ -156,6 +156,148 @@ pub fn session_evidence(observation: &Observation) -> Option<HookSessionEvidence
     })
 }
 
+/// One promoted process owns the hook fold until it leaves the foreground.
+#[derive(Default)]
+pub(crate) struct PromotedHooks {
+    foreground_pid: Option<i32>,
+    pending: std::collections::VecDeque<PendingHookSession>,
+    bound: Option<HookSessionEvidence>,
+    activity_on_bind: Option<(remuda_protocol::EventId, remuda_protocol::Activity)>,
+}
+
+struct PendingHookSession {
+    evidence: HookSessionEvidence,
+    activity: Option<remuda_protocol::Activity>,
+}
+
+const PENDING_SESSION_LIMIT: usize = 8;
+
+impl PromotedHooks {
+    /// SessionStart may beat the promotion poll; retain it until that poll
+    /// identifies its owner, including when the previous Claude has not yet
+    /// demoted. Only the old owner's binding is retired at that boundary.
+    pub(crate) fn observe(&mut self, event: &Observation) -> Option<HookSessionEvidence> {
+        self.activity_on_bind = None;
+        if let ObservationPayload::Lifecycle(payload) = &event.body
+            && let LifecyclePayload::Native(native) = payload.as_ref()
+            && event.source.channel == SourceChannel::Runtime
+        {
+            match native.native_name.as_str() {
+                "agent_demoted" => self.retire_bound(),
+                "agent_promoted" => {
+                    self.retire_bound();
+                    self.foreground_pid = native
+                        .related_ids
+                        .get("kind")
+                        .filter(|kind| kind.as_str() == "claude")
+                        .and_then(|_| native.related_ids.get("pid")?.parse().ok());
+                    if let Some(index) = self.pending.iter().position(|pending| {
+                        binds_instance(pending.evidence.agent_pid, self.foreground_pid)
+                    }) {
+                        let pending = self.pending.remove(index)?;
+                        self.activity_on_bind = pending
+                            .activity
+                            .map(|activity| (event.event_id.clone(), activity));
+                        self.bound = Some(pending.evidence);
+                        return self.bound.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(activity) = hook_activity(event)
+            && let Some(native) = hook_lifecycle(event)
+            && let Some(pending) = self.pending.iter_mut().find(|pending| {
+                hook_agent_pid(native) == Some(pending.evidence.agent_pid)
+                    && matches!(&native.native_id, remuda_protocol::Knowledge::Known { value }
+                        if value == &pending.evidence.session_id)
+            })
+        {
+            pending.activity = Some(activity);
+        }
+        let evidence = session_evidence(event)?;
+        if evidence.agent_pid <= 0 {
+            return None;
+        }
+        if binds_instance(evidence.agent_pid, self.foreground_pid) {
+            if self
+                .bound
+                .as_ref()
+                .is_none_or(|bound| bound.session_id != evidence.session_id)
+            {
+                self.bound = Some(evidence.clone());
+                return Some(evidence);
+            }
+        } else {
+            // A nested Claude cannot claim its parent's foreground, but its
+            // early SessionStart must survive until a later promotion sample.
+            let previous = self
+                .pending
+                .iter()
+                .position(|pending| pending.evidence.agent_pid == evidence.agent_pid)
+                .and_then(|index| self.pending.remove(index));
+            let activity = previous
+                .filter(|pending| pending.evidence.session_id == evidence.session_id)
+                .and_then(|pending| pending.activity);
+            if self.pending.len() == PENDING_SESSION_LIMIT {
+                self.pending.pop_front();
+            }
+            self.pending
+                .push_back(PendingHookSession { evidence, activity });
+        }
+        None
+    }
+
+    fn retire_bound(&mut self) {
+        if let Some(previous) = self.foreground_pid.take() {
+            self.pending
+                .retain(|pending| pending.evidence.agent_pid != previous);
+        }
+        self.bound = None;
+    }
+
+    pub(crate) fn activity(&mut self, event: &Observation) -> Option<remuda_protocol::Activity> {
+        if let Some((event_id, activity)) = self.activity_on_bind.take()
+            && event_id == event.event_id
+        {
+            return Some(activity);
+        }
+        if event.source.channel == SourceChannel::Pty
+            && let ObservationPayload::Lifecycle(payload) = &event.body
+            && let LifecyclePayload::Native(native) = payload.as_ref()
+            && native.native_name == "interrupted"
+            && native
+                .related_ids
+                .get("requestedBy")
+                .is_some_and(|by| by == "instance.cancel")
+            && native
+                .related_ids
+                .get("pid")
+                .and_then(|pid| pid.parse::<i32>().ok())
+                .is_some_and(|pid| binds_instance(pid, self.foreground_pid))
+        {
+            return Some(remuda_protocol::Activity::Idle);
+        }
+        if !self.owns_hook(event) {
+            return None;
+        }
+        hook_activity(event)
+    }
+
+    /// Only the verified foreground session can supply structured hook state.
+    pub(crate) fn owns_hook(&self, event: &Observation) -> bool {
+        let Some(bound) = self.bound.as_ref() else {
+            return false;
+        };
+        let Some(native) = hook_lifecycle(event) else {
+            return false;
+        };
+        hook_agent_pid(native) == Some(bound.agent_pid)
+            && matches!(&native.native_id, remuda_protocol::Knowledge::Known { value }
+                if value == &bound.session_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +387,154 @@ mod tests {
             assert!(!hooks_enabled(Some(value)), "{value}");
         }
         assert!(!hooks_enabled(None), "P1 default must be off");
+    }
+
+    #[test]
+    fn replacement_session_start_survives_the_previous_foregrounds_demote() {
+        let mut fold = PromotedHooks::default();
+        let promote = |pid: &str| {
+            observation(
+                SourceChannel::Runtime,
+                "agent_promoted",
+                None,
+                &[("kind", "claude"), ("pid", pid)],
+            )
+        };
+        let hook = |name: &str, pid: &str, session: &str| {
+            observation(SourceChannel::Hook, name, Some(session), &[("ppid", pid)])
+        };
+        let demote = || observation(SourceChannel::Runtime, "agent_demoted", None, &[]);
+        fold.observe(&promote("42"));
+        assert!(fold.observe(&hook("SessionStart", "42", "old")).is_some());
+        assert!(
+            fold.observe(&hook("SessionStart", "43", "replacement"))
+                .is_none()
+        );
+        // A nested session arriving later must not replace the pending owner.
+        fold.observe(&hook("SessionStart", "44", "nested"));
+        fold.observe(&demote());
+        assert_eq!(
+            fold.observe(&promote("43")).unwrap().session_id,
+            "replacement"
+        );
+        assert_eq!(
+            fold.activity(&hook("UserPromptSubmit", "43", "replacement")),
+            Some(remuda_protocol::Activity::Working)
+        );
+        assert!(fold.activity(&hook("Stop", "42", "old")).is_none());
+        assert!(fold.observe(&hook("SessionStart", "42", "old")).is_none());
+        assert!(
+            fold.activity(&hook("UserPromptSubmit", "42", "old"))
+                .is_none()
+        );
+        assert!(
+            fold.activity(&hook("UserPromptSubmit", "44", "nested"))
+                .is_none()
+        );
+        fold.observe(&demote());
+        assert!(
+            fold.observe(&promote("43")).is_none(),
+            "the retired binding is not reused without SessionStart evidence"
+        );
+    }
+
+    #[test]
+    fn current_foreground_rebinds_only_on_a_new_session_start() {
+        let mut fold = PromotedHooks::default();
+        let hook = |name: &str, pid: &str, session: &str| {
+            observation(SourceChannel::Hook, name, Some(session), &[("ppid", pid)])
+        };
+        fold.observe(&observation(
+            SourceChannel::Runtime,
+            "agent_promoted",
+            None,
+            &[("kind", "claude"), ("pid", "42")],
+        ));
+        assert!(fold.observe(&hook("SessionStart", "42", "old")).is_some());
+        assert!(fold.observe(&hook("SessionStart", "42", "old")).is_none());
+        fold.observe(&hook("UserPromptSubmit", "42", "new"));
+        fold.observe(&hook("SessionStart", "99", "new"));
+        assert!(fold.activity(&hook("Stop", "42", "new")).is_none());
+        assert_eq!(
+            fold.activity(&hook("UserPromptSubmit", "42", "old")),
+            Some(remuda_protocol::Activity::Working)
+        );
+
+        assert_eq!(
+            fold.observe(&hook("SessionStart", "42", "new"))
+                .unwrap()
+                .session_id,
+            "new"
+        );
+        for name in ["UserPromptSubmit", "Stop"] {
+            assert!(fold.activity(&hook(name, "42", "old")).is_none());
+        }
+        assert_eq!(
+            fold.activity(&hook("UserPromptSubmit", "42", "new")),
+            Some(remuda_protocol::Activity::Working)
+        );
+        assert!(fold.observe(&hook("SessionStart", "42", "new")).is_none());
+        assert_eq!(
+            fold.activity(&hook("Stop", "42", "new")),
+            Some(remuda_protocol::Activity::Idle)
+        );
+    }
+
+    #[test]
+    fn unmatched_session_starts_are_bounded_and_deduplicated_by_pid() {
+        let mut fold = PromotedHooks::default();
+        for pid in 1..=PENDING_SESSION_LIMIT + 3 {
+            let event = observation(
+                SourceChannel::Hook,
+                "SessionStart",
+                Some("pending"),
+                &[("ppid", &pid.to_string())],
+            );
+            fold.observe(&event);
+            fold.observe(&event);
+        }
+        assert_eq!(fold.pending.len(), PENDING_SESSION_LIMIT);
+        assert_eq!(fold.pending.front().unwrap().evidence.agent_pid, 4);
+    }
+
+    #[test]
+    fn early_turn_boundary_is_applied_once_when_its_session_binds() {
+        for ended in [false, true] {
+            let mut fold = PromotedHooks::default();
+            let hook = |name: &str, pid: &str, session: &str| {
+                observation(SourceChannel::Hook, name, Some(session), &[("ppid", pid)])
+            };
+            fold.observe(&hook("SessionStart", "42", "early"));
+            fold.observe(&hook("UserPromptSubmit", "42", "early"));
+            if ended {
+                fold.observe(&hook("Stop", "42", "early"));
+            }
+            fold.observe(&hook("UserPromptSubmit", "42", "foreign"));
+            fold.observe(&hook("Stop", "99", "early"));
+            fold.observe(&hook("SubagentStop", "42", "early"));
+            // Duplicate SessionStart must retain the matching turn boundary.
+            fold.observe(&hook("SessionStart", "42", "early"));
+            let promoted = observation(
+                SourceChannel::Runtime,
+                "agent_promoted",
+                None,
+                &[("kind", "claude"), ("pid", "42")],
+            );
+            assert!(fold.observe(&promoted).is_some());
+            assert_eq!(
+                fold.activity(&promoted),
+                Some(if ended {
+                    remuda_protocol::Activity::Idle
+                } else {
+                    remuda_protocol::Activity::Working
+                })
+            );
+            assert_eq!(
+                fold.activity(&promoted),
+                None,
+                "binding only restates pending activity once"
+            );
+        }
     }
 
     #[test]

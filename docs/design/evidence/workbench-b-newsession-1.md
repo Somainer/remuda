@@ -18,7 +18,7 @@
 4. **首层用户词汇。** 首层是「要做什么 / 工作目录 / 执行 agent / 权限 / 模型来源」。承载方式（driver）矩阵、launch prefill、settings overlay、config dir、预算、特殊参数、可执行文件全部收进「高级设置」。终端本身是技术表面，其唯一承载 `shell-pty` 在首层如实命名（外部终端 e2e 依赖该 testid）。effort 滑块布局 A 视觉不变，仅把 helper 里的实现名 `InstanceSpec` 换成用户说法「会话开始后仍可在会话内调整」。
 5. **幂等提交。** 每次提交生成客户端请求 id（`creq_…`，Crypto UUID，降级时随机串），随表单展示：
    - 明确拒绝（4xx，除 408）：错误留在发生位置，输入与草稿保留，可修正后再提交一次；
-   - **ACK 未知**（断连 / 超时 / 5xx）：请求可能已在主机创建会话，页面进入常驻 `状态待确认`（P0-3 词汇，本批 C1 的 commandStatus 尚未在本分支，故使用本地常量），主按钮禁用、不自动重发、不猜测实例归属，只提供「刷新状态」（只读 `instanceList` 调和）与「返回列表」；
+   - **ACK 未知**（断连 / 超时 / 5xx）：请求可能已在主机创建会话，页面进入常驻 `状态待确认`（P0-3 词汇，直接消费批次 C1 `commandStatus.ts` 的 `COMMAND_STATUS_LABEL.unconfirmed`），主按钮禁用、不自动重发、不猜测实例归属，只提供「刷新状态」（只读 `instanceList` 调和）与「返回列表」；
    - 重复 requestSubmit 由 ref 门禁拦截，同一次尝试不可能产生第二个 POST。
 6. **纯键盘。** 初始焦点在提示词；Tab 在弹层内循环；最后一站是「开始」，Enter 提交；滑块本就支持 ←/→/Home/End。hub-live e2e 用键盘完成整次创建。
 7. **390px 软键盘。** sheet 与 footer 使用 visual viewport 高度（`--workbench-height`，viewport.ts 已随软键盘更新）；底部 sheet 固定在可视区底边，键盘弹起时 footer 连同主操作上移，不被遮挡。

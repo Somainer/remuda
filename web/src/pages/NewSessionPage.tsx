@@ -37,6 +37,8 @@ import {
   loadNewSessionDraft,
   saveNewSessionDraft,
 } from "../lib/newSessionDraft";
+import { COMMAND_STATUS_LABEL } from "../lib/commandStatus";
+import { notify } from "../lib/notify";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
@@ -69,8 +71,8 @@ import css from "./NewSessionPage.module.css";
  */
 const EFFORT_HELP = "会话开始后仍可在会话内调整";
 
-/** P0-3 vocabulary: the create request left the page but its result is unknown. */
-const STATUS_UNCERTAIN = "状态待确认";
+/** P0-3 vocabulary (batch C1 commandStatus): the create left the page but its result is unknown. */
+const STATUS_UNCERTAIN = COMMAND_STATUS_LABEL.unconfirmed;
 
 type CreateKind = Exclude<Kind, "generic">;
 type CwdMode = "existing" | "worktree";
@@ -482,9 +484,24 @@ export function NewSessionPage() {
                 phaseRef.current = "idle";
               } else {
                 // The request may have been created on the host. We do not
-                // know which instance is ours, so we never resend.
+                // know which instance is ours, so we never resend. The
+                // occurrence keeps its own panel; the standing blocking
+                // region (plan §2 notify contract) keeps the fact visible on
+                // the list the user navigates to to verify.
                 setPhase("unknown");
                 phaseRef.current = "unknown";
+                notify({
+                  subject: "新建会话",
+                  stage: STATUS_UNCERTAIN,
+                  reason: `创建结果没有确认（请求 ${requestId}），可能已创建会话；已停止，不会自动再次创建。`,
+                  severity: "blocking",
+                  key: `new-session:${requestId}`,
+                  diagnostic: {
+                    hostId,
+                    reasonCode: "create-ack-unknown",
+                    statusKey: "unconfirmed",
+                  },
+                });
               }
             }
           })();

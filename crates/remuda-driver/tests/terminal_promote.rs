@@ -33,8 +33,27 @@ fn mapper() -> TranscriptMapper {
 fn hydrate() -> Vec<remuda_protocol::Observation> {
     let body = std::fs::read_to_string(fixture()).expect("fixture");
     let mut mapper = mapper();
-    body.lines()
+    let mut out: Vec<_> = body
+        .lines()
         .flat_map(|line| mapper.map_line(line).expect("map transcript line"))
+        .collect();
+    // An assistant run stays buffered until superseded, so the closing turn
+    // only lands on the end-of-batch flush the tailer performs (D-028 §7).
+    out.extend(mapper.flush().expect("flush"));
+    out
+}
+
+/// The conversation payloads, dropping the bookkeeping lifecycles that D-028
+/// §7 now retains (`mode`, `permission-mode`, the queue ledger). Those have
+/// their own coverage in `transcript_origin.rs`; these tests are about the
+/// conversation shape.
+fn conversation(
+    observations: &[remuda_protocol::Observation],
+) -> Vec<remuda_protocol::Observation> {
+    observations
+        .iter()
+        .filter(|observation| !matches!(observation.body, ObservationPayload::Lifecycle(_)))
+        .cloned()
         .collect()
 }
 
@@ -84,7 +103,7 @@ fn operation_name(operation: MutationOperation) -> &'static str {
 
 #[test]
 fn a_transcript_hydrates_the_conversation_in_order() {
-    let observations = hydrate();
+    let observations = conversation(&hydrate());
     assert_eq!(
         payload_kinds(&observations),
         vec![
@@ -104,7 +123,7 @@ fn a_transcript_hydrates_the_conversation_in_order() {
 #[test]
 fn each_hydrated_block_opens_and_closes() {
     assert_eq!(
-        mutations(&hydrate()),
+        mutations(&conversation(&hydrate())),
         vec![
             // The user turn is complete the moment it is read.
             "message:open",
@@ -135,7 +154,7 @@ fn hydrated_observations_are_structured_transcript_records_on_the_promoted_drive
 
 #[test]
 fn the_first_message_is_the_users_prompt_and_the_last_is_the_reply() {
-    let observations = hydrate();
+    let observations = conversation(&hydrate());
     let ObservationPayload::Message(first) = &observations[0].body else {
         panic!("expected a user message first");
     };
@@ -158,8 +177,6 @@ fn the_first_message_is_the_users_prompt_and_the_last_is_the_reply() {
 fn bookkeeping_and_sidechain_records_are_not_journaled() {
     let mut mapper = mapper();
     for line in [
-        r#"{"type":"mode","mode":"normal"}"#,
-        r#"{"type":"permission-mode","permissionMode":"default"}"#,
         r#"{"type":"atis-latch","atis":"deadbeef"}"#,
         r#"{"type":"file-history-snapshot","messageId":"x","snapshot":{}}"#,
         r#"{"type":"attachment","attachment":{"type":"hook_success"}}"#,
@@ -173,11 +190,23 @@ fn bookkeeping_and_sidechain_records_are_not_journaled() {
             "{line} must map to nothing"
         );
     }
+    // `mode` and `permission-mode` are the exception D-028 §7 calls out: they
+    // are not conversation, but dropping them loses the record of a permission
+    // change the user can see in the terminal.
+    for line in [
+        r#"{"type":"mode","mode":"normal"}"#,
+        r#"{"type":"permission-mode","permissionMode":"default"}"#,
+    ] {
+        assert!(
+            !mapper.map_line(line).expect("map").is_empty(),
+            "{line} must reach the journal as a lifecycle"
+        );
+    }
 }
 
 #[test]
 fn the_tool_call_and_its_result_share_one_native_tool_id() {
-    let observations = hydrate();
+    let observations = conversation(&hydrate());
     let ObservationPayload::ToolCall(call) = &observations[3].body else {
         panic!("expected a tool call");
     };
@@ -253,7 +282,7 @@ fn tailing_a_growing_transcript_hydrates_only_the_new_lines() {
         .iter()
         .flat_map(|line| mapper.map_line(line).expect("map"))
         .collect();
-    assert_eq!(payload_kinds(&first), vec!["message"]);
+    assert_eq!(payload_kinds(&conversation(&first)), vec!["message"]);
 
     // The agent keeps working; the tail picks up only what was appended.
     let mut file = std::fs::OpenOptions::new()
@@ -262,14 +291,18 @@ fn tailing_a_growing_transcript_hydrates_only_the_new_lines() {
         .expect("append");
     use std::io::Write;
     writeln!(file, "{}", lines[split..].join("\n")).expect("write");
-    let rest: Vec<_> = tail
+    let mut rest: Vec<_> = tail
         .poll()
         .expect("poll")
         .iter()
         .flat_map(|line| mapper.map_line(line).expect("map"))
         .collect();
+    // The poller flushes at the end of every batch, which is what releases the
+    // closing turn of a finished response instead of holding it until the next
+    // record arrives.
+    rest.extend(mapper.flush().expect("flush"));
     assert_eq!(
-        payload_kinds(&rest),
+        payload_kinds(&conversation(&rest)),
         vec![
             "thought",
             "thought",

@@ -1891,6 +1891,9 @@ export type MediaBlock = ({
   [key: string]: unknown;
 });
 
+/** MessageOrigin wire values; `protocol.md` §5.2. */
+export type MessageOrigin = ("human" | "injected-skill" | "injected-command-output" | "hook-context" | "tool-result" | "compaction" | "unknown");
+
 /** MessagePayload; `protocol.md` §5.2. */
 export type MessagePayload = ({
   "baseRevision": (U64 | (null));
@@ -1899,6 +1902,7 @@ export type MessagePayload = ({
   "nativeOrigin": Knowledge2;
   "nodeId": Id;
   "operation": MutationOperation;
+  "origin"?: (MessageOrigin | (null));
   "parentToolCallId": (Id | (null));
   "phase": MessagePhase;
   "revision": U64;

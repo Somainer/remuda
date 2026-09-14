@@ -4,6 +4,7 @@ import { knowledgeValue } from "../../types/command";
 import { asRecord, asString, jsonPreview } from "../../lib/format";
 import { DiffBlock } from "../../components/DiffBlock";
 import { familyFor, splitMcpName } from "./toolRegistry";
+import { presentTool } from "./toolPresenters";
 import type { DiffState } from "./assemble";
 import css from "./session.module.css";
 
@@ -149,18 +150,6 @@ function WorkflowCard({
   );
 }
 
-function TaskCard({ call }: { call: ToolCallPayload }) {
-  const rec = asRecord(knowledgeValue(call.input));
-  return (
-    <article className={css.tool}>
-      <div className={css.toolHead}>
-        <span className={css.toolTitle}>Task</span>
-      </div>
-      <pre className={css.cmd}>{asString(rec?.prompt) ?? jsonPreview(rec)}</pre>
-    </article>
-  );
-}
-
 function McpCard({ call, result }: { call: ToolCallPayload; result: ToolResultPayload | null }) {
   const name = knowledgeValue(call.toolName) ?? "mcp";
   const { server, tool } = splitMcpName(name);
@@ -186,23 +175,64 @@ function McpCard({ call, result }: { call: ToolCallPayload; result: ToolResultPa
   );
 }
 
-function GenericCard({ call, result }: { call: ToolCallPayload; result: ToolResultPayload | null }) {
-  const name = knowledgeValue(call.displayTitle) ?? knowledgeValue(call.toolName) ?? "tool";
+/**
+ * A presenter-driven card: title, subtitle, labelled rows, and a 原始 toggle.
+ *
+ * This replaces the old `GenericCard`'s raw-JSON dump and the empty
+ * `WorkflowCard`. The user's comparison with Claude's own TUI was that
+ * `Workflow` showed nothing at all and `TaskOutput` showed raw JSON; a
+ * presenter gives each tool a sentence a human can read, and keeps the raw
+ * payload one click away instead of making it the default.
+ */
+function PresentedCard({
+  name,
+  call,
+  result,
+  completeness,
+}: {
+  name: string;
+  call: ToolCallPayload;
+  result: ToolResultPayload | null;
+  completeness: string;
+}) {
+  const [raw, setRaw] = useState(false);
+  const view = presentTool(name, call, result);
   return (
-    <article className={css.tool}>
+    <article className={`${css.tool} ${completeness === "partial" ? css.toolPartial : ""}`}>
       <div className={css.toolHead}>
-        <span className={css.toolTitle}>{name}</span>
-        <span className={css.stat}>Generic</span>
+        <span className={css.toolTitle}>{view.title}</span>
+        {view.subtitle ? <span className={css.path}>{view.subtitle}</span> : null}
+        <span className={css.toolStatus} data-testid="tool-status" data-status={view.status}>
+          {view.status === "running" ? <span className={css.runDot} /> : <span className={css.okDot} />}
+          {view.status === "running" ? "运行中" : view.status === "failed" ? "失败" : "完成"}
+        </span>
+        <span className={css.spacer} />
+        <button type="button" className={css.openBtn} onClick={() => setRaw(!raw)} data-testid="tool-raw-toggle">
+          {raw ? "收起原始" : "原始"}
+        </button>
       </div>
-      <details open>
-        <summary className={css.stdoutHead}>入参</summary>
-        <pre className={css.stdout}>{jsonPreview(knowledgeValue(call.input))}</pre>
-      </details>
-      {result ? (
-        <details>
-          <summary className={css.stdoutHead}>出参</summary>
-          <pre className={css.stdout}>{jsonPreview(result)}</pre>
-        </details>
+      {view.details.map((detail) =>
+        detail.fold ? (
+          <details key={detail.label}>
+            <summary className={css.stdoutHead}>{detail.label}</summary>
+            <pre className={css.stdout}>{detail.value}</pre>
+          </details>
+        ) : detail.pre ? (
+          <div key={detail.label}>
+            <div className={css.stdoutHead}>{detail.label}</div>
+            <pre className={css.cmd}>{detail.value}</pre>
+          </div>
+        ) : (
+          <div key={detail.label} className={css.toolHead}>
+            <span className={css.stat}>{detail.label}</span>
+            <span className={css.path}>{detail.value}</span>
+          </div>
+        ),
+      )}
+      {raw ? (
+        <pre className={css.stdout} data-testid="tool-raw">
+          {jsonPreview({ input: knowledgeValue(call.input), result })}
+        </pre>
       ) : null}
     </article>
   );
@@ -254,14 +284,14 @@ export function ToolCard({
       <EditWriteCard family={family} call={call} result={shown} diffState={diffState} />
     ) : family === "Read" ? (
       <ReadCard call={call} result={shown} />
-    ) : family === "Workflow" ? (
+    ) : family === "Workflow" && workflowMembers?.length ? (
+      // A `workflow.run` observation gives us real members to draw; the tool
+      // call on its own does not, and used to render an empty card.
       <WorkflowCard runTitle={workflowTitle} members={workflowMembers} />
-    ) : family === "Task" ? (
-      <TaskCard call={call} />
     ) : family === "MCP" ? (
       <McpCard call={call} result={shown} />
     ) : (
-      <GenericCard call={call} result={shown} />
+      <PresentedCard name={name} call={call} result={shown} completeness={completeness} />
     );
   return (
     <div data-testid="tool-card" data-folded="0">

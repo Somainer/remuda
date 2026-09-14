@@ -39,7 +39,7 @@ describe("tool registry dispatch", () => {
     expect(TOOL_FAMILIES).toContain("Generic");
   });
 
-  it("renders the Bash card for Bash and Generic for unknown tools", () => {
+  it("renders the Bash card for Bash, and a key/value summary for unknown tools", () => {
     const { rerender } = render(
       <ToolCard
         driverKind="claude-print"
@@ -60,7 +60,10 @@ describe("tool registry dispatch", () => {
         diffState="unknown"
       />,
     );
-    expect(screen.getByText("Generic")).toBeTruthy();
+    // An unknown tool gets a readable key/value summary rather than the raw
+    // JSON dump the old Generic card printed (D-028 P3 feedback A).
     expect(screen.getByText("NotARealTool")).toBeTruthy();
+    expect(screen.getByText("foo")).toBeTruthy();
+    expect(screen.getByText("bar")).toBeTruthy();
   });
 });

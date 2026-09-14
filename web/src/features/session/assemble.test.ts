@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MessagePayload, Observation, ToolCallPayload } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
-import { assembleTranscript, compactTranscript, diffState } from "./assemble";
+import { assembleTranscript, compactTranscript, diffState, isToolFailure, type TranscriptNode } from "./assemble";
 
 function obs(seq: number, kind: Observation["kind"], payload: unknown): Observation {
   return {
@@ -77,7 +77,7 @@ describe("assembleTranscript", () => {
     ];
     for (const events of orders) {
       expect(assembleTranscript(events)).toMatchObject([
-        { id: "message", text: "hello world", status: "complete" },
+        { id: "message-node", text: "hello world", status: "complete" },
       ]);
       expect(assembleTranscript([...events, append, open, close])).toEqual(assembleTranscript(events));
     }
@@ -135,12 +135,12 @@ describe("assembleTranscript", () => {
       message(2, "先", { targetBlock: 1 }),
       message(3, "看看", { targetBlock: 1 }),
     ];
-    expect(assembleTranscript(events)).toMatchObject([{ id: "message", text: "Header\n我先看看", status: "streaming" }]);
+    expect(assembleTranscript(events)).toMatchObject([{ id: "message-node", text: "Header\n我先看看", status: "streaming" }]);
     events.push(events[1], message(4, "", {
       operation: "replace", targetBlock: null,
       blocks: [{ type: "text", text: "Header" }, { type: "text", text: "我先看看仓库。" }],
     }), message(5, "", { operation: "close", blocks: [], status: "complete" }), events[2]);
-    expect(assembleTranscript(events)).toMatchObject([{ id: "message", text: "Header\n我先看看仓库。", status: "complete" }]);
+    expect(assembleTranscript(events)).toMatchObject([{ id: "message-node", text: "Header\n我先看看仓库。", status: "complete" }]);
   });
 
   it("uses node identity as a fallback, recovers snapshots across gaps, and accepts empty replacement", () => {
@@ -148,7 +148,7 @@ describe("assembleTranscript", () => {
       message(1, "first"),
       message(3, "missing-base"),
       message(4, "final", { operation: "close", messageId: "renamed", status: "complete" }),
-    ])).toMatchObject([{ id: "message", text: "final", status: "complete" }]);
+    ])).toMatchObject([{ id: "message-node", text: "final", status: "complete" }]);
     expect(assembleTranscript([message(1, "first"), message(2, "", { operation: "replace", blocks: [] })]))
       .toMatchObject([{ text: "" }]);
   });
@@ -392,5 +392,132 @@ describe("diffState", () => {
       }, "structured"),
     ).toBe("applied");
     expect(diffState(base, null, "partial")).toBe("unknown");
+  });
+});
+
+describe("stable content identity (batch E)", () => {
+  function result(seq: number, toolCallId: string, outcome: "succeeded" | "failed" | "denied"): Observation {
+    return obs(seq, "tool_result", {
+      nodeId: `result-${toolCallId}` as Id,
+      toolCallId: toolCallId as Id,
+      revision: "1",
+      baseRevision: null,
+      operation: "close",
+      stage: "final",
+      outcome,
+      blocks: [{ type: "text", text: outcome }],
+      structuredResult: unknownKnowledge("text"),
+      exitCode: known(outcome === "succeeded" ? 0 : 1),
+      changes: [],
+    });
+  }
+
+  it("keeps the same node id through open, streaming appends and close", () => {
+    const open = message(1, "hello", { nodeId: "stable-node", messageId: "stable-message" });
+    const append = message(2, " world", { nodeId: "stable-node", messageId: "stable-message" });
+    const close = message(3, "", {
+      nodeId: "stable-node", messageId: "stable-message",
+      operation: "close", blocks: [], status: "complete",
+    });
+    const first = assembleTranscript([open]);
+    const mid = assembleTranscript([open, append]);
+    const done = assembleTranscript([open, append, close]);
+    expect(first[0]?.id).toBe("stable-node");
+    expect(mid[0]?.id).toBe(first[0]?.id);
+    expect(done[0]?.id).toBe(first[0]?.id);
+  });
+
+  it("holds the node id when the producer regroups (messageId renamed on close)", () => {
+    // Suffix seen first: the regroup/close is the only event at first mount.
+    const suffix = message(5, "final text", {
+      nodeId: "same-node", messageId: "renamed",
+      revision: "3", baseRevision: "2", operation: "close", status: "complete",
+    });
+    expect(assembleTranscript([suffix])[0]?.id).toBe("same-node");
+    // Prefix/history arrive later via backfill and end up at the tail of the
+    // store array; identity and text must reconcile without a key change.
+    const open = message(1, "final", { nodeId: "same-node", messageId: "original" });
+    const delta = message(2, " text", { nodeId: "same-node", messageId: "original" });
+    expect(assembleTranscript([suffix, open, delta])).toMatchObject([
+      { id: "same-node", text: "final text", status: "complete" },
+    ]);
+  });
+
+  it("does not move a node when late backfill prepends journal history", () => {
+    // Tail arrived first (store order), as in gap backfill: events 1..2 are
+    // appended to the events array only after events 4..5 were rendered.
+    const tailUser = message(4, "question", { nodeId: "n4", messageId: "m4", role: "user" });
+    const tailAssistant = message(5, "answer", { nodeId: "n5", messageId: "m5", role: "assistant" });
+    const earlyUser = message(1, "first prompt", { nodeId: "n1", messageId: "m1", role: "user" });
+    const earlyAssistant = message(2, "first reply", { nodeId: "n2", messageId: "m2", role: "assistant" });
+    const withTail = assembleTranscript([tailUser, tailAssistant]);
+    const withBackfill = assembleTranscript([tailUser, tailAssistant, earlyUser, earlyAssistant]);
+    expect(withTail.map((n) => n.id)).toEqual(["n4", "n5"]);
+    // Late-arriving history takes its journal position instead of landing at
+    // the bottom, and the tail nodes keep their ids.
+    expect(withBackfill.map((n) => n.id)).toEqual(["n1", "n2", "n4", "n5"]);
+    // Reassembly in seq order (re-follow) yields exactly the same sequence.
+    const seqOrder = assembleTranscript([earlyUser, earlyAssistant, tailUser, tailAssistant]);
+    expect(seqOrder.map((n) => n.id)).toEqual(withBackfill.map((n) => n.id));
+  });
+
+  it("keeps failed and denied tools inline instead of folding them away", () => {
+    const user: TranscriptNode = {
+      type: "message", id: "u", role: "user", text: "q", status: "complete", origin: "human",
+    };
+    const assistant: TranscriptNode = {
+      type: "message", id: "a", role: "assistant", text: "ok", status: "complete", origin: "human",
+    };
+    const mkTool = (idVal: string, outcome: "succeeded" | "failed" | "denied" | null): TranscriptNode => ({
+      type: "tool",
+      id: idVal,
+      family: "Bash",
+      name: "Bash",
+      driverKind: "claude-print",
+      call: call("Bash", idVal),
+      result: outcome
+        ? {
+            nodeId: `r-${idVal}` as Id,
+            toolCallId: idVal as Id,
+            revision: "1",
+            baseRevision: null,
+            operation: "close",
+            stage: "final",
+            outcome,
+            blocks: [{ type: "text", text: outcome }],
+            structuredResult: unknownKnowledge("text"),
+            exitCode: known(1),
+            changes: [],
+          }
+        : null,
+      completeness: "structured",
+      diffState: "unknown",
+    });
+    const nodes = [
+      user,
+      mkTool("ok-1", "succeeded"),
+      mkTool("ok-2", "succeeded"),
+      mkTool("boom", "failed"),
+      mkTool("nope", "denied"),
+      assistant,
+    ];
+    expect(isToolFailure(mkTool("boom", "failed"))).toBe(true);
+    expect(isToolFailure(mkTool("ok-1", "succeeded"))).toBe(false);
+    const folded = compactTranscript(nodes, true);
+    // The two failures stay at top level and never enter the compact group;
+    // only successful tools are folded away.
+    const top = folded.filter((n) => n.type === "tool");
+    expect(top.map((n) => n.id)).toEqual(["boom", "nope"]);
+    const group = folded.find((n) => n.type === "compact");
+    expect(group?.type === "compact" && group.children.map((c) => c.id)).toEqual(["ok-1", "ok-2"]);
+  });
+
+  it("marks a tool failure assembled from observations", () => {
+    const nodes = assembleTranscript([
+      obs(1, "tool_call", call("Bash", "c-fail")),
+      result(2, "c-fail", "failed"),
+    ]);
+    expect(nodes).toHaveLength(1);
+    expect(isToolFailure(nodes[0]!)).toBe(true);
   });
 });

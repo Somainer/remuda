@@ -1,9 +1,10 @@
 //! Validated scalar encodings and identity brands; `protocol.md` §1.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use sha2::{Digest as _, Sha256};
 use std::{fmt, str::FromStr};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use uuid::{Uuid, Variant};
+use uuid::{Builder as UuidBuilder, Uuid, Variant};
 
 const ID_PREFIXES: &[&str] = &[
     "hst", "wsp", "wkt", "ins", "run", "cmd", "int", "evt", "dev", "prn", "pvp", "cred", "obj",
@@ -56,6 +57,42 @@ impl Id {
     /// Generate a UUIDv7 for a registered entity prefix; §1.2.
     pub fn new(prefix: &str) -> Result<Self, WireValueError> {
         format!("{prefix}_{}", Uuid::now_v7()).try_into()
+    }
+
+    /// Deterministic identity for a native object: the same `(prefix, scope,
+    /// native)` always yields the same [`Id`], so two channels observing one
+    /// thing — the hook relay and the transcript tailer, say — converge on one
+    /// node without sharing state (live-view design §2.3).
+    ///
+    /// `scope` is the instance identity; ids therefore never collide across
+    /// sessions. `native` is the id as the harness spells it (a tool's
+    /// `tool_use_id`). Callers that derive more than one kind of object over
+    /// the same native id space must namespace it themselves (e.g.
+    /// `format!("thought:{native}")`).
+    ///
+    /// The id has a legal UUIDv7 *layout*. Its timestamp and random bits both
+    /// come from a 256-bit hash of `(scope, native)`, so it is unordered: v7
+    /// monotonicity is a producer convention, and nothing sorts node ids.
+    /// SHA-256 fills the role the design assigns to BLAKE3; the tree's offline
+    /// registry does not vendor BLAKE3 and no new lock entry may be added here.
+    pub fn derive(prefix: &str, scope: &str, native: &str) -> Result<Self, WireValueError> {
+        if !ID_PREFIXES.contains(&prefix) {
+            return Err(WireValueError("unknown ID prefix".into()));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"remuda-id-derive-v1\0");
+        hasher.update((scope.len() as u64).to_le_bytes());
+        hasher.update(scope.as_bytes());
+        hasher.update((native.len() as u64).to_le_bytes());
+        hasher.update(native.as_bytes());
+        let digest = hasher.finalize();
+        // 48-bit millisecond field and 80-bit counter/random field, per v7.
+        let millis =
+            u64::from_be_bytes(<[u8; 8]>::try_from(&digest[..8]).unwrap()) & 0x0000_FFFF_FFFF_FFFF;
+        let mut counter = [0u8; 10];
+        counter.copy_from_slice(&digest[8..18]);
+        let uuid = UuidBuilder::from_unix_timestamp_millis(millis, &counter).into_uuid();
+        format!("{prefix}_{uuid}").try_into()
     }
 
     /// Return the complete wire spelling, including its prefix; §1.2.
@@ -369,5 +406,57 @@ impl<T: schemars::JsonSchema> schemars::JsonSchema for NonEmpty<T> {
     }
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({"type":"array", "minItems":1, "items":generator.subschema_for::<T>()})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_derived_id_round_trips_through_the_wire_validator() {
+        let id = Id::derive("obj", "ins_scope", "call_abc123").expect("derive");
+        // The same canonical lowercase UUIDv7 the wire validator enforces.
+        let parsed = Id::try_from(id.as_str().to_owned()).expect("valid on the wire");
+        assert_eq!(parsed, id);
+        let suffix = id.as_str().trim_start_matches("obj_");
+        let uuid = Uuid::parse_str(suffix).unwrap();
+        assert_eq!(uuid.get_version_num(), 7);
+        assert_eq!(uuid.get_variant(), Variant::RFC4122);
+        assert_eq!(suffix, &uuid.to_string());
+    }
+
+    #[test]
+    fn derived_identity_is_a_pure_function_of_scope_and_native() {
+        let a = Id::derive("obj", "ins_one", "call_x").unwrap();
+        let b = Id::derive("obj", "ins_one", "call_x").unwrap();
+        assert_eq!(a, b, "the same inputs must converge on one node");
+        assert_ne!(
+            Id::derive("obj", "ins_two", "call_x").unwrap(),
+            a,
+            "scope separates sessions"
+        );
+        assert_ne!(
+            Id::derive("obj", "ins_one", "call_y").unwrap(),
+            a,
+            "native id separates objects"
+        );
+        assert_ne!(
+            Id::derive("obj", "ins_one", "Xcall_x").unwrap(),
+            a,
+            "length-prefixed hashing must not admit prefix collisions"
+        );
+        assert!(Id::derive("nope", "ins_one", "call_x").is_err());
+    }
+
+    #[test]
+    fn a_million_derived_native_ids_do_not_collide() {
+        // The convergence mechanism is only safe if the derived-id space stays
+        // effectively injective; 10^6 real tool ids must all stay distinct.
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..1_000_000u64 {
+            let id = Id::derive("obj", "ins_collision", &format!("call_{seed:016x}")).unwrap();
+            assert!(seen.insert(id), "collision at seed {seed}");
+        }
     }
 }

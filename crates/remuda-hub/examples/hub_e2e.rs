@@ -1,6 +1,7 @@
 //! In-process Hub plus a fake Node for Playwright live-hub e2e.
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use remuda_hub::{DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, spawn};
 use remuda_protocol::{HostId, InteractionId};
@@ -306,16 +307,12 @@ async fn fake_node(
     );
     let _ = ready.send(());
     let mut append_n = 0u64;
-    // Per-instance PTY state for the terminal-typing half of the C2
-    // correlation e2e: the stream the follower attached, its seq cursor, and
-    // the input bytes the browser's keystrokes wrote.
-    #[derive(Default)]
-    struct TtyState {
-        stream_id: Option<String>,
-        seq: u64,
-        input: Vec<u8>,
-    }
-    let tty: Arc<Mutex<HashMap<String, TtyState>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Minimal PTY harness for the xterm e2e specs. A terminal session is
+    // registered on create, tty.attach returns its stable per-instance stream
+    // + screen, and tty.write records raw bytes (QuickFind proves an Escape
+    // reached the process) and echoes printable input; CR additionally submits
+    // a commandId-less journal user node (C2 native-typing correlation).
+    let mut ttys: HashMap<String, TtyFake> = HashMap::new();
     while let Some(msg) = ws.next().await {
         let Ok(Message::Text(text)) = msg else {
             continue;
@@ -323,6 +320,8 @@ async fn fake_node(
         let Ok(frame) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        // Journal append acknowledgements share this socket with Hub requests.
+        // Only this loop reads frames so concurrent RPCs are never discarded.
         if frame.get("method").is_none() {
             continue;
         }
@@ -344,6 +343,24 @@ async fn fake_node(
                 .await?;
             }
             "instance.create" => {
+                let kind = params
+                    .pointer("/spec/kind")
+                    .or_else(|| params.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("claude");
+                if kind == "terminal" {
+                    // A raw terminal has no agent prompt, approval or journal
+                    // turns; its surface is the PTY stream the QuickFind test
+                    // attaches to.
+                    ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "instanceId": instance_id }),
+                    )
+                    .await?;
+                    continue;
+                }
                 let prompt = params
                     .pointer("/initialInput/text")
                     .or_else(|| params.get("prompt"))
@@ -436,90 +453,6 @@ async fn fake_node(
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
-            "tty.attach" => {
-                // C2 terminal typing: give the follower a real stream and echo
-                // its input back as PTY output so the screen visibly types.
-                // One stable stream per instance: the web client mounts the
-                // terminal twice under dev StrictMode, and a remounted socket
-                // must keep addressing the stream it already bound.
-                let stream_id = {
-                    let mut state = tty.lock().await;
-                    let entry = state.entry(instance_id.clone()).or_default();
-                    entry
-                        .stream_id
-                        .get_or_insert_with(|| format!("tty_{}", uuid7()))
-                        .clone()
-                };
-                let snapshot = format!("fake-pty\r\n{instance_id} $ ");
-                send_rpc_ok(
-                    &mut ws,
-                    id,
-                    json!({
-                        "streamId": stream_id,
-                        "streamEpoch": "epoch_e2e",
-                        "availableFrom": "0",
-                        "nextOffset": snapshot.len().to_string(),
-                        "altScreen": false,
-                        "snapshotBase64": b64(snapshot.as_bytes()),
-                    }),
-                )
-                .await?;
-            }
-            "tty.write" => {
-                // Keystrokes from the attached terminal. CR submits the line:
-                // append a commandId-less user observation (native typing),
-                // Keystrokes from the attached terminal arrive one tty.write
-                // per character. Buffer them silently (per-char echo would
-                // race the JSON-RPC drain); CR submits the line.
-                if let Some(raw) = params.get("dataBase64").and_then(Value::as_str)
-                    && let Ok(bytes) = decode_b64(raw)
-                {
-                    let mut state = tty.lock().await;
-                    let entry = state.entry(instance_id.clone()).or_default();
-                    entry.input.extend_from_slice(&bytes);
-                    if bytes.contains(&b'\r') {
-                        let line = String::from_utf8_lossy(&entry.input)
-                            .replace('\r', "")
-                            .trim()
-                            .to_string();
-                        let stream_id = entry.stream_id.clone();
-                        entry.seq += 1;
-                        let sequence = entry.seq;
-                        entry.input.clear();
-                        drop(state);
-                        if !line.is_empty() {
-                            // One screen echo for the submitted line.
-                            if let Some(stream_id) = stream_id {
-                                let echoed = format!("{line}\r\n");
-                                send_tty_frame(
-                                    &mut ws,
-                                    &instance_id,
-                                    &stream_id,
-                                    sequence,
-                                    echoed.as_bytes(),
-                                )
-                                .await?;
-                            }
-                            // No commandId: this prompt was typed natively, so
-                            // the web must render it as its own user node.
-                            append_n =
-                                append_native_user(&mut ws, &instance_id, append_n, &line).await?;
-                            append_n = append_journal(
-                                &mut ws,
-                                &instance_id,
-                                append_n,
-                                "assistant",
-                                &format!("typed echo: {line}"),
-                            )
-                            .await?;
-                            append_n =
-                                append_native_status(&mut ws, &instance_id, append_n, "idle")
-                                    .await?;
-                        }
-                    }
-                }
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
             "instance.close" | "instance.resume" => {
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
@@ -538,12 +471,132 @@ async fn fake_node(
                 )
                 .await?;
             }
+            "tty.attach" => {
+                // The Hub asks for the live PTY stream when a follower opens
+                // the terminal tab. Registering lazily keeps resume onto a
+                // session created before this node connection behaved.
+                let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                send_rpc_ok(
+                    &mut ws,
+                    id,
+                    json!({
+                        "ok": true,
+                        "streamId": tty.stream_id,
+                        "snapshotBase64": base64::engine::general_purpose::STANDARD
+                            .encode(&tty.screen),
+                        "availableFrom": "0",
+                    }),
+                )
+                .await?;
+            }
+            "tty.write" => {
+                // Raw keyboard bytes from the browser. Every byte is recorded
+                // (the QuickFind e2e reads the Escape back via the marker) and
+                // printable input is echoed like a cooked PTY. A CR submits
+                // the buffered line as a commandId-less journal user node so
+                // the C2 native-typing e2e can prove it renders once with no
+                // command attribution.
+                let bytes = params
+                    .get("dataBase64")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
+                    .unwrap_or_default();
+                let submitted = {
+                    let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                    tty.received.extend_from_slice(&bytes);
+                    let mut reply = Vec::new();
+                    for byte in &bytes {
+                        // ESC and CR are control bytes, not display text.
+                        if *byte != 0x1b && *byte != b'\r' {
+                            reply.push(*byte);
+                        }
+                    }
+                    if bytes.contains(&0x1b) {
+                        reply.extend_from_slice(b"\r\nQUICKFIND_ESC_RECEIVED\r\n$ ");
+                    }
+                    if !reply.is_empty() {
+                        tty.screen.extend_from_slice(&reply);
+                        ws.send(Message::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "tty.frame",
+                                "params": {
+                                    "instanceId": instance_id,
+                                    "streamId": tty.stream_id,
+                                    "dataBase64": base64::engine::general_purpose::STANDARD
+                                        .encode(&reply),
+                                },
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?;
+                    }
+                    tty.submit(&bytes)
+                };
+                if let Some(line) = submitted {
+                    append_n = append_native_user(&mut ws, &instance_id, append_n, &line).await?;
+                    append_n = append_journal(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "assistant",
+                        &format!("typed echo: {line}"),
+                    )
+                    .await?;
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                }
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
+            "tty.resize" => {
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
             _ => {
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
         }
     }
     Ok(())
+}
+
+/// A script-free PTY double for the xterm e2e specs.
+///
+/// It models a stable per-instance stream id the Hub binds the follower to, a
+/// one-screen buffer, and a raw byte log. Receiving an ESC byte is
+/// acknowledged with an on-screen marker (`QUICKFIND_ESC_RECEIVED`, QuickFind
+/// test); CR flushes the buffered cooked line so the C2 native-typing test can
+/// journal it as a commandId-less user node.
+struct TtyFake {
+    stream_id: String,
+    screen: Vec<u8>,
+    received: Vec<u8>,
+    line: Vec<u8>,
+}
+
+impl TtyFake {
+    fn new() -> Self {
+        Self {
+            stream_id: format!("tty_{}", uuid::Uuid::now_v7()),
+            screen: b"fake-harness terminal\r\n$ ".to_vec(),
+            received: Vec::new(),
+            line: Vec::new(),
+        }
+    }
+
+    /// Feed raw bytes; return the trimmed submitted line once CR flushes it.
+    fn submit(&mut self, bytes: &[u8]) -> Option<String> {
+        self.line.extend_from_slice(bytes);
+        if !bytes.contains(&b'\r') {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&self.line)
+            .replace('\r', "")
+            .trim()
+            .to_string();
+        self.line.clear();
+        (!line.is_empty()).then_some(line)
+    }
 }
 
 async fn send_rpc_ok(
@@ -658,50 +711,6 @@ async fn append_native_user(ws: &mut NodeWs, instance_id: &str, n: u64, text: &s
     Ok(seq)
 }
 
-/// Push one PTY output frame (keystroke echo) to the attached follower.
-async fn send_tty_frame(
-    ws: &mut NodeWs,
-    instance_id: &str,
-    stream_id: &str,
-    seq: u64,
-    bytes: &[u8],
-) -> Result<()> {
-    ws.send(Message::Text(
-        json!({
-            "jsonrpc": "2.0",
-            "id": format!("t{seq}"),
-            "method": "tty.frame",
-            "params": {
-                "instanceId": instance_id,
-                "streamId": stream_id,
-                "dataBase64": b64(bytes),
-            }
-        })
-        .to_string()
-        .into(),
-    ))
-    .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
-    Ok(())
-}
-
-fn b64(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-fn decode_b64(raw: &str) -> Result<Vec<u8>, ()> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(raw.as_bytes())
-        .map_err(|_| ())
-}
-
-/// A fresh v7 uuid, the shape the tty registry expects.
-fn uuid7() -> uuid::Uuid {
-    uuid::Uuid::now_v7()
-}
-
 async fn append_journal(
     ws: &mut NodeWs,
     instance_id: &str,
@@ -728,8 +737,6 @@ async fn append_journal(
         .into(),
     ))
     .await?;
-    // Drain the Hub RPC result so it is not mistaken for a later request.
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 
@@ -788,7 +795,6 @@ async fn append_stream_chunks(
             .into(),
         ))
         .await?;
-        let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     }
     Ok(seq)
 }
@@ -823,7 +829,6 @@ async fn append_native_status(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 

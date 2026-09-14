@@ -90,7 +90,8 @@ impl Harness {
             .arg(script)
             .env_clear()
             .env("PATH", self.path())
-            .env("REMUDA_HOOK_CREDENTIAL", "cred-test");
+            .env("REMUDA_HOOK_CREDENTIAL", "cred-test")
+            .env("REMUDA_HOOK_RELAY", self.real_bin.join("claude"));
         if let Some(home) = std::env::var_os("HOME") {
             command.env("HOME", home);
         }
@@ -153,9 +154,9 @@ fn the_users_own_flags_survive_and_come_after_ours() {
 }
 
 #[test]
-fn a_user_who_passes_their_own_settings_keeps_it() {
-    // Overriding an explicit --settings would be worse than losing our signal:
-    // they asked for that file.
+fn explicit_settings_reach_the_merger_with_the_original_argv() {
+    // This fake records the relay invocation. The real merger is exercised by
+    // remuda's hook_launch_cli test, including unchanged user-file contents.
     let harness = harness();
     assert!(
         harness
@@ -171,9 +172,10 @@ fn a_user_who_passes_their_own_settings_keeps_it() {
     );
     assert!(argv.contains(&"/tmp/theirs.json".to_owned()), "{argv:?}");
     assert!(
-        !argv.contains(&harness.overlay.to_string_lossy().into_owned()),
-        "our overlay must not override an explicit one: {argv:?}"
+        argv.contains(&harness.overlay.to_string_lossy().into_owned()),
+        "the merger needs both overlays: {argv:?}"
     );
+    assert_eq!(&argv[..3], &["hook", "launch", "--overlay"]);
 }
 
 #[test]

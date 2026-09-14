@@ -138,7 +138,7 @@ it("settles by the journal observation carrying the same commandId, even with id
   // one so the send path actually drives the journal client, then follow to
   // open the subscription.
   vi.spyOn(api, "instanceList").mockResolvedValue({
-    items: [{ id: INSTANCE, journalId: JOURNAL } as Awaited<ReturnType<Api["instanceList"]>>["items"][number]],
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "0" } as Awaited<ReturnType<Api["instanceList"]>>["items"][number]],
     nextCursor: null,
   });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);

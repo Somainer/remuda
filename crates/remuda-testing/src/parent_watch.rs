@@ -71,10 +71,7 @@ impl ParentWatch {
         #[cfg(target_os = "linux")]
         request_parent_death_signal();
 
-        use nix::fcntl::OFlag;
-        use nix::unistd::pipe2;
-        let (read_end, write_end) =
-            pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).expect("parent-watch pipe2");
+        let (read_end, write_end) = notification_pipe().expect("parent-watch notification pipe");
 
         std::thread::Builder::new()
             .name("parent-watch".into())
@@ -100,6 +97,32 @@ impl ParentWatch {
 
 #[cfg(not(unix))]
 impl ParentWatch {}
+
+/// Keep Linux's atomic flags; macOS needs `pipe` followed by `fcntl` instead.
+/// Both ends are configured before the watcher or any hook child is spawned.
+#[cfg(unix)]
+fn notification_pipe() -> nix::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::OFlag;
+        nix::unistd::pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+        use std::os::fd::AsRawFd;
+
+        let ends = nix::unistd::pipe()?;
+        for end in [&ends.0, &ends.1] {
+            let fd = end.as_raw_fd();
+            let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
+            fcntl(fd, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC))?;
+            let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+            fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        }
+        Ok(ends)
+    }
+}
 
 /// Watcher thread body: poll the parent pid and stdin hangup, then notify the
 /// main loop and hard-exit after a grace period.
@@ -229,5 +252,45 @@ pub fn terminate_child(child: &mut std::process::Child, grace: Duration) {
         let _ = child.kill();
         let _ = child.wait();
         let _ = grace;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    use std::os::fd::AsRawFd;
+
+    #[tokio::test]
+    async fn notification_pipe_has_required_flags_and_wakes_the_waiter() {
+        let (read_end, write_end) = notification_pipe().unwrap();
+        for end in [&read_end, &write_end] {
+            let fd = end.as_raw_fd();
+            assert!(
+                FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD).unwrap())
+                    .contains(FdFlag::FD_CLOEXEC)
+            );
+            assert!(
+                OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL).unwrap())
+                    .contains(OFlag::O_NONBLOCK)
+            );
+        }
+        let mut byte = [0];
+        assert_eq!(
+            nix::unistd::read(read_end.as_raw_fd(), &mut byte),
+            Err(nix::errno::Errno::EAGAIN)
+        );
+        let watcher = ParentWatch {
+            notify_fd: read_end,
+        };
+        notify(&write_end);
+        tokio::time::timeout(Duration::from_secs(1), watcher.exited())
+            .await
+            .expect("notification must wake the async waiter");
+        assert_eq!(
+            nix::unistd::read(watcher.notify_fd.as_raw_fd(), &mut byte).unwrap(),
+            1
+        );
+        assert_eq!(byte, *b"x");
     }
 }

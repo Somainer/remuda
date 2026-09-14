@@ -65,6 +65,7 @@
 - `pnpm --dir web lint` / `tsc -b`：通过；`pnpm --dir web test`：74 文件 514 例通过。
 - mock e2e（chromium via `ws://127.0.0.1:3177`）：本 spec 19 通过 / 2 失败；失败用例均为「kind terminal uses shell-pty」（chromium 与 mobile-webkit 同一原因），在未改动的 origin/main 上同样失败（已知的 mock-backed 基线问题，见本机 devbox 记录；根因在 `SessionPage` 的 baseView 选择，本批未触碰），与本批改动无关。
 - hub e2e（`HUB_E2E_LISTEN=127.0.0.1:58280 HUB_E2E_WEB_PORT=58289`，`flock /tmp/remuda-agents/e2e.lock`，conda OpenSSL 3）：本批三个新用例首次运行全部通过；同轮另两个失败（hub-live 承载矩阵断言因矩阵移入高级区、spaces-hub-live 关闭按钮名）已在本批修正并复验；`providers-discovery` 的失败属于该共享机记录在案的基线 flake 集合（本机高负载），本分支未触碰该路径。
+- 与 `origin/main`（含 ux-c1、r-p3-stream、c-hookgap 等 28 个提交）合并后复验：`playwright.hub.config.ts` 的 testMatch 冲突按并集解决；`状态待确认` 改为直接引用 C1 的 `COMMAND_STATUS_LABEL.unconfirmed`，ACK 未知同时 `notify({ severity: "blocking", diagnostic.statusKey: "unconfirmed" })` 进常驻错误区。lint / `tsc -b` / build / 79 文件 630 单元例通过；**完整 `test:e2e:hub` 串行套件 29 passed / 14 skipped（真机条件用例）/ 0 failed**；mock 侧仅记录在案的「kind terminal」基线失败。
 
 ## 4 · 边界与未做
 

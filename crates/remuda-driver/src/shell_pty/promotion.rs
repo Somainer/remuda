@@ -670,6 +670,7 @@ pub(super) fn spawn(
         // None = nothing announced yet this epoch.
         let mut announced: Option<String> = None;
         let mut bypass_announced = false;
+        let mut tui_released = false;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -739,16 +740,30 @@ pub(super) fn spawn(
             // binding. Without this bridge only Claude's separate pid file
             // could hydrate, leaving a spurious manual picker over a hooked
             // session. begin_epoch must happen first so it cannot erase it.
-            if let Some(binding) = hooks.as_ref().and_then(|hooks| hooks.binding())
+            if let Some(hooks) = hooks.as_ref()
+                && let Some(binding) = hooks.binding()
                 && found.as_ref().is_some_and(|found| found.pid == binding.pid)
-                && let Some(path) = binding.transcript_path
             {
-                bindings.ingest_session_start(SessionStartReport {
-                    session_id: binding.session_id,
-                    transcript_path: path.into(),
-                    cwd: None,
-                    ppid: Some(i64::from(binding.pid)),
-                });
+                // Only an authenticated SessionStart for the observed
+                // foreground agent can release the deterministic start pin.
+                // A /tui relaunch keeps the same --settings argv, so its file
+                // must stop overriding the user's new renderer preference.
+                if !tui_released {
+                    match hooks.release_tui_pin() {
+                        Ok(()) => tui_released = true,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not release launch renderer pin")
+                        }
+                    }
+                }
+                if let Some(path) = binding.transcript_path {
+                    bindings.ingest_session_start(SessionStartReport {
+                        session_id: binding.session_id,
+                        transcript_path: path.into(),
+                        cwd: None,
+                        ppid: Some(i64::from(binding.pid)),
+                    });
+                }
             }
 
             if !bypass_announced

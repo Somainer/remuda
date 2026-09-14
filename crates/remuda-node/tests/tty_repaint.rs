@@ -93,7 +93,7 @@ async fn with_the_emulator_off_the_snapshot_is_the_raw_ring_exactly_as_before() 
          behaviour P0 must preserve unchanged: {text:?}"
     );
     assert!(
-        !attached.alt_screen,
+        attached.alt_screen.is_none(),
         "the ring path cannot know the mode and must not claim to"
     );
     assert_eq!(
@@ -130,7 +130,7 @@ async fn an_alt_screen_session_reports_it_and_snapshots_only_the_alt_grid() {
     let attached = attach_when(ALT_SCREEN, true, "fullscreen tui frame").await;
     let text = String::from_utf8_lossy(&attached.snapshot).into_owned();
     assert!(
-        attached.alt_screen,
+        attached.alt_screen == Some(true),
         "?1049 must be reported so the web stops hijacking the wheel (§4.6)"
     );
     assert!(
@@ -153,7 +153,7 @@ async fn an_alt_screen_session_reports_it_and_snapshots_only_the_alt_grid() {
 #[tokio::test]
 async fn a_primary_screen_session_reports_alt_screen_false() {
     let attached = attach_when(REPAINT, true, "second frame").await;
-    assert!(!attached.alt_screen);
+    assert_eq!(attached.alt_screen, Some(false));
     let json = attached.into_json().expect("attach json");
     assert_eq!(json["altScreen"], serde_json::Value::Bool(false));
 }
@@ -166,7 +166,7 @@ async fn the_emulator_and_hook_flags_do_not_interfere() {
     // an assertion rather than an argument, since both now touch `spawn_at`.
     let with_both = attach_with(ALT_SCREEN, true, true, "fullscreen tui frame").await;
     assert!(
-        with_both.alt_screen,
+        with_both.alt_screen == Some(true),
         "the repaint path must still report ?1049 with the hook path also up"
     );
     let text = String::from_utf8_lossy(&with_both.snapshot).into_owned();
@@ -181,5 +181,5 @@ async fn the_emulator_and_hook_flags_do_not_interfere() {
         String::from_utf8_lossy(&hooks_only.snapshot).contains("first frame"),
         "with the emulator off the snapshot is the ring, hook path or not"
     );
-    assert!(!hooks_only.alt_screen);
+    assert_eq!(hooks_only.alt_screen, None);
 }

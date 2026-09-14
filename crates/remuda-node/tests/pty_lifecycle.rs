@@ -51,6 +51,7 @@ fn create_req(kind: AgentKind, driver: DriverKind) -> CreateInstanceRequest {
         resume_session_id: None,
         resumed_from: None,
         effort: None,
+        tui: None,
     }
 }
 

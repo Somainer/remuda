@@ -43,10 +43,10 @@
 
 ## 检查记录
 
-- `cargo fmt` / `clippy` / touched crates `cargo test`
-- `pnpm --dir web lint` / `typecheck` / `vitest`（27 个 workflow 测试，全套 233+ 测试）
-- `just gen-types` 后 `web/src/types/generated.ts` 与 schema 同步
-- `pnpm --dir web run test:e2e:hub`（ux-workflow-card）于 flock 下通过
+- `cargo fmt --all --check` / `cargo clippy --workspace --all-targets` / touched crates `cargo test`（post-merge origin/main）
+- `pnpm --dir web lint` / `typecheck` / `vitest`（27 个 workflow 测试，全套 672 测试）
+- `cargo run -p remuda-protocol --example gen_types` 后 `web/src/types/generated.ts` 与 schema 同步
+- hub-live e2e：`ux-workflow-card.hub.spec.ts` 6/6（flock + 规定端口/WS 环境）；spec 按批次约定命名为 `.hub.spec.ts`，config 以数组形式追加 `/\.hub\.spec\.ts$/`
 - `./scripts/ci/secret-scan.sh` 通过
 
 ## 截图

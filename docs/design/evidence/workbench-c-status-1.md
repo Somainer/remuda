@@ -1,7 +1,8 @@
 # 工作台 C1 实跑证据：状态词汇、通知接口、持久错误、可访问播报
 
 - 日期：2026-09-14
-- 分支：`wt/ux-c1/status-vocabulary-and-notify`，基线 `origin/main` = `3da158d`
+- 分支：`wt/ux-c1/status-vocabulary-and-notify`，起点 `origin/main` = `3da158d`
+  （期间 main 已推进到 `31dbbe4`；该区间未触碰本批次任何文件，合并干净）
 - 对应需求：[workbench-ux-exploration.md](../workbench-ux-exploration.md) §5 P0-3；
   执行计划 [workbench-ux-plan.md](../workbench-ux-plan.md) §2 通知契约、§3 字段映射、§4 风险 4
 - 数据来源：单元测试用合成 fixture；e2e 用 `crates/remuda-hub/examples/hub_e2e.rs`

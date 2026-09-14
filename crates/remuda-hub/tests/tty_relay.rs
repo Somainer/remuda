@@ -739,16 +739,47 @@ async fn unacknowledged_creates_expire_and_release_the_placement_cap() -> Result
     let mut config = HubConfig::for_test(dir.path().join("data"));
     // A tiny window so the sweeper fires within the test.
     config.requested_grace_ms = 1;
+    // The fake Node never acknowledges; its RPC must fail fast instead of
+    // burning the production 5s accept deadline. With the real deadline the
+    // create POST took ~5s, which on a loaded host outran the drain task's
+    // fixed socket lifetime and the host went offline before the retry.
+    config.command_accept_timeout_ms = 50;
     let hub = spawn(config).await?;
     let cookie = login(hub.addr, &hub.bootstrap_token).await?;
     let host_id = HostId::new();
     let enroll = enroll_token(hub.addr, &cookie).await?;
 
-    // A Node that accepts nothing: every create stays `requested`.
-    let (mut node, _) = node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    // A Node that accepts nothing: every create stays `requested`. This task
+    // owns the socket for the *entire* test — there is no wall-clock deadline
+    // that could close it — drains every frame the Hub forwards, and heartbeats
+    // like a real idle Node, so the host cannot lapse offline under load.
+    let (node, _) = node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    let (mut node_tx, mut node_rx) = node.split();
     let deaf = tokio::spawn(async move {
-        while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(6), node.next()).await
-        {
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(250));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                incoming = node_rx.next() => {
+                    if !matches!(incoming, Some(Ok(_))) {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "node.heartbeat",
+                        "params": {}
+                    });
+                    if node_tx
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
         }
     });
     let (status, _, body) = http(

@@ -928,8 +928,14 @@ fn spawn_transcript_pump(
                 // A read error is transient (the file is being appended to);
                 // the next tick retries from the same offset.
                 let lines = tail.poll().unwrap_or_default();
-                for line in lines {
-                    let mapped = match mapper.map_line(&line) {
+                // Flush the buffered assistant run at the end of the batch:
+                // the mapper holds a run open until it is superseded, so the
+                // final message of a finished turn would otherwise wait for
+                // the next record to arrive.
+                let mut batches: Vec<_> = lines.iter().map(|line| mapper.map_line(line)).collect();
+                batches.push(mapper.flush());
+                for batch in batches {
+                    let mapped = match batch {
                         Ok(mapped) => mapped,
                         Err(error) => {
                             tracing::debug!(%error, "transcript line did not map");

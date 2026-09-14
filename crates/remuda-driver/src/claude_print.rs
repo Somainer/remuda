@@ -127,6 +127,9 @@ struct Live {
 #[path = "claude_print_stream.rs"]
 mod stream;
 
+#[path = "claude_transcript_records.rs"]
+mod records;
+
 struct Mapper {
     stream: stream::StreamState,
     ids: NativeIds,
@@ -861,6 +864,9 @@ fn user_text_message(
             target_block: None,
             parent_tool_call_id: None,
             native_origin: known_or_unknown(uuid),
+            // Overwritten by the transcript mapper, which has the evidence to
+            // classify. stdout `user` frames are the prompt we just sent.
+            origin: Some(remuda_protocol::MessageOrigin::Human),
             status: ContentStatus::Complete,
         })),
     )
@@ -1756,10 +1762,27 @@ fn workflow_state(status: &str) -> WorkflowState {
 /// The transcript on disk holds the same `user` / `assistant` records the
 /// stream-json stdout carries, so a promoted `shell-pty` terminal (D-025) can
 /// hydrate a structured view through exactly this mapper rather than a second
-/// parser. Records that are not conversation content (`mode`, `atis-latch`,
-/// `file-history-snapshot`, hook attachments, …) map to nothing.
+/// parser.
+///
+/// Three D-028 §7 behaviours live here on top of that replay:
+///
+/// - **Regrouping.** One record holds one content block and 2–7 records share a
+///   `message.id`; they are buffered by [`records::GroupKey`] and replayed as
+///   one message once the run is superseded. Feeding them individually is what
+///   slid the tool bookkeeping by one.
+/// - **Authorship.** Every `user` record is classified into a
+///   [`MessageOrigin`], so injected skill bodies and hook context stop
+///   masquerading as the human's words.
+/// - **Retention.** `queue-operation`, `permission-mode` and
+///   `attachment.queued_command` records are journaled as lifecycle rather
+///   than dropped: they are the queue ledger and the mode-drift record.
 pub struct TranscriptMapper {
     mapper: Mapper,
+    group: records::Group,
+    /// `(promptId, text)` of human prompts already emitted, for dedup.
+    seen_prompts: std::collections::HashSet<(String, String)>,
+    /// Record uuids already mapped, so a re-read tail cannot double-emit.
+    seen_uuids: std::collections::HashSet<String>,
 }
 
 impl TranscriptMapper {
@@ -1791,6 +1814,9 @@ impl TranscriptMapper {
                 driver_kind: driver,
                 channel: SourceChannel::Transcript,
             },
+            group: records::Group::default(),
+            seen_prompts: std::collections::HashSet::new(),
+            seen_uuids: std::collections::HashSet::new(),
         }
     }
 
@@ -1807,28 +1833,25 @@ impl TranscriptMapper {
         self.map_record(value)
     }
 
-    /// Map one decoded transcript record.
-    pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
-        // Only conversation records reach the transcript mapper. Everything
-        // else in the file is Claude's own bookkeeping and is not journaled.
-        if !matches!(
-            value.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
+    /// Flush whatever assistant run is still buffered.
+    ///
+    /// A run is normally closed by the record that supersedes it, so the last
+    /// message of a transcript would otherwise sit in the buffer forever. The
+    /// tailer calls this when it reaches the end of the available input.
+    pub fn flush(&mut self) -> DriverResult<Vec<Observation>> {
+        self.flush_group()
+    }
+
+    /// Emit the buffered assistant run, if there is one.
+    fn flush_group(&mut self) -> DriverResult<Vec<Observation>> {
+        let Some(record) = self.group.flush() else {
             return Ok(Vec::new());
-        }
-        // A sidechain record belongs to a sub-agent's own transcript view; the
-        // main conversation is what the 结构 tab renders.
-        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            return Ok(Vec::new());
-        }
-        if let Some(session) = value.get("sessionId").and_then(Value::as_str)
-            && !session.is_empty()
-        {
-            self.mapper.session_id = session.to_owned();
-        }
-        // Transcript records nest the wire frame under `message`; lift it so the
-        // stdout mapper sees the shape it already knows.
+        };
+        self.emit_conversation(record)
+    }
+
+    /// Hand one already-assembled record to the stdout mapper.
+    fn emit_conversation(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
         let Some(message) = value.get("message").cloned() else {
             return Ok(Vec::new());
         };
@@ -1847,10 +1870,197 @@ impl TranscriptMapper {
                 frame.insert(wire.into(), found.clone());
             }
         }
-        map_outbound(
+        // The link from a result back to its call. `parentToolUseId` — what this
+        // mapper used to read — does not occur in a transcript at all (0 hits);
+        // `sourceToolUseID` is the key Claude actually writes.
+        if let Some(source) = value.get("sourceToolUseID").and_then(Value::as_str) {
+            frame.insert("parent_tool_use_id".into(), Value::String(source.into()));
+        }
+        let mut out = map_outbound(
             &mut self.mapper,
             &Outbound::from_value(Value::Object(frame)),
-        )
+        )?;
+        // Stamp authorship on the messages this record produced. Tool results
+        // and tool calls carry their own identity and are left alone.
+        if value.get("type").and_then(Value::as_str) == Some("user") {
+            let origin = records::classify_user_record(&value, &value["message"]);
+            for observation in &mut out {
+                if let ObservationPayload::Message(payload) = &mut observation.body
+                    && payload.role == MessageRole::User
+                {
+                    payload.origin = Some(origin);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Map one decoded transcript record.
+    pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        // A sidechain record belongs to a sub-agent's own transcript view; the
+        // main conversation is what the 结构 tab renders.
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return Ok(Vec::new());
+        }
+        if let Some(session) = value.get("sessionId").and_then(Value::as_str)
+            && !session.is_empty()
+        {
+            self.mapper.session_id = session.to_owned();
+        }
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "assistant" => self.map_assistant_record(value),
+            "user" => {
+                // Any user record ends the assistant run before it.
+                let mut out = self.flush_group()?;
+                out.extend(self.map_user_record(value)?);
+                Ok(out)
+            }
+            // §7: the queue ledger and mode drift are not conversation content,
+            // but dropping them loses the evidence for what the composer showed.
+            "queue-operation" => self.map_queue_operation(&value),
+            "permission-mode" | "mode" => self.map_permission_mode(&value),
+            "attachment" => self.map_attachment(&value),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Buffer an assistant record, flushing the previous run when superseded.
+    fn map_assistant_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        let message = value.get("message").cloned().unwrap_or(Value::Null);
+        let Some(key) = records::GroupKey::of(&value, &message) else {
+            // No `message.id` to group on — replay it on its own rather than
+            // dropping a real assistant turn.
+            let mut out = self.flush_group()?;
+            out.extend(self.emit_conversation(value)?);
+            return Ok(out);
+        };
+        if self.group.continues(&key) {
+            self.group.push(&value, &message);
+            return Ok(Vec::new());
+        }
+        let out = self.flush_group()?;
+        self.group.start(key, value.clone());
+        self.group.push(&value, &message);
+        Ok(out)
+    }
+
+    /// Map a user record, dropping only exact re-deliveries of one prompt.
+    fn map_user_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        let message = value.get("message").cloned().unwrap_or(Value::Null);
+        if message.is_null() {
+            return Ok(Vec::new());
+        }
+        // A tail that re-reads the file must not re-emit what it already sent.
+        if let Some(uuid) = value.get("uuid").and_then(Value::as_str)
+            && !self.seen_uuids.insert(uuid.to_owned())
+        {
+            return Ok(Vec::new());
+        }
+        // The same human prompt lands twice when it is enqueued and then
+        // delivered. Both records share a `promptId`, so the pair is only a
+        // duplicate when the text matches too — two different prompts queued
+        // under one id are two real messages.
+        let origin = records::classify_user_record(&value, &message);
+        if origin == remuda_protocol::MessageOrigin::Human
+            && let Some(prompt_id) = value.get("promptId").and_then(Value::as_str)
+        {
+            let text = records::record_text(&message);
+            if !text.trim().is_empty()
+                && !self
+                    .seen_prompts
+                    .insert((prompt_id.to_owned(), text.clone()))
+            {
+                return Ok(Vec::new());
+            }
+        }
+        self.emit_conversation(value)
+    }
+
+    /// `queue-operation` → a queue lifecycle carrying enqueue / dequeue / remove.
+    ///
+    /// §7: Remuda's own `pty_queue` stays the authority for the queue; this is
+    /// the reconciliation evidence beside it, which is why it is journaled as a
+    /// lifecycle rather than turned into a message.
+    fn map_queue_operation(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        let operation = value
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut related = std::collections::BTreeMap::new();
+        related.insert("operation".into(), operation.to_owned());
+        if let Some(reason) = value.get("reason").and_then(Value::as_str) {
+            related.insert("reason".into(), reason.to_owned());
+        }
+        if let Some(content) = value.get("content").and_then(Value::as_str) {
+            related.insert("content".into(), content.to_owned());
+        }
+        // The journal status the composer reads: an enqueue leaves the text
+        // queued, everything else releases it.
+        let status = match operation {
+            "enqueue" => "queued",
+            "dequeue" | "remove" => "dequeued",
+            other => other,
+        };
+        let session_id = self.mapper.session_id.clone();
+        Ok(vec![self.mapper.lifecycle_related(
+            LifecycleTopic::Turn,
+            "queue-operation",
+            Knowledge::Known { value: session_id },
+            status,
+            related,
+            false,
+        )?])
+    }
+
+    /// `permission-mode` / `mode` → a permission lifecycle recording the drift.
+    fn map_permission_mode(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        let mode = value
+            .get("mode")
+            .or_else(|| value.get("permissionMode"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let session_id = self.mapper.session_id.clone();
+        Ok(vec![self.mapper.lifecycle_related(
+            LifecycleTopic::Permission,
+            "permission-mode",
+            Knowledge::Known { value: session_id },
+            mode,
+            std::collections::BTreeMap::new(),
+            false,
+        )?])
+    }
+
+    /// `attachment` → only `queued_command` is journaled.
+    ///
+    /// §7 [V]: `attachment.queued_command` is the delivery evidence for a
+    /// queued message and is **not** a `user` record, so a mapper that only
+    /// tails user/assistant misses it entirely. It keeps the *enqueue*
+    /// timestamp, so it is ordered by file position, never by its own clock.
+    /// The other attachment subtypes (`hook_success`, `skill_listing`,
+    /// `agent_listing_delta`, …) are Claude's own bookkeeping.
+    fn map_attachment(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        let attachment = value.get("attachment").unwrap_or(&Value::Null);
+        if attachment.get("type").and_then(Value::as_str) != Some("queued_command") {
+            return Ok(Vec::new());
+        }
+        let mut related = std::collections::BTreeMap::new();
+        related.insert("operation".into(), "delivered".into());
+        for (key, field) in [("content", "command"), ("content", "content")] {
+            if let Some(text) = attachment.get(field).and_then(Value::as_str) {
+                related.insert(key.into(), text.to_owned());
+                break;
+            }
+        }
+        let session_id = self.mapper.session_id.clone();
+        Ok(vec![self.mapper.lifecycle_related(
+            LifecycleTopic::Turn,
+            "queued-command",
+            Knowledge::Known { value: session_id },
+            "dequeued",
+            related,
+            false,
+        )?])
     }
 }
 

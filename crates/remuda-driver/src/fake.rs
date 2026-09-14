@@ -234,6 +234,8 @@ impl Driver for FakeDriver {
                     reason: "stub".into(),
                     evidence_event_ids: vec![],
                 },
+                // Assistant output; never an injected user record.
+                origin: Some(remuda_protocol::MessageOrigin::Human),
                 status: ContentStatus::Complete,
             }));
             for (index, payload) in [lifecycle, message].into_iter().enumerate() {
@@ -337,6 +339,8 @@ impl Driver for FakeDriver {
                 reason: "stub".into(),
                 evidence_event_ids: vec![],
             },
+            // Assistant output; never an injected user record.
+            origin: Some(remuda_protocol::MessageOrigin::Human),
             status: ContentStatus::Complete,
         })))
         .await?;

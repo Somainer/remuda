@@ -826,14 +826,25 @@ fn spawn_observation_pump(
             // are journaled but the instance still follows `agent_status`,
             // which is a screen guess — the composer would keep believing the
             // screen over the harness's own account of what it is doing.
-            if let Some(activity) = crate::signal::hook_activity(&observation)
+            //
+            // File turn lifecycles only fold for a kind that actually has a
+            // file-tail adapter (codex/grok); the registry is the single
+            // lookup for that rather than another per-kind branch here.
+            let file_activity = match store.get_instance(&instance_id) {
+                Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
+                    crate::signal::file_activity(&observation)
+                }
+                _ => None,
+            };
+            let activity = crate::signal::hook_activity(&observation).or(file_activity);
+            if let Some(activity) = activity
                 && let Err(error) = store.set_instance_state(
                     &instance_id,
                     None,
                     Some(remuda_protocol::Knowledge::Known { value: activity }),
                 )
             {
-                tracing::warn!(%error, "hook activity not applied");
+                tracing::warn!(%error, "hook/file activity not applied");
             }
             match store.append_driver_observation(&instance_id, observation) {
                 Ok(committed) => {

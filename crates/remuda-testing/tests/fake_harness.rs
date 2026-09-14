@@ -716,3 +716,177 @@ fn yaml_scenario_loads() {
         .unwrap_or_default();
     assert!(transcript.contains("SPIKE_COMPLETE YAML"));
 }
+
+// ===========================================================================
+// D-028 P6: production file adapters against fake-harness artifacts
+// ===========================================================================
+
+use remuda_driver::adapters::{AdapterHome, CodexAdapter, FileSignalAdapter, GrokAdapter};
+use remuda_protocol::{LifecycleTopic, ObservationPayload, SourceChannel};
+
+fn kinds(
+    observations: &[remuda_driver::adapters::AdapterObservation],
+) -> Vec<(LifecycleTopic, String)> {
+    observations
+        .iter()
+        .filter_map(|o| match &o.payload {
+            ObservationPayload::Lifecycle(box_payload) => match box_payload.as_ref() {
+                remuda_protocol::LifecyclePayload::Native(n) => {
+                    Some((n.topic, n.native_name.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn p6_codex_adapter_lifecycle_messages_tools_and_usage_from_a_live_fake() {
+    let _serial = support::serial();
+    let mut h = HarnessBuilder::new("codex")
+        .scenario("approval.json")
+        .spawn();
+    h.submit("RUN_TOOL");
+    // approval.json's tool asks on screen; approve it so a result is written.
+    h.press_digit(1);
+    h.wait_exit(WAIT);
+
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: h.home().to_path_buf(),
+        cwd: h.home().to_path_buf(),
+        pid: Some(h.pid()),
+    });
+    let observed = adapter.poll().expect("adapter poll");
+    assert!(
+        adapter.session_id().is_some(),
+        "discovered the rollout session"
+    );
+    // Every fact is a file-channel fact.
+    assert!(observed.iter().all(|o| o.channel == SourceChannel::File));
+    let lifecycle = kinds(&observed);
+    assert!(
+        lifecycle
+            .iter()
+            .any(|(topic, name)| *topic == LifecycleTopic::Turn && name == "task_started"),
+        "saw task_started: {lifecycle:?}"
+    );
+    assert!(
+        lifecycle
+            .iter()
+            .any(|(topic, name)| *topic == LifecycleTopic::Turn && name == "task_complete"),
+        "saw task_complete: {lifecycle:?}"
+    );
+    // Content: at least one user message, assistant message, tool call/result.
+    assert!(observed
+        .iter()
+        .any(|o| matches!(&o.payload, ObservationPayload::Message(m) if m.role == remuda_protocol::MessageRole::User)));
+    assert!(
+        observed
+            .iter()
+            .any(|o| matches!(&o.payload, ObservationPayload::ToolCall(_)))
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|o| matches!(&o.payload, ObservationPayload::ToolResult(_)))
+    );
+    // Usage: the ok scenario writes a token_usage_record → session snapshot.
+    assert!(
+        observed
+            .iter()
+            .any(|o| matches!(&o.payload, ObservationPayload::Usage(u)
+                if u.scope == remuda_protocol::UsageScope::Session
+                    && u.accounting == remuda_protocol::Accounting::Estimated)),
+        "estimated session usage emitted"
+    );
+}
+
+#[test]
+fn p6_codex_adapter_records_an_interrupted_turn_from_a_live_fake() {
+    let _serial = support::serial();
+    let mut h = HarnessBuilder::new("codex").scenario("slow.json").spawn();
+    h.submit("SLOW");
+    // Esc while the long tool is running aborts the turn.
+    h.press(Key::Esc);
+    h.wait_any(&["interrupt"], WAIT);
+    h.shutdown();
+
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: h.home().to_path_buf(),
+        cwd: h.home().to_path_buf(),
+        pid: Some(h.pid()),
+    });
+    let observed = adapter.poll().expect("poll");
+    assert!(
+        observed.iter().any(|o| matches!(
+            &o.payload,
+            ObservationPayload::Lifecycle(box_payload)
+                if matches!(box_payload.as_ref(),
+                    remuda_protocol::LifecyclePayload::Native(n)
+                        if n.native_name == "turn_aborted")
+        )),
+        "Esc produced a turn_aborted lifecycle"
+    );
+}
+
+#[test]
+fn p6_grok_adapter_chunks_turns_and_tools_from_a_live_fake() {
+    let _serial = support::serial();
+    let mut h = HarnessBuilder::new("grok")
+        .scenario("approval.json")
+        .spawn();
+    h.submit("RUN_TOOL");
+    // The registry is removed at shutdown, so discover (and drain the
+    // in-progress stream) while the TUI is alive, exactly as the 250 ms
+    // supervisor does in production.
+    let mut adapter = GrokAdapter::new(AdapterHome {
+        home: h.home().to_path_buf(),
+        cwd: h.home().to_path_buf(),
+        pid: Some(h.pid()),
+    });
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut observed = Vec::new();
+    while adapter.session_id().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        observed.extend(adapter.poll().unwrap());
+    }
+    assert!(adapter.session_id().is_some(), "active_sessions discovery");
+    h.wait_event("approval_prompt", |_| true, WAIT);
+    h.press_digit(2); // "Yes, proceed"
+    h.wait_exit(WAIT);
+    observed.extend(adapter.poll().expect("poll"));
+    let lifecycle = kinds(&observed);
+    assert!(
+        lifecycle
+            .iter()
+            .any(|(t, n)| *t == LifecycleTopic::Turn && n == "turn_started")
+    );
+    assert!(
+        lifecycle
+            .iter()
+            .any(|(t, n)| *t == LifecycleTopic::Turn && n == "turn_ended")
+    );
+    // Chunk-level streaming: at least one append, plus a close.
+    let operations: Vec<_> = observed
+        .iter()
+        .filter_map(|o| match &o.payload {
+            ObservationPayload::Message(m) => Some(m.mutation.operation),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        operations.contains(&remuda_protocol::MutationOperation::Close),
+        "chunks closed into a complete message"
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|o| matches!(&o.payload, ObservationPayload::ToolCall(_)))
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|o| matches!(&o.payload, ObservationPayload::ToolResult(_)))
+    );
+}

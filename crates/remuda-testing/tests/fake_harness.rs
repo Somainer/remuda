@@ -41,6 +41,7 @@ fn claude_artifacts_parse_with_the_transcript_mapper() {
         .spawn();
     h.submit("RUN_TOOL");
     // Native approval dialog: single approval.
+    h.wait_event("approval_prompt", |_| true, WAIT);
     h.press_digit(1);
     h.wait_exit(WAIT);
     let path = h
@@ -272,6 +273,21 @@ fn claude_hooks_round_trip_with_observed_events() {
             "missing hook event {required}: {names:?}"
         );
     }
+    let session_start = events
+        .iter()
+        .find(|row| row["event"] == "SessionStart")
+        .expect("SessionStart stdin");
+    let transcript_path = session_start["payload"]["transcript_path"]
+        .as_str()
+        .expect("SessionStart must let the production driver bind its transcript");
+    assert_eq!(
+        std::fs::canonicalize(transcript_path).unwrap(),
+        std::fs::canonicalize(
+            h.find_file("00000000-0000-4000-8000-000000000001.jsonl")
+                .expect("native transcript")
+        )
+        .unwrap()
+    );
     let permission = events
         .iter()
         .find(|row| row["event"] == "PermissionRequest")

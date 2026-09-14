@@ -100,6 +100,32 @@ function TranscriptInner({
   const instanceId = routeInstanceId;
   const saved = useMemo(() => (instanceId ? readPosition(instanceId) : null), [instanceId]);
 
+  // The route keeps this component mounted while the reader moves directly
+  // between sessions (tab switch). Per-instance refs must therefore reset on
+  // an id change, or one session's "already restored"/pin state would leak
+  // into the next. The reset runs during render (not in an effect) so React
+  // StrictMode's dev-time mount replay cannot wipe a restore set by the
+  // passive restore effect.
+  const [instanceEpoch, setInstanceEpoch] = useState(instanceId);
+  const restoredRef = useRef(false);
+  // Follow state restores from the last visit; a brand-new session pins.
+  const pinRef = useRef(saved ? saved.follow : true);
+  const scrollTopRef = useRef(0);
+  const saveTimer = useRef<number | null>(null);
+  const pendingScroll = useRef<
+    | { kind: "index"; index: number; offset: number; tries: number }
+    | { kind: "restore"; anchorId: string; offset: number; tries: number }
+    | null
+  >(null);
+  if (instanceEpoch !== instanceId) {
+    setInstanceEpoch(instanceId);
+    restoredRef.current = false;
+    pinRef.current = saved ? saved.follow : true;
+    scrollTopRef.current = 0;
+    pendingScroll.current = null;
+    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+  }
+
   const [showInjected, setShowInjected] = useState(readShowInjected);
   const assembled = useMemo(
     () => compactTranscript(assembleTranscript(events, bubbles), compact),
@@ -120,7 +146,6 @@ function TranscriptInner({
   const scrollerRef = useRef<HTMLDivElement>(null);
   // Latest scroll offset in a ref: passive-effect cleanup runs after refs are
   // detached on unmount, so the leave-session flush cannot read the DOM.
-  const scrollTopRef = useRef(0);
   const viewportRef = useRef(720);
   // Per-row height used for geometry the window has not measured yet. It is
   // seeded from the last visit's measured average and converges to this
@@ -132,12 +157,10 @@ function TranscriptInner({
   useLayoutEffect(() => {
     estimateRef.current = estimate;
   }, [estimate]);
-  // Follow state restores from the last visit; a brand-new session pins.
-  const pinRef = useRef(saved ? saved.follow : true);
   const nodesRef = useRef(nodes);
   const sizesHold = useRef(sizes);
-  const restoredRef = useRef(false);
-  const saveTimer = useRef<number | null>(null);
+  // saveTimer and pendingScroll are declared with the other per-instance
+  // refs above so the route-switch reset can clear them.
   // A scroll request toward a row whose size the window has not measured yet
   // (a search hit, j/k navigation, or a saved anchor) is refined as
   // ResizeObserver reports the real heights — see the pendingScroll effect.
@@ -252,12 +275,8 @@ function TranscriptInner({
   }, []);
 
   // Refine an estimated scroll (search hit, saved position) as the window
-  // measures the rows around it.
-  const pendingScroll = useRef<
-    | { kind: "index"; index: number; offset: number; tries: number }
-    | { kind: "restore"; anchorId: string; offset: number; tries: number }
-    | null
-  >(null);
+  // measures the rows around it. pendingScroll is declared with the other
+  // per-instance refs so the route-switch reset can clear it.
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     const pending = pendingScroll.current;

@@ -6,10 +6,20 @@ const webPort = process.env.HUB_E2E_WEB_PORT ?? "58889";
 const origin = `http://127.0.0.1:${webPort}`;
 /** Fake Anthropic-Messages gateway the provider-discovery spec probes. */
 const upstream = process.env.HUB_E2E_UPSTREAM_LISTEN ?? "127.0.0.1:58881";
+// Visible to spec modules (same runner process): lets a spec that runs under
+// both configs (new-session.spec.ts) separate its hub-live cases from the
+// mock-backed ones.
+process.env.REMUDA_E2E_BACKEND = "hub";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|session-virtual)\.spec\.ts/,
+  // New hub-backed specs follow the wt/ux-g2 naming convention
+  // <name>.hub.spec.ts and match the second pattern automatically; until that
+  // lands on main the existing inline list stays in the first.
+  testMatch: [
+    /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|ux-quickfind|new-session)\.spec\.ts/,
+    /\.hub\.spec\.ts$/,
+  ],
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),
@@ -53,10 +63,6 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      // session-virtual is dual-mode: its 2,000-event synthetic fixture runs
-      // against the Vite mock; hub mode runs the fake-node subset. The spec
-      // branches on this metadata so mock-only tests skip against the Hub.
-      metadata: { appMode: "hub" },
       use: {
         ...devices["Desktop Chrome"],
         // Google Chrome locally; bundled Chromium on CI or when PW_CHANNEL=chromium (hosts without Chrome).

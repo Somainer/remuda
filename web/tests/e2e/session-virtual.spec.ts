@@ -1,5 +1,4 @@
 import { expect, test, type Page } from "@playwright/test";
-import { login } from "./hub-auth";
 import {
   BATCH_E_DENIED_CALL,
   BATCH_E_FAILED_CALL,
@@ -9,25 +8,21 @@ import {
 } from "../../src/fixtures/session/batchE";
 
 /**
- * Workbench batch E — §5 P1-2 acceptance:
+ * Mock/Vite-backed batch of session-virtual.
  *
- * - in-transcript search hits *loaded* nodes outside the virtual window and
- *   scrolls to them (2,000-event synthetic fixture, mock mode);
- * - reading position and follow state survive leaving/re-entering a session;
- * - tool failures stay visible inline, never hidden behind a fold;
- * - streaming transcript text never reaches the live region (bounded change
- *   count, hub fake-node mode);
- * - searching never writes to the journal or drives the native session.
+ * The Hub + fake-node invariants (search writes nothing, reading position
+ * across real navigation, live-region silence during a streamed turn) live in
+ * session-virtual.hub.spec.ts, picked up only by playwright.hub.config.ts.
  *
- * The 2,000-event geometry tests run against the Vite mock (the Hub fake node
- * appends events one at a time and cannot synthesize that journal); the
- * streaming/no-write/restore invariants run against the Hub + fake node. The
- * hub Playwright project tags itself with metadata.appMode; the mock project
- * leaves metadata unset.
+ * Workbench batch E — §5 P1-2 acceptance covered here:
+ * - 2,000-event virtualization stays cheap;
+ * - in-transcript search hits *loaded* nodes outside the virtual window;
+ * - reading position and follow survive leaving/re-entering;
+ * - failed/denied tools stay visible inline, never folded away;
+ * - long TaskTrack prompts truncate with an expand affordance.
  */
 
 const HUB_BATCH_E = "/s/ins_mock_batch_e";
-const hubMode = (info: { project: { metadata: Record<string, unknown> } }) => info.project.metadata.appMode === "hub";
 
 function row(page: Page, text: string) {
   return page.getByTestId("session-row").filter({ hasText: text }).first();
@@ -46,10 +41,6 @@ async function openNamedSession(page: Page, title: string) {
 }
 
 test.describe("transcript virtualization and session chrome", () => {
-  test.beforeEach(({ }, info) => {
-    test.skip(hubMode(info), "mock-fixture cases run under the Vite mock config");
-  });
-
   test("2000-event fixture stays windowed and jump-to-latest is cheap", async ({ page }, info) => {
     test.skip(info.project.name === "mobile-webkit", "scroll perf case is desktop");
     await page.goto("/s/ins_mock_long");
@@ -118,8 +109,7 @@ test.describe("transcript virtualization and session chrome", () => {
 });
 
 test.describe("batch E: in-transcript search on the 2000-event fixture", () => {
-  test.beforeEach(async ({ page }, info) => {
-    test.skip(hubMode(info), "2000-event synthetic journal is a Vite-mock fixture");
+  test.beforeEach(async ({ page }) => {
     await page.goto(HUB_BATCH_E);
     await expect(page.getByTestId("transcript")).toBeVisible();
     await expect(page.getByTestId("transcript-row")).not.toHaveCount(0);
@@ -193,8 +183,8 @@ test.describe("batch E: in-transcript search on the 2000-event fixture", () => {
     await page.getByTestId("transcript-search-prev").click();
     await page.getByTestId("transcript-search-close").click();
     // Search is a pure projection of assembled loaded nodes; the mock needs
-    // no request at all, and the fake-node Hub test below proves the same
-    // invariant against a real server.
+    // no request at all, and the fake-node Hub spec proves the same invariant
+    // against a real server.
     expect(writes).toEqual([]);
   });
 
@@ -264,242 +254,8 @@ test.describe("batch E: in-transcript search on the 2000-event fixture", () => {
   });
 
   test("the batch-e session is discoverable by its synthetic title", async ({ page }) => {
+    // Sanity: the fixture is registered and listed, not just routable.
     await page.goto("/sessions");
     await expect(page.getByTestId("session-row").filter({ hasText: BATCH_E_TITLE })).toBeVisible();
   });
 });
-
-// --- Hub fake-node subset ---------------------------------------------------
-
-test.describe("batch E: Hub fake-node invariants", () => {
-  /** Every mutating native-driving request; searching must add none. */
-  const NATIVE_ACTION = /\/v1\/instances\/[^/]+\/(?:commands|input|interrupt)$|\/v1\/interactions\/[^/]+\/answer$/;
-  const created: string[] = [];
-
-  test.beforeEach(async ({ page }, info) => {
-    test.skip(!hubMode(info), "fake-node cases run under test:e2e:hub");
-    await login(page);
-    await raiseCap(page, 24);
-  });
-
-  test.afterEach(async ({ page }, info) => {
-    if (!hubMode(info)) return;
-    for (const id of created.splice(0)) {
-      await page.evaluate(async (instanceId) => {
-        await fetch(`/v1/instances/${instanceId}?force=1`, { method: "DELETE", credentials: "include" }).catch(() => {});
-      }, id);
-    }
-  });
-
-  test.afterAll(async ({ browser }) => {
-    // Restore the shared fake node's fixture default (maxInstances:8) for
-    // the specs that run later in the serial suite.
-    const page = await browser.newPage();
-    try {
-      await login(page);
-      const hosts = await page.evaluate(async () => {
-        const response = await fetch("/v1/hosts", { credentials: "include" });
-        return response.json() as Promise<{ items?: { hostId?: string; id?: string; label?: string }[] }>;
-      });
-      const host = (hosts.items ?? []).find((h) => h.label === "e2e-fake-node");
-      if (host) {
-        await page.evaluate(
-          async (id) => {
-            await fetch(`/v1/hosts/${id}`, {
-              method: "PATCH",
-              credentials: "include",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ maxInstances: 8 }),
-            }).catch(() => {});
-          },
-          (host.hostId ?? host.id) as string,
-        );
-      }
-    } finally {
-      await page.close();
-    }
-  });
-
-  async function createSession(page: Page, prompt: string): Promise<string> {
-    await page.goto("/sessions/new");
-    const hostPicker = page.getByTestId("new-session-host");
-    await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
-    const hostId = await hostPicker.locator("option").filter({ hasText: "e2e-fake-node" }).getAttribute("value");
-    expect(hostId).toBeTruthy();
-    await hostPicker.selectOption(hostId!);
-    await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, { timeout: 20_000 });
-    await page.getByTestId("new-session-prompt").fill(prompt);
-    await expect(page.getByTestId("new-session-start")).toBeEnabled();
-    const creating = page.waitForResponse(
-      (response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/instances",
-    );
-    await page.getByTestId("new-session-start").click();
-    const response = await creating;
-    expect(response.ok()).toBe(true);
-    const instanceId = (await response.json()).instance.instanceId as string;
-    created.push(instanceId);
-    await expect(page).toHaveURL(new RegExp(`/s/${instanceId}`), { timeout: 20_000 });
-    return instanceId;
-  }
-
-  async function answerPending(page: Page, instanceId: string): Promise<void> {
-    await page.evaluate(async (id) => {
-      const list = await fetch("/v1/interactions", { credentials: "include" });
-      const body = (await list.json()) as {
-        items?: {
-          id: string;
-          instanceId?: string;
-          state?: string;
-          request?: { inputDigest?: string; options?: { id: string }[] };
-        }[];
-      };
-      for (const item of body.items ?? []) {
-        if (item.instanceId !== id || item.state !== "pending") continue;
-        const optionId = item.request?.options?.[0]?.id;
-        if (!optionId) continue;
-        await fetch(`/v1/interactions/${item.id}/answer`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ answer: { kind: "approval", optionId, inputDigest: item.request?.inputDigest ?? "" } }),
-        });
-      }
-    }, instanceId);
-  }
-
-  async function readySession(page: Page, prompt: string): Promise<string> {
-    const instanceId = await createSession(page, prompt);
-    await answerPending(page, instanceId);
-    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 30_000 });
-    return instanceId;
-  }
-
-  async function sendTurn(page: Page, prompt: string): Promise<void> {
-    const composer = page.getByTestId("composer-input");
-    await composer.fill(prompt);
-    await composer.press("Enter");
-    await expect(page.getByTestId("transcript")).toContainText(`echo: ${prompt}`, { timeout: 30_000 });
-  }
-
-  test("search is read-only: it never writes the journal or drives the native session", async ({ page }) => {
-    const marker = "zulu-4173";
-    await readySession(page, `seed ${marker}`);
-    await sendTurn(page, `followup ${marker}`);
-
-    const nativeWrites: string[] = [];
-    page.on("request", (request) => {
-      if (NATIVE_ACTION.test(new URL(request.url()).pathname) && request.method() !== "GET") {
-        nativeWrites.push(request.method());
-      }
-    });
-
-    await page.getByTestId("transcript-search-open").click();
-    const input = page.getByTestId("transcript-search-input");
-    await input.fill(marker);
-    await expect(page.getByTestId("transcript-search-count")).not.toHaveText("0/0");
-    await input.press("Enter");
-    await expect(page.locator('[data-search-current="1"]').first()).toBeVisible();
-    await page.getByTestId("transcript-search-prev").click();
-    await page.getByTestId("transcript-search-next").click();
-    await page.getByTestId("transcript-search-close").click();
-    await page.waitForTimeout(500);
-    expect(nativeWrites, `search issued native actions: ${nativeWrites.join(", ")}`).toEqual([]);
-  });
-
-  test("reading position and follow state survive leaving and re-entering", async ({ page }) => {
-    const instanceId = await readySession(page, "batch-e restore seed");
-    // Make the transcript scrollable WITHOUT relying on multiple turns: the
-    // fake node keeps reporting working after a send, so a second Enter
-    // becomes a queue rather than a turn. One long (wrapping) prompt produces
-    // a tall user bubble and an equally tall echo from a single instance.send.
-    const filler = `restore-filler ${Array.from({ length: 200 }, (_, i) => `line-${i}-padding`).join(" ")}`;
-    const composer = page.getByTestId("composer-input");
-    await composer.fill(filler);
-    await composer.press("Enter");
-    await expect(page.getByTestId("transcript")).toContainText("echo: restore-filler", { timeout: 30_000 });
-    const scroller = page.getByTestId("transcript-scroller");
-    await expect.poll(async () => scroller.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeGreaterThan(600);
-
-    await scroller.evaluate((el) => {
-      el.scrollTop = 0;
-      el.dispatchEvent(new Event("scroll", { bubbles: true }));
-    });
-    await expect(page.getByTestId("jump-latest")).toBeVisible();
-    await page.waitForTimeout(300);
-
-    await page.goto("/sessions");
-    await expect(page.getByTestId("session-list")).toBeVisible();
-    await page.goto(`/s/${instanceId}`);
-    await expect(page.getByTestId("transcript-row")).not.toHaveCount(0, { timeout: 15_000 });
-    expect(await scroller.evaluate((el) => el.scrollTop)).toBeLessThan(160);
-
-    // Re-pin and confirm follow itself is what restores.
-    await scroller.evaluate((el) => {
-      el.scrollTop = el.scrollHeight;
-      el.dispatchEvent(new Event("scroll", { bubbles: true }));
-    });
-    await page.waitForTimeout(300);
-    await page.goto("/sessions");
-    await page.goto(`/s/${instanceId}`);
-    await expect(page.getByTestId("transcript-row")).not.toHaveCount(0, { timeout: 15_000 });
-    const atBottom = await scroller.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight < 64);
-    expect(atBottom).toBe(true);
-  });
-
-  test("streaming transcript text produces a bounded number of live-region changes", async ({ page }) => {
-    await readySession(page, "batch-e stream seed");
-    const region = page.getByTestId("live-region");
-    await expect(region).toHaveAttribute("aria-live", "polite");
-    await expect(page.getByTestId("transcript")).toHaveAttribute("aria-live", "off");
-
-    // Count polite-region DOM mutations across the streamed turn. The counter
-    // lives on window because an evaluate() return value cannot keep a
-    // MutationObserver alive.
-    await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="live-region"]');
-      const w = window as unknown as { __batchELiveChanges?: number };
-      w.__batchELiveChanges = 0;
-      if (el) {
-        new MutationObserver(() => {
-          w.__batchELiveChanges = (w.__batchELiveChanges ?? 0) + 1;
-        }).observe(el, { childList: true, characterData: true, subtree: true });
-      }
-    });
-
-    await sendTurn(page, "stream bounded-region-delta-9931");
-    // Let any debounced announcement settle.
-    await page.waitForTimeout(800);
-    const count = await page.evaluate(() => (window as unknown as { __batchELiveChanges?: number }).__batchELiveChanges ?? 0);
-    // The whole open/append/close chain streamed body text: the polite region
-    // may carry unrelated app noise (announce + clear), but must not
-    // machine-gun once per chunk.
-    expect(count).toBeLessThanOrEqual(4);
-    const announced = (await region.textContent()) ?? "";
-    expect(announced).not.toContain("bounded-region-delta");
-  });
-});
-
-/** maxInstances:8 is shared across every hub spec; raise it for this file. */
-async function raiseCap(page: Page, to: number): Promise<void> {
-  const hosts = await page.evaluate(async () => {
-    const response = await fetch("/v1/hosts", { credentials: "include" });
-    return response.json() as Promise<{
-      items?: { hostId?: string; id?: string; label?: string; maxInstances?: number }[];
-    }>;
-  });
-  const host = (hosts.items ?? []).find((h) => h.label === "e2e-fake-node");
-  if (!host) return;
-  const hostId = (host.hostId ?? host.id) as string;
-  if ((host.maxInstances ?? 8) >= to) return;
-  await page.evaluate(
-    async ({ id, value }) => {
-      await fetch(`/v1/hosts/${id}`, {
-        method: "PATCH",
-        credentials: "include",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ maxInstances: value }),
-      });
-    },
-    { id: hostId, value: to },
-  );
-}

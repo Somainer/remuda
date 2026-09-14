@@ -17,7 +17,9 @@
 | `web/src/features/session/transcript.module.css`（新） | 本批样式；未编辑 `styles/ui.module.css`（批次 F 独占） |
 | `web/src/features/session/TaskTrack.tsx` | 长 prompt 两行截断 + 展开/收起；失败结果标注 |
 | `web/src/fixtures/session/batchE.ts`（新）、`web/src/lib/mock.ts` | 2,000 事件合成会话 `ins_mock_batch_e` |
-| `web/tests/e2e/session-virtual.spec.ts` | 双模式：mock 几何用例 + Hub fake-node 不变量 |
+| `web/tests/e2e/session-virtual.spec.ts` | mock/Vite 子集（原有 5 个 chrome 用例 + 本批 7 个几何用例） |
+| `web/tests/e2e/session-virtual.hub.spec.ts`（新） | Hub fake-node 子集（搜索只读、位置恢复、live region 边界），由 hub 配置的 `/\.hub\.spec\.ts$/` 规则选中 |
+| `web/playwright.hub.config.ts` / `web/playwright.config.ts` | testMatch 改为数组并加入 `/\.hub\.spec\.ts$/`；mock 配置 testIgnore 同步排除（wt/ux-g2 命名约定落地前的数组形式） |
 | 单测 | `assemble.test.ts`、`transcriptSearch.test.ts`、`readingPosition.test.ts`、`Transcript.test.tsx`、`TaskTrack.test.tsx`、`hubJournal.test.ts`（身份断言随契约更新） |
 
 ## 2. 稳定内容身份（需求：修订/追加到来时保持当前命中身份）
@@ -74,7 +76,7 @@
 
 ### 3.4 e2e 证据（Hub + fake node）
 
-hub 配置新增 project metadata `appMode: "hub"`，spec 据此分支。fake-node 子集中：
+hub 子集在 `session-virtual.hub.spec.ts`（按 wt/ux-g2 的 `<name>.hub.spec.ts` 命名约定，由 hub 配置的 `/\.hub\.spec\.ts$/` 规则选中；mock 配置 testIgnore 排除）。fake-node 子集中：
 
 - 创建会话、回答开业审批后发两轮带唯一标记 `zulu-4173` 的消息；监听所有指向 `/v1/instances/.../commands|input|interrupt` 与 `/v1/interactions/.../answer` 的非 GET 请求；搜索（输入、Enter、prev、next、关闭）后等待 500ms，原生动作写请求为 **0**。搜索不改 journal、不驱动原生会话得到真实验证。
 
@@ -107,14 +109,21 @@ hub 配置新增 project metadata `appMode: "hub"`，spec 据此分支。fake-no
 
 - `pnpm --dir web lint`：通过（仅既有 fast-refresh/set-state warning，无新增 error）。
 - `pnpm --dir web exec tsc -b`：通过。
-- `pnpm --dir web test`（vitest）：81 个文件、629 个用例全部通过；其中本批新增单测：assemble 稳定身份/失败 5 个、transcriptSearch 12 个、readingPosition 4 个、Transcript 组件 5 个、TaskTrack 4 个。
-- mock e2e（`playwright.config.ts`，session-virtual）：12 passed / 3 skipped（hub 用例在 mock project 下按 metadata 跳过；mobile-webkit 的桌面用例跳过）。
-- Hub e2e（`test:e2e:hub`，flock 串行）：结果见下方“最终运行结果”小节。
-- `./scripts/ci/secret-scan.sh`：见最终提交前记录。
+- `pnpm --dir web test`（vitest）：合并 `origin/main` 后 84 个文件、675 个用例全部通过；其中本批新增单测：assemble 稳定身份/失败 5 个、transcriptSearch 12 个、readingPosition 4 个、Transcript 组件 5 个、TaskTrack 4 个。
+- mock e2e（`playwright.config.ts`，`session-virtual.spec.ts`）：chromium 12 passed（mobile-webkit 的桌面用例跳过）。
+- Hub e2e（`test:e2e:hub`，flock 串行）：本批 fake-node 用例见 `session-virtual.hub.spec.ts`，结果见下方“最终运行结果”小节。
+- `./scripts/ci/secret-scan.sh`：通过。
 
 ### 最终运行结果
 
-（Hub e2e 完成后填写实际通过/失败与已知 flake 比对结论。）
+- mock 子集（`playwright.config.ts`，`session-virtual.spec.ts` chromium）：12 passed（mobile-webkit 的桌面用例按既有用法跳过）。
+- Hub 子集（`test:e2e:hub` 经 flock，`session-virtual.hub.spec.ts`）：3 passed——搜索只读、位置/follow 恢复、live region 有界。
+- 整套 `test:e2e:hub`（首次运行，2026-09-14 晚，含本批首次并入的 session-virtual）：24 passed / 2 failed / 2 did not run。
+  - 两个 failure：一个是本批自己的 restore 用例（在 fake node 上连续 Enter 撞上「working 期间再发会变 queue」的已知 fixture 行为，已改为单条超长 prompt 后通过）；另一个是 `providers-discovery` 的目录数断言 5 vs 0——属于本开发机已知的共享负载 flake（该 spec 单独重跑 3/3 通过；同样的失败在未改动的树上也出现）。
+  - “2 did not run” 是 serial describe `providers-discovery` 在首个用例失败后跳过的同文件后续用例，与本批代码无关。
+  - 修复后 `session-virtual.hub.spec.ts` 在合并 `origin/main`（含批次 B/D 与 g2 命名约定）后的树上重跑：3 passed（搜索只读 6.1s、位置/follow 恢复 8.8s、live region 有界 6.0s）。
+- 合并 `origin/main` 后：`tsc -b` 通过、vitest 84 个文件 675 个用例全部通过、mock e2e 12 passed、hub `.hub.spec.ts` 3 passed。
+- hub 配置改动遵循 wt/ux-g2 的新约定：未往 testMatch 内联列表加 spec，而是采用协调者指定的数组第二模式 `/\.hub\.spec\.ts$/`，新文件命名为 `session-virtual.hub.spec.ts`；mock 配置 testIgnore 同步排除 `*.hub.spec.ts`。
 
 ## 9. 未做与边界
 

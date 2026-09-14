@@ -87,6 +87,7 @@ const fn remuda_signal_events() -> &'static [&'static str] {
         "Stop",
         "StopFailure",
         "SessionEnd",
+        "SubagentStop",
         "Notification",
         "PreToolUse",
         "PostToolUse",
@@ -128,9 +129,11 @@ pub fn materialize_overlay(options: &OverlayOptions) -> DriverResult<HookOverlay
 ///
 /// The credential is deliberately *not* here: it reaches the relay through the
 /// child environment, because a command line is world-readable via `ps`.
+/// Explicit `exec` preserves the harness as the relay's parent even when the
+/// hook runner's `/bin/sh` does not optimize away its command interpreter.
 fn relay_command(options: &OverlayOptions, event: &str) -> String {
     format!(
-        "{} hook emit --socket {} --event {}",
+        "exec {} hook emit --socket {} --event {}",
         quote(&options.relay_binary.to_string_lossy()),
         quote(&options.socket_path.to_string_lossy()),
         quote(event),
@@ -225,6 +228,117 @@ pub fn ensure_overlay_argv(argv: &mut Vec<String>, overlay: &Path) -> DriverResu
     Ok(())
 }
 
+/// Merge an explicit CLI settings file (or inline JSON) with this session's
+/// overlay. Only the generated launch directory is written; the user's file
+/// and every unrelated argument stay intact. Like Claude's scalar CLI option,
+/// the last `--settings` value wins when it is repeated.
+pub fn merge_explicit_settings(overlay: &Path, argv: &mut Vec<String>) -> DriverResult<()> {
+    let mut remaining = Vec::new();
+    let mut explicit = None;
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            remaining.push(arg.clone());
+            remaining.extend(args.cloned());
+            break;
+        }
+        if arg == "--settings" {
+            explicit = Some(
+                args.next()
+                    .ok_or_else(|| {
+                        DriverError::SettingsIsolationUnavailable(
+                            "--settings requires a value".into(),
+                        )
+                    })?
+                    .clone(),
+            );
+        } else if let Some(value) = arg.strip_prefix("--settings=") {
+            explicit = Some(value.to_owned());
+        } else {
+            remaining.push(arg.clone());
+        }
+    }
+    let mut destination = overlay.to_path_buf();
+    if let Some(explicit) = explicit {
+        let bytes = if explicit.trim_start().starts_with('{') {
+            explicit.into_bytes()
+        } else {
+            std::fs::read(explicit)?
+        };
+        let mut settings: Value = serde_json::from_slice(&bytes)?;
+        if !settings.is_object() {
+            return Err(DriverError::SettingsIsolationUnavailable(
+                "--settings must contain a JSON object".into(),
+            ));
+        }
+        let generated: Value = serde_json::from_slice(&std::fs::read(overlay)?)?;
+        // The generated overlay owns hook registration and the three terminal
+        // keys; all other user settings, including env and own hooks, survive.
+        if let Some(hooks) = generated.get("hooks").and_then(Value::as_object) {
+            let target = settings
+                .as_object_mut()
+                .ok_or_else(|| {
+                    DriverError::SettingsIsolationUnavailable("settings must be an object".into())
+                })?
+                .entry("hooks")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| {
+                    DriverError::SettingsIsolationUnavailable("hooks must be an object".into())
+                })?;
+            for (event, matchers) in hooks {
+                let entries = target
+                    .entry(event.clone())
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .ok_or_else(|| {
+                        DriverError::SettingsIsolationUnavailable(format!(
+                            "{event} hooks must be an array"
+                        ))
+                    })?;
+                for matcher in matchers.as_array().into_iter().flatten() {
+                    if !entries.contains(matcher) {
+                        entries.push(matcher.clone());
+                    }
+                }
+            }
+        }
+        for key in [
+            "tui",
+            "showStatusInTerminalTab",
+            "terminalProgressBarEnabled",
+        ] {
+            if let Some(value) = generated.get(key) {
+                settings[key] = value.clone();
+            }
+        }
+        let launch = overlay.parent().ok_or_else(|| {
+            DriverError::SettingsIsolationUnavailable("overlay has no launch directory".into())
+        })?;
+        // One immutable overlay per invocation: a nested launch cannot replace
+        // the file an already running Claude might reread.
+        destination = launch.join(format!(
+            "settings-{}.json",
+            remuda_protocol::RunId::new().as_id()
+        ));
+        write_private(&destination, &serde_json::to_vec_pretty(&settings)?, 0o600)?;
+    }
+    let mut injected = vec![
+        "--settings".into(),
+        destination.to_string_lossy().into_owned(),
+    ];
+    if !remaining
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--setting-sources" || arg.starts_with("--setting-sources="))
+    {
+        injected.extend(["--setting-sources".into(), "user,project,local".into()]);
+    }
+    injected.extend(remaining);
+    *argv = injected;
+    Ok(())
+}
+
 /// Shadow config directory for a non-claude harness (§5.1).
 ///
 /// Reserved, not implemented: codex reads `CODEX_HOME` and grok reads
@@ -295,9 +409,91 @@ mod tests {
         let overlay = materialize_overlay(&options(dir.path())).unwrap();
         let settings = read(&overlay);
         let hooks = settings["hooks"].as_object().unwrap();
-        for event in HOOK_EVENTS {
-            assert!(hooks.contains_key(*event), "{event} was not registered");
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "Stop",
+            "StopFailure",
+            "SessionEnd",
+            "SubagentStop",
+            "Notification",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolBatch",
+            "MessageDisplay",
+            "PermissionRequest",
+            "Elicitation",
+        ] {
+            assert!(
+                hooks[event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("--event '{event}'")),
+                "{event} relay missing"
+            );
         }
+    }
+
+    #[test]
+    fn explicit_file_and_inline_settings_keep_user_config_and_all_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = materialize_overlay(&options(dir.path())).unwrap();
+        let user = json!({"env":{"CUSTOM":"preserved"},"model":"user-model",
+            "hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"user-hook"}]}]},
+            "showStatusInTerminalTab":false});
+        let user_path = dir.path().join("user settings.json");
+        std::fs::write(&user_path, user.to_string()).unwrap();
+        for settings_arg in [
+            vec![
+                "--settings".into(),
+                user_path.to_string_lossy().into_owned(),
+            ],
+            vec![format!("--settings={user}")],
+        ] {
+            let mut argv = settings_arg;
+            argv.extend([
+                "--model".into(),
+                "explicit-model".into(),
+                "--setting-sources=".into(),
+            ]);
+            merge_explicit_settings(&overlay.path, &mut argv).unwrap();
+            assert_eq!(argv.iter().filter(|arg| *arg == "--settings").count(), 1);
+            assert!(argv.ends_with(&[
+                "--model".into(),
+                "explicit-model".into(),
+                "--setting-sources=".into()
+            ]));
+            let merged_path = Path::new(&argv[1]);
+            assert_eq!(merged_path.parent(), overlay.path.parent());
+            assert_ne!(merged_path, overlay.path);
+            let merged: Value =
+                serde_json::from_slice(&std::fs::read(merged_path).unwrap()).unwrap();
+            assert_eq!(merged["env"], user["env"]);
+            assert_eq!(merged["model"], user["model"]);
+            assert_eq!(
+                merged["hooks"]["SessionStart"][0],
+                user["hooks"]["SessionStart"][0]
+            );
+            for event in HOOK_EVENTS {
+                assert!(
+                    merged["hooks"][event].to_string().contains("hook emit"),
+                    "{event}"
+                );
+            }
+            assert_eq!(merged["showStatusInTerminalTab"], true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(merged_path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(user_path).unwrap(),
+            user.to_string()
+        );
     }
 
     #[test]

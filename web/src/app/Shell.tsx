@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { isSessionRoute, MORE_NAV } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
-import { formatDiagnostic, notify, notifyStore, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
+import { formatDiagnostic, notify, notifyStore, toastAdapter, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
@@ -245,7 +245,8 @@ export function Shell() {
    */
   useEffect(() => {
     if (!hub.toast) return;
-    notify({ subject: hub.toast.text, stage: "", severity: "info", key: `legacy-toast:${hub.toast.text}` });
+    // Collapse by text so a repeated identical toast updates one line.
+    toastAdapter(hub.toast.text, `legacy-toast:${hub.toast.text}`);
     hubStore.clearToast();
   }, [hub.toast]);
 

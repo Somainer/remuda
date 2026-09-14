@@ -261,8 +261,8 @@ export function notify(input: NotifyInput): string {
  * `commandStatus.ts` to decide. Same for `store.ts:619` (恢复会话失败) once C2
  * owns that file.
  */
-export function toastAdapter(text: string): string {
-  return notify({ subject: text, stage: "", severity: "info" });
+export function toastAdapter(text: string, key?: string): string {
+  return notify({ subject: text, stage: "", severity: "info", key });
 }
 
 /** Subscribe a component to the notification state. */

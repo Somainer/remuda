@@ -15,7 +15,34 @@
 //! - `ultracode` reads back as level `xhigh`; the workflow boolean is not on
 //!   the assistant record.
 
-use crate::{EffortName, EffortSource};
+use crate::{EffortName, EffortSource, EventId, Id};
+
+/// Deterministic observation id for an effort edge read from one native
+/// assistant record.
+///
+/// Both channels that can observe the edge — the driver's live transcript
+/// hydrator and the journal file tailer — process the *same* native record, so
+/// deriving the event id from `(instance scope, assistant record id, level)`
+/// via [`Id::derive`] makes the observation stable across channels: re-tailing
+/// the file after the live event was already journaled does not mint a second
+/// identity for the same edge.
+pub fn effort_event_id(scope: &str, assistant_native_id: &str, name: EffortName) -> EventId {
+    let native = format!("effort:{}:{assistant_native_id}", name_wire(name));
+    // Id::derive is infallible for the registered `evt` prefix and valid
+    // `(scope, native)` strings; the branded constructor enforces the prefix.
+    let id: Id = Id::derive("evt", scope, &native).expect("evt prefix registered");
+    EventId::try_from(String::from(id)).expect("derive with the evt prefix yields an EventId")
+}
+
+fn name_wire(name: EffortName) -> &'static str {
+    match name {
+        EffortName::Low => "low",
+        EffortName::Medium => "medium",
+        EffortName::High => "high",
+        EffortName::Xhigh => "xhigh",
+        EffortName::Max => "max",
+    }
+}
 
 /// An effort level as read off an assistant transcript record.
 #[derive(
@@ -217,5 +244,20 @@ mod tests {
         let content = "<command-name>/effort</command-name>\n<command-args>max</command-args>";
         assert_eq!(slash_effort_word(content).as_deref(), Some("max"));
         assert!(slash_effort_word("<command-name>/clear</command-name>").is_none());
+    }
+
+    #[test]
+    fn effort_event_id_is_stable_across_channels_and_namespaced_per_instance() {
+        // The live hydrator and the file tailer both observe the same native
+        // assistant record; they must draw one event id (live-view §2.3).
+        let a = effort_event_id("ins_one", "msg_42", EffortName::Xhigh);
+        let b = effort_event_id("ins_one", "msg_42", EffortName::Xhigh);
+        assert_eq!(a, b);
+        // A different record or level is a different edge.
+        assert_ne!(a, effort_event_id("ins_one", "msg_43", EffortName::Xhigh));
+        assert_ne!(a, effort_event_id("ins_one", "msg_42", EffortName::High));
+        // Ids never collide across sessions.
+        assert_ne!(a, effort_event_id("ins_two", "msg_42", EffortName::Xhigh));
+        assert!(a.as_id().as_str().starts_with("evt_"));
     }
 }

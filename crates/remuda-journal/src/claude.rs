@@ -6,11 +6,12 @@ use crate::source::{FileTail, MapContext, Source, SourceResume};
 use crate::util::{known, parse_timestamp, timestamp_now, unknown};
 use remuda_protocol::{
     Completeness, ContentBlock, ContentStatus, EffortEffective, EffortPayload, EffortTracker,
-    FileCursor, Id, Knowledge, LifecyclePayload, LifecycleTopic, MessageOrigin, MessagePayload,
-    MessagePhase, MessageRole, MutationOperation, NativeLifecycle, NativeRequestKey, NodeMutation,
-    ObservationPayload, ObservationSource, OpaqueImpact, OpaquePayload, OpaqueReason, ResultStage,
-    Severity, SourceChannel, SourceCursor, TextBlock, ThoughtPayload, ThoughtRepresentation,
-    ToolCallPayload, ToolCallState, ToolCategory, ToolOutcome, ToolResultPayload, U64,
+    EventId, FileCursor, Id, Knowledge, LifecyclePayload, LifecycleTopic, MessageOrigin,
+    MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
+    NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource, OpaqueImpact,
+    OpaquePayload, OpaqueReason, ResultStage, Severity, SourceChannel, SourceCursor, TextBlock,
+    ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
+    ToolOutcome, ToolResultPayload, U64,
 };
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -47,7 +48,19 @@ impl NativeIds {
             thoughts: HashMap::new(),
             workflows: HashMap::new(),
             members: HashMap::new(),
+            effort: EffortTracker::new(),
         }
+    }
+
+    /// Deterministic event id for an §9.1 effort edge read from one assistant
+    /// record. Same `(instance, record, level)` from the live channel and this
+    /// tailer draws the same id (see [`remuda_protocol::effort_event_id`]).
+    pub(crate) fn effort_event(
+        &self,
+        assistant_native_id: &str,
+        name: remuda_protocol::EffortName,
+    ) -> EventId {
+        remuda_protocol::effort_event_id(&self.scope, assistant_native_id, name)
     }
 
     /// Deterministic id for a native object in this instance's scope.
@@ -400,14 +413,17 @@ fn map_user(
 #[allow(clippy::too_many_arguments)]
 fn effort_envelope(
     ctx: &MapContext,
+    ids: &NativeIds,
     value: &Value,
     line: &[u8],
     cursor: &FileCursor,
+    assistant_native_id: &str,
     observed: remuda_protocol::ObservedEffort,
     source: remuda_protocol::EffortSource,
     raw: Option<&str>,
 ) -> Result<Envelope, Error> {
-    envelope(
+    let event_id = ids.effort_event(assistant_native_id, observed.name);
+    let mut env = envelope(
         ctx,
         cursor,
         line,
@@ -424,7 +440,9 @@ fn effort_envelope(
             },
             raw: raw.map(str::to_owned),
         })),
-    )
+    )?;
+    env.event_id = Some(event_id);
+    Ok(env)
 }
 
 /// Plain-text view of a user record's content (string or text-block array).
@@ -464,11 +482,16 @@ fn map_assistant(
     let raw_effort = value.get("effort").and_then(Value::as_str);
     let raw_per_turn = value.get("perTurnEffort").and_then(Value::as_str);
     if let Some((observed, source)) = ids.effort.observe(raw_effort, raw_per_turn) {
+        let effort_native = native_msg
+            .clone()
+            .unwrap_or_else(|| format!("assistant-{}", cursor.offset.0));
         out.push(effort_envelope(
             ctx,
+            ids,
             value,
             line,
             cursor,
+            &effort_native,
             observed,
             source,
             raw_effort.or(raw_per_turn),
@@ -1183,6 +1206,7 @@ pub(crate) fn envelope(
         },
         completeness,
         evidence_event_ids: Vec::new(),
+        event_id: None,
         body,
         raw: None,
     };

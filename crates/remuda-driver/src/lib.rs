@@ -58,6 +58,12 @@ pub use claude_transcript::{
 };
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
+/// Validate `InstanceSpec.args` against the per-driver launch allowlist.
+///
+/// Exported so the Hub can reject a bad flag with a 400 at create time instead
+/// of letting it travel to the Node and fail there. One table, two callers: the
+/// Node stays the authority and re-runs this during materialization.
+pub use flags::validate_spec_args as validate_launch_args;
 pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, WaitUntil};
 pub use launch::{
     HOOKS_ENABLE_ENV, HookOverlay, HookSession, HookSessionOptions, OverlayOptions,

@@ -484,7 +484,7 @@ mod tests {
     fn node(store: Arc<MemoryStore>, config: NativeDriverConfig) -> DevNode {
         DevNode::with_parts(
             &DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
             store,
             DriverRegistry::with_fake().unwrap(),
         )

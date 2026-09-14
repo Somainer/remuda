@@ -830,7 +830,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("data directory");
         let node = crate::compose(&crate::ServeConfig::fake(
             DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
             dir.path().to_path_buf(),
         ))
         .expect("node");
@@ -912,7 +912,7 @@ mod tests {
     async fn create_params_preserve_native_model_permission_and_allowlisted_args() {
         let node = DevNode::new(
             &DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
         )
         .expect("node");
         let request = create_from_params(
@@ -942,7 +942,7 @@ mod tests {
     async fn create_params_preserve_gateway_overlay_config_dir_and_budget() {
         let node = DevNode::new(
             &DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
         )
         .expect("node");
         let request = create_from_params(
@@ -982,7 +982,7 @@ mod tests {
     async fn create_params_reject_non_string_native_args() {
         let node = DevNode::new(
             &DevServerConfig::loopback(0)
-                .with_workspace_roots(vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))]),
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
         )
         .expect("node");
         let error = create_from_params(

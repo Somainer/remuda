@@ -428,7 +428,7 @@ async fn wss_runtime_create_follow_cancel_reconnect_without_duplicates() {
     let node = DevNode::new(
         &DevServerConfig::loopback(0)
             .with_workspace_root(dir.path().to_path_buf())
-            .with_workspace_roots(vec![std::env::temp_dir()]),
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("dev node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
@@ -641,7 +641,7 @@ async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     let mut node_config = DevServerConfig::loopback(0);
     node_config.workspace_root = workspace;
-    node_config.workspace_roots = Some(vec![std::env::temp_dir()]);
+    node_config.workspace_roots = Some(remuda_testing::test_workspace_roots!());
     let mut native = NativeDriverConfig::new(dir.path().join("node"))
         .with_claude_binary(ensure_workspace_bin("fake-claude"));
     native.herdr_binary = Some(ensure_workspace_bin("fake-herdr"));
@@ -803,7 +803,7 @@ async fn wss_create_preserves_gateway_delegation_overlay_and_budget() {
         .expect("hub");
     let mut node_http = DevServerConfig::loopback(0);
     node_http.workspace_root = workspace;
-    node_http.workspace_roots = Some(vec![std::env::temp_dir()]);
+    node_http.workspace_roots = Some(remuda_testing::test_workspace_roots!());
     let mut native = NativeDriverConfig::new(dir.path().join("node"))
         .with_claude_binary(ensure_workspace_bin("fake-claude"));
     native.extra_env.insert(
@@ -1025,7 +1025,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     std::fs::create_dir_all(&workspace).unwrap();
     let config = DevServerConfig::loopback(0)
         .with_workspace_root(workspace)
-        .with_workspace_roots(vec![std::env::temp_dir()]);
+        .with_workspace_roots(remuda_testing::test_workspace_roots!());
     let native = NativeDriverConfig::new(dir.path().join("node"))
         .with_claude_binary(ensure_workspace_bin("fake-claude"));
     let node = DevNode::with_parts(
@@ -1443,7 +1443,7 @@ async fn runtime_hello_always_reports_the_instance_inventory() {
     let node = DevNode::new(
         &DevServerConfig::loopback(0)
             .with_workspace_root(dir.path().to_path_buf())
-            .with_workspace_roots(vec![std::env::temp_dir()]),
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("dev node");
     let host_id = node.host().meta.id.as_id().as_str().to_owned();

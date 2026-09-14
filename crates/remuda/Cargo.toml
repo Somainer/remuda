@@ -49,6 +49,7 @@ remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-hub.workspace = true
 remuda-protocol.workspace = true
 remuda-signal.workspace = true
+remuda-testing.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net", "process", "test-util"] }

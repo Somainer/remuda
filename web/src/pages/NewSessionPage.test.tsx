@@ -305,6 +305,25 @@ describe("drafts", () => {
     renderAt(["/sessions/new"]);
     await waitFor(() => expect(screen.getByTestId("new-session-prompt")).toHaveValue(""));
   });
+
+  it("does not bleed a body into a workspace that has no draft of its own", async () => {
+    const second = { ...workspace, id: "wsp_other", rootPath: "/srv/other" };
+    vi.mocked(store.useHub).mockReturnValue({
+      ...store.hubStore.getSnapshot(), hosts: [host], workspaces: [workspace, second], instances: [],
+    });
+    renderAt(["/sessions/new"]);
+    fireEvent.change(screen.getByTestId("new-session-prompt"), { target: { value: "只属于第一个目录" } });
+    await waitFor(() => expect(screen.getByTestId("new-session-prompt")).toHaveValue("只属于第一个目录"));
+
+    // Same host, different registered workspace: no draft there, so the body
+    // must not follow the selection.
+    fireEvent.change(screen.getByTestId("new-session-workspace"), { target: { value: second.id } });
+    await waitFor(() => expect(screen.getByTestId("new-session-prompt")).toHaveValue(""));
+
+    // Switching back restores the first context's own draft.
+    fireEvent.change(screen.getByTestId("new-session-workspace"), { target: { value: workspace.id } });
+    await waitFor(() => expect(screen.getByTestId("new-session-prompt")).toHaveValue("只属于第一个目录"));
+  });
 });
 
 describe("first layer uses user vocabulary", () => {

@@ -331,6 +331,14 @@ export function NewSessionPage() {
       if (draft.effortKind && draft.effortIndex !== undefined && KINDS.some((item) => item.id === draft.effortKind)) {
         setEffort(effortAt(draft.effortKind as EffortKind, draft.effortIndex, draft.effortUltracode === true));
       }
+    } else {
+      // Switching into a context that has no draft must not silently carry
+      // the previous context's body into it (acceptance: 切换主机/目录不串用).
+      // Non-sensitive options stay as form defaults; only the body resets.
+      setPrompt("");
+      setCwdPath("");
+      setWorktreeName("");
+      setCwdMode("existing");
     }
     setRestoredKey(contextKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps

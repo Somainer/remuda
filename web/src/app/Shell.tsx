@@ -70,7 +70,10 @@ export function ShellNotify() {
 
   async function copyDiagnostic(notification: Notification) {
     try {
-      await navigator.clipboard.writeText(formatDiagnostic(notification));
+      // `writeText` rejects when the page lacks clipboard permission (common
+      // in a headless browser). Catch it here so a denied copy stays silent
+      // rather than surfacing as an unhandled rejection.
+      await navigator.clipboard?.writeText(formatDiagnostic(notification));
       setCopied(notification.id);
       setTimeout(() => setCopied(null), 1500);
     } catch {

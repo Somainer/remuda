@@ -374,14 +374,16 @@ test("the live region carries status text only, never streamed transcript body",
   // The transcript is explicitly opted out, so no ancestor can announce it.
   await expect(page.getByTestId("transcript")).toHaveAttribute("aria-live", "off");
 
-  // Drive real streaming output through the fake node.
+  // Drive real streaming output through the fake node. Each turn is awaited
+  // rather than fired on a timer: sending faster than the agent replies just
+  // queues the prompt (`You · queued`) and proves nothing about streaming.
   const composer = page.getByTestId("composer-input");
   for (const text of ["first", "second", "third"]) {
+    await expect(composer).toBeEnabled({ timeout: 20_000 });
     await composer.fill(text);
     await composer.press("Enter");
-    await page.waitForTimeout(300);
+    await expect(page.getByTestId("transcript")).toContainText(`echo: ${text}`, { timeout: 20_000 });
   }
-  await expect(page.getByTestId("transcript")).toContainText("echo: third", { timeout: 20_000 });
 
   // Whatever the transcript rendered, none of it was announced.
   const announced = (await region.textContent()) ?? "";

@@ -182,6 +182,15 @@ fake node 自身无法产生的故障——被拒绝的命令、`nodePurge !== "
 
 本批次不触碰 provider 相关代码，也不声称修复它。
 
+### 顺带发现，未修（不属本批次文件）
+
+e2e 日志里有一条 `[Unhandled rejection] NotAllowedError: Failed to execute
+'writeText' on 'Clipboard'`，出现在 pairing 用例期间。来源是
+`lib/clipboard.ts:3`——它用 `navigator.clipboard?.writeText(...)` 防了
+**属性不存在**，但没防 **promise 被拒绝**（无头浏览器没有剪贴板权限时正是后者）。
+调用方是配对码复制按钮，不在本批次的文件清单内，因此只记录不改。
+本批次自己的复制诊断路径已经 `try/catch` + `?.`，不会产生这条。
+
 ## 8 交付文件
 
 | 文件 | 说明 |

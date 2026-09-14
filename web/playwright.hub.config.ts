@@ -9,7 +9,10 @@ const upstream = process.env.HUB_E2E_UPSTREAM_LISTEN ?? "127.0.0.1:58881";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status)\.spec\.ts/,
+  testMatch: [
+    /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status)\.spec\.ts/,
+    /\.hub\.spec\.ts$/,
+  ],
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),

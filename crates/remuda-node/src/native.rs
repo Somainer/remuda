@@ -604,11 +604,24 @@ impl Driver for NativeAdapter {
                     effort,
                     effort_index,
                 } => {
+                    let effort = effort.filter(|value| !value.is_empty());
                     let switch = remuda_protocol::ModelSwitchInput {
                         model_id: model.clone().unwrap_or_default(),
                         effective: remuda_protocol::ModelEffective::NextTurn,
                         effort: effort.clone(),
                     };
+                    // §9.1: an effort switch reports its own lifecycle from the
+                    // driver (`effort-applied` / `effort-queued` /
+                    // `effort-degraded`) after transcript read-back. A generic
+                    // "applied" here would claim it before the read-back exists.
+                    let effort_only = model.as_deref().is_none_or(str::is_empty);
+                    if effort.is_some() && effort_only {
+                        self.native
+                            .send(remuda_protocol::DriverInput::ModelSwitch(Box::new(switch)))
+                            .await
+                            .map_err(map_driver_error)?;
+                        return Ok(Vec::new());
+                    }
                     let applied = format!(
                         "model={} effort={} index={}",
                         model.as_deref().unwrap_or("-"),

@@ -1196,10 +1196,18 @@ async fn execute_queued(
             // A lost carrier is the Node's problem to fix, not the command's.
             // Recovery runs in the background; this command still settles now.
             notify_carrier(carrier.as_ref(), &error);
+            // §9.1: an effort switch a carrier cannot do (claude-print) is an
+            // honest capability rejection, not a driver fault — name it for the
+            // operation so the UI can show "unsupported in this session".
+            let diagnostic_name = if matches!(queued.request, DriverRequest::Configure { .. }) {
+                "instance.configure"
+            } else {
+                "fake-driver-error"
+            };
             let diagnostic = DriverEmission::NativeLifecycle {
-                name: "fake-driver-error".to_owned(),
-                status: error.to_string(),
-                severity: remuda_protocol::Severity::Error,
+                name: diagnostic_name.to_owned(),
+                status: format!("rejected: {error}"),
+                severity: remuda_protocol::Severity::Warning,
             };
             store.append_observation(
                 instance_id,
@@ -1207,7 +1215,10 @@ async fn execute_queued(
                 Completeness::Structured,
                 diagnostic.into_payload()?,
             )?;
-            if !pty_queue::is_pty(driver.kind()) {
+            // A control operation's rejection (e.g. an effort switch a carrier
+            // cannot do) must not mark the instance itself failed.
+            let is_control = matches!(queued.request, DriverRequest::Configure { .. });
+            if !pty_queue::is_pty(driver.kind()) && !is_control {
                 record_task_exit(store.as_ref(), instance_id, &error.to_string());
             }
             settle_command(

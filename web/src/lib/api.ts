@@ -221,6 +221,14 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     model?: string | null;
     effortName?: string | null;
     effortIndex?: number | null;
+    effortEffective?:
+      | {
+          name?: string;
+          ultracode?: boolean | null;
+          source?: string;
+          observedAt?: string;
+        }
+      | null;
     mode?: string | null;
     promotedAt?: string | null;
     launchedBy?: string | null;
@@ -294,6 +302,23 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     model: typeof extra.model === "string" ? extra.model : null,
     effortName: typeof extra.effortName === "string" ? extra.effortName : null,
     effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
+    effortEffective:
+      extra.effortEffective && typeof extra.effortEffective.name === "string"
+        ? {
+            name: extra.effortEffective.name,
+            ultracode:
+              typeof extra.effortEffective.ultracode === "boolean"
+                ? extra.effortEffective.ultracode
+                : null,
+            source:
+              extra.effortEffective.source === "launch" ||
+              extra.effortEffective.source === "slash" ||
+              extra.effortEffective.source === "remuda"
+                ? extra.effortEffective.source
+                : "unknown",
+            observedAt: extra.effortEffective.observedAt ?? "",
+          }
+        : null,
     mode: extra.mode === "promoted" || extra.mode === "native" ? extra.mode : null,
     promotedAt: typeof extra.promotedAt === "string" ? extra.promotedAt : null,
   };

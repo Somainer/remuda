@@ -68,6 +68,14 @@ const DENY: &[&str] = &[
     // Native features the driver contract disables; see `flags.rs`.
     "CLAUDE_CODE_SIMPLE",
     "CLAUDE_CODE_SAFE_MODE",
+    // §9.1: this outranks an in-PTY `/effort`, so a host-inherited value would
+    // pin the level and silently defeat every runtime switch. It must reach
+    // neither a launched nor a promoted child.
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    // When set (Remuda itself runs as a Claude child session on some hosts)
+    // Claude turns transcript saving off, and transcript records are the
+    // effort read-back channel (§9.1). Letting it leak blinds the hydrator.
+    "CLAUDE_CODE_CHILD_SESSION",
 ];
 
 /// Denied prefixes.
@@ -207,6 +215,8 @@ mod tests {
             "REMUDA_BOOTSTRAP_TOKEN",
             "CLAUDE_CODE_SIMPLE",
             "CLAUDE_CODE_SAFE_MODE",
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            "CLAUDE_CODE_CHILD_SESSION",
         ] {
             assert!(is_denied(name), "{name} must be denied");
         }
@@ -248,5 +258,27 @@ mod tests {
             ("FAKE_CLAUDE_SCRIPT", "/tmp/script"),
         ]));
         assert!(env.is_empty(), "{env:?}");
+    }
+
+    #[test]
+    fn effort_level_and_child_session_markers_are_never_passed_to_a_child() {
+        // §9.1: CLAUDE_CODE_EFFORT_LEVEL outranks the in-PTY `/effort` command;
+        // CLAUDE_CODE_CHILD_SESSION switches transcript saving off, which would
+        // blind the effort read-back. Whatever the source (host inheritance,
+        // instance spec, provider profile), neither may reach the child.
+        for name in [
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            "claude_code_effort_level",
+            "CLAUDE_CODE_CHILD_SESSION",
+        ] {
+            assert!(is_denied(name), "{name} must be denied");
+        }
+        // Even when the name sits on an allowlisted-style incoming map, the
+        // deny guard the spawn sites apply drops the value.
+        let env = inherit_from(vars(&[
+            ("HOME", "/home/node"),
+            ("CLAUDE_CODE_EFFORT_LEVEL", "max"),
+        ]));
+        assert!(!env.contains_key("CLAUDE_CODE_EFFORT_LEVEL"));
     }
 }

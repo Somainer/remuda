@@ -417,6 +417,57 @@ async fn fake_node(
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
+            "instance.configure" => {
+                // §9.1: emulate a native agent that accepted `/effort` and
+                // whose next assistant record reports the level back. When the
+                // requested level differs from what the transcript says, the
+                // fake agent reports a *clamped* level — exactly the
+                // 请求 max → 实际 xhigh path the UI must render.
+                if let Some(effort) = params.get("effort")
+                    && let Some(requested) = effort.get("name").and_then(Value::as_str)
+                {
+                    let observed = match requested {
+                        // The fake agent's environment caps at xhigh.
+                        "max" => "xhigh",
+                        other => other,
+                    };
+                    let observed_at = "2026-09-14T12:00:00.000Z";
+                    let event = json!({
+                        "kind": "effort",
+                        "completeness": "structured",
+                        "payload": {
+                            "requested": {"name": requested,
+                                "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
+                            "effective": {
+                                "name": observed,
+                                "ultracode": if requested == "ultracode" {
+                                    serde_json::Value::Bool(true)
+                                } else {
+                                    serde_json::Value::Null
+                                },
+                                "source": "remuda",
+                                "observedAt": observed_at
+                            },
+                            "raw": observed
+                        }
+                    });
+                    let seq = append_n + 1;
+                    ws.send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": format!("j{seq}"),
+                            "method": "journal.append",
+                            "params": {"instanceId": instance_id, "event": event}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+                    append_n = seq;
+                }
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
             "instance.close" | "instance.resume" => {
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }

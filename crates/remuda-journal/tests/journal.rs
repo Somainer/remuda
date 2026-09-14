@@ -376,3 +376,63 @@ async fn source_trait_object_and_opaque_unknown_types() -> Result<()> {
     assert_eq!(source.name(), "claude-jsonl");
     Ok(())
 }
+
+#[test]
+fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
+    let (_, _, _, map) = ctx("effort-session");
+    let lines = [
+        serde_json::json!({
+            "type":"user","uuid":"u1","sessionId":"effort-session",
+            "message":{"role":"user","content":"say ok"}
+        }),
+        serde_json::json!({
+            "type":"assistant","uuid":"a1","sessionId":"effort-session",
+            "message":{"id":"m1","role":"assistant","type":"message",
+                "content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"},
+            "effort":"high","perTurnEffort":null
+        }),
+        serde_json::json!({
+            "type":"user","uuid":"c1","sessionId":"effort-session",
+            "message":{"role":"user","content":
+                "<command-name>/effort</command-name><command-args>max</command-args>"}
+        }),
+        serde_json::json!({
+            "type":"assistant","uuid":"a2","sessionId":"effort-session",
+            "message":{"id":"m2","role":"assistant","type":"message",
+                "content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"},
+            "effort":"max","perTurnEffort":null
+        }),
+        serde_json::json!({
+            "type":"assistant","uuid":"a3","sessionId":"effort-session",
+            "message":{"id":"m3","role":"assistant","type":"message",
+                "content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"},
+            "effort":"max","perTurnEffort":null
+        }),
+    ];
+    let contents = lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let envelopes = map_file(&contents, &map)?;
+    let effort: Vec<_> = envelopes
+        .iter()
+        .filter_map(|env| match &env.body {
+            ObservationPayload::Effort(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    // high (first sight), max (after the slash), then the second max is deduped.
+    assert_eq!(effort.len(), 2, "{effort:?}");
+    assert_eq!(effort[0].effective.name, remuda_protocol::EffortName::High);
+    assert_eq!(
+        effort[0].effective.source,
+        remuda_protocol::EffortSource::Unknown
+    );
+    assert_eq!(effort[1].effective.name, remuda_protocol::EffortName::Max);
+    assert_eq!(
+        effort[1].effective.source,
+        remuda_protocol::EffortSource::Slash
+    );
+    Ok(())
+}

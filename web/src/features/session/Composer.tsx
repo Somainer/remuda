@@ -20,6 +20,12 @@ import {
   type EffortSelection,
 } from "./effort";
 import { composerState, type Phase } from "../composer/state";
+import {
+  effectiveLabel,
+  effortMismatch,
+  isEffortUnknown,
+  type EffortEffectiveView,
+} from "./effortEffective";
 import { useAttachments } from "./useAttachments";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
 import css from "./session.module.css";
@@ -49,6 +55,7 @@ export function Composer({
   models,
   effort,
   onEffort,
+  effortEffective,
   onModel,
   contextLabel,
   effortDisabled,
@@ -74,6 +81,8 @@ export function Composer({
   models?: string[];
   effort?: EffortSelection;
   onEffort?: (next: EffortSelection) => void;
+  /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
+  effortEffective?: EffortEffectiveView | null;
   onModel?: (model: string) => void;
   contextLabel?: string | null;
   /** True when the session cannot take instance.configure (exited / observed-only). */
@@ -281,6 +290,19 @@ export function Composer({
   // data-attr carries the wire name so an ultracode selection round-trips.
   const effortChipLabel = effortStopName(harness, currentEffort.name, ultraOn);
   const effortWire = effortWireName(currentEffort);
+  // §9.1: the chip text is the EFFECTIVE level read back from the transcript,
+  // not the requested selection. `?` until the first assistant record; a
+  // requested/effective divergence renders explicitly, it is never hidden.
+  const effectiveUnknown = isEffortUnknown(effortEffective);
+  const effectiveWord = effectiveLabel(effortEffective);
+  const mismatch = caps.effort
+    ? effortMismatch(effortWire, ultraOn, effortEffective)
+    : null;
+  const effortChipTitle = effectiveUnknown
+    ? "实际档位：等待会话回读（？）"
+    : mismatch
+      ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
+      : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
   const primaryLabel = sending
     ? "发送中"
     : controls.primary.kind === "steer"
@@ -394,9 +416,13 @@ export function Composer({
             className={`${css.chip} ${ember ? css.ember : ""}`}
             data-testid="model-effort-chip"
             data-ember={ember ? "1" : "0"}
+            data-effort-effective={effectiveUnknown ? "unknown" : effectiveWord}
+            data-effort-source={effortEffective?.source ?? "unknown"}
+            data-effort-mismatch={mismatch ? "1" : "0"}
             aria-expanded={menu === "effort"}
             aria-haspopup="dialog"
-            aria-label={`Select effort, ${effortChipLabel}`}
+            aria-label={`Select effort, ${effortChipLabel}; effective ${effectiveUnknown ? "unknown" : effectiveWord}`}
+            title={effortChipTitle}
             onClick={() => toggle("effort")}
           >
             {ember ? (
@@ -406,7 +432,14 @@ export function Composer({
                 <span className={`${css.emberSpark} ${css.emberSpark3}`} />
             </>
             ) : null}
-            <span className={css.chipModel}>{effortChipLabel}</span>
+            <span className={css.chipModel} data-testid="model-effort-chip-label">
+              {effectiveUnknown ? "?" : effectiveWord}
+            </span>
+            {mismatch ? (
+              <span className={css.chipEffortMismatch} data-testid="model-effort-mismatch">
+                请求 {mismatch.requested} → 实际 {mismatch.effective}
+              </span>
+            ) : null}
             <span className={css.chipCaret}>▾</span>
           </button>
         ) : null}

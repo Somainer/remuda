@@ -18,17 +18,18 @@ use crate::pty_interaction::PtyInteractions;
 use crate::recipe::{FileLifetime, FileRole, LaunchRecipe, MaterializedFile};
 use async_trait::async_trait;
 use remuda_herdr::{
-    AgentPromptParams, AgentStartParams, AgentStatus, Client, EventKind, EventStream, HerdrServer,
-    PaneSplitParams, SplitDirection, Subscription, TerminalObserver, WorkspaceCreateParams,
+    AgentPromptParams, AgentReadParams, AgentStartParams, AgentStatus, Client, EventKind,
+    EventStream, HerdrServer, PaneSplitParams, ReadFormat, ReadSource, SplitDirection,
+    Subscription, TerminalObserver, WorkspaceCreateParams,
 };
 use remuda_protocol::{
-    AgentKind, ClaudeRef, Completeness, ContentBlock, Digest, DriverInput, DriverKind, EventId,
-    HerdrRef, HerdrRepresentation, HerdrServer as HerdrPin, HostId, Id, InstanceId, InstanceSpec,
-    InteractionAnswer, InteractionId, Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle,
-    NativeRef, NativeRequestKey, NativeTerminalFrame, Observation, ObservationPayload,
-    ObservationSource, PtyBackend, PtyCarrier, RawRef, Redaction, RunId, SchemaVersion, Severity,
-    SourceChannel, SourceCursor, SourceDelivery, Timestamp, TranscriptRef, TtyOutput,
-    TtyRepresentation, U64,
+    AgentKind, ClaudeRef, Completeness, ContentBlock, Digest, DriverInput, DriverKind,
+    EffortSelection, EventId, HerdrRef, HerdrRepresentation, HerdrServer as HerdrPin, HostId, Id,
+    InstanceId, InstanceSpec, InteractionAnswer, InteractionId, Knowledge, LifecyclePayload,
+    LifecycleTopic, NativeLifecycle, NativeRef, NativeRequestKey, NativeTerminalFrame, Observation,
+    ObservationPayload, ObservationSource, PtyBackend, PtyCarrier, RawRef, Redaction, RunId,
+    SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, Timestamp, TranscriptRef,
+    TtyOutput, TtyRepresentation, U64,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -162,6 +163,12 @@ struct PtyLive {
     herdr_session: String,
     transcript_path: Arc<std::sync::Mutex<Option<String>>>,
     events: mpsc::Sender<Observation>,
+    /// §9.1 in-session effort switch coordination. Kept on the live handle so
+    /// resume/attach paths share the same read-back rendezvous.
+    #[allow(dead_code)]
+    effort_bridge: Arc<crate::effort::EffortBridge>,
+    effort_queue: Arc<crate::effort::EffortQueue>,
+    effort_worker: Option<JoinHandle<()>>,
     status_task: Option<JoinHandle<()>>,
     interactions: Arc<PtyInteractions>,
     interaction_task: JoinHandle<()>,
@@ -469,6 +476,16 @@ impl ClaudePtyDriver {
             Arc::clone(&self.seq),
             Arc::clone(&transcript_path),
         );
+        // §9.1: effort switches type `/effort` into this pane and read back
+        // through the same transcript pump below.
+        let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
+        if let Some(effort) = spec.effort {
+            effort_bridge.note_launch_request(crate::effort::EffortRequest {
+                name: effort.name,
+                ultracode: effort.ultracode,
+            });
+        }
+        let effort_queue = Arc::new(crate::effort::EffortQueue::new());
         // The TUI's tool calls exist only in the native transcript; follow it as
         // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
         let transcript_task = spawn_transcript_pump(
@@ -476,6 +493,20 @@ impl ClaudePtyDriver {
             tx.clone(),
             ctx.clone(),
             Arc::clone(&self.seq),
+            Some(Arc::clone(&effort_bridge)),
+            spec.effort,
+        );
+        let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
+            client: client.clone(),
+            pane_id: pane_id.clone(),
+            events: tx.clone(),
+            seq: Arc::clone(&self.seq),
+            ctx: ctx.clone(),
+        });
+        let effort_worker = crate::effort::spawn_worker(
+            Arc::clone(&effort_bridge),
+            Arc::clone(&effort_queue),
+            effort_io,
         );
 
         *self.inner.lock().await = Some(PtyLive {
@@ -493,6 +524,9 @@ impl ClaudePtyDriver {
             herdr_session: session_name,
             transcript_path,
             events: tx,
+            effort_bridge,
+            effort_queue,
+            effort_worker: Some(effort_worker),
             status_task: Some(status_task),
             interactions,
             interaction_task,
@@ -512,6 +546,75 @@ impl ClaudePtyDriver {
     /// Native identity for the live pane, if started.
     pub async fn native_ref(&self) -> Option<NativeRef> {
         self.inner.lock().await.as_ref().map(native_ref_for)
+    }
+}
+
+impl ClaudePtyDriver {
+    /// §9.1: type `/effort <level>` and let the transcript pump prove it.
+    async fn switch_effort(&self, level: &str) -> DriverResult<DriverAck> {
+        let Some(request) = crate::effort::EffortRequest::from_level(level) else {
+            // An honest refusal for a word the in-session command does not take
+            // (`auto` is a mode, and an unknown future name must not be typed
+            // and hoped about). The Node surfaces the rejection in the UI.
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "claude /effort does not accept {level:?} in-session; \
+                 valid: low, medium, high, xhigh, max, ultracode"
+            )));
+        };
+        let (pane_id, session_id, queue, ready, io) = {
+            let inner = self.inner.lock().await;
+            let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+            if live.closed {
+                return Err(DriverError::ControlUnavailable);
+            }
+            require_session_start(live)?;
+            let ready = crate::pty_interaction::prompt_ready(&live.client, &live.pane_id)
+                .await
+                .is_ok();
+            let io = HerdrEffortIo {
+                client: live.client.clone(),
+                pane_id: live.pane_id.clone(),
+                events: live.events.clone(),
+                seq: Arc::clone(&self.seq),
+                ctx: live.ctx.clone(),
+            };
+            (
+                live.pane_id.clone(),
+                live.session_id.clone(),
+                Arc::clone(&live.effort_queue),
+                ready,
+                Arc::new(io) as Arc<dyn crate::effort::EffortSwitchIo>,
+            )
+        };
+
+        if ready {
+            // Fast path: the composer is idle, so the worker applies it now and
+            // the read-back settles this command.
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait =
+                std::time::Duration::from_millis(crate::effort::EFFORT_READBACK_TIMEOUT_MS + 5_000);
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // Bounded window elapsed without a terminal outcome. The worker
+                // keeps running and will journal applied/degraded; this command
+                // settles as dispatched, never as applied.
+            }
+        } else {
+            // Ready ladder: a turn is running. Journal `queued` and hand off;
+            // the worker types it at the next idle and journals the result.
+            io.journal(
+                crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
+                Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+
+        let mut ack = DriverAck::transport_written();
+        ack.native_ids
+            .insert("sessionId".into(), session_id.clone());
+        ack.native_ids.insert("paneId".into(), pane_id);
+        Ok(ack)
     }
 }
 
@@ -611,6 +714,15 @@ impl Driver for ClaudePtyDriver {
     }
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
+        // §9.1: an effort-bearing switch is typed into the composer as
+        // `/effort <level>` and read back through the transcript — it is not a
+        // model switch and never was unsupported on the PTY carrier.
+        if let DriverInput::ModelSwitch(switch) = &input
+            && let Some(level) = switch.effort.as_deref()
+            && !level.is_empty()
+        {
+            return self.switch_effort(level).await;
+        }
         let text = prompt_text(&input)?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
@@ -693,6 +805,10 @@ impl Driver for ClaudePtyDriver {
         }
         live.closed = true;
         live.interaction_task.abort();
+        live.effort_queue.close();
+        if let Some(task) = live.effort_worker.take() {
+            task.abort();
+        }
         if let Some(task) = live.status_task.take() {
             task.abort();
         }
@@ -895,6 +1011,8 @@ fn spawn_transcript_pump(
     tx: mpsc::Sender<Observation>,
     ctx: ObsCtx,
     seq: Arc<AtomicU64>,
+    effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
+    launch_effort: Option<EffortSelection>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -910,18 +1028,19 @@ fn spawn_transcript_pump(
                     .filter(|path| path.is_file());
                 if let Some(path) = path {
                     info!(session = %ctx.session_id, "hydrating claude-pty from native transcript");
-                    hydrator = Some((
-                        crate::claude_transcript::TranscriptTail::new(path),
-                        TranscriptMapper::new(
-                            ctx.driver,
-                            ctx.instance_id.clone(),
-                            ctx.run_id.clone(),
-                            ctx.journal_id.clone(),
-                            ctx.host_id.clone(),
-                            ctx.session_id.clone(),
-                            ctx.pin_version.clone(),
-                        ),
-                    ));
+                    let mut mapper = TranscriptMapper::new(
+                        ctx.driver,
+                        ctx.instance_id.clone(),
+                        ctx.run_id.clone(),
+                        ctx.journal_id.clone(),
+                        ctx.host_id.clone(),
+                        ctx.session_id.clone(),
+                        ctx.pin_version.clone(),
+                    );
+                    if let Some(bridge) = &effort_bridge {
+                        mapper = mapper.with_effort_bridge(Arc::clone(bridge), launch_effort);
+                    }
+                    hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
                 }
             }
             if let Some((tail, mapper)) = hydrator.as_mut() {
@@ -1169,6 +1288,88 @@ pub(crate) fn dummy_digest() -> DriverResult<Digest> {
     .map_err(DriverError::Protocol)
 }
 
+/// §9.1 [`crate::effort::EffortSwitchIo`] backed by a Herdr pane.
+struct HerdrEffortIo {
+    client: Client,
+    pane_id: String,
+    events: mpsc::Sender<Observation>,
+    seq: Arc<AtomicU64>,
+    ctx: ObsCtx,
+}
+
+#[async_trait]
+impl crate::effort::EffortSwitchIo for HerdrEffortIo {
+    async fn is_idle(&self) -> bool {
+        let Ok(info) = self.client.agent_get(&self.pane_id).await else {
+            return false;
+        };
+        matches!(
+            info.agent.agent_status,
+            AgentStatus::Idle | AgentStatus::Done
+        ) && info.agent.interactive_ready
+    }
+
+    async fn type_body(&self, body: &str) -> DriverResult<()> {
+        // Body as its own write; Enter comes separately (§5.2 measured split).
+        self.client
+            .pane_send_text(self.pane_id.clone(), body)
+            .await
+            .map_err(map_herdr)?;
+        Ok(())
+    }
+
+    async fn press_enter(&self) -> DriverResult<()> {
+        self.client
+            .agent_send_keys(self.pane_id.clone(), vec!["enter".into()])
+            .await
+            .map_err(map_herdr)?;
+        Ok(())
+    }
+
+    async fn screen_text(&self) -> DriverResult<String> {
+        let read = self
+            .client
+            .agent_read(AgentReadParams {
+                target: self.pane_id.clone(),
+                source: ReadSource::Visible,
+                lines: Some(40),
+                format: ReadFormat::Text,
+                strip_ansi: true,
+            })
+            .await
+            .map_err(map_herdr)?;
+        Ok(read.text().to_owned())
+    }
+
+    async fn journal(&self, status: String, severity: Severity) {
+        let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+            NativeLifecycle {
+                topic: LifecycleTopic::Configuration,
+                native_name: "instance.configure".into(),
+                native_id: Knowledge::NotApplicable,
+                status: Knowledge::Known { value: status },
+                related_ids: BTreeMap::new(),
+                data_ref: None,
+                severity,
+                affects_completion: false,
+            },
+        ))));
+        if emit_obs(
+            &self.events,
+            &self.seq,
+            &self.ctx,
+            SourceChannel::Runtime,
+            Completeness::Structured,
+            payload,
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!("effort lifecycle dropped: event channel closed");
+        }
+    }
+}
+
 pub(crate) fn prompt_text(input: &DriverInput) -> DriverResult<String> {
     match input {
         DriverInput::Prompt(prompt) => blocks_to_text(&prompt.blocks),
@@ -1176,9 +1377,9 @@ pub(crate) fn prompt_text(input: &DriverInput) -> DriverResult<String> {
             "claude-pty does not accept structured steer".into(),
         )),
         DriverInput::ModelSwitch(switch) => Err(DriverError::CapabilityUnsupported(format!(
-            "claude-pty has no runtime model/effort command; requested model={} effort={}",
+            "claude-pty has no runtime model command; requested model={} (effort switches \
+             are typed as /effort before this path)",
             switch.model_id,
-            switch.effort.as_deref().unwrap_or("-"),
         ))),
     }
 }

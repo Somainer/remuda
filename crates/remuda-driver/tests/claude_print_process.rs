@@ -170,6 +170,7 @@ impl KindName for remuda_protocol::ObservationKind {
             Self::Lifecycle => "lifecycle",
             Self::Usage => "usage",
             Self::Artifact => "artifact",
+            Self::Effort => "effort",
             Self::RawTty => "raw_tty",
             Self::Opaque => "opaque",
         }

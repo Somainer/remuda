@@ -343,6 +343,17 @@ wire_enum!(EffortName, "4.1", {
     Max => "max",
 });
 
+// Where an *effective* effort observation came from; D-028 §9.1:
+// `launch` = read back after a `--effort` launch flag; `slash` = the user
+// typed `/effort` in the native TUI; `remuda` = a Remuda-initiated switch;
+// `unknown` = observed with no attributable switch.
+wire_enum!(EffortSource, "9.1", {
+    Launch => "launch",
+    Slash => "slash",
+    Remuda => "remuda",
+    Unknown => "unknown",
+});
+
 wire_enum!(ClaudePermissionMode, "4.1", {
     Manual => "manual",
     Auto => "auto",
@@ -768,6 +779,7 @@ wire_enum!(ObservationKind, "5.1", {
     Lifecycle => "lifecycle",
     Usage => "usage",
     Artifact => "artifact",
+    Effort => "effort",
     RawTty => "raw_tty",
     Opaque => "opaque",
 });

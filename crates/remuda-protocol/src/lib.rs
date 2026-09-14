@@ -6,6 +6,7 @@
 mod macros;
 mod binary;
 mod capabilities;
+mod effort;
 mod entities;
 mod enums;
 mod error;
@@ -22,6 +23,7 @@ pub mod schema;
 
 pub use binary::*;
 pub use capabilities::*;
+pub use effort::*;
 pub use entities::*;
 pub use enums::*;
 pub use error::*;

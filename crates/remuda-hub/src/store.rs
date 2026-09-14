@@ -356,6 +356,13 @@ pub struct InstanceRecord {
         rename = "effortIndex"
     )]
     pub effort_index: Option<u32>,
+    /// §9.1 effective effort read back from assistant transcript records.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortEffective"
+    )]
+    pub effort_effective: Option<Value>,
     /// Native session id reported by the driver, resumable with `--resume` (D-026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
@@ -3095,6 +3102,28 @@ fn migrate_provider_models(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// §9.1: persist the transcript-observed effective effort onto the spec.
+fn apply_effective_effort_projection(
+    conn: &Connection,
+    instance_id: &str,
+    effective: &Value,
+) -> Result<(), StoreError> {
+    let spec_raw: String = conn.query_row(
+        "SELECT spec_json FROM instances WHERE id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let mut spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+    if let Some(object) = spec.as_object_mut() {
+        object.insert("effortEffective".into(), effective.clone());
+        conn.execute(
+            "UPDATE instances SET spec_json = ?1 WHERE id = ?2",
+            params![Value::Object(object.clone()).to_string(), instance_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_instance_projection(
     conn: &Connection,
     instance_id: &str,
@@ -3105,6 +3134,11 @@ fn apply_instance_projection(
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
     let payload = event.get("payload").cloned().unwrap_or(Value::Null);
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind == "effort"
+        && let Some(effective) = payload.get("effective")
+    {
+        apply_effective_effort_projection(conn, instance_id, effective)?;
+    }
     let mut lifecycle: Option<&str> = None;
     let mut last_error: Option<String> = None;
     if kind == "lifecycle"
@@ -4495,6 +4529,48 @@ mod tests {
             .expect("enroll");
         assert!(matches!(outcome, HostAuthOutcome::Authenticated { .. }));
     }
+    /// §9.1: an `effort` journal event persists the transcript-read-back level
+    /// as `effortEffective`, and never overwrites the requested `effort`.
+    #[tokio::test]
+    async fn effort_observation_projects_effective_without_touching_requested() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+        let instance = seed_instance(&store, &host).await;
+        store
+            .patch_instance_configure(
+                instance.instance_id.clone(),
+                json!({"effort": {"name": "max", "index": 4}}),
+            )
+            .await
+            .expect("configure");
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"effort","payload":{
+                    "requested":{"name":"max","ultracode":false},
+                    "effective":{"name":"xhigh","ultracode":null,
+                        "source":"slash","observedAt":"2026-09-14T12:00:00.000Z"},
+                    "raw":"xhigh"}}),
+            )
+            .await
+            .expect("effort event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.effort_name.as_deref(), Some("max"));
+        let effective = row.effort_effective.expect("effortEffective stored");
+        assert_eq!(effective.get("name").and_then(Value::as_str), Some("xhigh"));
+        assert_eq!(
+            effective.get("source").and_then(Value::as_str),
+            Some("slash")
+        );
+    }
 }
 
 fn touch_host_online(
@@ -4829,6 +4905,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                         .and_then(Value::as_u64)
                         .map(|n| n as u32)
                 });
+            let effort_effective = spec.get("effortEffective").cloned();
             let mode: Option<String> = row.get(15)?;
             let promoted_at: Option<String> = row.get(16)?;
             let stored: Option<String> = row.get(17)?;
@@ -4868,6 +4945,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 effort_name,
                 effort_ultracode,
                 effort_index,
+                effort_effective,
                 native_session_id: spec
                     .get("nativeSessionId")
                     .and_then(Value::as_str)

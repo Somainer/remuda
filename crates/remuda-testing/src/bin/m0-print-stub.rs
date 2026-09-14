@@ -390,6 +390,7 @@ fn kind_name(obs: &Observation) -> &'static str {
             remuda_protocol::ObservationKind::Lifecycle => "lifecycle",
             remuda_protocol::ObservationKind::Usage => "usage",
             remuda_protocol::ObservationKind::Artifact => "artifact",
+            remuda_protocol::ObservationKind::Effort => "effort",
             remuda_protocol::ObservationKind::RawTty => "raw_tty",
             remuda_protocol::ObservationKind::Opaque => "opaque",
         },

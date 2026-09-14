@@ -12,13 +12,13 @@ Hub upgrade, pairing, Node isolation and earlier blocked attempts, and
 [intranet-hub-1.md](../../docs/design/evidence/intranet-hub-1.md) for approved
 Caddy activation. No SG/bolt Node installation has been performed by these runs.
 
-This is the immediate [D-020](../../docs/design/decisions.md) deployment
+This is the only supported [D-031](../../docs/design/decisions.md) deployment
 path. Run Hub on the SG host, join its existing `deploy_default` network,
 and add one dedicated `remuda.<zone>` site to the existing Caddy. Use the
 existing Cloudflare DNS-01 setup. The A record is private; clients need an
 approved intranet route. Certificates do not provide public reachability.
-No cloudflared, frp, ngrok, reverse-SSH tunnel or other penetration service
-is part of this package. The public VPS variant remains in [public](../public/README.md).
+公网暴露：待定；禁止隧道工具（D-031）。The historical public VPS assets remain in
+[public](../public/README.md); they do not authorize public deployment.
 
 The detailed sequence, acceptance checks and rollback are in the
 [deploy runbook](../../docs/design/deploy-runbook.md). Actual execution

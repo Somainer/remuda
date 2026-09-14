@@ -31,7 +31,7 @@ Phase 0 的交付结果是：用户可从手机 PWA 或飞书私聊，通过 SG 
 - M0 固定两条并行主线：`claude-print` 和 `claude-pty`；`claude-bg` 同期交付。`docs/design/ui-spec.md` 中“M0 只暴露 print/M3 才实现 PTY”的里程碑句，以及 `docs/research/review-consistency.md §5–§6` 中旧的 Go/无 Herdr 建议，被更晚的 `decisions.md D-003, D-004, D-010` 覆盖；UI 的路由、状态投影、单实例双视图、移动交互仍是权威输入。
 - PTY 的 Phase 0 生产 carrier 是每台 Node 同 UID 运行的 Herdr headless server；不复制 Herdr server、不把 Herdr socket 暴露到网络，也不把 pane 状态当任务终态。`portable-pty` 只作为隔离测试工具与未来显式 fallback feature，不是 M0 生产 carrier。依据：`decisions.md D-010`、`docs/research/herdr-herdrx.md §0, §9, §12`、`docs/research/pty-driver-spike.md §5`。
 - Provider 层很薄：自动化 profile 只指向登记的 AsterGate ingress；Remuda 不复制其 upstream account pool、priority、weight、affinity、cooldown。`native-login` 是人工订阅登录 profile，不是第二个网关。依据：`decisions.md D-007`。
-- Hub 固定在 `devbox-sg-host` 的 Docker/Caddy/Cloudflare Tunnel 后；Node 只主动出站 WSS；第一台远端 Node 是 `devbox-sg`，CN 后置。依据：`decisions.md D-006`。
+- Hub 通过 SG 宿主机的 Docker 与内网 Caddy 部署；Node 只主动出站 WSS；第一台远端 Node 在 SG，CN 后置。公网暴露：待定；禁止隧道工具（D-031）。旧 D-006 暴露路径已废止。
 - 飞书首个 dispatcher 固定为独立企业自建 app；M2 由 Hub 管理 `lark-cli event consume` 子进程，不与其它 app 的长连接争抢；Telegram 后置。依据：`decisions.md D-008` 与 `docs/research/bot-dispatcher.md §0–§1`。
 
 Phase 0 明确不做：自研推理 loop、通用 workflow engine、AsterGate 内部账号池管理、多人组织/RBAC、Telegram、agy/Gemini ingress、Desktop 原生壳、多 pane 工作台、在线插件市场、跨 Hub federation、自动 CN↔SG failover、任意文件系统浏览。Herdr 的 102 方法只消费本计划列出的稳定子集。
@@ -139,7 +139,7 @@ M2 起 `claude-print` 固定：
 │   ├── src/{app,pages,features,components,lib,styles,types}/
 │   └── tests/e2e/
 ├── sidecars/claude-agent-sdk/       # optional, default-off
-├── deploy/{docker,compose,caddy,cloudflared,systemd}/
+├── deploy/{docker,compose,caddy,systemd}/
 ├── scripts/{ci,acceptance,canary,dev}/
 ├── testdata/{claude,protocol,herdr,failures}/
 └── docs/{design,operations,research}/
@@ -223,7 +223,7 @@ Cargo resolver固定v3，edition固定2024，`rust-toolchain.toml`初始pin本�
 | `web/tests/e2e` | Chromium/WebKit/mobile Playwright，不复制Rust状态机测试。 |
 | `sidecars/claude-agent-sdk` | 默认不构建；锁定Node与`@anthropic-ai/claude-agent-sdk`版本的最小UDS adapter，仅在Claude wire drift gate触发后启用。 |
 | `deploy/docker` | Web+Cargo多阶段构建、distroless Hub和Node artifact pipeline。 |
-| `deploy/compose,caddy,cloudflared,systemd` | SG edge、Hub、Node与Herdr守护模板。 |
+| `deploy/compose,caddy,systemd` | SG 内网 Caddy、Hub、Node与Herdr守护模板。 |
 | `scripts/ci` | fmt/clippy/test/schema/license/architecture/cross-target/secret gates。 |
 | `scripts/acceptance,canary` | 默认stub验收与必须显式`--live`的外部canary。 |
 | `testdata` | 脱敏、带来源commit/version/digest的Claude/Herdr/protocol/failure fixtures。 |
@@ -387,7 +387,7 @@ owner在手机飞书私聊bot发一个只在测试Workspace内触发无害读取
 
 ### 9.1 目标与退出条件
 
-M0 的dev-only Herdr/xterm路径在M3升级为受认证、可恢复、移动可用的production feature：多viewer单writer、bounded replay、完整full-frame重连、触控/IME、显式bg attach均通过故障测试；`/workflows`原生面板可用；至少一个已登记`native-login` profile真实通过Artifact。Host/Provider/Bot管理页可用，Hub通过命名Cloudflare Tunnel和现有Caddy正式上线。
+M0 的dev-only Herdr/xterm路径在M3升级为受认证、可恢复、移动可用的production feature：多viewer单writer、bounded replay、完整full-frame重连、触控/IME、显式bg attach均通过故障测试；`/workflows`原生面板可用；至少一个已登记`native-login` profile真实通过Artifact。Host/Provider/Bot管理页可用，Hub通过现有内网Caddy上线。公网暴露：待定；禁止隧道工具（D-031）。
 
 ### 9.2 PTY production invariants
 
@@ -405,9 +405,9 @@ M0 的dev-only Herdr/xterm路径在M3升级为受认证、可恢复、移动可�
 | M3-02 | `web/src/features/session/tty` | xterm移动端生产UX | 从Herdrx MIT实现lift fit/touch/visualViewport/IME/aux keys/search；read/write模式、lease接管、reconnect banner、detach/close分离；移除dev-only gate。 | M3-01 frame contract | 可对recorded terminal fixture并行。 | `pnpm --dir web exec playwright test tests/e2e/terminal-mobile.spec.ts --project=mobile-webkit` | L |
 | M3-03 | `remuda-driver`、`remuda-journal`、`web` | Workflow/Artifact profile gate | 分别探测AsterGate gateway与`native-login`的TUI Workflow/Artifact；记录settings/profile/binary/carrier证据；失败不以普通file viewer冒充。 | M3-01、M3-02 | canary runner可先写；live最后。 | `./scripts/canary/claude-pty.sh --live --confirm-external-calls --require-native-artifact` | L |
 | M3-04 | `remuda-hub`、`web/src/features` | Host、Provider、Bot管理页 | Host enroll/revoke/inventory、AsterGate-only profile/model/health、write-only secret rotate、Bot allowlist/status；所有mutation revision/CAS。 | M1、M2 | 三个页面可分支并行，统一导航PR收口。 | `cargo test -p remuda-hub --test admin_cas && pnpm --dir web exec playwright test tests/e2e/admin.spec.ts` | L |
-| M3-05 | `deploy/docker,compose,caddy,cloudflared,systemd` | Distroless生产部署与edge | 多阶段Web/Cargo build、digest-pinned Hub、Caddy独立hostname、named Tunnel、Node+Herdr units/no-systemd、health/migration/secret mounts；不碰AsterGate `/v1`。 | M1-06、M3-04 | 配置可从M1后并行；上线依赖auth/admin。 | `./scripts/ci/container.sh && docker compose -f deploy/compose/hub.compose.yaml config && ./scripts/acceptance/production-edge.sh --live` | L |
+| M3-05 | `deploy/docker,compose,caddy,systemd` | Distroless生产部署与内网Caddy | 多阶段Web/Cargo build、digest-pinned Hub、Caddy独立内网hostname、Node+Herdr units/no-systemd、health/migration/secret mounts；不碰AsterGate `/v1`。公网暴露：待定；禁止隧道工具（D-031）。 | M1-06、M3-04 | 配置可从M1后并行；上线依赖auth/admin。 | `./scripts/ci/container.sh && docker compose -f deploy/compose/hub.compose.yaml config && ./scripts/acceptance/production-edge.sh --live` | L |
 | M3-06 | `remuda-journal`、`crates/remuda`、`docs/operations` | Backup/restore与recovery escrow | 实现online backup、blob manifest、独立archive key、空目录restore、schema/digest验证、master-key recovery流程与rotation/drain runbook。 | M1-04、M3-05 storage shape | 可与terminal/admin并行。 | `cargo test -p remuda-journal --test backup_restore && ./scripts/acceptance/backup-restore.sh --mode stub` | L |
-| M3-07 | `scripts/acceptance`、`docs/operations` | SG故障演练与手机验收 | 分别重启Caddy/cloudflared/Hub/Node/Herdr，切换网络、恢复DB、重建TTY；记录machine-readable结果与15分钟rollback演练。 | M3-01–M3-06 | M3最后合并。 | `./scripts/canary/m3-production.sh --live --confirm-external-calls --device mobile` | M |
+| M3-07 | `scripts/acceptance`、`docs/operations` | SG故障演练与手机验收 | 经批准分别重启Caddy/Hub/Node/Herdr，在获准内网内切换网络、恢复DB、重建TTY；记录machine-readable结果与15分钟rollback演练。 | M3-01–M3-06 | M3最后合并。 | `./scripts/canary/m3-production.sh --live --confirm-external-calls --device mobile` | M |
 
 ### 9.4 手机可演示结果
 
@@ -514,7 +514,7 @@ codex-embedded = ["dep:codex-core", "dep:codex-protocol", "dep:codex-app-server-
 | A-027 | 飞书手机链路 | live | `./scripts/canary/lark-mobile.sh --live --confirm-external-calls` | allowlisted用户可创建/查看/回复交互；非allowlist拒绝；超时给深链，不泄露secret。 | 必须 |
 | A-028 | Terminal生产链路 | fault | `./scripts/acceptance/herdr-production.sh --session remuda-test` | 多读单写、lease fencing、慢读者、full-frame reset、epoch与Node-owned restore通过。 | 必须 |
 | A-029 | Artifact与订阅profile | live | `./scripts/canary/claude-pty.sh --live --confirm-external-calls --require-native-artifact` | Artifact仅在`native-login` profile通过；gateway profile明确unsupported而非伪造。 | 必须 |
-| A-030 | Edge与容器 | live | `./scripts/acceptance/production-edge.sh --live` | 无公开Hub端口，Caddy+named Tunnel 443可达；health、升级、rollback、Node出站连接通过。 | 必须 |
+| A-030 | Edge与容器 | live | `./scripts/acceptance/production-edge.sh --live` | 无公开Hub端口，内网Caddy 443在获准内网可达；health、升级、rollback、Node出站连接通过。公网暴露：待定；禁止隧道工具（D-031）。 | 必须 |
 | A-031 | Backup/restore | fault | `cargo test -p remuda-journal --test backup_restore && ./scripts/acceptance/backup-restore.sh --mode stub` | 新空目录可恢复DB/blob/capability证据；错误key/digest/schema安全失败。 | 必须 |
 | A-032 | Capability registry | fixture | `cargo test -p remuda-driver --test capability_registry` | key任一维度变化使证据过期；unknown不提升为supported；UI/API一致。 | 必须 |
 | A-033 | Codex spawn | live | `./scripts/canary/codex-appserver.sh --live --confirm-external-calls` | 目标installed app-server的init/turn/item/request/interrupt/resume通过，且无响应重放。 | 必须 |
@@ -694,7 +694,9 @@ secrets:
 
 Compose不声明`ports`。数据目录在首次启动前由operator建为目标UID可写、mode 0700；secret文件mode 0400。升级流程为：备份并验证 → 拉取digest → 单独跑`migrate --check`和migration job → 启动新Hub → health/canary → 再清理旧image。迁移必须expand/contract跨一版兼容，才能在应用rollback时继续读旧schema；不能用破坏性down migration回滚。
 
-### 13.3 Caddy与Cloudflare Tunnel
+### 13.3 内网Caddy
+
+公网暴露：待定；禁止隧道工具（D-031）。唯一支持路径见 [内网部署](../../deploy/intranet/README.md)。
 
 Remuda使用独立hostname，例如待定的`remuda.example.com`，不会复用或改写AsterGate的`/v1` route。现有Caddy仅新增一个精确站点块并加入同一Docker external network：
 
@@ -710,20 +712,7 @@ remuda.example.com {
 }
 ```
 
-若证书由Caddy的Cloudflare DNS challenge签发，`CF_API_TOKEN`继续由现有Caddy secret注入且只授予目标zone DNS edit；Remuda容器不得读取它。若TLS终止在Cloudflare Tunnel，仍保持Caddy到Hub的私网边界和Host校验，避免意外把Hub端口暴露到宿主机。
-
-`deploy/cloudflared/config.yml`使用named tunnel与显式ingress，末尾必须404：
-
-```yaml
-tunnel: <REMUDA_TUNNEL_UUID>
-credentials-file: /etc/cloudflared/<REMUDA_TUNNEL_UUID>.json
-ingress:
-  - hostname: remuda.example.com
-    service: http://caddy:80
-  - service: http_status:404
-```
-
-Tunnel credential只挂给cloudflared；不能进入Hub环境、image layer或backup。上线前验证DNS、Access策略、WebSocket upgrade、最大连接时长、手机蜂窝网络和源站不可公网直连。Cloudflare返回成功只证明edge接收，不证明Node或agent完成。
+若证书由Caddy的Cloudflare DNS challenge签发，`CF_API_TOKEN`继续由现有Caddy secret注入且只授予目标zone DNS edit；Remuda容器不得读取它。保持Caddy到Hub的私网边界和Host校验，避免意外把Hub端口暴露到宿主机。DNS-01签发证书不产生公网可达性；客户端必须具备获准的内网路由。
 
 ### 13.4 Node与Herdr systemd
 
@@ -808,7 +797,7 @@ Hub镜像按其pinned Debian/distroless运行时构建并在镜像内验收。No
 
 | Secret / authority | 所在位置 | 消费者 | 轮换与限制 |
 | --- | --- | --- | --- |
-| Hub master key | SG host secret file或credential store | Hub、显式migration/restore job | 不进Node/浏览器/Tunnel；双key读、单key写的受控rotation；独立escrow。 |
+| Hub master key | SG host secret file或credential store | Hub、显式migration/restore job | 不进Node/浏览器；双key读、单key写的受控rotation；独立escrow。 |
 | Archive/backup key | 独立离线或对象存储KMS ref | backup/restore命令 | 不与master key相同；restore演练验证；最小操作员集合。 |
 | Web password/session signing key | Hub secret file | Hub auth | password只存强KDF；session可逐个revoke；浏览器只收HttpOnly cookie。 |
 | Node enrollment/token | 每Node独立文件 | 对应Node | scope到hostId；可revoke；轮换时generation fencing；不复制。 |
@@ -816,7 +805,6 @@ Hub镜像按其pinned Debian/distroless运行时构建并在镜像内验收。No
 | Claude/Codex native auth | `remuda-agent`受控home | 对应原生CLI | 不同步到Hub/backup；profile切换只对新Instance；诊断包排除。 |
 | Lark app ID/secret | Hub secret file | 唯一lark consumer | 独立app、allowlist、单leader；回调日志脱敏。 |
 | Cloudflare DNS token | 现有Caddy secret | Caddy | 仅目标zone DNS edit；Remuda不可读。 |
-| Tunnel credential | cloudflared secret mount | cloudflared | 一tunnel一credential；Hub/backup不可读；泄露即rotate。 |
 | Sidecar launch capability | Node运行期0700目录 | 单个TS sidecar | single-use、短TTL、scope到Instance/socket；sidecar没有Hub root token。 |
 
 ## 14. 风险、缓解与回滚
@@ -833,7 +821,7 @@ Hub镜像按其pinned Debian/distroless运行时构建并在镜像内验收。No
 | Lark多consumer/平台重试造成双任务 | leader lease、message_id冲突、3秒callback监控 | 一app一leader、幂等表、stdin保活、SIGTERM drain。 | 停Larkconsumer，Web保持；按既有commandId查状态，不再创建。 |
 | Terminal writer冲突、粘贴重放或慢客户端拖垮 | lease/inputSeq/queue/epoch fault tests | 多读单写、短lease、bounded ring、control优先、full-frame reset。 | 撤销writer lease并降只读；detach而非kill；未知输入不补发。 |
 | Artifact在gateway profile被误报 | profile-specific native canary | Artifact只认native-login+PTY证据；UI区分unsupported/unknown。 | 隐藏Artifact入口并提供新建订阅profile，不改活session。 |
-| Edge误配置暴露Hub或破坏AsterGate | compose无ports检查、Caddy route diff、外网端口扫描 | 独立hostname、external network、named tunnel、精确配置scope。 | 回滚仅Remuda站点块/tunnel ingress与image digest；AsterGate route保持不变。 |
+| Edge误配置暴露Hub或破坏AsterGate | compose无ports检查、Caddy route diff、网络边界审查 | 独立内网hostname、external network、精确配置scope。 | 回滚仅Remuda站点块与image digest；AsterGate route保持不变。 |
 | Backup可写不可恢复或key同源 | 空目录restore与错误key/digest case | SQLite online backup、blob manifest、独立archive key、定期演练。 | 冻结写入，保留原data与backup；不覆盖原目录；由新目录恢复后切换。 |
 | Codex app-server版本漂移 | absolute path/version/digest与protocol canary变化 | 默认spawn目标用户installed client；typed JSON-RPC、raw evidence、每profile独立home。 | 该key过期，禁新建；保留历史。不能无证据自动转embed。 |
 | Codex direct embed扩大崩溃域/供应链 | compile/SBOM/size/MSRV/panic/auth parity gate | 精确git rev、optional feature、独立adapter与ADR。 | feature关闭并回到spawn的新Instance；旧embedded Run不自动迁移。 |
@@ -841,7 +829,7 @@ Hub镜像按其pinned Debian/distroless运行时构建并在镜像内验收。No
 | musl或glibc产物在老主机不兼容 | 真实Debian 10级host doctor与symbol scan | musl优先评估，失败用glibc2.28 builder；两条均跑完整host gate。 | 不部署该产物；保留上一digest。cross build本身不触发切换。 |
 | Lifted代码许可证/来源丢失 | license CI、SBOM/NOTICE diff | 记录repo/path/commit/license/header；AGPL来源只作行为参考。 | 阻止合并/发布；移除无法证明来源的lift并重写。 |
 
-所有rollback都以“停止接新工作 → drain → 保存journal/backup → 切回上一binary/image/config digest → 跑read-only reconciliation和canary”为顺序。不得`git reset --hard`、删除数据库/日志、执行破坏性down migration，或为恢复绿色而手工把capability改成supported。Caddy与Tunnel的回滚只撤Remuda精确配置，不触碰共享服务。
+所有rollback都以“停止接新工作 → drain → 保存journal/backup → 切回上一binary/image/config digest → 跑read-only reconciliation和canary”为顺序。不得`git reset --hard`、删除数据库/日志、执行破坏性down migration，或为恢复绿色而手工把capability改成supported。Caddy的回滚只撤Remuda精确配置，不触碰共享服务。
 
 ## 15. PR、合并与发布纪律
 
@@ -884,8 +872,7 @@ release manifest至少记录git commit、dirty=false、Rust/Cargo版本、target
 | Runtime wire方法命名 | 保留已发布设计的`runtime.*` namespace | M0-02 | 项目叫Remuda不要求破坏protocol兼容。 |
 | Node Linux链接策略 | 先证明musl；失败采用glibc 2.28 builder的GNU产物 | M1-07 | 影响SQLite/TLS依赖、artifact矩阵和运维。 |
 | Herdr release与session | 目标probe通过后pin；候选0.9.0；生产session `remuda`、测试`remuda-test` | M0-05 | 未probe前不把本地观察当release承诺。 |
-| 公网hostname | 独立`remuda.<approved-zone>` | M3-05 | Caddy、Tunnel、cookie origin、WebAuthn/Access。 |
-| Cloudflare Access | 默认在Hub自身auth之外再启用；service/WebSocket策略单独canary | M3-05 | 双层登录UX和Node WSS service token。 |
+| 公网暴露 | 待定；禁止隧道工具（D-031） | 新部署决策 | 内网Caddy为唯一路径；公网hostname与接入策略另行决策。 |
 | CN部署 | Phase 0不承诺；SG完成后只做read-only网络探针 | M3-07 | 网络、镜像/包分发、上游模型可达性。 |
 | Backup对象存储与escrow责任人 | 先用SG受控本地加密目录+离线独立key；上线前指定第二位置/责任人 | M3-06 | 灾难恢复RPO/RTO与key可用性。 |
 | 生产`--setting-sources` | 只含项目/Remuda审核overlay；排除未审核user/global hooks | M2-02 | 防Flux hook截走stdio permission；需要用户设置时逐项allowlist。 |
@@ -907,7 +894,7 @@ Phase 0只有在同一个候选release上满足以下全部条件才完成：
 - Hub/Node出站WSS、auth、journal复制、object store、断线恢复和手机Web在SG真实拓扑运行；Hub重启与Node离线时历史可读，未知dispatch不会自动重放。
 - 独立Lark app由唯一`lark-cli event consume`子进程消费；allowlist、message_id幂等、3秒callback、SIGTERM drain和手机interaction深链通过。
 - Herdr生产terminal满足多读单写、writer lease、binary WS frame、epoch/full-frame reset、慢客户端与显式bg wake；Artifact只在通过canary的`native-login` profile展示。
-- Caddy独立hostname、named Cloudflare Tunnel、无公开Hub端口、digest-pinned Compose、Node/Herdr supervision、backup/空目录restore与回滚演练全部通过；AsterGate现有`/v1`与admin边界未被改变。
+- Caddy独立内网hostname、无公开Hub端口、digest-pinned Compose、Node/Herdr supervision、backup/空目录restore与回滚演练全部通过；AsterGate现有`/v1`与admin边界未被改变。公网暴露：待定；禁止隧道工具（D-031）。
 - spawned installed `codex app-server`和Grok ACP的mandatory gate通过；Claude原生Workflow跨curated模型canary与受限主agent MCP通过。失败的driver/profile/model只显示unsupported/unknown，不拖累已验证Claude默认路径。
 - Codex direct embed不属于Phase 0默认完成条件，保持default-off；若构建或部署启用，则它的精确git rev、auth/config/behavior/panic/size/live parity独立gate自动变成mandatory，不能借spawn证据。
 - Claude Agent SDK sidecar只在§10.3阈值触发后需要。如果Rust wire失败而sidecar尚未完整gate，对应print/bg profile保持disabled；若启用，UDS、single-use capability、lock digest、raw-first和no-replay证据全部mandatory。

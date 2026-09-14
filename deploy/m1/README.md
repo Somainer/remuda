@@ -1,11 +1,11 @@
 # M1 deploy package (prepared locally, operator-run)
 
-> **Superseded by D-020.** The intranet Hub + Tunnel rollout below is not
-> applicable and must not be executed. Use [deploy/public](../public/README.md)
-> for the retained public VPS variant; the current supported path is the
-> [intranet runbook](../../docs/design/deploy-runbook.md). The musl artifact,
-> `Dockerfile` and separate Hub/Caddy building blocks remain reusable; build web and the
-> binary before copying the binary into the image context.
+> **Superseded by D-031.** 公网暴露：待定；禁止隧道工具（D-031）。
+> The only supported path is the [intranet runbook](../../docs/design/deploy-runbook.md).
+> The musl artifact, `Dockerfile` and separate Hub/Caddy building blocks remain
+> reusable. The commands below are historical operator reference, not rollout
+> authorization. Workers must not execute scripts under `deploy/` or probe
+> prohibited tools; see [D-031](../../docs/design/decisions.md).
 
 This directory is a **package**, not a rollout. Nothing here starts services
 on `devbox-sg-host` or `devbox-sg`. Artifacts are built on the
@@ -107,40 +107,9 @@ Reload Caddy, do not recreate it:
 ssh -o BatchMode=yes devbox-sg-host 'docker exec deploy-caddy-1 caddy reload --config /etc/caddy/Caddyfile'
 ```
 
-### A4. cloudflared token → local Caddy :443
+### A4. Public exposure
 
-No inbound security-group change. Configure the public hostname in the
-Cloudflare Zero Trust dashboard (token-based tunnels do not need a local
-`config.yml`):
-
-- Public hostname: `remuda.example.com`
-- Service: `https://127.0.0.1:443`
-- Origin TLS: SNI / HTTP Host `remuda.example.com`
-- Catch-all remains 404
-
-On a trusted laptop:
-
-```bash
-cloudflared tunnel create remuda-m1
-cloudflared tunnel token remuda-m1 > remuda-m1.token
-chmod 0400 remuda-m1.token
-scp -o BatchMode=yes remuda-m1.token devbox-sg-host:/tmp/remuda-m1.token
-```
-
-On the Hub host:
-
-```bash
-sudo mkdir -p /etc/cloudflared
-sudo install -m 0400 /tmp/remuda-m1.token /etc/cloudflared/remuda-m1.token
-rm -f /tmp/remuda-m1.token
-sudo install -m 0644 ~/path/to/checkout/deploy/m1/cloudflared.service /etc/systemd/system/cloudflared-remuda.service
-# if cloudflared is not at /usr/local/bin/cloudflared, edit ExecStart
-sudo systemctl daemon-reload
-sudo systemctl enable --now cloudflared-remuda.service
-```
-
-CNAME `remuda.example.com` to the tunnel. Do not publish a public A record
-for the private Hub IP.
+公网暴露：待定；禁止隧道工具（D-031）。Use the [intranet Caddy path](../intranet/README.md).
 
 ### A5. Bootstrap token retrieval
 
@@ -154,8 +123,7 @@ sudo cat /data00/remuda/hub/bootstrap-token
 ```
 
 Use that value only as `REMUDA_BOOTSTRAP_TOKEN` / `--bootstrap-token` for
-`POST /v1/login` and first Node enroll. Do not put it in compose YAML, Caddy,
-or cloudflared env.
+`POST /v1/login` and first Node enroll. Do not put it in compose YAML or Caddy configuration.
 
 ---
 

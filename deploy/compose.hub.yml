@@ -1,4 +1,4 @@
-# Remuda Hub only. Does not start or reconfigure Caddy / AsterGate / cloudflared.
+# Remuda Hub only. Does not start or reconfigure Caddy / AsterGate.
 #
 # Attach to the existing compose project network on devbox-sg-host.
 # Verified 2026-09-12 (read-only `docker network ls`):

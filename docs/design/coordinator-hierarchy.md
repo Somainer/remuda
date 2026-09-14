@@ -95,6 +95,25 @@
 
 ---
 
+### 2.5 修订：递归委托树，三层只是默认拓扑（2026-09-15，owner 评审后）
+
+owner 的评审意见：三层不能写死。对照先例（Erlang supervision tree、LangGraph hierarchical teams、OpenAI Agents SDK handoff 图、Claude Code 自身的 subagent/workflow），没有一个把层数放进 schema——委托是**递归**的，层数由策略约束。§2.0–§2.3 的三层因此降级为**默认拓扑（preset）**，原语改为**带作用域的递归委托树**：
+
+| 原语 | 含义 | 落点 |
+|---|---|---|
+| `parent` | 委托者；已有列（`InstanceRecord.parent`），不新增 | 不变 |
+| `scope` | 该节点可触达的资源集合：`projectIds[]`、`hostIds[]`、`workspaceIds[]`、supply 授予（§4）。**沿树单调收窄**：子 ⊆ 父，Hub 在 create 时校验 | 替代 `projectId` 单列（`projectId` 保留为 `scope.projectIds` 长度为 1 时的快捷字段） |
+| `grants` | 该节点被授予的动词：`dispatch`（可再委托）、`land`（可推进 main）、`spend`（可花 supply）、`address-owner`（可与 owner 对话）。默认全空 = 叶子 worker | 替代 `role` 枚举；`role` 只作为**预设名**保留（`worker` / `project-coordinator` / `top-coordinator` = 三组 grants+scope 的命名捆绑，UI 一键套用） |
+| `mandate` | 本节点的任务 + **沿链继承的 owner 原始意图**（mandate chain），每条委托边都把上游原话附上，深层节点不靠传话 | task ledger（批 4）的 `parentTaskId` 与委托树同构 |
+
+**不随层数变的不变量**（产品强制，替代原先按 role 的 403 表）：① 作用域沿树单调收窄；② supply 授予沿树下发并逐层记账，子节点不能花父节点没授予的额度；③ 上行只传结构化摘要（每条边 last-message，永不上传 transcript）；④ 落地按项目由 gate 串行，与树形无关；⑤ 深度上限（默认 3）、扇出上限、预算上限是 **策略字段**，写在 Project / Hub 策略里，可改；⑥ 不能向祖先的作用域之外委托，不能形成环（DAG 校验）；⑦ 任一节点都可由人占座。
+
+**由此自然得到的拓扑**：单项目用户 = 2 层（owner 直接对持有 dispatch 的项目节点说话，无人持有 address-owner 也可以——bot 直连该节点）；标准 = 3 层；worker 派 spike = 4 层（受深度上限约束，spike 节点无 `land`）；跨项目发布 coordinator = scope 覆盖多个 project 而无 address-owner 的节点；review agent、gate 失败交回原 worker = 同级 handoff（消息，不是树边）。
+
+**对批次的影响**：批 1（co-project）实现 `scope`/`grants` 两列与预设，唯一性约束改为「每个 Hub 至多一个活跃的 `address-owner` 持有者」+「每个项目默认至多一个活跃 `dispatch` 持有者（策略可放宽）」；批 4 的 task ledger 带 `parentTaskId`；批 5 的 `dispatch` 动词在创建子节点时校验收窄与 DAG。§2.1–§2.4 中所有「T1/T2 不得…」的 403 规则一律读作「不在 scope/grants 内的动作」。
+
+---
+
 ## 3 项目配置
 
 ### 3.1 住在哪里：两层，一层权威一层顾问

@@ -1,5 +1,61 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { expectCookieSession, login } from "./hub-auth";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const evidence = process.env.REMUDA_EVIDENCE === "1";
+const shotDir = evidence
+  ? path.join(here, "../../../docs/design/evidence")
+  : path.join(here, "../../test-results/native-pty-web");
+
+async function shot(page: Page, name: string) {
+  await mkdir(shotDir, { recursive: true });
+  await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
+}
+
+/** Answer every pending approval/question this instance currently has. */
+async function answerPendingApprovals(page: Page, instanceId: string) {
+  await expect
+    .poll(
+      async () =>
+        await page.evaluate(async (id) => {
+          const list = await fetch("/v1/interactions", { credentials: "include" });
+          const body = (await list.json()) as {
+            items?: {
+              id: string;
+              instanceId?: string;
+              state?: string;
+              request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
+            }[];
+          };
+          const mine = (body.items ?? []).filter(
+            (item) => item.instanceId === id && item.state === "pending",
+          );
+          for (const item of mine) {
+            const optionId = item.request?.options?.[0]?.id;
+            if (!optionId) continue;
+            await fetch(`/v1/interactions/${item.id}/answer`, {
+              method: "POST",
+              credentials: "include",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                answer: {
+                  kind: "approval",
+                  optionId,
+                  inputDigest: item.request?.inputDigest ?? "",
+                },
+              }),
+            });
+          }
+          return mine.length;
+        }, instanceId),
+      { timeout: 20_000 },
+    )
+    .toBe(0);
+}
+
 
 test.describe.configure({ mode: "serial" });
 
@@ -300,4 +356,120 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
       ),
     )
     .toBeTruthy();
+});
+
+/**
+ * D-028 §5.1/§1.0: New Session defaults to the native shell-pty carrier (the
+ * choice comes from the fake Node's driverInventory), and the resulting
+ * session carries BOTH projections — terminal and 结构.
+ */
+test("native PTY default from the host matrix, with both projections", async ({ page }) => {
+  test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node's matrix");
+  await login(page);
+  await page.goto("/sessions/new");
+  await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
+
+  const shell = page.getByTestId("new-session-driver-shell-pty");
+  await expect(shell).toBeVisible();
+  await expect(shell).toHaveAttribute("data-default", "1");
+  await expect(page.getByTestId("new-session-launch-preview")).toContainText("claude");
+  // Legacy carriers remain selectable but are secondary.
+  await expect(page.getByTestId("new-session-driver-claude-print")).toHaveAttribute("data-default", "0");
+  await shot(page, "native-pty-web-1-new-session-1440.png");
+  await page.setViewportSize({ width: 400, height: 840 });
+  await shot(page, "native-pty-web-1-new-session-400.png");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  await page.getByTestId("new-session-prompt").fill("native pty session");
+  await page.getByTestId("new-session-start").click();
+  await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+
+  // Both projections available: the 终端/结构 switch is rendered, and the
+  // structured conversation opens by default.
+  await expect(page.getByTestId("view-switch")).toBeVisible();
+  await expect(page.getByTestId("view-switch-tty")).toBeVisible();
+  await expect(page.getByTestId("view-switch-structured")).toBeVisible();
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
+});
+
+/**
+ * D-028 §6 composer states against the fake Node: working turns the composer
+ * into 发送(steer) / 排队 / 打断, the queue chip is removable, Esc cancels.
+ */
+test("composer steer / queue / interrupt states on a working native session", async ({ page }) => {
+  test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+  const commands: { operation?: string; payload?: { mode?: string; prompt?: string } }[] = [];
+  page.on("request", (request) => {
+    if (request.method() !== "POST") return;
+    if (!new URL(request.url()).pathname.endsWith("/commands")) return;
+    const body = request.postDataJSON() as (typeof commands)[number] | null;
+    if (body) commands.push(body);
+  });
+
+  await login(page);
+  await page.goto("/sessions/new");
+  await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
+  await page.getByTestId("new-session-prompt").fill("working session");
+  await page.getByTestId("new-session-start").click();
+  await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+  const instanceId = new URL(page.url()).pathname.split("/").pop() as string;
+  await answerPendingApprovals(page, instanceId);
+
+  // The fake Node reports the launched agent as working immediately.
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
+    timeout: 10_000,
+  });
+
+  // Working composer: native steer primary, Remuda-held queue, red interrupt.
+  const send = page.getByTestId("composer-send");
+  await expect(send).toHaveAttribute("data-mode", "steer");
+  await expect(page.getByTestId("composer-queue-btn")).toBeVisible();
+  await expect(page.getByTestId("composer-queue-btn")).toHaveAttribute("data-holder", "remuda");
+  const interrupt = page.getByTestId("composer-interrupt");
+  await expect(interrupt).toBeVisible();
+  await expect(interrupt).toHaveAttribute("data-provision", "native");
+  await shot(page, "native-pty-web-1-composer-working-1440.png");
+
+  // Steer carries PromptMode=steer on the wire.
+  await page.getByTestId("composer-input").fill("steer mid turn");
+  await send.click();
+  await expect
+    .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))
+    .toBeTruthy();
+
+  // Queueing holds a removable chip and sends nothing.
+  const before = commands.length;
+  await page.getByTestId("composer-input").fill("after this turn");
+  await page.getByTestId("composer-queue-btn").click();
+  await expect(page.getByTestId("composer-queued-chip")).toBeVisible();
+  await expect(page.getByTestId("composer-queue-status")).toContainText("1");
+  await page.getByTestId("composer-queued-remove").click();
+  await expect(page.getByTestId("composer-queued-chip")).toHaveCount(0);
+  expect(commands.length).toBe(before);
+
+  // 400px: the three controls still fit.
+  await page.getByTestId("composer-input").fill("later");
+  await page.getByTestId("composer-queue-btn").click();
+  await expect(page.getByTestId("composer-queued-chip")).toBeVisible();
+  await page.setViewportSize({ width: 400, height: 840 });
+  await shot(page, "native-pty-web-1-composer-working-400.png");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.getByTestId("composer-queued-remove").click();
+
+  // Esc while the composer is focused interrupts (with a confirm on desktop).
+  page.once("dialog", (dialog) => {
+    expect(dialog.message()).toContain("打断");
+    void dialog.accept();
+  });
+  await page.getByTestId("composer-input").focus();
+  await page.keyboard.press("Escape");
+  await expect
+    .poll(() => commands.some((c) => c.operation === "instance.cancel"))
+    .toBeTruthy();
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
+    timeout: 10_000,
+  });
+  await expect(page.getByTestId("composer-interrupt")).toHaveCount(0);
+  await expect(page.getByTestId("composer-queue-btn")).toHaveCount(0);
+  await expect(page.getByTestId("composer-send")).toHaveAttribute("data-mode", "new-turn");
 });

@@ -7,6 +7,7 @@ import { selectedTab, spaceStore, type Space, type SpacePrefs } from "./store";
 import type { Instance } from "../../types/instance";
 import { ActionSheet } from "./ActionSheet";
 import { HarnessGlyph } from "./SpacesPanel";
+import { LaunchedByMark } from "../session/LaunchedBy";
 import css from "./spaces.module.css";
 
 const LONG_PRESS_MS = 500;
@@ -84,7 +85,7 @@ export function SpaceTabs({ space, tabs, prefs, instanceId, newHref }: { space?:
             navigate(`/s/${tabs[next].id}`);
             const list = event.currentTarget.closest('[role="tablist"]');
             (list?.querySelectorAll('[role="tab"]')[next] as HTMLElement)?.focus();
-          }}><HarnessGlyph kind={instance.kind} /><span className={css.tabTitle}>{title}</span><StateDot status={status} /></button>
+          }}><HarnessGlyph kind={instance.kind} /><span className={css.tabTitle}>{title}</span><LaunchedByMark compact launchedBy={instance.launchedBy} /><StateDot status={status} /></button>
           <button type="button" className={css.tabClose} data-testid="tab-close" aria-label={`关闭标签 ${title}`}
             title={status === "exited" ? "关闭标签" : "关闭标签（可选择是否停止会话）"} disabled={closing.includes(instance.id)}
             onClick={() => {

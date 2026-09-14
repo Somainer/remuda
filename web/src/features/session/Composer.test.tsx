@@ -5,7 +5,7 @@ import { Composer } from "./Composer";
 import { effortAt } from "./effort";
 
 describe("Composer shortcuts", () => {
-  it("sends on Cmd/Ctrl+Enter on desktop, not on plain Enter", async () => {
+  it("sends on plain Enter (primary) on desktop; Shift+Enter is a newline", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn();
     render(<Composer instanceId="ins_x" mobile={false} onSend={onSend} />);
@@ -13,11 +13,14 @@ describe("Composer shortcuts", () => {
     await user.click(area);
     await user.type(area, "hello");
     await user.keyboard("{Enter}");
-    expect(onSend).not.toHaveBeenCalled();
-    await user.keyboard("{Meta>}{Enter}{/Meta}");
-    // The shortcut is what this asserts; a send now also carries its (empty)
-    // attachment lists.
+    // D-028 §6: Enter runs the primary control; the idle mode is new-turn.
+    expect(onSend).toHaveBeenCalledTimes(1);
     expect(onSend.mock.calls[0][0]).toBe("hello");
+    expect(onSend.mock.calls[0][3]).toBe("new-turn");
+    onSend.mockClear();
+    await user.type(area, "line1{Shift>}{Enter}{/Shift}line2");
+    expect(onSend).not.toHaveBeenCalled();
+    expect((area as HTMLTextAreaElement).value).toContain("\n");
   });
 
   it("does not send Cmd+Enter on mobile", async () => {

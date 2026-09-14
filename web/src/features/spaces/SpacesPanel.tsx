@@ -5,6 +5,7 @@ import { hubStore } from "../../lib/store";
 import { projectStatus } from "../../lib/status";
 import { newSessionPath, spaceSessions, spaceStore, type Space, type SpacePrefs } from "./store";
 import type { Instance } from "../../types/instance";
+import { LaunchedByMark } from "../session/LaunchedBy";
 import { ActionSheet } from "./ActionSheet";
 import css from "./spaces.module.css";
 
@@ -15,7 +16,7 @@ export function HarnessGlyph({ kind }: { kind: string }) {
 function SessionRow({ instance, spaceId, active, onNavigate }: { instance: Instance; spaceId: string; active: boolean; onNavigate?: () => void }) {
   return <Link className={css.sessionRow} data-testid="space-session" data-active={active} aria-current={active ? "page" : undefined}
     to={`/s/${instance.id}`} onClick={() => { spaceStore.selectTab(spaceId, instance.id); onNavigate?.(); }}>
-    <HarnessGlyph kind={instance.kind} /><span className={css.spaceName}>{hubStore.titleOf(instance.id)}</span><StateDot status={projectStatus(instance)} />
+    <HarnessGlyph kind={instance.kind} /><span className={css.spaceName}>{hubStore.titleOf(instance.id)}</span><LaunchedByMark launchedBy={instance.launchedBy} /><StateDot status={projectStatus(instance)} />
   </Link>;
 }
 

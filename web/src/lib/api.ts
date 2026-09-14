@@ -3,6 +3,7 @@ import type { Host, HostCli, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
+import type { PromptMode } from "../types/generated";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import { mapWorkspace } from "../features/workspaces/registry";
 import { followWorkspaces } from "../features/workspaces/follow";
@@ -16,10 +17,11 @@ import type {
 } from "../features/providers";
 import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import type { components, paths } from "./api.generated";
-import { printCapabilities, ptyCapabilities } from "./capabilities";
+import { printCapabilities, ptyCapabilities, agentPtyCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
 import {
   mockClose,
+  mockCancel,
   mockConfigure,
   mockCreate,
   mockDb,
@@ -155,6 +157,13 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
   const cli = Array.isArray(h.cli) ? h.cli.map(mapHostCli) : [];
   const resources = h.resources && typeof h.resources === "object" ? h.resources : undefined;
   const herdr = h.herdr && typeof h.herdr === "object" ? h.herdr : undefined;
+  // D-028 §5.1: the Node stores the driver inventory verbatim under
+  // `capabilities`; the New Session matrix reads it rather than hardcoding
+  // which drivers a host can launch.
+  const rawCaps = h.capabilities && typeof h.capabilities === "object" ? h.capabilities : undefined;
+  const driverInventory = Array.isArray((rawCaps as { driverInventory?: unknown } | undefined)?.driverInventory)
+    ? ((rawCaps as { driverInventory: unknown[] }).driverInventory as Host["driverInventory"])
+    : undefined;
   return {
     id,
     revision: "1",
@@ -169,6 +178,8 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
     hostname: h.hostname ?? undefined,
     lastSeenAt: h.lastSeenAt ?? undefined,
     cli,
+    capabilities: rawCaps as Host["capabilities"],
+    driverInventory,
     labels: h.labels ?? [],
     maxInstances: h.maxInstances ?? 8,
     resources: resources
@@ -210,7 +221,27 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     effortIndex?: number | null;
     mode?: string | null;
     promotedAt?: string | null;
+    launchedBy?: string | null;
+    signalTier?: string | null;
+    lastError?: string | null;
   };
+  const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
+  const capabilities =
+    ptyDriver && kind !== "terminal"
+      ? agentPtyCapabilities(kind, driver)
+      : ptyDriver
+        ? ptyCapabilities(driver)
+        : HUB_CAPABILITIES;
+  const launchedBy =
+    extra.launchedBy === "remuda" || extra.launchedBy === "user" ? extra.launchedBy : null;
+  const signalTier =
+    extra.signalTier === "hook" ||
+    extra.signalTier === "file" ||
+    extra.signalTier === "osc" ||
+    extra.signalTier === "screen" ||
+    extra.signalTier === "none"
+      ? extra.signalTier
+      : undefined;
   return {
     id,
     revision: "1",
@@ -231,6 +262,7 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
       kind,
       sessionId: unknownKnowledge("hub"),
       transcript: unknownKnowledge("hub"),
+      ...(signalTier ? { signalTier } : {}),
     },
     processRef: {
       processGeneration: "1",
@@ -239,16 +271,15 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     },
     specRevision: "1",
     launchId: unknownKnowledge("hub"),
-    capabilities:
-      driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty"
-        ? ptyCapabilities(driver)
-        : HUB_CAPABILITIES,
+    capabilities,
     ownerFence: "1",
     activeRunIds: [],
     parent: null,
     journalId: rec.journalId as Id,
     durableSeq: rec.durableSeq as U64,
     exit: { state: "not-applicable" },
+    lastError: typeof extra.lastError === "string" ? extra.lastError : null,
+    launchedBy,
     cwd: extra.cwd ?? rec.workspaceId ?? null,
     name: extra.name ?? rec.title ?? null,
     delegation: typeof rec.delegation === "string" ? rec.delegation : extra.delegation ?? null,
@@ -315,7 +346,7 @@ export type InstanceCreateSpec = {
   hostId: Id;
   workspaceId?: Id;
   kind: "claude" | "codex" | "grok" | "agy" | "terminal";
-  driver: "claude-print" | "claude-pty" | "claude-bg" | "generic-pty" | "shell-pty";
+  driver: Instance["driver"];
   model: string;
   providerProfileId?: string;
   permissionMode: string;
@@ -437,7 +468,14 @@ export type HubApi = {
   instanceList(q?: { hostId?: string; workspaceId?: string; kind?: string }): Promise<Page<Instance>>;
   instanceGet(instanceId: Id): Promise<Instance>;
   instanceCreate(spec: InstanceCreateSpec): Promise<{ command: CommandResult["command"]; instance: Instance }>;
-  instanceSend(instanceId: Id, prompt: string, attachments?: AttachmentRef[]): Promise<CommandResult>;
+  instanceSend(
+    instanceId: Id,
+    prompt: string,
+    attachments?: AttachmentRef[],
+    mode?: PromptMode,
+  ): Promise<CommandResult>;
+  /** D-028 §5.3: interrupt the current turn; the process and session stay alive. */
+  instanceCancel(instanceId: Id): Promise<CommandResult>;
   /** Stage one image for a later send (D-027). Returns its `obj_…` id. */
   objectUpload(instanceId: Id, blob: Blob, mediaType: string): Promise<{ objectId: string; size: number }>;
   instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
@@ -696,8 +734,12 @@ function createMockApi(): HubApi {
         },
       };
     },
-    async instanceSend(instanceId, prompt) {
+    async instanceSend(instanceId, prompt, _attachments, mode) {
+      void mode;
       return mockSend(instanceId, prompt);
+    },
+    async instanceCancel(instanceId) {
+      return mockCancel(instanceId);
     },
     async objectUpload(_instanceId, blob, mediaType) {
       // The mock Hub stages nothing; a deterministic id keeps the composer
@@ -1116,9 +1158,14 @@ function createLiveApi(): HubApi {
       titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
       return { instance, command: mapCommand(created.command, instance.id) };
     },
-    async instanceSend(instanceId, prompt, attachments) {
-      const payload = attachments?.length ? { prompt, attachments } : { prompt };
+    async instanceSend(instanceId, prompt, attachments, mode) {
+      const payload: Record<string, unknown> = { prompt };
+      if (attachments?.length) payload.attachments = attachments;
+      if (mode && mode !== "new-turn") payload.mode = mode;
       return command(instanceId, "instance.send", payload);
+    },
+    async instanceCancel(instanceId) {
+      return command(instanceId, "instance.cancel", {});
     },
     async objectUpload(instanceId, blob, mediaType) {
       // Raw body plus Content-Type: no multipart, and the bytes never pass

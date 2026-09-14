@@ -6,13 +6,14 @@ import { Button } from "../components/Button";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
+import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import { Transcript } from "../features/session/Transcript";
 import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
-import { canShowTerminal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
+import { canShowTerminal, hasStructuredSignal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
 import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode } from "../lib/status";
@@ -43,8 +44,12 @@ export function SessionPage({
   const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
   const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
   const showTerminal = instance ? canShowTerminal(instance) : false;
-  const remembered = showTerminal ? readSessionView(instanceId) : null;
-  const baseView: SessionView = showTerminal ? (remembered ?? "tty") : "structured";
+  const showStructured = instance ? hasStructuredSignal(instance) : false;
+  const remembered = showTerminal || showStructured ? readSessionView(instanceId) : null;
+  // Both projections exist on a native PTY session; open the conversation by
+  // default when a structured signal exists, the raw terminal otherwise
+  // (D-028 §1.0 — the switch always offers the other projection).
+  const baseView: SessionView = remembered ?? (showStructured ? "structured" : "tty");
   const backTo = `/s/${instanceId}/${baseView}`;
 
   useEffect(() => {
@@ -73,8 +78,12 @@ export function SessionPage({
   const events = hub.events[instanceId] ?? [];
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
   const status = instance ? projectStatus(instance) : "unknown";
-  const resolvedView =
-    view === "auto" ? (showTerminal ? (remembered ?? "tty") : "structured") : view;
+  // D-028 §6 composer phase. `starting` behaves like idle (one send box);
+  // only a live working/blocked turn exposes steer/queue/interrupt.
+  const composerPhase =
+    status === "blocked" ? "blocked" : status === "working" ? "working" : status === "exited" ? "exited" : "idle";
+  const nodeRestarted = instance?.lastError === "node-epoch-changed";
+  const resolvedView = view === "auto" ? baseView : view;
   const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
   const usageEvent = events.findLast((e) => e.kind === "usage");
@@ -147,6 +156,7 @@ export function SessionPage({
               {instance.kind} · promoted
             </span>
           ) : null}
+          <LaunchedByMark launchedBy={instance.launchedBy} />
           <span className={session.spacer} />
           {showTerminal ? (
             <ViewSwitch
@@ -287,6 +297,22 @@ export function SessionPage({
           {status === "idle" ? " · 回合结束、进程仍在" : ""}
         </div>
       </header>
+      {nodeRestarted ? (
+        <div className={session.nodeRestart} data-testid="node-restart-banner">
+          <span>Node 重启，会话已结束</span>
+          <Button
+            variant="primary"
+            disabled={resuming || !canResume}
+            data-testid="node-restart-resume"
+            onClick={() => {
+              void startResume("structured");
+            }}
+          >
+            Resume
+          </Button>
+          {!canResume ? <span className={session.nodeRestartNote}>该会话没有可续接的 transcript</span> : null}
+        </div>
+      ) : null}
       <div
         className={resolvedView === "tty" || resolvedView === "structured" ? session.pane : undefined}
         style={
@@ -388,6 +414,9 @@ export function SessionPage({
           mobile={mobile}
           sending={sending}
           disabled={status === "exited" || pending.length > 0}
+          phase={composerPhase}
+          capabilities={instance.capabilities}
+          onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={
             genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
           }
@@ -412,7 +441,7 @@ export function SessionPage({
           onModel={(next) => {
             void hubStore.setModel(instance.id, next);
           }}
-          onSend={async (text, attachments, staged) => {
+          onSend={async (text, attachments, staged, mode) => {
             setSending(true);
             try {
               // D-027: the bubble keeps the local blob URLs so the sent
@@ -425,7 +454,7 @@ export function SessionPage({
                   name: item.name,
                   previewUrl: item.previewUrl,
                 }));
-              await hubStore.send(instance.id, text, attachments ?? [], previews);
+              await hubStore.send(instance.id, text, attachments ?? [], previews, mode);
             } finally {
               setSending(false);
             }

@@ -445,9 +445,7 @@ impl TicketStore {
         let iid = interaction.meta.id.as_id().as_str().to_string();
         let previous = self.by_interaction.get(&iid).cloned();
         let (ticket, card) = self.issue(interaction, session_key, now)?;
-        if let Some(old_tid) =
-            previous.filter(|tid| tid != &ticket.ticket_id)
-        {
+        if let Some(old_tid) = previous.filter(|tid| tid != &ticket.ticket_id) {
             self.backend
                 .set_ticket_state(&old_tid, TicketState::Expired, None)
                 .await?;

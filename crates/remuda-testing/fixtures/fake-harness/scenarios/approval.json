@@ -1,0 +1,23 @@
+{
+  "turns": [
+    {
+      "match_prefix": "RUN_TOOL",
+      "thinking": "Checking the probe.",
+      "think_chunks": 2,
+      "text": "SPIKE_COMPLETE RUN_TOOL",
+      "chunks": 2,
+      "tools": [
+        {
+          "name": "Bash",
+          "input": {
+            "command": "printf SPIKE_TOOL_OK > spike-result.txt",
+            "description": "Write the fixed probe marker."
+          },
+          "approval": "ask",
+          "duration_ms": 20
+        }
+      ]
+    }
+  ],
+  "quit_after_turns": 1
+}

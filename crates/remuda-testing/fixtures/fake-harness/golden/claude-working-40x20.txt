@@ -1,0 +1,20 @@
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+SLOW_QUEUE                              
+⏺ Bash(sleep 20)                        
+                                        
+⏳ Bash… (esc to interrupt)              
+                                        
+❯ QUEUED_FOLLOWUP                       

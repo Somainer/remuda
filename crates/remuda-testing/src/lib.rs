@@ -10,6 +10,7 @@
 mod bin_locator;
 mod client;
 mod fake;
+pub mod fake_harness;
 mod fake_herdr;
 mod flags;
 mod paths;

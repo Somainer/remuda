@@ -1,0 +1,19 @@
+# YAML variant of the fake-harness scenario format (D-028 P7 fixture).
+# Field names mirror the JSON schema exactly.
+turns:
+  - match: YAML_RUN
+    thinking: Parsed from YAML.
+    think_chunks: 2
+    text: SPIKE_COMPLETE YAML
+    chunks: 2
+    chunk_delay_ms: 6
+    tools:
+      - name: Bash
+        input:
+          command: echo yaml
+          description: YAML-declared tool
+        approval: auto
+        duration_ms: 10
+  - # catch-all
+    text: SPIKE_COMPLETE default
+quit_after_turns: 1

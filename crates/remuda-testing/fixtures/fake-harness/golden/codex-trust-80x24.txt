@@ -1,0 +1,24 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+OpenAI Codex                                                                    
+                                                                                
+Do you trust the files in this folder?                                          
+wt                                                                              
+                                                                                
+❯ 1. Yes, proceed                                                               
+  2. No, exit                                                                   

@@ -1,0 +1,24 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+RUN_TOOL                                                                        
+                                                                                
+Would you like to run the following command?                                    
+Reason: Write the fixed probe marker.                                           
+$ printf SPIKE_TOOL_OK > spike-result.txt                                       
+› 1. Yes, proceed (y)                                                           
+  3. No, and tell Codex what to do differently (esc)                            
+Press enter to confirm or esc to cancel                                         

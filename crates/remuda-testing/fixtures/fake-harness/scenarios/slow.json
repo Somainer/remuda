@@ -1,0 +1,24 @@
+{
+  "turns": [
+    {
+      "match_prefix": "SLOW",
+      "thinking": "Starting the long running tool.",
+      "text": "SPIKE_COMPLETE SLOW",
+      "tools": [
+        {
+          "name": "Bash",
+          "input": { "command": "sleep 20", "timeout": 60000 },
+          "approval": "auto",
+          "duration_ms": 1500
+        },
+        {
+          "name": "Bash",
+          "input": { "command": "echo second" },
+          "approval": "auto",
+          "duration_ms": 500
+        }
+      ]
+    }
+  ],
+  "quit_after_turns": 2
+}

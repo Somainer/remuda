@@ -1,0 +1,12 @@
+{
+  "turns": [
+    {
+      "text": "SPIKE_COMPLETE",
+      "chunks": 3,
+      "chunk_delay_ms": 6,
+      "thinking": "Looking at the request.",
+      "think_chunks": 2
+    }
+  ],
+  "quit_after_turns": 1
+}

@@ -3243,15 +3243,21 @@ dependencies = [
  "async-trait",
  "clap",
  "fs2",
+ "nix",
+ "portable-pty",
  "remuda-driver",
  "remuda-herdr",
  "remuda-journal",
  "remuda-protocol",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
+ "signal-hook",
  "tempfile",
+ "terminal_size",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3670,6 +3676,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.2",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serial2"
 version = "0.2.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3763,6 +3782,16 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
 
 [[package]]
 name = "signal-hook-registry"
@@ -3978,6 +4007,16 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
  "rustix",
  "windows-sys 0.61.2",
 ]
@@ -4411,6 +4450,12 @@ dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

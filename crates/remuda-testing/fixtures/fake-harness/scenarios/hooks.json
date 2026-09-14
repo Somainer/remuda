@@ -1,0 +1,32 @@
+{
+  "turns": [
+    {
+      "match_prefix": "HOOK",
+      "text": "SPIKE_COMPLETE HOOK",
+      "tools": [
+        {
+          "name": "Bash",
+          "input": {
+            "command": "printf hook-approved",
+            "description": "Harmless command gated by the PermissionRequest hook."
+          },
+          "approval": "hook",
+          "duration_ms": 10
+        }
+      ]
+    },
+    {
+      "match_prefix": "HOOK_REQUIRED",
+      "text": "SPIKE_COMPLETE HOOK_REQUIRED",
+      "tools": [
+        {
+          "name": "Bash",
+          "input": { "command": "printf should-not-run" },
+          "approval": "hook_required",
+          "duration_ms": 10
+        }
+      ]
+    }
+  ],
+  "quit_after_turns": 1
+}

@@ -139,20 +139,186 @@
   color: var(--paper);
 }
 
-.chipKey {
-  color: var(--mute);
-}
-
 .chipX {
   color: var(--mute);
   margin-left: 2px;
 }
 
-.share {
-  margin-left: auto;
-  font-family: var(--mono);
-  font-size: 11px;
+/* The default toolbar row: search, scope, match count, scope switch. */
+.toolbarTop {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.toolbarTop .search {
+  flex: 1 1 220px;
+  min-width: 180px;
+}
+
+.scope {
+  font-size: 12px;
   color: var(--mute);
+}
+
+.scope[data-scope="all"] {
+  color: var(--dust);
+}
+
+.matchCount {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.scopeBtn {
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 12px;
+  padding: 0 10px;
+}
+
+.scopeBtn:disabled {
+  color: var(--mute);
+  border-color: var(--line);
+}
+
+/* Says what a Space switch just dropped, so a silently narrower query is
+   never mistaken for missing data (P0-1 rule 5). */
+.notice {
+  font-size: 12px;
+  color: var(--dust);
+}
+
+.clearAll {
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 12px;
+  padding: 0 10px;
+}
+
+.clearAll:disabled {
+  color: var(--mute);
+}
+
+.panelHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.panelTitle {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.panelClose {
+  margin-left: auto;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-size: 12px;
+  padding: 0 10px;
+}
+
+.panelScope {
+  margin: 0;
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.panelGroup {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.panelLegend {
+  width: 100%;
+  padding: 0;
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.panelNote {
+  margin: 0;
+  font-size: 12px;
+  color: var(--mute);
+  line-height: 1.5;
+}
+
+.panelFoot {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Filtered to zero is a distinct state from "no sessions": it names the
+   conditions as the cause and offers the two ways back (P0-1 rule 4). */
+.noMatches {
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.noMatchesTitle {
+  margin: 0;
+  font-size: 14px;
+  color: var(--paper);
+}
+
+.noMatchesBody {
+  margin: 0;
+  font-size: 13px;
+  color: var(--mute);
+  line-height: 1.6;
+}
+
+.noMatchesActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.noMatchesBtn {
+  height: 32px;
+  border: 1px solid var(--paper);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 13px;
+  padding: 0 14px;
+}
+
+/* Phones use the project's 44px target for every filter control. */
+@media (max-width: 767px) {
+  .chip,
+  .clearAll,
+  .scopeBtn {
+    height: 44px;
+    padding: 0 14px;
+  }
+
+  .panelClose,
+  .noMatchesBtn {
+    height: 44px;
+  }
 }
 
 .group {

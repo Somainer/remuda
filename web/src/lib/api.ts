@@ -201,6 +201,8 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
     ssh: h.ssh ?? undefined,
     lastError: h.lastError ?? undefined,
     providerBinding: typeof h.providerBinding === "string" && h.providerBinding ? h.providerBinding : "auto",
+    defaultLaunchArgs: Array.isArray(h.defaultLaunchArgs) ? h.defaultLaunchArgs : undefined,
+    claudeBinaryPath: h.claudeBinaryPath ?? undefined,
   };
 }
 
@@ -357,6 +359,10 @@ export type InstanceCreateSpec = {
   settingsOverlayPath?: string;
   claudeConfigDir?: string;
   maxBudgetUsd?: string;
+  /** Extra native CLI args as an argv array, never a shell string. Replaces the host default. */
+  args?: string[];
+  /** Host-absolute claude executable. Validated and pinned by the Node, not the Hub. */
+  binaryPath?: string;
   name?: string;
   /** Composer/New Session effort. Stored in UI state; Hub ignores unknown create fields. */
   effortIndex?: number;
@@ -495,7 +501,7 @@ export type HubApi = {
   hostRemove(hostId: Id): Promise<void>;
   hostList(): Promise<Page<Host>>;
   hostGet(hostId: Id): Promise<Host>;
-  hostPatch(hostId: Id, body: { name?: string; labels?: string[]; maxInstances?: number; providerBinding?: string }): Promise<Host>;
+  hostPatch(hostId: Id, body: { name?: string; labels?: string[]; maxInstances?: number; providerBinding?: string; defaultLaunchArgs?: string[] | null; claudeBinaryPath?: string | null }): Promise<Host>;
   workspaceList(hostId?: Id): Promise<Page<Workspace>>;
   workspaceRegister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceId?: string; workspaceRevision?: number }>;
   workspaceUnregister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceRevision?: number }>;
@@ -823,6 +829,13 @@ function createMockApi(): HubApi {
       if (body.labels) found.labels = body.labels;
       if (body.maxInstances != null) found.maxInstances = body.maxInstances;
       if (body.providerBinding) found.providerBinding = body.providerBinding;
+      // `null` clears; `undefined` means the PATCH did not mention the field.
+      if (body.defaultLaunchArgs !== undefined) {
+        found.defaultLaunchArgs = body.defaultLaunchArgs ?? undefined;
+      }
+      if (body.claudeBinaryPath !== undefined) {
+        found.claudeBinaryPath = body.claudeBinaryPath || undefined;
+      }
       return found;
     },
     async providerList(q) {
@@ -1144,6 +1157,10 @@ function createLiveApi(): HubApi {
         settingsOverlayPath: spec.settingsOverlayPath,
         claudeConfigDir: spec.claudeConfigDir,
         maxBudgetUsd: spec.maxBudgetUsd,
+        // Omitted rather than sent empty: an empty array would replace the
+        // host default with "no args", which is a different request.
+        args: spec.args?.length ? spec.args : undefined,
+        binaryPath: spec.binaryPath || undefined,
       };
       const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
         method: "POST",

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AddHostForm,
+  HostLaunchDefaults,
   HostProviderBinding,
   cliSummary,
   hostRegistry,
@@ -132,6 +133,7 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
   const [maxInstances, setMaxInstances] = useState(String(host.maxInstances));
   const [profiles, setProfiles] = useState<ProviderProfile[]>([]);
   const [bindingError, setBindingError] = useState<string | null>(null);
+  const [launchError, setLaunchError] = useState<string | null>(null);
 
   useEffect(() => {
     void api
@@ -245,6 +247,22 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
             }}
           />
           {bindingError ? <p role="alert" className={css.sshError}>{bindingError}</p> : null}
+          <HostLaunchDefaults
+            args={host.defaultLaunchArgs}
+            binaryPath={host.claudeBinaryPath}
+            probedBinaryPath={host.cli?.find((entry) => entry.kind === "claude")?.path ?? undefined}
+            onSave={(patch) => {
+              setLaunchError(null);
+              hostRegistry.patch(host.id, {
+                defaultLaunchArgs: patch.defaultLaunchArgs ?? undefined,
+                claudeBinaryPath: patch.claudeBinaryPath ?? undefined,
+              });
+              void api.hostPatch(host.id, patch).catch((error: unknown) => {
+                setLaunchError(error instanceof Error ? error.message : "保存失败");
+              });
+            }}
+          />
+          {launchError ? <p role="alert" className={css.sshError}>{launchError}</p> : null}
           <label className={ui.field}>
             maxInstances
             <input

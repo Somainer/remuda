@@ -1,6 +1,7 @@
 export { PlacementPicker } from "./PlacementPicker";
 export { AddHostForm } from "./AddHostForm";
 export { HostProviderBinding } from "./HostProviderBinding";
+export { HostLaunchDefaults, parseLaunchArgs } from "./HostLaunchDefaults";
 export { useHostViews, hostRegistry } from "./registry";
 export {
   hostsMatching,

@@ -125,6 +125,8 @@ async fn fake_driver_restart_lists_instances_and_replays_folds() {
 async fn fake_claude_kill_mid_session_replays_identical_folds() {
     let fake = ensure_workspace_bin("fake-claude");
     let data = tempfile::tempdir().expect("data dir");
+    let claude_config = data.path().join("claude-config");
+    std::fs::create_dir_all(&claude_config).expect("isolated Claude config");
     let http = loopback_config(data.path());
     let mut native = NativeDriverConfig::new(data.path().to_path_buf()).with_claude_binary(fake);
     native.extra_env.insert(
@@ -139,13 +141,12 @@ async fn fake_claude_kill_mid_session_replays_identical_folds() {
 
     let (instance_id, journal_id) = {
         let node = compose(&config).expect("compose native");
-        let created = tokio::time::timeout(
-            Duration::from_secs(20),
-            node.create_instance(create_req("mid-session")),
-        )
-        .await
-        .expect("create timed out")
-        .expect("create fake-claude instance");
+        let mut request = create_req("mid-session");
+        request.claude_config_dir = Some(claude_config.to_string_lossy().into_owned());
+        let created = tokio::time::timeout(Duration::from_secs(20), node.create_instance(request))
+            .await
+            .expect("create timed out")
+            .expect("create fake-claude instance");
         wait_for_settlement(&node, &created.command.command_id).await;
         // Drop `node` here: mid-session kill (no close command).
         (created.instance.meta.id, created.instance.journal_id)

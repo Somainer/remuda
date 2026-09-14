@@ -97,7 +97,10 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   expect(followUrls.every((url) => !new URL(url).searchParams.has("token"))).toBe(true);
   await page.reload();
   await expectCookieSession(page);
-  await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1);
+  // Reload waits for cookie-backed bootstrap and the durable journal read again.
+  await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1, {
+    timeout: 20_000,
+  });
   await expect(page.getByTestId("composer-bar")).toBeVisible();
 
   await page.goto("/approvals");
@@ -383,6 +386,9 @@ test("native PTY default from the host matrix, with both projections", async ({ 
   await page.goto("/sessions/new");
   await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
 
+  // Batch B moved the carrier matrix and launch preview behind 高级设置 so
+  // the first layer stays in user vocabulary; the matrix itself is unchanged.
+  await page.getByTestId("new-session-advanced").click();
   const shell = page.getByTestId("new-session-driver-shell-pty");
   await expect(shell).toBeVisible();
   await expect(shell).toHaveAttribute("data-default", "1");

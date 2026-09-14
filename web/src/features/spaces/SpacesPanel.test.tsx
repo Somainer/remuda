@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import { hubStore } from "../../lib/store";
 import type { Instance } from "../../types/instance";
@@ -9,9 +9,31 @@ import { known } from "../../types/wire";
 import { SpacesPanel } from "./SpacesPanel";
 import { spaceKey, spaceStore, SPACES_PREFS_KEY, type Space } from "./store";
 
+// jsdom has no matchMedia; QuickFind's viewport hook needs one. The panel
+// tests are desktop tests, so it reports the desktop (non-mobile) layout.
+beforeAll(() => {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+});
+
 vi.mock("../../lib/store", () => ({
   hubStore: { close: vi.fn(), deleteInstance: vi.fn().mockResolvedValue({ deleted: true, instanceId: "gone", nodePurge: "purged" }),
     resume: vi.fn(), toast: vi.fn(), titleOf: (id: string) => id, hostName: () => "host-a" },
+  // QuickFind (mounted by the panel for its ⌘/Ctrl+K shortcut) reads the hub
+  // snapshot; the panel tests exercise no finder behavior, so it gets an empty
+  // live cache.
+  useHub: () => ({ instances: [], hosts: [], workspaces: [], connection: "live" }),
 }));
 
 const alpha = spaceKey("host-a", "workspace-a");

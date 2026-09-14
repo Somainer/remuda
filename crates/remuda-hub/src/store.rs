@@ -431,6 +431,7 @@ impl InstanceRecord {
             "workspaceId": self.workspace_id,
             "cwd": self.cwd,
             "model": self.model,
+            "tui": self.tui,
             "delegation": self.delegation,
             "providerProfileId": self.provider_profile_id,
         });

@@ -114,7 +114,7 @@ async fn resume_creates_a_linked_child_on_both_targets_and_refuses_agents() -> R
     let created: Value = client
         .post(format!("{base}/v1/instances"))
         .bearer_auth(&human)
-        .json(&json!({"hostId":host,"kind":"claude","driver":"claude-print","prompt":"hi"}))
+        .json(&json!({"hostId":host,"kind":"claude","driver":"claude-print","prompt":"hi","tui":"default"}))
         .send()
         .await?
         .error_for_status()?
@@ -211,6 +211,8 @@ async fn resume_creates_a_linked_child_on_both_targets_and_refuses_agents() -> R
     assert_eq!(params["spec"]["resumeSessionId"], json!(session));
     assert_eq!(params["spec"]["resumedFrom"], json!(parent));
     assert_eq!(params["spec"]["driver"], json!("claude-print"));
+    assert_eq!(params["spec"]["tui"], json!("default"));
+    assert_eq!(structured["instance"]["tui"], json!("default"));
 
     // A repeat inside the idempotency window reuses the child instead of
     // launching a second process against the same conversation.
@@ -246,6 +248,8 @@ async fn resume_creates_a_linked_child_on_both_targets_and_refuses_agents() -> R
     assert_eq!(method, "instance.resume");
     assert_eq!(params["spec"]["resumeSessionId"], json!(session));
     assert_eq!(params["spec"]["driver"], json!("claude-pty"));
+    assert_eq!(params["spec"]["tui"], json!("default"));
+    assert_eq!(terminal["instance"]["tui"], json!("default"));
 
     let bad_mode = client
         .post(&resume_url)

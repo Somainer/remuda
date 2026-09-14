@@ -345,8 +345,10 @@ export function TerminalView({
         if (next === "failed") failRef.current?.(message ?? "tty follow failed");
       },
       onAltScreen: (active) => {
+        // Undefined explicitly invalidates an older observation when the
+        // replacement attach has no emulator-backed mode evidence.
         setAltScreen(active);
-        if (active) setHasEngagedAltScreen(true);
+        if (active === true) setHasEngagedAltScreen(true);
       },
     });
     sessionRef.current = session;

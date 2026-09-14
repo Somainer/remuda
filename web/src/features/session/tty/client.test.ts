@@ -121,7 +121,7 @@ describe("follow tty client", () => {
     // D-028 §4.6: the Node reports ?1049 on attach and the hub relays it
     // before the snapshot, so the client knows the mode while it paints.
     vi.stubGlobal("WebSocket", FakeSocket);
-    const modes: boolean[] = [];
+    const modes: Array<boolean | undefined> = [];
     const frames: Uint8Array[] = [];
     const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb02" as const };
     const session = openTtySession(instance, {
@@ -152,7 +152,7 @@ describe("follow tty client", () => {
 
   it("follows live mode events on the current stream after an in-session renderer switch", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
-    const modes: boolean[] = [];
+    const modes: Array<boolean | undefined> = [];
     const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb04" as const };
     const session = openTtySession(instance, {
       onFrame: () => {}, onStatus: () => {}, onAltScreen: (mode) => modes.push(mode),
@@ -169,7 +169,52 @@ describe("follow tty client", () => {
     ws.emitJson(event(true, "tty_other"));
     ws.emitJson(event(true, TTY_LAB_STREAM_ID, "ins_other"));
     ws.emitJson(event(null));
-    expect(modes).toEqual([false, true, false]);
+    expect(modes).toEqual([undefined, false, true, false]);
+    await session.detach();
+  });
+
+  it("adopts a replacement attach stream and clears a stale mode when evidence is unknown", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const modes: Array<boolean | undefined> = [];
+    const frames: string[] = [];
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb05" as const };
+    const replacement = "tty_01993ab0-0000-7000-8000-00000000bb06";
+    const session = openTtySession(instance, {
+      onFrame: (payload) => frames.push(new TextDecoder().decode(payload)),
+      onStatus: () => {},
+      onAltScreen: (mode) => modes.push(mode),
+    });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    const first = FakeSocket.latest!;
+    first.emitJson({ type: "tty.mode", instanceId: instance.id, streamId: TTY_LAB_STREAM_ID, altScreen: true });
+    expect(modes.at(-1)).toBe(true);
+
+    session.disconnectForTest();
+    session.reconnectForTest();
+    await vi.waitFor(() => expect(FakeSocket.latest !== first && FakeSocket.latest?.readyState === FakeSocket.OPEN).toBe(true));
+    const next = FakeSocket.latest!;
+    next.emitJson({ type: "tty.mode", instanceId: instance.id, streamId: replacement, altScreen: null });
+    expect(modes.at(-1)).toBeUndefined();
+    next.emitBinary(encodeTtyOutputFrame(replacement, 0n, new TextEncoder().encode("replacement")));
+    expect(frames).toEqual(["replacement"]);
+    next.emitJson({ type: "event", event: { type: "tty.mode", params: {
+      instanceId: instance.id, streamId: replacement, altScreen: false,
+    } } });
+    expect(modes.at(-1)).toBe(false);
+
+    const observed = modes.slice();
+    next.emitJson({ type: "event", event: { type: "tty.mode", params: {
+      instanceId: instance.id, streamId: TTY_LAB_STREAM_ID, altScreen: true,
+    } } });
+    first.emitJson({ type: "tty.mode", instanceId: instance.id, streamId: TTY_LAB_STREAM_ID, altScreen: true });
+    next.emitBinary(encodeTtyOutputFrame(TTY_LAB_STREAM_ID, 0n, new TextEncoder().encode("stale")));
+    expect(modes).toEqual(observed);
+    expect(frames).toEqual(["replacement"]);
+
+    // An older Node can omit mode entirely; a fresh snapshot still clears
+    // the previous observation before any cached bytes are shown.
+    next.emitJson({ type: "snapshot", instanceId: instance.id, events: [] });
+    expect(modes.at(-1)).toBeUndefined();
     await session.detach();
   });
 

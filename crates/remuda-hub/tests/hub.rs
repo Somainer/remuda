@@ -2236,6 +2236,11 @@ async fn tty_binary_frames_are_scoped_to_the_registering_socket() -> Result<()> 
         ))
         .await?;
 
+    let unknown_mode = recv_json(&mut follow).await?;
+    assert_eq!(unknown_mode["type"], json!("tty.mode"));
+    assert_eq!(unknown_mode["altScreen"], Value::Null);
+    assert_eq!(unknown_mode["streamId"], json!(stream_id.as_str()));
+
     // Host B replays A's stream UUID on its own socket.
     let host_b = HostId::new();
     let enroll_b = enroll_token(hub.addr, &cookie).await?;

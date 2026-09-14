@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
@@ -24,6 +24,7 @@ import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
+import { FilesView } from "../features/files/FilesView";
 import session from "../features/session/session.module.css";
 
 export function SessionPage({
@@ -60,6 +61,20 @@ export function SessionPage({
     if (instanceId && (view === "tty" || view === "structured")) writeSessionView(instanceId, view);
   }, [instanceId, view]);
 
+  // The files route replaces the conversation inside the same scroll container.
+  // Remember the conversation position when leaving it and restore it on return
+  // so back from the full-screen files view lands where the reader was.
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const preFilesScroll = useRef(0);
+  const currentScroller = () =>
+    document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")
+      ?? document.querySelector<HTMLElement>(".xterm-viewport")
+      ?? bodyRef.current;
+  const openFiles = () => {
+    preFilesScroll.current = currentScroller()?.scrollTop ?? 0;
+    navigate(`/s/${instanceId}/files`);
+  };
+
   // Esc backs out of the full-screen files route. Armed in a layout effect so it is
   // live as soon as the route commits, and in the capture phase so it still fires
   // when focus sits on a control that swallows the bubble.
@@ -84,6 +99,27 @@ export function SessionPage({
     status === "blocked" ? "blocked" : status === "working" ? "working" : status === "exited" ? "exited" : "idle";
   const nodeRestarted = instance?.lastError === "node-epoch-changed";
   const resolvedView = view === "auto" ? baseView : view;
+
+  // Restore the saved reading position when leaving the files route. The
+  // transcript is virtualized, so retry over a couple of frames after its rows
+  // mount; setting scrollTop drives its range via the existing scroll handler.
+  useLayoutEffect(() => {
+    if (resolvedView === "files") return;
+    const apply = () => {
+      const scroller =
+        document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")
+          ?? document.querySelector<HTMLElement>(".xterm-viewport")
+          ?? bodyRef.current;
+      if (scroller) scroller.scrollTop = preFilesScroll.current;
+    };
+    apply();
+    const first = requestAnimationFrame(apply);
+    const second = requestAnimationFrame(() => requestAnimationFrame(apply));
+    return () => {
+      cancelAnimationFrame(first);
+      cancelAnimationFrame(second);
+    };
+  }, [resolvedView]);
   const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
   const usageEvent = events.findLast((e) => e.kind === "usage");
@@ -173,17 +209,19 @@ export function SessionPage({
           >
             {hub.compact ? "Compact" : "Full"}
           </button>
+          {/* 文件 entry is available in every projection, including at ≤767px
+              where it previously had no path into the fullscreen files route. */}
+          <button
+            type="button"
+            className={resolvedView === "files" ? session.headBtnActive : session.headBtn}
+            data-testid="files-toggle"
+            aria-pressed={resolvedView === "files"}
+            onClick={() => (resolvedView === "files" ? navigate(backTo) : openFiles())}
+          >
+            文件
+          </button>
           {resolvedView === "structured" || resolvedView === "files" || resolvedView === "events" ? (
             <>
-              <button
-                type="button"
-                className={`${resolvedView === "files" ? session.headBtnActive : session.headBtn} ${session.deskOnly}`}
-                data-testid="files-toggle"
-                aria-pressed={resolvedView === "files"}
-                onClick={() => navigate(resolvedView === "files" ? backTo : `/s/${instance.id}/files`)}
-              >
-                文件
-              </button>
               <button
                 type="button"
                 className={resolvedView === "events" ? session.headBtnActive : session.headBtn}
@@ -314,6 +352,8 @@ export function SessionPage({
         </div>
       ) : null}
       <div
+        ref={bodyRef}
+        data-testid="session-body"
         className={resolvedView === "tty" || resolvedView === "structured" ? session.pane : undefined}
         style={
           resolvedView === "tty" || resolvedView === "structured"
@@ -324,21 +364,15 @@ export function SessionPage({
         {resolvedView === "events" ? (
           <RawEvents events={events} />
         ) : resolvedView === "files" ? (
-          <div className={session.filesPane} data-testid="files-pane">
-            <button
-              type="button"
-              className={session.filesBack}
-              data-testid="files-back"
-              onClick={() => {
-                if (location.key !== "default") navigate(-1);
-                else navigate(backTo, { replace: true });
-              }}
-            >
-              ← 返回会话
-            </button>
-            <p className={session.filesHint}>文件 / diff 栏占位。空间不够时走这条全屏路由。</p>
-            <p className={session.filesHint}>按 Esc 或点上面的按钮回到会话。</p>
-          </div>
+          <FilesView
+            hostId={instance.hostId}
+            workspaceId={instance.workspaceId}
+            hostLabel={hubStore.hostName(instance.hostId)}
+            onBack={() => {
+              if (location.key !== "default") navigate(-1);
+              else navigate(backTo, { replace: true });
+            }}
+          />
         ) : resolvedView === "tty" ? (
           <TerminalView
             instance={instance}

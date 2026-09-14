@@ -237,9 +237,17 @@ async fn fake_node(
             .context("authorization header")?,
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    let host = host_id.as_id().as_str();
     let workspaces = json!([
-        { "workspaceId": "wsp_e2e", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e" },
-        { "workspaceId": "wsp_e2e_second", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e-second" }
+        { "workspaceId": "wsp_e2e", "hostId": host, "root": "/tmp/remuda-e2e" },
+        { "workspaceId": "wsp_e2e_second", "hostId": host, "root": "/tmp/remuda-e2e-second" },
+        // G2 files-view synthetic scenarios (docs/design/files-view-contract.md §3.6).
+        { "workspaceId": "wsp_g2_changes", "hostId": host, "root": "/tmp/remuda-g2/changes" },
+        { "workspaceId": "wsp_g2_clean", "hostId": host, "root": "/tmp/remuda-g2/clean" },
+        { "workspaceId": "wsp_g2_nogit", "hostId": host, "root": "/tmp/remuda-g2/nogit" },
+        { "workspaceId": "wsp_g2_denied", "hostId": host, "root": "/tmp/remuda-g2/denied" },
+        { "workspaceId": "wsp_g2_trunc", "hostId": host, "root": "/tmp/remuda-g2/trunc" },
+        { "workspaceId": "wsp_g2_changed", "hostId": host, "root": "/tmp/remuda-g2/changed" }
     ]);
     ws.send(Message::Text(
         json!({
@@ -427,12 +435,150 @@ async fn fake_node(
                 )
                 .await?;
             }
+            "workspace.scm.status" | "workspace.scm.diff" | "workspace.scm.file" => {
+                let result = g2_scm_answer(method, &params);
+                send_rpc_ok(&mut ws, id, result).await?;
+            }
             _ => {
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
         }
     }
     Ok(())
+}
+
+/// Synthetic answers for the three read-only `workspace.scm.*` RPCs. Every body
+/// is hand-authored fixture data (no real models, no real repository); the
+/// workspace id selects the §3.6 availability scenario the Playwright spec
+/// drives. `changed_first_status` implements row 9's stale-snapshot-then-refresh.
+fn g2_scm_answer(method: &str, params: &Value) -> Value {
+    let workspace_id = params
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .unwrap_or("wsp_e2e");
+    let observed_at = "2026-09-14T12:00:00.000Z";
+    let head = "9c2f1a4b7d8e0f11223344556677889900aabbcc";
+    let limits = json!({"maxEntries": 5000, "maxDiffBytes": 262144, "maxFileBytes": 1048576});
+    let no_trunc = json!({"entries": false, "entriesOmitted": 0, "nonUtf8Omitted": 0,
+                           "statusBytes": false});
+    let status_envelope = |entries: Value, truncated: Value, root: &str| {
+        json!({
+            "workspaceId": workspace_id, "root": root, "scm": "git", "availability": "ok",
+            "headOid": head,
+            "branch": {"state": "known", "value": "feat/workbench-g2"},
+            "observedAt": observed_at, "entries": entries, "limits": limits,
+            "truncated": truncated, "ignoreRules": "git-default",
+        })
+    };
+
+    if method == "workspace.scm.status" {
+        return match workspace_id {
+            "wsp_g2_clean" => status_envelope(json!([]), no_trunc, "/tmp/remuda-g2/clean"),
+            "wsp_g2_nogit" => json!({
+                "workspaceId": workspace_id, "root": "/tmp/remuda-g2/nogit", "scm": "git",
+                "availability": "unsupported", "unsupportedReason": "not-a-git-repository",
+                "headOid": null, "branch": {"state": "unknown", "reason": "unknown"},
+                "observedAt": observed_at, "entries": [], "limits": limits,
+                "truncated": no_trunc,
+            }),
+            "wsp_g2_denied" => json!({
+                "workspaceId": workspace_id, "root": "/tmp/remuda-g2/denied", "scm": "git",
+                "availability": "denied", "deniedReason": "permission-denied",
+                "headOid": null, "branch": {"state": "unknown", "reason": "unknown"},
+                "observedAt": observed_at, "entries": [], "limits": limits,
+                "truncated": no_trunc,
+            }),
+            "wsp_g2_trunc" => status_envelope(
+                json!([
+                    {"path": "big.txt", "origPath": null, "xy": " M", "kind": "modified",
+                     "sizeBytes": 2000000, "oldOid": "1111111111111111111111111111111111111111",
+                     "newOid": "2222222222222222222222222222222222222222",
+                     "digest": {"state": "unknown", "reason": "not-collected"}},
+                    {"path": "many.txt", "origPath": null, "xy": "??", "kind": "untracked",
+                     "sizeBytes": 300000, "oldOid": null, "newOid": null,
+                     "digest": {"state": "unknown", "reason": "not-collected"}}
+                ]),
+                json!({"entries": true, "entriesOmitted": 12, "nonUtf8Omitted": 0,
+                       "statusBytes": false}),
+                "/tmp/remuda-g2/trunc",
+            ),
+            "wsp_g2_changed" => status_envelope(
+                json!([
+                    {"path": "src/edited.rs", "origPath": null, "xy": " M",
+                     "kind": "modified", "sizeBytes": 64,
+                     "oldOid": "3333333333333333333333333333333333333333",
+                     "newOid": "4444444444444444444444444444444444444444",
+                     "digest": {"state": "unknown", "reason": "not-collected"}}
+                ]),
+                no_trunc,
+                "/tmp/remuda-g2/changed",
+            ),
+            _ => status_envelope(
+                json!([
+                    {"path": "src/main.rs", "origPath": null, "xy": " M", "kind": "modified",
+                     "sizeBytes": 42,
+                     "oldOid": "5555555555555555555555555555555555555555",
+                     "newOid": "6666666666666666666666666666666666666666",
+                     "digest": {"state": "unknown", "reason": "not-collected"}},
+                    {"path": "notes/todo.md", "origPath": null, "xy": "??", "kind": "untracked",
+                     "sizeBytes": 14, "oldOid": null, "newOid": null,
+                     "digest": {"state": "unknown", "reason": "not-collected"}},
+                    {"path": "assets/logo.bin", "origPath": null, "xy": " M",
+                     "kind": "modified", "sizeBytes": 2048,
+                     "oldOid": "7777777777777777777777777777777777777777",
+                     "newOid": "8888888888888888888888888888888888888888",
+                     "digest": {"state": "unknown", "reason": "not-collected"}}
+                ]),
+                no_trunc,
+                "/tmp/remuda-e2e",
+            ),
+        };
+    }
+
+    if method == "workspace.scm.diff" {
+        let path = params["paths"][0].as_str().unwrap_or("");
+        let item = if workspace_id == "wsp_g2_trunc" {
+            json!({"path": path, "patch": "diff --git a/many.txt b/many.txt\n@@\n+…\n",
+                   "binary": false, "truncated": true, "bytesAvailable": 262144})
+        } else if path == "assets/logo.bin" {
+            json!({"path": path, "patch": null, "binary": true,
+                   "truncated": false, "bytesAvailable": 0})
+        } else {
+            json!({"path": path,
+                   "patch": "diff --git a/src/main.rs b/src/main.rs\nindex 5555555..6666666 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n fn main() {\n+    println!(\"workbench g2\");\n }\n",
+                   "binary": false, "truncated": false, "bytesAvailable": 96})
+        };
+        let diff_truncated = workspace_id == "wsp_g2_trunc";
+        return json!({
+            "workspaceId": workspace_id, "scm": "git", "availability": "ok",
+            "headOid": head,
+            "staged": params.get("staged").and_then(Value::as_bool).unwrap_or(false),
+            "observedAt": observed_at, "items": [item], "limits": limits,
+            "truncated": {"diffBytes": diff_truncated,
+                          "bytesOmitted": if diff_truncated { 37856 } else { 0 }},
+        });
+    }
+
+    // workspace.scm.file
+    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+    if workspace_id == "wsp_g2_trunc" {
+        return json!({
+            "workspaceId": workspace_id, "scm": "git", "availability": "ok",
+            "path": path, "headOid": head, "observedAt": observed_at,
+            "mediaType": "text/plain", "binary": false, "sizeBytes": 2000000,
+            "digest": {"state": "unknown", "reason": "file-exceeds-inline-limit"},
+            "content": null, "truncated": true, "limits": limits,
+        });
+    }
+    json!({
+        "workspaceId": workspace_id, "scm": "git", "availability": "ok",
+        "path": path, "headOid": head, "observedAt": observed_at,
+        "mediaType": "text/plain", "binary": false, "sizeBytes": 14,
+        "digest": {"state": "known",
+                   "value": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff0000"},
+        "content": "# TODO\n- g2\n- ship\n",
+        "truncated": false, "limits": limits,
+    })
 }
 
 async fn send_rpc_ok(

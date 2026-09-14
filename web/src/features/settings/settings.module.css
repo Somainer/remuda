@@ -1,3 +1,6 @@
+/* Settings — grouped page with anchor navigation (exploration §5 P1-3).
+   Tokens only; the same class names older sections used are kept. */
+
 .page {
   display: flex;
   flex-direction: column;
@@ -6,45 +9,124 @@
 }
 
 .head {
-  height: 56px;
+  min-height: var(--top);
   flex: none;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 0 18px;
+  gap: var(--space-3);
+  padding: 0 var(--space-4) 0 var(--space-2);
   border-bottom: 1px solid var(--line);
 }
 
+.back {
+  min-width: var(--touch);
+  min-height: var(--touch);
+  border: 0;
+  background: transparent;
+  color: var(--paper);
+  font-size: var(--text-body);
+  padding: 0 var(--space-2);
+}
+
 .title {
-  font-size: 16px;
+  font-size: var(--text-lg);
   font-weight: 600;
   margin: 0;
 }
 
-.body {
-  padding: 16px 18px 24px;
+/* Sticky section rail on ≥768 px; a horizontal chip strip on phones. */
+.layout {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: var(--space-5);
+  align-items: start;
+  padding: var(--space-4) var(--space-5) 40px;
+}
+
+.nav {
+  position: sticky;
+  top: calc(var(--top) + var(--space-3));
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  max-width: 560px;
+  gap: 2px;
+}
+
+.navLink {
+  display: flex;
+  align-items: center;
+  min-height: var(--touch);
+  padding: 0 var(--space-3);
+  border-left: 2px solid transparent;
+  color: var(--mute);
+  font-size: var(--text-body);
+}
+
+.navLink:hover {
+  color: var(--paper);
+}
+
+.navLink[aria-current="true"] {
+  color: var(--paper);
+  font-weight: 600;
+  border-left-color: var(--dust);
+  background: color-mix(in srgb, var(--cold) 8%, transparent);
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+  max-width: 640px;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  padding: var(--space-4) var(--space-4) var(--space-5);
+  /* Anchored headers stop under the workbench top bar. */
+  scroll-margin-top: calc(var(--top) + var(--space-2));
+  outline: none;
+}
+
+.groupHead {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.groupTitle {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  margin: 0;
+}
+
+.localNote {
+  margin: 0;
+  color: var(--mute);
+  font-size: var(--text-aux);
 }
 
 .section {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .label {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-label);
   color: var(--mute);
   letter-spacing: 0.06em;
 }
 
 .hint {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-aux);
   color: var(--mute);
   line-height: 1.55;
   margin: 0;
@@ -54,35 +136,35 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--text-aux);
   color: var(--mute);
 }
 
 .input {
-  min-height: 44px;
+  min-height: var(--touch);
   background: var(--ink-0, #0f1319);
   border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 0 12px;
+  border-radius: var(--radius);
+  padding: 0 var(--space-3);
   color: var(--paper);
   width: 100%;
-  font-size: 16px;
+  font-size: var(--text-lg);
 }
 
 .row {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   flex-wrap: wrap;
   align-items: center;
 }
 
 .chip {
-  min-height: 44px;
+  min-height: var(--touch);
   border: 1px solid var(--line);
   background: transparent;
   color: var(--mute);
-  border-radius: 4px;
-  padding: 0 14px;
+  border-radius: var(--radius);
+  padding: 0 var(--space-4);
   font-size: 13px;
 }
 
@@ -100,34 +182,39 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 44px;
-  font-size: 14px;
+  min-height: var(--touch);
+  font-size: var(--text-body);
   color: var(--paper);
 }
 
 .check input {
   width: 18px;
   height: 18px;
+  flex: none;
 }
 
 .link {
   display: flex;
   align-items: center;
-  min-height: 44px;
+  min-height: var(--touch);
   border-bottom: 1px solid var(--line);
   color: inherit;
-  font-size: 14px;
+  font-size: var(--text-body);
 }
 
 .action {
-  min-height: 44px;
-  height: 44px;
+  min-height: var(--touch);
   border: 1px solid var(--paper);
-  border-radius: 4px;
+  border-radius: var(--radius);
   background: transparent;
   color: var(--paper);
-  padding: 0 16px;
+  padding: 0 var(--space-4);
   font-size: 13px;
+}
+
+.action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .danger {
@@ -139,7 +226,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 44px;
+  min-height: var(--touch);
   border-bottom: 1px solid var(--line);
   padding: 6px 0;
 }
@@ -147,19 +234,19 @@
 .deviceName {
   flex: 1;
   min-width: 0;
-  font-size: 14px;
+  font-size: var(--text-body);
   color: var(--paper);
 }
 
 .deviceId {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-label);
   color: var(--mute);
 }
 
 .you {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-label);
   color: var(--dust);
 }
 
@@ -170,17 +257,122 @@
   color: var(--paper);
 }
 
+/* Explicit save row: the button pair plus the status line, which carries
+   保存中 / 已保存 / 失败 through role="status" — text plus a glyph, so the
+   state never depends on colour alone. */
+.saveBar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line);
+}
+
+.saveBtn {
+  composes: action;
+  border-color: var(--dust);
+  background: var(--dust);
+  color: var(--on-dust);
+  font-weight: 600;
+}
+
+.resetBtn {
+  composes: action;
+}
+
+.saveBtn:disabled,
+.resetBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.status {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-aux);
+  min-height: var(--space-5);
+  flex-basis: 100%;
+}
+
+.statusSaving {
+  color: var(--cold);
+}
+
+.statusSaved {
+  color: var(--ok);
+}
+
+.statusError {
+  color: var(--danger-strong);
+}
+
+.spin {
+  display: inline-flex;
+  animation: spin 1.2s linear infinite;
+}
+
+/* Tablet: slimmer rail. */
+@media (max-width: 1023px) and (min-width: 768px) {
+  .layout {
+    grid-template-columns: 148px minmax(0, 1fr);
+    gap: var(--space-4);
+    padding: var(--space-4);
+  }
+}
+
+/* Phone: one column with a horizontal group strip pinned just under the
+   header, so the in-page category entry is always reachable. */
 @media (max-width: 767px) {
   .head {
-    height: 52px;
-    padding: 0 16px;
+    min-height: var(--top-mobile);
+    padding: 0 var(--space-3) 0 var(--space-1);
+  }
+
+  .layout {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-3) calc(32px + var(--safe-bottom));
+  }
+
+  .nav {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    flex-direction: row;
+    gap: var(--space-2);
+    overflow-x: auto;
+    margin: 0 calc(-1 * var(--space-3));
+    padding: var(--space-1) var(--space-3);
+    background: var(--ink);
+    scrollbar-width: none;
+  }
+
+  .navLink {
+    flex: none;
+    min-height: var(--touch);
+    border: 1px solid var(--line);
+    border-left: 1px solid var(--line);
+    border-radius: 99px;
+    padding: 0 var(--space-4);
+    white-space: nowrap;
+  }
+
+  .navLink[aria-current="true"] {
+    border-color: var(--dust);
+    background: var(--ink-2);
+    box-shadow: none;
+  }
+
+  .group {
+    padding: var(--space-4) var(--space-3) var(--space-5);
+    scroll-margin-top: calc(var(--top-mobile) + var(--touch));
   }
 
   .title {
-    font-size: 18px;
-  }
-
-  .body {
-    padding: 16px;
+    font-size: var(--text-lg);
   }
 }

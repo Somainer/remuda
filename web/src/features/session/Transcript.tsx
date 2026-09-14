@@ -133,7 +133,7 @@ export function Transcript({
   const slice = nodes.slice(range.start, range.end);
 
   return (
-    <div className={css.root} data-testid="transcript">
+    <div className={css.root} data-testid="transcript" aria-live="off">
       <JournalBanner status={journalStatus} onRetry={onRetryJournal} />
       <div className={css.toolbar}>
         <button type="button" className={ui.chip} data-testid="collapse-all" onClick={() => setCollapseTick((n) => n + 1)}>

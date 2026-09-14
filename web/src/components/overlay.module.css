@@ -101,10 +101,13 @@
   color: var(--paper);
 }
 
-/* Phones get the project's 44px touch target (exploration §P1-3). */
+/* Phones get the project's 44px touch target (exploration §P1-3). `min-height`
+   rather than `height`: under border-box a fractional device-pixel border
+   rounds the painted box just under the target. */
 @media (max-width: 767px) {
   .close {
-    height: 44px;
+    height: auto;
+    min-height: 44px;
     min-width: 44px;
   }
 }

@@ -306,18 +306,22 @@
   padding: 0 14px;
 }
 
-/* Phones use the project's 44px target for every filter control. */
+/* Phones use the project's 44px target for every filter control. `min-height`
+   rather than `height`: under border-box a fractional device-pixel border
+   rounds the painted box just under the target. */
 @media (max-width: 767px) {
   .chip,
   .clearAll,
   .scopeBtn {
-    height: 44px;
+    height: auto;
+    min-height: 44px;
     padding: 0 14px;
   }
 
   .panelClose,
   .noMatchesBtn {
-    height: 44px;
+    height: auto;
+    min-height: 44px;
   }
 }
 

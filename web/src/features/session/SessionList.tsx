@@ -116,9 +116,13 @@ export function SessionList({
    * Explicit condition changes push a history entry, so Back undoes exactly the
    * filter the user chose. Typing in the search box replaces instead — a
    * keystroke is not a decision worth its own entry (P0-1 rule 3).
+   *
+   * The update is a function of the *current* params rather than the ones this
+   * render closed over: two changes in quick succession (clicking a scope and
+   * immediately typing) must compose, not clobber each other.
    */
-  const commit = (next: FilterConditions, mode: "push" | "replace") =>
-    setParams(writeConditions(params, next), { replace: mode === "replace" });
+  const commit = (update: (current: FilterConditions) => FilterConditions, mode: "push" | "replace") =>
+    setParams((prev) => writeConditions(prev, update(readConditions(prev))), { replace: mode === "replace" });
 
   const ptyKey = source
     .filter((instance) => uiMode(instance) === "tty-attachable")
@@ -131,17 +135,25 @@ export function SessionList({
   const spaceId = space?.id;
   const pruned = pruneForScope(conditions, scope);
   const prunedKey = pruned.dropped.map((chip) => `${chip.key}:${chip.value}`).join(",");
-  const [droppedNotice, setDroppedNotice] = useState<SelectedChip[]>([]);
+  // Keyed by Space so the message survives the rewrite that clears `prunedKey`
+  // and disappears on the next Space, rather than a render later.
+  const [droppedNotice, setDroppedNotice] = useState<{ spaceId?: string; chips: SelectedChip[] }>({ chips: [] });
   useEffect(() => {
     if (!prunedKey) return;
-    setDroppedNotice(pruned.dropped);
-    setParams(writeConditions(params, pruned.conditions), { replace: true });
+    setDroppedNotice({ spaceId, chips: pruned.dropped });
+    // Re-read the params inside the updater: this effect runs after a commit
+    // that may itself have changed the URL (switching to global scope is one),
+    // and writing back the render's stale copy would undo it.
+    setParams((prev) => {
+      const current = readConditions(prev);
+      const verdict = pruneForScope(current, describeScope(current, space, (hostId) => hubStore.hostName(hostId as Id)));
+      return verdict.dropped.length ? writeConditions(prev, verdict.conditions) : prev;
+    }, { replace: true });
     // Re-run only when the pruning verdict itself changes, not on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [spaceId, prunedKey]);
-  useEffect(() => {
-    setDroppedNotice([]);
-  }, [spaceId]);
+  // The notice belongs to the Space that triggered it; a later Space retires it.
+  const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
 
   useEffect(() => {
     if (variant !== "full" || !ptyKey) return;
@@ -269,7 +281,7 @@ export function SessionList({
               value={conditions.q}
               // Typing replaces the history entry: Back should undo the filter
               // the user chose, not each keystroke on the way there.
-              onChange={(e) => commit({ ...conditions, q: e.target.value }, "replace")}
+              onChange={(e) => commit((current) => ({ ...current, q: e.target.value }), "replace")}
             />
           </label>
           <div className={css.scope} data-testid="session-scope" data-scope={scope.kind}>
@@ -283,7 +295,7 @@ export function SessionList({
               type="button"
               className={css.scopeBtn}
               data-testid="session-scope-space"
-              onClick={() => commit({ ...conditions, scope: "space" }, "push")}
+              onClick={() => commit((current) => ({ ...current, scope: "space" }), "push")}
               disabled={!space?.hostId}
             >
               回到当前 Space
@@ -293,15 +305,15 @@ export function SessionList({
               type="button"
               className={css.scopeBtn}
               data-testid="session-scope-all"
-              onClick={() => commit({ ...conditions, scope: "all" }, "push")}
+              onClick={() => commit((current) => ({ ...current, scope: "all" }), "push")}
             >
               搜索所有空间
             </button>
           )}
         </div>
-        {droppedNotice.length ? (
+        {notice.length ? (
           <div className={css.notice} data-testid="session-scope-notice" role="status">
-            切换 Space 已清除不适用的条件（{droppedNotice.length} 项主机 / 目录），保留了文本与状态条件。
+            切换 Space 已清除不适用的条件（{notice.length} 项主机 / 目录），保留了文本与状态条件。
           </div>
         ) : null}
         {chips.length ? (
@@ -314,7 +326,7 @@ export function SessionList({
                 data-testid="session-chip"
                 data-chip-key={chip.key}
                 aria-label={`移除条件 ${chip.label}`}
-                onClick={() => commit(withoutChip(conditions, chip), "push")}
+                onClick={() => commit((current) => withoutChip(current, chip), "push")}
               >
                 {chip.label}
                 <span className={css.chipX} aria-hidden="true">
@@ -326,7 +338,7 @@ export function SessionList({
               type="button"
               className={css.clearAll}
               data-testid="session-clear-filters"
-              onClick={() => commit(clearedConditions(conditions), "push")}
+              onClick={() => commit(clearedConditions, "push")}
             >
               清除筛选
             </button>
@@ -358,7 +370,7 @@ export function SessionList({
                 className={`${css.chip} ${conditions.status.includes(s) ? css.chipOn : ""}`}
                 data-testid={`session-filter-status-${s}`}
                 aria-pressed={conditions.status.includes(s)}
-                onClick={() => commit({ ...conditions, status: toggleValue(conditions.status, s) }, "push")}
+                onClick={() => commit((current) => ({ ...current, status: toggleValue(current.status, s) }), "push")}
               >
                 {STATUS_LABELS[s] ?? s}
               </button>
@@ -373,7 +385,7 @@ export function SessionList({
                 className={`${css.chip} ${conditions.kind.includes(k) ? css.chipOn : ""}`}
                 data-testid={`session-filter-kind-${k}`}
                 aria-pressed={conditions.kind.includes(k)}
-                onClick={() => commit({ ...conditions, kind: toggleValue(conditions.kind, k) }, "push")}
+                onClick={() => commit((current) => ({ ...current, kind: toggleValue(current.kind, k) }), "push")}
               >
                 {k}
               </button>
@@ -390,7 +402,7 @@ export function SessionList({
                   type="button"
                   className={`${css.chip} ${conditions.host.includes(h.id) ? css.chipOn : ""}`}
                   aria-pressed={conditions.host.includes(h.id)}
-                  onClick={() => commit({ ...conditions, host: toggleValue(conditions.host, h.id) }, "push")}
+                  onClick={() => commit((current) => ({ ...current, host: toggleValue(current.host, h.id) }), "push")}
                 >
                   {h.label}
                 </button>
@@ -408,7 +420,7 @@ export function SessionList({
                     type="button"
                     className={`${css.chip} ${conditions.workspace.includes(w.id) ? css.chipOn : ""}`}
                     aria-pressed={conditions.workspace.includes(w.id)}
-                    onClick={() => commit({ ...conditions, workspace: toggleValue(conditions.workspace, w.id) }, "push")}
+                    onClick={() => commit((current) => ({ ...current, workspace: toggleValue(current.workspace, w.id) }), "push")}
                   >
                     {/* Same-name directories on different hosts are only
                         distinguishable once the host is spelled out (§2.2). */}
@@ -428,7 +440,7 @@ export function SessionList({
               className={css.clearAll}
               data-testid="session-filter-clear"
               disabled={!hasConditions(conditions)}
-              onClick={() => commit(clearedConditions(conditions), "push")}
+              onClick={() => commit(clearedConditions, "push")}
             >
               清除筛选
             </button>
@@ -468,7 +480,7 @@ export function SessionList({
               type="button"
               className={css.noMatchesBtn}
               data-testid="session-no-matches-clear"
-              onClick={() => commit(clearedConditions(conditions), "push")}
+              onClick={() => commit(clearedConditions, "push")}
             >
               清除筛选
             </button>
@@ -477,7 +489,7 @@ export function SessionList({
                 type="button"
                 className={css.noMatchesBtn}
                 data-testid="session-no-matches-all"
-                onClick={() => commit({ ...conditions, scope: "all" }, "push")}
+                onClick={() => commit((current) => ({ ...current, scope: "all" }), "push")}
               >
                 搜索所有空间
               </button>

@@ -274,13 +274,21 @@ test("slow ack: a pending command never reads as success while it is in flight",
   const instanceId = await createReadySession(page, "status-slow-ack");
   const recorder = await recordNativeActions(page);
 
-  // Hold the command response open, so the UI sits in the written-but-
-  // unconfirmed window for a measurable time.
-  let release: (() => void) | undefined;
-  const held = new Promise<void>((resolve) => (release = resolve));
+  // Delay the command *response* so the UI sits in the written-but-
+  // unconfirmed window for a measurable time. The handler answers on its own
+  // rather than staying suspended until the test releases it: a suspended
+  // handler races `unrouteAll` in teardown and dies with "Route is already
+  // handled!", which is a harness artefact, not a product fact.
+  const HOLD_MS = 3000;
   await page.route(`**/v1/instances/${instanceId}/commands`, async (route) => {
-    await held;
-    await route.continue();
+    let response;
+    try {
+      response = await route.fetch();
+    } catch {
+      return; // Page went away mid-flight; nothing to fulfil.
+    }
+    await new Promise((resolve) => setTimeout(resolve, HOLD_MS));
+    await route.fulfill({ response }).catch(() => {});
   });
 
   const composer = page.getByTestId("composer-input");
@@ -293,12 +301,11 @@ test("slow ack: a pending command never reads as success while it is in flight",
   expect(body).not.toContain("本轮已结束");
   const sentWhileHeld = recorder.count();
 
-  release?.();
+  // Let the held response land, then confirm waiting did not cause a resend.
+  await page.waitForTimeout(HOLD_MS);
   await page.unroute(`**/v1/instances/${instanceId}/commands`);
-
-  // Waiting did not cause a second send of the same prompt.
   await page.waitForTimeout(1000);
-  expect(recorder.count()).toBe(sentWhileHeld);
+  expect(recorder.count(), "a slow ack must not trigger a second send").toBe(sentWhileHeld);
 });
 
 test("rejection: a refused command surfaces and does not auto-resend", async ({ page }) => {

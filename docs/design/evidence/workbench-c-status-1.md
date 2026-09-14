@@ -147,7 +147,7 @@ fake node 自身无法产生的故障——被拒绝的命令、`nodePurge !== "
 `/commands`、`/input`、`/interrupt`、`/interactions/*/answer` 的写请求，
 断线刷新后断言增量为 0；被拒绝的命令在 2 秒后断言计数未变。
 
-### 两个必须记录的坑
+### 三个必须记录的坑
 
 1. **fake node 宣告 `maxInstances: 8`**，而 hub 配置串行跑所有 spec、共用一个
    Hub。本 spec 的用例跑到一半就撞配额（更早的 spec 也占着槽位），
@@ -162,12 +162,25 @@ fake node 自身无法产生的故障——被拒绝的命令、`nodePurge !== "
    `clearPendingApprovals()`（`POST /v1/interactions/{id}/answer`）清掉它，
    否则 `composer.fill` 会在 disabled textarea 上超时 90 s。
    封装成 `createReadySession()`。
+3. **挂起的 `page.route` handler 会和 teardown 抢**。慢确认最初写成「handler
+   里 await 一个由测试释放的 promise」，结果 `afterEach` 的 `unrouteAll` 先到，
+   handler 再 `route.continue()` 就抛 `Route is already handled!`。
+   改成 handler 自己 `route.fetch()` 后 `setTimeout` 再 `fulfill`——
+   延迟的是响应而不是 handler 的生命周期，语义等价但不依赖拆解顺序。
 
 ### 与已知基线 flake 的关系
 
-`providers-discovery` 在本机同样失败，与本分支无关：它在未修改的
-`origin/main` 上也失败，属于共享 devbox 的已知现象（load、端口竞争）。
-本批次不触碰 provider 相关代码。
+`providers-discovery` 在本机每一轮都失败（`provider-model-row` 计数 0/5），
+**与本批次无关**，三条证据：
+
+1. 本分支 diff 不含任何 provider 文件（`git diff origin/main...HEAD --name-only`
+   过滤 `provider|gateway` 为空）；
+2. `3da158d..origin/main` 区间也没动过 `providers.rs` / `ProvidersPage.tsx`，
+   即它不是被隔壁批次改坏的；
+3. 该 spec 依赖 `HUB_E2E_UPSTREAM_LISTEN` 上的 fake gateway 探测，属于
+   共享 devbox 上已知的 load / 端口竞争类现象。
+
+本批次不触碰 provider 相关代码，也不声称修复它。
 
 ## 8 交付文件
 

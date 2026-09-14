@@ -1,4 +1,4 @@
-// WebAuthn passkey ceremony wrapper (D-029).
+// WebAuthn passkey ceremony wrapper (D-030).
 //
 // The Hub speaks the webauthn-rs JSON dialect: challenge envelopes carry
 // `{ publicKey: ... }` options whose binary fields (challenge, user.id,

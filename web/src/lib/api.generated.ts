@@ -110,6 +110,109 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/auth/passkeys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List registered passkeys (requires a paired device) */
+        get: operations["passkeyList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/passkeys/login/finish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete a passkey login; mints the same device cookie as POST /v1/login */
+        post: operations["passkeyLoginFinish"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/passkeys/login/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin a discoverable passkey login ceremony */
+        post: operations["passkeyLoginStart"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/passkeys/register/finish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete a passkey registration with the authenticator attestation */
+        post: operations["passkeyRegisterFinish"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/passkeys/register/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Begin a passkey registration ceremony (requires a paired device) */
+        post: operations["passkeyRegisterStart"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/passkeys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete a passkey */
+        delete: operations["passkeyDelete"];
+        options?: never;
+        head?: never;
+        /** Rename a passkey */
+        patch: operations["passkeyRename"];
+        trace?: never;
+    };
     "/v1/caller": {
         parameters: {
             query?: never;
@@ -1104,6 +1207,56 @@ export interface components {
             code: string;
             deviceName?: string;
         };
+        Passkey: {
+            /** Format: date-time */
+            createdAt: string;
+            id: string;
+            /** Format: date-time */
+            lastUsedAt?: string | null;
+            name: string;
+            /** @description Whether this passkey was registered from the device making the request. */
+            thisDevice: boolean;
+        };
+        PasskeyChallenge: {
+            /** @description Single-use, 120s server ceremony token. */
+            challengeId: string;
+            /** @description WebAuthn options object (PublicKeyCredentialCreationOptions for register, PublicKeyCredentialRequestOptions for login). */
+            options: {
+                [key: string]: unknown;
+            };
+        };
+        PasskeyLoginFinish: {
+            /** @description AuthenticatorAssertionResponse PublicKeyCredential as produced by navigator.credentials.get; rawId and response fields are base64url. */
+            assertion: {
+                [key: string]: unknown;
+            };
+            challengeId: string;
+            deviceName?: string;
+        };
+        PasskeyLoginStart: {
+            /**
+             * @description Set to conditional for WebAuthn conditional mediation (autofill); omit for the platform picker.
+             * @enum {string}
+             */
+            mediation?: "conditional";
+        };
+        PasskeyPage: {
+            items: components["schemas"]["Passkey"][];
+        };
+        PasskeyRegisterFinish: {
+            /** @description AuthenticatorAttestationResponse PublicKeyCredential as produced by navigator.credentials.create; rawId and response fields are base64url. */
+            attestation: {
+                [key: string]: unknown;
+            };
+            challengeId: string;
+        };
+        PasskeyRegisterStart: {
+            /** @description Human label, e.g. browser/OS name. */
+            name: string;
+        };
+        PasskeyRename: {
+            name: string;
+        };
         PlacementResolve: {
             delegation?: string;
             driver?: string;
@@ -1478,6 +1631,190 @@ export interface operations {
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    passkeyList: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Passkeys */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasskeyPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+        };
+    };
+    passkeyLoginFinish: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyLoginFinish"];
+            };
+        };
+        responses: {
+            /** @description New device session */
+            200: {
+                headers: {
+                    /** @description remuda_device; HttpOnly; SameSite=Strict */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeviceSession"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            429: components["responses"]["Error"];
+        };
+    };
+    passkeyLoginStart: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PasskeyLoginStart"];
+            };
+        };
+        responses: {
+            /** @description Authentication challenge envelope */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasskeyChallenge"];
+                };
+            };
+            403: components["responses"]["Error"];
+            429: components["responses"]["Error"];
+        };
+    };
+    passkeyRegisterFinish: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyRegisterFinish"];
+            };
+        };
+        responses: {
+            /** @description Stored passkey */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Passkey"];
+                };
+            };
+            401: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            429: components["responses"]["Error"];
+        };
+    };
+    passkeyRegisterStart: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyRegisterStart"];
+            };
+        };
+        responses: {
+            /** @description Registration challenge envelope */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasskeyChallenge"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            429: components["responses"]["Error"];
+        };
+    };
+    passkeyDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok: boolean;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    passkeyRename: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyRename"];
+            };
+        };
+        responses: {
+            /** @description Renamed passkey */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Passkey"];
+                };
+            };
+            401: components["responses"]["Error"];
             404: components["responses"]["Error"];
         };
     };

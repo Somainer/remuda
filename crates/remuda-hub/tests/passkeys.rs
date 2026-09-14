@@ -1,4 +1,4 @@
-//! Passkey (WebAuthn) ceremony tests against a real Hub (D-029).
+//! Passkey (WebAuthn) ceremony tests against a real Hub (D-030).
 //!
 //! webauthn-rs-core ships no software authenticator, so this module contains
 //! a minimal ES256/P-256 one: it builds the attestation object and assertion

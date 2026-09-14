@@ -1,6 +1,6 @@
 # Passkey 登录（WebAuthn）
 
-日期：2026-09-14 · 决策：**D-029** · 证据：[evidence/passkey-1.md](./evidence/passkey-1.md)
+日期：2026-09-14 · 决策：**D-030** · 证据：[evidence/passkey-1.md](./evidence/passkey-1.md)
 
 ## 1. 目标与边界
 

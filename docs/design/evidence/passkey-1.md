@@ -1,7 +1,7 @@
-# D-029 Passkey 登录 · 真机证据
+# D-030 Passkey 登录 · 真机证据
 
 日期：2026-09-14（Asia/Shanghai；下文时间戳为 UTC）。分支 `wt/x-passkey/passkey-login`。
-对应设计：[passkey-login.md](../passkey-login.md)、[D-029](../decisions.md)。
+对应设计：[passkey-login.md](../passkey-login.md)、[D-030](../decisions.md)。
 
 ## 方法
 
@@ -157,7 +157,7 @@ host，内网 `remuda.<zone>` 与 loopback、127.0.0.1 与 localhost 各自独�
 
 ## 结论
 
-D-029 在真实 `remuda dev` + Chrome 上端到端成立：设置里注册/改名/删除
+D-030 在真实 `remuda dev` + Chrome 上端到端成立：设置里注册/改名/删除
 Passkey，退出后以 Passkey（conditional 自动填充与显式按钮两条路径）登录成功，
 会话仍是原有 HttpOnly Strict cookie 设备会话；凭据缺失时无法被冒用，访问码
 回退不受影响；来源与 RP 绑定、统一 401/403 错误面均符合设计。真机证据还抓到

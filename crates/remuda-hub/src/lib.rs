@@ -84,7 +84,7 @@ pub struct AppState {
     blocked: BlockedWatch,
     auth_limits: rate_limit::AuthRateLimits,
     agent_approvals: agent_approvals::AgentApprovals,
-    /// Process-local, single-use WebAuthn ceremony challenges (D-029).
+    /// Process-local, single-use WebAuthn ceremony challenges (D-030).
     challenges: passkeys::ChallengeStore,
 }
 

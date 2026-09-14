@@ -1,4 +1,4 @@
-//! WebAuthn passkey registration and login (D-029).
+//! WebAuthn passkey registration and login (D-030).
 //!
 //! Passkeys are a second *redemption* path into the same device session that
 //! the bootstrap access code mints (D-018): a successful passkey login issues

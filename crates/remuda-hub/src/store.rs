@@ -112,7 +112,7 @@ pub struct Device {
     pub instance_id: Option<String>,
 }
 
-/// A registered WebAuthn credential (D-029). `public_key` is the
+/// A registered WebAuthn credential (D-030). `public_key` is the
 /// webauthn-rs-core `Credential` JSON; the other columns denormalize the fields
 /// that list views and the clone-detection counter need without a parse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1169,7 +1169,7 @@ impl Store {
         .await
     }
 
-    // ----- Passkeys (D-029) -------------------------------------------------
+    // ----- Passkeys (D-030) -------------------------------------------------
 
     /// Persist a freshly registered credential. A repeated credential id is a
     /// conflict rather than a second row.

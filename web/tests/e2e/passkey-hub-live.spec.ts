@@ -67,7 +67,7 @@ test.describe("passkey login (CDP virtual authenticator)", () => {
 
     // The conditional ceremony the login page fires on mount races the logout
     // cookie clear: a stale remuda_device cookie must never make the Hub
-    // answer login/finish 401 before the WebAuthn handler runs (D-029).
+    // answer login/finish 401 before the WebAuthn handler runs (D-030).
     const finishStatuses: number[] = [];
     page.on("response", (response) => {
       if (new URL(response.url()).pathname.endsWith("/v1/auth/passkeys/login/finish")) {

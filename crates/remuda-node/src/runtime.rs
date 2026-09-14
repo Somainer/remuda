@@ -855,10 +855,13 @@ fn spawn_observation_pump(
             {
                 record_native_session(store.as_ref(), &instance_id, &session);
             }
-            // D-028 §4.3: Hook outranks Screen. Without this the hook events
-            // are journaled but the instance still follows `agent_status`,
-            // which is a screen guess — the composer would keep believing the
-            // screen over the harness's own account of what it is doing.
+            // D-028 §4.3: Hook outranks File, and both outrank Screen. Without
+            // this the hook/file events are journaled but the instance still
+            // follows `agent_status`, which is a screen guess — the composer
+            // would keep believing the screen over the harness's own account.
+            //
+            // Promoted hand-typed sessions fold through the promoted-hook
+            // tracker; a launched session folds through the static classifier.
             let hook_activity = if promoted_hook {
                 promoted_hooks.activity(&observation)
             } else {
@@ -885,14 +888,23 @@ fn spawn_observation_pump(
                     activity_annotated = true;
                 }
             }
-            if let Some(activity) = hook_activity
+            // P6: File turn lifecycles fold only when no hook set activity and
+            // only for a kind with a file-tail adapter (codex/grok); the
+            // registry is the single lookup rather than another per-kind branch.
+            let activity = hook_activity.or_else(|| match store.get_instance(&instance_id) {
+                Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
+                    crate::signal::file_activity(&observation)
+                }
+                _ => None,
+            });
+            if let Some(activity) = activity
                 && let Err(error) = store.set_instance_state(
                     &instance_id,
                     None,
                     Some(remuda_protocol::Knowledge::Known { value: activity }),
                 )
             {
-                tracing::warn!(%error, "hook activity not applied");
+                tracing::warn!(%error, "hook/file activity not applied");
             }
             match store.append_driver_observation(&instance_id, observation) {
                 Ok(committed) => {

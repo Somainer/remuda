@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -89,8 +90,15 @@ try:
                 step["retried"] = attempt > 1
                 print(f"gate: {step['name']}" + (" (retried)" if attempt > 1 else ""),
                       file=sys.stderr, flush=True)
+                command = step["command"]
+                # The Hub e2e step shares one browser server across merge
+                # lanes; serialise it on an advisory lock (flock(1)).
+                if (step["name"] == "web-hub-e2e"
+                        and os.environ.get("REMUDA_E2E_LOCK")
+                        and shutil.which("flock")):
+                    command = ["flock", os.environ["REMUDA_E2E_LOCK"], *command]
                 try:
-                    result = subprocess.run(step["command"], cwd=root / step["cwd"],
+                    result = subprocess.run(command, cwd=root / step["cwd"],
                                             stdin=subprocess.DEVNULL,
                                             stdout=sys.stderr, stderr=sys.stderr)
                     code = result.returncode

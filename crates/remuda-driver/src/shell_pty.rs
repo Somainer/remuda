@@ -372,6 +372,9 @@ pub struct ShellPtyDriver {
     /// Live hook path, when the instance opted in. Dropped on close, which
     /// unbinds the socket.
     hooks: Mutex<Option<Arc<crate::launch::HookSession>>>,
+    /// File-tail signal adapters (codex rollout, grok ACP files). Dropped on
+    /// close, which stops their poll tasks (D-028 P6).
+    adapters: Mutex<Option<crate::adapters::supervisor::AdapterHandle>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
@@ -416,6 +419,7 @@ impl ShellPtyDriver {
             waiter: Mutex::new(None),
             table,
             hooks: Mutex::new(None),
+            adapters: Mutex::new(None),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
@@ -519,6 +523,15 @@ impl ShellPtyDriver {
                 relay_binary: config.relay_binary,
                 tui: config.tui,
                 base_settings,
+                // The launch target is authoritative before the first promote
+                // tick; a promoted hand-typed session defaults to Claude for
+                // the overlay (its shim is a pass-through until promotion
+                // rewires it), matching §1.0's one-path rule.
+                kind: self
+                    .options
+                    .target
+                    .agent_kind()
+                    .unwrap_or(AgentKind::Claude),
             },
             bus,
         )?)))
@@ -817,6 +830,15 @@ impl ShellPtyDriver {
             effort_io,
         ));
         *self.effort_bridge.lock().await = Arc::clone(&effort_bridge);
+        // D-028 P6: file-tail signal adapters for the codex/grok structured
+        // channels. They read the shadow home the hook session materialized
+        // (which is the same path the child receives via CODEX_HOME /
+        // GROK_HOME), follow the child pid, and emit on the instance's one
+        // ordered observation channel. Hook-confirmed session identity wins
+        // over file discovery (Hook > File) via the adapter confirm path.
+        if let Some(handle) = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)? {
+            *self.adapters.lock().await = Some(handle);
+        }
         if self.options.promote {
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
@@ -834,6 +856,14 @@ impl ShellPtyDriver {
                 Some(Arc::clone(&effort_bridge)),
                 spec.and_then(|spec| spec.effort),
             ));
+            // A login shell has no agent at spawn; once promotion identifies a
+            // hand-typed codex/grok, start its file adapter against the native
+            // (not a shadow) home. §1.0 rule 2: the promoted path gets the
+            // same structured lifecycle channel as a launched one.
+            if self.options.target.agent_kind().is_none() {
+                *self.adapters.lock().await =
+                    Some(self.spawn_promoted_adapter_watch(&hook_ctx, tx.clone()));
+            }
         }
         // §5.5: a crashed agent used to stay `ready` forever, because EOF only
         // broke the read loop. Both witnesses now journal an exit.
@@ -850,6 +880,135 @@ impl ShellPtyDriver {
             *slot = Some(recipe.clone());
         }
         Ok(RunHandle::new(recipe, DriverAck::transport_written(), rx))
+    }
+
+    /// Start the per-kind file-tail adapter for a Remuda-launched agent.
+    ///
+    /// Returns `None` for shells, promoted hand-typed sessions (their adapter
+    /// starts when promotion identifies the kind), and kinds without a file
+    /// channel. The adapter reads from the shadow home the hook session
+    /// wrote, so it only exists when the hook path is live — without hooks
+    /// there is no per-session shadow home, and reading the user's real
+    /// `~/.codex` from a launched session would cross the §4.2 boundary.
+    fn spawn_adapters(
+        &self,
+        hooks: &Option<Arc<crate::launch::HookSession>>,
+        recipe: &LaunchRecipe,
+        ctx: &promotion::PromoteCtx,
+        events: &mpsc::Sender<remuda_protocol::Observation>,
+        pid: Option<i32>,
+        cwd: &str,
+    ) -> DriverResult<Option<crate::adapters::supervisor::AdapterHandle>> {
+        let Some(hooks) = hooks else {
+            return Ok(None);
+        };
+        let Some(kind) = self.options.target.agent_kind() else {
+            return Ok(None);
+        };
+        let Some(shadow) = &hooks.shadow else {
+            return Ok(None);
+        };
+        let home = crate::adapters::AdapterHome {
+            home: shadow.home.clone(),
+            cwd: PathBuf::from(cwd),
+            pid: pid.filter(|pid| *pid > 0).map(|pid| pid as u32),
+        };
+        let stamp = crate::adapters::supervisor::stamp_ctx(
+            ctx.instance_id.clone(),
+            ctx.host_id.clone(),
+            ctx.journal_id.clone(),
+            ctx.run_id.clone(),
+            recipe
+                .session_id
+                .clone()
+                .unwrap_or_else(|| format!("{kind:?}-pending")),
+        );
+        let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
+            stamp,
+            seq: Arc::clone(&self.seq),
+            events: events.clone(),
+            home,
+            fallback_model: Some(recipe.provider.model_requested.clone())
+                .filter(|model| !model.is_empty()),
+            hooks: Some(Arc::clone(hooks)),
+            agent_pid: pid,
+        };
+        crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
+    }
+
+    /// Watch the promoted agent; when it resolves to a codex/grok kind with a
+    /// discoverable native home, spawn that kind's file adapter once.
+    ///
+    /// A promoted session reads the user's *real* `~/.codex`/`~/.grok` (the
+    /// human started the binary themselves, outside the shadow), so the
+    /// adapter home comes from the Node environment rather than from a
+    /// materialized shadow. The poll cadence matches the promotion tick.
+    fn spawn_promoted_adapter_watch(
+        &self,
+        ctx: &promotion::PromoteCtx,
+        events: mpsc::Sender<remuda_protocol::Observation>,
+    ) -> crate::adapters::supervisor::AdapterHandle {
+        let promoted = Arc::clone(&self.promoted);
+        let options_cwd = self.options.cwd.clone();
+        let seq = Arc::clone(&self.seq);
+        let stamp_ctx = crate::adapters::supervisor::stamp_ctx(
+            ctx.instance_id.clone(),
+            ctx.host_id.clone(),
+            ctx.journal_id.clone(),
+            ctx.run_id.clone(),
+            "promoted-pending",
+        );
+        let task = tokio::spawn(async move {
+            let mut current: Option<remuda_protocol::AgentKind> = None;
+            let mut handle: Option<crate::adapters::supervisor::AdapterHandle> = None;
+            let mut tick = tokio::time::interval(PROMOTE_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if events.is_closed() {
+                    break;
+                }
+                let kind = promoted
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|found| found.kind));
+                if kind == current {
+                    continue;
+                }
+                // Kind changed (terminal → agent, or one agent → another):
+                // drop the previous adapter before starting the new one.
+                if let Some(old) = handle.take() {
+                    old.abort();
+                }
+                current = kind;
+                if let Some(kind @ (AgentKind::Codex | AgentKind::Grok)) = kind
+                    && let Some(found) = promoted.lock().ok().and_then(|slot| slot.clone())
+                    && let Some(home) = crate::adapters::supervisor::promoted_home(
+                        kind,
+                        options_cwd.clone(),
+                        u32::try_from(found.pid).ok(),
+                    )
+                {
+                    let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
+                        stamp: stamp_ctx.clone(),
+                        seq: Arc::clone(&seq),
+                        events: events.clone(),
+                        home,
+                        fallback_model: None,
+                        hooks: None,
+                        agent_pid: Some(found.pid),
+                    };
+                    match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
+                        Ok(Some(started)) => handle = Some(started),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::debug!(%error, ?kind, "promoted file adapter failed to start")
+                        }
+                    }
+                }
+            }
+        });
+        crate::adapters::supervisor::AdapterHandle { tasks: vec![task] }
     }
 
     /// The launch recipe for this PTY's target.    ///
@@ -1445,6 +1604,11 @@ impl Driver for ShellPtyDriver {
         // stay for `instance.purge` to remove with the rest of the instance
         // directory — they are launch audit evidence until then.
         self.hooks.lock().await.take();
+        // Stop the file-tail adapters; their shadow files likewise survive for
+        // purge as audit evidence.
+        if let Some(handle) = self.adapters.lock().await.take() {
+            handle.abort();
+        }
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();

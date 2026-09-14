@@ -113,6 +113,48 @@ resolution): merge into a staging branch rather than `main`, run the gate
 commands above on the **merged** tree, then merge to `main` with `merge:
 wt/<agent>/<topic> into main` as the subject, matching existing history.
 
+### Optimistic merge queue
+
+One `--gate` landing at a time means each branch waits for the previous
+branch's full gate. `remuda merge --queue` keeps that landing guarantee
+while verifying in parallel: branch 1 gates onto `main` on lane 1 while
+branch 2 gates speculatively onto branch 1's not-yet-landed merge commit on
+lane 2. If branch 1 lands, branch 2's verified tree *is* main+branch1+branch2
+— it lands without another gate. If branch 1 fails (or a third party moves
+main), branch 2 is automatically re-verified onto the real main. The same
+semantic-conflict guarantee holds: a branch green on an old main cannot land
+when the merged tree fails — its speculative verification fails and it never
+advances main.
+
+The coordinator's two-lane recipe (run over ssh on the merge host):
+
+```sh
+remuda merge --queue wt/a wt/b \
+  --gate --web-e2e --json --no-push \
+  --repo … --target-dir … --lanes 2
+```
+
+Each lane builds in `<target-dir>` / `<target-dir>-lane2`, gets its own Hub
+e2e port pair (58980/58989 and 58990/58999 by default), and shares one
+Playwright endpoint; only the browser step serialises, on
+`<git-common-dir>/remuda/e2e.lock` (that is `<repo>/.git/remuda/e2e.lock` in a
+normal checkout; override with `--e2e-lock`, ports with `--e2e-port-base`).
+Landing stays serial: main only ever advances to a merge whose exact tree
+passed a gate. Exit 0 all landed, 1 at least one gate failed (landed
+branches stay landed; send only the failures back), 2 an unresolved base
+move — re-read `currentMain` / the `queue` summary and retry. Single
+verification or landing split across ssh calls:
+
+```sh
+remuda merge wt/a --gate --onto main --no-push --json   # verify, persist report
+remuda merge wt/a --land  --onto <base> --no-push --json # CAS main, no gate
+```
+
+`--land` exits 2 `base_moved` (and prints the new main) when main is no
+longer the verified base. Reports live in
+`<git-common-dir>/remuda/merge-reports/<branch-slug>/<base>.json`.
+
+
 If a gate fails, the branch goes back to its agent with the failing output —
 don't fix a worker's crate inside the merge. Independent branches merge in
 any order; when two agents touched one file, land the smaller diff first.

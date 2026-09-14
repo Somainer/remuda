@@ -1,0 +1,139 @@
+/*
+ * Notification surfaces (plan §2, exploration §5 P0-3).
+ *
+ * Two regions with different lifetimes and different visual weight. The info
+ * strip replaces the old 2.4-second `.toast`; the blocking area is new and is
+ * the reason the toast could be removed — a failure now has somewhere to stay.
+ */
+
+/*
+ * One anchored stack holds both regions, so they can never overlap however
+ * tall either grows. Confirmations sit above the standing errors; the errors
+ * keep the anchored position nearest the user's attention.
+ */
+.stack {
+  position: fixed;
+  bottom: calc(var(--bar) + var(--safe-bottom) + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  width: min(92vw, 520px);
+  z-index: 30;
+}
+
+/* Transient confirmations, above the errors in the same stack. */
+.info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  pointer-events: none;
+}
+
+.infoItem {
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  max-width: min(92vw, 420px);
+}
+
+/*
+ * Standing errors. A later success is laid out above them rather than over
+ * them, which is the P0-3 requirement the old single-toast slot could not
+ * meet: there was one slot, so the next message took it.
+ */
+.blocking {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.blockingItem {
+  background: var(--ink-2);
+  border: 1px solid var(--danger, #b4483f);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.blockingHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.blockingText {
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+/* The reason, when known. Never a placeholder when it is not. */
+.blockingReason {
+  display: block;
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 2px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.action {
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: inherit;
+  /* 44px touch target (P1-3), without the button looking oversized. */
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--ink-3, rgba(255, 255, 255, 0.06));
+}
+
+.dismiss {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px 6px;
+  margin: -4px -6px 0 0;
+}
+
+@media (max-width: 767px) {
+  .action,
+  .dismiss {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* A screen-reader-only live region: announced, never seen. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

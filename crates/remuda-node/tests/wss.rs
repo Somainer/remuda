@@ -1390,6 +1390,10 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         .unwrap();
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
+    // This authorization fixture must not depend on the developer's Claude
+    // configuration, skills, or macOS permissions.
+    let claude_config = dir.path().join("claude-config");
+    std::fs::create_dir_all(&claude_config).unwrap();
     let config = DevServerConfig::loopback(0)
         .with_workspace_root(workspace)
         .with_workspace_roots(remuda_testing::test_workspace_roots!());
@@ -1414,7 +1418,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"permissionMode":"bypassPermissions","prompt":"human-origin"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","prompt":"human-origin"})),
         None,
     )
     .await;
@@ -1467,7 +1471,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     .await;
     assert_eq!(status, 403, "{denied_enrollment}");
 
-    let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
+    let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"claudeConfigDir":claude_config,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
     assert_eq!(status, 200, "{child}");
     assert_eq!(child["instance"]["parentInstanceId"], parent_id);
     assert_eq!(child["command"]["payload"]["origin"], "agent");
@@ -1528,7 +1532,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"permissionMode":"manual"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"manual"})),
         None,
     )
     .await;
@@ -1747,7 +1751,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         bot,
         "/v1/instances",
-        Some(json!({"hostId":host,"permissionMode":"bypassPermissions"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions"})),
         None,
     )
     .await;

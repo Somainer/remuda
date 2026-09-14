@@ -321,7 +321,6 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
                 &engine.clock,
             )?;
         }
-        engine.fire_hook(HookEvent::SessionStart, json!({ "source": "resume" }));
     } else {
         engine.write_session_header()?;
         if dialect == Dialect::Grok {
@@ -332,8 +331,12 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
                 &engine.clock,
             )?;
         }
-        engine.fire_hook(HookEvent::SessionStart, json!({ "source": "new" }));
     }
+    let mut session_start = json!({ "source": if resuming { "resume" } else { "new" } });
+    if dialect == Dialect::Claude {
+        session_start["transcript_path"] = json!(engine.paths.main.to_string_lossy());
+    }
+    engine.fire_hook(HookEvent::SessionStart, session_start);
     if opts.trust_dialog {
         engine.view.mode = ScreenMode::Trust;
     }

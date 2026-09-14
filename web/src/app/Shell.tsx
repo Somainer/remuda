@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { isSessionRoute, MORE_NAV } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
+import { formatDiagnostic, notify, notifyStore, toastAdapter, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
@@ -11,12 +12,158 @@ import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { SessionsPage } from "../pages/SessionsPage";
 import { InstallBar } from "./InstallBar";
 import css from "./Shell.module.css";
+import notifyCss from "./shellNotify.module.css";
 
 function layoutOf(pathname: string): "sessions" | "session" | "sheet" | "page" {
   if (pathname === "/sessions/new") return "sheet";
   if (pathname.startsWith("/s/")) return "session";
   if (pathname === "/sessions") return "sessions";
   return "page";
+}
+
+/** Test seam for the notification surfaces; mirrors `window.__ttyLab`. */
+type NotifyLabHandle = {
+  notify: (input: NotifyInput) => string;
+  dismissAllBlocking: () => void;
+};
+
+declare global {
+  interface Window {
+    __notifyLab?: NotifyLabHandle;
+  }
+}
+
+/**
+ * Notification surfaces for the whole app (plan §2).
+ *
+ * Replaces the 2.4-second plain `div` that used to render `hub.toast`. Three
+ * separate concerns, deliberately not merged:
+ *
+ * - a visually-hidden `role="status"` live region carrying only the latest
+ *   debounced one-line confirmation. It never receives transcript text: the
+ *   only thing written into it is `Notification.text`, built from
+ *   subject/stage/reason. (risk 4)
+ * - a visible transient strip for the same confirmations, `aria-hidden` so a
+ *   screen reader hears the line once rather than twice;
+ * - a standing error area that outlives every later success.
+ */
+export function ShellNotify() {
+  const { info, blocking } = useNotifications();
+  const announcement = useLiveAnnouncement(info);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  /*
+   * Test seam, same shape as `window.__ttyLab` in `tty/TerminalView.tsx`.
+   *
+   * Only the batches that own the call sites can post a real `blocking`
+   * notification today (SpacesPanel's delayed-purge branch, store's resume
+   * failure), so without this an e2e could not reach the standing error area
+   * through the app at all. It posts notifications; it cannot fabricate
+   * backend facts.
+   */
+  useEffect(() => {
+    window.__notifyLab = { notify, dismissAllBlocking: notifyStore.dismissAllBlocking };
+    return () => {
+      delete window.__notifyLab;
+    };
+  }, []);
+
+  async function copyDiagnostic(notification: Notification) {
+    try {
+      // `writeText` rejects when the page lacks clipboard permission (common
+      // in a headless browser). Catch it here so a denied copy stays silent
+      // rather than surfacing as an unhandled rejection.
+      await navigator.clipboard?.writeText(formatDiagnostic(notification));
+      setCopied(notification.id);
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      // Clipboard denied: say nothing rather than post a second failure on
+      // top of the error the user is already looking at.
+    }
+  }
+
+  return (
+    <>
+      {/*
+        The app's only polite live region. Transcript streaming must never be
+        routed here; `Transcript.tsx` sets aria-live="off" on its root so an
+        ancestor can never make it announce.
+      */}
+      <div className={notifyCss.srOnly} role="status" aria-live="polite" aria-atomic="true" data-testid="live-region">
+        {announcement}
+      </div>
+
+      {blocking.length || info.length ? (
+        <div className={notifyCss.stack}>
+          {/* Confirmations lay out above the errors, never over them. */}
+          {info.length ? (
+            <div className={notifyCss.info} data-testid="info-toasts" aria-hidden="true">
+              {info.map((n) => (
+                <div key={n.id} className={notifyCss.infoItem} data-testid="info-toast">
+                  {n.text}
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {blocking.length ? (
+            <div
+              className={notifyCss.blocking}
+              data-testid="blocking-errors"
+              role="region"
+              aria-label="需要处理的问题"
+            >
+              {blocking.map((n) => (
+                <div key={n.id} className={notifyCss.blockingItem} data-testid="blocking-error" data-key={n.key}>
+                  <div className={notifyCss.blockingHead}>
+                    <span className={notifyCss.blockingText}>
+                      {n.subject}
+                      {n.stage ? ` · ${n.stage}` : ""}
+                      {n.reason ? <span className={notifyCss.blockingReason}>{n.reason}</span> : null}
+                    </span>
+                    <button
+                      type="button"
+                      className={notifyCss.dismiss}
+                      aria-label={`忽略：${n.text}`}
+                      data-testid="blocking-dismiss"
+                      onClick={() => notifyStore.dismiss(n.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  {n.actions?.length || n.diagnostic ? (
+                    <div className={notifyCss.actions}>
+                      {n.actions?.map((action) => (
+                        <button
+                          key={action.id}
+                          type="button"
+                          className={notifyCss.action}
+                          data-testid={`blocking-action-${action.id}`}
+                          onClick={() => void action.run?.()}
+                        >
+                          {action.label}
+                        </button>
+                      ))}
+                      {n.diagnostic ? (
+                        <button
+                          type="button"
+                          className={notifyCss.action}
+                          data-testid="blocking-copy-diagnostic"
+                          onClick={() => void copyDiagnostic(n)}
+                        >
+                          {copied === n.id ? "已复制" : "复制诊断"}
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  );
 }
 
 export function Shell() {
@@ -85,10 +232,25 @@ export function Shell() {
     return () => document.removeEventListener("visibilitychange", onVis);
   }, [location.pathname]);
 
+  /*
+   * Bridge the legacy `hubStore.toast(text)` callers onto `notify()`.
+   *
+   * Those callers live in files this batch does not own (`SpacesPanel.tsx:49`,
+   * `store.ts:583,619`), so rather than edit them, their text is forwarded
+   * here as `info` — the same transient behaviour they have today, now in the
+   * new surface with a live region attached.
+   *
+   * TODO(batch D / C2): the `nodePurge !== "purged"` branch at
+   * `SpacesPanel.tsx:49` and the 恢复会话失败 path at `store.ts:619` are
+   * genuinely blocking and should call `notify({ severity: "blocking" })`
+   * directly, with a `projectDeletion()` row and a diagnostic. While they go
+   * through this bridge they still self-dismiss after INFO_TTL_MS.
+   */
   useEffect(() => {
     if (!hub.toast) return;
-    const t = window.setTimeout(() => hubStore.clearToast(), 2400);
-    return () => window.clearTimeout(t);
+    // Collapse by text so a repeated identical toast updates one line.
+    toastAdapter(hub.toast.text, `legacy-toast:${hub.toast.text}`);
+    hubStore.clearToast();
   }, [hub.toast]);
 
   return (
@@ -176,7 +338,7 @@ export function Shell() {
           ))}
         </div>
       ) : null}
-      {hub.toast ? <div className={css.toast}>{hub.toast.text}</div> : null}
+      <ShellNotify />
     </div>
   );
 }

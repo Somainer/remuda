@@ -10,10 +10,27 @@ export type EffortTier = {
 };
 
 /**
+ * One stop of the slider. Tiers map 1:1 onto a row of the harness table; the
+ * Claude-only `ultracode` stop is a sixth stop PAST `max` that selects the
+ * `xhigh` tier together with the ultracode workflow flag — the wire shape is
+ * still {@link EffortSelection} `{name: "xhigh", ultracode: true}`.
+ */
+export type EffortStop = {
+  name: string;
+  description: string;
+  /** Tier index addressed in {@link effortTable}; the ultracode stop parks on xhigh. */
+  index: number;
+  ultracode: boolean;
+  /** Short tick label for the cramped composer popover; falls back to `name`. */
+  short?: string;
+};
+
+/**
  * A chosen effort. `name`/`index` always address a row of the harness table.
  * `ultracode` is Claude-only and is NOT a tier: when it is on Claude forces
- * the `xhigh` tier plus workflow orchestration, so the slider parks and locks
- * on `xhigh`. Other harnesses leave it `undefined`.
+ * the `xhigh` tier plus workflow orchestration. In the UI it is the slider's
+ * sixth (rightmost) stop rather than a separate switch; other harnesses leave
+ * it `undefined`.
  */
 export type EffortSelection = {
   index: number;
@@ -36,6 +53,21 @@ const CLAUDE: EffortTier[] = [
 
 /** Claude forces this tier while ultracode is on. */
 export const CLAUDE_ULTRACODE_INDEX = 3;
+
+/** Position of the ultracode stop on the six-stop Claude slider (past `max`). */
+export const CLAUDE_ULTRACODE_STOP = 5;
+
+/**
+ * The ultracode stop, in the Desktop's slot: the rightmost stop past `max`,
+ * still the `xhigh` tier plus the workflow flag on the wire.
+ */
+const CLAUDE_ULTRACODE_STOP_DEF: EffortStop = {
+  name: "ultracode",
+  description: "多代理工作流 · 锁 xhigh",
+  index: CLAUDE_ULTRACODE_INDEX,
+  ultracode: true,
+  short: "ultra",
+};
 
 const CODEX: EffortTier[] = [
   { name: "low", description: "不额外思考" },
@@ -60,8 +92,8 @@ export const DEFAULT_EFFORT_INDEX = 2;
 /**
  * Legacy Claude tier names from before the real `--effort` levels, mapped by
  * NAME onto the new table. `ultracode` was once a tier; it is now the
- * `xhigh` tier plus the ultracode boolean. Anything unrecognised lands on the
- * default `high`.
+ * rightmost slider stop over the `xhigh` tier plus the ultracode boolean.
+ * Anything unrecognised lands on the default `high`.
  */
 const CLAUDE_LEGACY_NAMES: Record<string, { tier: string; ultracode?: boolean }> = {
   default: { tier: "low" },
@@ -76,6 +108,53 @@ export function effortTable(kind: EffortKind | string): EffortTier[] {
   if (kind === "grok") return GROK;
   if (kind === "agy") return AGY;
   return EMPTY;
+}
+
+/**
+ * The slider stops for a harness. Claude gets a sixth stop past `max` —
+ * ultracode — which selects `xhigh` plus the workflow flag. Every other
+ * harness exposes its native tiers one-to-one.
+ */
+export function effortStops(kind: EffortKind | string): EffortStop[] {
+  const table = effortTable(kind);
+  // The ~280px composer popover cannot fit six full tick labels; New Session's
+  // inline field is wider and renders the full names (see EffortSlider).
+  const popoverShort: Record<string, string> = { medium: "med" };
+  const stops: EffortStop[] = table.map((tier, index) => ({
+    ...tier,
+    index,
+    ultracode: false,
+    short: popoverShort[tier.name],
+  }));
+  if (kind === "claude") stops.push({ ...CLAUDE_ULTRACODE_STOP_DEF });
+  return stops;
+}
+
+/** Slider position (0..stops-1) of a Claude tier/flag pair. Ultracode is the last stop. */
+export function effortStopIndex(
+  kind: EffortKind | string,
+  index: number,
+  ultracode?: boolean,
+): number {
+  if (kind === "claude" && ultracode === true) return CLAUDE_ULTRACODE_STOP;
+  const stops = effortStops(kind);
+  return clampEffortIndex(index, Math.max(1, stops.length));
+}
+
+/** Build a selection from a slider position. The last Claude stop is xhigh + ultracode. */
+export function effortAtStop(kind: EffortKind | string, stopIndex: number): EffortSelection {
+  const stops = effortStops(kind);
+  const stop = stops[clampEffortIndex(stopIndex, Math.max(1, stops.length))];
+  return effortAt(kind, stop?.index ?? 0, stop?.ultracode === true);
+}
+
+/** The name the UI shows for the current stop: "ultracode" while the flag is on. */
+export function effortStopName(
+  kind: EffortKind | string,
+  name: string,
+  ultracode?: boolean,
+): string {
+  return kind === "claude" && ultracode === true ? "ultracode" : name;
 }
 
 export function clampEffortIndex(index: number, length: number): number {
@@ -257,11 +336,6 @@ export function effortCaps(kind: EffortKind | string): {
     return { harness: true, model: false, effort: true, context: true, permission: true };
   }
   return { harness: true, model: true, effort: true, context: true, permission: true };
-}
-
-/** Whether a harness exposes the ultracode workflow toggle (Claude only). */
-export function supportsUltracode(kind: EffortKind | string): boolean {
-  return kind === "claude";
 }
 
 export const HARNESS_META: { id: EffortKind; label: string; mark: string }[] = [

@@ -985,7 +985,12 @@ fn agent_status(status: ScreenStatus) -> ObservationPayload {
 async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> {
     let pgid = {
         let master = state.master.lock().await;
-        foreground_pgid(master.as_ref())
+        // `None` once the stop ladder has released the master (§5.3 step 2).
+        // Falling through to the screen is right: there is no foreground group
+        // to read, and the poller is about to be aborted anyway.
+        master
+            .as_ref()
+            .and_then(|master| foreground_pgid(master.as_ref()))
     };
     if let Some(pgid) = pgid {
         return detect(&table.process_group(pgid));
@@ -1077,6 +1082,23 @@ async fn pump(
 }
 
 /// Stamp and send one Observation on the driver's event channel.
+///
+/// Re-exported to the parent module so the exit waiter (§5.5) stamps its
+/// lifecycle with the same identity and the same sequence counter as every
+/// promotion event. Two emitters with two counters would interleave
+/// unpredictably, and §5.5's exit would sort against promotion events by
+/// accident rather than by order of observation.
+pub(super) async fn emit_payload(
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+    channel: SourceChannel,
+    completeness: Completeness,
+    body: ObservationPayload,
+) -> DriverResult<()> {
+    emit(events, seq, ctx, channel, completeness, body).await
+}
+
 async fn emit(
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,

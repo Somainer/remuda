@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   deploy-public:
+    # D-031: validate retained public assets only; public exposure is pending.
     runs-on: ubuntu-24.04
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-c-deploy
@@ -84,6 +85,10 @@ jobs:
           test -s scripts/ci/private-tokens.sha256
           ./scripts/ci/secret-scan.sh --self-test
           ./scripts/ci/secret-scan.sh
+      - name: Enforce D-031 deployment policy
+        run: |
+          ./scripts/ci/no-tunnel-scan.sh --self-test
+          ./scripts/ci/no-tunnel-scan.sh
 
   cargo-audit:
     name: cargo-audit (optional)

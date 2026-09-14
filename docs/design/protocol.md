@@ -609,7 +609,9 @@ type MaterializedLaunch = {
 
 **绝不使用 `CLAUDE_CODE_EFFORT_LEVEL`**：它的优先级高于会话内 `/effort`，会把 PTY 的实时改档钉死。反向地，`child_env` 必须从子进程环境中**剥离**宿主继承的该变量，否则外部环境静默覆盖一切。
 
-`MaterializedLaunch` 是进程内结构，含 env 值的部分不准序列化到 RPC、Observation 或错误。持久 LaunchManifest 只存 audit、配置对象引用、binary/cwd/nativeStore/ProviderSelection；重启从 secret store 重新解析相同 credential version，不从日志恢复 secret。私有 settingsOverlay 的明文也不返回 UI；可审查的界面展示 key 名、非敏感 provider/model 字段和凭据引用。`args` 是原生 argv 数组，不是 shell 字符串；materializer 用 allowlist 解析器拒绝与保留 flag 冲突、重复 flag、未知危险启动模式和不兼容 driver 的 flag，不能只搜索子字符串。
+`MaterializedLaunch` 是进程内结构，含 env 值的部分不准序列化到 RPC、Observation 或错误。持久 LaunchManifest 只存 audit、配置对象引用、binary/cwd/nativeStore/ProviderSelection；重启从 secret store 重新解析相同 credential version，不从日志恢复 secret。私有 settingsOverlay 的明文也不返回 UI；可审查的界面展示 key 名、非敏感 provider/model 字段和凭据引用。`args` 是原生 argv 数组，不是 shell 字符串；materializer 用 allowlist 解析器拒绝与保留 flag 冲突、重复 flag、未知危险启动模式和不兼容 driver 的 flag，不能只搜索子字符串。allowlist 按 driver 分表：claude 的 EXTRA 不等于 codex/grok/agy 的 EXTRA，一个 flag 进表的依据是对该 binary 的实际验证，不是「看起来无害」。
+
+**binaryPath / binarySha256（自定义可执行文件）。** `binaryPath` 是 host 上的绝对路径，覆盖该 driver 默认解析到的命令；缺省时 Node 按「host 默认 → `REMUDA_CLAUDE_BIN` → `PATH`」解析，与以往一致。Hub 只存字符串——它 stat 不到 Node 的文件系统——**Node 是唯一权威**：拒绝相对路径与含 `.`/`..` 的路径（落盘前就拒，不先 canonicalize），拒绝空白与 shell 元字符（该值还会被写进 launch shim 脚本），`canonicalize` 后必须是常规文件且可执行，必须不落在 instance 目录、`<instance>/launch/`、workspace/worktree cwd 或 `TMPDIR` 之内（否则一个能写自己 cwd 的 agent 就自我提权成任意执行），且不能 group/other 可写、不能不属于 Node uid。校验通过后走既有 `pin_binary` 记录 version 与 sha256；若请求带了 `binarySha256` 而 pin 不相等，返回 `INVALID_LAUNCH_SPEC`。任何一条不过都**失败关闭**，绝不静默回落到 `PATH` 上的 `claude`。bot/agent origin 既不能带 `args` 也不能带 `binaryPath`，与 bypass 的拒绝同形（D-011）。override 记在 `LaunchAudit` 上，连同 pin digest 一起进日志。
 
 物化顺序：验证 spec/tag/capability → Node 验证 host-local cwd、worktree 和 writer lease → 选择已健康且 ingress 匹配的 provider/profile → 固定 binary digest → 读取注册的持久 native home → 合并私有 overlay → 校验权限/模型/环境 → 原子写 launch 文件 → 持久 manifest 与命令 intent → spawn。失败时只清理本 launch 创建的临时文件，不改用户现有配置；生成文件夹 `0700`、文件 `0600`，Windows 使用等效 ACL。原生 home、sessions、登录存储不是临时文件，close 和 resume 后都保留。
 

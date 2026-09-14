@@ -88,7 +88,16 @@ impl HookSession {
             tui: options.tui,
             base: options.base_settings.clone(),
         })?;
-        let shims = materialize_shims(&launch_dir, &overlay.path, &credential, shim_off)?;
+        let shims = materialize_shims(
+            &launch_dir,
+            &overlay.path,
+            &credential,
+            shim_off,
+            // No override plumbed through this path yet: the shell-pty session
+            // builder that owns these options is in flight elsewhere. `None`
+            // is the pre-existing behaviour (search PATH), not a regression.
+            None,
+        )?;
         Ok(Self {
             _server: server,
             overlay,

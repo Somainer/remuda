@@ -38,6 +38,15 @@ pub(crate) struct DevNodeInner {
     interactions: Arc<InteractionRuntime>,
     senders: RwLock<BTreeMap<InstanceId, mpsc::Sender<QueuedCommand>>>,
     pub(crate) workers: tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>,
+    /// Observation pumps, one per started instance.
+    ///
+    /// Tracked rather than detached because a pump owns an `Arc<dyn LocalStore>`
+    /// and writes to it. A pump that outlives its Node keeps that store — and
+    /// therefore the journal's SQLite handle and its in-memory `durable_seq`
+    /// mirror — alive after a second Node has reopened the same data dir, and
+    /// the two then allocate the same sequence number. That surfaces as
+    /// `UNIQUE constraint failed: events.instance_id, events.seq`.
+    pub(crate) pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
     pub(crate) instance_drivers: RwLock<BTreeMap<InstanceId, Arc<dyn Driver>>>,
     pub(crate) stopping: std::sync::atomic::AtomicBool,
     pub(crate) mutations: RwLock<()>,
@@ -118,6 +127,7 @@ impl DevNode {
                 interactions,
                 senders: RwLock::new(BTreeMap::new()),
                 workers: Default::default(),
+                pumps: Default::default(),
                 instance_drivers: Default::default(),
                 stopping: Default::default(),
                 mutations: Default::default(),
@@ -653,6 +663,7 @@ impl DevNode {
         let data_dir = self.data_dir();
         let worker_instance = instance_id.clone();
         let carrier = self.carrier_supervisor();
+        let pumps = Arc::clone(&self.inner.pumps);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(materialize_instance(
@@ -666,6 +677,7 @@ impl DevNode {
                 initial_prompt,
                 data_dir,
                 carrier,
+                pumps,
             ))
             .catch_unwind()
             .await;
@@ -778,7 +790,8 @@ fn spawn_observation_pump(
     interactions: Arc<InteractionRuntime>,
     instance_id: InstanceId,
     mut observations: mpsc::Receiver<remuda_protocol::Observation>,
-) {
+    driver: Arc<dyn Driver>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // D-028 §7: `MessageDisplay` deltas are the only live text an
         // agent-in-PTY session has. Folding them here — beside the journal
@@ -786,18 +799,30 @@ fn spawn_observation_pump(
         // fill in line by line instead of a whole message at a time.
         let mut assembler = crate::signal_messages::MessageAssembler::new();
         while let Some(observation) = observations.recv().await {
-            if let Some(reason) = native_failure_reason(&observation) {
+            // §5.5 before the generic failure fold: a clean exit carries
+            // `Severity::Info` and would otherwise fall through both, leaving
+            // a finished instance reported as `ready`.
+            if let Some(exit) = native_exit(&observation) {
+                record_native_exit(store.as_ref(), &instance_id, &exit);
+            } else if let Some(reason) = native_failure_reason(&observation) {
                 record_task_exit(store.as_ref(), &instance_id, &reason);
             }
-            if let Some(promotion) = promotion_change(&observation)
-                && let Err(error) = store.set_instance_promotion(
+            if let Some(promotion) = promotion_change(&observation) {
+                if let Err(error) = store.set_instance_promotion(
                     &instance_id,
                     promotion.kind,
                     promotion.mode,
                     promotion.promoted_at,
-                )
-            {
-                tracing::warn!(%error, "instance promotion not applied");
+                ) {
+                    tracing::warn!(%error, "instance promotion not applied");
+                } else {
+                    // Promotion is precisely the event that changes the
+                    // answer: the PTY was carrying a login shell and is now
+                    // carrying an agent, so steer / queue / interrupt move
+                    // from "not provided" to that harness's measured
+                    // provisions (§4.3, §6).
+                    refresh_capabilities(store.as_ref(), &instance_id, driver.as_ref()).await;
+                }
             }
             if let Some(session) = native_session_evidence(&observation) {
                 record_native_session(store.as_ref(), &instance_id, &session);
@@ -847,7 +872,7 @@ fn spawn_observation_pump(
                 }
             }
         }
-    });
+    })
 }
 
 async fn materialize_instance(
@@ -862,6 +887,11 @@ async fn materialize_instance(
     // Node data dir, so this worker can drop its attachments on the way out.
     data_dir: Option<std::path::PathBuf>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
+    // Where this instance's observation pump is registered so a shutdown can
+    // stop it. Just the map, not the whole Node: the pump outliving its Node is
+    // the bug being fixed, and handing this worker a Node handle to fix it
+    // would be a second way to do the same thing.
+    pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
 ) -> Result<(), NodeError> {
     let observations = match driver.start().await {
         Ok(observations) => observations,
@@ -898,12 +928,14 @@ async fn materialize_instance(
         return Ok(());
     }
     if let Some(observations) = observations {
-        spawn_observation_pump(
+        let pump = spawn_observation_pump(
             Arc::clone(&store),
             Arc::clone(&interactions),
             instance_id.clone(),
             observations,
+            Arc::clone(&driver),
         );
+        pumps.lock().await.insert(instance_id.clone(), pump);
     }
     if let Some(recipe) = driver.launch_recipe() {
         store.put_launch_recipe(&instance_id, &recipe)?;
@@ -931,6 +963,11 @@ async fn materialize_instance(
         "ready",
         "driver-started",
     )?;
+    // D-028 §4.3/§6: the create-time snapshot is keyed by `DriverKind` and
+    // cannot know what this session is actually carrying. Ask the live driver
+    // now that it has started, so the wire reports the session's real
+    // steer / queue / interrupt provisions instead of the static row.
+    refresh_capabilities(store.as_ref(), &instance_id, driver.as_ref()).await;
 
     if pty_queue::is_pty(driver.kind()) {
         let result = pty_queue::run(
@@ -1257,6 +1294,34 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
     }
 }
 
+/// Store what the live driver says this session can do (§4.3, §6).
+///
+/// Called after start and again after a promotion, because promotion is
+/// exactly the event that changes the answer: a `shell-pty` that was carrying a
+/// login shell is now carrying `claude`, and steer / queue / interrupt go from
+/// "not provided" to the provisions measured for that harness.
+///
+/// Silent when the driver has nothing to add — a driver whose abilities really
+/// are fixed by its kind returns `None` and keeps its create-time snapshot.
+async fn refresh_capabilities(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    driver: &dyn Driver,
+) {
+    let Some(snapshot) = driver.capabilities().await else {
+        return;
+    };
+    match store.set_instance_capabilities(instance_id, snapshot) {
+        Ok(Some(instance)) => tracing::debug!(
+            instance = %instance_id.as_id(),
+            revision = instance.meta.revision.0,
+            "session capabilities refreshed from the live driver"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "session capabilities not stored"),
+    }
+}
+
 /// A terminal → agent promotion or demotion read off a driver lifecycle (D-025).
 struct PromotionChange {
     kind: AgentKind,
@@ -1419,6 +1484,90 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     match &native.status {
         Knowledge::Known { value } if !value.is_empty() => Some(value.clone()),
         _ => Some(native.native_name.clone()),
+    }
+}
+
+/// A PTY process that ended, as reported by the driver's exit waiter (§5.5).
+///
+/// Separate from [`native_failure_reason`] because a *clean* exit is not a
+/// failure and must not be journaled as one: the `Severity::Info` a code-0 exit
+/// carries is exactly what keeps it out of that path, and without this it would
+/// be journaled and then silently dropped, leaving the instance `ready` — which
+/// is the §5.5 defect in a new place rather than a fix for it.
+struct NativeExit {
+    /// `exited` or `failed`.
+    state: String,
+    /// Reason naming the evidence, e.g. `native-exit-code-0`.
+    reason: String,
+}
+
+fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    if native.native_name != remuda_driver::shell_pty::NATIVE_EXIT {
+        return None;
+    }
+    let Knowledge::Known { value: state } = &native.status else {
+        return None;
+    };
+    Some(NativeExit {
+        state: state.clone(),
+        reason: native
+            .related_ids
+            .get("reason")
+            .cloned()
+            .unwrap_or_else(|| state.clone()),
+    })
+}
+
+/// Settle an instance whose PTY process ended (§5.5).
+///
+/// §5.5's other half: a *promoted* instance distinguishes two deaths. The agent
+/// going away while the shell survives is a demote, and the driver reports that
+/// as `agent_demoted`, never as this event — the exit waiter watches the child
+/// the driver itself spawned. So anything arriving here really is the instance
+/// ending.
+fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &NativeExit) {
+    let Ok(instance) = store.get_instance(instance_id) else {
+        return;
+    };
+    if matches!(
+        instance.lifecycle,
+        InstanceLifecycle::Exited | InstanceLifecycle::Failed
+    ) {
+        return;
+    }
+    if let Err(error) = store.mark_unsettled_unknown(instance_id) {
+        tracing::warn!(%error, "unsettled commands not marked before native exit");
+    }
+    if exit.state == "failed"
+        && let Err(error) = store.set_instance_failure(instance_id, &exit.reason)
+    {
+        tracing::warn!(%error, "native exit failure reason not recorded");
+    }
+    // Journal first, settle second. A reader that sees `exited` will then
+    // always find the event explaining it: the other order leaves a window in
+    // which an instance has stopped and the journal cannot say why, and a UI
+    // polling for the transition lands in that window under load. Ordering it
+    // this way makes the entity state the *last* thing to change, so it is
+    // safe to treat as the signal that everything else is already written.
+    if let Err(error) =
+        append_instance_lifecycle(store, instance_id, Some("ready"), &exit.state, &exit.reason)
+    {
+        tracing::error!(%error, "native exit lifecycle not appended");
+    }
+    if let Err(error) = store.set_instance_state(
+        instance_id,
+        Some(InstanceLifecycle::Exited),
+        Some(Knowledge::Known {
+            value: Activity::Idle,
+        }),
+    ) {
+        tracing::error!(%error, "instance not marked exited after its process ended");
     }
 }
 
@@ -1840,11 +1989,59 @@ fn fixture_host(host_id: HostId) -> Result<Host, NodeError> {
         },
         last_seen_at: Knowledge::Known { value: now },
         lease_expires_at: unknown("local-dev-no-lease"),
-        // TODO(inventory): Hub enroll should call crate::inventory::collect; DevNode stays fixture-only.
-        driver_inventory: Vec::new(),
+        driver_inventory: driver_inventory(),
         journal_id: Id::new("obj")?,
         durable_seq: U64(0),
     })
+}
+
+/// What this Node can actually launch, for the Hub host view (D-028 §5.1).
+///
+/// The demo this exists to prevent: New Session offered `claude` on
+/// `shell-pty`, the Node silently fell back to a login shell because
+/// `REMUDA_PTY_CARRIER` was unset, and the first prompt was typed into zsh —
+/// which ran it as a command. Nothing anywhere reported that native launch was
+/// off, so the UI could not have known. `launchable` is that report, and the
+/// web keys its `shell-pty` default on it.
+///
+/// Only `shell-pty` is described: it is the one driver whose ability to launch
+/// an agent depends on a runtime flag rather than on a binary being present.
+/// The rest keep the host's existing (empty) inventory, which is honest —
+/// absence means "not reported", and no caller reads it as "cannot".
+fn driver_inventory() -> Vec<remuda_protocol::DriverDescriptor> {
+    let native = remuda_driver::shell_pty::native_carrier_enabled();
+    let Ok(capabilities) = fixture_capabilities(remuda_protocol::DriverKind::ShellPty) else {
+        return Vec::new();
+    };
+    let Ok(empty_digest) = remuda_protocol::Digest::try_from(format!(
+        "sha256:{:x}",
+        <Sha256 as sha2::Digest>::digest([])
+    )) else {
+        return Vec::new();
+    };
+    vec![remuda_protocol::DriverDescriptor {
+        kind: remuda_protocol::DriverKind::ShellPty,
+        adapter_version: remuda_driver::ADAPTER_VERSION.to_owned(),
+        // The binary is per-launch here — a login shell or whichever agent the
+        // recipe pins — so there is nothing host-wide to name or hash. Left
+        // empty rather than filled with a plausible-looking `$SHELL`, which
+        // would be wrong for every agent launch. The digest is the sha256 of
+        // no bytes, which is what "nothing was hashed" spells in a field the
+        // wire type requires to be a well-formed sha256.
+        binary_path: String::new(),
+        binary_version: String::new(),
+        binary_digest: empty_digest,
+        launchable: native,
+        reason_code: if native {
+            "carrier-native".to_owned()
+        } else {
+            // Names the flag's absence, not a defect: `shell-pty` still
+            // launches a login shell, and D-025 promotion still works inside
+            // it. What is unavailable is Remuda running the agent command.
+            "carrier-not-enabled".to_owned()
+        },
+        capabilities,
+    }]
 }
 
 pub(crate) fn fixture_workspace(

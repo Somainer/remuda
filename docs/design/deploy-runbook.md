@@ -5,15 +5,15 @@
 执行重启或继续 Node 接入验收。此前操作和基线恢复以
 [实施证据](./evidence/intranet-hub-1.md) 为准，不把临时探测当作最终启用结果。
 
-当前支持入口是 [deploy/intranet](../../deploy/intranet/README.md)。按 D-020
+公网暴露：待定；禁止隧道工具（D-031）。唯一支持入口是
+[deploy/intranet](../../deploy/intranet/README.md) 的内网 Caddy。按 D-020
 后续优先级调整，先把 Hub 放到 `<sg-host>`，复用现有 Caddy 的 DNS-01，使用
-独立域名 `remuda.<zone>`。未来公网 VPS 方案保留在
-[deploy/public](../../deploy/public/README.md)，本轮不部署公网 VPS。
+独立域名 `remuda.<zone>`。历史公网 VPS 方案保留在
+[deploy/public](../../deploy/public/README.md)，等待新的公网部署决策。
 
 SG 没有公网 IP；域名 A 记录指向内网地址。DNS-01 可签发 HTTPS 证书，但不会
 让该地址变成公网可达。浏览器、手机和 Node 必须有获准的内网路由。普通蜂窝
-网络访问不属于此次内网验收。cloudflared、frp、ngrok、长期 `ssh -R` 等隧道/
-内网穿透均不适用；旧 [cloudflared 文档](../../deploy/cloudflared.md) 仅作历史记录。
+网络访问不属于此次内网验收。旧公网暴露路径已移除，遵循 D-031。
 
 ## 前置证据与构建
 

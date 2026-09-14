@@ -12,8 +12,41 @@ use std::{
     time::Duration,
 };
 
-pub(crate) struct ResourceStore(pub Arc<dyn LocalStore>);
+/// Reason and diagnostic name for a session lost to a Node restart (§8 plan A).
+///
+/// Shared with the Hub, which applies the same string when its own reconcile
+/// notices an epoch change: the web should not have to know whether the Node
+/// confessed first or the Hub worked it out.
+pub const NODE_EPOCH_CHANGED: &str = "node-epoch-changed";
 
+/// The journal entry the web turns into 「Node 重启，会话已结束」 plus Resume.
+fn node_epoch_diagnostic() -> remuda_protocol::ObservationPayload {
+    remuda_protocol::ObservationPayload::Lifecycle(Box::new(
+        remuda_protocol::LifecyclePayload::Native(Box::new(remuda_protocol::NativeLifecycle {
+            topic: remuda_protocol::LifecycleTopic::Diagnostic,
+            native_name: "node_epoch_changed".to_owned(),
+            native_id: remuda_protocol::Knowledge::NotApplicable,
+            status: remuda_protocol::Knowledge::Known {
+                value: "exited".to_owned(),
+            },
+            related_ids: [
+                ("reason".to_owned(), NODE_EPOCH_CHANGED.to_owned()),
+                // D-026 can continue this conversation in a fresh PTY, so the
+                // UI should offer that rather than only reporting the loss.
+                ("resumable".to_owned(), "true".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            data_ref: None,
+            // Not an error: the Node restarted, which is a normal thing to do.
+            // §8 asks for an honest explanation, not an incident.
+            severity: remuda_protocol::Severity::Warning,
+            affects_completion: true,
+        })),
+    ))
+}
+
+pub(crate) struct ResourceStore(pub Arc<dyn LocalStore>);
 impl PtyResourceStore for ResourceStore {
     fn save(&self, resource: &PtyResource) -> remuda_driver::DriverResult<()> {
         self.0
@@ -78,7 +111,17 @@ impl DevNode {
 
     /// Adopt known live panes and sweep orphans before accepting new commands.
     /// No prompt, approval, start, or semantic resume is replayed here.
+    ///
+    /// Settles native-PTY sessions **first** (§8 plan A,
+    /// [`Self::reconcile_native_pty`]), then waits on herdr. The order is not
+    /// cosmetic: waiting out a predecessor's session server can take the whole
+    /// of [`remuda_herdr::RetryPolicy`]'s budget, and until it returns every
+    /// native-PTY row still reads `ready`. Those sessions are already gone and
+    /// the user is already looking at them, so their loss is reported before
+    /// anything that can block — a herdr socket that will not answer must not
+    /// also hide an unrelated carrier's casualties.
     pub async fn reconcile_herdr(&self) -> Result<(), NodeError> {
+        self.reconcile_native_pty().await?;
         self.reconcile_herdr_with(remuda_herdr::RetryPolicy::default())
             .await
     }
@@ -243,6 +286,150 @@ impl DevNode {
         Ok(())
     }
 
+    /// Settle native-PTY sessions that did not survive this Node's restart
+    /// (D-028 §8, plan A).
+    ///
+    /// An in-process `portable-pty` dies with the Node: the child is ours, and
+    /// when the master fd closes the kernel sends `SIGHUP` to the foreground
+    /// group. There is no adopting it back. Plan A accepts that and requires
+    /// the loss be *said out loud* rather than left as a row that claims to be
+    /// ready — so every live `shell-pty` row from the previous process is
+    /// marked exited with `node-epoch-changed`, and a diagnostic carries the
+    /// same reason into the journal for the web to render as
+    /// 「Node 重启，会话已结束」 beside a Resume affordance.
+    ///
+    /// Resume is what makes this honest rather than merely blunt: D-026 can
+    /// continue the same conversation, and §5.6 makes that a new PTY with
+    /// `--resume` prefilled. The session is over; the conversation is not.
+    ///
+    /// Herdr-carried instances are **not** touched — they genuinely do survive,
+    /// which is why herdr stays an optional carrier until `remuda-ptyd` lands
+    /// in P8. Those are [`Self::reconcile_herdr`]'s business.
+    ///
+    /// Runs at startup, before any instance is served. Idempotent: a row that
+    /// is already exited is left alone, so a Node that restarts twice does not
+    /// journal the loss twice.
+    pub async fn reconcile_native_pty(&self) -> Result<(), NodeError> {
+        let mut lost = Vec::new();
+        for instance in self.inner.store.list_instances()? {
+            if instance.driver != DriverKind::ShellPty {
+                continue;
+            }
+            if matches!(
+                instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            ) {
+                continue;
+            }
+            // A driver in this map was built by *this* process, so its PTY is
+            // alive and this is not a restart casualty. At startup the map is
+            // empty; the check matters if this is ever called again later.
+            if self
+                .inner
+                .instance_drivers
+                .read()
+                .await
+                .contains_key(&instance.meta.id)
+            {
+                continue;
+            }
+            lost.push(instance.meta.id.clone());
+        }
+        for id in lost {
+            tracing::warn!(
+                instance = %id.as_id(),
+                "native PTY did not survive the node restart; marking exited ({NODE_EPOCH_CHANGED})"
+            );
+            self.inner
+                .store
+                .set_instance_failure(&id, NODE_EPOCH_CHANGED)?;
+            // The diagnostic is what the web reads: the lifecycle event says
+            // the session ended, and this says *why* in a form that can be
+            // turned into a sentence and a Resume button. Journaled *before*
+            // the row is settled, so a reader that sees `exited` always finds
+            // the explanation already there — settling first leaves a window
+            // where a session has ended and nothing can say why.
+            if let Err(error) = self.inner.store.append_observation(
+                &id,
+                None,
+                remuda_protocol::Completeness::Structured,
+                node_epoch_diagnostic(),
+            ) {
+                tracing::warn!(%error, "node-epoch-changed diagnostic not journaled");
+            }
+            self.mark_exited(&id, NODE_EPOCH_CHANGED)?;
+        }
+        Ok(())
+    }
+
+    /// Kill this Node's PTY processes without settling any row.
+    ///
+    /// What a Node *dying* looks like from the store's point of view: the
+    /// processes go, and every row it was serving is left exactly as it was,
+    /// still saying `ready`. That gap is the thing
+    /// [`Self::reconcile_native_pty`] exists to close, so a test for it has to
+    /// be able to produce the gap — going through `instance.close` would settle
+    /// the rows and leave reconciliation with nothing to find.
+    ///
+    /// Not a shutdown: no `stopping` flag, no command settlement, no carrier
+    /// sweep. Only the child processes end.
+    #[doc(hidden)]
+    pub async fn shutdown_processes_only(&self) {
+        let workers = std::mem::take(&mut *self.inner.workers.lock().await);
+        for worker in workers.values() {
+            worker.abort();
+        }
+        // Awaited, not just aborted. `abort()` schedules cancellation; a worker
+        // already inside a close runs to the end of that call and settles the
+        // row as `exited`. That is the correct behaviour for a real close and
+        // exactly wrong here, where the whole point is to leave the row saying
+        // `ready` so reconciliation has the casualty to find.
+        for (_, worker) in workers {
+            let _ = worker.await;
+        }
+        // Before the drivers, not after: closing a driver makes it emit its
+        // §5.5 exit, and a pump still running would journal that — into a store
+        // this Node is about to stop owning.
+        self.stop_pumps().await;
+        let drivers: Vec<_> = self
+            .inner
+            .instance_drivers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for driver in drivers {
+            let _ = driver.execute(DriverRequest::Close).await;
+        }
+        self.inner.instance_drivers.write().await.clear();
+    }
+
+    /// Abort every observation pump and wait for it to actually stop.
+    ///
+    /// A pump owns an `Arc<dyn LocalStore>` and writes through it. Left running
+    /// past its Node it keeps that store — and so the journal's SQLite handle
+    /// and its in-memory `durable_seq` mirror — alive while a *second* Node has
+    /// reopened the same data dir. Both then read the same watermark and
+    /// allocate the same sequence number, which SQLite rejects as
+    /// `UNIQUE constraint failed: events.instance_id, events.seq`. That is a
+    /// restart-shaped race, so it showed up first in the restart test, but any
+    /// two Nodes over one data dir can hit it.
+    ///
+    /// Awaited rather than fired and forgotten: `abort()` only schedules
+    /// cancellation, and a pump already inside `append_observation` runs to the
+    /// end of that call. Returning before it does would leave exactly the
+    /// overlap this exists to prevent.
+    async fn stop_pumps(&self) {
+        let pumps = std::mem::take(&mut *self.inner.pumps.lock().await);
+        for pump in pumps.values() {
+            pump.abort();
+        }
+        for (_, pump) in pumps {
+            let _ = pump.await;
+        }
+    }
+
     /// Stop workers, close every retained driver and sweep durable ownership.
     /// Finished workers count as settled even when their command queue is gone.
     pub async fn shutdown(&self) -> Result<(), NodeError> {
@@ -255,6 +442,7 @@ impl DevNode {
         for (_, worker) in workers {
             let _ = worker.await;
         }
+        self.stop_pumps().await;
         let mut tasks = tokio::task::JoinSet::new();
         for instance in self.inner.store.list_instances()? {
             let node = self.clone();

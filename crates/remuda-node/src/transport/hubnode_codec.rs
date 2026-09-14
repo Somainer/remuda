@@ -307,6 +307,9 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             driver: DriverKind::ClaudePrint,
             model: "fake".into(),
             args: Vec::new(),
+            // Filled by apply_spec_launch_fields from the Hub spec.
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "dev-fake".into(),
             permission_mode: "manual".into(),
             prompt: String::new(),
@@ -710,7 +713,16 @@ pub fn stdio_hello_params(
             "maxFrameBytes": 1_048_576,
         })),
         host: serde_json::from_value(host.clone()).ok(),
-        capabilities: None,
+        // D-028 §5.1: the Hub's host view stores this verbatim and the web
+        // reads `capabilities.driverInventory[].launchable` from it to decide
+        // whether `shell-pty` can actually launch an agent on this host.
+        // Sending `None` is what left the UI guessing — it offered a native
+        // launch on a Node whose carrier flag was off, and the first prompt
+        // went to a login shell.
+        capabilities: host
+            .get("driverInventory")
+            .filter(|inventory| !inventory.is_null())
+            .map(|inventory| json!({ "driverInventory": inventory })),
         cli: host.get("cli").cloned(),
     });
     if let Some(object) = params.as_object_mut() {
@@ -757,6 +769,51 @@ mod tests {
         let append = encode_append("ins_x", Some(4), json!({"kind":"message"}));
         assert_eq!(append["events"].as_array().map(Vec::len), Some(1));
         assert_eq!(append["watermark"]["durableSeq"], json!("4"));
+    }
+
+    #[test]
+    fn hello_carries_the_driver_inventory_under_capabilities() {
+        // D-028 §5.1: the web reads
+        // `capabilities.driverInventory[].launchable` to decide whether this
+        // host can actually launch an agent on `shell-pty`. Sending `None` is
+        // what let New Session offer a native launch on a Node whose carrier
+        // flag was off, so the first prompt was typed into a login shell.
+        let epoch = Id::new("epoch").expect("epoch");
+        let host_id = HostId::new();
+        let host = json!({
+            "hostname": "lab",
+            "driverInventory": [{"kind": "shell-pty", "launchable": false,
+                                 "reasonCode": "carrier-not-enabled"}],
+        });
+        let params =
+            stdio_hello_params(&host_id, "lab", "outbound-wss", "0.1.0", &epoch, host, None);
+        assert_eq!(
+            params["capabilities"]["driverInventory"][0]["launchable"],
+            json!(false)
+        );
+        assert_eq!(
+            params["capabilities"]["driverInventory"][0]["reasonCode"],
+            json!("carrier-not-enabled")
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_inventory_reports_no_capabilities_rather_than_an_empty_claim() {
+        // Absence must read as "not reported", never as "cannot launch": a
+        // Node too old to describe itself should not have its silence rendered
+        // as a refusal.
+        let epoch = Id::new("epoch").expect("epoch");
+        let host_id = HostId::new();
+        let params = stdio_hello_params(
+            &host_id,
+            "lab",
+            "outbound-wss",
+            "0.1.0",
+            &epoch,
+            json!({"hostname": "lab"}),
+            None,
+        );
+        assert!(params["capabilities"].is_null());
     }
 
     #[test]

@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   CLAUDE_ULTRACODE_INDEX,
+  CLAUDE_ULTRACODE_STOP,
   contextPercent,
   DEFAULT_EFFORT_INDEX,
   defaultEffortIndex,
   effortAt,
+  effortAtStop,
   effortFromRecord,
   effortIndexFromClientX,
   effortRatio,
+  effortStops,
+  effortStopIndex,
+  effortStopName,
   effortTable,
   effortWireName,
   isEmberEffort,
@@ -211,6 +216,80 @@ describe("effort slider snapping", () => {
     expect(keyboardEffortIndex(0, "End", 5)).toBe(4);
     expect(keyboardEffortIndex(1, "End", 3)).toBe(2);
     expect(keyboardEffortIndex(1, "Enter", 5)).toBeNull();
+  });
+});
+
+describe("six-stop Claude slider", () => {
+  it("lists six stops in order with ultracode as the rightmost, other harnesses unchanged", () => {
+    expect(effortStops("claude").map((s) => s.name)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultracode",
+    ]);
+    expect(effortStops("codex").map((s) => s.name)).toEqual(["low", "medium", "high", "ultra"]);
+    expect(effortStops("grok").map((s) => s.name)).toEqual(["quick", "standard", "max"]);
+    expect(effortStops("agy").map((s) => s.name)).toEqual(["default"]);
+    // Only the last Claude stop carries the flag; it parks on the xhigh tier.
+    const ultra = effortStops("claude")[5];
+    expect(ultra).toMatchObject({ index: 3, ultracode: true });
+    expect(effortStops("claude").slice(0, 5).every((s) => s.ultracode === false)).toBe(true);
+    expect(CLAUDE_ULTRACODE_STOP).toBe(5);
+  });
+
+  it("round-trips every stop: selection → stop position → selection", () => {
+    const expected = [
+      { name: "low", index: 0, ultracode: false },
+      { name: "medium", index: 1, ultracode: false },
+      { name: "high", index: 2, ultracode: false },
+      { name: "xhigh", index: 3, ultracode: false },
+      { name: "max", index: 4, ultracode: false },
+      { name: "xhigh", index: 3, ultracode: true },
+    ];
+    for (let stop = 0; stop < 6; stop++) {
+      const selection = effortAtStop("claude", stop);
+      expect(selection).toMatchObject(expected[stop]);
+      expect(selection.kind).toBe("claude");
+      expect(effortStopIndex("claude", selection.index, selection.ultracode)).toBe(stop);
+    }
+    // The ultracode stop keeps the D-028 §9.1 wire shape; only the display name changes.
+    const ultraStop = effortAtStop("claude", 5);
+    expect(ultraStop.name).toBe("xhigh");
+    expect(ultraStop.ultracode).toBe(true);
+    expect(effortStopName("claude", ultraStop.name, ultraStop.ultracode)).toBe("ultracode");
+    expect(effortStopName("claude", "max", false)).toBe("max");
+    // A plain xhigh selection never renders at the ultracode stop.
+    expect(effortStopIndex("claude", 3, false)).toBe(3);
+  });
+
+  it("reverse-maps records: {xhigh, ultracode:true} renders at the ultracode stop", () => {
+    const ultra = effortFromRecord("claude", "xhigh", 3, true);
+    expect(ultra).toMatchObject({ name: "xhigh", index: 3, ultracode: true });
+    expect(effortStopIndex("claude", ultra!.index, ultra!.ultracode)).toBe(5);
+    const plain = effortFromRecord("claude", "xhigh", 3, false);
+    expect(effortStopIndex("claude", plain!.index, plain!.ultracode)).toBe(3);
+    // Legacy names keep normalising by name, incl. the old ultracode tier.
+    expect(effortStopIndex("claude", normalizeClaudeName("default").index, false)).toBe(0);
+    expect(effortStopIndex("claude", normalizeClaudeName("think").index, false)).toBe(2);
+    expect(effortStopIndex("claude", normalizeClaudeName("think-hard").index, false)).toBe(3);
+    const legacyUltra = normalizeClaudeName("ultracode");
+    expect(effortStopIndex("claude", legacyUltra.index, legacyUltra.ultracode)).toBe(5);
+    // Wire name round-trip through the stop is unchanged.
+    expect(effortWireName(effortAtStop("claude", 5))).toBe("ultracode");
+  });
+
+  it("steps with arrows and jumps with Home/End across six stops", () => {
+    expect(keyboardEffortIndex(4, "ArrowRight", 6)).toBe(5);
+    expect(keyboardEffortIndex(5, "ArrowRight", 6)).toBe(5);
+    expect(keyboardEffortIndex(5, "ArrowLeft", 6)).toBe(4);
+    expect(keyboardEffortIndex(0, "End", 6)).toBe(5);
+    expect(keyboardEffortIndex(5, "Home", 6)).toBe(0);
+    // Walk low → ultracode one press at a time.
+    let stop = 0;
+    for (let i = 0; i < 5; i++) stop = keyboardEffortIndex(stop, "ArrowRight", 6) ?? stop;
+    expect(stop).toBe(5);
   });
 });
 

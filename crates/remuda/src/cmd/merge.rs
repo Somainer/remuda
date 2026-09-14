@@ -935,6 +935,7 @@ mod tests {
             names,
             [
                 "secret-scan",
+                "no-tunnel-scan",
                 "cargo-fmt",
                 "cargo-check",
                 "cargo-clippy",
@@ -945,7 +946,7 @@ mod tests {
                 "web-hub-e2e"
             ]
         );
-        assert!(plan[5..].iter().all(|step| step.status == "skipped"));
+        assert!(plan[6..].iter().all(|step| step.status == "skipped"));
         assert!(
             gate_plan(&repo, true, None, true)
                 .unwrap()
@@ -958,8 +959,8 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         let web_only: Vec<Step> = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(web_only[..5].iter().all(|step| step.status == "skipped"));
-        assert!(web_only[5..8].iter().all(|step| step.status == "planned"));
-        assert_eq!(web_only[8].status, "skipped");
+        assert!(web_only[..6].iter().all(|step| step.status == "skipped"));
+        assert!(web_only[6..9].iter().all(|step| step.status == "planned"));
+        assert_eq!(web_only[9].status, "skipped");
     }
 }

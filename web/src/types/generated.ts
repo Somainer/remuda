@@ -1261,7 +1261,9 @@ export type InstanceSnapshot = ({
 /** InstanceSpec; `protocol.md` §4.1. */
 export type InstanceSpec = ({
   "args": (((string))[]);
+  "binaryPath"?: (string | null);
   "binaryRef": Id;
+  "binarySha256"?: (Digest | (null));
   "carrier": CarrierSpec;
   "completionScope": CompletionScope;
   "cwd": (string);

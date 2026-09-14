@@ -177,8 +177,15 @@ fn materialize_inner(
     }
     let extras = validate_spec_args(request.spec.driver, &request.spec.args)?;
     reject_spec_env(request.spec)?;
+    reject_agent_launch_overrides(request.spec, request.origin)?;
     let setting_sources = setting_sources(request)?;
-    let binary = pin_source(&request.binary)?;
+    // M2: the override is validated before any file is written, so a bad path
+    // fails the launch without leaving an overlay or a shim behind.
+    let binary_override = binary_override_pin(request)?;
+    let binary = match &binary_override {
+        Some(pin) => pin.clone(),
+        None => pin_source(&request.binary)?,
+    };
     let model = resolve_model(request.spec, request.profile)?;
     let (permission, debt, approval) = permission_plan(request.spec, request.origin)?;
     let inject_provider = request.profile.delegation == Delegation::Gateway;
@@ -198,7 +205,13 @@ fn materialize_inner(
     // two very different launches: `terminal` / `generic` is a login shell,
     // and `claude` / `codex` / `grok` / `agy` is an agent in a native PTY.
     if request.spec.driver == DriverKind::ShellPty && is_agent_kind(request.spec.kind) {
-        return materialize_shell_pty_agent(request, extras, setting_sources, binary);
+        return materialize_shell_pty_agent(
+            request,
+            extras,
+            setting_sources,
+            binary,
+            binary_override.is_some(),
+        );
     }
 
     match request.spec.driver {
@@ -451,6 +464,7 @@ fn materialize_inner(
             redacted_argv,
             settings_digest,
             prohibited_options_checked: BoolLiteral,
+            binary_override: binary_override.is_some(),
             approval_authority: approval,
         },
     };
@@ -458,6 +472,8 @@ fn materialize_inner(
         launch_id = %recipe.launch_id,
         driver = ?recipe.driver,
         binary = %recipe.binary.abs_path,
+        binary_override = recipe.audit.binary_override,
+        binary_digest = %String::from(recipe.binary.sha256.clone()),
         debt = ?recipe.technical_debt,
         "materialized launch recipe"
     );
@@ -484,6 +500,7 @@ fn materialize_shell_pty_agent(
     extras: Vec<String>,
     setting_sources: Vec<String>,
     binary: BinaryPin,
+    binary_override: bool,
 ) -> DriverResult<LaunchRecipe> {
     let preset = crate::presets::preset_for_spec(request.spec)?;
     let (permission, debt, approval) = permission_plan(request.spec, request.origin)?;
@@ -616,6 +633,7 @@ fn materialize_shell_pty_agent(
             redacted_argv,
             settings_digest,
             prohibited_options_checked: BoolLiteral,
+            binary_override,
             // The agent owns its own TUI prompts until the hook adjudication
             // path (D-028 §4.4 tier A) is wired; claiming runtime-hook here
             // before then would be a lie in the audit record.
@@ -732,6 +750,64 @@ fn pin_source(source: &BinarySource) -> DriverResult<BinaryPin> {
         BinarySource::Path(path) => pin_binary(path),
         BinarySource::Command(name) => pin_binary(name),
     }
+}
+
+/// Validate and pin `spec.binary_path`, when the spec carries one.
+///
+/// The guard roots come from the request rather than being rediscovered here:
+/// `launch_dir` is the instance's launch directory, and `cwd` is where the
+/// agent will run. Both are places the agent can write, which is exactly what
+/// makes naming a binary inside them a privilege escalation.
+fn binary_override_pin(request: &MaterializeRequest<'_>) -> DriverResult<Option<BinaryPin>> {
+    let Some(raw) = request
+        .spec
+        .binary_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    // `launch_dir` is `<instance>/launch`, so its parent is the instance dir.
+    let guard = crate::binary::BinaryOverrideGuard {
+        instance_dir: request
+            .launch_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .or_else(|| Some(request.launch_dir.clone())),
+        cwd: Some(PathBuf::from(&request.spec.cwd)),
+        extra: Vec::new(),
+    };
+    let pin =
+        crate::binary::validate_binary_override(raw, &guard, request.spec.binary_sha256.as_ref())?;
+    Ok(Some(pin))
+}
+
+/// Bot and agent origins may not choose their own argv or executable.
+///
+/// Same shape as the bypass refusal in [`permission_plan`]: a dispatcher or an
+/// instance never inherits operator authority, and both `args` and
+/// `binary_path` are operator-level choices — one picks flags the allowlist
+/// would otherwise have to defend alone, the other picks the code that runs.
+fn reject_agent_launch_overrides(spec: &InstanceSpec, origin: LaunchOrigin) -> DriverResult<()> {
+    if matches!(origin, LaunchOrigin::Human) {
+        return Ok(());
+    }
+    if !spec.args.is_empty() {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "{origin:?} origin may not set launch args"
+        )));
+    }
+    if spec
+        .binary_path
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "{origin:?} origin may not set binaryPath"
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_model(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult<String> {

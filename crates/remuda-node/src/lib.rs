@@ -19,7 +19,8 @@ mod native;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod native_config_access;
 mod origin;
-mod reclaim;
+/// Carrier reclamation, adoption without replay, and restart reconciliation.
+pub mod reclaim;
 mod runtime;
 mod runtime_link;
 mod server;

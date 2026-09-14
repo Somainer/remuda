@@ -11,25 +11,27 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     expect(shellPtyAllowed(undefined, "terminal")).toBe(true);
   });
 
-  it("defaults every agent kind to shell-pty when the CLI exists and no matrix was reported", () => {
+  it("falls back to legacy drivers when the CLI exists but no driver matrix was reported", () => {
     const host = withCli(["claude", "codex", "grok", "agy"]);
-    for (const kind of ["claude", "codex", "grok", "agy"] as const) {
-      expect(shellPtyAllowed(host, kind)).toBe(true);
-      expect(defaultDriver(host, kind)).toBe("shell-pty");
+    expect(shellPtyAllowed(host, "claude")).toBe(false);
+    expect(defaultDriver(host, "claude")).toBe("claude-pty");
+    for (const kind of ["codex", "grok", "agy"] as const) {
+      expect(shellPtyAllowed(host, kind)).toBe(false);
+      expect(defaultDriver(host, kind)).toBe("generic-pty");
     }
   });
 
-  it("missing CLI inventory is treated as 'not reported', not 'unsupported'", () => {
-    expect(defaultDriver({}, "claude")).toBe("shell-pty");
+  it("missing CLI inventory never defaults an agent kind to shell-pty", () => {
+    expect(defaultDriver({}, "claude")).not.toBe("shell-pty");
   });
 
   it("falls back to a legacy driver when the harness binary is not installed", () => {
     const host = withCli(["codex"]);
     expect(shellPtyAllowed(host, "grok")).toBe(false);
     expect(defaultDriver(host, "grok")).toBe("generic-pty");
-    expect(defaultDriver(host, "claude")).toBe("claude-print");
-    // codex IS installed → native PTY stays the default.
-    expect(defaultDriver(host, "codex")).toBe("shell-pty");
+    expect(defaultDriver(host, "claude")).toBe("claude-pty");
+    // codex IS installed but no matrix was reported → still a legacy carrier.
+    expect(defaultDriver(host, "codex")).toBe("generic-pty");
   });
 
   it("honours an explicit launchable shell-pty descriptor from driverInventory", () => {
@@ -46,7 +48,7 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
       capabilities: { driverInventory: [{ kind: "shell-pty", launchable: false }] },
     };
     expect(shellPtyAllowed(host, "claude")).toBe(false);
-    expect(defaultDriver(host, "claude")).toBe("claude-print");
+    expect(defaultDriver(host, "claude")).toBe("claude-pty");
   });
 
   it("an inventory without a shell-pty row also falls back (the matrix says no)", () => {
@@ -64,7 +66,7 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
   });
 
   it("keeps the legacy drivers selectable but secondary", () => {
-    expect(legacyDrivers("claude")).toEqual(["claude-print", "claude-pty", "generic-pty"]);
+    expect(legacyDrivers("claude")).toEqual(["claude-pty", "generic-pty", "claude-print"]);
     expect(legacyDrivers("grok")).toEqual(["generic-pty"]);
   });
 

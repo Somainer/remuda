@@ -40,7 +40,10 @@ pub mod usage;
 mod fake;
 
 pub use attachment::{PromptAttachment, attachments_of, text_with_path_mentions};
-pub use binary::{BinaryPin, default_command, hash_file, pin_binary, resolve_binary};
+pub use binary::{
+    BinaryOverrideGuard, BinaryPin, default_command, hash_file, pin_binary, resolve_binary,
+    validate_binary_override,
+};
 pub use capabilities::{
     ADAPTER_VERSION, MatrixMark, capability_matrix, capability_set, capability_snapshot,
 };
@@ -58,6 +61,12 @@ pub use claude_transcript::{
 };
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
+/// Validate `InstanceSpec.args` against the per-driver launch allowlist.
+///
+/// Exported so the Hub can reject a bad flag with a 400 at create time instead
+/// of letting it travel to the Node and fail there. One table, two callers: the
+/// Node stays the authority and re-runs this during materialization.
+pub use flags::validate_spec_args as validate_launch_args;
 pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, WaitUntil};
 pub use launch::{
     HOOKS_ENABLE_ENV, HookOverlay, HookSession, HookSessionOptions, OverlayOptions,

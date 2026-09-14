@@ -45,6 +45,24 @@ struct PatchHostBody {
     max_instances: Option<i64>,
     #[serde(default)]
     provider_binding: Option<String>,
+    /// Per-host default extra CLI args. `null` clears the default.
+    ///
+    /// Double `Option` so "field absent" and "field set to null" stay
+    /// distinguishable — without that there is no way to remove a default.
+    #[serde(default, deserialize_with = "double_option")]
+    default_launch_args: Option<Option<Vec<String>>>,
+    /// Per-host default claude executable. `null` or `""` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    claude_binary_path: Option<Option<String>>,
+}
+
+/// Deserialize a present-but-null field as `Some(None)`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 pub(crate) fn host_view(host: &HostRecord) -> Value {
@@ -69,6 +87,8 @@ pub(crate) fn host_view(host: &HostRecord) -> Value {
         "ssh": host.ssh,
         "lastError": host.last_error,
         "providerBinding": host.provider_binding,
+        "defaultLaunchArgs": host.default_launch_args,
+        "claudeBinaryPath": host.claude_binary_path,
         "workspaces": host.workspaces,
         "workspaceRevision": host.workspace_revision,
     })
@@ -110,9 +130,30 @@ async fn patch_host(
         Some(raw) => Some(validate_binding(&state, &id, raw).await?),
         None => None,
     };
+    // Validate the args default here so a bad flag is a 400 on the PATCH, not
+    // a surprise the next time someone launches on this host. Same table the
+    // Node uses; the Node still re-checks and stays the authority.
+    if let Some(Some(args)) = body.default_launch_args.as_ref() {
+        remuda_driver::validate_launch_args(remuda_protocol::DriverKind::ClaudePrint, args)
+            .map_err(|error| HubError::BadRequest(error.to_string()))?;
+    }
+    // `claudeBinaryPath` gets no such check: the Hub cannot stat the Node's
+    // filesystem, so anything it validated here would be a guess. It is stored
+    // as given and the Node is the authority — a path that host rejects shows
+    // up as a launch failure naming the reason.
     let host = state
         .store
-        .patch_host(id, body.name, labels, body.max_instances, provider_binding)
+        .patch_host(
+            id,
+            body.name,
+            labels,
+            body.max_instances,
+            provider_binding,
+            crate::store::HostLaunchDefaultsPatch {
+                default_launch_args: body.default_launch_args,
+                claude_binary_path: body.claude_binary_path,
+            },
+        )
         .await
         .map_err(crate::http::map_store)?;
     let live = state.nodes.kind_of(&host.host_id).await.is_some();

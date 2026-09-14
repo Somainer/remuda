@@ -49,6 +49,12 @@ pub struct CreateInstanceBody {
     model: Option<String>,
     #[serde(default)]
     args: Vec<String>,
+    /// Host-absolute claude executable for this session.
+    #[serde(default, rename = "binaryPath")]
+    binary_path: Option<String>,
+    /// Expected digest of `binaryPath`; the Node refuses a mismatch.
+    #[serde(default, rename = "binarySha256")]
+    binary_sha256: Option<String>,
     #[serde(rename = "providerProfileId")]
     provider_profile_id: Option<String>,
     #[serde(rename = "permissionMode")]
@@ -486,6 +492,48 @@ async fn stop_before_delete(
 }
 
 /// `POST /v1/instances` — index + forward `instance.create` when the Node is online.
+/// Map a wire driver name to the kind whose allowlist applies.
+///
+/// An unknown or kind-polymorphic driver falls back to the claude table, which
+/// is the widest — the Node re-validates with the real driver, so guessing
+/// narrow here would reject flags that would actually have worked.
+fn driver_kind_for_args(driver: &str) -> remuda_protocol::DriverKind {
+    use remuda_protocol::DriverKind;
+    match driver {
+        "codex-appserver" => DriverKind::CodexAppserver,
+        "grok-acp" => DriverKind::GrokAcp,
+        "agy-print" => DriverKind::AgyPrint,
+        _ => DriverKind::ClaudePrint,
+    }
+}
+
+/// Fold the chosen host's launch defaults into the spec.
+///
+/// Session values REPLACE the host default rather than concatenating. Merging
+/// two arg lists would produce duplicate flags, which the allowlist refuses —
+/// so a host default and a session arg together would fail the launch for a
+/// caller who did nothing wrong.
+fn merge_host_launch_defaults(
+    spec: &mut serde_json::Map<String, Value>,
+    host: &crate::store::HostRecord,
+    body: &CreateInstanceBody,
+) {
+    if body.args.is_empty()
+        && let Some(args) = host.default_launch_args.as_ref().filter(|a| !a.is_empty())
+    {
+        spec.insert("args".into(), json!(args));
+    }
+    if !spec.contains_key("binaryPath")
+        && let Some(path) = host
+            .claude_binary_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        spec.insert("binaryPath".into(), json!(path));
+    }
+}
+
 pub async fn create_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -526,6 +574,28 @@ pub async fn create_instance(
         if let Some(effort) = &body.effort {
             obj.insert("effort".into(), effort.clone());
         }
+        if let Some(path) = body
+            .binary_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            obj.insert("binaryPath".into(), json!(path));
+        }
+        if let Some(digest) = body
+            .binary_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            obj.insert("binarySha256".into(), json!(digest));
+        }
+    }
+    // Fail fast on a bad flag rather than making the caller wait for the Node
+    // to refuse it. Same table the Node uses; the Node re-checks regardless.
+    if !body.args.is_empty() {
+        remuda_driver::validate_launch_args(driver_kind_for_args(&body.driver), &body.args)
+            .map_err(|error| HubError::BadRequest(error.to_string()))?;
     }
     let placement =
         crate::placement::Placement::from_value(body.placement.as_ref(), body.host_id.as_deref())?;
@@ -537,6 +607,7 @@ pub async fn create_instance(
     for host in hosts {
         if let Some(obj) = spec.as_object_mut() {
             obj.insert("hostId".into(), json!(host.host_id));
+            merge_host_launch_defaults(obj, &host, &body);
         }
         match crate::providers::resolve_and_attach(&state, &host, &mut spec).await {
             Ok(()) => {
@@ -765,7 +836,20 @@ impl ResumeMode {
     }
 
     /// Structured keeps whatever the parent used; terminal always needs a PTY.
+    ///
+    /// D-028 §5.6: a `shell-pty` parent resumes as `shell-pty` on **both**
+    /// modes. That driver now has a semantic resume (a new PTY with the
+    /// harness's own resume flag prefilled), and unification means it already
+    /// has both projections — so there is nothing for the mode to choose
+    /// between, and routing it to `claude-pty` would move a native-carrier
+    /// session onto herdr just because the user clicked a different button.
+    /// This is the second of the two spots §5.6 names as "necessarily 409
+    /// today": the driver's was `CapabilityUnsupported`, and this was a Hub
+    /// that could not name the driver at all.
     fn driver(self, parent_driver: &str) -> &'static str {
+        if parent_driver == "shell-pty" {
+            return "shell-pty";
+        }
         match self {
             Self::Terminal => "claude-pty",
             Self::Structured if parent_driver == "claude-pty" => "claude-pty",

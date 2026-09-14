@@ -1885,7 +1885,16 @@
           "instanceCount": { "type": "integer" },
           "transport": { "type": "string" },
           "hostname": { "type": ["string", "null"] },
-          "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" }
+          "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" },
+          "defaultLaunchArgs": {
+            "type": ["array", "null"],
+            "items": { "type": "string" },
+            "description": "Per-host default extra CLI args, used when a create omits args."
+          },
+          "claudeBinaryPath": {
+            "type": ["string", "null"],
+            "description": "Per-host default claude executable. Validated by the Node, not the Hub."
+          }
         }
       },
       "HostPage": {
@@ -1902,7 +1911,16 @@
           "name": { "type": "string" },
           "labels": { "type": "array", "items": { "type": "string" } },
           "maxInstances": { "type": "integer" },
-          "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" }
+          "providerBinding": { "type": "string", "description": "auto | native | profile:<id>" },
+          "defaultLaunchArgs": {
+            "type": ["array", "null"],
+            "items": { "type": "string" },
+            "description": "Per-host default extra CLI args. Null clears the default."
+          },
+          "claudeBinaryPath": {
+            "type": ["string", "null"],
+            "description": "Per-host default claude executable. Empty string clears the default."
+          }
         }
       },
       "ResumeRequest": {
@@ -2056,6 +2074,19 @@
           "settingsOverlayPath": { "type": "string" },
           "claudeConfigDir": { "type": "string" },
           "maxBudgetUsd": { "type": ["string", "number"] },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present."
+          },
+          "binaryPath": {
+            "type": "string",
+            "description": "Host-absolute executable override. The Node validates and pins it; the Hub only stores the string."
+          },
+          "binarySha256": {
+            "type": "string",
+            "description": "Expected sha256: digest of binaryPath. The launch is refused when the Node's pin disagrees."
+          },
           "effort": { "$ref": "#/components/schemas/EffortSelection" }
         }
       },

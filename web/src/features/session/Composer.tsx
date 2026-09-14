@@ -10,6 +10,7 @@ import {
   defaultEffortIndex,
   effortAt,
   effortCaps,
+  effortStopName,
   effortTable,
   effortWireName,
   harnessMeta,
@@ -276,9 +277,9 @@ export function Composer({
   };
 
   const harnessChip = harnessMeta(harness);
-  // The chip names the tier (xhigh under ultracode); the form's data-attr
-  // carries the wire name so an ultracode selection round-trips.
-  const effortChipLabel = currentEffort.name;
+  // The chip names the current stop ("ultracode" at the top stop); the form's
+  // data-attr carries the wire name so an ultracode selection round-trips.
+  const effortChipLabel = effortStopName(harness, currentEffort.name, ultraOn);
   const effortWire = effortWireName(currentEffort);
   const primaryLabel = sending
     ? "发送中"

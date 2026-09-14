@@ -44,6 +44,7 @@ test_command += [arg for name in crates for arg in ["-p", name]] if args.affecte
 # This is the only definition of gate commands, order, and retry policy.
 definitions = [
     ("secret-scan", ["./scripts/ci/secret-scan.sh"], ".", 1),
+    ("no-tunnel-scan", ["./scripts/ci/no-tunnel-scan.sh"], ".", 1),
     ("cargo-fmt", ["cargo", "fmt", "--all", "--check"], ".", 1),
     ("cargo-check", ["cargo", "check", "--workspace", "--all-targets", "--locked"], ".", 1),
     ("cargo-clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"], ".", 1),

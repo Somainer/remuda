@@ -156,6 +156,19 @@ impl PasskeyRecord {
     }
 }
 
+/// Per-host launch defaults an operator PATCH may change.
+///
+/// Two levels of Option per field: the outer is "did the PATCH mention this",
+/// the inner is "set it or clear it". Collapsing them would leave no way to
+/// remove a default once set.
+#[derive(Debug, Clone, Default)]
+pub struct HostLaunchDefaultsPatch {
+    /// Per-host default extra CLI args. `Some(None)` clears the default.
+    pub default_launch_args: Option<Option<Vec<String>>>,
+    /// Per-host default claude executable. `Some(None)` clears it.
+    pub claude_binary_path: Option<Option<String>>,
+}
+
 /// Host index row (Hub projection).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -202,6 +215,12 @@ pub struct HostRecord {
     /// Provider binding: `auto` | `native` | `profile:<id>` (D-021).
     #[serde(default = "default_provider_binding")]
     pub provider_binding: String,
+    /// Per-host default extra CLI args, used when a create omits `args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_launch_args: Option<Vec<String>>,
+    /// Per-host default claude executable. Stored as given; the Node validates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_binary_path: Option<String>,
     /// Last acknowledged Node workspace registry.
     #[serde(default)]
     pub workspaces: Vec<Value>,
@@ -369,8 +388,16 @@ pub struct InstanceRecord {
     pub promoted_at: Option<String>,
     /// `remuda` or `user` — who ran the launch command (D-028 §1.0 rule 4).
     ///
-    /// Derived from `mode` / `promoted_at` for rows written before D-028, so
-    /// it is always populated on read even though no column stores it.
+    /// Written on the first promotion from what the row was *before* it: a
+    /// `terminal` that becomes an agent is a human typing into a shell,
+    /// anything else is the launch Remuda ran. Settled once, so a later
+    /// demote/repromote cycle cannot rewrite a session's origin.
+    ///
+    /// Stored rather than inferred because §1.0 rule 2 makes promotion the only
+    /// detection path — both launches promote, so `mode == promoted` stopped
+    /// meaning "a human typed it" and read every Remuda-launched agent as
+    /// `user` (measured in native-pty-2 §6). Rows written before the column
+    /// existed still fall back to that derivation, which was sound for them.
     /// Provenance only: it never gates a capability.
     #[serde(
         default,
@@ -2272,7 +2299,12 @@ impl Store {
         labels: Option<Value>,
         max_instances: Option<i64>,
         provider_binding: Option<String>,
+        launch_defaults: HostLaunchDefaultsPatch,
     ) -> Result<HostRecord, StoreError> {
+        let HostLaunchDefaultsPatch {
+            default_launch_args,
+            claude_binary_path,
+        } = launch_defaults;
         self.run(move |conn| {
             if load_host(conn, &host_id)?.is_none() {
                 return Err(StoreError::Id("unknown host".into()));
@@ -2302,6 +2334,26 @@ impl Store {
                 conn.execute(
                     "UPDATE hosts SET provider_binding = ?1 WHERE id = ?2",
                     params![provider_binding, host_id],
+                )?;
+            }
+            // Two levels of Option: the outer is "did the PATCH mention this
+            // field", the inner is "set it or clear it". Collapsing them would
+            // leave no way to remove a default once set.
+            if let Some(args) = default_launch_args {
+                let encoded = args
+                    .map(|args| serde_json::to_string(&args))
+                    .transpose()
+                    .map_err(|error| StoreError::Id(error.to_string()))?;
+                conn.execute(
+                    "UPDATE hosts SET default_launch_args = ?1 WHERE id = ?2",
+                    params![encoded, host_id],
+                )?;
+            }
+            if let Some(path) = claude_binary_path {
+                let path = path.filter(|value| !value.trim().is_empty());
+                conn.execute(
+                    "UPDATE hosts SET claude_binary_path = ?1 WHERE id = ?2",
+                    params![path, host_id],
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
@@ -2977,6 +3029,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "provider_binding",
         "TEXT NOT NULL DEFAULT 'auto'",
     )?;
+    // Per-host launch defaults. Nullable like `hostname`: absent means "no
+    // default", which is different from "an empty arg list".
+    ensure_column(&conn, "hosts", "default_launch_args", "TEXT")?;
+    ensure_column(&conn, "hosts", "claude_binary_path", "TEXT")?;
     ensure_column(
         &conn,
         "provider_profiles",
@@ -2986,6 +3042,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "instances", "mode", "TEXT")?;
     ensure_column(&conn, "instances", "promoted_at", "TEXT")?;
+    // D-028 §1.0 rule 4. Stored rather than inferred: §1.0 rule 2 makes
+    // promotion the only detection path, so `mode == promoted` stopped meaning
+    // "a human typed it" once Remuda-launched agents began promoting too.
+    ensure_column(&conn, "instances", "launched_by", "TEXT")?;
     // Operator ceiling survives Node hello/heartbeat inventory and Hub restarts.
     ensure_column(&conn, "hosts", "max_instances_override", "INTEGER")?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
@@ -3094,6 +3154,21 @@ fn apply_instance_projection(
                 })
                 .flatten();
             if let Some(promoted_kind) = promoted_kind {
+                // Settle provenance on the *first* promotion, using what the
+                // row was before it: a `terminal` that becomes an agent is a
+                // human typing into a shell, anything else is the launch
+                // Remuda ran. Once written it never changes — a later
+                // demote/repromote cycle must not rewrite where a session came
+                // from. Mirrors the Node's own rule in `set_instance_promotion`
+                // so the two cannot disagree.
+                if name == "agent_promoted" {
+                    conn.execute(
+                        "UPDATE instances
+                         SET launched_by = CASE WHEN kind = 'terminal' THEN 'user' ELSE 'remuda' END
+                         WHERE id = ?1 AND launched_by IS NULL",
+                        params![instance_id],
+                    )?;
+                }
                 conn.execute(
                     "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3, updated_at = ?4
                      WHERE id = ?5",
@@ -4008,6 +4083,75 @@ mod tests {
         assert_eq!(promoted.launched_by.as_deref(), Some("user"));
     }
 
+    /// D-028 §1.0 rule 4, the case the legacy derivation gets wrong.
+    #[tokio::test]
+    async fn a_remuda_launched_agent_stays_remuda_after_it_promotes() {
+        // §1.0 rule 2 makes promotion the only detection path, so a
+        // Remuda-launched agent promotes too and `mode == promoted` stopped
+        // meaning "a human typed it". Measured on a live Node before this fix:
+        // both launch paths read back as `user`. What separates them is what
+        // the row was *before* — `terminal` is a shell someone typed into.
+        let (_dir, store, host) = store_with_host("enroll-launched-by-native").await;
+        for (created_as, expected) in [("claude", "remuda"), ("terminal", "user")] {
+            let instance = store
+                .insert_instance(
+                    host.clone(),
+                    None,
+                    created_as.into(),
+                    "shell-pty".into(),
+                    Some(format!("{created_as}-session")),
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            let id = instance.instance_id.clone();
+            store
+                .append_journal(
+                    host.clone(),
+                    id.clone(),
+                    None,
+                    json!({
+                        "kind": "lifecycle",
+                        "payload": {
+                            "type": "native",
+                            "nativeName": "agent_promoted",
+                            "relatedIds": {"kind": "claude", "mode": "promoted",
+                                           "promotedAt": now_rfc3339()},
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+            let promoted = store.get_instance(id.clone()).await.unwrap().unwrap();
+            assert_eq!(
+                promoted.launched_by.as_deref(),
+                Some(expected),
+                "a session created as {created_as} that promotes to claude"
+            );
+
+            // A demote/repromote cycle must not rewrite where it came from.
+            store
+                .append_journal(
+                    host.clone(),
+                    id.clone(),
+                    None,
+                    json!({
+                        "kind": "lifecycle",
+                        "payload": {
+                            "type": "native",
+                            "nativeName": "agent_promoted",
+                            "relatedIds": {"kind": "claude", "mode": "promoted",
+                                           "promotedAt": now_rfc3339()},
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+            let again = store.get_instance(id).await.unwrap().unwrap();
+            assert_eq!(again.launched_by.as_deref(), Some(expected));
+        }
+    }
+
     /// Backdate a row so time-window behaviour is testable without sleeping.
     async fn backdate_instance(store: &Store, instance_id: &str, minutes: i64) {
         let instance_id = instance_id.to_owned();
@@ -4152,7 +4296,7 @@ mod tests {
         // The insert guard still fences a burst: fresh `requested` rows count
         // there, so a host at its ceiling refuses another create…
         store
-            .patch_host(host.clone(), None, None, Some(2), None)
+            .patch_host(host.clone(), None, None, Some(2), None, Default::default())
             .await
             .expect("cap 2");
         let pending = seed_instance(&store, &host).await;
@@ -4308,7 +4452,7 @@ mod tests {
             let store = Store::open(dir.path()).expect("store");
             enroll_labeled(&store, host.clone(), "cap-node").await;
             let patched = store
-                .patch_host(host.clone(), None, None, Some(32), None)
+                .patch_host(host.clone(), None, None, Some(32), None, Default::default())
                 .await
                 .expect("patch");
             assert_eq!(patched.max_instances, 32);
@@ -4501,7 +4645,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         .query_row(
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
                     labels_json, herdr_json, resources_json,
-                    COALESCE(max_instances_override, max_instances), hostname, provider_binding
+                    COALESCE(max_instances_override, max_instances), hostname, provider_binding,
+                    default_launch_args, claude_binary_path
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -4522,6 +4667,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                     row.get::<_, Option<String>>(13)?
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "auto".into()),
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
                 ))
             },
         )
@@ -4541,6 +4688,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         max_instances,
         hostname,
         provider_binding,
+        default_launch_args,
+        claude_binary_path,
     )) = row
     else {
         return Ok(None);
@@ -4593,6 +4742,13 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         max_instances,
         hostname,
         provider_binding,
+        // A column that fails to parse is treated as absent rather than
+        // failing the read: a malformed default must not make the host
+        // unloadable and the whole fleet view unavailable.
+        default_launch_args: default_launch_args
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+        claude_binary_path: claude_binary_path.filter(|value| !value.trim().is_empty()),
         workspaces,
         workspace_revision: workspace_revision.max(0) as u64,
     }))
@@ -4602,7 +4758,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
     conn.query_row(
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
-                mode, promoted_at
+                mode, promoted_at, launched_by
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -4675,14 +4831,19 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 });
             let mode: Option<String> = row.get(15)?;
             let promoted_at: Option<String> = row.get(16)?;
-            let launched_by = Some(
+            let stored: Option<String> = row.get(17)?;
+            // The stored value wins. The derivation below is only for rows
+            // written before the column existed, where `mode == promoted` was
+            // still a sound proxy because Remuda-launched agents did not yet
+            // promote (§1.0 rule 2 is what changed that).
+            let launched_by = Some(stored.unwrap_or_else(|| {
                 if mode.as_deref() == Some("promoted") || promoted_at.is_some() {
                     "user"
                 } else {
                     "remuda"
                 }
-                .to_string(),
-            );
+                .to_string()
+            }));
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 parent_instance_id: spec

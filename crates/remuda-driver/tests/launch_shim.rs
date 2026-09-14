@@ -31,7 +31,7 @@ fn harness() -> Harness {
     let overlay = launch.join("settings.json");
     std::fs::create_dir_all(&launch).unwrap();
     std::fs::write(&overlay, r#"{"hooks":{}}"#).unwrap();
-    let set = materialize_shims(&launch, &overlay, "cred-test", false).unwrap();
+    let set = materialize_shims(&launch, &overlay, "cred-test", false, None).unwrap();
 
     let real_bin = dir.path().join("realbin");
     std::fs::create_dir_all(&real_bin).unwrap();
@@ -68,13 +68,36 @@ impl Harness {
     /// calls out that a non-login shell must still get the injection, and it
     /// does because PATH is inherited rather than sourced from a profile.
     fn sh(&self, script: &str) -> std::process::Output {
-        Command::new("/bin/sh")
+        self.sh_env(script, &[])
+    }
+
+    /// [`Self::sh`] with `extra` added on top of the fixed environment.
+    ///
+    /// `env_clear` first, deliberately. These tests are *about* which
+    /// environment reaches the agent, so inheriting the runner's own is the
+    /// one thing they must not do: a `REMUDA_SHIM=off` in the ambient shell
+    /// silently turns the shim into a passthrough and the assertions then
+    /// describe the operator's machine rather than the code. Verified by
+    /// running this binary under `REMUDA_SHIM=off`, which failed two tests
+    /// before this and passes after.
+    ///
+    /// `HOME` is kept because the shadow `ZDOTDIR` logic reads it, and nothing
+    /// else is: `sh -c` needs no more than `PATH`.
+    fn sh_env(&self, script: &str, extra: &[(&str, &str)]) -> std::process::Output {
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(script)
+            .env_clear()
             .env("PATH", self.path())
-            .env("REMUDA_HOOK_CREDENTIAL", "cred-test")
-            .output()
-            .expect("shell runs")
+            .env("REMUDA_HOOK_CREDENTIAL", "cred-test");
+        if let Some(home) = std::env::var_os("HOME") {
+            command.env("HOME", home);
+        }
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        command.output().expect("shell runs")
     }
 
     fn recorded(&self) -> Vec<String> {
@@ -156,13 +179,11 @@ fn a_user_who_passes_their_own_settings_keeps_it() {
 #[test]
 fn remuda_shim_off_makes_the_shim_a_plain_passthrough() {
     let harness = harness();
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg("claude --resume abc123")
-        .env("PATH", harness.path())
-        .env("REMUDA_SHIM", "off")
-        .output()
-        .unwrap();
+    // Through the same fixed-environment helper as every other case, with the
+    // switch set explicitly: this test asserts what `REMUDA_SHIM=off` does, so
+    // the value has to come from the test rather than from whatever the
+    // runner's shell happened to export.
+    let output = harness.sh_env("claude --resume abc123", &[("REMUDA_SHIM", "off")]);
     assert!(output.status.success(), "{output:?}");
     let argv = harness.recorded();
     assert!(
@@ -231,7 +252,7 @@ fn a_shim_alone_on_path_exits_rather_than_resolving_to_itself() {
     std::fs::create_dir_all(&launch).unwrap();
     let overlay = launch.join("settings.json");
     std::fs::write(&overlay, "{}").unwrap();
-    let set = materialize_shims(&launch, &overlay, "cred", false).unwrap();
+    let set = materialize_shims(&launch, &overlay, "cred", false, None).unwrap();
     let status = run_bounded(
         Command::new(set.bin_dir.join("claude"))
             .env("PATH", set.bin_dir.to_string_lossy().into_owned()),
@@ -287,7 +308,7 @@ fn the_pass_through_shims_reach_their_real_binaries_unchanged() {
     std::fs::create_dir_all(&launch).unwrap();
     let overlay = launch.join("settings.json");
     std::fs::write(&overlay, "{}").unwrap();
-    let set = materialize_shims(&launch, &overlay, "cred", false).unwrap();
+    let set = materialize_shims(&launch, &overlay, "cred", false, None).unwrap();
 
     let real = dir.path().join("realbin");
     std::fs::create_dir_all(&real).unwrap();
@@ -321,4 +342,140 @@ fn write_recorder(path: &Path, record: &Path) {
 fn the_disable_switch_is_read_the_same_way_everywhere() {
     assert!(shim_disabled(Some("off")));
     assert!(!shim_disabled(Some("on")));
+}
+
+/// A pinned binary beats whatever `claude` PATH would have found first.
+///
+/// The PATH loop is the right default, but it is exactly wrong once an
+/// operator names a specific executable: the loop would silently run the decoy
+/// that happens to sit earlier on PATH. This puts a decoy first and asserts the
+/// pinned one is what ran.
+#[test]
+fn shim_execs_the_pinned_binary_not_the_first_on_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = dir.path().join("launch");
+    let overlay = launch.join("settings.json");
+    std::fs::create_dir_all(&launch).unwrap();
+    std::fs::write(&overlay, r#"{"hooks":{}}"#).unwrap();
+
+    // The decoy goes on PATH; the pinned one deliberately does not, so finding
+    // it at all proves the shim used the pin rather than a lookup.
+    let decoy_dir = dir.path().join("decoy");
+    let pinned_dir = dir.path().join("pinned");
+    std::fs::create_dir_all(&decoy_dir).unwrap();
+    std::fs::create_dir_all(&pinned_dir).unwrap();
+    let decoy_record = dir.path().join("decoy-argv.txt");
+    let pinned_record = dir.path().join("pinned-argv.txt");
+    write_recorder(&decoy_dir.join("claude"), &decoy_record);
+    let pinned = pinned_dir.join("claude-custom");
+    write_recorder(&pinned, &pinned_record);
+
+    let set = materialize_shims(&launch, &overlay, "cred", false, Some(&pinned)).unwrap();
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("claude --effort high")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                set.bin_dir.display(),
+                decoy_dir.display()
+            ),
+        )
+        .output()
+        .expect("shell runs");
+    assert!(output.status.success(), "{output:?}");
+
+    assert!(
+        !decoy_record.exists(),
+        "the decoy earlier on PATH must not have run"
+    );
+    let argv: Vec<String> = std::fs::read_to_string(&pinned_record)
+        .expect("the pinned binary ran")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // The overlay contract is unchanged by pinning: our flags first, the
+    // user's after.
+    assert!(argv.contains(&"--settings".to_owned()), "{argv:?}");
+    assert!(argv.contains(&"--effort".to_owned()), "{argv:?}");
+
+    // `command -v` still reports a working path, so the session does not look
+    // broken from the inside.
+    let which = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("command -v claude")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                set.bin_dir.display(),
+                decoy_dir.display()
+            ),
+        )
+        .output()
+        .expect("shell runs");
+    assert!(which.status.success(), "{which:?}");
+}
+
+/// A pinned path that disappeared fails open on 127 rather than silently
+/// running some other `claude` the PATH happens to offer.
+#[test]
+fn a_missing_pinned_binary_exits_127_without_falling_back_to_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = dir.path().join("launch");
+    let overlay = launch.join("settings.json");
+    std::fs::create_dir_all(&launch).unwrap();
+    std::fs::write(&overlay, r#"{"hooks":{}}"#).unwrap();
+
+    let decoy_dir = dir.path().join("decoy");
+    std::fs::create_dir_all(&decoy_dir).unwrap();
+    let decoy_record = dir.path().join("decoy-argv.txt");
+    write_recorder(&decoy_dir.join("claude"), &decoy_record);
+
+    let absent = dir.path().join("gone").join("claude");
+    let set = materialize_shims(&launch, &overlay, "cred", false, Some(&absent)).unwrap();
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("claude")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                set.bin_dir.display(),
+                decoy_dir.display()
+            ),
+        )
+        .output()
+        .expect("shell runs");
+    assert_eq!(output.status.code(), Some(127), "{output:?}");
+    assert!(
+        !decoy_record.exists(),
+        "a missing pin must not fall back to PATH"
+    );
+}
+
+/// A pinned path containing a quote is still one argument.
+#[test]
+fn a_pinned_path_with_a_quote_is_quoted_into_the_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let launch = dir.path().join("launch");
+    let overlay = launch.join("settings.json");
+    std::fs::create_dir_all(&launch).unwrap();
+    std::fs::write(&overlay, r#"{"hooks":{}}"#).unwrap();
+    let odd_dir = dir.path().join("it's");
+    std::fs::create_dir_all(&odd_dir).unwrap();
+    let record = dir.path().join("argv.txt");
+    let pinned = odd_dir.join("claude");
+    write_recorder(&pinned, &record);
+
+    let set = materialize_shims(&launch, &overlay, "cred", false, Some(&pinned)).unwrap();
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("claude")
+        .env("PATH", format!("{}:/usr/bin:/bin", set.bin_dir.display()))
+        .output()
+        .expect("shell runs");
+    assert!(output.status.success(), "{output:?}");
+    assert!(record.exists(), "the quoted pin must still exec");
 }

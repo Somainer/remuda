@@ -259,35 +259,12 @@ impl DriverFactory for NativeClaudeFactory {
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
         }
         let spec = instance_spec(&launch, &self.config, &profile)?;
-        let binary = match self.kind {
-            DriverKind::GenericPty => {
-                let name = preset_by_id(match launch.request.kind {
-                    remuda_protocol::AgentKind::Codex => "codex",
-                    remuda_protocol::AgentKind::Grok => "grok",
-                    remuda_protocol::AgentKind::Agy => "agy",
-                    remuda_protocol::AgentKind::Generic => "gemini",
-                    remuda_protocol::AgentKind::Claude => "claude",
-                    remuda_protocol::AgentKind::Terminal => "sh",
-                })
-                .map(|preset| preset.binary)
-                .unwrap_or("claude");
-                if name == "claude" {
-                    self.config
-                        .claude_binary
-                        .clone()
-                        .map(BinarySource::Path)
-                        .unwrap_or_else(|| BinarySource::Command(name.to_owned()))
-                } else {
-                    BinarySource::Command(name.to_owned())
-                }
-            }
-            _ => self
-                .config
-                .claude_binary
-                .clone()
-                .map(BinarySource::Path)
-                .unwrap_or_else(|| BinarySource::Command("claude".to_owned())),
-        };
+        let binary = resolve_binary_source(
+            self.kind,
+            launch.request.kind,
+            spec.binary_path.as_deref(),
+            self.config.claude_binary.as_deref(),
+        );
         let native: Arc<dyn NativeDriver> = match self.kind {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
@@ -344,25 +321,59 @@ impl DriverFactory for NativeClaudeFactory {
                 Arc::new(GenericPtyDriver::new(options))
             }
             DriverKind::ShellPty => {
-                let mut options = ShellPtyOptions::login(launch.workspace_root.clone());
+                // D-028 §5.1: one driver, two launches. `terminal` / `generic`
+                // is the login shell it always was; an agent kind under the
+                // native carrier is that agent's CLI started directly. The
+                // difference ends at `target` — promotion, hooks, the emulator
+                // and the stop ladder are the same code either way, which is
+                // what makes §1.0's "the two paths produce one journal" a
+                // property of the design rather than a thing to maintain.
+                let agent_kind = agent_pty_kind(launch.request.kind);
+                let mut options = match agent_kind {
+                    Some(kind) => {
+                        let agent = remuda_driver::shell_pty::AgentLaunch {
+                            profile: Box::new(profile),
+                            launch_dir,
+                            native_home,
+                            binary: match &binary {
+                                BinarySource::Path(path) => Some(path.clone()),
+                                // The preset names the binary; letting it
+                                // resolve on PATH is what makes the shim (which
+                                // is *first* on PATH) able to intercept.
+                                _ => None,
+                            },
+                            origin: launch.request.origin.into(),
+                            settings_overlay: overlay.clone(),
+                        };
+                        ShellPtyOptions::agent(launch.workspace_root.clone(), kind, agent)
+                    }
+                    None => ShellPtyOptions::login(launch.workspace_root.clone()),
+                };
                 options.extra_env = crate::origin::instance_env(&self.config.extra_env);
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
-                options.args = launch.request.args.clone();
-                // D-025: watch for an agent CLI taking the foreground so the
-                // structured view and composer follow what the human started.
-                options.promote = self.config.promote_terminal_agents;
+                if agent_kind.is_none() {
+                    // An agent's argv comes from its recipe (§5.1 step 3), not
+                    // from the request; only the shell path forwards args.
+                    options.args = launch.request.args.clone();
+                    // D-025: watch for an agent CLI taking the foreground so
+                    // the structured view and composer follow what the human
+                    // started. An agent target sets this itself, because for it
+                    // promotion is not optional.
+                    options.promote = self.config.promote_terminal_agents;
+                }
                 options.claude_home = self.config.claude_native_home.clone();
                 // D-028 §4.2: the hook path only exists when the operator
-                // opted in. Promotion is its precondition — a shell nobody can
-                // start an agent in has nothing to hook.
-                if self.config.pty_hooks && self.config.promote_terminal_agents {
+                // opted in. For a shell, promotion is its precondition — one
+                // nobody can start an agent in has nothing to hook. An agent
+                // target is already an agent, so the precondition is met.
+                if self.config.pty_hooks && (agent_kind.is_some() || options.promote) {
                     options.hooks = Some(remuda_driver::shell_pty::HookConfig {
                         instance_dir: instance_dir.clone(),
                         relay_binary: relay_binary(&self.config)?,
-                        // P1 only runs under a promoted terminal, whose
-                        // renderer is whatever the human chose. Pinning
-                        // `default` here would fight them; P2 takes this from
-                        // the launch request once Remuda owns the launch.
+                        // §9.2 wants the renderer pinned in both directions.
+                        // Under a promoted terminal the human already chose it
+                        // and pinning `default` would fight them; when Remuda
+                        // owns the launch, it owns the choice.
                         tui: remuda_driver::TuiMode::Fullscreen,
                     });
                 }
@@ -389,6 +400,29 @@ impl DriverFactory for NativeClaudeFactory {
             startup_error: std::sync::Mutex::new(None),
         }))
     }
+}
+
+/// Whether this kind should be launched as an agent CLI in the PTY (§5.1).
+///
+/// Three conditions, all required. The kind has to name an agent — `terminal`
+/// and `generic` mean a login shell and always will. The operator has to have
+/// opted into the native carrier, because until P6/P7 flip the default these
+/// kinds still have herdr-backed drivers that work. And the harness has to be
+/// one whose launch recipe exists.
+///
+/// `None` falls back to a login shell, which is the pre-D-028 behaviour and
+/// still the D-025 promotion entry point: a human can type `claude` into it and
+/// reach the same place by the other road.
+fn agent_pty_kind(kind: remuda_protocol::AgentKind) -> Option<remuda_protocol::AgentKind> {
+    use remuda_protocol::AgentKind;
+    if !remuda_driver::shell_pty::native_carrier_enabled() {
+        return None;
+    }
+    matches!(
+        kind,
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Grok | AgentKind::Agy
+    )
+    .then_some(kind)
 }
 
 /// The binary a hook re-enters as `remuda hook emit`.
@@ -486,6 +520,27 @@ impl Driver for NativeAdapter {
 
     fn startup_error(&self) -> Option<String> {
         self.startup_error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Ask the live driver what this session can do (§4.3, §6).
+    ///
+    /// A failure is not fatal and not a downgrade: the create-time snapshot
+    /// stays, which is the honest fallback — "we could not ask" must not be
+    /// written down as "it cannot".
+    fn capabilities(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Option<remuda_protocol::CapabilitySnapshot>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            match NativeDriver::capabilities(&*self.native).await {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::debug!(%error, "driver did not report capabilities; keeping the static row");
+                    None
+                }
+            }
+        })
     }
 
     fn wait_control(&self) -> DriverFuture<'_> {
@@ -874,6 +929,50 @@ fn with_max_budget(mut args: Vec<String>, budget: Option<&str>) -> Vec<String> {
     args
 }
 
+/// Pick the executable for a launch.
+///
+/// Order: the session's own `binaryPath` (which the Hub has already merged the
+/// host default into) beats the Node-wide `REMUDA_CLAUDE_BIN`, which beats a
+/// plain `PATH` lookup. Naming a path here only decides which file gets
+/// validated — `materialize` does the containment, mode, and pin checks, and
+/// refuses the launch rather than falling back if any of them fail.
+///
+/// `session_binary` is a *claude* override. A `generic-pty` launch of codex,
+/// grok, or agy ignores it: handing one CLI's binary to another driver's argv
+/// template would exec the wrong program with flags it never defined.
+fn resolve_binary_source(
+    driver: DriverKind,
+    kind: remuda_protocol::AgentKind,
+    session_binary: Option<&str>,
+    node_binary: Option<&Path>,
+) -> BinarySource {
+    let claude_override = || {
+        session_binary
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| node_binary.map(Path::to_path_buf))
+    };
+    if driver == DriverKind::GenericPty {
+        let name = preset_by_id(match kind {
+            remuda_protocol::AgentKind::Codex => "codex",
+            remuda_protocol::AgentKind::Grok => "grok",
+            remuda_protocol::AgentKind::Agy => "agy",
+            remuda_protocol::AgentKind::Generic => "gemini",
+            remuda_protocol::AgentKind::Claude => "claude",
+            remuda_protocol::AgentKind::Terminal => "sh",
+        })
+        .map(|preset| preset.binary)
+        .unwrap_or("claude");
+        if name != "claude" {
+            return BinarySource::Command(name.to_owned());
+        }
+    }
+    claude_override()
+        .map(BinarySource::Path)
+        .unwrap_or_else(|| BinarySource::Command("claude".to_owned()))
+}
+
 fn instance_spec(
     launch: &DriverLaunch,
     config: &NativeDriverConfig,
@@ -936,6 +1035,22 @@ fn instance_spec(
         kind: launch.request.kind,
         driver: launch.request.driver,
         binary_ref: object_id()?,
+        binary_path: launch
+            .request
+            .binary_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        binary_sha256: launch
+            .request
+            .binary_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| remuda_protocol::Digest::try_from(value.to_owned()))
+            .transpose()
+            .map_err(|error| DriverError::Failed(format!("binarySha256: {error}")))?,
         cwd: launch.workspace_root.to_string_lossy().into_owned(),
         worktree: None,
         provider_profile: ProfileRef {
@@ -1108,6 +1223,8 @@ mod tests {
                 driver: kind,
                 model: "haiku".to_owned(),
                 args: vec!["--max-budget-usd".to_owned(), "0.3".to_owned()],
+                binary_path: None,
+                binary_sha256: None,
                 provider_profile_id: "native".to_owned(),
                 permission_mode: "manual".to_owned(),
                 prompt: String::new(),
@@ -1216,6 +1333,68 @@ mod tests {
         assert!(error.to_string().contains("conflicts"));
     }
 
+    /// A spec `binaryPath` outranks the Node-wide `REMUDA_CLAUDE_BIN`.
+    ///
+    /// The env var is a machine-level default; naming a path on one session is
+    /// a deliberate per-session choice, so it has to win or the feature is
+    /// invisible on any Node that happens to set the env var.
+    #[test]
+    fn spec_binary_path_beats_the_node_wide_claude_bin() {
+        let env_bin = Path::new("/usr/local/bin/claude");
+        let session = "/opt/claude-2.2/bin/claude";
+
+        for driver in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ClaudeBg,
+        ] {
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, Some(session), Some(env_bin)),
+                BinarySource::Path(PathBuf::from(session)),
+                "{driver:?}"
+            );
+            // Without a session override the env var still applies.
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, None, Some(env_bin)),
+                BinarySource::Path(env_bin.to_path_buf()),
+                "{driver:?}"
+            );
+            // With neither, PATH resolution is unchanged.
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, None, None),
+                BinarySource::Command("claude".into()),
+                "{driver:?}"
+            );
+            // An empty string is not a choice.
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, Some("   "), Some(env_bin)),
+                BinarySource::Path(env_bin.to_path_buf()),
+                "{driver:?}"
+            );
+        }
+
+        // generic-pty hosting claude honours the override too.
+        assert_eq!(
+            resolve_binary_source(
+                DriverKind::GenericPty,
+                AgentKind::Claude,
+                Some(session),
+                None
+            ),
+            BinarySource::Path(PathBuf::from(session)),
+        );
+
+        // But a claude binary must never be handed to another CLI's template.
+        for kind in [AgentKind::Codex, AgentKind::Grok, AgentKind::Agy] {
+            let resolved =
+                resolve_binary_source(DriverKind::GenericPty, kind, Some(session), Some(env_bin));
+            assert!(
+                matches!(resolved, BinarySource::Command(ref name) if name != "claude"),
+                "{kind:?} must not exec the claude override: {resolved:?}"
+            );
+        }
+    }
+
     #[test]
     fn parse_delegation_prefers_explicit_field_then_profile_id() {
         let mut request = crate::CreateInstanceRequest {
@@ -1229,6 +1408,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "none".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),
@@ -1276,6 +1457,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "gateway".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),
@@ -1326,6 +1509,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "gateway".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),
@@ -1378,6 +1563,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "pvp_other".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),

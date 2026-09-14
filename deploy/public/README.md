@@ -1,11 +1,13 @@
 # Public VPS Hub package
 
-This is the retained public VPS variant of [D-020](../../docs/design/deploy-public.md).
-The current priority is the [intranet Hub runbook](../../docs/design/deploy-runbook.md).
-The public variant places Hub and Caddy on a public VPS, with Nodes dialing
-outbound WSS/HTTPS and phones reaching the Hub through HTTPS. The old intranet Hub + cloudflared
-package is not applicable. The commands below are for a human on a fresh
-Ubuntu 24.04 VPS; preparing this package does not deploy any service.
+公网暴露：待定；禁止隧道工具（D-031）。The only supported deployment path is the
+[intranet Hub runbook](../../docs/design/deploy-runbook.md).
+These historical [D-020](../../docs/design/deploy-public.md) public VPS assets
+remain validated by CI: Hub and Caddy on a public VPS, with Nodes dialing
+outbound WSS/HTTPS and phones reaching the Hub through HTTPS. The commands
+below are retained for reference and do not authorize a rollout. Workers must
+not execute scripts under `deploy/` or probe prohibited tools; see
+[D-031](../../docs/design/decisions.md).
 
 ## Build the image
 

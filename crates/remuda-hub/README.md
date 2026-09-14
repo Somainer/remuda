@@ -144,4 +144,4 @@ This crate maps:
 | no `ports:` | bind `0.0.0.0:8080` behind Caddy on `deploy_default` |
 | `remuda-migrate` | additive SQLite migrations (journal crate); Hub `open` is still idempotent `CREATE TABLE IF NOT EXISTS` |
 
-The Hub image is distroless and does not start Caddy, AsterGate, or cloudflared.
+The Hub image is distroless and does not start Caddy or AsterGate.

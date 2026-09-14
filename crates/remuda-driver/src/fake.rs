@@ -132,6 +132,7 @@ impl FakeDriver {
                 ],
                 settings_digest: None,
                 prohibited_options_checked: BoolLiteral,
+                binary_override: false,
                 approval_authority: ApprovalAuthority::Unknown,
             },
         })

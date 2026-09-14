@@ -116,12 +116,6 @@ if probe_host "$HUB_SSH"; then
   DATA=$(ssh_ro "$HUB_SSH" 'df -h /data00 2>/dev/null | tail -1 || df -h / | tail -1' | redact)
   check "hub disk" GO "$DATA"
 
-  if ssh_ro "$HUB_SSH" 'command -v cloudflared >/dev/null || command -v /usr/local/bin/cloudflared >/dev/null'; then
-    check "hub cloudflared bin" GO "binary present"
-  else
-    check "hub cloudflared bin" GO "not installed yet (token-based install is in README)"
-  fi
-
   EXISTING=$(ssh_ro "$HUB_SSH" 'docker ps -a --format "{{.Names}}" 2>/dev/null | grep -E "remuda" || true')
   if [[ -n "$EXISTING" ]]; then
     check "hub remuda containers" GO "already present (preflight will not start/stop): $EXISTING"

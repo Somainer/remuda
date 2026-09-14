@@ -133,6 +133,27 @@ pub fn restrict_permission(device: &Device, spec: &mut Value) -> Result<(), HubE
     Ok(())
 }
 
+/// Agent callers may not choose their own argv or executable.
+///
+/// The spec fields are operator-level: `args` picks flags that the allowlist
+/// would otherwise have to defend alone, and `binaryPath` picks the code that
+/// runs. An instance never inherits operator authority, so both are refused
+/// outright rather than sanitized. The Node refuses them again during
+/// materialization; this is the early, cheap half.
+pub fn restrict_launch_overrides(device: &Device, spec: &Value) -> Result<(), HubError> {
+    if origin(device) != InputOrigin::Agent {
+        return Ok(());
+    }
+    let has_args = spec["args"].as_array().is_some_and(|args| !args.is_empty());
+    let has_binary = spec["binaryPath"]
+        .as_str()
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_args || has_binary {
+        return Err(HubError::Forbidden);
+    }
+    Ok(())
+}
+
 pub async fn prepare_create(
     state: &AppState,
     headers: &HeaderMap,
@@ -144,6 +165,7 @@ pub async fn prepare_create(
     stamp(spec, device);
     spec["parentInstanceId"] = json!(device.instance_id);
     restrict_permission(device, spec)?;
+    restrict_launch_overrides(device, spec)?;
     if origin(device) == remuda_protocol::InputOrigin::Agent
         && (!same_host(state, device, host).await?
             || shell_driver(driver)

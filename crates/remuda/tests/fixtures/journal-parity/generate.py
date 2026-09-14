@@ -9,9 +9,15 @@ prove nothing about parity.
 
 Run from the repo root:
     python3 crates/remuda/tests/fixtures/journal-parity/generate.py
+
+`--out <dir>` writes elsewhere, which is how the drift test compares without
+rewriting the checked-in files: regenerating in place made every concurrent
+reader of those fixtures race a truncated write.
 """
 
+import argparse
 import json
+import os
 import pathlib
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -109,8 +115,8 @@ class Journal:
     def node(self, prefix, index):
         return f"obj_{self.side['journal'][4:-4]}{prefix}{index:03d}"
 
-    def dump(self, name, container):
-        path = HERE / name
+    def dump(self, name, container, out_dir=HERE):
+        path = out_dir / name
         if container == "hub":
             body = {
                 "instanceId": self.side["instance"],
@@ -125,7 +131,14 @@ class Journal:
                 "durableSeq": str(len(self.events)),
                 "observations": self.events,
             }
-        path.write_text(json.dumps(body, indent=2) + "\n")
+        # Write-then-rename. `write_text` truncates in place, so a reader
+        # that opens the file mid-write sees a partial document — which is
+        # exactly what happened when this ran alongside the tests that read
+        # these fixtures. Rename within a directory is atomic on POSIX, so a
+        # reader sees either the old file or the new one.
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(body, indent=2) + "\n")
+        tmp.replace(path)
         return path
 
 
@@ -423,13 +436,27 @@ def build_pty_missing_result():
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--out",
+        type=pathlib.Path,
+        default=HERE,
+        help="directory to write into; defaults to the fixture directory",
+    )
+    args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
     written = [
-        build_print().dump("print-3turn.json", "hub"),
-        build_pty().dump("pty-3turn.json", "jdump"),
-        build_pty_missing_result().dump("pty-3turn-missing-tool-result.json", "jdump"),
+        build_print().dump("print-3turn.json", "hub", args.out),
+        build_pty().dump("pty-3turn.json", "jdump", args.out),
+        build_pty_missing_result().dump(
+            "pty-3turn-missing-tool-result.json", "jdump", args.out
+        ),
     ]
     for path in written:
-        print(path.relative_to(HERE.parents[3]))
+        try:
+            print(path.relative_to(HERE.parents[3]))
+        except ValueError:
+            print(path)
 
 
 if __name__ == "__main__":

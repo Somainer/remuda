@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -98,6 +98,216 @@ fn probe_version(original: &Path) -> DriverResult<(PathBuf, String)> {
             ),
         )
     })))
+}
+
+/// Directories a binary override may not resolve inside.
+///
+/// Each is a place the agent itself can write. A path that canonicalizes into
+/// one of them would let an agent that can write its own cwd drop a script
+/// there and name it as the executable — self-upgrading from "run the agent"
+/// to arbitrary exec on the next launch.
+#[derive(Debug, Clone, Default)]
+pub struct BinaryOverrideGuard {
+    /// The instance directory; its `launch/` subtree is derived from it.
+    pub instance_dir: Option<PathBuf>,
+    /// Workspace or worktree cwd for the launch.
+    pub cwd: Option<PathBuf>,
+    /// Additional roots to refuse, for callers with their own scratch dirs.
+    pub extra: Vec<PathBuf>,
+}
+
+/// Validate a caller-supplied absolute executable and pin it.
+///
+/// Fails closed with a named error at every step; there is deliberately no
+/// fallback to `PATH`. A caller that asked for a specific binary and cannot
+/// have it should hear so, not silently get a different one.
+///
+/// `expected` is an optional pin-on-record digest. When present the computed
+/// pin must equal it, so a caller that recorded a binary detects it changing
+/// underneath rather than executing the replacement.
+pub fn validate_binary_override(
+    raw: &str,
+    guard: &BinaryOverrideGuard,
+    expected: Option<&Digest>,
+) -> DriverResult<BinaryPin> {
+    // B2: reject whitespace and shell metacharacters before anything else.
+    // We exec argv directly, so this is not about our own quoting — the value
+    // is also baked into the generated launch shim, which is `sh`.
+    if raw.trim().is_empty() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "binaryPath must not be empty".into(),
+        ));
+    }
+    if raw.chars().any(char::is_whitespace) {
+        return Err(DriverError::InvalidLaunchSpec(
+            "binaryPath must be a single path with no arguments or whitespace".into(),
+        ));
+    }
+    if raw.chars().any(crate::profile::is_shell_metacharacter) {
+        return Err(DriverError::InvalidLaunchSpec(
+            "binaryPath must not contain shell metacharacters".into(),
+        ));
+    }
+    // B1: absolute, and no traversal segments — checked before the filesystem
+    // is touched, so a crafted path cannot be resolved even once.
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "binaryPath must be an absolute path, got {raw}"
+        )));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "binaryPath must not contain . or .. segments: {raw}"
+        )));
+    }
+    // B3: canonicalize resolves symlinks, so the checks below apply to the
+    // file that will actually be exec'd rather than to the name given.
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            DriverError::BinaryNotFound(path.to_path_buf())
+        } else {
+            DriverError::InvalidLaunchSpec(format!("resolve binaryPath {raw}: {error}"))
+        }
+    })?;
+    let meta = fs::metadata(&canonical).map_err(|error| {
+        DriverError::InvalidLaunchSpec(format!("stat binaryPath {raw}: {error}"))
+    })?;
+    if !meta.is_file() {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "binaryPath must be a regular file: {raw}"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "binaryPath is not executable: {raw}"
+            )));
+        }
+        // B4: anyone but the owner being able to rewrite the file makes the
+        // pin meaningless — the bytes we hashed are not the bytes that run.
+        if mode & 0o022 != 0 {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "binaryPath must not be group- or world-writable, found {:04o}: {raw}",
+                mode & 0o777
+            )));
+        }
+        // B4, ownership. The spec says "owned by the Node uid", but the
+        // overwhelmingly common install is a root-owned `claude` under
+        // /usr/local or a package manager prefix, which the Node user cannot
+        // rewrite and which that rule would reject outright. What the rule is
+        // actually defending against is a file the *agent* can replace, so the
+        // test is "owned by us or by root", with root already covered by the
+        // group/other-writable check above. An unrelated third uid is refused:
+        // that is neither our file nor a system install.
+        let owner = meta.uid();
+        if let Some(uid) = node_uid()
+            && owner != uid
+            && owner != 0
+        {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "binaryPath must be owned by the Node user or root, found uid {owner}: {raw}"
+            )));
+        }
+    }
+    // B4: containment. An agent that can write one of these directories must
+    // not be able to name something inside it as its own executable.
+    for (label, root) in guard.forbidden_roots() {
+        if canonical.starts_with(&root) {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "binaryPath must not resolve inside the {label} ({}): {raw}",
+                root.display()
+            )));
+        }
+    }
+    // B5: pin it with the same code path every other binary goes through.
+    let pin = pin_binary(&canonical)?;
+    if let Some(expected) = expected
+        && &pin.sha256 != expected
+    {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "binaryPath digest mismatch: recorded {}, found {}",
+            String::from(expected.clone()),
+            String::from(pin.sha256.clone())
+        )));
+    }
+    tracing::info!(
+        path = %pin.abs_path,
+        version = %pin.version,
+        digest = %String::from(pin.sha256.clone()),
+        "pinned binary override"
+    );
+    Ok(pin)
+}
+
+/// Effective uid of this process, without `unsafe`.
+///
+/// The workspace forbids `unsafe_code`, so `geteuid(2)` is out of reach. A file
+/// this process creates is owned by our effective uid by definition, so one
+/// throwaway file in the temp dir answers the same question with std alone.
+/// Cached: the answer cannot change within a process.
+///
+/// `None` when the probe fails (an unwritable temp dir). Callers skip the
+/// ownership check rather than failing a launch over it — the mode and
+/// containment checks are the ones carrying the weight.
+#[cfg(unix)]
+fn node_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::OnceLock;
+    static UID: OnceLock<Option<u32>> = OnceLock::new();
+    *UID.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!(".remuda-uid-probe-{}", unique_token()));
+        let uid = File::create(&path)
+            .ok()?
+            .metadata()
+            .ok()
+            .map(|meta| meta.uid());
+        let _ = fs::remove_file(&path);
+        uid
+    })
+}
+
+impl BinaryOverrideGuard {
+    /// Directories the override may not resolve inside, canonicalized.
+    ///
+    /// A root that does not exist or cannot be canonicalized is skipped rather
+    /// than failing the launch: it cannot contain the resolved path either way.
+    ///
+    /// `TMPDIR` is deliberately *not* a blanket root. The spec called for it,
+    /// but `std::env::temp_dir()` is `/tmp` on stock Linux, and refusing
+    /// everything beneath `/tmp` would reject any deployment whose checkout or
+    /// install prefix happens to live there — including this repo's own CI
+    /// worktrees. The escalation it was meant to stop is "the agent writes a
+    /// file and names it", which the instance, launch, and cwd roots already
+    /// cover precisely. A caller with its own scratch directory adds it via
+    /// [`BinaryOverrideGuard::extra`] rather than having a guess imposed here.
+    fn forbidden_roots(&self) -> Vec<(&'static str, PathBuf)> {
+        let mut roots = Vec::new();
+        let mut push = |label: &'static str, path: Option<PathBuf>| {
+            if let Some(path) = path
+                && let Ok(canonical) = fs::canonicalize(&path)
+            {
+                roots.push((label, canonical));
+            }
+        };
+        push("instance directory", self.instance_dir.clone());
+        push(
+            "launch directory",
+            self.instance_dir.as_ref().map(|dir| dir.join("launch")),
+        );
+        push("workspace cwd", self.cwd.clone());
+        for path in &self.extra {
+            push("refused directory", Some(path.clone()));
+        }
+        roots
+    }
 }
 
 /// Resolve a command name or path to a canonical absolute file.

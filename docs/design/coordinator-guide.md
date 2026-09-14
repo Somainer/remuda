@@ -47,6 +47,12 @@ on a worker's build. `remuda merge --gate` enforces this for itself: it sets
 `<repo>/target-gate`, override `--target-dir`) rather than inheriting a
 worker's. Two coordinators gating at once each need their own.
 
+## Worker rules
+
+- **不得执行 deploy/ 下脚本或探测隧道工具（D-031）。** Do not install or run
+  tunnel tools. Public exposure is pending; intranet Caddy is the only supported
+  deployment path. See [D-031](./decisions.md) for the prohibited tools and rationale.
+
 ## Merge with gates
 
 Do not merge on the strength of a worker's report. `remuda merge <branch>
@@ -72,6 +78,7 @@ Order, with only `cargo-test` retrying (once):
 
 ```text
 ./scripts/ci/secret-scan.sh
+./scripts/ci/no-tunnel-scan.sh
 cargo fmt --all --check
 cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings

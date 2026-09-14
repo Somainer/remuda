@@ -1,6 +1,8 @@
 //! Coordinator merge: verify an immutable merge, then compare-and-swap main.
 
 mod generated_api;
+mod queue;
+mod reports;
 mod web_e2e;
 
 use std::fs;
@@ -18,23 +20,51 @@ use serde::{Deserialize, Serialize};
 #[command(about = "Verify a branch in a temporary worktree, then advance and push main.")]
 pub(crate) struct MergeArgs {
     /// Local branch to merge into main (the committed snapshot is pinned).
-    #[arg(required_unless_present = "list")]
+    #[arg(required_unless_present_any = ["list", "queue"])]
     pub branch: Option<String>,
     /// Run the gate before advancing main.
-    #[arg(long, required_unless_present_any = ["dry_run", "list"])]
+    #[arg(long, required_unless_present_any = ["dry_run", "list", "land"])]
     #[serde(default)]
     pub gate: bool,
     /// Show local wt/* branches ahead of main and their mergeability.
-    #[arg(long, visible_alias = "pending", conflicts_with_all = ["branch", "gate", "dry_run", "message", "web", "web_e2e", "no_push"])]
+    #[arg(long, visible_alias = "pending", conflicts_with_all = ["branch", "gate", "dry_run", "message", "web", "web_e2e", "no_push", "onto", "land", "queue"])]
     #[serde(default)]
     pub list: bool,
     /// Override the merge title; the gate summary is still appended to the body.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "queue")]
     pub message: Option<String>,
     /// Inspect local refs and print the plan; do not fetch, merge, or run checks.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["onto", "land", "queue"])]
     #[serde(default)]
     pub dry_run: bool,
+    /// Verify the branch merged onto an explicit base (a sha or `main`)
+    /// without advancing main; pair with --land to land the verified result.
+    #[arg(long, conflicts_with_all = ["dry_run", "list", "queue"])]
+    pub onto: Option<String>,
+    /// Fast-forward main to a report verified for exactly this (branch, --onto)
+    /// pair; fails without re-running the gate when main has moved.
+    #[arg(long, requires = "onto", conflicts_with_all = ["dry_run", "list", "queue"])]
+    #[serde(default)]
+    pub land: bool,
+    /// Verify the listed branches as an optimistic queue across --lanes lanes.
+    #[arg(long, num_args = 1.., value_name = "BRANCH", conflicts_with_all = ["dry_run", "list", "land", "onto", "message", "branch"])]
+    #[serde(default)]
+    pub queue: Vec<String>,
+    /// Verification lanes for --queue (each lane gets its own target directory).
+    #[arg(long, default_value_t = 2)]
+    #[serde(default = "default_lanes")]
+    pub lanes: usize,
+    /// Base port for per-lane Hub e2e pairs; lane N uses base+10*(N-1) and +9.
+    #[arg(long, default_value_t = 58980)]
+    #[serde(default = "default_e2e_port_base")]
+    pub e2e_port_base: u16,
+    /// Advisory lock serialising the shared-browser web e2e step across lanes.
+    #[arg(long)]
+    pub e2e_lock: Option<PathBuf>,
+    /// Internal: lane index used by --queue to derive ports (1-based; hidden).
+    #[arg(long, hide = true, default_value_t = 1)]
+    #[serde(default = "default_e2e_lane")]
+    pub e2e_lane: usize,
     /// Test changed crates and their reverse dependencies (default).
     #[arg(long, default_value_t = true, conflicts_with = "full")]
     #[serde(default = "default_affected")]
@@ -69,6 +99,18 @@ pub(crate) struct MergeArgs {
 
 fn default_affected() -> bool {
     true
+}
+
+fn default_lanes() -> usize {
+    2
+}
+
+fn default_e2e_port_base() -> u16 {
+    58980
+}
+
+fn default_e2e_lane() -> usize {
+    1
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,7 +150,7 @@ impl Step {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MergeReport {
     pub exit_code: i32,
@@ -119,6 +161,19 @@ pub(crate) struct MergeReport {
     expected_main: Option<String>,
     source: Option<String>,
     merged: Option<String>,
+    /// `--onto` base the merge was constructed and verified on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Pinned branch commit the verified merge incorporated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// Tree oid of the verified merge commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// Current main when a `--land` compare-and-swap found the base had moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_main: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     target_dir: Option<PathBuf>,
     gate_override: bool,
     web: bool,
@@ -128,6 +183,13 @@ pub(crate) struct MergeReport {
     conflicts: Vec<String>,
     steps: Vec<Step>,
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue: Option<queue::QueueSummary>,
+    // Internal bookkeeping for failure-path report persistence; never serialised.
+    #[serde(skip)]
+    repo_root: Option<PathBuf>,
+    #[serde(skip)]
+    reference: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +198,8 @@ enum MergeStop {
     Conflict(Vec<String>),
     #[error("main changed during verification; compare-and-swap lost")]
     CasLost,
+    #[error("main moved from {0} to {1} since verification; re-verify onto {1}")]
+    BaseMoved(String, String),
 }
 
 pub(crate) fn run(args: MergeArgs) -> Result<i32> {
@@ -185,6 +249,11 @@ pub(crate) fn run(args: MergeArgs) -> Result<i32> {
     let report = execute(args);
     if json {
         super::hub_client::print_json(&serde_json::to_value(&report)?)?;
+        if let Some(error) = &report.error {
+            eprintln!("{error}");
+        }
+    } else if let Some(summary) = &report.queue {
+        render_queue(&report, summary);
     } else {
         for step in &report.steps {
             println!(
@@ -218,47 +287,56 @@ pub(crate) fn run(args: MergeArgs) -> Result<i32> {
 
 /// Shared synchronous operation; MCP runs this on a blocking worker.
 pub(crate) fn execute(args: MergeArgs) -> MergeReport {
-    let mut report = MergeReport {
-        exit_code: 1,
-        status: "gate_failed".into(),
-        branch: args.branch.clone().unwrap_or_default(),
-        dry_run: args.dry_run,
-        affected: args.affected && !args.full,
-        expected_main: None,
-        source: None,
-        merged: None,
-        target_dir: None,
-        gate_override: std::env::var_os("REMUDA_MERGE_GATE_COMMAND")
-            .is_some_and(|value| !value.is_empty()),
-        web: args.web,
-        web_e2e: args.web_e2e,
-        main_updated: false,
-        pushed: false,
-        conflicts: Vec::new(),
-        steps: Vec::new(),
-        error: None,
-    };
+    if !args.queue.is_empty() {
+        return queue::run_queue(args);
+    }
+    let mut report = new_report(args.branch.as_deref().unwrap_or_default(), &args);
     let mut temporary = None;
-    let result = execute_inner(&args, &mut report, &mut temporary);
-    match result {
-        Ok(()) => {
-            report.exit_code = 0;
-            report.status = if args.dry_run { "dry_run" } else { "ok" }.into();
-        }
-        Err(error) => {
-            match error.downcast_ref::<MergeStop>() {
-                Some(MergeStop::Conflict(files)) => {
-                    report.exit_code = 2;
-                    report.status = "conflict".into();
-                    report.conflicts = files.clone();
-                }
-                Some(MergeStop::CasLost) => {
-                    report.exit_code = 3;
-                    report.status = "cas_lost".into();
-                }
-                None => {}
+    // 1. Verify (construct merge, run gate). Land-only skips this.
+    let verified = if args.land && !args.gate {
+        Ok(())
+    } else {
+        execute_inner(&args, &mut report, &mut temporary)
+    };
+    if let Err(error) = verified {
+        apply_stop(&mut report, error);
+    } else {
+        report.exit_code = 0;
+        if report.status == "gate_failed" {
+            report.status = if args.dry_run {
+                "dry_run"
+            } else if args.onto.is_some() && !args.land {
+                "verified"
+            } else {
+                "ok"
             }
-            report.error = Some(format!("{error:#}"));
+            .into();
+        }
+        // 2. Persist the passing verification so --land can consume it.
+        if args.onto.is_some() {
+            persist_report(&args, &report);
+        }
+        // 3. Verify-then-land, or land-only, publishes main immediately.
+        if args.land
+            && let Err(error) = execute_land(&args, &mut report)
+        {
+            apply_stop(&mut report, error);
+        }
+    }
+    // A failed gate leaves a persisted report too, naming the merge and base
+    // that failed, for inspection and for the queue to read the verdict. The
+    // merge never lands, so drop its reachability pin.
+    if args.onto.is_some() && report.exit_code != 0 {
+        persist_report(&args, &report);
+        if let (Some(repo), Some(reference), Some(base)) = (
+            report.repo_root.as_ref(),
+            report.reference.as_ref(),
+            report.base.as_ref(),
+        ) {
+            let _ = git(
+                repo,
+                &["update-ref", "-d", &reports::verified_ref(reference, base)],
+            );
         }
     }
     if let Some(mut temporary) = temporary
@@ -274,6 +352,113 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
         ));
     }
     report
+}
+
+fn apply_stop(report: &mut MergeReport, error: anyhow::Error) {
+    match error.downcast_ref::<MergeStop>() {
+        Some(MergeStop::Conflict(files)) => {
+            report.exit_code = 2;
+            report.status = "conflict".into();
+            report.conflicts = files.clone();
+        }
+        Some(MergeStop::CasLost) => {
+            report.exit_code = 3;
+            report.status = "cas_lost".into();
+        }
+        Some(MergeStop::BaseMoved(_, current)) => {
+            report.exit_code = 2;
+            report.status = "base_moved".into();
+            report.current_main = Some(current.clone());
+        }
+        None => {
+            report.exit_code = 1;
+            report.status = "gate_failed".into();
+        }
+    }
+    report.error = Some(format!("{error:#}"));
+}
+
+fn persist_report(args: &MergeArgs, report: &MergeReport) {
+    if !args.gate && args.land {
+        return; // land-only consumes a report; it never rewrites it
+    }
+    let (Some(repo), Some(reference)) = (report.repo_root.clone(), report.reference.clone()) else {
+        return;
+    };
+    if let Err(error) = reports::save(&repo, &reference, report) {
+        eprintln!("merge: could not persist verification report: {error:#}");
+    }
+}
+
+fn render_queue(report: &MergeReport, summary: &queue::QueueSummary) {
+    println!(
+        "queue: {} ({} lane{})",
+        report.status,
+        summary.lanes,
+        if summary.lanes == 1 { "" } else { "s" }
+    );
+    for outcome in &summary.branches {
+        println!(
+            "{}. {}: {}",
+            outcome.order + 1,
+            outcome.branch,
+            outcome.status
+        );
+        for verification in &outcome.verifications {
+            println!(
+                "   lane {} verified on {}{}: {} (reused={})",
+                verification.lane,
+                verification.base,
+                if verification.speculative {
+                    " (speculative)"
+                } else {
+                    ""
+                },
+                verification.status,
+                verification.reused,
+            );
+        }
+        if let Some(sha) = &outcome.landed_sha {
+            println!("   landed: {sha}");
+        }
+        println!("   {}", outcome.why);
+    }
+    if let Some(after) = &summary.main_after {
+        println!("main: {} -> {after}", summary.main_before);
+    }
+    if let Some(error) = &report.error {
+        eprintln!("{error}");
+    }
+}
+
+fn new_report(branch: &str, args: &MergeArgs) -> MergeReport {
+    MergeReport {
+        exit_code: 1,
+        status: "gate_failed".into(),
+        branch: branch.into(),
+        dry_run: args.dry_run,
+        affected: args.affected && !args.full,
+        expected_main: None,
+        source: None,
+        merged: None,
+        base: None,
+        head: None,
+        tree: None,
+        current_main: None,
+        target_dir: None,
+        gate_override: std::env::var_os("REMUDA_MERGE_GATE_COMMAND")
+            .is_some_and(|value| !value.is_empty()),
+        web: args.web,
+        web_e2e: args.web_e2e,
+        main_updated: false,
+        pushed: false,
+        conflicts: Vec::new(),
+        steps: Vec::new(),
+        error: None,
+        queue: None,
+        repo_root: None,
+        reference: None,
+    }
 }
 
 fn execute_inner(
@@ -295,34 +480,47 @@ fn execute_inner(
         git(&repo, &["check-ref-format", &reference])?;
         Ok((repo, reference))
     })?;
+    report.repo_root = Some(repo.clone());
+    report.reference = Some(reference.clone());
+    let verify_onto = args.onto.is_some();
     let target = args
         .target_dir
         .as_ref()
         .map(|path| repo.join(path))
         .unwrap_or_else(|| repo.join("target-gate"));
     report.target_dir = Some(target.clone());
+    // `--onto` names an explicit local base; the caller controls freshness and
+    // concurrent lanes must not race `git fetch` locks.
     if args.dry_run {
         report.steps.push(Step::planned("fetch"));
-    } else {
+    } else if !verify_onto {
         record(report, "fetch", || git(&repo, &["fetch", "origin"]))?;
     }
     let (expected, source) = record(report, "preflight", || {
-        let expected = resolve(&repo, "refs/heads/main")?;
-        ensure!(
-            is_ancestor(&repo, &expected, &resolve(&repo, "HEAD")?)?,
-            "checkout is behind main; update the coordinator checkout before merging"
-        );
-        if let Ok(remote) = resolve(&repo, "refs/remotes/origin/main") {
+        let expected = if let Some(onto) = args.onto.as_deref() {
+            resolve_onto(&repo, onto)?
+        } else {
+            resolve(&repo, "refs/heads/main")?
+        };
+        if !verify_onto {
             ensure!(
-                is_ancestor(&repo, &remote, &expected)?,
-                "local main is behind or diverged from origin/main; refresh the coordinator checkout before merging"
+                is_ancestor(&repo, &expected, &resolve(&repo, "HEAD")?)?,
+                "checkout is behind main; update the coordinator checkout before merging"
             );
+            if let Ok(remote) = resolve(&repo, "refs/remotes/origin/main") {
+                ensure!(
+                    is_ancestor(&repo, &remote, &expected)?,
+                    "local main is behind or diverged from origin/main; refresh the coordinator checkout before merging"
+                );
+            }
         }
         check_branch_worktrees(&repo, &reference)?;
         Ok((expected, resolve(&repo, &reference)?))
     })?;
     report.expected_main = Some(expected.clone());
+    report.base = Some(expected.clone());
     report.source = Some(source.clone());
+    report.head = Some(source.clone());
 
     if args.dry_run {
         let diff = git_output(
@@ -407,6 +605,23 @@ fn execute_inner(
         resolve(&worktree, "HEAD")
     })?;
     report.merged = Some(merged.clone());
+    report.tree = Some(git(&worktree, &["rev-parse", "HEAD^{tree}"])?);
+    if verify_onto {
+        // Keep the constructed merge reachable after the worktree goes away
+        // and publish the preparing sidecar for speculative queue lanes.
+        record(report, "pin-merge", || {
+            git(
+                &repo,
+                &[
+                    "update-ref",
+                    &reports::verified_ref(&reference, &expected),
+                    &merged,
+                ],
+            )?;
+            reports::write_preparing(&repo, &reference, &expected, &merged, &source)
+                .context("publish preparing report")
+        })?;
+    }
     let diff = git_output(
         &worktree,
         &["diff", "--name-only", "-z", &expected, &merged, "--"],
@@ -416,7 +631,7 @@ fn execute_inner(
     report.web_e2e |= web_e2e::changed(&diff.stdout);
     report.web |= report.web_e2e;
     let report_file = worktree.with_file_name("gate.jsonl");
-    run_gate(report, &worktree, &target, &report_file)?;
+    run_gate(report, &worktree, &target, &report_file, args)?;
     record(report, "verify-tree", || {
         ensure!(
             resolve(&worktree, "HEAD")? == merged,
@@ -431,21 +646,50 @@ fn execute_inner(
     })?;
     if merged != expected {
         let summary = gate_summary(report);
-        merged = record(report, "record-gate", || {
-            let tree = git(&worktree, &["rev-parse", "HEAD^{tree}"])?;
-            git(
-                &worktree,
-                &[
-                    "commit", "--amend", "--only", "-m", &message, "-m", &summary,
-                ],
-            )?;
-            ensure!(
-                git(&worktree, &["rev-parse", "HEAD^{tree}"])? == tree,
-                "recording gate summary changed the verified tree"
-            );
-            resolve(&worktree, "HEAD")
-        })?;
-        report.merged = Some(merged.clone());
+        if verify_onto {
+            // The merge sha is the identity a queue lane speculates onto, so
+            // it must not change after the gate. Attach the gate summary as a
+            // git note (refs/notes/remuda-gate) instead of amending.
+            record(report, "record-gate", || {
+                let note_args = [
+                    "notes",
+                    "--ref=remuda-gate",
+                    "add",
+                    "--force",
+                    "-m",
+                    summary.as_str(),
+                    merged.as_str(),
+                ];
+                git(&worktree, &note_args)?;
+                ensure!(
+                    resolve(&worktree, "HEAD")? == merged,
+                    "recording the gate note ref changed HEAD"
+                );
+                Ok(())
+            })?;
+        } else {
+            merged = record(report, "record-gate", || {
+                let tree = git(&worktree, &["rev-parse", "HEAD^{tree}"])?;
+                git(
+                    &worktree,
+                    &[
+                        "commit", "--amend", "--only", "-m", &message, "-m", &summary,
+                    ],
+                )?;
+                ensure!(
+                    git(&worktree, &["rev-parse", "HEAD^{tree}"])? == tree,
+                    "recording gate summary changed the verified tree"
+                );
+                resolve(&worktree, "HEAD")
+            })?;
+            report.merged = Some(merged.clone());
+            report.tree = Some(git(&worktree, &["rev-parse", "HEAD^{tree}"])?);
+        }
+    }
+    if verify_onto {
+        // Verification only: the report (persisted by execute) is the claim.
+        // Advancing main is a separate `--land` compare-and-swap.
+        return Ok(());
     }
     record(report, "update-main", || {
         let output = git_output(
@@ -482,6 +726,121 @@ fn branch_ref(branch: &str) -> Result<String> {
     );
     ensure!(name != "main", "source branch must differ from main");
     Ok(format!("refs/heads/{name}"))
+}
+
+/// Resolve `--onto`: the literal `main`, or a local commit/sha.
+fn resolve_onto(repo: &Path, onto: &str) -> Result<String> {
+    let reference = if onto == "main" {
+        "refs/heads/main"
+    } else {
+        onto
+    };
+    resolve(repo, &format!("{reference}^{{commit}}"))
+}
+
+/// Lane target directories keep parallel builds out of one Cargo lock.
+/// Lane 1 keeps the historical `<target-dir>` / `target-gate` path.
+pub(crate) fn lane_target_dir(repo: &Path, target_dir: Option<&Path>, lane: usize) -> PathBuf {
+    let target = target_dir
+        .map(|path| repo.join(path))
+        .unwrap_or_else(|| repo.join("target-gate"));
+    if lane <= 1 {
+        target
+    } else {
+        let mut name = target
+            .file_name()
+            .map(|name| name.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("target-gate"));
+        name.push(format!("-lane{lane}"));
+        target.with_file_name(name)
+    }
+}
+
+/// `--land`: publish a previously verified merge without touching the gate.
+fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
+    let (repo, reference) = record(report, "repository", || {
+        let cwd = args.repo.clone().unwrap_or(std::env::current_dir()?);
+        let repo = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
+        let reference = branch_ref(args.branch.as_deref().context("branch is required")?)?;
+        git(&repo, &["check-ref-format", &reference])?;
+        Ok((repo, reference))
+    })?;
+    report.repo_root = Some(repo.clone());
+    report.reference = Some(reference.clone());
+    let onto = args.onto.as_deref().context("--land requires --onto")?;
+    let (base, verified) = record(report, "preflight", || {
+        let base = resolve_onto(&repo, onto)?;
+        let verified = reports::load(&repo, &reference, &base)?;
+        ensure!(
+            verified.exit_code == 0 && verified.merged.is_some(),
+            "verification report for {} on {base} is not a passing gate",
+            reference.trim_start_matches("refs/heads/")
+        );
+        let merged = verified.merged.as_deref().unwrap_or_default();
+        let head = verified.head.as_deref().context("report has no head")?;
+        // The branch snapshot must be exactly the one that was verified.
+        let current_head = resolve(&repo, &reference)?;
+        ensure!(
+            head == current_head,
+            "branch moved since verification ({head} -> {current_head}); re-verify before landing"
+        );
+        // The merge commit and its parentage must still be present locally.
+        git(&repo, &["cat-file", "-e", &format!("{merged}^{{commit}}")])?;
+        let first = git(&repo, &["rev-parse", &format!("{merged}^1")])?;
+        let second = git(&repo, &["rev-parse", &format!("{merged}^2")])?;
+        ensure!(first == base, "verified merge is not based on {base}");
+        ensure!(
+            second == head,
+            "verified merge does not contain the pinned branch head"
+        );
+        Ok((base, verified))
+    })?;
+    report.base = Some(base.clone());
+    report.head = verified.head.clone();
+    report.tree = verified.tree.clone();
+    report.source = verified.head.clone();
+    report.expected_main = Some(base.clone());
+    let merged = verified.merged.clone().unwrap_or_default();
+    report.merged = Some(merged.clone());
+    report.affected = verified.affected;
+    report.web = verified.web;
+    report.web_e2e = verified.web_e2e;
+    record(report, "land", || {
+        let current = resolve(&repo, "refs/heads/main")?;
+        if current != base {
+            return Err(MergeStop::BaseMoved(base.clone(), current).into());
+        }
+        let output = git_output(&repo, &["update-ref", "refs/heads/main", &merged, &base])?;
+        if !output.status.success() {
+            let now = resolve(&repo, "refs/heads/main")?;
+            if now != base {
+                return Err(MergeStop::BaseMoved(base.clone(), now).into());
+            }
+            successful(&output)?;
+        }
+        Ok(())
+    })?;
+    report.main_updated = true;
+    report.status = "landed".into();
+    // The merge is main now and reachable on its own; drop the pin.
+    let _ = git(
+        &repo,
+        &[
+            "update-ref",
+            "-d",
+            &reports::verified_ref(&reference, &base),
+        ],
+    );
+    if !args.no_push {
+        record(report, "push", || {
+            git(
+                &repo,
+                &["push", "origin", &format!("{merged}:refs/heads/main")],
+            )
+        })?;
+        report.pushed = true;
+    }
+    Ok(())
 }
 
 fn gate_summary(report: &MergeReport) -> String {
@@ -640,6 +999,7 @@ fn run_gate(
     merged_worktree: &Path,
     target: &Path,
     report_file: &Path,
+    args: &MergeArgs,
 ) -> Result<()> {
     let planned = gate_plan(
         merged_worktree,
@@ -647,20 +1007,32 @@ fn run_gate(
         test_range(report),
         report.web_e2e,
     )?;
-    let status = gate_command(
+    let mut command = gate_command(
         merged_worktree,
         report.web,
         test_range(report),
         report.web_e2e,
-    )
-    .arg("--report")
-    .arg(report_file)
-    .env("CARGO_TARGET_DIR", target)
-    .env("CARGO_INCREMENTAL", "0")
-    .stdout(Stdio::from(std::io::stderr()))
-    .stderr(Stdio::inherit())
-    .status()
-    .context("run gate")?;
+    );
+    command
+        .arg("--report")
+        .arg(report_file)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_INCREMENTAL", "0");
+    // Per-lane Hub ports: lane 1 keeps --e2e-port-base, lane N shifts by 10.
+    let shift = 10u16 * u16::try_from(args.e2e_lane.saturating_sub(1)).unwrap_or(0);
+    let hub_port = args.e2e_port_base.saturating_add(shift);
+    let web_port = hub_port.saturating_add(9);
+    command
+        .env("HUB_E2E_LISTEN", format!("127.0.0.1:{hub_port}"))
+        .env("HUB_E2E_WEB_PORT", web_port.to_string());
+    if let Some(lock) = &args.e2e_lock {
+        command.env("REMUDA_E2E_LOCK", lock);
+    }
+    let status = command
+        .stdout(Stdio::from(std::io::stderr()))
+        .stderr(Stdio::inherit())
+        .status()
+        .context("run gate")?;
     let results = fs::read_to_string(report_file).context("read gate report")?;
     let steps: Vec<Step> = results
         .lines()

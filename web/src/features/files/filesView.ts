@@ -5,7 +5,7 @@
 //! component renders. The six §3.6 availability states are kept distinct —
 //! nothing collapses into a generic "加载失败".
 
-import type { HubHttpError } from "../httpError";
+import type { HubHttpError } from "../../lib/httpError";
 import type {
   Digest,
   ScmDiff,

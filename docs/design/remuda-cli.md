@@ -155,10 +155,70 @@ an existing main commit. Step commands, machine paths and credential values are
 not copied into the commit message.
 
 Merge JSON still includes per-step statuses/timings and whether main was updated
-or pushed. Exit codes remain 0 success, 1 gate/preflight/push failure, 2 merge
-conflict, and 3 lost main compare-and-swap. Temporary worktrees are removed on
+or pushed. Exit codes are 0 success, 1 gate/preflight/push failure, 2 merge
+conflict (and `base_moved` for `--land`/`--queue`), and 3 lost main
+compare-and-swap for the legacy verify-and-advance flow. Temporary worktrees are removed on
 success and failure. A push failure can occur after a successful local CAS;
 inspect `mainUpdated` before retrying. `--no-push` skips only the push.
+
+## Optimistic verification: `--onto`, `--land`, and `--queue`
+
+`--onto <ref>` verifies a branch merged onto an explicit base — `main` or a
+commit sha — without touching `main`. The merge is constructed in the
+temporary worktree, the gate runs on that exact merged tree, and the JSON
+report records `base`, `head` (pinned branch commit), `tree` (the verified
+tree oid) and `merged`. With `--no-push` (the queue's mode) `--onto` never
+advances local main; add `--land` to advance main in the same invocation.
+The merge commit's sha is stable across the gate (the gate summary is
+attached as a `refs/notes/remuda-gate` note instead of amending), so a queue
+lane can speculate onto it.
+
+Verification reports persist under the repository's common git directory:
+
+```
+<git-common-dir>/remuda/merge-reports/<branch-slug>/<base>.json
+```
+
+`wt/a/b` slugs to `wt-a-b`. A `<base>.preparing.json` sidecar appears the
+moment the merge commit is constructed (pinned at
+`refs/remuda/merge/<slug>/<base>`), before the gate finishes, which is what a
+speculating lane waits on.
+
+`remuda merge <branch> --land --onto <ref>` fast-forwards main to a merge
+that was verified for **exactly** this `(branch, base)` pair. It never
+re-runs the gate: it loads the persisted report, checks the branch head and
+the merge's two parents still match, and advances main only when
+`main == base`. If main moved meanwhile it exits **2** with status
+`base_moved`, `currentMain` in the JSON (and printed to stderr), so the
+caller re-verifies onto the new main. Reports produced by `--gate` without
+`--onto` keep the historical verify-and-advance flow (the commit is amended
+with the gate summary body); `--land` requires `--onto`.
+
+`--queue <branch>...` verifies N branches as an optimistic queue. Lane 1
+verifies branch 1 onto main; lane 2 speculatively verifies branch 2 onto
+branch 1's not-yet-landed merge commit. When branch 1 lands, branch 2 lands
+directly if its base *is* the new main; otherwise (branch 1 failed, or a
+third party moved main) it is re-verified onto the real main. Each lane gets
+its own target directory (`<target-dir>-lane<N>`, lane 1 unchanged) and a
+derived Hub e2e port pair: `--e2e-port-base` (default 58980) and
+`+10*(lane-1)` / that `+9`, so lanes are 58980/58989, 58990/58999, …
+sharing one Playwright browser endpoint. The web e2e step is serialised
+across lanes with an advisory `flock(1)` on `--e2e-lock`
+(default `<git-common-dir>/remuda/e2e.lock`); all Cargo steps run fully
+parallel. Concurrency defaults to 2 lanes (`--lanes N`).
+
+Queue JSON is the normal merge report plus a `queue` summary: queue order,
+for every branch every verification (lane, base, merge, tree, status,
+`speculative`, `reused`), the landed sha, and a human `why`. Exit codes:
+**0** every branch landed, **1** at least one gate failure (landed branches
+stay landed), **2** an unresolved base move (main kept moving past the
+re-verification budget; `currentMain` names it).
+
+```sh
+remuda merge wt/worker/task --gate --onto main --no-push --json   # verify only
+remuda merge wt/worker/task --land --onto <base-sha> --no-push --json
+remuda merge --queue wt/a wt/b --gate --no-push --json --lanes 2
+```
 
 ## MCP tools
 
@@ -166,7 +226,7 @@ inspect `mainUpdated` before retrying. `--no-push` skips only the push.
 | --- | --- | --- |
 | `remuda_doctor` | Optional `host` or `local`, optional local `dataDir` | Same structured diagnostic report; blockers set `isError: true` |
 | `remuda_worktree_rm` | Required `name` (name or explicit path), optional `repo`, boolean `force` | Removal result including retained branch; same protections as CLI |
-| `remuda_merge` | Required `branch`, `gate: true` or `dryRun: true`; optional `web`, `noPush`, `repo`, `targetDir`, `message`, `affected`, `full` | Same merge report and exit semantics |
+| `remuda_merge` | Required `branch` (or `queue`), `gate: true` or `dryRun: true`; optional `onto`, `land`, `queue`, `lanes`, `web`, `noPush`, `repo`, `targetDir`, `message`, `affected`, `full` | Same merge report and exit semantics (`base_moved` is exit 2) |
 
 Example tool arguments:
 

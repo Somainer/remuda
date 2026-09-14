@@ -1,13 +1,16 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { Sheet } from "../../components/Sheet";
 import { StateDot } from "../../components/StateDot";
+import { useWorkbenchViewport } from "../../lib/viewport";
 import { hubStore } from "../../lib/store";
 import { projectStatus } from "../../lib/status";
 import { newSessionPath, spaceSessions, spaceStore, type Space, type SpacePrefs } from "./store";
 import type { Instance } from "../../types/instance";
 import { LaunchedByMark } from "../session/LaunchedBy";
-import { ActionSheet } from "./ActionSheet";
+import { QuickFind, QuickFindTrigger } from "../search/QuickFind";
 import css from "./spaces.module.css";
+import qfCss from "../search/quickfind.module.css";
 
 export function HarnessGlyph({ kind }: { kind: string }) {
   return <span className={css.glyph} title={kind} aria-label={kind}>{({ claude: "✳", codex: "⌘", grok: "𝕏", agy: "A", terminal: ">_" } as Record<string, string>)[kind] ?? "◇"}</span>;
@@ -25,6 +28,7 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
   onNavigate?: () => void; collapsed?: boolean; drawer?: boolean;
 }) {
   const [renaming, setRenaming] = useState<string>();
+  const { mobile } = useWorkbenchViewport();
   // Ids, not the row itself: a session that resumes while the sheet is open
   // must be offered 停止并删除 rather than the exited-only action.
   const [deleting, setDeleting] = useState<{ spaceId: string; instanceId: string }>();
@@ -61,6 +65,9 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
       {!collapsed ? <span>Spaces <span className={css.muted}>/ Sessions</span></span> : null}
       {!drawer ? <button type="button" className={css.tool} data-testid="panel-toggle" aria-label={collapsed ? "展开空间面板" : "折叠空间面板"} title="⌘/Ctrl+B" aria-expanded={!collapsed} onClick={() => spaceStore.setCollapsed(!collapsed)}>{collapsed ? "»" : "«"}</button> : null}
     </header>
+    <div className={qfCss.panelSearch} data-collapsed={collapsed}>
+      <QuickFindTrigger collapsed={collapsed} />
+    </div>
     <div className={css.groups}>
       {spaces.map((space, index) => {
         const { live, exited } = spaceSessions(space);
@@ -109,13 +116,34 @@ export function SpacesPanel({ spaces, active, prefs, instanceId, onSelect, onNav
       {!spaces.length ? <p className={css.empty}>{collapsed ? "—" : "注册工作区后在这里切换项目"}</p> : null}
     </div>
     {!collapsed ? <footer className={css.panelFoot}>活跃 / 待处理 <span>⌘/Ctrl+[ ] 切换</span></footer> : null}
-    {deleting && target ? <ActionSheet testId="delete-session-sheet" title="删除会话及其记录？"
-      detail={projectStatus(target) === "exited"
-        ? `「${hubStore.titleOf(target.id)}」的记录将被删除，无法恢复。`
-        : `「${hubStore.titleOf(target.id)}」仍在运行，删除前会先停止它。记录将被删除，无法恢复。`}
-      busy={busy} onClose={() => { if (!busy) setDeleting(undefined); }}
-      actions={projectStatus(target) === "exited"
-        ? [{ id: "delete-session-confirm", label: "删除", tone: "danger", onSelect: () => void remove(target, false) }]
-        : [{ id: "delete-session-stop", label: "停止并删除", tone: "danger", onSelect: () => void remove(target, true) }]} /> : null}
+    {/*
+      The cross-space finder is always mounted (even collapsed): its global
+      ⌘/Ctrl+K listener has to work from a session page next to an attached
+      terminal, and the keyboard-scope guard keeps it out of the PTY bytes.
+      On a phone the panel lives in the Spaces drawer, which is the same entry.
+    */}
+    <QuickFind onNavigate={onNavigate} inline={drawer} />
+    <Sheet
+      open={Boolean(deleting && target)}
+      onClose={() => { if (!busy) setDeleting(undefined); }}
+      variant={mobile ? "sheet" : "popover"}
+      labelledBy="delete-session-title"
+      testId="delete-session-sheet"
+      className={qfCss.confirmSheet}
+    >
+      <p className={qfCss.confirmTitle} id="delete-session-title">删除会话及其记录？</p>
+      <p className={qfCss.confirmDetail}>{target && projectStatus(target) === "exited"
+        ? `「${target ? hubStore.titleOf(target.id) : ""}」的记录将被删除，无法恢复。`
+        : `「${target ? hubStore.titleOf(target.id) : ""}」仍在运行，删除前会先停止它。记录将被删除，无法恢复。`}</p>
+      <div className={qfCss.confirmActions}>
+        {target && projectStatus(target) === "exited"
+          ? <button type="button" className={`${qfCss.confirmButton} ${qfCss.confirmDanger}`} data-testid="delete-session-confirm" disabled={busy}
+            onClick={() => void remove(target, false)}>删除</button>
+          : <button type="button" className={`${qfCss.confirmButton} ${qfCss.confirmDanger}`} data-testid="delete-session-stop" disabled={busy}
+            onClick={() => target && void remove(target, true)}>停止并删除</button>}
+        <button type="button" className={qfCss.confirmButton} data-testid="delete-session-sheet-cancel" disabled={busy}
+          onClick={() => setDeleting(undefined)}>取消</button>
+      </div>
+    </Sheet>
   </section>;
 }

@@ -78,6 +78,16 @@ pub struct CreateInstanceRequest {
     /// Extra allowlisted native CLI arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Host-absolute executable override; validated and pinned on this Node.
+    ///
+    /// Wins over `REMUDA_CLAUDE_BIN` and the host default. Absent restores the
+    /// previous resolution order, so a request that does not ask for a specific
+    /// binary behaves exactly as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Expected digest of [`Self::binary_path`]; a mismatch refuses the launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
     /// Provider profile label used to construct the native launch profile.
     #[serde(default = "default_profile")]
     pub provider_profile_id: String,
@@ -160,6 +170,22 @@ impl CreateInstanceRequest {
         }
         if self.max_budget_usd.is_none() {
             self.max_budget_usd = stringish(spec.get("maxBudgetUsd"));
+        }
+        if self.binary_path.is_none() {
+            self.binary_path = spec
+                .get("binaryPath")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+        if self.binary_sha256.is_none() {
+            self.binary_sha256 = spec
+                .get("binarySha256")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
         }
         if self.provider_overlay.is_none() {
             self.provider_overlay = spec.get("providerOverlay").cloned();

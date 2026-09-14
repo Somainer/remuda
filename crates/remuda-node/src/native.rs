@@ -259,35 +259,12 @@ impl DriverFactory for NativeClaudeFactory {
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
         }
         let spec = instance_spec(&launch, &self.config, &profile)?;
-        let binary = match self.kind {
-            DriverKind::GenericPty => {
-                let name = preset_by_id(match launch.request.kind {
-                    remuda_protocol::AgentKind::Codex => "codex",
-                    remuda_protocol::AgentKind::Grok => "grok",
-                    remuda_protocol::AgentKind::Agy => "agy",
-                    remuda_protocol::AgentKind::Generic => "gemini",
-                    remuda_protocol::AgentKind::Claude => "claude",
-                    remuda_protocol::AgentKind::Terminal => "sh",
-                })
-                .map(|preset| preset.binary)
-                .unwrap_or("claude");
-                if name == "claude" {
-                    self.config
-                        .claude_binary
-                        .clone()
-                        .map(BinarySource::Path)
-                        .unwrap_or_else(|| BinarySource::Command(name.to_owned()))
-                } else {
-                    BinarySource::Command(name.to_owned())
-                }
-            }
-            _ => self
-                .config
-                .claude_binary
-                .clone()
-                .map(BinarySource::Path)
-                .unwrap_or_else(|| BinarySource::Command("claude".to_owned())),
-        };
+        let binary = resolve_binary_source(
+            self.kind,
+            launch.request.kind,
+            spec.binary_path.as_deref(),
+            self.config.claude_binary.as_deref(),
+        );
         let native: Arc<dyn NativeDriver> = match self.kind {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
@@ -952,6 +929,50 @@ fn with_max_budget(mut args: Vec<String>, budget: Option<&str>) -> Vec<String> {
     args
 }
 
+/// Pick the executable for a launch.
+///
+/// Order: the session's own `binaryPath` (which the Hub has already merged the
+/// host default into) beats the Node-wide `REMUDA_CLAUDE_BIN`, which beats a
+/// plain `PATH` lookup. Naming a path here only decides which file gets
+/// validated — `materialize` does the containment, mode, and pin checks, and
+/// refuses the launch rather than falling back if any of them fail.
+///
+/// `session_binary` is a *claude* override. A `generic-pty` launch of codex,
+/// grok, or agy ignores it: handing one CLI's binary to another driver's argv
+/// template would exec the wrong program with flags it never defined.
+fn resolve_binary_source(
+    driver: DriverKind,
+    kind: remuda_protocol::AgentKind,
+    session_binary: Option<&str>,
+    node_binary: Option<&Path>,
+) -> BinarySource {
+    let claude_override = || {
+        session_binary
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| node_binary.map(Path::to_path_buf))
+    };
+    if driver == DriverKind::GenericPty {
+        let name = preset_by_id(match kind {
+            remuda_protocol::AgentKind::Codex => "codex",
+            remuda_protocol::AgentKind::Grok => "grok",
+            remuda_protocol::AgentKind::Agy => "agy",
+            remuda_protocol::AgentKind::Generic => "gemini",
+            remuda_protocol::AgentKind::Claude => "claude",
+            remuda_protocol::AgentKind::Terminal => "sh",
+        })
+        .map(|preset| preset.binary)
+        .unwrap_or("claude");
+        if name != "claude" {
+            return BinarySource::Command(name.to_owned());
+        }
+    }
+    claude_override()
+        .map(BinarySource::Path)
+        .unwrap_or_else(|| BinarySource::Command("claude".to_owned()))
+}
+
 fn instance_spec(
     launch: &DriverLaunch,
     config: &NativeDriverConfig,
@@ -1014,10 +1035,22 @@ fn instance_spec(
         kind: launch.request.kind,
         driver: launch.request.driver,
         binary_ref: object_id()?,
-        // Per-session executable override; wired to the request in the Node
-        // binary-resolution change that follows.
-        binary_path: None,
-        binary_sha256: None,
+        binary_path: launch
+            .request
+            .binary_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        binary_sha256: launch
+            .request
+            .binary_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| remuda_protocol::Digest::try_from(value.to_owned()))
+            .transpose()
+            .map_err(|error| DriverError::Failed(format!("binarySha256: {error}")))?,
         cwd: launch.workspace_root.to_string_lossy().into_owned(),
         worktree: None,
         provider_profile: ProfileRef {
@@ -1190,6 +1223,8 @@ mod tests {
                 driver: kind,
                 model: "haiku".to_owned(),
                 args: vec!["--max-budget-usd".to_owned(), "0.3".to_owned()],
+                binary_path: None,
+                binary_sha256: None,
                 provider_profile_id: "native".to_owned(),
                 permission_mode: "manual".to_owned(),
                 prompt: String::new(),
@@ -1298,6 +1333,68 @@ mod tests {
         assert!(error.to_string().contains("conflicts"));
     }
 
+    /// A spec `binaryPath` outranks the Node-wide `REMUDA_CLAUDE_BIN`.
+    ///
+    /// The env var is a machine-level default; naming a path on one session is
+    /// a deliberate per-session choice, so it has to win or the feature is
+    /// invisible on any Node that happens to set the env var.
+    #[test]
+    fn spec_binary_path_beats_the_node_wide_claude_bin() {
+        let env_bin = Path::new("/usr/local/bin/claude");
+        let session = "/opt/claude-2.2/bin/claude";
+
+        for driver in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ClaudeBg,
+        ] {
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, Some(session), Some(env_bin)),
+                BinarySource::Path(PathBuf::from(session)),
+                "{driver:?}"
+            );
+            // Without a session override the env var still applies.
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, None, Some(env_bin)),
+                BinarySource::Path(env_bin.to_path_buf()),
+                "{driver:?}"
+            );
+            // With neither, PATH resolution is unchanged.
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, None, None),
+                BinarySource::Command("claude".into()),
+                "{driver:?}"
+            );
+            // An empty string is not a choice.
+            assert_eq!(
+                resolve_binary_source(driver, AgentKind::Claude, Some("   "), Some(env_bin)),
+                BinarySource::Path(env_bin.to_path_buf()),
+                "{driver:?}"
+            );
+        }
+
+        // generic-pty hosting claude honours the override too.
+        assert_eq!(
+            resolve_binary_source(
+                DriverKind::GenericPty,
+                AgentKind::Claude,
+                Some(session),
+                None
+            ),
+            BinarySource::Path(PathBuf::from(session)),
+        );
+
+        // But a claude binary must never be handed to another CLI's template.
+        for kind in [AgentKind::Codex, AgentKind::Grok, AgentKind::Agy] {
+            let resolved =
+                resolve_binary_source(DriverKind::GenericPty, kind, Some(session), Some(env_bin));
+            assert!(
+                matches!(resolved, BinarySource::Command(ref name) if name != "claude"),
+                "{kind:?} must not exec the claude override: {resolved:?}"
+            );
+        }
+    }
+
     #[test]
     fn parse_delegation_prefers_explicit_field_then_profile_id() {
         let mut request = crate::CreateInstanceRequest {
@@ -1311,6 +1408,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "none".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),
@@ -1358,6 +1457,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "gateway".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),
@@ -1408,6 +1509,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "gateway".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),
@@ -1460,6 +1563,8 @@ mod tests {
             driver: DriverKind::ClaudePrint,
             model: "haiku".into(),
             args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "pvp_other".into(),
             permission_mode: "dontAsk".into(),
             prompt: String::new(),

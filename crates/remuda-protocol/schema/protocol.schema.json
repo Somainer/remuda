@@ -5755,9 +5755,27 @@
           },
           "type": "array"
         },
+        "binaryPath": {
+          "description": "Host-absolute executable override, Node-validated; §4.1.\n\nAbsent means the Node resolves the driver's default command the way it\nalways has (host default, then `REMUDA_CLAUDE_BIN`, then `PATH`). The\nHub stores the string but cannot stat the Node's filesystem, so every\ncontainment, ownership, and mode check happens on the Node and a path\nthat fails them fails the launch — there is no fallback to `PATH`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "binaryRef": {
           "$ref": "#/$defs/Id",
           "description": "`binary_ref`; protocol §4.1."
+        },
+        "binarySha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Expected digest of [`Self::binary_path`], for pin-on-record; §4.1.\n\nWhen present the Node's own pin must equal it or the launch is refused,\nso a caller that recorded a binary can detect it changing underneath."
         },
         "carrier": {
           "$ref": "#/$defs/CarrierSpec",

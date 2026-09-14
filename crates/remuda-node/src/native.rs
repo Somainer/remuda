@@ -1014,6 +1014,10 @@ fn instance_spec(
         kind: launch.request.kind,
         driver: launch.request.driver,
         binary_ref: object_id()?,
+        // Per-session executable override; wired to the request in the Node
+        // binary-resolution change that follows.
+        binary_path: None,
+        binary_sha256: None,
         cwd: launch.workspace_root.to_string_lossy().into_owned(),
         worktree: None,
         provider_profile: ProfileRef {

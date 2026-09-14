@@ -17,11 +17,13 @@
 
 pub mod bus;
 pub mod event;
+pub mod live;
 pub mod map;
 pub mod socket;
 
 pub use bus::{BusContext, SessionBinding, SignalBus};
 pub use event::{HookDecision, HookEnvelope, HookEvent, HookReply};
+pub use live::{LiveFold, LiveState, Phase, tool_node_id};
 pub use map::{Mapped, MappedKind, map_event};
 pub use socket::{HookServer, SignalSink, SocketError, send_event};
 

@@ -89,4 +89,40 @@ test.describe("mobile visual QA", () => {
     expect(box).toBeTruthy();
     expect(box!.height).toBeGreaterThanOrEqual(44);
   });
+
+  test("space chips are at least 44px", async ({ page }) => {
+    await page.goto("/sessions");
+    const strip = page.getByTestId("spaces-chips");
+    await expect(strip).toBeVisible();
+    const chips = page.getByTestId("space-chip");
+    expect(await chips.count()).toBeGreaterThan(0);
+    for (const chip of await chips.all()) {
+      const box = await chip.boundingBox();
+      expect(box).toBeTruthy();
+      expect(box!.height).toBeGreaterThanOrEqual(44);
+    }
+  });
+
+  test("action sheet buttons are at least 44px", async ({ page }) => {
+    await page.goto("/sessions");
+    // On a phone the spaces panel (and its exited-session group) lives in the
+    // drawer behind the ☰ control.
+    await page.getByTestId("spaces-drawer-open").click();
+    const drawer = page.getByTestId("spaces-drawer");
+    await expect(drawer).toBeVisible();
+    const group = drawer.getByTestId("exited-toggle").first();
+    await expect(group).toBeVisible();
+    if ((await group.getAttribute("aria-expanded")) === "false") await group.click();
+    await expect(group).toHaveAttribute("aria-expanded", "true");
+    await drawer.getByTestId("exited-delete").first().click();
+    const sheet = page.getByTestId("delete-session-sheet");
+    await expect(sheet).toBeVisible();
+    for (const button of await sheet.getByRole("button").all()) {
+      const box = await button.boundingBox();
+      expect(box, await button.textContent()).toBeTruthy();
+      expect(box!.height, await button.textContent()).toBeGreaterThanOrEqual(44);
+    }
+    await page.getByTestId("delete-session-sheet-cancel").click();
+    await expect(sheet).toHaveCount(0);
+  });
 });

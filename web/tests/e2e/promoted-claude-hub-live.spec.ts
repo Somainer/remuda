@@ -28,8 +28,8 @@ test.beforeAll(async ({}, testInfo) => {
   await Promise.all([access(remuda), access(harness)]);
 });
 
-type NativeEvent = { event: string; by?: string; outcome?: string };
-type JournalEvent = { source?: { channel?: string }; kind?: string; payload?: { nativeName?: string } };
+type NativeEvent = { event: string; by?: string; outcome?: string; pid?: number; session_id?: string; alt_screen?: boolean; tui_latch?: string };
+type JournalEvent = { source?: { channel?: string }; kind?: string; payload?: { nativeName?: string; relatedIds?: Record<string, string> } };
 type JournalRow = { seq?: string; observedAt?: string; event: JournalEvent };
 
 function quote(value: string): string {
@@ -180,7 +180,7 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     const created = await page.request.post("/v1/instances", {
       headers: { Origin: new URL(page.url()).origin },
       data: { hostId, workspaceId: workspaces.workspaces[0].workspaceId, cwd: workspace,
-        kind: "terminal", driver: "shell-pty", name: "promoted-hook-e2e" },
+        kind: "terminal", driver: "shell-pty", name: "promoted-hook-e2e", tui: "default" },
     });
     expect(created.ok()).toBe(true);
     const result = await created.json();
@@ -227,6 +227,7 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     expect(await (await page.request.get(`/v1/instances/${id}`)).json()).toMatchObject({
       driver: "shell-pty", kind: "claude", mode: "promoted", launchedBy: "user", signalTier: "hook",
     });
+    await expect(page.getByTestId("tty-alt-screen")).toHaveAttribute("data-alt-screen", "false");
     await page.getByTestId("view-switch-structured").click();
 
     let turn = 0;
@@ -276,6 +277,37 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     await expect.poll(async () => (await nativeEvents(eventsFile)).filter((event) => event.event === "turn_end").length,
       { timeout: 10_000 }).toBe(2);
     await assertActivity("idle", "after-interrupt-end");
+
+    // /tui replaces the native process while carrying the same --settings
+    // argv. Node must have released only tui and follow the replacement PID.
+    await page.getByTestId("view-switch-tty").click();
+    const starts = () => nativeEvents(eventsFile).then((rows) => rows.filter((event) => event.event === "session_start"));
+    const initial = (await starts())[0];
+    expect(initial.alt_screen).toBe(false);
+    for (const [index, mode] of ["fullscreen", "default"].entries()) {
+      await submit(`/tui ${mode}`);
+      await expect.poll(async () => (await starts()).length, { timeout: 15_000 }).toBe(index + 2);
+      const current = (await starts())[index + 1];
+      expect(current.pid).not.toBe(initial.pid);
+      expect(current.session_id).toBe(initial.session_id);
+      expect(current.tui_latch).toBe(mode);
+      expect(current.alt_screen).toBe(mode === "fullscreen");
+      await expect(page.getByTestId("tty-alt-screen")).toHaveAttribute("data-alt-screen", String(mode === "fullscreen"));
+      await expect.poll(async () => (await journal(page, id))
+        .filter((event) => event.source?.channel === "hook" && event.payload?.nativeName === "SessionStart").length,
+      { timeout: 15_000 }).toBe(index + 2);
+      await expect.poll(async () => (await journal(page, id))
+        .filter((event) => event.payload?.nativeName === "agent_promoted")
+        .map((event) => event.payload?.relatedIds?.pid), { timeout: 15_000 }).toContain(String(current.pid));
+      await expect(session).toHaveAttribute("data-mode", "promoted");
+      await expect(session).toHaveAttribute("data-lifecycle", "running");
+      await page.screenshot({ path: testInfo.outputPath(`tui-${mode}.png`), animations: "disabled" });
+    }
+    await submit("AFTER_TUI_SWITCH");
+    await expect.poll(async () => (await nativeEvents(eventsFile)).filter((event) => event.event === "turn_end").length,
+      { timeout: 15_000 }).toBe(3);
+    await assertActivity("idle", "after-tui-switch");
+
   } finally {
     if (instanceId) {
       try {

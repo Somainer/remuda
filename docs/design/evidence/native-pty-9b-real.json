@@ -10,7 +10,7 @@
   "scope": {
     "method": "stdlib Python PTY with raw byte counters and two synthetic SessionStart command hooks",
     "configIsolation": "CLAUDE_CONFIG_DIR, project settings, local settings, relay overlay, and temporary files under worktree target",
-    "credentialsCopied": false,
+    "nativeCredentialFilesCopied": false,
     "modelPromptSubmitted": false,
     "screenshotsCaptured": false,
     "runtimeSettings": "authorized relay settings merged into a private overlay; gateway values omitted from this artifact"

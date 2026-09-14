@@ -15,6 +15,7 @@ pub mod journal_diff;
 pub mod mcp;
 pub mod merge;
 pub mod node;
+mod project;
 pub(crate) mod registry;
 pub mod ssh;
 pub mod table;
@@ -48,6 +49,7 @@ commands! {
     Ssh(ssh::Args),
     Instance(instance::Args),
     Journal(journal_diff::Args),
+    Project(project::ProjectArgs),
     Fleet(fleet::Args),
     Worktree(worktree::Args),
     Merge(merge::MergeArgs),

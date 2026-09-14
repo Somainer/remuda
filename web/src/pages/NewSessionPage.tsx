@@ -32,6 +32,15 @@ import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
 import {
+  defaultDriver,
+  DRIVER_LABELS,
+  launchPreview,
+  legacyDrivers,
+  shellPtyAllowed,
+  type AgentKindId,
+  type HostMatrix,
+} from "../lib/driverMatrix";
+import {
   defaultGatewayProfile,
   enabledModels,
   fromHub,
@@ -85,7 +94,7 @@ export function NewSessionPage() {
   });
   const [delegation, setDelegation] = useState<DelegationId>(normalizeDelegation(prefs.delegation));
   const [kind, setKind] = useState<CreateKind>("claude");
-  const [wantTty, setWantTty] = useState(false);
+  const [driverOverride, setDriverOverride] = useState<DriverKind | null>(null);
   const [cwdMode, setCwdMode] = useState<CwdMode>("existing");
   const [cwdPath, setCwdPath] = useState("");
   const [worktreeName, setWorktreeName] = useState("");
@@ -168,14 +177,38 @@ export function NewSessionPage() {
     explicitProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
   });
   const plainTerminal = activeKind === "terminal";
+  // D-028 §5.1: the matrix comes from the Node-reported driver inventory on
+  // the host, never from a hardcoded driver table.
+  const hostMatrix: HostMatrix = {
+    cli: hostView?.cli ?? host?.cli,
+    capabilities: host?.capabilities ?? null,
+  };
+  const legacy = plainTerminal ? [] : legacyDrivers(activeKind as AgentKindId);
   const driver: DriverKind = plainTerminal
     ? "shell-pty"
-    : activeKind === "claude"
-      ? mobile || !wantTty
-        ? "claude-print"
-        : "claude-pty"
-      : "generic-pty";
+    : driverOverride && legacy.includes(driverOverride)
+      ? driverOverride
+      : defaultDriver(hostMatrix, activeKind as AgentKindId);
+  const nativeDefault = plainTerminal
+    ? "shell-pty"
+    : defaultDriver(hostMatrix, activeKind as AgentKindId);
+  const driverChoices: { id: DriverKind; allowed: boolean }[] = plainTerminal
+    ? [{ id: "shell-pty", allowed: true }]
+    : [
+        { id: "shell-pty", allowed: shellPtyAllowed(hostMatrix, activeKind as AgentKindId) },
+        ...legacy.map((id) => ({ id, allowed: true })),
+      ];
   const sessionEffort = effort.kind === activeKind ? effort : mapEffort(effort, activeKind as EffortKind);
+  // Read-only preview of the launch the Node will prefill into the PTY. The
+  // materialized recipe is Node-side (flags whitelist); until the Hub exposes
+  // it, show the honest kind + flags summary (D-028 §5.1).
+  const preview = plainTerminal
+    ? launchPreview({ kind: "terminal" })
+    : launchPreview({
+        kind: activeKind as AgentKindId,
+        effortName: effortWireName(sessionEffort),
+        yolo: permissionMode === "bypassPermissions",
+      });
   // Launch and remember what the picker shows, not a remembered id the
   // catalog has since stopped exposing.
   const launchModel = gatewayModel ?? model;
@@ -439,6 +472,37 @@ export function NewSessionPage() {
               </label>
             )}
           </div>
+          <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }} data-testid="new-session-driver-row">
+            <legend className={css.label}>驱动 · launch prefill</legend>
+            <div className={css.driverChoices}>
+              {driverChoices.map((choice) => (
+                <button
+                  key={choice.id}
+                  type="button"
+                  className={`${css.driverChoice} ${driver === choice.id ? css.driverChoiceOn : ""} ${choice.allowed ? "" : css.choiceDisabled}`}
+                  data-testid={`new-session-driver-${choice.id}`}
+                  data-default={choice.id === nativeDefault ? "1" : "0"}
+                  disabled={!choice.allowed}
+                  onClick={() => setDriverOverride(choice.id === nativeDefault ? null : choice.id)}
+                >
+                  <span className={`${css.radio} ${driver === choice.id ? css.radioOn : ""}`} />
+                  <span className={css.driverName}>{DRIVER_LABELS[choice.id]}</span>
+                  {choice.id === nativeDefault ? <span className={css.driverDefault}>默认</span> : null}
+                </button>
+              ))}
+            </div>
+            <pre className={css.launchPreview} data-testid="new-session-launch-preview">
+              {preview}
+            </pre>
+            <span className={css.hint}>
+              {driver === "shell-pty"
+                ? "Remuda 在自持 PTY 里预填 launch 命令并回车 · 终端与结构两个投影都可用"
+                : "legacy carrier · 结构化能力以该 driver 实际上报为准"}
+              {!shellPtyAllowed(hostMatrix, activeKind as AgentKindId) && !plainTerminal
+                ? " · 该主机未上报 shell-pty 可用（矩阵以 Node driverInventory 为准）"
+                : ""}
+            </span>
+          </fieldset>
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
             <legend className={css.label}>权限</legend>
             <div className={`${css.seg} ${css.permRow}`} data-testid="new-session-perm-row">
@@ -480,6 +544,16 @@ export function NewSessionPage() {
                   <span className={css.yoloTitle}>driver shell-pty</span>
                 </div>
                 <div className={css.yoloBody}>plain terminal · 默认打开终端 tab · 键鼠走 raw PTY</div>
+              </div>
+            ) : driver === "shell-pty" ? (
+              <div className={css.yolo} data-testid="new-session-pty-hint">
+                <div className={css.yoloHead}>
+                  <span className={css.yoloDot} />
+                  <span className={css.yoloTitle}>driver shell-pty · 原生终端</span>
+                </div>
+                <div className={css.yoloBody}>
+                  launch shim + per-session overlay · {PTY_YOLO_FLAGS[activeKind as keyof typeof PTY_YOLO_FLAGS] ?? ""} 仅在绕过全部时追加
+                </div>
               </div>
             ) : activeKind === "codex" || activeKind === "grok" || activeKind === "agy" ? (
               <div className={css.yolo} data-testid="new-session-pty-hint">
@@ -553,35 +627,18 @@ export function NewSessionPage() {
           <div className={css.advanced}>
             <button type="button" className={css.advancedToggle} data-testid="new-session-advanced" onClick={() => setAdvanced(!advanced)}>
               <span>{advanced ? "▾" : "▸"}</span>
-              <span>高级 · 驱动</span>
-              <span className={css.m3}>
-                {plainTerminal ? "shell-pty" : activeKind === "claude" ? "claude-print / claude-pty" : "generic-pty"}
-              </span>
+              <span>高级 · overlay / 覆写</span>
+              <span className={css.m3}>{driver}</span>
             </button>
             {advanced ? (
               <div className={css.driverList}>
                 {plainTerminal ? (
                   <p className={css.hint}>kind terminal · driver shell-pty · 空 prompt 打开 login shell。</p>
-                ) : mobile ? (
-                  <p className={css.hint}>手机固定 structured print。</p>
                 ) : (
-                  <>
-                    <button type="button" className={css.driverRow} onClick={() => setWantTty(false)}>
-                      <span className={`${css.radio} ${wantTty ? "" : css.radioOn}`} />
-                      <span>结构化 print</span>
-                      <span className={css.driverId}>claude-print · structured-only · 默认</span>
-                    </button>
-                    <button type="button" className={`${css.driverRow} ${css.driverOff}`} disabled>
-                      <span className={css.radio} />
-                      <span>后台可唤醒</span>
-                      <span className={css.driverIdOff}>claude-bg · 忽略 --session-id</span>
-                    </button>
-                    <button type="button" className={css.driverRow} onClick={() => setWantTty(true)}>
-                      <span className={`${css.radio} ${wantTty ? css.radioOn : ""}`} />
-                      <span>需要 /workflows 面板</span>
-                      <span className={css.driverId}>claude-pty · 订阅登录 profile</span>
-                    </button>
-                  </>
+                  <p className={css.hint}>
+                    driver {driver} · 可在上方「驱动 · launch prefill」切换；shell-pty 时 Node 按 {activeKind} recipe
+                    过 flags 白名单后拼 argv，不接受原样透传。
+                  </p>
                 )}
                 <label className={css.field}>
                   <span className={css.label}>settings overlay 路径</span>

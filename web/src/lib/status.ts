@@ -1,5 +1,6 @@
 import type { Instance, UiStatus } from "../types/instance";
 import { knowledgeValue } from "../types/command";
+import { canShowTerminal, hasStructuredSignal } from "../features/session/tty/gate";
 
 /** UI status dot = lifecycle × activity × connectivity (ui-spec §2.1). */
 export function projectStatus(instance: Instance): UiStatus {
@@ -32,24 +33,23 @@ export function isPromoted(instance: Instance): boolean {
 /**
  * Render as a raw screen rather than a transcript.
  *
- * PTY-carried sessions have no structured conversation — except a promoted one,
- * which hydrates the native transcript and therefore renders like an agent.
+ * D-028 §1.0: an agent in a native PTY gets BOTH projections — it renders
+ * the transcript whenever the session has a structured signal tier, and only
+ * falls back to raw screen text without one.
  */
 export function isGenericPty(instance: Instance): boolean {
   if (isPromoted(instance)) return false;
-  return (
+  if (instance.kind === "terminal") return true;
+  const pty =
     instance.driver === "generic-pty" ||
     instance.driver === "shell-pty" ||
-    instance.kind === "terminal"
-  );
+    instance.driver === "claude-pty";
+  return pty && !hasStructuredSignal(instance);
 }
 
 export function uiMode(instance: Instance): "structured-only" | "tty-attachable" {
-  if (instance.kind === "terminal" || instance.driver === "shell-pty") return "tty-attachable";
-  if (instance.driver === "claude-print") return "structured-only";
-  if (instance.driver === "generic-pty" || instance.driver === "claude-pty") return "tty-attachable";
-  const tty = instance.capabilities.capabilities["tty-attach"];
-  return tty?.state === "supported" ? "tty-attachable" : "structured-only";
+  // Carrier/capability, not driver name (D-028 §1.0 rule 4).
+  return canShowTerminal(instance) ? "tty-attachable" : "structured-only";
 }
 
 export function nativeShort(instance: Instance): string {

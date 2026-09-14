@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
 import * as store from "../lib/store";
 import { mockDb } from "../lib/mock";
@@ -210,4 +210,63 @@ it("writes the harness-native tier after a runtime switch", async () => {
   await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
     kind: "grok", effortIndex: 2, effortName: "max",
   })));
+});
+
+describe("D-028 native PTY default", () => {
+  it("offers 原生终端 shell-pty as the default for claude and creates with it", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    renderWithCli();
+    const row = screen.getByTestId("new-session-driver-shell-pty");
+    expect(row).toHaveAttribute("data-default", "1");
+    expect(screen.getByTestId("new-session-launch-preview")).toHaveTextContent(/claude/);
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({ kind: "claude", driver: "shell-pty" })),
+    );
+  });
+
+  it("keeps claude-print selectable as a secondary choice", () => {
+    renderWithCli();
+    const print = screen.getByTestId("new-session-driver-claude-print");
+    expect(print).toHaveAttribute("data-default", "0");
+    fireEvent.click(print);
+    expect(print.className).toMatch(/driverChoiceOn/);
+  });
+
+  it("falls back to claude-print when the host's matrix says shell-pty is not launchable", () => {
+    vi.mocked(store.useHub).mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      hosts: [
+        {
+          ...cliHost,
+          capabilities: { driverInventory: [{ kind: "shell-pty", launchable: false }] },
+        },
+      ],
+      workspaces: [workspace],
+      instances: [],
+    });
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    const shell = screen.getByTestId("new-session-driver-shell-pty");
+    expect(shell).toBeDisabled();
+    expect(shell).toHaveAttribute("data-default", "0");
+    expect(screen.getByTestId("new-session-driver-claude-print")).toHaveAttribute("data-default", "1");
+  });
+
+  it("falls back to generic-pty for grok when the installed CLI meets a matrix refusing shell-pty", () => {
+    vi.mocked(store.useHub).mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      hosts: [
+        {
+          ...cliHost,
+          capabilities: { driverInventory: [{ kind: "shell-pty", launchable: false }] },
+        },
+      ],
+      workspaces: [workspace],
+      instances: [],
+    });
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-kind-grok"));
+    expect(screen.getByTestId("new-session-driver-generic-pty")).toHaveAttribute("data-default", "1");
+    expect(screen.getByTestId("new-session-driver-shell-pty")).toBeDisabled();
+  });
 });

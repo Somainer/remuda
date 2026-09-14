@@ -100,6 +100,14 @@ export type Host = EntityMeta & {
   /** `auto` | `native` | `profile:<id>` */
   providerBinding?: string;
   online?: boolean;
+  /** Raw Node-reported capability object (may carry `driverInventory`; D-028 §5.1). */
+  capabilities?: Record<string, unknown> | null;
+  /** Driver descriptors parsed out of {@link capabilities}, when the Node reported any. */
+  driverInventory?: Array<{
+    kind: string;
+    launchable?: boolean;
+    [key: string]: unknown;
+  }>;
 };
 
 export type UiStatus = "blocked" | "working" | "starting" | "idle" | "exited" | "unknown";

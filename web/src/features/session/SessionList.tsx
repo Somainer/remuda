@@ -8,12 +8,16 @@ import { formatListTime, shortId } from "../../lib/format";
 import { nativeShort, projectStatus, uiMode } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
 import { isEmberEffort } from "./effort";
+import { LaunchedByMark } from "./LaunchedBy";
 import css from "./SessionList.module.css";
 
 const GROUPS: { id: string; title: string; match: (s: UiStatus) => boolean }[] = [
   { id: "blocked", title: "待处理", match: (s) => s === "blocked" },
   { id: "working", title: "进行中", match: (s) => s === "working" || s === "starting" },
-  { id: "recent", title: "最近", match: (s) => s === "idle" || s === "exited" || s === "unknown" },
+  { id: "recent", title: "最近", match: (s) => s === "idle" || s === "unknown" },
+  // D-028 §8 方案 A: node-epoch-changed settles the row as exited; it leaves
+  // the live groups and lands here, next to its Resume button.
+  { id: "exited", title: "已退出", match: (s) => s === "exited" },
 ];
 
 function csv(params: URLSearchParams, key: string): string[] {
@@ -357,6 +361,7 @@ export function SessionList({ instances, variant = "full", title = "会话", new
                         {title}
                       </div>
                       <span className={`${css.kind} ${kindClass(instance.kind)}`}>{instance.kind}</span>
+                      <LaunchedByMark launchedBy={instance.launchedBy} />
                       {screen?.done ? (
                         <span className={css.done} data-testid="board-done">
                           DONE

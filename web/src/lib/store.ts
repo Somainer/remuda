@@ -4,6 +4,7 @@ import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
 import type { Id } from "../types/wire";
+import type { PromptMode } from "../types/generated";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import type { AttachmentRef } from "./attachments";
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
@@ -67,6 +68,8 @@ export type LocalBubble = {
    * because the Hub does not echo attachments back onto the journal yet.
    */
   attachments?: BubbleAttachment[];
+  /** D-028 §6 PromptMode used for this send; absent is a normal new turn. */
+  promptMode?: PromptMode;
 };
 
 /** One image shown under a sent bubble. */
@@ -508,7 +511,13 @@ class HubStore {
     return this.state.instances.find((i) => i.id === result.instance.id) ?? result.instance;
   }
 
-  async send(instanceId: Id, prompt: string, attachments: AttachmentRef[] = [], previews: BubbleAttachment[] = []) {
+  async send(
+    instanceId: Id,
+    prompt: string,
+    attachments: AttachmentRef[] = [],
+    previews: BubbleAttachment[] = [],
+    mode?: PromptMode,
+  ) {
     const localId = id("local_");
     const bubble: LocalBubble = {
       id: localId,
@@ -517,11 +526,12 @@ class HubStore {
       ...(previews.length ? { attachments: previews } : {}),
       commandId: localId,
       state: "queued",
+      ...(mode ? { promptMode: mode } : {}),
       createdAt: now(),
     };
     this.emit({ bubbles: this.state.bubbles.concat(bubble) });
     try {
-      const result = await api.instanceSend(instanceId, prompt, attachments);
+      const result = await api.instanceSend(instanceId, prompt, attachments, mode);
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
           b.id === localId ? { ...b, state: result.command.state, commandId: result.command.commandId } : b,
@@ -546,6 +556,12 @@ class HubStore {
 
   async close(instanceId: Id) {
     await api.instanceClose(instanceId);
+    await this.refresh();
+  }
+
+  /** D-028 §5.3: interrupt the current turn; session and process stay alive. */
+  async cancel(instanceId: Id) {
+    await api.instanceCancel(instanceId);
     await this.refresh();
   }
 

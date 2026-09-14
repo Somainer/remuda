@@ -95,6 +95,57 @@ export function ptyCapabilities(driverKind: DriverKind = "generic-pty"): Capabil
   return snapshot;
 }
 
+/**
+ * Static fallback matrix for an agent harness running in a Remuda-owned PTY
+ * (D-028 §6 measured results). Runtime reports layered by
+ * {@link withRuntimeCapabilities} win per name; this is what a fresh
+ * shell-pty session is honest about before the Node reports live.
+ *
+ * claude: Enter steers at the next tool boundary (native); after-turn queue
+ * is Remuda-held; Esc interrupts natively.
+ * codex: Enter steers immediately, Tab queues natively, Esc interrupts.
+ * grok: no native send-now (queue primary, send = cancel+resend); queue is
+ * Remuda-held; interrupt needs the emulated double-Ctrl+C sequence.
+ * agy: unmeasured — every one of the three stays `unknown`.
+ */
+const AGENT_PTY_MATRIX: Record<
+  string,
+  { steer: CapabilityProvision; queue: CapabilityProvision; interrupt: CapabilityProvision }
+> = {
+  claude: { steer: "native", queue: "emulated", interrupt: "native" },
+  codex: { steer: "native", queue: "native", interrupt: "native" },
+  grok: { steer: "unknown", queue: "emulated", interrupt: "emulated" },
+  agy: { steer: "unknown", queue: "unknown", interrupt: "unknown" },
+};
+
+function provisioned(state: Capability["state"], reason: string, provision: CapabilityProvision): Capability {
+  return { ...cap(state, reason), provision };
+}
+
+export function agentPtyCapabilities(
+  kind: string,
+  driverKind: DriverKind = "shell-pty",
+): CapabilitySnapshot {
+  const snapshot = ptyCapabilities(driverKind);
+  const row = AGENT_PTY_MATRIX[kind];
+  if (!row) return snapshot;
+  for (const name of ["steer", "queue", "interrupt"] as const) {
+    const p = row[name];
+    snapshot.capabilities[name] =
+      p === "unknown"
+        ? provisioned("unknown", `${kind}-${name}-unverified`, "unknown")
+        : provisioned("supported", `${kind}-${name}-${p}`, p);
+  }
+  // Promoted/launched agents hydrate a transcript tail; structured is a real
+  // projection alongside the terminal one (D-028 §1.0).
+  snapshot.capabilities["structured-workflow"] = provisioned(
+    "supported",
+    `${kind}-transcript-tail`,
+    "native",
+  );
+  return snapshot;
+}
+
 export function printCapabilities(): CapabilitySnapshot {
   const capabilities = {} as Record<CapabilityName, Capability>;
   for (const name of NAMES) capabilities[name] = cap("unknown", "unverified");

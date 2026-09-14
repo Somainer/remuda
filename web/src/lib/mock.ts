@@ -1228,6 +1228,34 @@ export function mockClose(instanceId: Id): CommandResult {
 }
 
 /**
+ * D-028 §5.3: cancel interrupts the turn only — lifecycle stays running and
+ * the activity returns to idle, unlike {@link mockClose} which exits.
+ */
+export function mockCancel(instanceId: Id): CommandResult {
+  const inst = instances.find((i) => i.id === instanceId);
+  if (!inst) throw new Error("INSTANCE_NOT_FOUND");
+  inst.activity = known("idle");
+  inst.activeRunIds = [];
+  inst.updatedAt = now();
+  const commandId = id("cmd_");
+  return {
+    command: {
+      ...meta(commandId),
+      commandId,
+      actor: { principalId: id("prn_"), type: "human", deviceId: id("dev_"), instanceId },
+      origin: "ui",
+      operation: "instance.cancel",
+      target: { hostId, instanceId, runId: null },
+      payloadDigest: digestPlaceholder(),
+      state: "accepted",
+      dispatch: "intent-durable",
+      resolution: "clear",
+    },
+    relatedCommandIds: [],
+  };
+}
+
+/**
  * Mirrors the Hub's real delete: a live Instance is refused with 409 unless
  * `force` stops it first, a repeated delete is 404-idempotent, and the record
  * and its journal are gone for good.

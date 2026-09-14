@@ -6,6 +6,7 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { useWorkbenchViewport } from "../../../lib/viewport";
+import { hubStore } from "../../../lib/store";
 import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
@@ -602,7 +603,10 @@ export function TerminalView({
           would still reserve a strip of dead space under the terminal. */}
       {!directInput ? (
         <div className={css.dock} data-testid="tty-dock">
-          <LocalInput disabled={frozen} mobile={mobile} onSend={send} />
+          {/* D-028 §5.2: the dock routes through instance.send so the driver
+              performs body-then-Enter as two PTY writes; raw key buttons
+              below stay on the binary channel. */}
+          <LocalInput disabled={frozen} mobile={mobile} onSend={(text) => void hubStore.send(instance.id, text)} />
         </div>
       ) : null}
       {mobile ? <AuxKeys disabled={frozen} onKey={send} /> : null}

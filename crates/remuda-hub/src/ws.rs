@@ -84,6 +84,12 @@ impl TtyRelay {
                 // rather than growing it without bound.
                 streams.clear();
             }
+            // An instance has one active terminal stream. Retire its old
+            // identity so delayed mode notices cannot overwrite the state of
+            // a replacement stream after reopen or recovery.
+            streams.retain(|uuid, owner| {
+                uuid == stream_uuid || owner.host_id != host_id || owner.instance_id != instance_id
+            });
             streams.insert(
                 stream_uuid.to_owned(),
                 StreamOwner {
@@ -1454,6 +1460,24 @@ async fn snapshot_json(state: &AppState, instance_id: &str) -> Result<Value, Hub
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_terminal_stream_retires_stale_mode_source() {
+        let relay = TtyRelay::default();
+        relay.bind("old-stream", "host-a", "instance-a");
+        relay.bind("other-stream", "host-a", "instance-b");
+        relay.bind("new-stream", "host-a", "instance-a");
+        assert_eq!(relay.instance_for_host("old-stream", "host-a"), None);
+        assert_eq!(relay.instance_for_host("new-stream", "host-b"), None);
+        assert_eq!(
+            relay.instance_for_host("new-stream", "host-a").as_deref(),
+            Some("instance-a")
+        );
+        assert_eq!(
+            relay.instance_for_host("other-stream", "host-a").as_deref(),
+            Some("instance-b")
+        );
+    }
 
     #[tokio::test]
     async fn follow_bus_reports_lag_when_capacity_exceeded() {

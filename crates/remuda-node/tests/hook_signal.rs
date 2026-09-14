@@ -32,7 +32,13 @@ async fn journal_recorded_session() -> Vec<Observation> {
         },
         tx,
         Arc::new(AtomicU64::new(0)),
-    );
+    )
+    // The recording contains a `PermissionRequest`, and since P5 that parks the
+    // hook until somebody answers or the wait expires. Nobody answers here —
+    // this fixture is about the *fold*, not about adjudication — so the wait is
+    // shortened from the broker-aligned 15 minutes to something a test can
+    // spend. It still ends in a deny, which is the point of §4.4.
+    .with_blocking_wait(std::time::Duration::from_millis(50));
     for line in remuda_testing::hook_session_fixture().lines() {
         if line.trim().is_empty() {
             continue;
@@ -158,13 +164,37 @@ async fn the_turn_opens_on_the_prompt_and_closes_on_the_stop() {
 }
 
 #[tokio::test]
-async fn a_permission_request_shows_as_waiting_without_being_answered() {
+async fn a_permission_request_holds_the_instance_waiting_on_a_human() {
+    // Since P5 the hook is parked on this and the instance really is blocked
+    // on a person, so `WaitingInteraction` is now a statement of fact rather
+    // than an observation about a prompt someone else will answer.
     let journal = journal_recorded_session().await;
     let end = journal
         .iter()
         .position(|observation| native_name(observation) == Some("PermissionRequest"))
         .expect("the recording includes a permission prompt");
     assert_eq!(project(&journal[..=end]), Activity::WaitingInteraction);
+}
+
+#[tokio::test]
+async fn a_permission_request_opens_a_card_a_device_can_answer() {
+    // The fold is only half the story: without a journaled
+    // `interaction.requested` there is nothing for a human to answer, and the
+    // hook would wait out its whole deadline for a card nobody ever saw.
+    let journal = journal_recorded_session().await;
+    let card = journal
+        .iter()
+        .find_map(|observation| match &observation.body {
+            ObservationPayload::InteractionRequested(payload) => Some(&payload.interaction),
+            _ => None,
+        })
+        .expect("the permission request opened an interaction");
+    assert_eq!(
+        card.carrier,
+        remuda_protocol::InteractionCarrier::HarnessHook
+    );
+    assert!(card.blocking, "the agent is parked on this answer");
+    assert!(card.answerable);
 }
 
 #[tokio::test]

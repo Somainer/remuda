@@ -578,8 +578,8 @@ export function NewSessionPage() {
             >
               {/*
                * Layout A: no card. The label row, the dotted pill spanning the
-               * same column as the 权限 row, the five tick labels and the spec
-               * helper all use the form's own tokens. Remounting on the
+               * same column as the 权限 row, the six stop tick labels and the
+               * spec helper all use the form's own tokens. Remounting on the
                * harness drops the drag draft, so the pill re-snaps onto the
                * new table instead of showing the stop the pointer left behind.
                */}

@@ -1,21 +1,21 @@
 import { useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import {
-  CLAUDE_ULTRACODE_INDEX,
   clampEffortIndex,
   defaultEffortIndex,
   EFFORT_MENU_FOOTER,
-  effortAt,
+  effortAtStop,
   effortIndexFromClientX,
   effortRatio,
-  effortTable,
+  effortStops,
+  effortStopIndex,
   isEmberEffort,
   keyboardEffortIndex,
   modelsFor,
   shortModel,
-  supportsUltracode,
   ULTRACODE_HINT,
   type EffortKind,
   type EffortSelection,
+  type EffortStop,
 } from "./effort";
 import css from "./session.module.css";
 
@@ -82,8 +82,10 @@ function ResetIcon() {
  * `-track`, `-knob`, ...) so two mounts can be addressed apart. The composer
  * keeps the default `effort`, i.e. its ids are unchanged.
  *
- * `ultracode` is Claude-only and is NOT a tier: when on, the tier is forced to
- * `xhigh`, the track locks onto that stop, and the chip + ember mark it.
+ * Claude has six stops — low · medium · high (default) · xhigh · max ·
+ * ultracode — like the Desktop control. The rightmost stop is not a tier: it
+ * selects the `xhigh` tier with the ultracode workflow flag
+ * (`{name: "xhigh", ultracode: true}` on the wire) and plays a denser ember.
  */
 export function EffortSlider({
   kind,
@@ -104,7 +106,7 @@ export function EffortSlider({
   model?: string;
   models?: string[];
   index: number;
-  /** Claude ultracode workflow toggle; forces the xhigh tier while on. */
+  /** Claude ultracode workflow flag; the rightmost slider stop sets it. */
   ultracode?: boolean;
   disabled?: boolean;
   /** `popover` is the composer's framed menu; `inline` is the frameless New Session form row. */
@@ -119,31 +121,26 @@ export function EffortSlider({
 }) {
   const tid = (suffix: string) => `${idPrefix}-${suffix}`;
   const inline = variant === "inline";
-  const frame = inline
-    ? `${css.effortForm}`
-    : `${css.effortCard}`;
-  const table = effortTable(kind);
+  const frame = inline ? `${css.effortForm}` : `${css.effortCard}`;
+  const stops = effortStops(kind);
   const trackRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef(false);
   const [draft, setDraft] = useState<number | null>(null);
   const [list, setList] = useState(false);
 
-  const supportsUltra = supportsUltracode(kind);
-  const ultraOn = supportsUltra && ultracode === true;
-  const baseShown = clampEffortIndex(draft ?? index, table.length);
-  // Ultracode forces xhigh; the knob never sits on another stop while it is on.
-  const shown = ultraOn ? clampEffortIndex(CLAUDE_ULTRACODE_INDEX, table.length) : baseShown;
-  const locked = Boolean(disabled) || table.length === 0;
-  // The track takes no tier input while ultracode holds it on xhigh.
-  const tierLocked = locked || ultraOn;
-  const ember = isEmberEffort(kind, shown, ultraOn);
-  const current = table[shown];
-  const ratio = effortRatio(shown, table.length);
-  const fallback = defaultEffortIndex(kind);
+  const ultraOn = kind === "claude" && ultracode === true;
+  const propStop = effortStopIndex(kind, index, ultraOn);
+  const shown = clampEffortIndex(draft ?? propStop, Math.max(1, stops.length));
+  const stop: EffortStop | undefined = stops[shown];
+  const locked = Boolean(disabled) || stops.length === 0;
+  const ember = isEmberEffort(kind, stop?.index ?? 0, stop?.ultracode === true);
+  const ultraStop = stop?.ultracode === true;
+  const ratio = effortRatio(shown, Math.max(1, stops.length));
+  const fallback = effortStopIndex(kind, defaultEffortIndex(kind), false);
   const modelLabel = model ? shortModel(model) : "";
   const modelList = model ? modelsFor(kind, models ?? [model]) : [];
 
-  if (table.length === 0) return null;
+  if (stops.length === 0) return null;
 
   const snapFromClientX = (clientX: number): number => {
     const rect = trackRef.current?.getBoundingClientRect();
@@ -152,18 +149,18 @@ export function EffortSlider({
     return effortIndexFromClientX(
       clientX,
       { left: rect.left + KNOB_INSET, width: Math.max(1, rect.width - KNOB_INSET * 2) },
-      table.length,
+      stops.length,
     );
   };
 
-  const emit = (next: number, nextUltra: boolean) => {
-    const clamped = clampEffortIndex(next, table.length);
-    if (clamped === index && nextUltra === ultraOn) return;
-    onChange(effortAt((kind as EffortKind) || "claude", clamped, supportsUltra && nextUltra));
+  const emit = (next: number) => {
+    const clamped = clampEffortIndex(next, stops.length);
+    if (clamped === propStop) return;
+    onChange(effortAtStop((kind as EffortKind) || "claude", clamped));
   };
 
   const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
-    if (tierLocked) return;
+    if (locked) return;
     event.preventDefault();
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -175,7 +172,7 @@ export function EffortSlider({
   };
 
   const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current || tierLocked) return;
+    if (!dragRef.current || locked) return;
     setDraft(snapFromClientX(event.clientX));
   };
 
@@ -184,71 +181,42 @@ export function EffortSlider({
     const next = snapFromClientX(event.clientX);
     dragRef.current = false;
     setDraft(next);
-    emit(next, ultraOn);
+    emit(next);
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (tierLocked) return;
-    const next = keyboardEffortIndex(shown, event.key, table.length);
+    if (locked) return;
+    const next = keyboardEffortIndex(shown, event.key, stops.length);
     if (next == null) return;
     event.preventDefault();
     setDraft(next);
-    emit(next, false);
+    emit(next);
   };
 
-  const pickTier = (next: number) => {
+  const pickStop = (next: number) => {
     setDraft(next);
-    emit(next, false);
+    emit(next);
     setList(false);
   };
-
-  const toggleUltracode = () => {
-    if (!supportsUltra || locked) return;
-    emit(ultraOn ? shown : CLAUDE_ULTRACODE_INDEX, !ultraOn);
-  };
-
-  const ultraChip = (
-    <button
-      type="button"
-      className={`${css.ultraChip} ${ultraOn ? css.ultraChipOn : ""}`}
-      data-testid={tid("ultracode")}
-      data-on={ultraOn ? "1" : "0"}
-      aria-pressed={ultraOn}
-      aria-label={ULTRACODE_HINT}
-      title={ULTRACODE_HINT}
-      disabled={locked}
-      onClick={toggleUltracode}
-    >
-      {ultraOn ? (
-        <span className={css.ultraChipSpark} aria-hidden="true">
-          <span className={css.emberSpark} />
-          <span className={`${css.emberSpark} ${css.emberSpark2}`} />
-          <span className={`${css.emberSpark} ${css.emberSpark3}`} />
-        </span>
-      ) : (
-        <span className={css.ultraChipDot} aria-hidden="true" />
-      )}
-      <span className={css.ultraChipText}>ultracode</span>
-    </button>
-  );
 
   const track = (
     <div
       className={css.effortHit}
       data-testid={tid("slider")}
       data-index={String(shown)}
-      data-name={current?.name ?? ""}
+      data-tier-index={String(stop?.index ?? 0)}
+      data-name={stop?.name ?? ""}
       data-ember={ember ? "1" : "0"}
-      data-ultracode={ultraOn ? "1" : "0"}
-      data-tiers={table.map((tier) => tier.name).join(",")}
+      data-ultracode={ultraStop ? "1" : "0"}
+      data-tiers={stops.map((s) => s.name).join(",")}
       role="slider"
-      tabIndex={tierLocked ? -1 : 0}
+      tabIndex={locked ? -1 : 0}
       aria-label="effort"
       aria-valuemin={0}
-      aria-valuemax={Math.max(0, table.length - 1)}
+      aria-valuemax={Math.max(0, stops.length - 1)}
       aria-valuenow={shown}
-      aria-valuetext={current?.name ?? ""}
-      aria-disabled={tierLocked}
+      aria-valuetext={stop?.name ?? ""}
+      aria-disabled={locked}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -268,25 +236,56 @@ export function EffortSlider({
             data-testid={tid("fill")}
           >
             {ember ? (
-              <span className={css.effortEmbers} data-testid={tid("embers")}>
+              <span
+                className={`${css.effortEmbers} ${ultraStop ? css.effortEmbersUltra : ""}`}
+                data-testid={tid("embers")}
+                data-intensity={ultraStop ? "ultra" : "ember"}
+              >
                 <span className={css.effortEmberGlow} />
                 <span className={`${css.effortEmberLayer} ${css.effortEmberBack}`} />
                 <span className={`${css.effortEmberLayer} ${css.effortEmberMid}`} />
                 <span className={`${css.effortEmberLayer} ${css.effortEmberFront}`} />
+                {/* Ultracode stop: a fourth, denser dotted drift like the Desktop's glow. */}
+                {ultraStop ? <span className={`${css.effortEmberLayer} ${css.effortEmberDots}`} /> : null}
               </span>
             ) : null}
           </span>
-          {table.map((tier, i) => (
+          {stops.map((s, i) => (
             <span
-              key={tier.name}
-              className={`${css.effortDot} ${i <= shown ? css.effortDotOn : ""}`}
-              style={{ ["--dot" as string]: String(effortRatio(i, table.length)) }}
+              key={s.name}
+              className={`${css.effortDot} ${i <= shown ? css.effortDotOn : ""} ${
+                ember && i <= shown ? css.effortDotEmber : ""
+              }`}
+              style={{ ["--dot" as string]: String(effortRatio(i, stops.length)) }}
             />
           ))}
         </span>
-        {ember ? <span className={css.effortKnobGlow} aria-hidden="true" /> : null}
+        {ember ? (
+          <span
+            className={`${css.effortKnobGlow} ${ultraStop ? css.effortKnobGlowUltra : ""}`}
+            aria-hidden="true"
+          />
+        ) : null}
         <span className={css.effortKnob} data-testid={tid("knob")} />
       </div>
+    </div>
+  );
+
+  const ticks = (
+    <div className={`${css.effortTicks} ${inline ? "" : css.effortTicksPop}`} aria-hidden="true">
+      {stops.map((s, i) => (
+        <span
+          key={s.name}
+          className={`${css.effortTick} ${i === shown ? css.effortTickOn : ""} ${
+            ember && i === shown ? css.effortTickEmber : ""
+          }`}
+          style={{ ["--tick" as string]: String(effortRatio(i, stops.length)) }}
+        >
+          {/* Full names on the wide inline field; shorts in the popover and on narrow tracks. */}
+          <span className={css.effortTickFull}>{s.name}</span>
+          <span className={css.effortTickShort}>{s.short ?? s.name}</span>
+        </span>
+      ))}
     </div>
   );
 
@@ -306,20 +305,22 @@ export function EffortSlider({
           <span className={css.effortListTitle}>档位</span>
         </div>
         <div className={css.effortListBody} data-testid={tid("list")}>
-          {table.map((tier, i) => (
+          {stops.map((s, i) => (
             <button
-              key={tier.name}
+              key={s.name}
               type="button"
               className={`${css.effortRow} ${i === shown ? css.effortOn : ""}`}
-              data-testid={tid(`tier-${tier.name}`)}
+              data-testid={tid(`tier-${s.name}`)}
               data-selected={i === shown ? "1" : "0"}
-              data-ember={isEmberEffort(kind, i, false) ? "1" : "0"}
+              data-ember={isEmberEffort(kind, s.index, s.ultracode) ? "1" : "0"}
+              data-ultracode={s.ultracode ? "1" : "0"}
+              title={s.ultracode ? ULTRACODE_HINT : undefined}
               disabled={locked}
-              onClick={() => pickTier(i)}
+              onClick={() => pickStop(i)}
             >
               <span className={`${css.radio} ${i === shown ? css.radioOn : ""}`} />
-              <span className={css.effortName}>{tier.name}</span>
-              <span className={css.effortDesc}>{tier.description}</span>
+              <span className={css.effortName}>{s.name}</span>
+              <span className={css.effortDesc}>{s.description}</span>
             </button>
           ))}
           {modelList.length ? (
@@ -329,7 +330,7 @@ export function EffortSlider({
                 <button
                   key={id}
                   type="button"
-                  className={`${css.effortRow} ${shortModel(model) === shortModel(id) ? css.effortOn : ""}`}
+                  className={css.effortRow + (shortModel(model) === shortModel(id) ? ` ${css.effortOn}` : "")}
                   data-testid={`model-option-${shortModel(id)}`}
                   onClick={() => {
                     onModel?.(id);
@@ -351,9 +352,9 @@ export function EffortSlider({
   }
 
   if (inline) {
-    // Layout A: no card. A label row (label · level + description · ultracode),
-    // then the dotted pill spanning the form column with tick labels, then the
-    // spec helper in the same muted slot as every other field's helper.
+    // Layout A: no card. A label row (label · level + description), then the
+    // dotted pill spanning the form column with tick labels, then the spec
+    // helper in the same muted slot as every other field's helper.
     return (
       <div
         className={frame}
@@ -361,32 +362,21 @@ export function EffortSlider({
         data-view="slider"
         data-variant="inline"
         data-disabled={locked ? "1" : "0"}
-        data-ultracode={ultraOn ? "1" : "0"}
+        data-ultracode={ultraStop ? "1" : "0"}
       >
         <div className={css.effortFormRow}>
           <span className={css.effortFormLabel}>{label}</span>
           <span className={css.effortFormMeta}>
             <span className={css.effortFormName} data-testid={tid("title")} data-ember={ember ? "1" : "0"}>
-              {current?.name ?? "effort"}
+              {stop?.name ?? "effort"}
             </span>
             <span className={css.effortFormDesc} data-testid={tid("model")}>
-              {current?.description ?? ""}
+              {stop?.description ?? ""}
             </span>
           </span>
-          {supportsUltra ? ultraChip : null}
         </div>
         {track}
-        <div className={css.effortTicks} aria-hidden="true">
-          {table.map((tier, i) => (
-            <span
-              key={tier.name}
-              className={`${css.effortTick} ${i === shown ? css.effortTickOn : ""} ${ember && i === shown ? css.effortTickEmber : ""}`}
-              style={{ ["--tick" as string]: String(effortRatio(i, table.length)) }}
-            >
-              <span className={css.effortTickFull}>{tier.name}</span>
-            </span>
-          ))}
-        </div>
+        {ticks}
         {footer ? (
           <div className={css.effortFormFoot} data-testid={tid("foot")}>
             {footer}
@@ -406,36 +396,36 @@ export function EffortSlider({
           type="button"
           className={`${css.effortTitleBtn} ${ember ? css.effortTitleEmber : ""}`}
           data-testid={tid("open-list")}
-          aria-label={`${current?.name ?? "effort"}，展开档位与模型`}
+          aria-label={`${stop?.name ?? "effort"}，展开档位与模型`}
           aria-expanded={false}
           onClick={() => setList(true)}
         >
           <span className={css.effortTitle} data-testid={tid("title")} data-ember={ember ? "1" : "0"}>
-            {current?.name ?? "effort"}
+            {stop?.name ?? "effort"}
           </span>
           <span className={css.effortChevron}>
             <ChevronIcon />
           </span>
         </button>
-        {supportsUltra ? <span className={css.effortHeadUltra}>{ultraChip}</span> : null}
         <button
           type="button"
           className={css.effortIconBtn}
           data-testid={tid("reset")}
           aria-label="复位到默认档"
-          disabled={locked || (shown === fallback && !ultraOn)}
+          disabled={locked || shown === fallback}
           onClick={() => {
             setDraft(fallback);
-            emit(fallback, false);
+            emit(fallback);
           }}
         >
           <ResetIcon />
         </button>
       </div>
       <div className={css.effortModel} data-testid={tid("model")}>
-        {modelLabel || current?.description || ""}
+        {modelLabel || stop?.description || ""}
       </div>
       {track}
+      {ticks}
     </div>
   );
 }

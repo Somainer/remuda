@@ -89,26 +89,33 @@
   「等待发送」；仅服务器响应赋值 commandId；5xx 保持 null 且投影
   「状态待确认」；并发发送 clientRequestId 互异；journal 节点带同一
   commandId 时结算（相同文本也能区分两条），重放不产生重复。
+  「等待发送」；仅服务器响应赋值 commandId；5xx 保持 null 且投影
+  「状态待确认」；并发发送 clientRequestId 互异；journal 节点带同一
+  commandId 时结算（相同文本也能区分两条），重放不产生重复。
 - `store.follow.test.ts`：follow/regroup 之外新增 commandId 对账 1 例（
   同文本两条气泡只被各自的 commandId 节点结算，无 id 的原生节点不误结算）。
 - `assemble.test.ts`：新增 C2 分组 5 例（join 后隐藏乐观气泡、无匹配不
   隐藏、有服务器 id 时不靠文本去重、queued 期间命令节点到达仍只一条、
   旧文本规则仅用于无服务器 id 的气泡）。
 
-### Hub e2e（fake node + Playwright）
+### Hub e2e（fake node + Playwright，4/4 通过）
 
 - fake node（`hub_e2e.rs`）扩展：
   - `instance.create` / `instance.send` 的用户 journal 节点改为全形状并携带
     params 里的 `commandId`；
-  - 新增 `tty.attach` 与 `tty.write`：浏览器在附加终端里的键入在 CR 时生成
-    **无 commandId** 的用户节点 + echo，用于验证原生路径。
-- `web/tests/e2e/ux-command-id.hub.spec.ts`（新，4 例）：
+  - 新增 `tty.attach` 与 `tty.write`：每实例一个**稳定的** stream id（dev
+    StrictMode 会 attach 两次，重挂的 socket 必须沿用同一 stream）；浏览器在
+    附加终端里的键入在 CR 时生成 **无 commandId** 的用户节点 + 一行 echo，
+    用于验证原生路径。
+- `web/tests/e2e/ux-command-id.hub.spec.ts`（新，4 例，本地 45s 全绿）：
   1. composer 提交：hook+transcript 往返后恰好一个用户气泡，且带
      `data-command-id^=cmd_`；
   2. 附加终端原生键入：恰好一个无 `data-command-id` 的用户气泡；
-  3. POST 延迟：等待发送期间一条气泡、只一个原生动作，响应后原地合并不重复；
-  4. POST 5xx：气泡与标签显示「状态待确认」，1.5s 内无重发；reload 不产生
-     新原生动作、不重复节点。
+  3. POST 延迟：等待发送期间一条气泡、只一次 POST，响应后原地合并不重复，
+     GET catchup 不被路由拦截；
+  4. POST 502：气泡与标签显示「状态待确认」，仅一次 POST 尝试、1.5s 内无
+     重发；reload 不产生额外原生动作、乐观气泡消失，直接查
+     `/journal` 确认失败的 POST 从未被 Node 记录。
 
 > 文件按协调器约定命名为 `*.hub.spec.ts`，未改
 > `playwright.hub.config.ts`（待 wt/ux-g2 的 `\.hub\.spec\.ts$` 匹配落地）。

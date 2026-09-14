@@ -399,7 +399,33 @@ stateDiagram-v2
     reconciling --> unknown: 无法判定
 ~~~
 
-图中的 `answer_committed` 对应 wire `answer-committed`。同一请求重放不产生第二个卡片；有答案的请求永不回到可回答 pending。`resolved` 只表示原生不再等待，不保证选择了 allow，也不保证工具已执行成功；必须读 resolution、delivery 与对应 tool_result。
+图中的 `answer_committed` 对应 wire `answer-committed`。同一请求重放不产生第二个卡片；有答案的请求永不回到可回答 pending。`resolved` 只表示原生不再等待，不保证选择了 allow，也不保证工具已执行成功；必须读 resolution、delivery 与 application 字段。
+
+### 2.7 工作区当前变更（只读 SCM 快照）
+
+工作台「工作区当前变更」视图只由 Node 对**注册工作区当前工作树**的实时只读计算支撑（[files-view-contract.md](./files-view-contract.md) §3）。这是三个 Hub→Node JSON-RPC 与三个 operator-only Hub REST 代理；不新增 observation kind、不写 journal、Hub 不缓存任何文件内容或 diff。方法名进入 Node 的显式 `match`，不能依赖 WSS 派发的 `{"ok":true}` 兜底。
+
+**只读与授权边界。**
+
+- 定轴只接受 `workspaceId`（`workspace.scm.file`/`.diff` 另加相对 `path`），不接受绝对路径、`repo`、`base`。Node 必须命中自己的注册表并重新通过 canonical 身份校验；未注册或根已迁移 → `NotFound`（视图「工作区不存在」）。
+- 内容路径在读取前用 `path_guard::absolutize/real_path/contain` 以注册根为唯一允许根重新校验，拒绝绝对路径、`..` 穿越、glob/`:(` pathspec magic，以及解析到根外的符号链接；最终叶子以 `O_NOFOLLOW` 打开，闭合校验与读取之间的 symlink 替换窗口。
+- git 以 argv 数组调用（无 shell）：`--no-optional-locks`、`current_dir("/")`、`LC_ALL=C`、`GIT_OPTIONAL_LOCKS=0`、`GIT_TERMINAL_PROMPT=0`，且每个子命令必须命中固定白名单模板（`rev-parse --show-toplevel` / `rev-parse HEAD` / `symbolic-ref --quiet --short HEAD` / `status --porcelain=v2 -z --untracked-files=all` / `diff --no-color --no-ext-diff [--cached] -- <path>`）；路径只能出现在字面 `--` 之后。每次调用走有界、可杀进程组、有 5 秒截止与输出字节上限的 helper。
+
+| JSON-RPC（Hub→Node，只读） | 参数 | 结果要点 |
+| --- | --- | --- |
+| `workspace.scm.status` | `{workspaceId}` | `availability: ok|unsupported|denied`、`headOid`、`branch`、`observedAt`、`entries[]`（相对 `path`、经典两字符 `xy`、`kind`、`sizeBytes`、`oldOid/newOid`，列表期 digest 为 `unknown("not-collected")`；重命名条目额外带 `origPath`）、`limits`、`truncated` |
+| `workspace.scm.diff` | `{workspaceId, paths:[…], staged:bool}` | 每路径 `{path, patch|null, binary, truncated, bytesAvailable}`，总量受 `maxDiffBytes` 封顶并回传 `truncated.diffBytes/bytesOmitted` |
+| `workspace.scm.file` | `{workspaceId, path}` | 未跟踪/新文件当前字节：`mediaType`、`binary`、`sizeBytes`、`digest:{known,"sha256:…"}`、`content|null`、`truncated`；超 `maxFileBytes` 不返回内容，二进制不内联 |
+
+`status` 的可用性穷举为视图六态（无变化 / 尚未采集 / 不支持 / 权限不足 / 离线 / 工作区不存在），前端不得合并成「加载失败」。非 git 目录的判定是 `rev-parse --show-toplevel` 结果**等于注册根本身**，避免祖先目录恰好是仓库时误判为受支持；探针被拒或超时映射为 `availability:"denied"`。
+
+| Hub REST（operator-only，纯代理、无缓存） | Node 方法 | 离线语义 |
+| --- | --- | --- |
+| `GET /v1/hosts/{id}/workspaces/{workspaceId}/changes` | `workspace.scm.status` | host 不在线 → 409 `HOST_OFFLINE`；会话不可写 → 422 `PLACEMENT_UNSATISFIABLE` |
+| `GET …/changes/diff?path=&staged=` | `workspace.scm.diff` | 同上 |
+| `GET …/changes/file?path=` | `workspace.scm.file` | 同上 |
+
+会话内 agent 凭据对三个 REST 一律 403 fail-closed。响应不含 `instanceId`/`turn` 字段，UI 标题恒为「工作区当前变更」；列表与内容是两次独立采集，`headOid`/`sizeBytes`/digest 不一致时前端只显示「内容在采集后变化，请刷新」并提供手动刷新，不自动轮询、不静默替换。
 
 ## 3. Driver 接口与能力声明
 

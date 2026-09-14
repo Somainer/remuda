@@ -1045,8 +1045,17 @@ async fn pump(
     ctx: &PromoteCtx,
 ) -> Result<(), ()> {
     let lines = hydrator.tail.poll().map_err(|_| ())?;
-    for line in lines {
-        let mapped = match hydrator.mapper.map_line(&line) {
+    // The mapper buffers an assistant run until something supersedes it, so
+    // the last message of a batch would otherwise sit unseen until the next
+    // record arrives — which, at the end of a turn, may be minutes away.
+    // Flushing at the end of each poll is what makes a finished turn appear.
+    let mut batches: Vec<_> = lines
+        .iter()
+        .map(|line| hydrator.mapper.map_line(line))
+        .collect();
+    batches.push(hydrator.mapper.flush());
+    for batch in batches {
+        let mapped = match batch {
             Ok(mapped) => mapped,
             Err(error) => {
                 tracing::debug!(%error, "transcript line did not map");

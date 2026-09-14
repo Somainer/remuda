@@ -281,7 +281,7 @@ describe("compactTranscript", () => {
     };
     const inflight = compactTranscript(
       [
-        { type: "message", id: "u", role: "user", text: "q", status: "complete" },
+        { type: "message", id: "u", role: "user", text: "q", status: "complete", origin: "human" },
         thought,
         tool,
       ],
@@ -290,10 +290,10 @@ describe("compactTranscript", () => {
     expect(inflight.some((n) => n.type === "compact")).toBe(false);
     const done = compactTranscript(
       [
-        { type: "message", id: "u", role: "user", text: "q", status: "complete" },
+        { type: "message", id: "u", role: "user", text: "q", status: "complete", origin: "human" },
         thought,
         tool,
-        { type: "message", id: "a", role: "assistant", text: "ok", status: "complete" },
+        { type: "message", id: "a", role: "assistant", text: "ok", status: "complete", origin: "human" },
       ],
       true,
     );

@@ -60,6 +60,20 @@ pub fn hook_session_fixture() -> &'static str {
     include_str!("../fixtures/hooks/claude-hook-session.jsonl")
 }
 
+/// A recorded session whose assistant text arrives as **several**
+/// `MessageDisplay` chunks (D-028 §7, P3).
+///
+/// [`hook_session_fixture`] covers the event vocabulary but was captured
+/// headless, where claude fires `MessageDisplay` once with the whole message
+/// (`final: true`, one chunk) — so it cannot exercise streaming at all. This
+/// one is from an interactive PTY, the only place the text actually arrives
+/// incrementally: `index:0 delta:"1\n2\n3\n4\n"` then `index:1 final:true
+/// delta:"5\n6\n7\n8"`. Host paths and identifiers are scrubbed; the field
+/// shapes and chunk boundaries are verbatim.
+pub fn hook_message_stream_fixture() -> &'static str {
+    include_str!("../fixtures/hooks/claude-message-stream.jsonl")
+}
+
 /// Path to the recorded hook session, for tests that want to read it at runtime.
 pub fn hook_session_path() -> PathBuf {
     fixtures_dir()

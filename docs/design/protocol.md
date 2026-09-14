@@ -843,6 +843,8 @@ type MessagePayload = NodeMutation & {
   targetBlock: number|null;
   parentToolCallId: Id|null;
   nativeOrigin: Knowledge<string>;
+  origin: "human"|"injected-skill"|"injected-command-output"
+        |"hook-context"|"tool-result"|"compaction"|"unknown";
   status: "queued"|"streaming"|"complete"|"interrupted"|"unknown";
 };
 type ThoughtPayload = NodeMutation & {
@@ -872,6 +874,10 @@ open 的 revision 为 1、baseRevision 为 null；append/replace/close 的 revis
 PTY 输入因原生交互或 control 尚未就绪而等待时，Node 以 user message 的 `status: "queued"` 记录待发文本；确认写入后用相同 node/message ID 的 replace 更新为 `complete`。`PromptMode: "queue"`（§3.1）走的是同一套账本，区别只在于排队是调用方**明确要求**的而不是 ready 判定推出来的；两者都不新增 status 值。这里的 complete 仅证明输入已发送，不证明 assistant turn 完成。排队期间 `instance.create` 可结算 accepted，Instance 保持 ready，原生阻塞交互仍可回答；未发送即取消/关闭的消息更新为 interrupted。`queued` 不用于 thought。
 
 同一 node 的 source 优先级由字段定义：结构化 native item/message 负责内容和最终 tool 结果；hook 负责它自身的前后事件和交互请求；screen 只负责展示提示。低信息来源不能把高信息值改成空值。usage 不随 message replace 被累加第二次。thought 只显示原生实际输出的文本/summary，redacted thinking 保存 redaction 标记，不尝试恢复隐藏内容。
+
+**`origin`（D-028 P3 增量字段）**：`role` 说的是这条记录被记在谁名下，`origin` 说的是**它到底是谁写的**。Claude transcript 把 skill 正文、slash 命令展开（`<command-message>` / `<command-name>`）、`<local-command-stdout>`、hook additionalContext、`<task-notification>`、tool result、compact 摘要**一律记成 `user` 记录**——把它们都画成用户气泡，既重复又让人误以为是自己发的。因此分类必须落在 mapper 上，由**证据**判定而不是猜文本：`isCompactSummary` → `compaction`；`sourceToolUseID` 或含 `tool_result` block → `tool-result`；`isMeta` → `injected-skill`；`<command-*>` 开头 → `injected-skill`（命令调用）；`<local-command-*>` 开头 → `injected-command-output`；`<system-reminder>` / `<task-notification>` 开头 → `hook-context`；其余为 `human`。Claude 自报的 `origin.kind`（`human` / `task-notification` / …）与 `promptSource`（`typed` / `sdk` / `system`）**优先于**上述启发式，因为那是 harness 的直接陈述。
+
+**不得丢弃**：注入项仍要进 journal（否则无法解释 agent 为什么那样答），只是 UI 默认折叠成一行。`unknown` 按 `human` 渲染——漏判要表现为多显示一条，不能表现为静默吞掉用户的话。同一条人类 prompt 可能既有入队记录又有投递记录（共享 `promptId`），按 `promptId` + 文本去重**保留第一条**。
 
 ### 5.3 Workflow
 

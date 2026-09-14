@@ -1,5 +1,6 @@
 import type {
   ContentBlock,
+  MessageOrigin,
   NodeMutation,
   Observation,
   ToolCallPayload,
@@ -29,7 +30,22 @@ export type ToolNode = {
 };
 
 export type TranscriptNode =
-  | { type: "message"; id: string; role: "user" | "assistant" | "system"; text: string; status: string; local?: LocalBubble }
+  | {
+      type: "message";
+      id: string;
+      role: "user" | "assistant" | "system";
+      text: string;
+      status: string;
+      /**
+       * Who wrote it (protocol §5.2). A Claude transcript files skill bodies,
+       * slash-command markup, hook context and task notifications as `user`
+       * records, so only `origin === "human"` may render as the user's own
+       * bubble. Absent on pre-D-028 producers, which read as `human`: showing
+       * one row too many is recoverable, hiding what someone said is not.
+       */
+      origin: MessageOrigin;
+      local?: LocalBubble;
+    }
   | { type: "thought"; id: string; text: string; completeness: Observation["completeness"] }
   | ToolNode
   | {
@@ -120,10 +136,20 @@ function assembleMessages(events: Observation[]): Map<MessageEvent, MessageNode>
       // show its available suffix until the missing revisions arrive.
       const hasBase = mutation && (payload.operation !== "append" || payload.baseRevision === mutation.revision);
       blocks = messageBlocks(hasBase ? blocks : [], payload.blocks, payload.operation, payload.targetBlock);
-      node ??= { type: "message", id: group[0].payload.messageId, role: payload.role, text: "", status: payload.status };
+      node ??= {
+        type: "message",
+        id: group[0].payload.messageId,
+        role: payload.role,
+        text: "",
+        status: payload.status,
+        origin: "human",
+      };
       node.text = blocksText(blocks);
       node.role = payload.role;
       node.status = payload.status;
+      // `origin` is additive: a producer that does not classify leaves it
+      // undefined, and an unclassified message must stay visible.
+      node.origin = payload.origin ?? "human";
       mutation = payload;
     }
     if (node) messages.set(group[0], node);
@@ -276,7 +302,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   }
 
   for (const node of nodes) {
-    if (node.type === "message" && node.role === "user") seenUser.add(node.text);
+    if (node.type === "message" && node.role === "user" && node.origin === "human") {
+      seenUser.add(node.text);
+    }
   }
   for (const bubble of bubbles) {
     if (bubble.state === "settled") continue;
@@ -287,6 +315,8 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       role: "user",
       text: bubble.text,
       status: bubble.state,
+      // A local bubble is text this user just typed into the composer.
+      origin: "human",
       local: bubble,
     });
   }

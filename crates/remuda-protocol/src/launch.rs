@@ -128,6 +128,10 @@ pub struct NativeHome {
 /// **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only,
 /// and is never persisted as a level name.
 ///
+/// [`EffortName`] additionally carries `minimal`, which Claude Code does not
+/// expose: the Codex/Grok vocabularies do. It is rejected at Claude launches
+/// by the driver, so it can never reach `claude --effort`.
+///
 /// Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes
 /// legacy tier **names**, so a stored row or an old client keeps working:
 ///
@@ -136,6 +140,7 @@ pub struct NativeHome {
 /// | `default` | `low` |
 /// | `think` | `high` |
 /// | `think-hard` | `xhigh` |
+/// | `ultra` | `xhigh` (the old top codex/web tier; codex's current top is `xhigh`) |
 /// | `ultracode` | `xhigh` + `ultracode: true` |
 /// | anything unrecognized | `high` (the documented default tier) |
 ///
@@ -146,7 +151,7 @@ pub struct NativeHome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EffortSelection {
-    /// One of the five Claude effort levels.
+    /// Claude level (`low..=max`); `minimal` is Codex/Grok-only.
     pub name: EffortName,
     /// Dynamic-workflow flag (`--effort ultracode`). Session-only.
     pub ultracode: bool,
@@ -170,6 +175,10 @@ impl EffortSelection {
                 name: EffortName::Low,
                 ultracode: false,
             },
+            "minimal" => Self {
+                name: EffortName::Minimal,
+                ultracode: false,
+            },
             "medium" => Self {
                 name: EffortName::Medium,
                 ultracode: false,
@@ -178,7 +187,7 @@ impl EffortSelection {
                 name: EffortName::High,
                 ultracode: false,
             },
-            "xhigh" | "think-hard" => Self {
+            "xhigh" | "think-hard" | "ultra" => Self {
                 name: EffortName::Xhigh,
                 ultracode: false,
             },
@@ -201,6 +210,7 @@ impl EffortSelection {
     /// than collapsing into a name that is not one of the five.
     pub fn level_name(&self) -> &'static str {
         match self.name {
+            EffortName::Minimal => "minimal",
             EffortName::Low => "low",
             EffortName::Medium => "medium",
             EffortName::High => "high",

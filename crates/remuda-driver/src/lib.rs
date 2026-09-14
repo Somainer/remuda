@@ -16,6 +16,7 @@ pub mod claude_pty;
 pub mod claude_transcript;
 pub mod codex_rollout;
 mod driver;
+pub mod effort;
 mod error;
 mod flags;
 pub mod generic_pty;

@@ -541,13 +541,15 @@ fn materialize_shell_pty_agent(
             argv.push(path.to_string_lossy().into_owned());
         }
     }
-    // §9.1: `--effort <name>`, and `--effort ultracode` when the flag is set.
-    // Absent effort emits nothing at all rather than pinning a default the
-    // user never chose.
-    if let Some(effort) = request.spec.effort {
-        argv.push("--effort".into());
-        argv.push(effort.flag_value().into());
-    }
+    // §9.1 + composer-slider-5: the selection reaches each CLI in its OWN
+    // vocabulary: `--effort` for claude, `-c model_reasoning_effort=…` for
+    // codex (a top-level `--effort` is a clap error in codex), canonical
+    // `--reasoning-effort` for grok. Absent effort emits nothing at all rather
+    // than pinning a default the user never chose.
+    argv.extend(crate::effort::effort_argv(
+        request.spec.kind,
+        request.spec.effort,
+    )?);
     match &request.session {
         SessionAction::Resume { session_id } => {
             argv.push("--resume".into());
@@ -565,6 +567,9 @@ fn materialize_shell_pty_agent(
             )));
         }
     }
+    // Effort is emitted per-kind just above; a caller-supplied duplicate would
+    // either repeat it or use the other CLI's vocabulary.
+    crate::effort::ensure_no_effort_in_extras(request.spec.kind, &extras)?;
     argv.extend(extras);
     crate::presets::merge_yolo_argv(
         &mut argv,
@@ -1128,10 +1133,10 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
     argv.push("--model".into());
     argv.push(model.to_string());
     // §9.1: launch-time effort. `--effort ultracode` is the flag spelling for
-    // the boolean; it is not a sixth level name.
+    // the boolean; it is not a sixth level name. `minimal` is a Codex/Grok
+    // spelling that claude does not parse — refuse rather than launch-crash.
     if let Some(effort) = effort {
-        argv.push("--effort".into());
-        argv.push(effort.flag_value().into());
+        argv.extend(crate::effort::effort_argv(AgentKind::Claude, Some(effort))?);
     }
     if driver != DriverKind::ClaudeBg {
         match session {

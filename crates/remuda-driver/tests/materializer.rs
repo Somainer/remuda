@@ -1127,8 +1127,7 @@ mod shell_pty_agent {
         }
     }
 
-    /// §9.1: `--effort <level>`, `--effort ultracode` when the flag is set,
-    /// and nothing at all when no effort was requested.
+    /// §9.1 / composer-slider-5: each CLI gets its own effort spelling.
     #[test]
     fn effort_becomes_one_flag_or_none() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1183,6 +1182,97 @@ mod shell_pty_agent {
             1,
             "one flag, never a level plus a boolean"
         );
+    }
+
+    /// Codex takes `-c model_reasoning_effort="…"`, grok takes
+    /// `--reasoning-effort <v>`; neither ever receives a top-level `--effort`
+    /// (codex's clap rejects it) and no value outside the verified set.
+    #[test]
+    fn codex_and_grok_effort_use_their_native_vocabulary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut codex = agent_spec(AgentKind::Codex);
+        for (name, expected) in [
+            (EffortName::Minimal, "minimal"),
+            (EffortName::Low, "low"),
+            (EffortName::Medium, "medium"),
+            (EffortName::High, "high"),
+            (EffortName::Xhigh, "xhigh"),
+        ] {
+            codex.effort = Some(EffortSelection {
+                name,
+                ultracode: false,
+            });
+            let out = recipe(&codex, tmp.path(), LaunchOrigin::Human);
+            assert!(
+                !out.argv.iter().any(|t| t == "--effort"),
+                "codex rejects --effort: {:?}",
+                out.argv
+            );
+            let config = out
+                .argv
+                .iter()
+                .find(|t| t.starts_with("model_reasoning_effort="))
+                .unwrap_or_else(|| panic!("missing overlay: {:?}", out.argv));
+            assert_eq!(config, &format!("model_reasoning_effort=\"{expected}\""));
+        }
+
+        // `max` is not in codex's offered set and must error, not pass through.
+        codex.effort = Some(EffortSelection {
+            name: EffortName::Max,
+            ultracode: false,
+        });
+        let binary = stub_binary(tmp.path(), "1.0.0");
+        let home = tmp.path().join("home-max");
+        fs::create_dir_all(&home).unwrap();
+        let mut bad = request(
+            &codex,
+            Box::leak(Box::new(native_profile())),
+            &tmp.path().join("launch-codex-max"),
+            &home,
+            pin_source(&binary),
+        );
+        bad.origin = LaunchOrigin::Human;
+        assert!(materialize(&bad).is_err());
+
+        // Grok: canonical flag, menu vocabulary only.
+        let mut grok = agent_spec(AgentKind::Grok);
+        for (name, expected) in [
+            (EffortName::Low, "low"),
+            (EffortName::Medium, "medium"),
+            (EffortName::High, "high"),
+            (EffortName::Xhigh, "xhigh"),
+        ] {
+            grok.effort = Some(EffortSelection {
+                name,
+                ultracode: false,
+            });
+            let out = recipe(&grok, tmp.path(), LaunchOrigin::Human);
+            let value = out
+                .argv
+                .iter()
+                .position(|t| t == "--reasoning-effort")
+                .and_then(|i| out.argv.get(i + 1))
+                .map(String::as_str);
+            assert_eq!(value, Some(expected), "{name:?}: {:?}", out.argv);
+            assert!(!out.argv.iter().any(|t| t == "--effort"));
+        }
+        for name in [EffortName::Minimal, EffortName::Max] {
+            grok.effort = Some(EffortSelection {
+                name,
+                ultracode: false,
+            });
+            let home = tmp.path().join(format!("home-grok-{name:?}"));
+            fs::create_dir_all(&home).unwrap();
+            let mut bad = request(
+                &grok,
+                Box::leak(Box::new(native_profile())),
+                &tmp.path().join(format!("launch-grok-{name:?}")),
+                &home,
+                pin_source(&binary),
+            );
+            bad.origin = LaunchOrigin::Human;
+            assert!(materialize(&bad).is_err(), "{name:?} must be rejected");
+        }
     }
 
     /// D-011 / D-017 survive the move out of the herdr driver: yolo argv needs

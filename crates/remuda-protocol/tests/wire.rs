@@ -476,9 +476,10 @@ mod d028 {
             ("xhigh", EffortName::Xhigh, false),
             ("max", EffortName::Max, false),
             ("ultracode", EffortName::Xhigh, true),
+            // The old web/codex top tier `ultra` migrates to the current top.
+            ("ultra", EffortName::Xhigh, false),
             // Unrecognized spellings fall to the documented default rather
             // than failing a launch over a stale UI string.
-            ("ultra", EffortName::High, false),
             ("whatever-the-ui-said", EffortName::High, false),
         ] {
             let expected = EffortSelection { name, ultracode };

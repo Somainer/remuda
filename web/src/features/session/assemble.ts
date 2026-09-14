@@ -11,6 +11,7 @@ import type {
   WorkflowRunPayload,
 } from "../../types/generated";
 import type { Interaction } from "../../types/generated";
+import type { Id } from "../../types/wire";
 import { knowledgeValue } from "../../types/command";
 import { familyFor, type ToolFamily } from "./toolRegistry";
 import type { LocalBubble } from "../../lib/store";
@@ -45,6 +46,12 @@ export type TranscriptNode =
        */
       origin: MessageOrigin;
       local?: LocalBubble;
+      /**
+       * Server command that delivered this prompt (C2). Present only on human
+       * user nodes that came through a Remuda command; natively typed prompts
+       * leave it unset.
+       */
+      commandId?: Id;
     }
   | { type: "thought"; id: string; text: string; completeness: Observation["completeness"] }
   | ToolNode
@@ -150,6 +157,9 @@ function assembleMessages(events: Observation[]): Map<MessageEvent, MessageNode>
       // `origin` is additive: a producer that does not classify leaves it
       // undefined, and an unclassified message must stay visible.
       node.origin = payload.origin ?? "human";
+      // C2: carry the delivering command id so the UI can attribute the
+      // node and hide the matching optimistic bubble.
+      if (payload.commandId != null) node.commandId = payload.commandId;
       mutation = payload;
     }
     if (node) messages.set(group[0], node);
@@ -308,16 +318,35 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   }
   for (const bubble of bubbles) {
     if (bubble.state === "settled") continue;
-    if (seenUser.has(bubble.text) && bubble.state !== "queued") continue;
+    // C2: a journal node carrying the same commandId is the authoritative
+    // copy of this optimistic bubble — the Node joined hook/transcript
+    // evidence onto the delivering command. The Node journals its own queued
+    // observation as soon as the command is enqueued, which can beat the HTTP
+    // response, so this match hides the bubble even while it is still
+    // `queued`: the journal node carries that status itself.
+    if (bubble.commandId) {
+      const joinedById = events.some(
+        (ev) =>
+          ev.kind === "message" &&
+          (ev.payload as { commandId?: string }).commandId === bubble.commandId,
+      );
+      if (joinedById) continue;
+    } else {
+      // No server id (pre-C2 producers / POST failure): keep the legacy text
+      // rule, which never hides an in-flight queued bubble.
+      if (bubble.state !== "queued" && seenUser.has(bubble.text)) continue;
+    }
     nodes.push({
       type: "message",
-      id: bubble.id,
+      // The node's local identity is the pre-POST clientRequestId.
+      id: bubble.clientRequestId,
       role: "user",
       text: bubble.text,
       status: bubble.state,
       // A local bubble is text this user just typed into the composer.
       origin: "human",
       local: bubble,
+      commandId: bubble.commandId ?? undefined,
     });
   }
 

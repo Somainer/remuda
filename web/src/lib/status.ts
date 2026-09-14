@@ -2,6 +2,20 @@ import type { Instance, UiStatus } from "../types/instance";
 import { knowledgeValue } from "../types/command";
 import { canShowTerminal, hasStructuredSignal } from "../features/session/tty/gate";
 
+/**
+ * Chinese wording for the instance-level UI status. The single source the
+ * header label and {@link StateDot} should converge on (C2 wired the header;
+ * `StateDot` keeps its own identical map until a later batch touches it).
+ */
+export const UI_STATUS_LABEL: Record<UiStatus, string> = {
+  blocked: "待处理",
+  working: "运行中",
+  starting: "启动中",
+  idle: "空闲",
+  exited: "已退出",
+  unknown: "状态未知",
+};
+
 /** UI status dot = lifecycle × activity × connectivity (ui-spec §2.1). */
 export function projectStatus(instance: Instance): UiStatus {
   if (instance.lifecycle === "unknown" || instance.lifecycle === "reconciling" || instance.connectivity !== "connected") {

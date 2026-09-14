@@ -3,6 +3,7 @@ import type { Instance } from "../types/instance";
 import type { Observation } from "../types/observation";
 import { api } from "./api";
 import { mockDb } from "./mock";
+import type { LocalBubble } from "./store";
 import { hubStore } from "./store";
 
 type History = Awaited<ReturnType<typeof api.eventsRead>>;
@@ -84,4 +85,77 @@ it("keeps concurrent follows of distinct journals independent", async () => {
     .toEqual([first.instance.journalId, second.instance.journalId].sort());
   expect(hubStore.getSnapshot().events[first.instance.id]).toEqual([first.event]);
   expect(hubStore.getSnapshot().events[second.instance.id]).toEqual([second.event]);
+});
+
+/** A user-message live batch attributed to `commandId`. */
+function userBatch(instance: Instance, commandId: string | null, text: string, seq: string) {
+  return {
+    subscriptionId: `sub_${instance.id}`,
+    journalId: instance.journalId,
+    fromSeq: seq,
+    toSeq: seq,
+    durableSeq: seq,
+    events: [
+      {
+        ...fixture("live").event,
+        eventId: `evt_live_${seq}_${commandId ?? "native"}`,
+        instanceId: instance.id,
+        journalId: instance.journalId,
+        seq,
+        payload: {
+          nodeId: `obj_node_${seq}_${commandId ?? "native"}`,
+          messageId: `obj_node_${seq}_${commandId ?? "native"}`,
+          revision: "3",
+          baseRevision: "2",
+          operation: "replace",
+          role: "user",
+          phase: "input",
+          blocks: [{ type: "text", text }],
+          targetBlock: null,
+          parentToolCallId: null,
+          nativeOrigin: { state: "known", value: "ui" },
+          origin: "human",
+          ...(commandId ? { commandId } : {}),
+          status: "complete",
+        },
+      },
+    ],
+  };
+}
+
+it("reconciles bubbles by commandId on the live stream, even for identical text", async () => {
+  const { instance, history } = fixture("reconcile");
+  vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
+  vi.spyOn(api, "eventsRead").mockResolvedValue(history);
+  const subscribe = vi.spyOn(api, "eventsSubscribe").mockResolvedValue(subscription(instance));
+
+  await hubStore.follow(instance.id);
+  const onBatch = subscribe.mock.calls[0]?.[2] as (batch: unknown) => void;
+
+  // Two sends with the same text, each with its own server command.
+  const twins: LocalBubble[] = [
+    { clientRequestId: "local_a", instanceId: instance.id, text: "twin", commandId: "cmd_a", state: "accepted", createdAt: "t" },
+    { clientRequestId: "local_b", instanceId: instance.id, text: "twin", commandId: "cmd_b", state: "accepted", createdAt: "t" },
+  ];
+  (hubStore as unknown as { emit: (patch: { bubbles: typeof twins }) => void }).emit({
+    bubbles: hubStore.getSnapshot().bubbles.concat(twins),
+  });
+  expect(hubStore.getSnapshot().bubbles).toHaveLength(2);
+
+  // Only cmd_a's journal node arrives. The text is identical, so a text-only
+  // rule could not tell which bubble it settles; the commandId rule can.
+  onBatch(userBatch(instance, "cmd_a", "twin", "2"));
+  await vi.waitFor(() => {
+    const settled = hubStore.getSnapshot().bubbles.map((b) => b.state);
+    expect(settled).toEqual(["settled", "accepted"]);
+  });
+
+  // cmd_b's node settles the remaining one; a natively-typed node
+  // (no commandId) with the same text does not settle it prematurely.
+  onBatch(userBatch(instance, null, "twin", "3"));
+  expect(hubStore.getSnapshot().bubbles.map((b) => b.state)).toEqual(["settled", "accepted"]);
+  onBatch(userBatch(instance, "cmd_b", "twin", "4"));
+  await vi.waitFor(() => {
+    expect(hubStore.getSnapshot().bubbles.map((b) => b.state)).toEqual(["settled", "settled"]);
+  });
 });

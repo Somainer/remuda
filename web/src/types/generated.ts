@@ -1898,6 +1898,7 @@ export type MessageOrigin = ("human" | "injected-skill" | "injected-command-outp
 export type MessagePayload = ({
   "baseRevision": (U64 | (null));
   "blocks": ((ContentBlock)[]);
+  "commandId"?: (CommandId | (null));
   "messageId": Id;
   "nativeOrigin": Knowledge2;
   "nodeId": Id;

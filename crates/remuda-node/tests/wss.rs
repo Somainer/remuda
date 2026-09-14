@@ -1215,7 +1215,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","prompt":"human-origin"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","grants":["dispatch"],"prompt":"human-origin"})),
         None,
     )
     .await;
@@ -1358,8 +1358,21 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
             assert_eq!(status, 403, "{route}: {body}");
         }
     }
+    // §2.5: this agent holds dispatch, so it may list instances — but only
+    // its own subtree. The fleet-wide GET is no longer refused for it; the
+    // sibling instance above must not appear.
+    let (status, fleet) = request(hub.addr, agent, "/v1/instances", None, None).await;
+    assert_eq!(status, 200, "{fleet}");
+    let visible: Vec<&str> = fleet["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["instanceId"].as_str().unwrap())
+        .collect();
+    assert!(visible.contains(&parent_id));
+    assert!(visible.contains(&child_id));
+    assert!(!visible.contains(&sibling_id));
     for route in [
-        "/v1/instances",
         "/v1/hosts",
         "/v1/devices",
         "/v1/providers",

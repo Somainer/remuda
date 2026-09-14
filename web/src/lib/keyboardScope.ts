@@ -37,3 +37,14 @@ export function isTypingTarget(target: EventTarget | null): boolean {
 export function isTerminalTarget(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest(TERMINAL_SELECTOR) != null;
 }
+
+/**
+ * True when *focus itself* currently sits in a text-entry surface or terminal.
+ *
+ * Event-target guards only cover the key being pressed; the hold-to-reveal
+ * modifier hook also has to hide its badges the moment the user clicks into
+ * the composer while the modifier is still physically down.
+ */
+export function isTypingFocusActive(doc: Document = document): boolean {
+  return isTypingTarget(doc.activeElement);
+}

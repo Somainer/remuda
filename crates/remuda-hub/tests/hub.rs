@@ -1198,6 +1198,295 @@ async fn create_instance_persists_delegation_and_provider_profile() -> Result<()
     Ok(())
 }
 
+/// Per-host launch defaults: PATCH round-trip, create-time merge, and the
+/// session-replaces-default rule.
+#[tokio::test]
+async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "runtime.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "label": "local-development",
+                "host": { "hostname": "local-development", "maxInstances": 4 }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+    let sink = seen.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            sink.lock().expect("lock").push(frame.clone());
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let _ = node
+                .send(Message::Text(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+        }
+    });
+
+    let host_path = format!("/v1/hosts/{}", host_id.as_id().as_str());
+
+    // PATCH stores both defaults and the view reports them back.
+    let (status, _, patched) = http(
+        hub.addr,
+        "PATCH",
+        &host_path,
+        &[("Cookie", &cookie)],
+        Some(
+            &json!({
+                "defaultLaunchArgs": ["--effort", "high"],
+                "claudeBinaryPath": "/opt/claude/bin/claude"
+            })
+            .to_string(),
+        ),
+    )
+    .await?;
+    assert_eq!(status, 200, "{patched}");
+    let patched: Value = serde_json::from_str(patched.trim())?;
+    assert_eq!(patched["defaultLaunchArgs"], json!(["--effort", "high"]));
+    assert_eq!(patched["claudeBinaryPath"], json!("/opt/claude/bin/claude"));
+
+    // A flag the allowlist refuses is a 400 on the PATCH, not a surprise at
+    // the next launch.
+    let (status, _, rejected) = http(
+        hub.addr,
+        "PATCH",
+        &host_path,
+        &[("Cookie", &cookie)],
+        Some(&json!({ "defaultLaunchArgs": ["--dangerously-skip-permissions"] }).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 400, "{rejected}");
+
+    // A create that omits both inherits the host defaults.
+    let create = |extra: Value| {
+        let mut body = json!({
+            "hostId": host_id.as_id().as_str(),
+            "kind": "claude",
+            "driver": "claude-print",
+            "permissionMode": "manual",
+            "prompt": "defaults"
+        });
+        if let (Some(obj), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        body.to_string()
+    };
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create(json!({}))),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+
+    // A session value REPLACES the host default rather than concatenating:
+    // two arg lists merged would repeat a flag, which the allowlist refuses.
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create(json!({
+            "args": ["--effort", "low"],
+            "binaryPath": "/opt/claude-2.2/bin/claude"
+        }))),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+
+    let frames = seen.lock().expect("lock").clone();
+    let specs: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["method"] == json!("instance.create"))
+        .map(|f| &f["params"]["spec"])
+        .collect();
+    assert_eq!(specs.len(), 2, "two creates were forwarded: {frames:?}");
+    assert_eq!(specs[0]["args"], json!(["--effort", "high"]));
+    assert_eq!(specs[0]["binaryPath"], json!("/opt/claude/bin/claude"));
+    assert_eq!(specs[1]["args"], json!(["--effort", "low"]));
+    assert_eq!(
+        specs[1]["binaryPath"],
+        json!("/opt/claude-2.2/bin/claude"),
+        "the session value must win outright"
+    );
+
+    // A bad session flag is a 400 from the same table the Node uses.
+    let (status, _, refused) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create(json!({ "args": ["--bare"] }))),
+    )
+    .await?;
+    assert_eq!(status, 400, "{refused}");
+
+    // Clearing a default is distinct from never setting one.
+    let (status, _, cleared) = http(
+        hub.addr,
+        "PATCH",
+        &host_path,
+        &[("Cookie", &cookie)],
+        Some(&json!({ "defaultLaunchArgs": null, "claudeBinaryPath": null }).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 200, "{cleared}");
+    let cleared: Value = serde_json::from_str(cleared.trim())?;
+    assert!(cleared["defaultLaunchArgs"].is_null(), "{cleared}");
+    assert!(cleared["claudeBinaryPath"].is_null(), "{cleared}");
+    Ok(())
+}
+
+/// An instance never inherits operator authority, so it picks neither its own
+/// flags nor its own executable.
+#[tokio::test]
+async fn agent_scoped_create_cannot_set_args_or_binary_path() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "runtime.hello",
+            "params": {
+                "hostId": host_id.as_id().as_str(),
+                "nodeVersion": "0.1.0",
+                "label": "local-development",
+                "host": { "hostname": "local-development", "maxInstances": 8 }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let _ = node
+                .send(Message::Text(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+        }
+    });
+
+    let parent_body = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "permissionMode": "manual",
+        "prompt": "parent"
+    })
+    .to_string();
+    let (status, _, created) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&parent_body),
+    )
+    .await?;
+    assert_eq!(status, 200, "{created}");
+    let created: Value = serde_json::from_str(created.trim())?;
+    let parent = created["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+
+    for extra in [
+        json!({ "args": ["--effort", "high"] }),
+        json!({ "binaryPath": "/opt/claude/bin/claude" }),
+    ] {
+        let mut body = json!({
+            "hostId": host_id.as_id().as_str(),
+            "kind": "claude",
+            "driver": "claude-print",
+            "permissionMode": "manual",
+            "prompt": "child"
+        });
+        if let (Some(obj), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        let (status, _, refused) = http(
+            hub.addr,
+            "POST",
+            "/v1/instances",
+            &[("Cookie", &cookie), ("x-remuda-instance-id", &parent)],
+            Some(&body.to_string()),
+        )
+        .await?;
+        assert_eq!(status, 403, "{extra} -> {refused}");
+    }
+
+    // Without either field the same agent-scoped create still works, so the
+    // gate is the fields and not the caller being blocked outright.
+    let plain = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "permissionMode": "manual",
+        "prompt": "child-plain"
+    })
+    .to_string();
+    let (status, _, ok) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie), ("x-remuda-instance-id", &parent)],
+        Some(&plain),
+    )
+    .await?;
+    assert_eq!(status, 200, "{ok}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_instance_fails_when_node_rejects_cwd() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;

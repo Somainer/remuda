@@ -156,6 +156,19 @@ impl PasskeyRecord {
     }
 }
 
+/// Per-host launch defaults an operator PATCH may change.
+///
+/// Two levels of Option per field: the outer is "did the PATCH mention this",
+/// the inner is "set it or clear it". Collapsing them would leave no way to
+/// remove a default once set.
+#[derive(Debug, Clone, Default)]
+pub struct HostLaunchDefaultsPatch {
+    /// Per-host default extra CLI args. `Some(None)` clears the default.
+    pub default_launch_args: Option<Option<Vec<String>>>,
+    /// Per-host default claude executable. `Some(None)` clears it.
+    pub claude_binary_path: Option<Option<String>>,
+}
+
 /// Host index row (Hub projection).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -202,6 +215,12 @@ pub struct HostRecord {
     /// Provider binding: `auto` | `native` | `profile:<id>` (D-021).
     #[serde(default = "default_provider_binding")]
     pub provider_binding: String,
+    /// Per-host default extra CLI args, used when a create omits `args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_launch_args: Option<Vec<String>>,
+    /// Per-host default claude executable. Stored as given; the Node validates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_binary_path: Option<String>,
     /// Last acknowledged Node workspace registry.
     #[serde(default)]
     pub workspaces: Vec<Value>,
@@ -2280,7 +2299,12 @@ impl Store {
         labels: Option<Value>,
         max_instances: Option<i64>,
         provider_binding: Option<String>,
+        launch_defaults: HostLaunchDefaultsPatch,
     ) -> Result<HostRecord, StoreError> {
+        let HostLaunchDefaultsPatch {
+            default_launch_args,
+            claude_binary_path,
+        } = launch_defaults;
         self.run(move |conn| {
             if load_host(conn, &host_id)?.is_none() {
                 return Err(StoreError::Id("unknown host".into()));
@@ -2310,6 +2334,26 @@ impl Store {
                 conn.execute(
                     "UPDATE hosts SET provider_binding = ?1 WHERE id = ?2",
                     params![provider_binding, host_id],
+                )?;
+            }
+            // Two levels of Option: the outer is "did the PATCH mention this
+            // field", the inner is "set it or clear it". Collapsing them would
+            // leave no way to remove a default once set.
+            if let Some(args) = default_launch_args {
+                let encoded = args
+                    .map(|args| serde_json::to_string(&args))
+                    .transpose()
+                    .map_err(|error| StoreError::Id(error.to_string()))?;
+                conn.execute(
+                    "UPDATE hosts SET default_launch_args = ?1 WHERE id = ?2",
+                    params![encoded, host_id],
+                )?;
+            }
+            if let Some(path) = claude_binary_path {
+                let path = path.filter(|value| !value.trim().is_empty());
+                conn.execute(
+                    "UPDATE hosts SET claude_binary_path = ?1 WHERE id = ?2",
+                    params![path, host_id],
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
@@ -2985,6 +3029,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "provider_binding",
         "TEXT NOT NULL DEFAULT 'auto'",
     )?;
+    // Per-host launch defaults. Nullable like `hostname`: absent means "no
+    // default", which is different from "an empty arg list".
+    ensure_column(&conn, "hosts", "default_launch_args", "TEXT")?;
+    ensure_column(&conn, "hosts", "claude_binary_path", "TEXT")?;
     ensure_column(
         &conn,
         "provider_profiles",
@@ -4248,7 +4296,7 @@ mod tests {
         // The insert guard still fences a burst: fresh `requested` rows count
         // there, so a host at its ceiling refuses another create…
         store
-            .patch_host(host.clone(), None, None, Some(2), None)
+            .patch_host(host.clone(), None, None, Some(2), None, Default::default())
             .await
             .expect("cap 2");
         let pending = seed_instance(&store, &host).await;
@@ -4404,7 +4452,7 @@ mod tests {
             let store = Store::open(dir.path()).expect("store");
             enroll_labeled(&store, host.clone(), "cap-node").await;
             let patched = store
-                .patch_host(host.clone(), None, None, Some(32), None)
+                .patch_host(host.clone(), None, None, Some(32), None, Default::default())
                 .await
                 .expect("patch");
             assert_eq!(patched.max_instances, 32);
@@ -4597,7 +4645,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         .query_row(
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
                     labels_json, herdr_json, resources_json,
-                    COALESCE(max_instances_override, max_instances), hostname, provider_binding
+                    COALESCE(max_instances_override, max_instances), hostname, provider_binding,
+                    default_launch_args, claude_binary_path
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -4618,6 +4667,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                     row.get::<_, Option<String>>(13)?
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "auto".into()),
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
                 ))
             },
         )
@@ -4637,6 +4688,8 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         max_instances,
         hostname,
         provider_binding,
+        default_launch_args,
+        claude_binary_path,
     )) = row
     else {
         return Ok(None);
@@ -4689,6 +4742,13 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         max_instances,
         hostname,
         provider_binding,
+        // A column that fails to parse is treated as absent rather than
+        // failing the read: a malformed default must not make the host
+        // unloadable and the whole fleet view unavailable.
+        default_launch_args: default_launch_args
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
+        claude_binary_path: claude_binary_path.filter(|value| !value.trim().is_empty()),
         workspaces,
         workspace_revision: workspace_revision.max(0) as u64,
     }))

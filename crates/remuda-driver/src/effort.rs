@@ -10,13 +10,12 @@
 //! | codex | `-c model_reasoning_effort="<v>"` | minimal low medium high xhigh |
 //! | grok | `--reasoning-effort <v>` (alias `--effort`) | low medium high xhigh |
 //!
+//! The vocabulary and the legacy migration (`ultra`/`quick`/`standard`/
+//! `max`…) live in ONE place,
+//! [`remuda_protocol::normalize_legacy_effort`]; this module only validates
+//! that an already-normalized selection is launchable and renders argv.
 //! Codex's `codex` binary rejects a top-level `--effort` at parse time, so a
-//! selection must be mapped onto `-c`, never forwarded as a flag. Grok's
-//! canonical flag is `--reasoning-effort` (`--effort` is only a visible alias).
-//! `max` exists in the Codex enum but is not advertised by any current model
-//! catalog and `ultra` belongs to newer 5.6 models this client pins behind an
-//! advanced picker; the slider offers only the common verified set, and a
-//! stray value is a typed error here rather than a word passed to the binary.
+//! selection must be mapped onto `-c`, never forwarded as a flag.
 
 use crate::error::{DriverError, DriverResult};
 use remuda_protocol::{AgentKind, EffortName, EffortSelection};

@@ -215,15 +215,29 @@ impl CreateInstanceRequest {
         if self.effort.is_none() {
             // Accepts both the D-028 object and the legacy `effortName`
             // string the Hub has stored on specs since before it existed.
-            self.effort = spec
+            // Normalization is per harness through the shared protocol
+            // helper: a grok `quick/standard/max` or codex `ultra` row must
+            // migrate onto the verified native vocabulary, not a Claude
+            // default.
+            let raw = spec
                 .get("effort")
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .or_else(|| {
-                    spec.get("effortName")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|value| !value.is_empty())
-                        .map(remuda_protocol::EffortSelection::from_legacy_name)
-                });
+                .and_then(|value| value.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| spec.get("effort").and_then(serde_json::Value::as_str))
+                .or_else(|| spec.get("effortName").and_then(serde_json::Value::as_str))
+                .filter(|value| !value.is_empty());
+            let raw_ultracode = spec
+                .get("effort")
+                .and_then(|value| value.get("ultracode"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.effort = raw.map(|name| {
+                let mut selection = remuda_protocol::normalize_legacy_effort(self.kind, name);
+                if raw_ultracode {
+                    selection.ultracode = true;
+                }
+                selection
+            });
         }
     }
 }

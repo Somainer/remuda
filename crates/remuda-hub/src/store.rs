@@ -1979,10 +1979,21 @@ impl Store {
                     .and_then(Value::as_str)
                     .map(|name| json!(name))
             });
-            if let Some(incoming) = incoming
-                && let Ok(selection) =
-                    serde_json::from_value::<remuda_protocol::EffortSelection>(incoming)
-            {
+            if let Some(incoming) = incoming {
+                // Normalize with the instance's own kind, the same shared
+                // per-harness map insert uses.
+                let kind = object
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("claude");
+                let effort_kind = remuda_protocol::effort_kind_from_str(kind);
+                let selection = if let Some(name) = incoming.as_str() {
+                    // A bare legacy word goes through the per-kind migrator.
+                    remuda_protocol::normalize_legacy_effort(effort_kind, name)
+                } else {
+                    // The D-028 object: deserialize the current enum word.
+                    serde_json::from_value::<remuda_protocol::EffortSelection>(incoming)?
+                };
                 object.insert(
                     "effort".into(),
                     json!({
@@ -4056,6 +4067,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_effort_tier_names_normalize_by_name_not_index() {
         let (_dir, store, host) = store_with_host("enroll-legacy-effort").await;
+        // Claude rows use the Claude legacy table; unknown → high.
         for (legacy, index, level, ultracode) in [
             ("default", 0, "low", false),
             ("think", 1, "high", false),
@@ -4063,7 +4075,6 @@ mod tests {
             ("ultracode", 3, "xhigh", true),
             // Codex's index 3 was `ultra`, not `ultracode` — normalizing by
             // index instead of name would silently turn it into ultracode.
-            ("ultra", 3, "high", false),
             ("max", 4, "max", false),
         ] {
             let instance = store
@@ -4087,6 +4098,74 @@ mod tests {
             // The legacy index survives for older clients but never decided
             // the tier above.
             assert_eq!(reloaded.effort_index, Some(index), "{legacy}");
+        }
+        // Cross-crate: for EVERY legacy word the web/driver tables migrate,
+        // the Hub store must land on exactly what the shared
+        // remuda-protocol normalizer returns. This pins the three layers
+        // (protocol table, Hub row, driver argv) to the one function.
+        let cases = [
+            ("claude", "default"),
+            ("claude", "think"),
+            ("claude", "think-hard"),
+            ("claude", "ultra"),
+            ("claude", "ultracode"),
+            ("claude", "whatever"),
+            ("codex", "ultra"),
+            ("codex", "bogus"),
+            ("grok", "quick"),
+            ("grok", "standard"),
+            ("grok", "max"),
+            ("grok", "bogus"),
+        ];
+        for (kind, legacy) in cases {
+            let expected = remuda_protocol::normalize_legacy_effort(
+                remuda_protocol::effort_kind_from_str(kind),
+                legacy,
+            );
+            // Insert below the maxInstances gate so the large cross-crate
+            // table exercises load_instance's normalization directly.
+            let instance_id = new_id("ins").unwrap();
+            let journal_id = new_id("obj").unwrap();
+            let now = now_rfc3339();
+            let spec = json!({ "effortName": legacy, "effortIndex": 9 }).to_string();
+            let reload_id = instance_id.clone();
+            store
+                .run({
+                    let host = host.clone();
+                    move |conn| {
+                        conn.execute(
+                            "INSERT INTO instances
+                                (id, host_id, workspace_id, kind, driver, lifecycle, activity,
+                                 connectivity, title, journal_id, durable_seq, spec_json,
+                                 created_at, updated_at)
+                             VALUES (?1, ?2, NULL, ?3, 'generic-pty', 'running', 'idle',
+                                     'connected', ?4, ?5, 0, ?6, ?7, ?7)",
+                            params![
+                                instance_id.clone(),
+                                host,
+                                kind,
+                                format!("legacy-{kind}-{legacy}"),
+                                journal_id,
+                                spec,
+                                now
+                            ],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
+            let reloaded = store.get_instance(reload_id).await.unwrap().unwrap();
+            assert_eq!(
+                reloaded.effort_name.as_deref(),
+                Some(expected.level_name()),
+                "{kind}:{legacy} disagrees with remuda-protocol"
+            );
+            assert_eq!(
+                reloaded.effort_ultracode,
+                Some(expected.ultracode),
+                "{kind}:{legacy} disagrees with remuda-protocol"
+            );
         }
     }
 
@@ -4913,10 +4992,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let effort = spec.get("effort");
-            // D-028 §9.1: normalize by NAME, never by index. The legacy
-            // tables were per-harness and different lengths, so index 3 was
-            // `ultracode` for claude but `ultra` for codex — carrying the
-            // index across would silently change the tier.
+            // D-028 §9.1: normalize by NAME, never by index, using the shared
+            // per-harness normalizer (remuda-protocol): codex `ultra` and the
+            // invented grok quick/standard/max table migrate onto the verified
+            // vocabulary here, exactly as the driver and the web table do.
             let legacy_name = effort
                 .and_then(|value| value.get("name"))
                 .and_then(Value::as_str)
@@ -4926,8 +5005,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(|value| value.get("ultracode"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let effort_kind =
+                remuda_protocol::effort_kind_from_str(row.get::<_, String>(3)?.as_str());
             let normalized = legacy_name.map(|name| {
-                let mut selection = remuda_protocol::EffortSelection::from_legacy_name(name);
+                let mut selection = remuda_protocol::normalize_legacy_effort(effort_kind, name);
                 if effort_ultracode {
                     selection.ultracode = true;
                 }

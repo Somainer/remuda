@@ -1,0 +1,128 @@
+/* Shared overlay surface (UX plan §2). Batches B/D/F style their contents, not
+   the scrim — the scrim and panel geometry live here so every overlay in the
+   workbench sits at the same depth and reads the same in both themes. */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: var(--scrim);
+  display: flex;
+}
+
+/* Desktop: anchored under the toolbar, near the trigger that opened it. */
+.scrim[data-variant="popover"] {
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: calc(var(--top) + 8px) 20px 20px;
+}
+
+/* Phone: rises from the bottom edge, clear of the home indicator. */
+.scrim[data-variant="sheet"] {
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0;
+}
+
+.panel {
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  color: var(--paper);
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.panelPopover {
+  border-radius: var(--radius);
+  width: min(420px, 100%);
+  padding: 14px 16px 16px;
+  gap: 12px;
+}
+
+.panelSheet {
+  border-radius: var(--radius) var(--radius) 0 0;
+  border-bottom: none;
+  width: 100%;
+  max-height: 80vh;
+  padding: 16px 16px calc(16px + var(--safe-bottom));
+  gap: 14px;
+}
+
+/* The centered dialog keeps its own geometry; Modal.tsx still uses
+   ui.module.css for it, which batch F owns. These are here only so a caller
+   can reach the same tokens without editing that shared file. */
+.modalScrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: var(--scrim);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.modalPanel {
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  width: min(520px, calc(100% - 24px));
+  margin-bottom: calc(24px + var(--safe-bottom));
+  padding: 16px;
+}
+
+/* A header row most overlays want: title on the left, close on the right. */
+.head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.close {
+  margin-left: auto;
+  height: 32px;
+  min-width: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-size: 13px;
+  padding: 0 10px;
+}
+
+.close:hover {
+  color: var(--paper);
+}
+
+/* Phones get the project's 44px touch target (exploration §P1-3). `min-height`
+   rather than `height`: under border-box a fractional device-pixel border
+   rounds the painted box just under the target. */
+@media (max-width: 767px) {
+  .close {
+    height: auto;
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .panelSheet {
+    animation: rise 140ms ease-out;
+  }
+}
+
+@keyframes rise {
+  from {
+    transform: translateY(8px);
+  }
+  to {
+    transform: translateY(0);
+  }
+}

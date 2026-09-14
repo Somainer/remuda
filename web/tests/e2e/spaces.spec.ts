@@ -142,3 +142,42 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   expect(await panel.getByTestId("space-select").evaluateAll((buttons) => buttons.map((button) => button.getAttribute("data-space-id")))).toEqual(order);
   expect(errors).toEqual([]);
 });
+
+/**
+ * P0-1 §5: the filter conditions live in the URL, so a deep link and a reload
+ * must produce the same list, and a Space must say which host it is on when the
+ * directory name alone cannot tell two Spaces apart.
+ */
+test("filter conditions survive a deep link and a reload, and the scope names its host", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  await page.goto("/sessions");
+  const scope = page.getByTestId("session-scope");
+  await expect(scope).toHaveAttribute("data-scope", "space");
+  // A Space is a host + directory pair, and the scope line spells out both so
+  // two Spaces sharing a directory name stay distinguishable (§2.2).
+  await expect(scope).toContainText("当前 Space 固定范围");
+  const hostInScope = await scope.innerText();
+  expect(hostInScope).toMatch(/·/);
+
+  // Deep-link straight into a global text search.
+  await page.goto("/sessions?scope=all&q=codex");
+  await expect(page.getByTestId("session-scope")).toHaveAttribute("data-scope", "all");
+  await expect(page.getByTestId("session-search")).toHaveValue("codex");
+  const matched = await page.getByTestId("board-card").count();
+  expect(matched).toBeGreaterThan(0);
+  await expect(page.getByTestId("session-match-count")).toContainText(`${matched} /`);
+
+  // A reload is the same URL, so it is the same list.
+  await page.reload();
+  await expect(page.getByTestId("session-search")).toHaveValue("codex");
+  await expect(page.getByTestId("board-card")).toHaveCount(matched);
+
+  // Clearing is one explicit action and never touches a session.
+  await page.getByTestId("session-clear-filters").click();
+  await expect(page.getByTestId("session-search")).toHaveValue("");
+  expect(await page.getByTestId("board-card").count()).toBeGreaterThanOrEqual(matched);
+  expect(errors).toEqual([]);
+});

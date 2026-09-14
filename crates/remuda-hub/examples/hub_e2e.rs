@@ -6,7 +6,7 @@ use futures::{SinkExt, StreamExt};
 use remuda_hub::{DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, spawn};
 use remuda_protocol::{HostId, InteractionId};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -257,6 +257,8 @@ async fn fake_node(
                     "labels": { "role": "e2e" },
                     // The shared Hub, slider and spaces scenarios create five instances.
                     "maxInstances": 8,
+                    // Inventory only: this harness never launches herdr.
+                    "herdr": { "version": "e2e-fake" },
                     "cli": [{
                         "kind": "claude",
                         "version": "2.1.268",
@@ -279,6 +281,11 @@ async fn fake_node(
                             "kind": "claude-print",
                             "launchable": true,
                             "reasonCode": "fake-node-legacy"
+                        },
+                        {
+                            "kind": "claude-pty",
+                            "launchable": true,
+                            "reasonCode": "fake-node-resume"
                         },
                         {
                             "kind": "generic-pty",
@@ -312,6 +319,8 @@ async fn fake_node(
     // (so the test can prove an Escape reached the process rather than being
     // swallowed by the browser) and echoes a visible marker back.
     let mut ttys: HashMap<String, TtyFake> = HashMap::new();
+    // A failed Claude launch must not acquire a TTY through lazy attach.
+    let mut claude_ptys = HashSet::new();
     while let Some(msg) = ws.next().await {
         let Ok(Message::Text(text)) = msg else {
             continue;
@@ -341,7 +350,54 @@ async fn fake_node(
                 )
                 .await?;
             }
-            "instance.create" => {
+            "instance.create" | "instance.resume" => {
+                let spec = params.get("spec").unwrap_or(&params);
+                if spec.get("driver").and_then(Value::as_str) == Some("claude-pty") {
+                    claude_ptys.insert(instance_id.clone());
+                    // Model the real driver's launch prerequisite, so this
+                    // e2e fails if resume omits either provider delivery field.
+                    let has_overlay = spec.get("providerOverlay").is_some_and(Value::is_object);
+                    let has_token = spec
+                        .get("providerAuthToken")
+                        .and_then(Value::as_str)
+                        .is_some_and(|token| !token.is_empty());
+                    if spec.get("delegation").and_then(Value::as_str) == Some("gateway")
+                        && (!has_overlay || !has_token)
+                    {
+                        send_rpc_error(
+                            &mut ws,
+                            id,
+                            "gateway delegation requires a settings overlay: fake Node did not receive providerOverlay and providerAuthToken",
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let session_id = spec
+                        .get("resumeSessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                    ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                    append_n = append_instance_state(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "ready",
+                        Some(&session_id),
+                    )
+                    .await?;
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "instanceId": instance_id }),
+                    )
+                    .await?;
+                    continue;
+                }
+                if method == "instance.resume" {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    continue;
+                }
                 let kind = params
                     .pointer("/spec/kind")
                     .or_else(|| params.get("kind"))
@@ -443,7 +499,13 @@ async fn fake_node(
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
-            "instance.close" | "instance.resume" => {
+            "instance.close" => {
+                if claude_ptys.contains(&instance_id) {
+                    ttys.remove(&instance_id);
+                    append_n =
+                        append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
+                            .await?;
+                }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
             "interaction.list" => {
@@ -462,6 +524,10 @@ async fn fake_node(
                 .await?;
             }
             "tty.attach" => {
+                if claude_ptys.contains(&instance_id) && !ttys.contains_key(&instance_id) {
+                    send_rpc_error(&mut ws, id, "instance has no TTY bridge").await?;
+                    continue;
+                }
                 // The Hub asks for the live PTY stream when a follower opens
                 // the terminal tab. Registering lazily keeps resume onto a
                 // session created before this node connection behaved.
@@ -569,6 +635,54 @@ async fn send_rpc_ok(
     ))
     .await?;
     Ok(())
+}
+
+async fn send_rpc_error(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: Value,
+    message: &str,
+) -> Result<()> {
+    ws.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": message } })
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Confirm resource lifecycle and the native identity needed by Hub resume.
+async fn append_instance_state(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    n: u64,
+    state: &str,
+    session_id: Option<&str>,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": format!("j{seq}"), "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity", "entityType": "instance", "state": state,
+                        "entity": { "nativeRef": { "sessionId": { "value": session_id } } }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    Ok(seq)
 }
 
 async fn append_journal(

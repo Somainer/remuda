@@ -138,8 +138,13 @@ attachments-2 的分层，本轮只把编号补到各层：
 3. **未引用仍发送**：删掉正文 token → chip 标 `未引用（仍会发送）` →
    发送后回声 `[attachments: image/png,image/png]`，sent 缩略图仍为两张。
 
-假 node 陷阱按既有约定处理：开测前与每个测试后 `DELETE /v1/instances?force=1`
-清掉残留（maxInstances 8），创建后走 API 回答那个会锁住 composer 的 approval。
+假 node 陷阱按既有约定处理（见 `hub-e2e-fake-node-traps` 记忆）：
+`beforeAll` 用 `PATCH /v1/hosts/{id} {"maxInstances": 24}` 抬高上限
+（串行套件到本 spec 时通常已占 7/8 槽，且 force-DELETE 要先 close、对假 node
+每条要数秒，来不及在创建超时内回收；与 ux-quickfind 同一解法），
+`afterAll` 恢复 8；每个测试后并发 `DELETE /v1/instances/{id}?force=1`
+（`force=1` 是 u8，`force=true` 会 400）；创建后走 API 回答那个会锁住
+composer 的 approval。
 
 ## 6 未验证 / 留给后续
 

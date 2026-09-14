@@ -54,7 +54,7 @@
 ## 3 · 测试
 
 - `web/src/lib/newSessionDraft.test.ts`（19 例）：身份/主机/工作目录三段隔离；无身份仅内存且不提升到存储；hostile 字段与被篡改存储的清洗；版本/损坏数据拒绝；与 `runtime.draft.<instanceId>` 共存互不触碰；空草稿判定。
-- `web/src/pages/NewSessionPage.test.tsx`（28 例）：保留全部既有创建/worktree/effort/launch 参数用例；新增来源返回（会话/列表/深链回退）、Escape 保留草稿与重开恢复、显式丢弃、首层无实现词汇、终端命名 shell-pty、ACK 未知恰好一次 create 且不能二次提交、明确 4xx 可修正后再提交。
+- `web/src/pages/NewSessionPage.test.tsx`（29 例）：保留全部既有创建/worktree/effort/launch 参数用例；新增来源返回（会话/列表/深链回退）、Escape 保留草稿与重开恢复、显式丢弃、首层无实现词汇、终端命名 shell-pty、ACK 未知恰好一次 create 且不能二次提交、明确 4xx 可修正后再提交。
 - `web/tests/e2e/new-session.spec.ts`：
   - mock-backed：原有 30 秒路径、终端、布局 A 滑块六档/ultracode/重吸附/等宽与证据用例保留；
   - hub-live（fake Hub + fake Node，`playwright.hub.config.ts`，串行单 worker）：纯键盘创建恰好一次 POST；**未知 ACK**——`page.route` 先 `route.fetch()` 让真实 Hub/fake Node 完成创建再回 504，客户端显示 `状态待确认`、POST 恰好 1 次、刷新只读不重发，服务端 `GET /v1/instances` 只多出恰好 1 个实例；390px 软键盘几何。
@@ -62,7 +62,7 @@
 
 ### 本机运行记录（共享开发机，2026-09-14）
 
-- `pnpm --dir web lint` / `tsc -b`：通过；`pnpm --dir web test`：74 文件 513 例通过。
+- `pnpm --dir web lint` / `tsc -b`：通过；`pnpm --dir web test`：74 文件 514 例通过。
 - mock e2e（chromium via `ws://127.0.0.1:3177`）：本 spec 19 通过 / 2 失败；失败用例均为「kind terminal uses shell-pty」（chromium 与 mobile-webkit 同一原因），在未改动的 origin/main 上同样失败（已知的 mock-backed 基线问题，见本机 devbox 记录；根因在 `SessionPage` 的 baseView 选择，本批未触碰），与本批改动无关。
 - hub e2e（`HUB_E2E_LISTEN=127.0.0.1:58280 HUB_E2E_WEB_PORT=58289`，`flock /tmp/remuda-agents/e2e.lock`，conda OpenSSL 3）：本批三个新用例首次运行全部通过；同轮另两个失败（hub-live 承载矩阵断言因矩阵移入高级区、spaces-hub-live 关闭按钮名）已在本批修正并复验；`providers-discovery` 的失败属于该共享机记录在案的基线 flake 集合（本机高负载），本分支未触碰该路径。
 

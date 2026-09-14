@@ -1,12 +1,9 @@
-import { isValidElement, useState, type ReactNode } from "react";
+import { isValidElement, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
-import { clipboardIo } from "../lib/clipboard";
 import ui from "../styles/ui.module.css";
-import { Button } from "./Button";
-
-const COLLAPSE_LINES = 8;
+import { CodeBlock } from "./CodeBlock";
 
 function nodeText(node: ReactNode): string {
   if (node == null || typeof node === "boolean") return "";
@@ -16,38 +13,26 @@ function nodeText(node: ReactNode): string {
   return "";
 }
 
-function CodeBlock({ children }: { children?: ReactNode }) {
-  const text = nodeText(children);
-  const lines = text.split("\n").length;
-  const [expanded, setExpanded] = useState(false);
-  const collapsible = lines > COLLAPSE_LINES;
-  const collapsed = collapsible && !expanded;
-  return (
-    <div data-testid="code-block">
-      <div className={ui.codeHead}>
-        {collapsible ? (
-          <Button variant="ghost" data-testid="code-expand" onClick={() => setExpanded((v) => !v)}>
-            {expanded ? "收起" : "展开"}
-          </Button>
-        ) : null}
-        <Button
-          variant="ghost"
-          data-testid="code-copy"
-          onClick={() => {
-            void clipboardIo.write(text);
-          }}
-        >
-          复制
-        </Button>
-      </div>
-      <pre data-testid="code-pre" style={collapsed ? { maxHeight: 160, overflow: "hidden" } : undefined}>
-        {children}
-      </pre>
-    </div>
-  );
+type CodeChildProps = { className?: string; children?: ReactNode };
+
+/**
+ * react-markdown renders fenced code as <pre><code class="language-x">. Pull
+ * the info string and the raw text out so CodeBlock owns the block; anything
+ * else inside a pre falls back to the default element.
+ */
+function renderPre(children: ReactNode): ReactNode {
+  const child = Array.isArray(children) ? children[0] : children;
+  if (isValidElement(child) && child.type === "code") {
+    const props = child.props as CodeChildProps;
+    const match = /language-(\S+)/.exec(props.className ?? "");
+    const info = match?.[1] ?? null;
+    const code = nodeText(props.children).replace(/\n$/, "");
+    return <CodeBlock code={code} info={info} />;
+  }
+  return <pre>{children}</pre>;
 }
 
-/** react-markdown + remark-gfm + rehype-sanitize: GFM without raw HTML; Shiki deferred (WASM cost on PWA shell). */
+/** react-markdown + remark-gfm + rehype-sanitize: GFM without raw HTML; code colour is lazy on demand. */
 export function MarkdownText({ text }: { text: string }) {
   return (
     <div className={ui.md}>
@@ -55,7 +40,7 @@ export function MarkdownText({ text }: { text: string }) {
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSanitize]}
         components={{
-          pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+          pre: ({ children }) => renderPre(children),
         }}
       >
         {text}

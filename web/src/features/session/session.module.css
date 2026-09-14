@@ -958,12 +958,20 @@
   --pill: 40px;
   --knob-size: 36px;
   --brand: var(--cold);
+  /* Ladder colours, night theme: top = dust, ultracode = bright amber. */
+  --ember-ultra: #f2b95e;
+  --knob-ring-top: rgba(201, 132, 42, 0.45);
+  --knob-ring-ultra: rgba(255, 196, 104, 0.85);
 }
 
 :global([data-theme="ledger"]) .effortCard,
 :global([data-theme="ledger"]) .effortForm {
   --knob-face: #ffffff;
   --knob-edge: rgba(30, 42, 50, 0.2);
+  /* Ledger theme: darker burnt ambers stay readable on paper. */
+  --ember-ultra: #9a5d08;
+  --knob-ring-top: rgba(140, 106, 22, 0.4);
+  --knob-ring-ultra: rgba(154, 93, 8, 0.75);
 }
 
 .effortCard {
@@ -1073,8 +1081,14 @@
   color: var(--paper);
 }
 
-.effortTickEmber {
+/* Restrained top-tier tick (`xhigh`/`max`): warm dust, never animated. */
+.effortTickTop {
   color: var(--dust);
+}
+
+/* Ultracode stop's own tick colour: brighter cream-amber than dust. */
+.effortTickUltra {
+  color: var(--ember-ultra);
 }
 
 /* Full tier names on the wide inline field. */
@@ -1131,8 +1145,14 @@
   justify-content: center;
 }
 
-.effortBoltEmber {
+/* Restrained top-tier bolt/title: dust, no animation. */
+.effortBoltTop {
   color: var(--dust);
+}
+
+/* Ultracode gets its own brighter amber glyph. */
+.effortBoltUltra {
+  color: var(--ember-ultra);
 }
 
 .effortTitleBtn {
@@ -1159,8 +1179,23 @@
   white-space: nowrap;
 }
 
-.effortTitleEmber {
+/* Restrained top-tier title: dust. */
+.effortTitleTop {
   --brand: var(--dust);
+}
+
+/* Ultracode's own title colour — visibly not the `max` dust. */
+.effortTitleUltra {
+  --brand: var(--ember-ultra);
+}
+
+/* Inline form name colours per ladder level. */
+.effortTextTop {
+  color: var(--dust);
+}
+
+.effortTextUltra {
+  color: var(--ember-ultra);
 }
 
 .effortChevron {
@@ -1273,12 +1308,29 @@
 }
 
 /*
- * Top tier only: three spark layers drifting across the amber gradient at
- * different speeds, plus a breathing warm wash — so the pill reads as live
- * embers rather than a texture. Each layer is one painted element animated on
- * transform and opacity alone: no layout, no repaint, no per-spark nodes, no
- * JS. The popover unmounts when it closes, so nothing animates behind a closed
- * card; prefers-reduced-motion keeps the still field and drops the motion.
+ * Restrained top-tier accent (`xhigh`/`max`; the native top row on codex/
+ * grok), same family as the Desktop's "max" look: the cold fill warms toward
+ * dust toward its cap, but there is NO glow, NO spark field and NO animation.
+ * The animated ember below exists only on the ultracode stop, so the two are
+ * impossible to confuse in either theme.
+ */
+.effortFillTop {
+  background: linear-gradient(
+    90deg,
+    var(--cold) 0%,
+    color-mix(in srgb, var(--cold) 62%, var(--dust)) 68%,
+    color-mix(in srgb, var(--dust) 78%, var(--cold)) 100%
+  );
+}
+
+/*
+ * Ultracode stop ONLY: three spark layers drifting across the amber gradient
+ * at different speeds, plus a breathing warm wash — the strongest treatment
+ * in the ladder, rendered at no other stop (not even `max`). Each layer is
+ * one painted element animated on transform and opacity alone: no layout, no
+ * repaint, no per-spark nodes, no JS. The popover unmounts when it closes, so
+ * nothing animates behind a closed card; prefers-reduced-motion keeps the
+ * still field and drops the motion.
  */
 .effortEmbers {
   position: absolute;
@@ -1362,10 +1414,10 @@
 }
 
 /*
- * Ultracode stop only: a fourth layer of small, tightly-spaced bright dots
- * counter-drifting over the three ember layers — the Desktop's denser dotted
- * glow. Denser and whiter than the near layer, but the same transform/opacity
- * motion so nothing extra repaints.
+ * A fourth layer of small, tightly-spaced bright dots counter-drifting over
+ * the three ember layers — the Desktop's dotted glow, the ultracode stop's
+ * signature. Denser and whiter than the near layer, but the same
+ * transform/opacity motion so nothing extra repaints.
  */
 .effortEmberDots {
   background-image:
@@ -1468,6 +1520,38 @@
   box-shadow:
     0 1px 2px var(--knob-edge),
     0 4px 12px var(--knob-edge);
+}
+
+/*
+ * Top-tier thumb (`xhigh`/`max`): one static thin dust ring, no glow, no
+ * motion — the thumb-state half of the restrained accent.
+ */
+.effortKnobTop {
+  box-shadow:
+    0 0 0 1.5px var(--knob-ring-top),
+    0 1px 2px var(--knob-edge),
+    0 4px 10px var(--knob-edge);
+}
+
+/*
+ * Ultracode thumb, its own state: a brighter, thicker amber ring and a warm
+ * face tint, static in itself (the breathing halo beside it is the animated
+ * part and is frozen under reduced motion). Clearly stronger than the top
+ * ring at a glance, in both themes.
+ */
+.effortKnobUltra {
+  box-shadow:
+    0 0 0 2.5px var(--knob-ring-ultra),
+    0 1px 2px var(--knob-edge),
+    0 6px 16px var(--knob-ring-ultra);
+}
+
+:global([data-theme="night"]) .effortKnobUltra {
+  background: color-mix(in srgb, var(--knob-face) 88%, #ffce85);
+}
+
+:global([data-theme="ledger"]) .effortKnobUltra {
+  background: color-mix(in srgb, var(--knob-face) 90%, #e8b866);
 }
 
 .effortListHead {

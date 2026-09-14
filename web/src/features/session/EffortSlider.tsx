@@ -5,15 +5,16 @@ import {
   EFFORT_MENU_FOOTER,
   effortAtStop,
   effortIndexFromClientX,
+  effortLook,
   effortRatio,
   effortStops,
   effortStopIndex,
-  isEmberEffort,
   keyboardEffortIndex,
   modelsFor,
   shortModel,
   ULTRACODE_HINT,
   type EffortKind,
+  type EffortLook,
   type EffortSelection,
   type EffortStop,
 } from "./effort";
@@ -85,7 +86,9 @@ function ResetIcon() {
  * Claude has six stops — low · medium · high (default) · xhigh · max ·
  * ultracode — like the Desktop control. The rightmost stop is not a tier: it
  * selects the `xhigh` tier with the ultracode workflow flag
- * (`{name: "xhigh", ultracode: true}` on the wire) and plays a denser ember.
+ * (`{name: "xhigh", ultracode: true}` on the wire) and plays the full ember
+ * field. `xhigh`/`max` only carry a restrained static top-tier accent — the
+ * animated ember exists nowhere but the ultracode stop (`data-effort-look`).
  */
 export function EffortSlider({
   kind,
@@ -133,7 +136,11 @@ export function EffortSlider({
   const shown = clampEffortIndex(draft ?? propStop, Math.max(1, stops.length));
   const stop: EffortStop | undefined = stops[shown];
   const locked = Boolean(disabled) || stops.length === 0;
-  const ember = isEmberEffort(kind, stop?.index ?? 0, stop?.ultracode === true);
+  // Three-level ladder: plain · top (restrained static accent) · ultracode
+  // (the only animated ember). See effortLook in effort.ts.
+  const look: EffortLook = effortLook(kind, stop?.index ?? 0, stop?.ultracode === true);
+  const ember = look === "ultracode";
+  const top = look === "top";
   const ultraStop = stop?.ultracode === true;
   const ratio = effortRatio(shown, Math.max(1, stops.length));
   const fallback = effortStopIndex(kind, defaultEffortIndex(kind), false);
@@ -206,6 +213,7 @@ export function EffortSlider({
       data-index={String(shown)}
       data-tier-index={String(stop?.index ?? 0)}
       data-name={stop?.name ?? ""}
+      data-effort-look={look}
       data-ember={ember ? "1" : "0"}
       data-ultracode={ultraStop ? "1" : "0"}
       data-tiers={stops.map((s) => s.name).join(",")}
@@ -232,21 +240,23 @@ export function EffortSlider({
         {/* Clipped layer: the pill's own paint. The knob sits outside it so its shadow shows. */}
         <span className={css.effortClip} aria-hidden="true">
           <span
-            className={`${css.effortFill} ${ember ? css.effortFillEmber : ""}`}
+            className={`${css.effortFill} ${ember ? css.effortFillEmber : ""} ${
+              top ? css.effortFillTop : ""
+            }`}
             data-testid={tid("fill")}
           >
             {ember ? (
               <span
-                className={`${css.effortEmbers} ${ultraStop ? css.effortEmbersUltra : ""}`}
+                className={`${css.effortEmbers} ${css.effortEmbersUltra}`}
                 data-testid={tid("embers")}
-                data-intensity={ultraStop ? "ultra" : "ember"}
+                data-intensity="ultra"
               >
                 <span className={css.effortEmberGlow} />
                 <span className={`${css.effortEmberLayer} ${css.effortEmberBack}`} />
                 <span className={`${css.effortEmberLayer} ${css.effortEmberMid}`} />
                 <span className={`${css.effortEmberLayer} ${css.effortEmberFront}`} />
                 {/* Ultracode stop: a fourth, denser dotted drift like the Desktop's glow. */}
-                {ultraStop ? <span className={`${css.effortEmberLayer} ${css.effortEmberDots}`} /> : null}
+                <span className={`${css.effortEmberLayer} ${css.effortEmberDots}`} />
               </span>
             ) : null}
           </span>
@@ -261,31 +271,40 @@ export function EffortSlider({
           ))}
         </span>
         {ember ? (
-          <span
-            className={`${css.effortKnobGlow} ${ultraStop ? css.effortKnobGlowUltra : ""}`}
-            aria-hidden="true"
-          />
+          <span className={`${css.effortKnobGlow} ${css.effortKnobGlowUltra}`} aria-hidden="true" />
         ) : null}
-        <span className={css.effortKnob} data-testid={tid("knob")} />
+        <span
+          className={`${css.effortKnob} ${top ? css.effortKnobTop : ""} ${
+            ember ? css.effortKnobUltra : ""
+          }`}
+          data-testid={tid("knob")}
+        />
       </div>
     </div>
   );
 
   const ticks = (
     <div className={`${css.effortTicks} ${inline ? "" : css.effortTicksPop}`} aria-hidden="true">
-      {stops.map((s, i) => (
-        <span
-          key={s.name}
-          className={`${css.effortTick} ${i === shown ? css.effortTickOn : ""} ${
-            ember && i === shown ? css.effortTickEmber : ""
-          }`}
-          style={{ ["--tick" as string]: String(effortRatio(i, stops.length)) }}
-        >
-          {/* Full names on the wide inline field; shorts in the popover and on narrow tracks. */}
-          <span className={css.effortTickFull}>{s.name}</span>
-          <span className={css.effortTickShort}>{s.short ?? s.name}</span>
-        </span>
-      ))}
+      {stops.map((s, i) => {
+        const stopLook = effortLook(kind, s.index, s.ultracode);
+        return (
+          <span
+            key={s.name}
+            className={`${css.effortTick} ${i === shown ? css.effortTickOn : ""} ${
+              i === shown && stopLook === "ultracode"
+                ? css.effortTickUltra
+                : i === shown && stopLook === "top"
+                  ? css.effortTickTop
+                  : ""
+            }`}
+            style={{ ["--tick" as string]: String(effortRatio(i, stops.length)) }}
+          >
+            {/* Full names on the wide inline field; shorts in the popover and on narrow tracks. */}
+            <span className={css.effortTickFull}>{s.name}</span>
+            <span className={css.effortTickShort}>{s.short ?? s.name}</span>
+          </span>
+        );
+      })}
     </div>
   );
 
@@ -312,7 +331,7 @@ export function EffortSlider({
               className={`${css.effortRow} ${i === shown ? css.effortOn : ""}`}
               data-testid={tid(`tier-${s.name}`)}
               data-selected={i === shown ? "1" : "0"}
-              data-ember={isEmberEffort(kind, s.index, s.ultracode) ? "1" : "0"}
+              data-effort-look={effortLook(kind, s.index, s.ultracode)}
               data-ultracode={s.ultracode ? "1" : "0"}
               title={s.ultracode ? ULTRACODE_HINT : undefined}
               disabled={locked}
@@ -362,12 +381,19 @@ export function EffortSlider({
         data-view="slider"
         data-variant="inline"
         data-disabled={locked ? "1" : "0"}
+        data-effort-look={look}
         data-ultracode={ultraStop ? "1" : "0"}
       >
         <div className={css.effortFormRow}>
           <span className={css.effortFormLabel}>{label}</span>
           <span className={css.effortFormMeta}>
-            <span className={css.effortFormName} data-testid={tid("title")} data-ember={ember ? "1" : "0"}>
+            <span
+              className={`${css.effortFormName} ${
+                look === "ultracode" ? css.effortTextUltra : top ? css.effortTextTop : ""
+              }`}
+              data-testid={tid("title")}
+              data-effort-look={look}
+            >
               {stop?.name ?? "effort"}
             </span>
             <span className={css.effortFormDesc} data-testid={tid("model")}>
@@ -387,20 +413,35 @@ export function EffortSlider({
   }
 
   return (
-    <div className={frame} data-testid={tid("slider-panel")} data-view="slider" data-disabled={locked ? "1" : "0"}>
+    <div
+      className={frame}
+      data-testid={tid("slider-panel")}
+      data-view="slider"
+      data-disabled={locked ? "1" : "0"}
+      data-effort-look={look}
+    >
       <div className={css.effortHead}>
-        <span className={`${css.effortBolt} ${ember ? css.effortBoltEmber : ""}`} aria-hidden="true">
+        <span
+          className={`${css.effortBolt} ${ember ? css.effortBoltUltra : top ? css.effortBoltTop : ""}`}
+          aria-hidden="true"
+        >
           <BoltIcon />
         </span>
         <button
           type="button"
-          className={`${css.effortTitleBtn} ${ember ? css.effortTitleEmber : ""}`}
+          className={`${css.effortTitleBtn} ${
+            ember ? css.effortTitleUltra : top ? css.effortTitleTop : ""
+          }`}
           data-testid={tid("open-list")}
           aria-label={`${stop?.name ?? "effort"}，展开档位与模型`}
           aria-expanded={false}
           onClick={() => setList(true)}
         >
-          <span className={css.effortTitle} data-testid={tid("title")} data-ember={ember ? "1" : "0"}>
+          <span
+            className={css.effortTitle}
+            data-testid={tid("title")}
+            data-effort-look={look}
+          >
             {stop?.name ?? "effort"}
           </span>
           <span className={css.effortChevron}>

@@ -92,12 +92,32 @@ pub fn shim_disabled(value: Option<&str>) -> bool {
 /// would silently find whichever `claude` came first instead. It is already
 /// validated and pinned by [`crate::validate_binary_override`], so no check is
 /// repeated here — but it is still single-quoted, because this is `sh`.
+/// Same as [`materialize_shims_with_env`] with no per-command exports.
 pub fn materialize_shims(
     launch_dir: &Path,
     overlay: &Path,
     credential: &str,
     disabled: bool,
     real_binary: Option<&Path>,
+) -> DriverResult<ShimSet> {
+    materialize_shims_with_env(launch_dir, overlay, credential, disabled, real_binary, &[])
+}
+
+/// Generate shims, exporting `shim_env` into the codex/grok pass-through
+/// shims' environment.
+///
+/// Entries are `(command, key, value)`: a hand-typed `codex`/`grok` reached
+/// through the shim must inherit the per-session shadow `CODEX_HOME` /
+/// `GROK_HOME` even though a promoted terminal did not get the launch-time
+/// environment (D-028 §4.2). Only `codex` and `grok` accept exports; a
+/// non-allowlisted command is ignored.
+pub fn materialize_shims_with_env(
+    launch_dir: &Path,
+    overlay: &Path,
+    credential: &str,
+    disabled: bool,
+    real_binary: Option<&Path>,
+    shim_env: &[(&str, &str, &str)],
 ) -> DriverResult<ShimSet> {
     let bin_dir = launch_dir.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
@@ -110,7 +130,12 @@ pub fn materialize_shims(
         let body = if *command == "claude" {
             claude_shim(command, overlay, real_binary, &markers)
         } else {
-            passthrough_shim(command)
+            let exports: Vec<(&str, &str)> = shim_env
+                .iter()
+                .filter(|(target, _, _)| *target == *command)
+                .map(|(_, key, value)| (*key, *value))
+                .collect();
+            passthrough_shim_with_env(command, &exports)
         };
         let path = bin_dir.join(command);
         std::fs::write(&path, body)?;
@@ -298,16 +323,31 @@ exec "$real_path" --settings "$overlay" --setting-sources user,project,local "$@
 ///
 /// It exists so PATH shape and `command -v` are already right, and so turning
 /// their overlays on later is a change to this file and not to the launch path.
-fn passthrough_shim(command: &str) -> String {
+/// Pass-through shim that exports per-session environment before exec.
+///
+/// Used by codex/grok so a hand-typed command in a promoted terminal still
+/// resolves its shadow `CODEX_HOME` / `GROK_HOME` (D-028 §4.2). Values are
+/// single-quote-escaped; keys are fixed constants from the caller, never user
+/// input.
+fn passthrough_shim_with_env(command: &str, exports: &[(&str, &str)]) -> String {
+    let mut prefix = String::new();
+    for (key, value) in exports {
+        prefix.push_str(&format!("export {}={}\n", key, single_quote(value)));
+    }
     format!(
         r#"#!/bin/sh
 # Remuda per-session launch shim (D-028 §4.2), pass-through.
-# {command} has no overlay until P6; this only keeps PATH resolution honest.
-{resolver}
+# {command} reads its config from the per-session shadow home, not the user's.
+{prefix}{resolver}
 exec "$real_path" "$@"
 "#,
         resolver = resolver(command),
     )
+}
+
+/// POSIX single-quote escaping.
+fn single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Files a zsh shadow `ZDOTDIR` needs, in the order zsh reads them.
@@ -420,10 +460,6 @@ fi
             ""
         },
     )
-}
-
-fn single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(unix)]

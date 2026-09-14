@@ -13,6 +13,9 @@ process.env.REMUDA_E2E_BACKEND = "hub";
 
 export default defineConfig({
   testDir: "./tests/e2e",
+  // New hub-backed specs follow the wt/ux-g2 naming convention
+  // <name>.hub.spec.ts and match the second pattern automatically; until that
+  // lands on main the existing inline list stays in the first.
   testMatch: [
     /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|ux-quickfind|new-session)\.spec\.ts/,
     /\.hub\.spec\.ts$/,

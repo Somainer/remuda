@@ -115,9 +115,10 @@ attachments-2 的分层，本轮只把编号补到各层：
   token 渲染成内联缩略图小 chip，链接到附件预览（`blob:`），chip 上带
   `[Image #n]` 文案；找不到附件的 token 渲染成淡化纯文本 token，**绝不吞字**。
 - **本地乐观气泡已接入**（`Transcript.tsx` 仅一处分支：`node.local` 走
-  AnchorText，journaled user 消息仍走旧 `<p>`，并留
-  `TODO(batch E, r-ux-imgref)`——等 Hub 把附件回声上 journal 后由批次 E
-  在同一组件上收口）。
+  AnchorText，journaled user 消息仍走旧 `<p>`——批次 E
+  （ux-e/transcript-search）已在本轮收尾时合入 main，AnchorText 分支在
+  合并后的新 Transcript 上原样保留；journaled 消息要等 Hub 把附件回声上
+  journal 才能带缩略图）。
 - 已发送气泡的缩略图角标也带编号（`SentAttachments` 的 `data-index`）。
 - store 改动只有锚点映射一行：send 时把 manifest 的 `index` 配到本地预览上。
 
@@ -168,7 +169,7 @@ composer 的 approval。
 | `web/src/features/session/Composer.tsx` | paste/drop/pick 光标处插 token；删 chip 重编号；未引用集合（只碰附件/粘贴路径） |
 | `web/src/features/session/AttachmentChips.tsx` + `.module.css` | 数字角标、未引用态、sent 角标 |
 | `web/src/features/session/AnchorText.tsx`（新）+ CSS + 测试 | 内联缩略图 chip 渲染 |
-| `web/src/features/session/Transcript.tsx` | 本地气泡接入 AnchorText + TODO(batch E) |
+| `web/src/features/session/Transcript.tsx` | 本地气泡接入 AnchorText（journaled 留待附件回声） |
 | `web/src/lib/store.ts` | send 时 index→预览映射（唯一一处附件相关改动） |
 | `web/tests/e2e/ux-imgref.hub.spec.ts`（新） | 端到端两条用例 |
 | `web/playwright.hub.config.ts` | testMatch 数组第二项 `/\.hub\.spec\.ts$/` |

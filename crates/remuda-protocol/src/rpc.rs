@@ -870,6 +870,12 @@ pub struct TtyAttachResult {
     /// Bounded snapshot bytes (standard base64) for attach-time replay; D-016.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_base64: Option<String>,
+    /// `?1049` was active when the snapshot was taken: the session is showing a
+    /// full-screen TUI, which has no meaningful scrollback, so the client must
+    /// leave the wheel to the application instead of hijacking it locally.
+    /// D-028 §4.6 — additive; absent means "not reported", not "not alt".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_screen: Option<bool>,
 }
 
 /// TtyDetachParams; `protocol.md` §7.4.

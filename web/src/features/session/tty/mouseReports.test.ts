@@ -96,3 +96,41 @@ describe("MOUSE_TRACKING_RESET", () => {
     expect(MOUSE_TRACKING_RESET).toBe("[?1000l[?1002l[?1003l[?1006l");
   });
 });
+
+describe("localWheelWanted in the alternate screen (D-028 §4.6)", () => {
+  it("hands the wheel back to a full-screen TUI even with reports off", () => {
+    // Without altScreen this is the exact case that returns true: tracking on,
+    // reports off. A TUI has no scrollback worth scrolling, so the local
+    // hijack would drag the user off the only frame that matters.
+    expect(localWheelWanted({ mouseMode: "any", mouseReports: false })).toBe(true);
+    expect(localWheelWanted({ mouseMode: "any", mouseReports: false, altScreen: true })).toBe(
+      false,
+    );
+  });
+
+  it("keeps the mouse-report path untouched in the alternate screen", () => {
+    // The gate is about the *wheel*, not about reporting: a TUI that asked for
+    // pointer reports must keep getting them, which is inputGate's business
+    // and is unaffected by altScreen.
+    const gate = inputGate({ directInput: true, frozen: false, mouseReports: true });
+    expect(gate).toEqual({ keyboard: true, mouse: true });
+    expect(allowInput("\u001b[<0;22;8M", gate)).toBe(true);
+  });
+
+  it("restores local scrolling when the TUI leaves the alternate screen", () => {
+    expect(localWheelWanted({ mouseMode: "any", mouseReports: false, altScreen: false })).toBe(
+      true,
+    );
+  });
+
+  it("keeps pre-D-028 behaviour when the node does not report the mode", () => {
+    // An older Node, or the raw-ring carrier, which cannot know. Undefined
+    // must not be read as either answer.
+    expect(localWheelWanted({ mouseMode: "any", mouseReports: false, altScreen: undefined })).toBe(
+      true,
+    );
+    expect(localWheelWanted({ mouseMode: "none", mouseReports: false, altScreen: undefined })).toBe(
+      false,
+    );
+  });
+});

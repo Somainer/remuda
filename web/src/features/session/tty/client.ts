@@ -38,6 +38,15 @@ export type TtyHandlers = {
   ) => void;
   onStatus: (status: TtyStatus, message?: string) => void;
   onSnapshot?: () => void;
+  /**
+   * The attached session is (or is no longer) showing a full-screen TUI.
+   *
+   * Reported by the Node on attach (D-028 §4.6) rather than sniffed from the
+   * byte stream, because attaching mid-session never sees the `?1049h` that
+   * put the terminal there. Not called at all when the Node does not report
+   * it, so the caller keeps whatever default it had.
+   */
+  onAltScreen?: (altScreen: boolean) => void;
 };
 
 export type TtySession = {
@@ -230,6 +239,10 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
       return;
     }
     const type = typeof msg.type === "string" ? msg.type : "";
+    if (type === "tty.mode") {
+      if (typeof msg.altScreen === "boolean") handlers.onAltScreen?.(msg.altScreen);
+      return;
+    }
     if (type === "snapshot" || type === "tty.snapshot") {
       sawSnapshot = true;
       resetNext = true;

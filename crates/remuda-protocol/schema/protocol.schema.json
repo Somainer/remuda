@@ -15184,6 +15184,13 @@
     "TtyAttachResult": {
       "description": "TtyAttachResult; `protocol.md` §7.4.",
       "properties": {
+        "altScreen": {
+          "description": "`?1049` was active when the snapshot was taken: the session is showing a\nfull-screen TUI, which has no meaningful scrollback, so the client must\nleave the wheel to the application instead of hijacking it locally.\nD-028 §4.6 — additive; absent means \"not reported\", not \"not alt\".",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "availableFrom": {
           "$ref": "#/$defs/U64",
           "description": "`available_from`; protocol §7.4."

@@ -32,10 +32,7 @@ use crate::claude_transcript::{
     transcript_belongs_to_cwd,
 };
 use crate::error::{DriverError, DriverResult};
-use crate::promote::{
-    Detected, ProcessTable, ScreenStatus, detect, detect_from_screen, foreground_pgid,
-    screen_status,
-};
+use crate::promote::{Detected, ProcessTable, ScreenStatus, detect, foreground_pgid};
 use remuda_protocol::{
     AgentKind, Completeness, DeadlineSource, DeliveryState, EntityLifecycle, EntityMeta, EventId,
     HostId, Id, InstanceId, Interaction, InteractionAnswer, InteractionCarrier, InteractionId,
@@ -730,9 +727,13 @@ pub(super) fn spawn(
 
             // Screen-derived readiness, on the same evidence class claude-pty
             // takes from herdr. Only transitions are journaled.
+            //
+            // The grid is the emulator's when `REMUDA_PTY_EMULATOR=1`, and the
+            // ANSI-stripped ring tail otherwise — the same input the matchers
+            // read before D-028, so the default path is unchanged (§13 P0).
             let status = promote
                 .kind
-                .and_then(|_| screen_status(&screen_text(&state)));
+                .and_then(|_| remuda_screen::screen_status(&state.screen_grid()));
             if let Ok(mut slot) = status_slot.lock() {
                 *slot = status;
             }
@@ -980,16 +981,6 @@ fn agent_status(status: ScreenStatus) -> ObservationPayload {
     .1
 }
 
-/// Current PTY ring as text, for the screen heuristics.
-fn screen_text(state: &PtyState) -> String {
-    state
-        .ring
-        .lock()
-        .ok()
-        .map(|ring| String::from_utf8_lossy(&ring.iter().copied().collect::<Vec<_>>()).into_owned())
-        .unwrap_or_default()
-}
-
 /// One detection sample: foreground process group first, screen as fallback.
 async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> {
     let pgid = {
@@ -999,7 +990,7 @@ async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> 
     if let Some(pgid) = pgid {
         return detect(&table.process_group(pgid));
     }
-    detect_from_screen(&screen_text(state)).map(|kind| Detected {
+    remuda_screen::detect_from_screen(&state.screen_grid()).map(|kind| Detected {
         kind,
         pid: 0,
         session_id: None,

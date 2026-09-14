@@ -1,7 +1,7 @@
 //! TTY binary framing and per-instance PTY bridges.
 
 use crate::NodeError;
-use remuda_driver::{HerdrTty, LocalPty, TTY_SNAPSHOT_MAX, TtyBridge};
+use remuda_driver::{HerdrTty, LocalPty, PtySnapshot, SnapshotSource, TTY_SNAPSHOT_MAX, TtyBridge};
 use remuda_protocol::{BinaryChannel, Id, InstanceId, StreamUuid, U64, encode_binary_frame};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -84,10 +84,18 @@ pub struct TtyAttach {
     pub cols: u16,
     /// Current rows.
     pub rows: u16,
+    /// `?1049` was active when the snapshot was taken, so the client is looking
+    /// at a full-screen TUI and must not hijack the wheel for local scrollback
+    /// (D-028 §4.6). False whenever the snapshot came from the raw ring, which
+    /// cannot know the mode — the client then keeps its existing behaviour.
+    pub alt_screen: bool,
 }
 
 impl TtyAttach {
     /// JSON-RPC result body (includes `snapshotBase64` when non-empty).
+    ///
+    /// D-016 wire format is unchanged; `altScreen` is the one additive field
+    /// (D-028 §4.6), so an older client simply ignores it.
     pub fn into_json(self) -> Result<Value, NodeError> {
         let snapshot_b64 = if self.snapshot.is_empty() {
             None
@@ -106,6 +114,7 @@ impl TtyAttach {
             "snapshotBase64": snapshot_b64,
             "cols": self.cols,
             "rows": self.rows,
+            "altScreen": self.alt_screen,
         }))
     }
 }
@@ -266,27 +275,44 @@ impl TtyRegistry {
             .get(instance_id)
             .cloned()
             .ok_or_else(|| NodeError::InvalidRequest("instance has no TTY bridge".into()))?;
-        let snapshot: Vec<u8> = match &session.backend {
+        let snapshot: PtySnapshot = match &session.backend {
             Backend::Local(local) => {
-                let snap = local.snapshot();
-                if snap.is_empty() {
-                    session.ring.lock().await.iter().copied().collect()
+                let snap = local.screen_snapshot();
+                if snap.bytes.is_empty() {
+                    PtySnapshot::raw_ring(session.ring.lock().await.iter().copied().collect())
                 } else {
                     snap
                 }
             }
-            Backend::Herdr { .. } => session.ring.lock().await.iter().copied().collect(),
+            Backend::Herdr { .. } => {
+                PtySnapshot::raw_ring(session.ring.lock().await.iter().copied().collect())
+            }
         };
         let next_offset = session.offset.load(Ordering::SeqCst);
-        let available_from = next_offset.saturating_sub(snapshot.len() as u64);
+        // A repaint is synthesized, not a slice of the stream, so it occupies
+        // no offset range of its own. Anchoring it at `next_offset` keeps the
+        // client's offset accounting continuous: the snapshot paints the screen
+        // and the next live byte is the first one it has not seen.
+        let available_from = match snapshot.source {
+            SnapshotSource::Repaint => next_offset,
+            SnapshotSource::RawRing => next_offset.saturating_sub(snapshot.bytes.len() as u64),
+        };
+        tracing::debug!(
+            instance_id = %instance_id.as_id(),
+            source = snapshot.source.label(),
+            alt_screen = snapshot.alt_screen,
+            bytes = snapshot.bytes.len(),
+            "tty attach snapshot"
+        );
         Ok(TtyAttach {
             stream_id: session.stream_id.clone(),
             stream_epoch: session.stream_epoch.clone(),
-            snapshot,
+            snapshot: snapshot.bytes,
             available_from,
             next_offset,
             cols: session.cols.load(Ordering::SeqCst),
             rows: session.rows.load(Ordering::SeqCst),
+            alt_screen: snapshot.alt_screen,
         })
     }
 

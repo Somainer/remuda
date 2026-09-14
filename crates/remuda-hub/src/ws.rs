@@ -1091,6 +1091,24 @@ async fn send_tty_snapshot(
                     state.tty.bind(&uuid, host_id, instance_id);
                 }
                 cached_stream_id = stream_id;
+                // D-028 §4.6: tell the follower whether the snapshot it is
+                // about to receive is a full-screen TUI, so it can leave the
+                // wheel to the application instead of guessing from DECSET
+                // bytes it may never have seen. Sent before the snapshot so the
+                // client has the mode in hand while it paints. Absent when the
+                // Node does not report it — the client then keeps its own
+                // behaviour rather than assuming either way.
+                if let Some(alt_screen) = result.get("altScreen").and_then(Value::as_bool) {
+                    let notice = json!({
+                        "type": "tty.mode",
+                        "instanceId": instance_id,
+                        "altScreen": alt_screen,
+                    });
+                    out_tx
+                        .send(FollowMsg::Text(notice.to_string()))
+                        .await
+                        .map_err(|_| ())?;
+                }
                 if let Some(b64) = result.get("snapshotBase64").and_then(Value::as_str)
                     && let Ok(bytes) = decode_b64(b64)
                     && !bytes.is_empty()

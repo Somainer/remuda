@@ -6,9 +6,17 @@
 //! the kernel's answer to "what is the user typing at", so it follows job
 //! control without heuristics. A screen signature over the ring buffer is the
 //! fallback when the fd query is unavailable, never the primary path.
+//!
+//! The screen half of that fallback now lives in `remuda-screen` (D-028 §4.2),
+//! which takes a rendered grid rather than a byte tail. The re-exports and
+//! `&str` adapters below keep existing callers working unchanged; a caller
+//! holding a real emulator grid should call the crate directly instead.
 
 use remuda_protocol::AgentKind;
+use remuda_screen::ScreenGrid;
 use std::path::Path;
+
+pub use remuda_screen::{ScreenStatus, strip_ansi};
 
 /// One row of the known-agent table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,136 +158,26 @@ pub fn detect(rows: &[ProcessRow]) -> Option<Detected> {
 
 /// Last-resort detection over the terminal screen when the foreground process
 /// group is unavailable. Deliberately narrow: only the Claude TUI's own banner.
+///
+/// Adapter over [`remuda_screen::detect_from_screen`] for callers that still
+/// hold raw PTY bytes: the last 4096 characters are stripped into a degraded
+/// grid, matching the pre-D-028 bound exactly.
 #[must_use]
 pub fn detect_from_screen(screen: &str) -> Option<AgentKind> {
-    let tail: String = screen
-        .chars()
-        .rev()
-        .take(4096)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    let lower = strip_ansi(&tail).to_ascii_lowercase();
-    (lower.contains("welcome to claude code") || lower.contains("claude code v"))
-        .then_some(AgentKind::Claude)
-}
-
-/// Screen-derived status of a promoted agent TUI.
-///
-/// Same class of evidence `claude-pty` takes from herdr's `agent_status`, read
-/// here off the PTY ring instead. It is a heuristic over rendered text, so it
-/// is reported as screen-derived and never treated as proof of task success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScreenStatus {
-    /// An input box is on screen and accepting a prompt.
-    Idle,
-    /// A turn is running; the TUI offers `esc to interrupt`.
-    Working,
-    /// A native dialog owns the keyboard; a prompt would answer it by accident.
-    Blocked,
-}
-
-impl ScreenStatus {
-    /// Wire label matching the `agent_status` values Node already folds into
-    /// [`remuda_protocol::Activity`].
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Working => "working",
-            Self::Blocked => "blocked",
-        }
-    }
+    let grid = ScreenGrid::from_raw(&remuda_screen::char_tail(screen, 4096));
+    remuda_screen::detect_from_screen(&grid)
 }
 
 /// Classify the tail of a promoted Claude TUI screen.
 ///
-/// Blocked is checked first: mistaking a dialog for an idle prompt is the one
-/// error that silently answers a question the human never saw (D-022).
-///
-/// The input is raw PTY bytes — unlike the herdr-carried drivers, nothing has
-/// stripped ANSI for us — so escapes are removed before any matching.
+/// Adapter over [`remuda_screen::screen_status`] for callers that still hold
+/// raw PTY bytes: the last ~8 KiB are stripped into a degraded grid, matching
+/// the pre-D-028 bound exactly. With the emulator on, pass its grid to the
+/// crate directly — the same rules then run against what the terminal really
+/// shows rather than against every frame it ever painted.
 #[must_use]
 pub fn screen_status(screen: &str) -> Option<ScreenStatus> {
-    let tail = strip_ansi(&screen_tail(screen));
-    let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.contains("Do you want to")
-        || flat.contains("Is this a project you created or one you trust?")
-        || flat.contains("Yes, I trust this folder")
-    {
-        return Some(ScreenStatus::Blocked);
-    }
-    if flat.contains("esc to interrupt") {
-        return Some(ScreenStatus::Working);
-    }
-    // The composer box is the TUI's "ready for a prompt" signal. A full-screen
-    // TUI repaints with cursor motion rather than newlines, so the prompt glyph
-    // is not reliably at the start of a line in the raw byte stream — look for
-    // the glyph itself, not for a line that begins with it.
-    tail.contains('\u{276f}').then_some(ScreenStatus::Idle)
-}
-
-/// Remove CSI / OSC / charset escapes so text matching sees rendered content.
-///
-/// This is a reader for heuristics, not a terminal emulator: cursor motion is
-/// dropped rather than replayed, which is enough to recognize the composer, a
-/// running turn, or a dialog.
-#[must_use]
-pub fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\u{1b}' {
-            if ch != '\u{7}' {
-                out.push(ch);
-            }
-            continue;
-        }
-        match chars.next() {
-            // CSI: parameters/intermediates, then one final byte.
-            Some('[') => {
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() || next == '~' {
-                        break;
-                    }
-                }
-            }
-            // OSC: runs to BEL or ST.
-            Some(']') => {
-                while let Some(next) = chars.next() {
-                    if next == '\u{7}' {
-                        break;
-                    }
-                    if next == '\u{1b}' {
-                        chars.next_if_eq(&'\\');
-                        break;
-                    }
-                }
-            }
-            // Charset selection and other two-byte sequences.
-            Some('(' | ')' | '#' | '=' | '>') => {
-                chars.next();
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Last ~8 KiB of the screen, so a long scrollback cannot mask current state.
-fn screen_tail(screen: &str) -> String {
-    const TAIL: usize = 8192;
-    if screen.len() <= TAIL {
-        return screen.to_owned();
-    }
-    let start = screen
-        .char_indices()
-        .rev()
-        .map(|(index, _)| index)
-        .find(|index| *index <= screen.len() - TAIL)
-        .unwrap_or(0);
-    screen[start..].to_owned()
+    remuda_screen::screen_status(&ScreenGrid::from_raw(&remuda_screen::screen_tail(screen)))
 }
 
 /// `--session-id <uuid>` / `--resume <uuid>` from an agent's argv.

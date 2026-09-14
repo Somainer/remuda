@@ -63,6 +63,37 @@ fn map_term(err: remuda_herdr::Error) -> DriverError {
     DriverError::Io(std::io::Error::other(err.to_string()))
 }
 
+pub use remuda_screen::SnapshotSource;
+
+/// An attach snapshot plus the provenance Node reports and logs.
+///
+/// D-028 §4.6 replaces the ring slice with a synthesized repaint when the
+/// emulator is on, and requires falling back to the ring "on any emulator
+/// error — honest fallback, log it". Carrying the source alongside the bytes is
+/// what makes that honesty checkable rather than aspirational.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtySnapshot {
+    /// Bytes to replay before live frames. D-016 wire format unchanged.
+    pub bytes: Vec<u8>,
+    /// Which path produced them.
+    pub source: SnapshotSource,
+    /// `?1049` was active when the snapshot was taken. Always false on the
+    /// raw-ring path, which has no way to know.
+    pub alt_screen: bool,
+}
+
+impl PtySnapshot {
+    /// Snapshot taken straight from the byte ring.
+    #[must_use]
+    pub fn raw_ring(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            source: SnapshotSource::RawRing,
+            alt_screen: false,
+        }
+    }
+}
+
 /// Local PTY byte pump used by [`TtyBridge::Local`].
 #[async_trait]
 pub trait LocalPty: Send + Sync {
@@ -70,6 +101,14 @@ pub trait LocalPty: Send + Sync {
     fn subscribe(&self) -> broadcast::Receiver<Vec<u8>>;
     /// Bounded snapshot (last [`TTY_SNAPSHOT_MAX`] bytes).
     fn snapshot(&self) -> Vec<u8>;
+    /// Attach snapshot with its provenance (D-028 §4.6).
+    ///
+    /// Defaults to labelling [`LocalPty::snapshot`] as a ring slice, so a
+    /// carrier without an emulator needs no change and cannot accidentally
+    /// claim to have produced a repaint.
+    fn screen_snapshot(&self) -> PtySnapshot {
+        PtySnapshot::raw_ring(self.snapshot())
+    }
     /// Write raw bytes (keyboard and mouse sequences).
     async fn write_bytes(&self, bytes: &[u8]) -> DriverResult<()>;
     /// Resize the PTY.

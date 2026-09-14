@@ -116,4 +116,48 @@ describe("follow tty client", () => {
     const decoded = decodeTtyBinaryFrame(frame);
     expect(decoded.ok && decoded.frame.channelType === CHANNEL_TTY_OUTPUT).toBe(true);
   });
+
+  it("surfaces the hub's tty.mode notice and treats it as its own message kind", async () => {
+    // D-028 §4.6: the Node reports ?1049 on attach and the hub relays it
+    // before the snapshot, so the client knows the mode while it paints.
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const modes: boolean[] = [];
+    const frames: Uint8Array[] = [];
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb02" as const };
+    const session = openTtySession(instance, {
+      onFrame: (payload) => {
+        frames.push(payload);
+      },
+      onStatus: () => {},
+      onAltScreen: (alt) => {
+        modes.push(alt);
+      },
+    });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    const ws = FakeSocket.latest!;
+
+    ws.emitJson({ type: "tty.mode", instanceId: instance.id, altScreen: true });
+    expect(modes).toEqual([true]);
+    expect(frames).toHaveLength(0);
+
+    ws.emitJson({ type: "tty.mode", instanceId: instance.id, altScreen: false });
+    expect(modes).toEqual([true, false]);
+
+    // A malformed or absent flag must not be read as `false`.
+    ws.emitJson({ type: "tty.mode", instanceId: instance.id });
+    ws.emitJson({ type: "tty.mode", instanceId: instance.id, altScreen: "yes" });
+    expect(modes).toEqual([true, false]);
+    await session.detach();
+  });
+
+  it("does not require onAltScreen — an older caller keeps working", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb03" as const };
+    const session = openTtySession(instance, { onFrame: () => {}, onStatus: () => {} });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    expect(() =>
+      FakeSocket.latest!.emitJson({ type: "tty.mode", instanceId: instance.id, altScreen: true }),
+    ).not.toThrow();
+    await session.detach();
+  });
 });

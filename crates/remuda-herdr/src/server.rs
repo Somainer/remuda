@@ -23,6 +23,15 @@ pub struct EnsureOptions {
     pub policy: RetryPolicy,
     /// `herdr` executable. Defaults to `$HERDR_BINARY`, else `herdr`.
     pub binary: Option<PathBuf>,
+    /// When this handle spawned the server, kill it (SIGTERM, then SIGKILL)
+    /// and reap it when the handle is dropped.
+    ///
+    /// Production leaves this off: a session server is meant to outlive the
+    /// transient handle that ensured it. Test harnesses turn it on so a
+    /// failed/aborted test cannot leak a server process. The spawned binary
+    /// also exits on its own when the parent dies, but tests must not rely on
+    /// that path for ordinary cleanup.
+    pub kill_on_drop: bool,
 }
 
 impl EnsureOptions {
@@ -34,6 +43,7 @@ impl EnsureOptions {
             socket_dir,
             policy: RetryPolicy::default(),
             binary: None,
+            kill_on_drop: false,
         }
     }
 
@@ -51,6 +61,13 @@ impl EnsureOptions {
         self
     }
 
+    /// Kill a server this handle spawned when the handle is dropped.
+    #[must_use]
+    pub fn with_kill_on_drop(mut self, kill_on_drop: bool) -> Self {
+        self.kill_on_drop = kill_on_drop;
+        self
+    }
+
     fn resolved_binary(&self) -> PathBuf {
         self.binary.clone().unwrap_or_else(herdr_binary)
     }
@@ -62,6 +79,8 @@ pub struct HerdrServer {
     socket_path: PathBuf,
     child: Option<Child>,
     spawned: bool,
+    /// When true, a spawned child is SIGTERM/SIGKILL'd and reaped on drop.
+    kill_on_drop: bool,
     /// Set when [`Self::ensure`] gave up waiting for a predecessor and started
     /// under a suffixed session name instead.
     renamed_from: Option<String>,
@@ -134,6 +153,7 @@ impl HerdrServer {
                     socket_path,
                     child: None,
                     spawned: false,
+                    kill_on_drop: false,
                     renamed_from: None,
                 });
             }
@@ -163,7 +183,7 @@ impl HerdrServer {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(false)
+            .kill_on_drop(options.kill_on_drop)
             .env_remove("HERDR_ENV")
             .env_remove("HERDR_PANE_ID");
         // Never inherit a parent agent's socket.
@@ -203,6 +223,7 @@ impl HerdrServer {
             socket_path: socket_path.clone(),
             child: Some(child),
             spawned: true,
+            kill_on_drop: options.kill_on_drop,
             renamed_from: None,
         };
         server.wait_until_ready().await?;
@@ -342,6 +363,58 @@ impl HerdrServer {
             .env_remove("HERDR_SOCKET_PATH");
         let _ = command.status().await;
         Ok(())
+    }
+}
+
+impl Drop for HerdrServer {
+    fn drop(&mut self) {
+        if !self.kill_on_drop {
+            return;
+        }
+        if let Some(mut child) = self.child.take() {
+            terminate_spawned_child(&mut child);
+        }
+    }
+}
+
+/// SIGTERM a spawned server, escalate to SIGKILL, and reap it — synchronously,
+/// so it is safe to call from `Drop`. Bounded waits keep a wedged child from
+/// stalling test teardown; `kill_on_drop` reaps anything left over.
+fn terminate_spawned_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let Some(raw_pid) = child.id().and_then(|id| i32::try_from(id).ok()) else {
+            return;
+        };
+        if raw_pid <= 0 || matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let pid = Pid::from_raw(raw_pid);
+        if kill(pid, Signal::SIGTERM).is_ok() {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        let _ = child.start_kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.try_wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.try_wait();
     }
 }
 

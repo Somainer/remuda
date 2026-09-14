@@ -925,6 +925,9 @@ export type GenericPermission = ({
 /** GenericPermissionMode wire values; `protocol.md` §4.1. */
 export type GenericPermissionMode = ("native");
 
+/** GrantVerb wire values; `protocol.md` §2.5. */
+export type GrantVerb = ("dispatch" | "land" | "spend" | "address-owner");
+
 /** GrokPermission; `protocol.md` §4.1. */
 export type GrokPermission = ({
   "mode": GrokPermissionMode;
@@ -1232,6 +1235,15 @@ export type InstanceResumeParams = ({
   "instanceId": InstanceId;
   "nativeRef": NativeRef;
   "providerProfileRevision": U64;
+  [key: string]: unknown;
+});
+
+/** Resource reach of one delegation node; design §2.5.  Scope narrows monotonically down the tree: a child scope must be a subset of its parent's. An *empty* dimension means "no narrowing on this dimension" for the dimension's parent view — a node with every dimension empty is the universe root (the human-seated top coordinator). */
+export type InstanceScope = ({
+  "hostIds"?: ((HostId)[]);
+  "projectIds"?: ((ProjectId)[]);
+  "supplyGrants"?: (((string))[]);
+  "workspaceIds"?: ((WorkspaceId)[]);
   [key: string]: unknown;
 });
 
@@ -2111,6 +2123,15 @@ export type MethodName = ("runtime.hello" | "runtime.heartbeat" | "host.report" 
 /** ModelEffective wire values; `protocol.md` §3.1. */
 export type ModelEffective = ("next-turn");
 
+/** Project speaks model roles, not concrete model ids; design §3.2. */
+export type ModelRoles = ({
+  "cheap"?: (string | null);
+  "frontier"?: (string | null);
+  "reviewer"?: (string | null);
+  "workhorse"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** ModelSwitchInput; `protocol.md` §3.1. */
 export type ModelSwitchInput = ({
   "effective": ModelEffective;
@@ -2620,6 +2641,138 @@ export type ProcessRef = ({
 export type ProfileRef = ({
   "id": Id;
   "revision": U64;
+  [key: string]: unknown;
+});
+
+/** Thin authoritative Hub Project entity; design §3.1–§3.2. */
+export type Project = ({
+  "branchPattern": (string);
+  "briefRef": (string);
+  "createdAt": Timestamp;
+  "defaultBaseBranch": (string);
+  "defaultEffort"?: (string | null);
+  "gate": ProjectGate;
+  "homeHost"?: (HostId | (null));
+  "hosts"?: ((ProjectHostQuota)[]);
+  "id": ProjectId;
+  "members"?: ((ProjectMember)[]);
+  "modelRoles": ModelRoles;
+  "name": (string);
+  "permissionPosture"?: (string | null);
+  "placement": ProjectPlacement;
+  "policy": ProjectPolicy;
+  "provider": ProjectProviderRef;
+  "repoRemote"?: (string | null);
+  "revision": U64;
+  "updatedAt": Timestamp;
+  [key: string]: unknown;
+});
+
+/** Configurable policy. Owner-tunable; the first four delegate-tree limits implement design §2.5 ⑤ (depth/fan-out are policy, not schema). */
+export type ProjectConfigurablePolicy = ({
+  "allowMultipleDispatchers": (boolean);
+  "completionLine": (string);
+  "coordinatorFanOut": (number);
+  "defaultPlacement": (string);
+  "maxConcurrentWorkers": (number);
+  "maxDelegationDepth": (number);
+  "maxFanOutPerTask": (number);
+  "nudgeThrottleMins": (number);
+  "stallThresholdMins": (number);
+  [key: string]: unknown;
+});
+
+/** Enforced policy switches. All default on; agents may never change them (D-031 — read-only for coordinators, change requires escalation). */
+export type ProjectEnforcedPolicy = ({
+  "allocatedPortBlocks": (boolean);
+  "casAncestorCheck": (boolean);
+  "gateBeforeLand": (boolean);
+  "noDeployScripts": (boolean);
+  "noOsSettingsChanges": (boolean);
+  "noTunnelTools": (boolean);
+  "oneWorktreePerWorker": (boolean);
+  "reclaimDiskOnRetire": (boolean);
+  "secretsNeverInBriefs": (boolean);
+  "workersNeverPush": (boolean);
+  [key: string]: unknown;
+});
+
+/** Gate configuration; design §3.2 (placeholder, consumed by r-mergequeue). */
+export type ProjectGate = ({
+  "affected": (boolean);
+  "command"?: (string | null);
+  "landSerialization"?: (string | null);
+  "lanes"?: ((ProjectGateLane)[]);
+  "mandatorySteps"?: (((string))[]);
+  "web"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** One gate lane; consumed later by r-mergequeue's `--onto/--lanes`.  Placeholder for batch 1: stored and returned verbatim, not yet enforced. */
+export type ProjectGateLane = ({
+  "hostId": HostId;
+  "id": (string);
+  "ports"?: (string | null);
+  "remote"?: (string | null);
+  "repoPath": (string);
+  "targetDir": (string);
+  [key: string]: unknown;
+});
+
+/** Project-side capacity view of one host with capacity; design §3.2. */
+export type ProjectHostQuota = ({
+  "diskBudgetGb"?: (number | null);
+  "hostId": HostId;
+  "latencyClass"?: (string | null);
+  "maxBuilding"?: (number | null);
+  "maxInstances"?: (number | null);
+  "portBlocks"?: (((string))[]);
+  "requires"?: (((string))[]);
+  [key: string]: unknown;
+});
+
+export type ProjectId = (string);
+
+/** Launch-relevant defaults folded into an instance create; design §3.2 / §6.  Fold priority is explicit (request body) > project > host > global, so every field here only fills a key the request did not name. */
+export type ProjectLaunchDefaults = ({
+  "agent"?: (string | null);
+  "delegation"?: (string | null);
+  "driver"?: (string | null);
+  "effort"?: (string | null);
+  "launchArgs"?: (((string))[]);
+  "model"?: (string | null);
+  "permissionPosture"?: (string | null);
+  "providerProfileId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** One `(hostId, workspaceId)` pair — the same key Space uses (D-024). */
+export type ProjectMember = ({
+  "hostId": HostId;
+  "role": (string);
+  "workspaceId": WorkspaceId;
+  [key: string]: unknown;
+});
+
+/** Project placement defaults. */
+export type ProjectPlacement = ({
+  "default": (string);
+  "hostIds"?: ((HostId)[]);
+  "labels"?: (((string))[]);
+  [key: string]: unknown;
+});
+
+/** Full project policy envelope; design §3.2. */
+export type ProjectPolicy = ({
+  "configurable": ProjectConfigurablePolicy;
+  "enforced": ProjectEnforcedPolicy;
+  [key: string]: unknown;
+});
+
+/** Provider reference (no secret — projects hold only a profileId; design §3.2). */
+export type ProjectProviderRef = ({
+  "delegation"?: (string | null);
+  "profileId"?: (string | null);
   [key: string]: unknown;
 });
 
@@ -3330,6 +3483,8 @@ export type SubscriptionParams = ({
   "subscriptionId": Id;
   [key: string]: unknown;
 });
+
+export type TaskId = (string);
 
 /** TerminalEvidence; `protocol.md` §2.4. */
 export type TerminalEvidence = ({

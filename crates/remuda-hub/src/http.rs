@@ -32,6 +32,10 @@ fn default_device_name() -> String {
 pub struct InstanceListQuery {
     #[serde(rename = "hostId")]
     host_id: Option<String>,
+    /// A specific id query keeps the single-instance read boundary (`owns`),
+    /// even for coordinators who may otherwise list their scoped fleet.
+    #[serde(rename = "instanceId")]
+    instance_id: Option<String>,
     #[serde(default, rename = "includeHistory")]
     include_history: bool,
 }
@@ -85,6 +89,23 @@ pub struct CreateInstanceBody {
     /// Native effort selection persisted on the instance spec.
     #[serde(default)]
     effort: Option<Value>,
+    /// Delegation preset name (`worker` / `project-coordinator` /
+    /// `top-coordinator`); display only, expanded into grants at create.
+    #[serde(default)]
+    role: Option<String>,
+    /// Explicit scope; §2.5. When omitted, a `projectId` shortcut (or a
+    /// project placement) fills the project dimension.
+    #[serde(default)]
+    scope: Option<serde_json::Value>,
+    /// Explicit grant verbs; overrides the preset's bundle when present.
+    #[serde(default)]
+    grants: Option<Vec<String>>,
+    /// Single-project scope shortcut; §2.5.
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
+    /// Bound task (`tsk_…`).
+    #[serde(default, rename = "taskId")]
+    task_id: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -294,11 +315,55 @@ pub async fn list_instances(
     headers: HeaderMap,
     Query(query): Query<InstanceListQuery>,
 ) -> Result<Json<Value>, HubError> {
-    crate::agent_scope::require_operator(&state, &headers).await?;
-    let mut items = state.store.list_instances(query.host_id).await?;
-    if !query.include_history {
-        items.retain(|instance| instance.last_error.as_deref() != Some("host-lost"));
+    let device = crate::agent_scope::caller(&state, &headers).await?;
+    let agent = crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent;
+    if agent {
+        // A specific-instance list query is the same boundary as
+        // `GET /v1/instances/{id}`: own instance or direct child only.
+        if let Some(target) = query.instance_id.as_deref() {
+            crate::agent_scope::require_instance_read(&state, &headers, target).await?;
+        } else {
+            // Fleet listing needs dispatch; a leaf worker gets 403.
+            crate::agent_scope::require_grant(
+                &state,
+                &device,
+                remuda_protocol::GrantVerb::Dispatch,
+            )
+            .await?;
+        }
     }
+    let scope = crate::agent_scope::caller_project_scope(&state, &device).await?;
+    let mut items = state.store.list_instances(query.host_id).await?;
+    items.retain(|instance| {
+        let mut keep = instance.last_error.as_deref() != Some("host-lost") || query.include_history;
+        if agent {
+            let caller_id = device.instance_id.as_deref();
+            let in_subtree = caller_id.is_some_and(|id| {
+                instance.instance_id == id || instance.parent_instance_id.as_deref() == Some(id)
+            });
+            // Universe reach means "may delegate to", never "may inspect the
+            // whole fleet": an un-narrowed node only sees its own subtree. A
+            // narrowed node additionally sees instances in its scope.
+            let visible = if scope.is_universe() {
+                in_subtree
+            } else {
+                let in_scope = scope.allows_host(&instance.host_id)
+                    && (scope.project_ids.is_empty()
+                        || instance
+                            .project_id
+                            .as_deref()
+                            .is_some_and(|project| scope.allows_project(project)));
+                in_scope || in_subtree
+            };
+            keep &= visible;
+            if let Some(target) = query.instance_id.as_deref() {
+                keep &= instance.instance_id == target;
+            }
+        } else if let Some(target) = query.instance_id.as_deref() {
+            keep &= instance.instance_id == target;
+        }
+        keep
+    });
     Ok(Json(json!({ "items": items, "nextCursor": null })))
 }
 
@@ -534,6 +599,139 @@ fn merge_host_launch_defaults(
     }
 }
 
+/// Fold a Project's launch defaults into the spec.
+///
+/// Priority explicit > project > host > global (design §6): this runs before
+/// [`merge_host_launch_defaults`] and only fills keys the request left null.
+/// Provider profile/delegation are *not* written here — the provider waterfall
+/// consumes them through its own project layer so the source line is
+/// attributed correctly.
+pub(crate) fn merge_project_defaults(
+    spec: &mut serde_json::Map<String, Value>,
+    defaults: &remuda_protocol::ProjectLaunchDefaults,
+) {
+    let fill = |spec: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>| {
+        if let Some(value) = value.filter(|value| !value.is_empty())
+            && spec.get(key).is_none_or(Value::is_null)
+        {
+            spec.insert(key.into(), json!(value));
+        }
+    };
+    fill(spec, "model", defaults.model.as_deref());
+    fill(spec, "effortName", defaults.effort.as_deref());
+    if let Some(posture) = defaults.permission_posture.as_deref()
+        && spec.get("permissionMode").is_none_or(Value::is_null)
+    {
+        spec.insert(
+            "permissionMode".into(),
+            json!(match posture {
+                "ask" => "manual",
+                "accept-edits" => "acceptEdits",
+                "bypass" => "bypassPermissions",
+                other => other,
+            }),
+        );
+    }
+}
+
+/// Resolve the create body's delegation-tree state; design §2.5.
+///
+/// `parent_scope` is the bound agent parent's scope (None for human/bot
+/// callers). Grants come from an explicit list, else from the named preset;
+/// scope comes from an explicit object, else the `projectId` shortcut / project
+/// placement, else the parent's scope (agent children) / universe (operators).
+pub(crate) fn resolve_delegation(
+    body: &CreateInstanceBody,
+    parent_scope: Option<&remuda_protocol::InstanceScope>,
+    placement_project_id: Option<&str>,
+) -> Result<crate::store::InstanceDelegation, HubError> {
+    let role = match &body.role {
+        Some(name) => {
+            if !remuda_protocol::is_preset_name(name) {
+                return Err(HubError::BadRequest(format!(
+                    "unknown role preset {name}; expected one of {}",
+                    remuda_protocol::PRESET_NAMES.join(", ")
+                )));
+            }
+            Some(name.clone())
+        }
+        None => Some(remuda_protocol::ROLE_WORKER.into()),
+    };
+    let grants = match &body.grants {
+        Some(explicit) => {
+            let mut verbs = Vec::new();
+            for wire in explicit {
+                let value: remuda_protocol::GrantVerb = serde_json::from_value(json!(wire))
+                    .map_err(|_| HubError::BadRequest(format!("unknown grant verb {wire}")))?;
+                verbs.push(
+                    serde_json::to_value(value)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+            verbs.sort();
+            verbs.dedup();
+            verbs
+        }
+        None => role
+            .as_deref()
+            .and_then(remuda_protocol::preset_grants)
+            .map(|grants| {
+                grants
+                    .iter()
+                    .map(|verb| {
+                        serde_json::to_value(verb)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let scope: remuda_protocol::InstanceScope = if let Some(value) = &body.scope {
+        serde_json::from_value(value.clone())
+            .map_err(|err| HubError::BadRequest(format!("invalid scope: {err}")))?
+    } else {
+        let project = body
+            .project_id
+            .as_deref()
+            .or(placement_project_id)
+            .map(str::to_string);
+        if let Some(project) = project {
+            let project_id = remuda_protocol::ProjectId::try_from(project)
+                .map_err(|err| HubError::BadRequest(format!("projectId: {err}")))?;
+            remuda_protocol::InstanceScope {
+                project_ids: vec![project_id],
+                ..Default::default()
+            }
+        } else if let Some(parent) = parent_scope {
+            parent.clone()
+        } else {
+            remuda_protocol::InstanceScope::universe()
+        }
+    };
+    let task_id = match &body.task_id {
+        Some(task) => Some(
+            remuda_protocol::TaskId::try_from(task.clone())
+                .map_err(|err| HubError::BadRequest(format!("taskId: {err}")))?
+                .as_id()
+                .to_string(),
+        ),
+        None => None,
+    };
+    Ok(crate::store::InstanceDelegation {
+        role,
+        scope,
+        grants,
+        task_id,
+        enforce_tree: true,
+    })
+}
+
 pub async fn create_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -599,6 +797,51 @@ pub async fn create_instance(
     }
     let placement =
         crate::placement::Placement::from_value(body.placement.as_ref(), body.host_id.as_deref())?;
+    // Project layer: a `Placement::Project` names the authoritative project
+    // whose defaults fold in before the per-host defaults (explicit > project
+    // > host > global; design §6).
+    let project = if let crate::placement::Placement::Project { project_id } = &placement {
+        Some(
+            state
+                .store
+                .get_project(project_id.clone())
+                .await?
+                .ok_or(HubError::NotFound)?,
+        )
+    } else {
+        None
+    };
+    let placement_project_id = project
+        .as_ref()
+        .map(|project| project.meta.id.as_id().to_string());
+    if let (Some(obj), Some(project)) = (spec.as_object_mut(), &project) {
+        if let Some(home) = &project.home_host
+            && body.host_id.is_none()
+            && obj.get("hostId").is_none_or(Value::is_null)
+        {
+            // The project's homeHost is the pinned T2 seat, not a hard
+            // placement; workers still solve over every member host.
+            obj.insert("homeHostId".into(), json!(home));
+        }
+        merge_project_defaults(obj, &project.launch_defaults());
+    }
+    let parent_scope = match device.instance_id.as_deref() {
+        Some(id) => Some(
+            state
+                .store
+                .get_instance(id.into())
+                .await?
+                .ok_or(HubError::Forbidden)?
+                .scope,
+        ),
+        None => None,
+    };
+    let delegation = resolve_delegation(
+        &body,
+        parent_scope.as_ref(),
+        placement_project_id.as_deref(),
+    )?;
+    let project_provider = project.as_ref().map(|project| project.provider.clone());
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
     let hosts = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
     let mut reasons = Vec::new();
@@ -609,7 +852,19 @@ pub async fn create_instance(
             obj.insert("hostId".into(), json!(host.host_id));
             merge_host_launch_defaults(obj, &host, &body);
         }
-        match crate::providers::resolve_and_attach(&state, &host, &mut spec).await {
+        let resolved = match &project_provider {
+            Some(provider) => {
+                crate::providers::resolve_and_attach_with_project(
+                    &state,
+                    &host,
+                    &mut spec,
+                    Some(provider),
+                )
+                .await
+            }
+            None => crate::providers::resolve_and_attach(&state, &host, &mut spec).await,
+        };
+        match resolved {
             Ok(()) => {
                 chosen = Some(host);
                 break;
@@ -663,6 +918,7 @@ pub async fn create_instance(
             spec,
             operation: "instance.create",
             idempotency_key: None,
+            delegation,
         },
     )
     .await?;
@@ -783,6 +1039,7 @@ pub async fn resume_instance(
             spec,
             operation: "instance.resume",
             idempotency_key: Some(idempotency_key),
+            delegation: crate::store::InstanceDelegation::default(),
         },
     )
     .await?;
@@ -1362,6 +1619,8 @@ pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
         {
             HubError::Conflict(msg.clone())
         }
+        crate::store::StoreError::Conflict(msg) => HubError::Conflict(msg.clone()),
+        crate::store::StoreError::Forbidden(_) => HubError::Forbidden,
         crate::store::StoreError::Id(msg) => HubError::BadRequest(msg.clone()),
         other => HubError::Store(other.clone_as_internal()),
     }

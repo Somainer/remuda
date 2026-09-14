@@ -79,6 +79,55 @@ pub async fn require_operator(state: &AppState, headers: &HeaderMap) -> Result<D
     Ok(device)
 }
 
+/// Load the caller's delegation scope; design §2.5.
+///
+/// Human/Bot devices are the universe root — their seat may touch any
+/// resource, with route-level operator checks deciding whether they may.
+/// Agent credentials inherit the scope stored on the bound instance.
+pub async fn caller_project_scope(
+    state: &AppState,
+    device: &Device,
+) -> Result<remuda_protocol::InstanceScope, HubError> {
+    let Some(id) = device.instance_id.as_deref() else {
+        return Ok(remuda_protocol::InstanceScope::universe());
+    };
+    let instance = state
+        .store
+        .get_instance(id.into())
+        .await?
+        .ok_or(HubError::Forbidden)?;
+    Ok(instance.scope)
+}
+
+/// An Agent caller must hold `grant`; design §2.5 (enforcement reads grants,
+/// never the display-only `role`).
+pub async fn require_grant(
+    state: &AppState,
+    device: &Device,
+    grant: remuda_protocol::GrantVerb,
+) -> Result<(), HubError> {
+    if origin(device) != InputOrigin::Agent {
+        return Ok(());
+    }
+    let Some(id) = device.instance_id.as_deref() else {
+        return Err(HubError::Forbidden);
+    };
+    let instance = state
+        .store
+        .get_instance(id.into())
+        .await?
+        .ok_or(HubError::Forbidden)?;
+    let wire = serde_json::to_value(grant)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if instance.grants.iter().any(|held| held == &wire) {
+        Ok(())
+    } else {
+        Err(HubError::Forbidden)
+    }
+}
+
 /// Repeat the middleware ownership check at the instance read boundary.
 pub async fn require_instance_read(
     state: &AppState,
@@ -106,6 +155,33 @@ fn attachment_read(path: &str) -> bool {
             .strip_prefix("/v1/attachments/")
             .and_then(|rest| rest.strip_suffix("/content"))
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// `GET /v1/projects` or `GET /v1/projects/{id}`; design §2.4.
+///
+/// The handler still filters by the caller's scope and requires the
+/// `dispatch` grant for Agent callers (leaf workers stay at 403).
+fn project_read_target(path: &str) -> bool {
+    if path == "/v1/projects" {
+        return true;
+    }
+    match path.strip_prefix("/v1/projects/") {
+        Some(rest) => !rest.is_empty() && !rest.contains('/'),
+        None => false,
+    }
+}
+
+/// `PATCH /v1/projects/{id}` or `POST|DELETE /v1/projects/{id}/members`.
+fn project_write_target(path: &str) -> bool {
+    match path.strip_prefix("/v1/projects/") {
+        Some(rest) => {
+            if let Some(rest) = rest.strip_suffix("/members") {
+                return !rest.is_empty() && !rest.contains('/');
+            }
+            !rest.is_empty() && !rest.contains('/')
+        }
+        None => false,
+    }
 }
 
 pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<bool, HubError> {
@@ -166,18 +242,41 @@ pub async fn prepare_create(
     spec["parentInstanceId"] = json!(device.instance_id);
     restrict_permission(device, spec)?;
     restrict_launch_overrides(device, spec)?;
-    if origin(device) == remuda_protocol::InputOrigin::Agent
-        && (!same_host(state, device, host).await?
+    if origin(device) == remuda_protocol::InputOrigin::Agent {
+        // §2.4/§2.5: the chosen host and workspace must be inside the
+        // caller's scope, and the caller needs dispatch to delegate at all.
+        // The store re-checks scope subset/grants against this same parent
+        // row inside the writer; this is the early, cheap rejection.
+        require_grant(state, device, remuda_protocol::GrantVerb::Dispatch).await?;
+        let caller_id = device.instance_id.as_deref().ok_or(HubError::Forbidden)?;
+        let caller_instance = state
+            .store
+            .get_instance(caller_id.into())
+            .await?
+            .ok_or(HubError::Forbidden)?;
+        if !caller_instance.scope.allows_host(host) {
+            return Err(HubError::Forbidden);
+        }
+        if let Some(workspace) = spec
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            && !caller_instance.scope.allows_workspace(workspace)
+        {
+            return Err(HubError::Forbidden);
+        }
+        if !same_host(state, device, host).await?
             || shell_driver(driver)
-            || headers.contains_key("x-remuda-require-approval"))
-    {
-        require_approval(
-            state,
-            headers,
-            device,
-            json!({"operation":"instance.create", "hostId":host, "spec":spec}),
-        )
-        .await?;
+            || headers.contains_key("x-remuda-require-approval")
+        {
+            require_approval(
+                state,
+                headers,
+                device,
+                json!({"operation":"instance.create", "hostId":host, "spec":spec}),
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -306,7 +405,13 @@ async fn get_caller(
         .collect();
     Ok(Json(
         json!({"origin": origin(&device), "instanceId": device.instance_id,
-        "hostId": instance.map(|row| row.host_id), "children": children}),
+        "hostId": instance.as_ref().map(|row| row.host_id.clone()),
+        "role": instance.as_ref().and_then(|row| row.role.clone()),
+        "projectId": instance.as_ref().and_then(|row| row.project_id.clone()),
+        "scope": instance.as_ref().map(|row| row.scope.clone())
+            .unwrap_or_else(remuda_protocol::InstanceScope::universe),
+        "grants": instance.as_ref().map(|row| row.grants.clone()).unwrap_or_default(),
+        "children": children}),
     ))
 }
 
@@ -416,6 +521,10 @@ pub async fn restrict_agent_routes(
                     // the credential's own instance — strictly narrower than
                     // `owns`, which also admits direct children.
                     || attachment_read(path)
+                    // §2.4: coordinators list/read projects and instances
+                    // inside their scope; handlers re-check grants + scope.
+                    || project_read_target(path)
+                    || path == "/v1/instances"
                     || match read_target(path) {
                         Some(id) => owns(&state, &device, id).await?,
                         None => false,
@@ -424,7 +533,13 @@ pub async fn restrict_agent_routes(
                 && (path == "/v1/instances"
                     || path == "/v1/fleet/instances"
                     || path == "/v1/fleet/broadcast"
-                    || (path.starts_with("/v1/instances/") && path.ends_with("/commands")));
+                    || (path.starts_with("/v1/instances/") && path.ends_with("/commands"))
+                    || (path.starts_with("/v1/projects/") && path.ends_with("/members")))
+                || request.method() == axum::http::Method::PATCH && project_write_target(path)
+                || (request.method() == axum::http::Method::DELETE
+                    && path
+                        .strip_prefix("/v1/projects/")
+                        .is_some_and(|rest| rest.ends_with("/members")));
             if !read && !write {
                 return Err(HubError::Forbidden);
             }

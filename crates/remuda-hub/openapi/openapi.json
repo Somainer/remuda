@@ -382,6 +382,196 @@
         }
       }
     },
+
+      "/v1/hosts/{id}/workspaces/{workspaceId}/changes": {
+        "get": {
+          "tags": [
+            "workspaces"
+          ],
+          "operationId": "workspaceChanges",
+          "summary": "Current read-only git working-tree status of one registered workspace",
+          "parameters": [
+            {
+              "name": "id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "workspaceId",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Real-time workspace status entries",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object"
+                  }
+                }
+              }
+            },
+            "401": {
+              "$ref": "#/components/responses/Error"
+            },
+            "403": {
+              "$ref": "#/components/responses/Error"
+            },
+            "404": {
+              "$ref": "#/components/responses/Error"
+            },
+            "409": {
+              "$ref": "#/components/responses/Error"
+            },
+            "422": {
+              "$ref": "#/components/responses/Error"
+            }
+          }
+        }
+      },
+      "/v1/hosts/{id}/workspaces/{workspaceId}/changes/diff": {
+        "get": {
+          "tags": [
+            "workspaces"
+          ],
+          "operationId": "workspaceChangesDiff",
+          "summary": "Unified diff for one workspace change entry (Node proxy, never cached)",
+          "parameters": [
+            {
+              "name": "id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "workspaceId",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "path",
+              "in": "query",
+              "required": true,
+              "description": "Workspace-relative entry path from the status response",
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "staged",
+              "in": "query",
+              "required": false,
+              "schema": {
+                "type": "boolean",
+                "default": false
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Per-entry unified diff with truncation markers",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object"
+                  }
+                }
+              }
+            },
+            "401": {
+              "$ref": "#/components/responses/Error"
+            },
+            "403": {
+              "$ref": "#/components/responses/Error"
+            },
+            "404": {
+              "$ref": "#/components/responses/Error"
+            },
+            "409": {
+              "$ref": "#/components/responses/Error"
+            },
+            "422": {
+              "$ref": "#/components/responses/Error"
+            }
+          }
+        }
+      },
+      "/v1/hosts/{id}/workspaces/{workspaceId}/changes/file": {
+        "get": {
+          "tags": [
+            "workspaces"
+          ],
+          "operationId": "workspaceChangesFile",
+          "summary": "Restricted current bytes for an untracked/new workspace file (Node proxy, never cached)",
+          "parameters": [
+            {
+              "name": "id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "workspaceId",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "path",
+              "in": "query",
+              "required": true,
+              "description": "Workspace-relative entry path from the status response",
+              "schema": {
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Restricted file content with sha256 digest",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object"
+                  }
+                }
+              }
+            },
+            "401": {
+              "$ref": "#/components/responses/Error"
+            },
+            "403": {
+              "$ref": "#/components/responses/Error"
+            },
+            "404": {
+              "$ref": "#/components/responses/Error"
+            },
+            "409": {
+              "$ref": "#/components/responses/Error"
+            },
+            "422": {
+              "$ref": "#/components/responses/Error"
+            }
+          }
+        }
+      },
     "/v1/hosts/{id}/doctor": {
       "get": {
         "tags": ["hosts"],

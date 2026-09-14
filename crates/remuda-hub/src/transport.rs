@@ -133,6 +133,43 @@ pub struct StdioTransport {
     host_id: String,
 }
 
+/// Scripted Node transport for Hub integration tests: every `call` returns a
+/// fixed JSON-RPC frame (`None` models an unwritable session, i.e. 422).
+///
+/// It lets route tests exercise the proxy's 200/4xx/422 mapping without a real
+/// WebSocket or a sleeping background task.
+#[doc(hidden)]
+pub struct ScriptedTransport {
+    reply: Option<Value>,
+    kind: TransportKind,
+}
+
+impl ScriptedTransport {
+    /// Build a synthetic outbound-WSS node returning `reply` to every call.
+    #[must_use]
+    pub fn new(reply: Option<Value>) -> Self {
+        Self {
+            reply,
+            kind: TransportKind::OutboundWss,
+        }
+    }
+}
+
+impl NodeTransport for ScriptedTransport {
+    fn kind(&self) -> TransportKind {
+        self.kind
+    }
+
+    fn call(
+        &self,
+        _method: &str,
+        _params: Value,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(self.reply.clone())))
+    }
+}
+
 impl StdioTransport {
     /// Named host that will speak JSON-RPC on a stdio pipe once wired.
     pub fn pending(host_id: impl Into<String>) -> Self {

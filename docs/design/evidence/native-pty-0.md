@@ -244,8 +244,8 @@ P0 的验收是「抽取零行为变更」。三层证据：
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | 通过 |
 | `cargo test --workspace --locked` | 见下 |
-| `pnpm test`（web） | 342 passed / 62 files |
-| `pnpm run test:e2e:hub` | 11 passed，退出码 0；未改动任何**已跟踪**文件 |
+| `pnpm test`（web） | 全绿（362 / 64 files，本分支 rebase 时的总数；主干新增测试会抬高它） |
+| `pnpm run test:e2e:hub` | 12 passed，退出码 0；未改动任何**已跟踪**文件（只生成了几个未跟踪的 `spaces-1/fake-*.png`，来自 `spaces-hub-live` 自身，非本改动） |
 | `./scripts/ci/secret-scan.sh` | pass |
 | `pnpm --dir web run gen:api` | 无 diff（本改动不触及 Hub REST OpenAPI 面） |
 

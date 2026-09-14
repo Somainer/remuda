@@ -177,13 +177,14 @@ impl HubConfig {
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
-            // The e2e harness mounts the login page dozens of times from a
-            // single loopback IP, and each mount now starts a passkey
-            // ceremony; disable effective rate limiting there.
-            auth_ip_burst: 1_000_000.0,
-            auth_ip_refill_per_sec: 1_000.0,
-            auth_global_burst: 1_000_000.0,
-            auth_global_refill_per_sec: 1_000.0,
+            // Keep production rate-limit defaults here so the 429 integration
+            // test exercises real budgets; the Playwright harness relaxes them
+            // explicitly because it mounts the login page dozens of times from
+            // one loopback IP (each mount starts a passkey ceremony).
+            auth_ip_burst: default_auth_ip_burst(),
+            auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
+            auth_global_burst: default_auth_global_burst(),
+            auth_global_refill_per_sec: default_auth_global_refill_per_sec(),
         }
     }
 

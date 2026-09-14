@@ -99,10 +99,11 @@ impl AuthRateLimits {
         let Ok(mut budgets) = self.limits.lock() else {
             return false;
         };
-        if !budgets
-            .global
-            .take(self.params.global_burst, self.params.global_refill_per_sec, now)
-        {
+        if !budgets.global.take(
+            self.params.global_burst,
+            self.params.global_refill_per_sec,
+            now,
+        ) {
             return false;
         }
         let peer = match peer {

@@ -32,7 +32,7 @@ fn ctx(session: &str) -> (HostId, InstanceId, Id, MapContext) {
 }
 
 fn map_file(contents: &str, map: &MapContext) -> Result<Vec<Envelope>> {
-    let mut ids = NativeIds::new();
+    let mut ids = NativeIds::new(map.instance_id.as_id().as_str());
     let mut out = Vec::new();
     let mut offset = 0u64;
     for line in contents.lines() {

@@ -24,7 +24,7 @@
 
 ### 1.1 结论
 
-- **采纳 native PTY 为默认 carrier**：`portable-pty` master + 终端模拟器（`wezterm-term`）+ 字节 ring，无 herdr 依赖。herdr 降为可选 carrier（feature），不急删。
+- **采纳 native PTY 为默认 carrier**：`portable-pty` master + 终端模拟器（`vt100`（P0 实测：`vt100` 未发布到 crates.io，`alacritty_terminal` 缺 §4.6 所需能力；见 evidence/native-pty-0.md））+ 字节 ring，无 herdr 依赖。herdr 降为可选 carrier（feature），不急删。
 - **采纳 per-session launch shim 作为 P1 核心机制**（不是补丁）：在 `<data_dir>/instances/<id>/launch/bin/` 生成透明 `exec` 的 `claude` / `codex` / `grok`，把 `--settings` overlay、`CODEX_HOME`、`GROK_HOME`、hook socket 注入进去。**这是让「用户手敲」也拿到结构化信号的唯一机关**，也是统一原则能成立的物理基础。
 - **生命周期五件事必须在 native 路径上重建**（§5）：新建 Session、发送消息、停止（打断 turn / 停进程两义）、删除、退出检测，外加 resume。herdr 今天替我们做的是**整个 agent 抽象**，不是一个 PTY 库。
 - **采纳信号分层**：`Hook > File(tail) > OSC > Screen`，每条 `Observation` 带 `SourceChannel`，UI 能解释「凭什么说它 blocked」。
@@ -95,7 +95,7 @@ herdr 剩下的**唯一不可替代价值是跨 Node 重启存活**（以及现�
 
 ### 4.1 载体（Carrier）
 
-`remuda-pty`：唯一载体。`portable-pty` master + `wezterm-term` 模拟器 + 256 KiB 字节 ring。提供：
+`remuda-pty`：唯一载体。`portable-pty` master + `vt100` 模拟器 + 256 KiB 字节 ring。提供：
 
 - **身份**：`tcgetpgrp` 读前台进程组（内核真相，无 `unsafe`），匹配 agent 表；屏幕签名兜底。
 - **模式集**：模拟器观测到的 DECSET —— `?2004`（bracketed paste）、`?1049`（alt-screen）、`?25`（光标）。

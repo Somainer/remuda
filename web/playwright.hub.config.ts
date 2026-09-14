@@ -13,7 +13,9 @@ process.env.REMUDA_E2E_BACKEND = "hub";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|ux-quickfind|new-session)\.spec\.ts/,
+  // New hub-backed specs use the .hub.spec.ts suffix (second entry); the
+  // first entry preserves the historical per-file allowlist.
+  testMatch: [/(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|ux-quickfind|new-session)\.spec\.ts/, /\.hub\.spec\.ts$/],
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),

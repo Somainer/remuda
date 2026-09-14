@@ -15,6 +15,9 @@ import {
 
 const b64 = (bytes: number[]) => base64UrlEncode(new Uint8Array(bytes));
 
+// vi.fn() infers no-arg calls here; the credential mocks do take one options arg.
+const firstCall = (fn: ReturnType<typeof vi.fn>) => (fn.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
+
 describe("base64url", () => {
   it("round-trips binary without padding", () => {
     const data = new Uint8Array([0, 1, 2, 250, 251, 252, 253, 254, 255]);
@@ -71,8 +74,6 @@ describe("feature detection", () => {
 
   it("is false when the probe throws", async () => {
     vi.stubGlobal("PublicKeyCredential", function PublicKeyCredential() {});
-    (window.PublicKeyCredential as unknown as { isConditionalMediationAvailable: () => Promise<boolean> })
-      .isCondentialMediationAvailable = undefined;
     Object.defineProperty(window.PublicKeyCredential, "isConditionalMediationAvailable", {
       configurable: true,
       value: () => Promise.reject(new Error("blocked")),
@@ -127,10 +128,14 @@ describe("createPasskey", () => {
     expect(Array.from(base64UrlDecode(body.response.clientDataJSON))).toEqual([4, 5, 6]);
     expect(body.response.transports).toEqual(["internal"]);
 
-    const passed = create.mock.calls[0]?.[0].publicKey;
+    const passed = firstCall(create).publicKey as {
+      challenge: unknown;
+      user: { id: unknown };
+      excludeCredentials: { id: unknown }[];
+    };
     expect(passed.challenge).toBeInstanceOf(Uint8Array);
     expect(passed.user.id).toBeInstanceOf(Uint8Array);
-    expect(passed.excludeCredentials[0].id).toBeInstanceOf(Uint8Array);
+    expect(passed.excludeCredentials[0]?.id).toBeInstanceOf(Uint8Array);
   });
 
   it("normalizes a dismissed ceremony to cancelled", async () => {
@@ -173,8 +178,8 @@ describe("getPasskey", () => {
     expect(Array.from(base64UrlDecode(body.response.authenticatorData))).toEqual([7, 8]);
     expect(Array.from(base64UrlDecode(body.response.signature))).toEqual([10, 11]);
     expect(Array.from(base64UrlDecode(body.response.userHandle ?? ""))).toEqual([12, 13]);
-    expect(get.mock.calls[0]?.[0].mediation).toBe("required");
-    expect(get.mock.calls[0]?.[0].signal).toBe(signal);
+    expect(firstCall(get).mediation).toBe("required");
+    expect(firstCall(get).signal).toBe(signal);
   });
 
   it("uses conditional mediation when asked and sends null userHandle", async () => {
@@ -188,7 +193,7 @@ describe("getPasskey", () => {
 
     const body = await getPasskey(serverOptions, "conditional");
     expect(body.response.userHandle).toBeNull();
-    expect(get.mock.calls[0]?.[0].mediation).toBe("conditional");
+    expect(firstCall(get).mediation).toBe("conditional");
   });
 
   it("maps InvalidStateError to unavailable", async () => {

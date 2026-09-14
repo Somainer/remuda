@@ -8,6 +8,8 @@ const access = process.env.VITE_ACCESS_CODE ?? "";
 async function login(page: Page) {
   await page.goto("/login");
   await expect(page.getByTestId("login-page")).toBeVisible();
+  const toggle = page.getByTestId("login-use-code");
+  if (await toggle.isVisible().catch(() => false)) await toggle.click();
   await page.getByTestId("login-tab-bootstrap").click();
   await page.getByTestId("login-device-name").fill("terminal-e2e");
   await page.getByTestId("login-bootstrap-token").fill(access);

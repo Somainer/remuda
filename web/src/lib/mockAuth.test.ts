@@ -48,7 +48,8 @@ describe("mock passkey auth", () => {
     writeSession(desk, { mock: true });
 
     const start = mockPasskeyRegisterStart("Chrome on macOS");
-    expect(start.options.publicKey.authenticatorSelection.residentKey).toBe("required");
+    const publicKey = start.options.publicKey as { authenticatorSelection: { residentKey: string } };
+    expect(publicKey.authenticatorSelection.residentKey).toBe("required");
     const saved = mockPasskeyRegisterFinish(desk.deviceId);
     expect(saved.name).toBe("Chrome on macOS");
     expect(saved.thisDevice).toBe(true);

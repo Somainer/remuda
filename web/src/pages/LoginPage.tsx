@@ -27,9 +27,9 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
   const [passkeyBusy, setPasskeyBusy] = useState(false);
   const [conditionalReady, setConditionalReady] = useState(false);
   const [showCodes, setShowCodes] = useState(!passkeySupported || pairDefault);
-  // The pending conditional (autofill) ceremony; aborted when an explicit
-  // passkey login or an access-code submit starts.
-  const conditionalAbort = useRef<AbortController | null>(null);
+  // Any pending get() ceremony (conditional autofill or explicit button);
+  // aborted before another ceremony or an access-code submit starts.
+  const ceremonyAbort = useRef<AbortController | null>(null);
 
   const destination = () => (from && from !== "/login" ? from : "/sessions");
 
@@ -37,7 +37,7 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
     if (!passkeySupported || pairDefault) return;
     let cancelled = false;
     const controller = new AbortController();
-    conditionalAbort.current = controller;
+    ceremonyAbort.current = controller;
     void hubStore
       .conditionalMediationAvailable()
       .then((available) => {
@@ -52,8 +52,10 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
       .then(() => {
         if (!cancelled && hubStore.stateAuthed()) navigate(destination(), { replace: true });
       })
-      .catch((err: unknown) => {
-        if (!cancelled && !controller.signal.aborted) setError(passkeyErrorText(err));
+      .catch(() => {
+        // Conditional mediation is an opportunistic autofill hint. It rejects
+        // whenever no discoverable credential exists; the explicit button is
+        // the authoritative path, so never surface its errors.
       });
     return () => {
       cancelled = true;
@@ -66,28 +68,32 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
     return <Navigate to={destination()} replace />;
   }
 
-  const stopConditional = () => {
-    conditionalAbort.current?.abort();
-    conditionalAbort.current = null;
+  const abortCeremonies = () => {
+    ceremonyAbort.current?.abort();
+    ceremonyAbort.current = null;
     setConditionalReady(false);
   };
 
   const passkeySubmit = () => {
     if (passkeyBusy) return;
-    stopConditional();
+    abortCeremonies();
+    const controller = new AbortController();
+    ceremonyAbort.current = controller;
     setPasskeyBusy(true);
     setError(null);
     void hubStore
-      .passkeyLogin("required", deviceName.trim() || undefined)
+      .passkeyLogin("required", deviceName.trim() || undefined, controller.signal)
       .then(() => navigate(destination(), { replace: true }))
-      .catch((err: unknown) => setError(passkeyErrorText(err)))
+      .catch((err: unknown) => {
+        if (!controller.signal.aborted) setError(passkeyErrorText(err));
+      })
       .finally(() => setPasskeyBusy(false));
   };
 
   const submit = () => {
     const secret = tab === "pair" ? code.trim() : token.trim();
     if (!secret || busy) return;
-    stopConditional();
+    abortCeremonies();
     setBusy(true);
     setError(null);
     void hubStore
@@ -152,7 +158,7 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
               className={css.toggle}
               data-testid="login-use-code"
               onClick={() => {
-                stopConditional();
+                abortCeremonies();
                 setShowCodes(true);
               }}
             >

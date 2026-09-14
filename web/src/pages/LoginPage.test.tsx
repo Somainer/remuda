@@ -32,7 +32,9 @@ describe("LoginPage passkey-primary layout", () => {
     expect(screen.queryByTestId("login-tab-bootstrap")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("login-passkey-submit"));
-    await waitFor(() => expect(passkeyLogin).toHaveBeenCalledWith("required", "this-device"));
+    await waitFor(() =>
+      expect(passkeyLogin).toHaveBeenCalledWith("required", "this-device", expect.any(AbortSignal)),
+    );
   });
 
   it("reveals the preserved bootstrap/pair form behind 使用访问码 and submits bootstrap", async () => {

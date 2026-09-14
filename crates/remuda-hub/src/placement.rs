@@ -27,6 +27,56 @@ pub enum Placement {
     },
     /// Any online host that meets capability constraints.
     Any,
+    /// A project's member hosts (design §3.4 step 1); per-host project
+    /// quotas and `requires` labels ride in [`PlaceConstraints`].
+    Project {
+        /// `prj_…`.
+        project_id: String,
+    },
+}
+
+/// Resource-utilization ceiling read at solve time; design §3.4 step 2.
+///
+/// `HostRecord.resources` (`{cpuPct, memPct}`, collected by remuda-node
+/// inventory) has been stored for ages but never read by host selection.
+/// A snapshot at/above the line removes the host with a machine-readable
+/// reason; absent snapshots do not exclude (older Nodes simply report none).
+pub const RESOURCE_CPU_PCT_MAX: u8 = 90;
+/// See [`RESOURCE_CPU_PCT_MAX`].
+pub const RESOURCE_MEM_PCT_MAX: u8 = 90;
+
+/// Read `(cpuPct, memPct)` off a host's last inventory snapshot.
+pub(crate) fn resource_pressure(host: &HostRecord) -> (Option<u8>, Option<u8>) {
+    let resources = host.resources.as_ref();
+    let cpu = resources
+        .and_then(|value| value.get("cpuPct"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u8::try_from(n).ok());
+    let mem = host
+        .resources
+        .as_ref()
+        .and_then(|value| value.get("memPct"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u8::try_from(n).ok());
+    (cpu, mem)
+}
+
+/// Project layer resolved before solving; design §3.4.
+#[derive(Clone, Debug, Default)]
+pub struct PlaceConstraints {
+    /// When set, only these hosts are eligible (project member hosts).
+    pub member_hosts: Option<std::collections::HashSet<String>>,
+    /// Per-host project quotas, keyed by `hst_…`.
+    pub project_hosts: std::collections::HashMap<String, ProjectHostPlace>,
+}
+
+/// One project-side host entry as the solver sees it.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectHostPlace {
+    /// Project cap, clamped to the host's own `maxInstances`.
+    pub max_instances: Option<i64>,
+    /// Hard label requirements normalized to `key=value`.
+    pub requires: Vec<String>,
 }
 
 impl Placement {
@@ -58,6 +108,18 @@ impl Placement {
                 host_id: id.to_string(),
             });
         }
+        // Project placement wins over a sibling `labels` array: project
+        // labels/requires arrive through PlaceConstraints instead.
+        if let Some(project_id) = value
+            .get("projectId")
+            .or_else(|| value.get("project"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(Self::Project {
+                project_id: project_id.to_string(),
+            });
+        }
         if let Some(labels) = value.get("labels").and_then(Value::as_array) {
             let labels: Vec<String> = labels
                 .iter()
@@ -68,6 +130,18 @@ impl Placement {
         }
         match value.get("kind").and_then(Value::as_str) {
             Some("any") => Ok(Self::Any),
+            Some("project") => {
+                let project_id = value
+                    .get("projectId")
+                    .or_else(|| value.get("project"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        HubError::BadRequest("placement.project requires projectId".into())
+                    })?;
+                Ok(Self::Project {
+                    project_id: project_id.to_string(),
+                })
+            }
             Some("host") => {
                 let host_id = value
                     .get("hostId")
@@ -135,11 +209,12 @@ pub fn select_hosts(
     running: &[(String, i64)],
     placement: &Placement,
     spec: &PlaceSpec,
+    constraints: &PlaceConstraints,
 ) -> Result<Vec<HostRecord>, HubError> {
     let mut reasons = Vec::new();
     let mut eligible = Vec::new();
     for host in hosts {
-        match consider(host, running, placement, spec) {
+        match consider(host, running, placement, spec, constraints) {
             Ok(()) => eligible.push(host.clone()),
             Err(reason) => reasons.push(reason),
         }
@@ -174,6 +249,7 @@ fn consider(
     running: &[(String, i64)],
     placement: &Placement,
     spec: &PlaceSpec,
+    constraints: &PlaceConstraints,
 ) -> Result<(), String> {
     match placement {
         Placement::Host { host_id } if host.host_id != *host_id => {
@@ -192,6 +268,31 @@ fn consider(
                 }
             }
         }
+        Placement::Project { project_id } => {
+            if !host.online {
+                return Err(format!("{}: host is offline", host.host_id));
+            }
+            if !constraints
+                .member_hosts
+                .as_ref()
+                .is_none_or(|members| members.contains(&host.host_id))
+            {
+                return Err(format!(
+                    "{}: not a member host of project {project_id}",
+                    host.host_id
+                ));
+            }
+            if let Some(project_host) = constraints.project_hosts.get(&host.host_id) {
+                for wanted in &project_host.requires {
+                    if !host_has_label(host, wanted) {
+                        return Err(format!(
+                            "{}: project {project_id} requires label {wanted}",
+                            host.host_id
+                        ));
+                    }
+                }
+            }
+        }
         Placement::Any => {
             if !host.online {
                 return Err(format!("{}: host is offline", host.host_id));
@@ -204,7 +305,14 @@ fn consider(
         .find(|(id, _)| id == &host.host_id)
         .map(|(_, n)| *n)
         .unwrap_or(host.instance_count);
-    if running_n >= host.max_instances {
+    // A project quota clamps, never raises, the host's own ceiling.
+    let mut max_instances = host.max_instances;
+    if let Some(project_host) = constraints.project_hosts.get(&host.host_id)
+        && let Some(project_cap) = project_host.max_instances
+    {
+        max_instances = max_instances.min(project_cap);
+    }
+    if running_n >= max_instances {
         // `running_n` counts only Node-confirmed live instances plus creates
         // still inside their acknowledgement window, so this is a real
         // ceiling, not a pile of stale `requested` rows (see
@@ -212,8 +320,28 @@ fn consider(
         // `PATCH /v1/hosts/{id} {"maxInstances":N}`, which now persists across
         // Node hello and Hub restarts.
         return Err(format!(
-            "{}: at maxInstances {} ({running_n} live); raise it with PATCH /v1/hosts/{}",
-            host.host_id, host.max_instances, host.host_id
+            "{}: at maxInstances {max_instances} ({running_n} live); raise it with PATCH /v1/hosts/{}",
+            host.host_id, host.host_id
+        ));
+    }
+    // Design §3.4 step 2: the inventory snapshot the Node already reports is
+    // finally read here. A missing snapshot never excludes (older Nodes, first
+    // hello), matching the best-effort nature of the field.
+    let (cpu_pct, mem_pct) = resource_pressure(host);
+    if let Some(cpu) = cpu_pct
+        && cpu >= RESOURCE_CPU_PCT_MAX
+    {
+        return Err(format!(
+            "{}: host CPU at {cpu}% (limit {RESOURCE_CPU_PCT_MAX}%)",
+            host.host_id
+        ));
+    }
+    if let Some(mem) = mem_pct
+        && mem >= RESOURCE_MEM_PCT_MAX
+    {
+        return Err(format!(
+            "{}: host memory at {mem}% (limit {RESOURCE_MEM_PCT_MAX}%)",
+            host.host_id
         ));
     }
     if host.ssh.is_some() && spec.driver == "generic-pty" && !has_herdr(host) {
@@ -279,6 +407,8 @@ pub struct SpawnRequest {
     pub operation: &'static str,
     /// Idempotency key so a retried spawn reuses the queued command.
     pub idempotency_key: Option<String>,
+    /// Delegation-tree state (scope, grants, preset, task); §2.5.
+    pub delegation: crate::store::InstanceDelegation,
 }
 
 /// Hosts with `online` derived from a live Hub<->Node session, not SQLite state.
@@ -309,13 +439,14 @@ pub async fn spawn_on_host(
     }
     let instance = state
         .store
-        .insert_instance(
+        .insert_instance_delegated(
             host.host_id.clone(),
             request.workspace_id,
             request.kind,
             request.driver,
             request.title,
             request.spec.clone(),
+            request.delegation,
         )
         .await
         .map_err(crate::http::map_store)?;
@@ -354,13 +485,52 @@ pub async fn pick_hosts(
             });
         }
     }
+    let constraints = project_constraints(state, placement).await?;
     let hosts = hosts_with_live_links(state).await?;
     let mut running = Vec::new();
     for host in &hosts {
         let n = state.store.running_count(host.host_id.clone()).await?;
         running.push((host.host_id.clone(), n));
     }
-    select_hosts(&hosts, &running, placement, spec)
+    select_hosts(&hosts, &running, placement, spec, &constraints)
+}
+
+/// Resolve a [`Placement::Project`] into member hosts + per-host quotas;
+/// design §3.4 step 1.
+pub async fn project_constraints(
+    state: &AppState,
+    placement: &Placement,
+) -> Result<PlaceConstraints, HubError> {
+    let Placement::Project { project_id } = placement else {
+        return Ok(PlaceConstraints::default());
+    };
+    let project = state
+        .store
+        .get_project(project_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let member_hosts = project
+        .members
+        .iter()
+        .map(|member| member.host_id.as_id().to_string())
+        .collect::<std::collections::HashSet<_>>();
+    let project_hosts = project
+        .hosts
+        .iter()
+        .map(|quota| {
+            (
+                quota.host_id.as_id().to_string(),
+                ProjectHostPlace {
+                    max_instances: quota.max_instances,
+                    requires: quota.requires.clone(),
+                },
+            )
+        })
+        .collect();
+    Ok(PlaceConstraints {
+        member_hosts: Some(member_hosts),
+        project_hosts,
+    })
 }
 
 /// `POST /v1/placement/resolve` — dry-run selection.
@@ -402,6 +572,10 @@ async fn resolve_http(
     Ok(Json(json!({
         "hostId": hosts.first().map(|h| h.host_id.clone()),
         "hosts": hosts,
+        "projectId": match &placement {
+            Placement::Project { project_id } => Some(project_id.clone()),
+            _ => None,
+        },
     })))
 }
 
@@ -458,6 +632,7 @@ mod tests {
                 labels: vec!["region=sg".into()],
             },
             &spec,
+            &PlaceConstraints::default(),
         )
         .unwrap();
         assert_eq!(picked[0].host_id, "hst_a");
@@ -473,6 +648,7 @@ mod tests {
                 host_id: "hst_b".into(),
             },
             &pty,
+            &PlaceConstraints::default(),
         )
         .unwrap_err();
         match err {
@@ -492,7 +668,14 @@ mod tests {
             driver: "claude-print".into(),
             delegation: None,
         };
-        let err = select_hosts(&hosts, &running, &Placement::Any, &spec).unwrap_err();
+        let err = select_hosts(
+            &hosts,
+            &running,
+            &Placement::Any,
+            &spec,
+            &PlaceConstraints::default(),
+        )
+        .unwrap_err();
         match err {
             HubError::Unsatisfiable { reasons } => {
                 assert!(
@@ -519,10 +702,26 @@ mod tests {
             driver: "generic-pty".into(),
             delegation: None,
         };
-        let error = consider(&remote, &[], &Placement::Any, &spec).unwrap_err();
+        let error = consider(
+            &remote,
+            &[],
+            &Placement::Any,
+            &spec,
+            &PlaceConstraints::default(),
+        )
+        .unwrap_err();
         assert!(error.contains("requires herdr") && error.contains("shell-pty"));
         remote.herdr = Some(json!({"path": "/usr/bin/herdr", "version": "0.9.0"}));
-        assert!(consider(&remote, &[], &Placement::Any, &spec).is_ok());
+        assert!(
+            consider(
+                &remote,
+                &[],
+                &Placement::Any,
+                &spec,
+                &PlaceConstraints::default()
+            )
+            .is_ok()
+        );
         remote.herdr = None;
         assert!(
             consider(
@@ -533,8 +732,188 @@ mod tests {
                     driver: "claude-print".into(),
                     delegation: None
                 },
+                &PlaceConstraints::default(),
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn project_placement_restricts_to_member_hosts_and_requires() {
+        let member = host("hst_sg", true, &["toolchain=rust"], false, 8);
+        let outsider = host("hst_other", true, &["toolchain=rust"], false, 8);
+        let unlabeled = host("hst_mac", true, &[], false, 8);
+        let constraints = PlaceConstraints {
+            member_hosts: Some(
+                ["hst_sg".to_string(), "hst_mac".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            project_hosts: [
+                (
+                    "hst_sg".to_string(),
+                    ProjectHostPlace {
+                        max_instances: Some(8),
+                        requires: vec!["toolchain=rust".into()],
+                    },
+                ),
+                (
+                    "hst_mac".to_string(),
+                    ProjectHostPlace {
+                        max_instances: Some(8),
+                        requires: vec!["toolchain=rust".into()],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let spec = PlaceSpec {
+            driver: "claude-print".into(),
+            delegation: None,
+        };
+        let err = select_hosts(
+            &[outsider, unlabeled],
+            &[],
+            &Placement::Project {
+                project_id: "prj_test".into(),
+            },
+            &spec,
+            &constraints,
+        )
+        .unwrap_err();
+        match err {
+            HubError::Unsatisfiable { reasons } => {
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.contains("not a member host") && r.contains("hst_other")),
+                    "{reasons:?}"
+                );
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| r.contains("requires label") && r.contains("hst_mac")),
+                    "{reasons:?}"
+                );
+            }
+            other => panic!("{other}"),
+        }
+        let picked = select_hosts(
+            &[member],
+            &[],
+            &Placement::Project {
+                project_id: "prj_test".into(),
+            },
+            &spec,
+            &constraints,
+        )
+        .unwrap();
+        assert_eq!(picked[0].host_id, "hst_sg");
+    }
+
+    #[test]
+    fn project_quota_clamps_host_capacity() {
+        let mut record = host("hst_sg", true, &[], false, 8);
+        record.instance_count = 4;
+        let constraints = PlaceConstraints {
+            member_hosts: Some(["hst_sg".to_string()].into_iter().collect()),
+            project_hosts: [(
+                "hst_sg".to_string(),
+                ProjectHostPlace {
+                    max_instances: Some(4),
+                    requires: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let spec = PlaceSpec {
+            driver: "claude-print".into(),
+            delegation: None,
+        };
+        let err = consider(
+            &record,
+            &[],
+            &Placement::Project {
+                project_id: "prj_test".into(),
+            },
+            &spec,
+            &constraints,
+        )
+        .unwrap_err();
+        assert!(err.contains("maxInstances 4"), "{err}");
+    }
+
+    #[test]
+    fn saturated_cpu_or_mem_resources_exclude_a_host() {
+        let mut busy = host("hst_busy", true, &[], false, 8);
+        busy.resources = Some(json!({ "cpuPct": 91, "memPct": 40 }));
+        let spec = PlaceSpec {
+            driver: "claude-print".into(),
+            delegation: None,
+        };
+        assert_eq!(resource_pressure(&busy), (Some(91), Some(40)));
+        let err = consider(
+            &busy,
+            &[],
+            &Placement::Any,
+            &spec,
+            &PlaceConstraints::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("CPU at 91%"), "{err}");
+        busy.resources = Some(json!({ "cpuPct": 5, "memPct": 95 }));
+        let err = consider(
+            &busy,
+            &[],
+            &Placement::Any,
+            &spec,
+            &PlaceConstraints::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("memory at 95%"), "{err}");
+        // Below the line, and absent snapshots, the host stays eligible.
+        busy.resources = Some(json!({ "cpuPct": 89, "memPct": 89 }));
+        assert!(
+            consider(
+                &busy,
+                &[],
+                &Placement::Any,
+                &spec,
+                &PlaceConstraints::default()
+            )
+            .is_ok()
+        );
+        busy.resources = None;
+        assert!(
+            consider(
+                &busy,
+                &[],
+                &Placement::Any,
+                &spec,
+                &PlaceConstraints::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn project_placement_parses() {
+        assert_eq!(
+            Placement::from_value(Some(&json!({"kind":"project","projectId":"prj_x"})), None)
+                .unwrap(),
+            Placement::Project {
+                project_id: "prj_x".into()
+            }
+        );
+        assert_eq!(
+            Placement::from_value(Some(&json!({"projectId":"prj_y"})), None).unwrap(),
+            Placement::Project {
+                project_id: "prj_y".into()
+            }
+        );
+        let err = Placement::from_value(Some(&json!({"kind":"project"})), None).unwrap_err();
+        assert!(err.to_string().contains("projectId"), "{err}");
     }
 }

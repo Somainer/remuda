@@ -27,6 +27,7 @@ mod maintenance;
 mod objects;
 mod passkeys;
 mod placement;
+mod projects;
 mod provider_models;
 mod provider_resolve;
 mod providers;
@@ -86,6 +87,29 @@ pub struct AppState {
     agent_approvals: agent_approvals::AgentApprovals,
     /// Process-local, single-use WebAuthn ceremony challenges (D-030).
     challenges: passkeys::ChallengeStore,
+}
+
+/// Test-only constructors for types private modules would otherwise hide
+/// from integration tests. Not part of the supported API.
+#[doc(hidden)]
+pub mod store_test_support {
+    use crate::store::InstanceDelegation;
+
+    /// A leaf-worker delegation scoped to one project.
+    pub fn leaf_delegation(project_id: &str) -> Result<InstanceDelegation, String> {
+        let project = remuda_protocol::ProjectId::try_from(project_id.to_string())
+            .map_err(|err| err.to_string())?;
+        Ok(InstanceDelegation {
+            role: Some(remuda_protocol::ROLE_WORKER.into()),
+            scope: remuda_protocol::InstanceScope {
+                project_ids: vec![project],
+                ..Default::default()
+            },
+            grants: Vec::new(),
+            task_id: None,
+            enforce_tree: true,
+        })
+    }
 }
 
 /// A bound Hub that shuts down when dropped.
@@ -350,6 +374,7 @@ pub fn router(state: AppState) -> Router {
         .merge(tty::routes())
         .merge(ws::routes())
         .merge(placement::routes())
+        .merge(projects::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())

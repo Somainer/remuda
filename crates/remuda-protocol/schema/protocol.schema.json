@@ -5002,7 +5002,7 @@
       ]
     },
     "Id": {
-      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
     "InputAccounting": {
@@ -6109,6 +6109,11 @@
         {
           "const": "claude-hook",
           "description": "Wire value `claude-hook`.",
+          "type": "string"
+        },
+        {
+          "const": "harness-hook",
+          "description": "Wire value `harness-hook`.",
           "type": "string"
         },
         {

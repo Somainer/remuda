@@ -288,8 +288,14 @@ impl InteractionRuntime {
         let ticket = {
             let glue = self.glue.lock().await;
             if let Some(row) = glue.pending.get(&interaction_id)
-                && row.interaction.carrier == InteractionCarrier::NativeTty
+                && matches!(
+                    row.interaction.carrier,
+                    InteractionCarrier::NativeTty | InteractionCarrier::HarnessHook
+                )
             {
+                // Both carriers answer a card that named its options and
+                // carried an input digest, so the answer has to match them —
+                // otherwise a stale or forged answer reaches the agent.
                 remuda_driver::interaction::validate_answer(&row.interaction.request, &answer)
                     .map_err(map_broker)?;
             }

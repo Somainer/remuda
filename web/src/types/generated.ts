@@ -1337,7 +1337,7 @@ export type InteractionAnsweredPayload = ({
 });
 
 /** InteractionCarrier wire values; `protocol.md` §2.6. */
-export type InteractionCarrier = ("claude-control" | "claude-hook" | "codex-rpc" | "acp-rpc" | "native-tty" | "unsupported");
+export type InteractionCarrier = ("claude-control" | "claude-hook" | "harness-hook" | "codex-rpc" | "acp-rpc" | "native-tty" | "unsupported");
 
 /** InteractionExpiredPayload; `protocol.md` §5.4. */
 export type InteractionExpiredPayload = ({

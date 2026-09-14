@@ -72,7 +72,14 @@ export type Interaction = EntityMeta & {
   state: "pending" | "answer-committed" | "resolved" | "expired" | "invalidated" | "unknown" | "reconciling";
   blocking: boolean;
   answerable: boolean;
-  carrier: "claude-control" | "claude-hook" | "codex-rpc" | "acp-rpc" | "native-tty" | "unsupported";
+  carrier:
+    | "claude-control"
+    | "claude-hook"
+    | "harness-hook"
+    | "codex-rpc"
+    | "acp-rpc"
+    | "native-tty"
+    | "unsupported";
   request: InteractionRequest;
   deadline: Knowledge<Timestamp>;
   deadlineSource: "native" | "runtime-policy" | "none" | "unknown";

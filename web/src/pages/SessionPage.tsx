@@ -209,19 +209,19 @@ export function SessionPage({
           >
             {hub.compact ? "Compact" : "Full"}
           </button>
-          {/* 文件 entry is available in every projection, including at ≤767px
-              where it previously had no path into the fullscreen files route. */}
-          <button
-            type="button"
-            className={resolvedView === "files" ? session.headBtnActive : session.headBtn}
-            data-testid="files-toggle"
-            aria-pressed={resolvedView === "files"}
-            onClick={() => (resolvedView === "files" ? navigate(backTo) : openFiles())}
-          >
-            文件
-          </button>
           {resolvedView === "structured" || resolvedView === "files" || resolvedView === "events" ? (
             <>
+              {/* 文件 was deskOnly, which hid the only entry to the fullscreen
+                  files route at ≤767px. It is now reachable on every width. */}
+              <button
+                type="button"
+                className={resolvedView === "files" ? session.headBtnActive : session.headBtn}
+                data-testid="files-toggle"
+                aria-pressed={resolvedView === "files"}
+                onClick={() => (resolvedView === "files" ? navigate(backTo) : openFiles())}
+              >
+                文件
+              </button>
               <button
                 type="button"
                 className={resolvedView === "events" ? session.headBtnActive : session.headBtn}

@@ -44,11 +44,7 @@ export function FilesView({ hostId, workspaceId, hostLabel, onBack }: FilesViewP
   const [detailLoading, setDetailLoading] = useState(false);
 
   const load = useCallback(async () => {
-    setView((current) => ({
-      phase: current.phase === "loading" ? "loading" : "loading",
-      status: current.status,
-      contentChanged: false,
-    }));
+    setView((current) => ({ phase: "loading", status: current.status, contentChanged: false }));
     setActivePath(null);
     setDetail({ kind: "idle" });
     try {

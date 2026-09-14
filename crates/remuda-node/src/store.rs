@@ -62,6 +62,22 @@ pub trait LocalStore: Send + Sync {
         lifecycle: Option<InstanceLifecycle>,
         activity: Option<Knowledge<Activity>>,
     ) -> Result<Instance, NodeError>;
+    /// Replace the capability snapshot with the one the live driver reports.
+    ///
+    /// D-028 §4.3: the create-time snapshot is keyed by `DriverKind`, which
+    /// cannot express the thing that actually varies. A `shell-pty` carrying a
+    /// promoted `claude` can steer and interrupt; the same driver carrying a
+    /// login shell cannot. Until the driver is asked, the wire reports the
+    /// static row and §6's honesty rule is unmet — the UI cannot tell
+    /// `emulated` from `native` from genuinely `unknown`.
+    ///
+    /// Returns `None` when the snapshot is unchanged, so a repeated refresh
+    /// does not bump the revision.
+    fn set_instance_capabilities(
+        &self,
+        instance_id: &InstanceId,
+        capabilities: remuda_protocol::CapabilitySnapshot,
+    ) -> Result<Option<Instance>, NodeError>;
     /// Apply a terminal → agent promotion or demotion (D-025).
     ///
     /// `kind` is the agent now holding the PTY's foreground (`terminal` on
@@ -539,6 +555,34 @@ impl LocalStore for MemoryStore {
             entities.put_instance(&instance)?;
         }
         Ok(instance)
+    }
+
+    fn set_instance_capabilities(
+        &self,
+        instance_id: &InstanceId,
+        capabilities: remuda_protocol::CapabilitySnapshot,
+    ) -> Result<Option<Instance>, NodeError> {
+        let now = timestamp_now()?;
+        let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
+        let record = state
+            .instances
+            .get_mut(instance_id)
+            .ok_or_else(|| not_found("instance", instance_id.as_id().to_string()))?;
+        // The snapshot carries its own `id`, minted per call, so comparing
+        // whole snapshots would report a change on every refresh. The
+        // capability set is the part callers act on.
+        if record.instance.capabilities.capabilities == capabilities.capabilities {
+            return Ok(None);
+        }
+        record.instance.capabilities = capabilities;
+        record.instance.meta.revision.0 = record.instance.meta.revision.0.saturating_add(1);
+        record.instance.meta.updated_at = now;
+        let instance = record.instance.clone();
+        drop(state);
+        if let Some(entities) = &self.entities {
+            entities.put_instance(&instance)?;
+        }
+        Ok(Some(instance))
     }
 
     fn set_instance_promotion(

@@ -418,6 +418,15 @@ impl ShellPtyDriver {
             .and_then(|slot| slot.as_ref().map(|found| found.kind))
     }
 
+    /// Screen-derived readiness of the promoted agent, when the poller has one.
+    ///
+    /// `None` means "no rule matched", which §10 insists never collapses into
+    /// `idle` — so a caller guarding on idleness gets a conservative answer.
+    #[must_use]
+    pub fn screen_status(&self) -> Option<ScreenStatus> {
+        self.status.lock().ok().and_then(|slot| *slot)
+    }
+
     /// Stand up this instance's hook path, when one was configured.
     ///
     /// The [`SignalBus`](remuda_signal::SignalBus) shares the promotion
@@ -983,7 +992,11 @@ impl Driver for ShellPtyDriver {
                 ));
             }
         };
-        let promoted = self.promoted_kind().is_some();
+        // Same reasoning as `cancel`: a Remuda-launched agent is an agent from
+        // the moment it is spawned, and a composer that got `text\r` in one
+        // write during the pre-promotion window would take the bytes and never
+        // submit them.
+        let promoted = self.session_kind().is_some();
         let state = self.state().await?;
         let delivery = send::encode(&text, promoted, state.modes());
         state.write_bytes(&delivery.body).await?;
@@ -1030,9 +1043,34 @@ impl Driver for ShellPtyDriver {
     /// `CAPABILITY_UNKNOWN` rather than a plausible keystroke and a false
     /// success.
     async fn cancel(&self) -> DriverResult<DriverAck> {
-        let Some(kind) = self.promoted_kind() else {
+        // `session_kind`, not `promoted_kind`: for a Remuda-launched agent the
+        // kind is known from the launch target before the first promotion poll
+        // lands. Reading only the poller left a window — measured live, not
+        // hypothetical — in which `instance.cancel` fell through to the shell
+        // branch and sent `\x03` to a Claude TUI, which killed the session it
+        // was supposed to interrupt.
+        let Some(kind) = self.session_kind() else {
             return self.write_tty(b"\x03").await;
         };
+        // An interrupt key is only an interrupt while there is a turn to
+        // interrupt. Measured live against claude 2.1.221: `Esc` sent to an
+        // *idle* composer quits the session (the instance landed `failed` with
+        // `native-exit-code-1`). The evidence that `Esc` interrupts —
+        // claude-queue-steer-1 — is all from a running turn, so sending it
+        // outside one is extrapolation, and the failure mode is losing the
+        // session the caller meant to keep.
+        //
+        // Idle is therefore a no-op that says so rather than an error: there is
+        // nothing to cancel, and having asked is not a mistake. `unknown` still
+        // sends, because refusing to interrupt a turn that might be running is
+        // the worse of the two risks.
+        if self.screen_status() == Some(ScreenStatus::Idle) {
+            tracing::debug!(
+                ?kind,
+                "cancel on an idle composer: nothing to interrupt, and the key would quit"
+            );
+            return Ok(DriverAck::not_dispatched());
+        }
         let Some(bytes) = keys::interrupt_bytes(kind) else {
             return Err(DriverError::CapabilityUnknown(format!(
                 "the interrupt key for {kind:?} has not been verified; \
@@ -1523,6 +1561,77 @@ fn shell_quote(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_launched_agent_is_an_agent_before_the_first_promotion_poll() {
+        // Measured live (native-pty-2 §5): `cancel` read only the promotion
+        // poller, so in the ~1s before the first poll an `instance.cancel` on a
+        // Remuda-launched Claude fell through to the shell branch and sent
+        // `\x03` — which does not interrupt a Claude turn, it quits the
+        // session. The launch target knows the kind immediately; the poller
+        // only confirms it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.target = Target::Agent {
+            kind: AgentKind::Claude,
+            resume: None,
+        };
+        let driver = ShellPtyDriver::new(options);
+        assert_eq!(
+            driver.session_kind(),
+            Some(AgentKind::Claude),
+            "the kind is known from the launch, with no poll yet"
+        );
+        assert_eq!(
+            driver.promoted_kind(),
+            None,
+            "and the poller has indeed not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_idle_composer_sends_nothing() {
+        // Measured live against claude 2.1.221 (native-pty-2 §5): `Esc` on an
+        // idle composer *quits*. The evidence that `Esc` interrupts is all from
+        // a running turn. A cancel with no turn to cancel must therefore be a
+        // no-op, not a keystroke that ends the session.
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let driver = ShellPtyDriver::new(options);
+        driver.spawn().await.expect("spawns");
+        // Promoted rather than launched, because the two are the same session
+        // to every line of code below this point (§1.0) and the promoted shape
+        // needs no materializer inputs.
+        *driver.promoted.lock().unwrap() = Some(crate::promote::Detected {
+            kind: AgentKind::Claude,
+            pid: 1,
+            session_id: None,
+            hydrates_transcript: true,
+        });
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
+
+        let ack = Driver::cancel(&driver)
+            .await
+            .expect("cancel is not an error");
+        assert_eq!(
+            ack.dispatch,
+            remuda_protocol::DispatchState::NotDispatched,
+            "nothing was sent, and the ack says so rather than claiming a write"
+        );
+        let _ = Driver::close(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn a_plain_shell_still_has_no_session_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = ShellPtyDriver::new(ShellPtyOptions::login(dir.path().to_path_buf()));
+        assert_eq!(
+            driver.session_kind(),
+            None,
+            "a login shell is not an agent, so cancel stays Ctrl+C"
+        );
+    }
 
     #[tokio::test]
     async fn a_driver_without_hooks_configured_starts_nothing() {

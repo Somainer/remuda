@@ -545,6 +545,27 @@ impl Driver for NativeAdapter {
         self.startup_error.lock().ok().and_then(|slot| slot.clone())
     }
 
+    /// Ask the live driver what this session can do (§4.3, §6).
+    ///
+    /// A failure is not fatal and not a downgrade: the create-time snapshot
+    /// stays, which is the honest fallback — "we could not ask" must not be
+    /// written down as "it cannot".
+    fn capabilities(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Option<remuda_protocol::CapabilitySnapshot>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            match NativeDriver::capabilities(&*self.native).await {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::debug!(%error, "driver did not report capabilities; keeping the static row");
+                    None
+                }
+            }
+        })
+    }
+
     fn wait_control(&self) -> DriverFuture<'_> {
         Box::pin(async move {
             NativeDriver::wait_control(&*self.native)

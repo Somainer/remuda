@@ -187,6 +187,21 @@ pub trait Driver: Send + Sync {
     fn startup_error(&self) -> Option<String> {
         None
     }
+    /// What this *session* can do, as opposed to what its driver kind can
+    /// (D-028 §4.3, §6).
+    ///
+    /// `None` keeps the create-time snapshot, which is the right answer for a
+    /// driver whose abilities really are fixed by its kind. A PTY's are not: it
+    /// carries whatever agent is in it, so it answers here and the Node stores
+    /// what it says. Without this the wire reports the static row and the UI
+    /// cannot distinguish `native` from `emulated` from `unknown` — which is
+    /// the whole of §6's honesty requirement.
+    fn capabilities(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<remuda_protocol::CapabilitySnapshot>> + Send + '_>>
+    {
+        Box::pin(async { None })
+    }
 }
 
 /// Creates one stateful driver object for each Instance.

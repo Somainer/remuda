@@ -778,6 +778,7 @@ fn spawn_observation_pump(
     interactions: Arc<InteractionRuntime>,
     instance_id: InstanceId,
     mut observations: mpsc::Receiver<remuda_protocol::Observation>,
+    driver: Arc<dyn Driver>,
 ) {
     tokio::spawn(async move {
         while let Some(observation) = observations.recv().await {
@@ -789,15 +790,22 @@ fn spawn_observation_pump(
             } else if let Some(reason) = native_failure_reason(&observation) {
                 record_task_exit(store.as_ref(), &instance_id, &reason);
             }
-            if let Some(promotion) = promotion_change(&observation)
-                && let Err(error) = store.set_instance_promotion(
+            if let Some(promotion) = promotion_change(&observation) {
+                if let Err(error) = store.set_instance_promotion(
                     &instance_id,
                     promotion.kind,
                     promotion.mode,
                     promotion.promoted_at,
-                )
-            {
-                tracing::warn!(%error, "instance promotion not applied");
+                ) {
+                    tracing::warn!(%error, "instance promotion not applied");
+                } else {
+                    // Promotion is precisely the event that changes the
+                    // answer: the PTY was carrying a login shell and is now
+                    // carrying an agent, so steer / queue / interrupt move
+                    // from "not provided" to that harness's measured
+                    // provisions (§4.3, §6).
+                    refresh_capabilities(store.as_ref(), &instance_id, driver.as_ref()).await;
+                }
             }
             if let Some(session) = native_session_evidence(&observation) {
                 record_native_session(store.as_ref(), &instance_id, &session);
@@ -888,6 +896,7 @@ async fn materialize_instance(
             Arc::clone(&interactions),
             instance_id.clone(),
             observations,
+            Arc::clone(&driver),
         );
     }
     if let Some(recipe) = driver.launch_recipe() {
@@ -916,6 +925,11 @@ async fn materialize_instance(
         "ready",
         "driver-started",
     )?;
+    // D-028 §4.3/§6: the create-time snapshot is keyed by `DriverKind` and
+    // cannot know what this session is actually carrying. Ask the live driver
+    // now that it has started, so the wire reports the session's real
+    // steer / queue / interrupt provisions instead of the static row.
+    refresh_capabilities(store.as_ref(), &instance_id, driver.as_ref()).await;
 
     if pty_queue::is_pty(driver.kind()) {
         let result = pty_queue::run(
@@ -1239,6 +1253,34 @@ fn record_task_exit(store: &dyn LocalStore, instance_id: &InstanceId, reason: &s
         append_instance_lifecycle(store, instance_id, Some("ready"), "failed", reason)
     {
         tracing::error!(%error, "failed to append task-exit lifecycle event");
+    }
+}
+
+/// Store what the live driver says this session can do (§4.3, §6).
+///
+/// Called after start and again after a promotion, because promotion is
+/// exactly the event that changes the answer: a `shell-pty` that was carrying a
+/// login shell is now carrying `claude`, and steer / queue / interrupt go from
+/// "not provided" to the provisions measured for that harness.
+///
+/// Silent when the driver has nothing to add — a driver whose abilities really
+/// are fixed by its kind returns `None` and keeps its create-time snapshot.
+async fn refresh_capabilities(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    driver: &dyn Driver,
+) {
+    let Some(snapshot) = driver.capabilities().await else {
+        return;
+    };
+    match store.set_instance_capabilities(instance_id, snapshot) {
+        Ok(Some(instance)) => tracing::debug!(
+            instance = %instance_id.as_id(),
+            revision = instance.meta.revision.0,
+            "session capabilities refreshed from the live driver"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "session capabilities not stored"),
     }
 }
 

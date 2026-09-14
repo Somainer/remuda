@@ -372,6 +372,17 @@ pub struct InstanceRecord {
     /// Derived from `mode` / `promoted_at` for rows written before D-028, so
     /// it is always populated on read even though no column stores it.
     /// Provenance only: it never gates a capability.
+    ///
+    /// TODO(x-protocol): the derivation is wrong now that P2 has landed and is
+    /// measured wrong on a live Node (native-pty-2 §6). §1.0 rule 2 makes D-025
+    /// promotion the *only* detection path, so a Remuda-launched agent is
+    /// promoted too — and `mode == promoted` therefore no longer means a human
+    /// typed the command. Both paths currently read back as `user` once they
+    /// promote. The Node already stores the right answer explicitly on its own
+    /// `Instance.launched_by` (it knows which one it started), so the fix is to
+    /// persist and read that column here rather than to infer it. Harmless
+    /// until then — the field is provenance only and gates nothing — but it is
+    /// the one entity field P2's parity check cannot currently verify.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

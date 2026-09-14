@@ -4,8 +4,8 @@
 //! Source: `tests/fixtures/claude-transcript.jsonl` (see `fixtures/SOURCES.md`).
 
 use remuda_driver::{
-    DriverKind, TranscriptMapper, TranscriptTail, encode_project_dir, locate_transcript,
-    project_dir,
+    BindingSource, DriverKind, TranscriptMapper, TranscriptTail, bind_by_pid_file,
+    bind_by_session_id, encode_project_dir, list_candidates, project_dir,
 };
 use remuda_protocol::{
     Completeness, HostId, Id, InstanceId, MutationOperation, ObservationPayload, RunId,
@@ -192,31 +192,48 @@ fn the_tool_call_and_its_result_share_one_native_tool_id() {
 }
 
 #[test]
-fn a_promoted_session_is_located_by_encoded_cwd_and_detection_time() {
+fn a_promoted_session_is_bound_by_exact_identity_never_by_newest_mtime() {
     let tmp = tempfile::tempdir().expect("tmp");
-    let cwd = Path::new("/work/repo");
-    let dir = project_dir(tmp.path(), cwd);
+    // Use a real cwd so canonicalize-based project_dir resolution works.
+    let cwd = tmp.path().join("work-repo");
+    std::fs::create_dir_all(&cwd).expect("mkdir");
+    let dir = project_dir(tmp.path(), &cwd);
     std::fs::create_dir_all(&dir).expect("mkdir");
     let session = "11111111-2222-4333-8444-555555555555";
     let path = dir.join(format!("{session}.jsonl"));
     std::fs::copy(fixture(), &path).expect("copy fixture");
 
-    assert_eq!(encode_project_dir(cwd), "-work-repo");
-    // argv gave us the session id, so the lookup is exact.
+    assert_eq!(encode_project_dir(Path::new("/work/repo")), "-work-repo");
+
+    // Channel A (argv): an explicit session id binds its exact file.
     assert_eq!(
-        locate_transcript(
-            tmp.path(),
-            cwd,
-            Some(session),
-            std::time::SystemTime::UNIX_EPOCH
+        bind_by_session_id(tmp.path(), &cwd, session)
+            .expect("argv binding")
+            .path,
+        path
+    );
+    // An unknown id never falls through to "newest file".
+    assert!(bind_by_session_id(tmp.path(), &cwd, "missing").is_none());
+
+    // Channel B (pid file): the foreground pid names the exact session.
+    let sessions = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    std::fs::write(
+        sessions.join("4242.json"),
+        format!(
+            r#"{{"pid":4242,"sessionId":"{session}","cwd":{}}}"#,
+            serde_json::json!(cwd.to_string_lossy())
         ),
-        Some(path.clone())
-    );
-    // Without one, the newest file written since detection is adopted.
-    assert_eq!(
-        locate_transcript(tmp.path(), cwd, None, std::time::SystemTime::UNIX_EPOCH),
-        Some(path)
-    );
+    )
+    .expect("write pid session");
+    let binding = bind_by_pid_file(tmp.path(), 4242, &cwd).expect("pid binding");
+    assert_eq!(binding.path, path);
+    assert_eq!(binding.source, BindingSource::PidFile);
+    // A different pid with no registry entry is unbound, never "newest file".
+    assert!(bind_by_pid_file(tmp.path(), 9999, &cwd).is_none());
+
+    // Channel C (manual): candidates are merely listed; nothing is auto-picked.
+    assert_eq!(list_candidates(tmp.path(), &cwd).len(), 1);
 }
 
 #[test]
@@ -265,4 +282,30 @@ fn tailing_a_growing_transcript_hydrates_only_the_new_lines() {
     );
     // Nothing new means nothing re-emitted.
     assert!(tail.poll().expect("poll").is_empty());
+}
+
+/// The SessionStart hook payload shape (D-028 P1 shim → `remuda hook emit`).
+/// Fixture: `tests/fixtures/session-start-hook.json`.
+#[test]
+fn the_session_start_hook_fixture_has_the_documented_shape() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/session-start-hook.json");
+    let body = std::fs::read_to_string(path).expect("hook fixture");
+    let report = remuda_driver::SessionStartReport::from_stdin(&body).expect("parse fixture");
+    assert_eq!(report.session_id, "04b95a78-e876-4212-aa9c-a6482f30f583");
+    assert_eq!(report.ppid, Some(5150));
+    assert!(
+        report
+            .transcript_path
+            .ends_with("04b95a78-e876-4212-aa9c-a6482f30f583.jsonl")
+    );
+    assert_eq!(
+        report.cwd.as_deref(),
+        Some(Path::new("/Users/dev/work/repo"))
+    );
+    // The hook binds only when its parent is the detected foreground process.
+    assert!(
+        report.bind(5150).is_none(),
+        "no transcript file on disk here"
+    );
+    assert!(report.bind(9999).is_none(), "a different pid never binds");
 }

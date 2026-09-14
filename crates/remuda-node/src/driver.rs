@@ -435,7 +435,22 @@ impl Driver for NativeShellAdapter {
                         .await
                         .map_err(|error| DriverError::Failed(error.to_string()))?;
                 }
-                DriverRequest::RespondInteraction { .. } => {}
+                DriverRequest::RespondInteraction {
+                    interaction_id,
+                    answer,
+                } => {
+                    let interaction_id = interaction_id
+                        .parse()
+                        .map_err(|error| DriverError::Failed(format!("interaction id: {error}")))?;
+                    let answer = serde_json::from_value(answer).map_err(|error| {
+                        DriverError::Failed(format!("interaction answer: {error}"))
+                    })?;
+                    use remuda_driver::Driver as _;
+                    self.inner
+                        .respond_interaction(interaction_id, answer)
+                        .await
+                        .map_err(|error| DriverError::Failed(error.to_string()))?;
+                }
                 DriverRequest::Configure { .. } => {}
             }
             Ok(Vec::new())

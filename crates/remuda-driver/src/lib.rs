@@ -51,7 +51,11 @@ pub use claude_onboarding::{
 };
 pub use claude_print::TranscriptMapper;
 pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
-pub use claude_transcript::{TranscriptTail, encode_project_dir, locate_transcript, project_dir};
+pub use claude_transcript::{
+    BindingSource, SessionStartReport, TranscriptBinding, TranscriptCandidate, TranscriptTail,
+    bind_by_pid_file, bind_by_session_id, bind_manual, cwd_matches, encode_project_dir,
+    list_candidates, project_dir, recorded_cwd, transcript_belongs_to_cwd,
+};
 pub use driver::{CallContext, Driver, DriverAck, RunHandle};
 pub use error::{DriverError, DriverResult};
 pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, WaitUntil};

@@ -1319,7 +1319,10 @@ fn native_session_evidence(
         .map(|path| path.trim().to_owned())
         .filter(|path| !path.is_empty());
     let carries_session = match native.topic {
-        remuda_protocol::LifecycleTopic::Session => native.native_name == "session",
+        // `transcript_bound` is the promoted terminal's deterministic claim.
+        remuda_protocol::LifecycleTopic::Session => {
+            matches!(native.native_name.as_str(), "session" | "transcript_bound")
+        }
         remuda_protocol::LifecycleTopic::Hook => {
             native.native_name == "SessionStart" && transcript_path.is_some()
         }

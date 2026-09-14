@@ -57,26 +57,51 @@ struct Budgets {
     global: Bucket,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LimitParams {
+    pub ip_burst: f64,
+    pub ip_refill_per_sec: f64,
+    pub global_burst: f64,
+    pub global_refill_per_sec: f64,
+}
+
 #[derive(Clone)]
-pub(crate) struct AuthRateLimits(Arc<Mutex<Budgets>>);
+pub(crate) struct AuthRateLimits {
+    limits: Arc<Mutex<Budgets>>,
+    params: LimitParams,
+}
 
 impl Default for AuthRateLimits {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(Budgets {
-            peers: HashMap::new(),
-            global: Bucket::full(GLOBAL_BURST, Instant::now()),
-        })))
+        Self::new(LimitParams {
+            ip_burst: IP_BURST,
+            ip_refill_per_sec: IP_REFILL_PER_SEC,
+            global_burst: GLOBAL_BURST,
+            global_refill_per_sec: GLOBAL_REFILL_PER_SEC,
+        })
+    }
+}
+
+impl AuthRateLimits {
+    pub(crate) fn new(params: LimitParams) -> Self {
+        Self {
+            limits: Arc::new(Mutex::new(Budgets {
+                peers: HashMap::new(),
+                global: Bucket::full(params.global_burst, Instant::now()),
+            })),
+            params,
+        }
     }
 }
 
 impl AuthRateLimits {
     fn admit(&self, peer: IpAddr, endpoint: Endpoint, now: Instant) -> bool {
-        let Ok(mut budgets) = self.0.lock() else {
+        let Ok(mut budgets) = self.limits.lock() else {
             return false;
         };
         if !budgets
             .global
-            .take(GLOBAL_BURST, GLOBAL_REFILL_PER_SEC, now)
+            .take(self.params.global_burst, self.params.global_refill_per_sec, now)
         {
             return false;
         }
@@ -96,8 +121,8 @@ impl AuthRateLimits {
         budgets
             .peers
             .entry((peer, endpoint))
-            .or_insert_with(|| Bucket::full(IP_BURST, now))
-            .take(IP_BURST, IP_REFILL_PER_SEC, now)
+            .or_insert_with(|| Bucket::full(self.params.ip_burst, now))
+            .take(self.params.ip_burst, self.params.ip_refill_per_sec, now)
     }
 }
 
@@ -174,7 +199,7 @@ mod tests {
     fn bucket_storage_is_bounded_and_idle_entries_are_reclaimed() {
         let limits = AuthRateLimits::default();
         let now = Instant::now();
-        let mut budgets = limits.0.lock().unwrap();
+        let mut budgets = limits.limits.lock().unwrap();
         for i in 0..MAX_BUCKETS as u32 {
             budgets.peers.insert(
                 (IpAddr::V4(i.into()), Endpoint::Login),
@@ -185,6 +210,6 @@ mod tests {
         let peer = "203.0.113.1".parse().unwrap();
         assert!(!limits.admit(peer, Endpoint::Login, now));
         assert!(limits.admit(peer, Endpoint::Login, now + IDLE_TTL));
-        assert_eq!(limits.0.lock().unwrap().peers.len(), 1);
+        assert_eq!(limits.limits.lock().unwrap().peers.len(), 1);
     }
 }

@@ -255,7 +255,12 @@ async fn spawn_inner(
         push,
         followers: Followers::default(),
         blocked: BlockedWatch::default(),
-        auth_limits: rate_limit::AuthRateLimits::default(),
+        auth_limits: rate_limit::AuthRateLimits::new(rate_limit::LimitParams {
+            ip_burst: config.auth_ip_burst,
+            ip_refill_per_sec: config.auth_ip_refill_per_sec,
+            global_burst: config.auth_global_burst,
+            global_refill_per_sec: config.auth_global_refill_per_sec,
+        }),
         agent_approvals: agent_approvals::AgentApprovals::new()?,
         challenges: passkeys::ChallengeStore::default(),
     };

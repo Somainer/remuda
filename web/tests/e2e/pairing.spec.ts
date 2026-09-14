@@ -37,6 +37,7 @@ test.describe("device pairing", () => {
   test("wrong bootstrap token stays on login", async ({ page }) => {
     await page.goto("/settings");
     await logout(page);
+    await useAccessCode(page);
     await page.getByTestId("login-tab-bootstrap").click();
     await page.getByTestId("login-bootstrap-token").fill("nope");
     await page.getByTestId("login-submit").click();

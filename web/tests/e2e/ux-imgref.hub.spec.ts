@@ -17,23 +17,59 @@ test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node"
 
 /**
  * The fake node advertises maxInstances 8 and earlier specs in the serial run
- * leave sessions behind. Force-delete every leftover on the e2e host before
- * we create ours, and clean our own up after each test.
+ * leave sessions behind, and a force-DELETE first closes each instance
+ * (~seconds against the fake node), so the documented escape is the same one
+ * ux-quickfind uses: raise the ceiling in beforeAll and restore it after.
  */
+async function patchMaxInstances(page: Page, value: number): Promise<number | undefined> {
+  return page.evaluate(async (next) => {
+    const list = await fetch("/v1/hosts", { credentials: "include" });
+    const body = (await list.json()) as {
+      items?: { hostId?: string; maxInstances?: number }[];
+    };
+    const id = body.items?.find((host) => host.hostId)?.hostId;
+    if (!id) return undefined;
+    const previous = body.items?.find((host) => host.hostId === id)?.maxInstances;
+    await fetch(`/v1/hosts/${id}`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ maxInstances: next }),
+    });
+    return previous;
+  }, value);
+}
+
+/** Best-effort concurrent slot reclamation (each DELETE is slow on the fake). */
 async function forceDeleteAllInstances(page: Page) {
   await page.evaluate(async () => {
     const list = await fetch("/v1/instances", { credentials: "include" });
-    const body = (await list.json()) as {
-      items?: { id: string }[];
-    };
-    for (const instance of body.items ?? []) {
-      await fetch(`/v1/instances/${instance.id}?force=1`, {
-        method: "DELETE",
-        credentials: "include",
-      }).catch(() => undefined);
-    }
+    const body = (await list.json()) as { items?: { id: string }[] };
+    await Promise.all(
+      (body.items ?? []).map((instance) =>
+        fetch(`/v1/instances/${instance.id}?force=1`, {
+          method: "DELETE",
+          credentials: "include",
+        }).catch(() => undefined),
+      ),
+    );
   });
 }
+
+test.beforeAll(async ({ browser }) => {
+  const page = await browser.newPage();
+  await login(page);
+  await patchMaxInstances(page, 24);
+  await page.close();
+});
+
+test.afterAll(async ({ browser }) => {
+  const page = await browser.newPage();
+  await login(page);
+  await patchMaxInstances(page, 8);
+  await forceDeleteAllInstances(page).catch(() => undefined);
+  await page.close();
+});
 
 test.afterEach(async ({ page }) => {
   await forceDeleteAllInstances(page).catch(() => undefined);

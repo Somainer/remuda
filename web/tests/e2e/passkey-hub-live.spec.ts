@@ -65,12 +65,25 @@ test.describe("passkey login (CDP virtual authenticator)", () => {
     await expect(row).toBeVisible();
     await expect(row).toContainText("本机");
 
+    // The conditional ceremony the login page fires on mount races the logout
+    // cookie clear: a stale remuda_device cookie must never make the Hub
+    // answer login/finish 401 before the WebAuthn handler runs (D-029).
+    const finishStatuses: number[] = [];
+    page.on("response", (response) => {
+      if (new URL(response.url()).pathname.endsWith("/v1/auth/passkeys/login/finish")) {
+        finishStatuses.push(response.status());
+      }
+    });
+
     await logout(page);
     await expect(page).toHaveURL(new RegExp(`${origin}/login`));
     await expect(page.getByTestId("login-page")).toBeVisible();
 
     await expectPasskeySession(page);
+    await expect(page).toHaveURL(/\/sessions/);
     await expectCookieSession(page);
+    expect(finishStatuses).toContain(200);
+    expect(finishStatuses).not.toContain(401);
 
     // The new session is a different device; the passkey row still exists.
     await page.goto(`${origin}/settings`);

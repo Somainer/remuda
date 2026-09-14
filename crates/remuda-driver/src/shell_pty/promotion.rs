@@ -1068,6 +1068,23 @@ async fn pump(
 }
 
 /// Stamp and send one Observation on the driver's event channel.
+///
+/// Re-exported to the parent module so the exit waiter (§5.5) stamps its
+/// lifecycle with the same identity and the same sequence counter as every
+/// promotion event. Two emitters with two counters would interleave
+/// unpredictably, and §5.5's exit would sort against promotion events by
+/// accident rather than by order of observation.
+pub(super) async fn emit_payload(
+    events: &mpsc::Sender<Observation>,
+    seq: &AtomicU64,
+    ctx: &PromoteCtx,
+    channel: SourceChannel,
+    completeness: Completeness,
+    body: ObservationPayload,
+) -> DriverResult<()> {
+    emit(events, seq, ctx, channel, completeness, body).await
+}
+
 async fn emit(
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,

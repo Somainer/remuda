@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { isSessionRoute, MORE_NAV } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
-import { formatDiagnostic, notify, notifyStore, useLiveAnnouncement, useNotifications, type Notification } from "../lib/notify";
+import { formatDiagnostic, notify, notifyStore, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
@@ -19,6 +19,18 @@ function layoutOf(pathname: string): "sessions" | "session" | "sheet" | "page" {
   if (pathname.startsWith("/s/")) return "session";
   if (pathname === "/sessions") return "sessions";
   return "page";
+}
+
+/** Test seam for the notification surfaces; mirrors `window.__ttyLab`. */
+type NotifyLabHandle = {
+  notify: (input: NotifyInput) => string;
+  dismissAllBlocking: () => void;
+};
+
+declare global {
+  interface Window {
+    __notifyLab?: NotifyLabHandle;
+  }
 }
 
 /**
@@ -39,6 +51,22 @@ export function ShellNotify() {
   const { info, blocking } = useNotifications();
   const announcement = useLiveAnnouncement(info);
   const [copied, setCopied] = useState<string | null>(null);
+
+  /*
+   * Test seam, same shape as `window.__ttyLab` in `tty/TerminalView.tsx`.
+   *
+   * Only the batches that own the call sites can post a real `blocking`
+   * notification today (SpacesPanel's delayed-purge branch, store's resume
+   * failure), so without this an e2e could not reach the standing error area
+   * through the app at all. It posts notifications; it cannot fabricate
+   * backend facts.
+   */
+  useEffect(() => {
+    window.__notifyLab = { notify, dismissAllBlocking: notifyStore.dismissAllBlocking };
+    return () => {
+      delete window.__notifyLab;
+    };
+  }, []);
 
   async function copyDiagnostic(notification: Notification) {
     try {

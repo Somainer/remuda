@@ -1,6 +1,6 @@
 # D-028 P1 · Protocol increments: every additive change and its compatibility proof
 
-2026-09-14 · `wt/x-p1-proto/d028-protocol-increments` · branched from `origin/main` (`f359e5c`)
+2026-09-14 · `wt/x-p1-proto/d028-protocol-increments` · rebased onto `origin/main` (`47555df`)
 
 D-028 §13 conflict rule ② requires all protocol changes to land **once**, purely additively, so the other workers rebase exactly once. This branch is that landing. It opens the wire for native-PTY-first; it deliberately changes **no driver behaviour**. Every capability it adds is reported as `unknown` until someone measures it.
 
@@ -110,9 +110,11 @@ Driver-side, `capability_set_with_runtime` precedence has four tests — includi
 | `cargo fmt --all` | clean |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | clean |
 | `cargo test --workspace --locked` | PASS except two pre-existing environmental failures (below) |
-| `pnpm test` (web) | PASS: 309 tests in 61 files |
+| `pnpm test` (web) | PASS: 336 tests in 62 files |
 | `pnpm exec tsc --noEmit` (web) | clean |
 | `./scripts/ci/secret-scan.sh` | pass |
+
+Re-run after rebasing onto `47555df`, which brought in x-p1-signal's hook socket / shim / overlay, x-onboard, the usage adapter, the codex/grok session parsers and the MCP attachment tools. The only conflict was `remuda-driver/src/lib.rs`, resolved keeping both sides: main's `launch` re-export is untouched, and `KindPreset` / `preset_by_id` simply moved from the `generic_pty` re-export line to the `presets` one under the same public names, so no caller changed. Both generated artifacts were **regenerated** after the rebase rather than hand-merged, and both came back byte-identical to the merged result — so main's attachment endpoints and this branch's effort/launchedBy fields coexist in one generated client without a hand edit.
 
 **Two failures are pre-existing, not from this branch.** `remuda-node`'s `native::tests::registry_constructs_all_three_native_claude_drivers` and `stdio::tests::composed_stdio_dispatches_create_and_streams_journal` fail because macOS denies this target directory's access probe on `~/.claude` (the error text names the missing Full Disk Access grant). Verified by checking out `origin/main` (then `b902d38`) into a scratch worktree with a separate target dir and running the same two tests: both fail identically there, with none of this branch's changes present.
 
@@ -144,7 +146,7 @@ Checked before writing this: the **inheritance** half is already closed. `child_
 
 What remains open is **explicit injection**: `ShellPtyOptions::extra_env` and spec `env` bindings are filtered by `child_env::is_denied`, which does not list the variable (`DENY_PREFIXES` covers `LD_` / `DYLD_` / `REMUDA_`, not `CLAUDE_`). So a caller can still set it deliberately and silently pin the tier. **The one-line requirement: add `CLAUDE_CODE_EFFORT_LEVEL` to `child_env::DENY`.** That closes the injection path at both sites at once, since the materializer's `reject_banned_env` already routes through the same predicate.
 
-**The settings-overlay slot is empty.** `materialize_shell_pty_agent` honours a caller-supplied `settings_overlay_path` and records its digest, but writes no overlay of its own. x-p1-signal's hook/settings overlay fills that slot. Until it does, an absent overlay emits no `--settings` flag rather than an empty file that would shadow the user's own settings.
+**The settings-overlay slot is wired but not yet connected.** `materialize_shell_pty_agent` honours a caller-supplied `settings_overlay_path` and records its digest, but writes no overlay of its own. x-p1-signal's `launch::materialize_overlay` landed on main during this branch's life and returns `HookOverlay { path, digest, events }` — the `path` is exactly what this slot takes, so the two halves fit without a signature change on either side. What remains is the caller that passes one to the other: today no call site hands an overlay path to the agent-pty materialize request. Until one does, an absent overlay emits no `--settings` flag rather than an empty file that would shadow the user's own settings.
 
 **Preset values need re-verification.** §5.1 asks for each yolo argv to be re-checked against its binary pin. They moved unchanged; the measurement is still owed.
 

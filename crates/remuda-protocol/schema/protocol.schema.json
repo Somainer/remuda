@@ -5755,9 +5755,27 @@
           },
           "type": "array"
         },
+        "binaryPath": {
+          "description": "Host-absolute executable override, Node-validated; §4.1.\n\nAbsent means the Node resolves the driver's default command the way it\nalways has (host default, then `REMUDA_CLAUDE_BIN`, then `PATH`). The\nHub stores the string but cannot stat the Node's filesystem, so every\ncontainment, ownership, and mode check happens on the Node and a path\nthat fails them fails the launch — there is no fallback to `PATH`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "binaryRef": {
           "$ref": "#/$defs/Id",
           "description": "`binary_ref`; protocol §4.1."
+        },
+        "binarySha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Expected digest of [`Self::binary_path`], for pin-on-record; §4.1.\n\nWhen present the Node's own pin must equal it or the launch is refused,\nso a caller that recorded a binary can detect it changing underneath."
         },
         "carrier": {
           "$ref": "#/$defs/CarrierSpec",
@@ -8443,6 +8461,46 @@
       ],
       "type": "object"
     },
+    "MessageOrigin": {
+      "description": "MessageOrigin wire values; `protocol.md` §5.2.",
+      "oneOf": [
+        {
+          "const": "human",
+          "description": "Wire value `human`.",
+          "type": "string"
+        },
+        {
+          "const": "injected-skill",
+          "description": "Wire value `injected-skill`.",
+          "type": "string"
+        },
+        {
+          "const": "injected-command-output",
+          "description": "Wire value `injected-command-output`.",
+          "type": "string"
+        },
+        {
+          "const": "hook-context",
+          "description": "Wire value `hook-context`.",
+          "type": "string"
+        },
+        {
+          "const": "tool-result",
+          "description": "Wire value `tool-result`.",
+          "type": "string"
+        },
+        {
+          "const": "compaction",
+          "description": "Wire value `compaction`.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Wire value `unknown`.",
+          "type": "string"
+        }
+      ]
+    },
     "MessagePayload": {
       "description": "MessagePayload; `protocol.md` §5.2.",
       "properties": {
@@ -8479,6 +8537,17 @@
         "operation": {
           "$ref": "#/$defs/MutationOperation",
           "description": "`operation`; protocol §5.2."
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`origin`; protocol §5.2 (D-028 P3). Additive: absent from pre-D-028\nproducers, which is why it is an `Option` rather than a defaulted enum\n— the schema stays honest about what is actually on the wire.\n\nWho authored this record. A Claude transcript files skill bodies,\nslash-command expansions, hook context and task notifications as `user`\nrecords, so `role` alone cannot tell the human's words from text the\nharness injected on their behalf. Rendering all of them as the user's\nown is both duplicated and misleading, so the classification travels\nwith the message instead of being re-guessed by every client.\n\n`None` means \"this producer does not classify\", and must render like\n[`MessageOrigin::Human`]: showing one row too many is recoverable,\nsilently hiding what someone said is not."
         },
         "parentToolCallId": {
           "anyOf": [

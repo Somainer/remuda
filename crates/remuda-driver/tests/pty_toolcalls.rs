@@ -28,9 +28,14 @@ fn hydrate() -> Vec<remuda_protocol::Observation> {
         "22222222-3333-4444-8555-666666666666".into(),
         "pty".into(),
     );
-    body.lines()
+    let mut out: Vec<_> = body
+        .lines()
         .flat_map(|line| mapper.map_line(line).expect("map transcript line"))
-        .collect()
+        .collect();
+    // The mapper holds an assistant run open until something supersedes it, so
+    // the last turn only lands once the tailer flushes (D-028 §7).
+    out.extend(mapper.flush().expect("flush"));
+    out
 }
 
 /// `kind:operation` per observation, the contract the journal and the web
@@ -78,9 +83,14 @@ fn an_interleaved_tool_turn_hydrates_every_block_in_order() {
     assert_eq!(
         steps(&hydrate()),
         vec![
+            // The `mode` record: permission-mode drift is journaled now rather
+            // than dropped, so the 结构 view can explain a mode change (§7).
+            "other:open",
             // The prompt Claude recorded receiving.
             "message:open",
-            // Commentary text, then the Bash call it introduces.
+            // Commentary text, then the Bash call it introduces. Both blocks
+            // share one `message.id` across two records and are reassembled
+            // into a single message before mapping.
             "message:open",
             "message:close",
             "toolCall:open",
@@ -92,7 +102,7 @@ fn an_interleaved_tool_turn_hydrates_every_block_in_order() {
             "toolResult:open",
             // A user text block that is not a tool_result is still a message.
             "message:open",
-            // The final reply.
+            // The final reply, released by the end-of-batch flush.
             "message:open",
             "message:close",
         ],

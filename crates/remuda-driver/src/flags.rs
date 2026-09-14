@@ -46,8 +46,51 @@ const RESERVED: &[&str] = &[
     "allow-dangerously-skip-permissions",
 ];
 
-/// Extra flags `spec.args` may append after the template.
-const EXTRA_ALLOWLIST: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-config", "name"];
+/// Extra flags `spec.args` may append after the template, per CLI family.
+///
+/// One table per family rather than one global table: the CLIs do not share a
+/// flag vocabulary, and the global list quietly accepted `--effort` and
+/// `--max-budget-usd` for `codex`, which has neither — the launch would have
+/// failed at startup with the binary's own parse error instead of here, where
+/// the message names the flag.
+///
+/// A flag enters a table only after it was seen in that binary's own `--help`.
+/// The list is an evidence gate, not a wish list: `--no-autoupdate` is absent
+/// because claude 2.1.221 has no such flag, however harmless it sounds.
+const EXTRA_CLAUDE: &[&str] = &[
+    "effort",
+    "max-budget-usd",
+    "add-dir",
+    "mcp-config",
+    "name",
+    // Verified against `claude --help` (2.1.221). `--agents` takes a JSON
+    // object of extra agent definitions and `--ide` is a zero-arg connect
+    // toggle; neither touches settings sources, permissions, or persistence.
+    "agents",
+    "ide",
+];
+
+/// Codex/grok/agy inherit the historical set unchanged.
+///
+/// Widening any of these needs the same `--help` evidence claude got, and
+/// narrowing them is a capability regression this change has no reason to
+/// make — so they keep exactly what they accepted before, in their own table,
+/// where a future per-CLI probe can correct them independently.
+const EXTRA_LEGACY: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-config", "name"];
+
+/// The allowlist a driver's `spec.args` are checked against.
+///
+/// `shell-pty` and `generic-pty` are kind-polymorphic — one driver hosts
+/// claude, codex, grok, or a login shell depending on `spec.kind`, which this
+/// function does not see — so they get the widest table. The narrowing that
+/// matters lands on the drivers that do name their CLI.
+fn extra_allowlist(driver: DriverKind) -> &'static [&'static str] {
+    match driver {
+        DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => EXTRA_CLAUDE,
+        DriverKind::CodexAppserver | DriverKind::GrokAcp | DriverKind::AgyPrint => EXTRA_LEGACY,
+        DriverKind::ShellPty | DriverKind::GenericPty => EXTRA_CLAUDE,
+    }
+}
 
 /// Values `--effort` accepts: the five D-028 §9.1 levels plus `ultracode`.
 ///
@@ -70,14 +113,17 @@ pub(crate) struct Flag {
 }
 
 /// Parse `spec.args` as an argv array and reject banned/reserved/unknown flags.
-pub(crate) fn validate_spec_args(
-    _driver: DriverKind,
-    args: &[String],
-) -> DriverResult<Vec<String>> {
+///
+/// Re-exported as `remuda_driver::validate_launch_args` so the Hub can return a
+/// fast 400 from the same table. The Node stays the authority — the Hub check
+/// is an early mirror, not a second copy of the rules.
+pub fn validate_spec_args(driver: DriverKind, args: &[String]) -> DriverResult<Vec<String>> {
     if args.is_empty() {
         return Ok(Vec::new());
     }
+    let allowlist = extra_allowlist(driver);
     let flags = parse_argv(args)?;
+    let mut seen: Vec<String> = Vec::new();
     for flag in &flags {
         let key = canonical(&flag.name);
         if is_banned(&key) {
@@ -92,12 +138,23 @@ pub(crate) fn validate_spec_args(
                 flag.name
             )));
         }
-        if !EXTRA_ALLOWLIST.contains(&key.as_str()) {
+        if !allowlist.contains(&key.as_str()) {
             return Err(DriverError::InvalidLaunchSpec(format!(
-                "flag --{} is not on the launch allowlist",
+                "flag --{} is not on the {driver:?} launch allowlist",
                 flag.name
             )));
         }
+        // A flag the template already emits is caught by RESERVED; this
+        // catches the same flag twice inside `spec.args`. Which of the two
+        // wins is the binary's business and differs per flag, so refuse
+        // rather than silently pick one.
+        if seen.contains(&key) {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "flag --{} is repeated",
+                flag.name
+            )));
+        }
+        seen.push(key.clone());
         if key == "setting-sources" {
             let empty = flag
                 .value
@@ -259,6 +316,8 @@ fn takes_value(canonical_name: &str) -> bool {
             | "resume"
             | "agents"
     )
+    // `--ide` is deliberately absent: it is a zero-arg toggle, so listing it
+    // here would swallow the following token as its value.
 }
 
 fn takes_value_allowing_dash(_canonical_name: &str) -> bool {
@@ -310,5 +369,122 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// Every denied name, in all three spellings a caller might reach for.
+    ///
+    /// `--x=v` and `-x` are the spellings a substring search or a naive
+    /// `contains("--x")` would miss, and each name on these lists breaks the
+    /// D-028 overlay/permission contract when it lands on argv.
+    #[test]
+    fn reserved_and_banned_names_are_rejected_in_every_spelling() {
+        for name in RESERVED.iter().chain(BANNED) {
+            for token in [
+                format!("--{name}"),
+                format!("--{name}=v"),
+                format!("-{name}"),
+            ] {
+                assert!(
+                    validate_spec_args(DriverKind::ClaudePrint, std::slice::from_ref(&token))
+                        .is_err(),
+                    "{token} must be refused"
+                );
+            }
+        }
+    }
+
+    /// The same flag twice is refused rather than silently resolved: which
+    /// occurrence wins is the binary's business and differs per flag.
+    #[test]
+    fn a_repeated_flag_is_refused() {
+        let repeated = validate_spec_args(
+            DriverKind::ClaudePrint,
+            &[
+                "--add-dir".into(),
+                "/srv/a".into(),
+                "--add-dir".into(),
+                "/srv/b".into(),
+            ],
+        )
+        .expect_err("a repeated flag must fail closed");
+        assert!(
+            repeated.to_string().contains("repeated"),
+            "{repeated} should name the repetition"
+        );
+        // Mixed spellings are the same flag, so they collide too.
+        assert!(
+            validate_spec_args(
+                DriverKind::ClaudePrint,
+                &["--effort=high".into(), "--effort".into(), "low".into()],
+            )
+            .is_err()
+        );
+        // Two *different* allowlisted flags remain fine.
+        assert!(
+            validate_spec_args(
+                DriverKind::ClaudePrint,
+                &["--effort".into(), "high".into(), "--ide".into()],
+            )
+            .is_ok()
+        );
+    }
+
+    /// The allowlist is per-CLI. `--ide` and `--agents` were read off
+    /// `claude --help` (2.1.221); codex has neither, so its table must not
+    /// accept them just because they are harmless to claude.
+    #[test]
+    fn the_allowlist_diverges_per_driver() {
+        for driver in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ClaudeBg,
+        ] {
+            assert!(
+                validate_spec_args(driver, &["--ide".into()]).is_ok(),
+                "{driver:?}"
+            );
+            assert!(
+                validate_spec_args(driver, &["--agents".into(), "{}".into()]).is_ok(),
+                "{driver:?}"
+            );
+        }
+        for driver in [
+            DriverKind::CodexAppserver,
+            DriverKind::GrokAcp,
+            DriverKind::AgyPrint,
+        ] {
+            assert!(
+                validate_spec_args(driver, &["--ide".into()]).is_err(),
+                "{driver:?} has no --ide"
+            );
+        }
+    }
+
+    /// `--ide` takes no value, so the token after it is its own flag rather
+    /// than something the parser swallows.
+    #[test]
+    fn ide_is_a_zero_arg_toggle() {
+        let parsed = parse_argv(&["--ide".into(), "--add-dir".into(), "/srv".into()]).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].value, None);
+        assert_eq!(parsed[1].value.as_deref(), Some("/srv"));
+    }
+
+    /// A prompt is not a launch flag. Positionals stay refused on every
+    /// driver, including the widened claude table.
+    #[test]
+    fn positional_argv_is_still_refused() {
+        for driver in [DriverKind::ClaudePrint, DriverKind::CodexAppserver] {
+            let error = validate_spec_args(driver, &["summarize the repo".into()])
+                .expect_err("a bare prompt must not reach argv");
+            assert!(error.to_string().contains("positional"), "{error}");
+        }
+        assert!(
+            validate_spec_args(
+                DriverKind::ClaudePrint,
+                &["--effort".into(), "high".into(), "trailing prompt".into()],
+            )
+            .is_err()
+        );
     }
 }

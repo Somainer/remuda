@@ -8,15 +8,14 @@ use crate::{
 };
 use futures::FutureExt;
 use remuda_protocol::{
-    Acceptance, AcceptanceScope, Activity, ActorRef, ActorType, AgentKind, Capability,
-    CapabilitySet, CapabilitySnapshot, CapabilityState, ClaudeRef, Command, CommandAuthority,
-    CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState, CommandTarget,
-    Completeness, Connectivity, Digest as WireDigest, DispatchState, EntityLifecycle, EntityMeta,
-    ExpectedState, Host, HostId, HostState, HostTransport, HostTransportMode, Id, Instance,
-    InstanceId, InstanceLifecycle, JournalEvent, Knowledge, LifecycleEntity, LifecyclePayload,
-    MessagePhase, MessageRole, NativeRef, NodeReceipt, ObservationPayload, Ownership, Page,
-    PathStyle, Platform, ProcessRef, ResolutionState, Settlement, SettlementOutcome, U64,
-    Workspace, WorkspaceId, WorkspaceState, WritePolicy,
+    Acceptance, AcceptanceScope, Activity, ActorRef, ActorType, AgentKind, ClaudeRef, Command,
+    CommandAuthority, CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState,
+    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState,
+    EntityLifecycle, EntityMeta, ExpectedState, Host, HostId, HostState, HostTransport,
+    HostTransportMode, Id, Instance, InstanceId, InstanceLifecycle, JournalEvent, Knowledge,
+    LifecycleEntity, LifecyclePayload, MessagePhase, MessageRole, NativeRef, NodeReceipt,
+    ObservationPayload, Ownership, Page, PathStyle, Platform, ProcessRef, ResolutionState,
+    Settlement, SettlementOutcome, U64, Workspace, WorkspaceId, WorkspaceState, WritePolicy,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -793,6 +792,11 @@ fn spawn_observation_pump(
     driver: Arc<dyn Driver>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // D-028 §7: `MessageDisplay` deltas are the only live text an
+        // agent-in-PTY session has. Folding them here — beside the journal
+        // append, not in a path of their own — is what makes the 结构 view
+        // fill in line by line instead of a whole message at a time.
+        let mut assembler = crate::signal_messages::MessageAssembler::new();
         while let Some(observation) = observations.recv().await {
             // §5.5 before the generic failure fold: a clean exit carries
             // `Severity::Info` and would otherwise fall through both, leaving
@@ -839,6 +843,21 @@ fn spawn_observation_pump(
                 Ok(committed) => {
                     if let Err(error) = interactions.ingest(&committed).await {
                         tracing::debug!(%error, "interaction ingest failed");
+                    }
+                    // The hook event itself is the evidence and is journaled
+                    // above; this is the readable message derived from it. It
+                    // follows the hook so the two stay in seq order, and is
+                    // built from `committed` so it inherits the envelope the
+                    // store just stamped.
+                    if let Some(delta) = crate::signal_messages::message_delta(&committed)
+                        && let Some(payload) = assembler.fold(&delta)
+                    {
+                        let message = crate::signal_messages::MessageAssembler::observation(
+                            &committed, payload,
+                        );
+                        if let Err(error) = store.append_driver_observation(&instance_id, message) {
+                            tracing::warn!(%error, "streamed message not journaled");
+                        }
                     }
                 }
                 Err(error) => {
@@ -1969,59 +1988,10 @@ fn fixture_host(host_id: HostId) -> Result<Host, NodeError> {
         },
         last_seen_at: Knowledge::Known { value: now },
         lease_expires_at: unknown("local-dev-no-lease"),
-        driver_inventory: driver_inventory(),
+        driver_inventory: crate::inventory::driver_inventory(),
         journal_id: Id::new("obj")?,
         durable_seq: U64(0),
     })
-}
-
-/// What this Node can actually launch, for the Hub host view (D-028 §5.1).
-///
-/// The demo this exists to prevent: New Session offered `claude` on
-/// `shell-pty`, the Node silently fell back to a login shell because
-/// `REMUDA_PTY_CARRIER` was unset, and the first prompt was typed into zsh —
-/// which ran it as a command. Nothing anywhere reported that native launch was
-/// off, so the UI could not have known. `launchable` is that report, and the
-/// web keys its `shell-pty` default on it.
-///
-/// Only `shell-pty` is described: it is the one driver whose ability to launch
-/// an agent depends on a runtime flag rather than on a binary being present.
-/// The rest keep the host's existing (empty) inventory, which is honest —
-/// absence means "not reported", and no caller reads it as "cannot".
-fn driver_inventory() -> Vec<remuda_protocol::DriverDescriptor> {
-    let native = remuda_driver::shell_pty::native_carrier_enabled();
-    let Ok(capabilities) = fixture_capabilities(remuda_protocol::DriverKind::ShellPty) else {
-        return Vec::new();
-    };
-    let Ok(empty_digest) = remuda_protocol::Digest::try_from(format!(
-        "sha256:{:x}",
-        <Sha256 as sha2::Digest>::digest([])
-    )) else {
-        return Vec::new();
-    };
-    vec![remuda_protocol::DriverDescriptor {
-        kind: remuda_protocol::DriverKind::ShellPty,
-        adapter_version: remuda_driver::ADAPTER_VERSION.to_owned(),
-        // The binary is per-launch here — a login shell or whichever agent the
-        // recipe pins — so there is nothing host-wide to name or hash. Left
-        // empty rather than filled with a plausible-looking `$SHELL`, which
-        // would be wrong for every agent launch. The digest is the sha256 of
-        // no bytes, which is what "nothing was hashed" spells in a field the
-        // wire type requires to be a well-formed sha256.
-        binary_path: String::new(),
-        binary_version: String::new(),
-        binary_digest: empty_digest,
-        launchable: native,
-        reason_code: if native {
-            "carrier-native".to_owned()
-        } else {
-            // Names the flag's absence, not a defect: `shell-pty` still
-            // launches a login shell, and D-025 promotion still works inside
-            // it. What is unavailable is Remuda running the agent command.
-            "carrier-not-enabled".to_owned()
-        },
-        capabilities,
-    }]
 }
 
 pub(crate) fn fixture_workspace(
@@ -2132,7 +2102,7 @@ pub(crate) fn fixture_instance_with_session(
         launch_id: Knowledge::Known {
             value: Id::new("launch")?,
         },
-        capabilities: fixture_capabilities(driver)?,
+        capabilities: crate::inventory::driver_capability_snapshot(driver),
         owner_fence: U64(1),
         active_run_ids: Vec::new(),
         parent: None,
@@ -2146,84 +2116,6 @@ pub(crate) fn fixture_instance_with_session(
         // Remuda ran the launch command. Promotion flips this to `user`
         // (D-028 §1.0 rule 4); it records provenance, never capability.
         launched_by: Some(remuda_protocol::LaunchedBy::Remuda),
-    })
-}
-
-fn fixture_capabilities(
-    driver: remuda_protocol::DriverKind,
-) -> Result<CapabilitySnapshot, NodeError> {
-    let unknown_capability = Capability {
-        state: CapabilityState::Unknown,
-        provision: remuda_protocol::CapabilityProvision::Unknown,
-        scope: Vec::new(),
-        reason_code: "not-verified".to_owned(),
-        prerequisites: Vec::new(),
-        evidence: Vec::new(),
-    };
-    let unsupported = Capability {
-        state: CapabilityState::Unsupported,
-        provision: remuda_protocol::CapabilityProvision::Unknown,
-        scope: Vec::new(),
-        reason_code: "fake-driver".to_owned(),
-        prerequisites: Vec::new(),
-        evidence: Vec::new(),
-    };
-    let supported = Capability {
-        state: CapabilityState::Supported,
-        provision: remuda_protocol::CapabilityProvision::Native,
-        scope: vec!["local-fixture".to_owned()],
-        reason_code: "fake-driver".to_owned(),
-        prerequisites: Vec::new(),
-        evidence: Vec::new(),
-    };
-    Ok(CapabilitySnapshot {
-        adapter_transport: remuda_protocol::AdapterTransport::NativeRustWire,
-        id: Id::new("obj")?,
-        driver_kind: driver,
-        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
-        binary_version: "fake".to_owned(),
-        binary_digest: format!("sha256:{:064x}", 0).try_into()?,
-        native_protocol_version: Knowledge::NotApplicable,
-        settings_revision: U64(1),
-        provider_profile_revision: U64(1),
-        capabilities: CapabilitySet {
-            resume: unsupported.clone(),
-            steer: unsupported.clone(),
-            // D-028 §6: unmeasured for the fake driver as for every real
-            // one; `unknown` keeps the fixture honest rather than teaching
-            // tests that a fake can queue or interrupt.
-            queue: unknown_capability.clone(),
-            interrupt: unknown_capability.clone(),
-            model_switch: unsupported.clone(),
-            fork: unsupported.clone(),
-            structured_workflow: unsupported.clone(),
-            artifact: unsupported.clone(),
-            tty_attach: if matches!(
-                driver,
-                remuda_protocol::DriverKind::GenericPty
-                    | remuda_protocol::DriverKind::ClaudePty
-                    | remuda_protocol::DriverKind::ShellPty
-            ) {
-                supported.clone()
-            } else {
-                unsupported.clone()
-            },
-            hooks: unsupported,
-            interactive_approval: unknown_capability.clone(),
-            question: unknown_capability.clone(),
-            plan_review: unknown_capability.clone(),
-            elicitation: unknown_capability.clone(),
-            live_attach: unknown_capability,
-            completion_native_turn: supported,
-            completion_task: Capability {
-                state: CapabilityState::Unsupported,
-                provision: remuda_protocol::CapabilityProvision::Unknown,
-                scope: Vec::new(),
-                reason_code: "fake-native-turn-only".to_owned(),
-                prerequisites: Vec::new(),
-                evidence: Vec::new(),
-            },
-        },
     })
 }
 

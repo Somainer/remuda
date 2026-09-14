@@ -309,7 +309,7 @@ impl SecretRefPolicy {
 }
 
 /// Characters that would turn an `apiKeyHelper` path into a shell expression.
-fn is_shell_metacharacter(c: char) -> bool {
+pub(crate) fn is_shell_metacharacter(c: char) -> bool {
     matches!(
         c,
         '|' | '&'

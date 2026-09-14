@@ -609,7 +609,9 @@ type MaterializedLaunch = {
 
 **绝不使用 `CLAUDE_CODE_EFFORT_LEVEL`**：它的优先级高于会话内 `/effort`，会把 PTY 的实时改档钉死。反向地，`child_env` 必须从子进程环境中**剥离**宿主继承的该变量，否则外部环境静默覆盖一切。
 
-`MaterializedLaunch` 是进程内结构，含 env 值的部分不准序列化到 RPC、Observation 或错误。持久 LaunchManifest 只存 audit、配置对象引用、binary/cwd/nativeStore/ProviderSelection；重启从 secret store 重新解析相同 credential version，不从日志恢复 secret。私有 settingsOverlay 的明文也不返回 UI；可审查的界面展示 key 名、非敏感 provider/model 字段和凭据引用。`args` 是原生 argv 数组，不是 shell 字符串；materializer 用 allowlist 解析器拒绝与保留 flag 冲突、重复 flag、未知危险启动模式和不兼容 driver 的 flag，不能只搜索子字符串。
+`MaterializedLaunch` 是进程内结构，含 env 值的部分不准序列化到 RPC、Observation 或错误。持久 LaunchManifest 只存 audit、配置对象引用、binary/cwd/nativeStore/ProviderSelection；重启从 secret store 重新解析相同 credential version，不从日志恢复 secret。私有 settingsOverlay 的明文也不返回 UI；可审查的界面展示 key 名、非敏感 provider/model 字段和凭据引用。`args` 是原生 argv 数组，不是 shell 字符串；materializer 用 allowlist 解析器拒绝与保留 flag 冲突、重复 flag、未知危险启动模式和不兼容 driver 的 flag，不能只搜索子字符串。allowlist 按 driver 分表：claude 的 EXTRA 不等于 codex/grok/agy 的 EXTRA，一个 flag 进表的依据是对该 binary 的实际验证，不是「看起来无害」。
+
+**binaryPath / binarySha256（自定义可执行文件）。** `binaryPath` 是 host 上的绝对路径，覆盖该 driver 默认解析到的命令；缺省时 Node 按「host 默认 → `REMUDA_CLAUDE_BIN` → `PATH`」解析，与以往一致。Hub 只存字符串——它 stat 不到 Node 的文件系统——**Node 是唯一权威**：拒绝相对路径与含 `.`/`..` 的路径（落盘前就拒，不先 canonicalize），拒绝空白与 shell 元字符（该值还会被写进 launch shim 脚本），`canonicalize` 后必须是常规文件且可执行，必须不落在 instance 目录、`<instance>/launch/`、workspace/worktree cwd 或 `TMPDIR` 之内（否则一个能写自己 cwd 的 agent 就自我提权成任意执行），且不能 group/other 可写、不能不属于 Node uid。校验通过后走既有 `pin_binary` 记录 version 与 sha256；若请求带了 `binarySha256` 而 pin 不相等，返回 `INVALID_LAUNCH_SPEC`。任何一条不过都**失败关闭**，绝不静默回落到 `PATH` 上的 `claude`。bot/agent origin 既不能带 `args` 也不能带 `binaryPath`，与 bypass 的拒绝同形（D-011）。override 记在 `LaunchAudit` 上，连同 pin digest 一起进日志。
 
 物化顺序：验证 spec/tag/capability → Node 验证 host-local cwd、worktree 和 writer lease → 选择已健康且 ingress 匹配的 provider/profile → 固定 binary digest → 读取注册的持久 native home → 合并私有 overlay → 校验权限/模型/环境 → 原子写 launch 文件 → 持久 manifest 与命令 intent → spawn。失败时只清理本 launch 创建的临时文件，不改用户现有配置；生成文件夹 `0700`、文件 `0600`，Windows 使用等效 ACL。原生 home、sessions、登录存储不是临时文件，close 和 resume 后都保留。
 
@@ -841,6 +843,8 @@ type MessagePayload = NodeMutation & {
   targetBlock: number|null;
   parentToolCallId: Id|null;
   nativeOrigin: Knowledge<string>;
+  origin: "human"|"injected-skill"|"injected-command-output"
+        |"hook-context"|"tool-result"|"compaction"|"unknown";
   status: "queued"|"streaming"|"complete"|"interrupted"|"unknown";
 };
 type ThoughtPayload = NodeMutation & {
@@ -870,6 +874,10 @@ open 的 revision 为 1、baseRevision 为 null；append/replace/close 的 revis
 PTY 输入因原生交互或 control 尚未就绪而等待时，Node 以 user message 的 `status: "queued"` 记录待发文本；确认写入后用相同 node/message ID 的 replace 更新为 `complete`。`PromptMode: "queue"`（§3.1）走的是同一套账本，区别只在于排队是调用方**明确要求**的而不是 ready 判定推出来的；两者都不新增 status 值。这里的 complete 仅证明输入已发送，不证明 assistant turn 完成。排队期间 `instance.create` 可结算 accepted，Instance 保持 ready，原生阻塞交互仍可回答；未发送即取消/关闭的消息更新为 interrupted。`queued` 不用于 thought。
 
 同一 node 的 source 优先级由字段定义：结构化 native item/message 负责内容和最终 tool 结果；hook 负责它自身的前后事件和交互请求；screen 只负责展示提示。低信息来源不能把高信息值改成空值。usage 不随 message replace 被累加第二次。thought 只显示原生实际输出的文本/summary，redacted thinking 保存 redaction 标记，不尝试恢复隐藏内容。
+
+**`origin`（D-028 P3 增量字段）**：`role` 说的是这条记录被记在谁名下，`origin` 说的是**它到底是谁写的**。Claude transcript 把 skill 正文、slash 命令展开（`<command-message>` / `<command-name>`）、`<local-command-stdout>`、hook additionalContext、`<task-notification>`、tool result、compact 摘要**一律记成 `user` 记录**——把它们都画成用户气泡，既重复又让人误以为是自己发的。因此分类必须落在 mapper 上，由**证据**判定而不是猜文本：`isCompactSummary` → `compaction`；`sourceToolUseID` 或含 `tool_result` block → `tool-result`；`isMeta` → `injected-skill`；`<command-*>` 开头 → `injected-skill`（命令调用）；`<local-command-*>` 开头 → `injected-command-output`；`<system-reminder>` / `<task-notification>` 开头 → `hook-context`；其余为 `human`。Claude 自报的 `origin.kind`（`human` / `task-notification` / …）与 `promptSource`（`typed` / `sdk` / `system`）**优先于**上述启发式，因为那是 harness 的直接陈述。
+
+**不得丢弃**：注入项仍要进 journal（否则无法解释 agent 为什么那样答），只是 UI 默认折叠成一行。`unknown` 按 `human` 渲染——漏判要表现为多显示一条，不能表现为静默吞掉用户的话。同一条人类 prompt 可能既有入队记录又有投递记录（共享 `promptId`），按 `promptId` + 文本去重**保留第一条**。
 
 ### 5.3 Workflow
 

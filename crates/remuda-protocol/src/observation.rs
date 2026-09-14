@@ -235,8 +235,32 @@ pub struct MessagePayload {
     pub parent_tool_call_id: Option<Id>,
     /// `native_origin`; protocol §5.2.
     pub native_origin: Knowledge<String>,
+    /// `origin`; protocol §5.2 (D-028 P3). Additive: absent from pre-D-028
+    /// producers, which is why it is an `Option` rather than a defaulted enum
+    /// — the schema stays honest about what is actually on the wire.
+    ///
+    /// Who authored this record. A Claude transcript files skill bodies,
+    /// slash-command expansions, hook context and task notifications as `user`
+    /// records, so `role` alone cannot tell the human's words from text the
+    /// harness injected on their behalf. Rendering all of them as the user's
+    /// own is both duplicated and misleading, so the classification travels
+    /// with the message instead of being re-guessed by every client.
+    ///
+    /// `None` means "this producer does not classify", and must render like
+    /// [`MessageOrigin::Human`]: showing one row too many is recoverable,
+    /// silently hiding what someone said is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MessageOrigin>,
     /// `status`; protocol §5.2.
     pub status: ContentStatus,
+}
+
+impl MessagePayload {
+    /// The classified author, treating an unclassified message as the human's.
+    #[must_use]
+    pub fn origin_or_human(&self) -> MessageOrigin {
+        self.origin.unwrap_or(MessageOrigin::Human)
+    }
 }
 
 /// ThoughtPayload; `protocol.md` §5.2.

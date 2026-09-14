@@ -307,6 +307,9 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             driver: DriverKind::ClaudePrint,
             model: "fake".into(),
             args: Vec::new(),
+            // Filled by apply_spec_launch_fields from the Hub spec.
+            binary_path: None,
+            binary_sha256: None,
             provider_profile_id: "dev-fake".into(),
             permission_mode: "manual".into(),
             prompt: String::new(),
@@ -684,6 +687,23 @@ fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
         .collect()
 }
 
+/// Build the hello/heartbeat `capabilities` blob from a nested host inventory.
+///
+/// D-028 §5.1: the Hub stores this verbatim on the host row and the web reads
+/// `capabilities.driverInventory[].launchable` to decide whether `shell-pty`
+/// can actually launch an agent on this host. Shared by the stdio and outbound
+/// WSS hello builders so the two transports can never advertise differently.
+///
+/// A host without a `driverInventory` sends **no** capabilities (`None`),
+/// never `{}`: absence reads as "not reported", and a Node too old to describe
+/// itself must not have its silence rendered as a refusal.
+#[must_use]
+pub fn hello_capabilities(host: &Value) -> Option<Value> {
+    host.get("driverInventory")
+        .filter(|inventory| !inventory.is_null())
+        .map(|inventory| json!({ "driverInventory": inventory }))
+}
+
 /// Build stdio hello params from a nested host inventory value.
 #[must_use]
 pub fn stdio_hello_params(
@@ -710,16 +730,7 @@ pub fn stdio_hello_params(
             "maxFrameBytes": 1_048_576,
         })),
         host: serde_json::from_value(host.clone()).ok(),
-        // D-028 §5.1: the Hub's host view stores this verbatim and the web
-        // reads `capabilities.driverInventory[].launchable` from it to decide
-        // whether `shell-pty` can actually launch an agent on this host.
-        // Sending `None` is what left the UI guessing — it offered a native
-        // launch on a Node whose carrier flag was off, and the first prompt
-        // went to a login shell.
-        capabilities: host
-            .get("driverInventory")
-            .filter(|inventory| !inventory.is_null())
-            .map(|inventory| json!({ "driverInventory": inventory })),
+        capabilities: hello_capabilities(&host),
         cli: host.get("cli").cloned(),
     });
     if let Some(object) = params.as_object_mut() {

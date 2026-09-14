@@ -361,6 +361,8 @@ mod tests {
             max_instances: 8,
             hostname: None,
             provider_binding: binding.into(),
+            default_launch_args: None,
+            claude_binary_path: None,
         }
     }
 

@@ -93,12 +93,13 @@ function renderWithLaunchableMatrix() {
   render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
 }
 
-it("mounts the inline slider (layout A, no card) with the five real levels", () => {
+it("mounts the inline slider (layout A, no card) with the six Claude stops", () => {
   renderWithCli();
   const slider = screen.getByTestId("new-session-effort-slider");
   expect(slider).toHaveAttribute("role", "slider");
-  expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
-  // The device default is Claude `high`, the third of five.
+  expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
+  expect(slider).toHaveAttribute("aria-valuemax", "5");
+  // The device default is Claude `high`, the third of six stops.
   expect(slider).toHaveAttribute("data-name", "high");
   expect(slider).toHaveAttribute("data-index", "2");
   expect(screen.getByTestId("new-session-effort-knob")).toBeInTheDocument();
@@ -109,8 +110,8 @@ it("mounts the inline slider (layout A, no card) with the five real levels", () 
     "写进 InstanceSpec，会话内可再改",
   );
   expect(screen.getByTestId("new-session-effort")).toHaveTextContent("写进 InstanceSpec，会话内可再改");
-  // The ultracode toggle sits at the far right of the label row.
-  expect(screen.getByTestId("new-session-effort-ultracode")).toHaveAttribute("data-on", "0");
+  // The standalone ultracode chip is gone; ultracode is the last tick.
+  expect(screen.queryByTestId("new-session-effort-ultracode")).toBeNull();
 });
 
 it("re-snaps the slider onto the new harness table when the runtime changes", () => {
@@ -125,8 +126,8 @@ it("re-snaps the slider onto the new harness table when the runtime changes", ()
   expect(slider()).toHaveAttribute("data-tiers", "low,medium,high,ultra");
   expect(slider()).toHaveAttribute("data-name", "high");
   expect(slider()).toHaveAttribute("data-index", "2");
-  // ultracode is Claude-only.
-  expect(screen.queryByTestId("new-session-effort-ultracode")).toBeNull();
+  // ultracode is Claude-only; other harnesses never show the extra stop.
+  expect(slider()).toHaveAttribute("aria-valuemax", "3");
 
   // grok has three: the midpoint snaps onto `standard`.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
@@ -141,10 +142,12 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   const slider = () => screen.getByTestId("new-session-effort-slider");
   slider().focus();
   fireEvent.keyDown(slider(), { key: "End" });
-  expect(slider()).toHaveAttribute("data-name", "max");
+  // End lands on the sixth stop, ultracode (xhigh tier + workflow flag).
+  expect(slider()).toHaveAttribute("data-name", "ultracode");
+  expect(slider()).toHaveAttribute("data-index", "5");
   expect(slider()).toHaveAttribute("data-ember", "1");
 
-  // grok's table is shorter; the ember tier must stay the ember tier.
+  // grok's table is shorter; the flag drops and the ember tier maps ember→ember.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
   expect(slider()).toHaveAttribute("data-name", "max");
   expect(slider()).toHaveAttribute("data-index", "2");
@@ -161,23 +164,26 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
-it("ultracode locks the slider on xhigh and the create carries the ultracode wire name", async () => {
+it("the ultracode stop is reached on the one slider and the create carries the ultracode wire name", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");
-  fireEvent.click(screen.getByTestId("new-session-effort-ultracode"));
-  // xhigh locked, ember playing, track refuses tier input.
-  expect(slider()).toHaveAttribute("data-name", "xhigh");
-  expect(slider()).toHaveAttribute("data-index", "3");
-  expect(slider()).toHaveAttribute("data-ultracode", "1");
-  expect(slider()).toHaveAttribute("data-ember", "1");
-  expect(slider()).toHaveAttribute("aria-disabled", "true");
-  expect(screen.getByTestId("new-session-effort-ultracode")).toHaveAttribute("data-on", "1");
-  // Arrow keys cannot move the locked track off xhigh.
+  // End walks all six stops to ultracode; the track stays an enabled slider.
   slider().focus();
   fireEvent.keyDown(slider(), { key: "End" });
+  expect(slider()).toHaveAttribute("data-name", "ultracode");
+  expect(slider()).toHaveAttribute("data-index", "5");
+  expect(slider()).toHaveAttribute("data-tier-index", "3");
+  expect(slider()).toHaveAttribute("data-ultracode", "1");
+  expect(slider()).toHaveAttribute("data-ember", "1");
+  expect(slider()).toHaveAttribute("aria-disabled", "false");
+  expect(screen.getByTestId("new-session-effort-title")).toHaveTextContent("ultracode");
+  // One step back returns to max on the same slider.
   fireEvent.keyDown(slider(), { key: "ArrowLeft" });
-  expect(slider()).toHaveAttribute("data-index", "3");
+  expect(slider()).toHaveAttribute("data-name", "max");
+  expect(slider()).toHaveAttribute("data-index", "4");
+  fireEvent.keyDown(slider(), { key: "ArrowRight" });
+  expect(slider()).toHaveAttribute("data-name", "ultracode");
 
   fireEvent.click(screen.getByTestId("new-session-start"));
   await waitFor(() =>
@@ -280,5 +286,80 @@ describe("D-028 native PTY default", () => {
     fireEvent.click(screen.getByTestId("new-session-kind-grok"));
     expect(screen.getByTestId("new-session-driver-generic-pty")).toHaveAttribute("data-default", "1");
     expect(screen.getByTestId("new-session-driver-shell-pty")).toBeDisabled();
+  });
+});
+
+describe("特殊参数 and claude 可执行文件", () => {
+  it("splits args on whitespace into an argv array rather than sending a shell string", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    fireEvent.change(screen.getByTestId("new-session-args"), {
+      target: { value: "  --effort   high --ide " },
+    });
+    fireEvent.change(screen.getByTestId("new-session-binary"), {
+      target: { value: " /opt/claude/bin/claude " },
+    });
+    // The chips are the argv the Hub will receive, so a user can see that
+    // runs of whitespace collapse and nothing is shell-parsed.
+    expect(screen.getByTestId("new-session-args-chips")).toHaveTextContent("--effort");
+    expect(screen.getByTestId("new-session-args-chips")).toHaveTextContent("--ide");
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          args: ["--effort", "high", "--ide"],
+          binaryPath: "/opt/claude/bin/claude",
+        }),
+      ),
+    );
+  });
+
+  it("omits both fields when they are blank so the host default still applies", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    fireEvent.change(screen.getByTestId("new-session-args"), { target: { value: "   " } });
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const spec = create.mock.calls[0][0] as { args?: string[]; binaryPath?: string };
+    // Sending `[]` would replace the host default with "no args", which is a
+    // different request from "I did not choose".
+    expect(spec.args).toBeUndefined();
+    expect(spec.binaryPath).toBeUndefined();
+  });
+
+  it("remembers args across sessions but never the executable", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    fireEvent.change(screen.getByTestId("new-session-args"), { target: { value: "--effort high" } });
+    fireEvent.change(screen.getByTestId("new-session-binary"), {
+      target: { value: "/opt/claude/bin/claude" },
+    });
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const stored = localStorage.getItem("runtime.new-session") ?? "";
+    expect(stored).toContain("--effort high");
+    // A silently restored executable is the kind of thing you would not
+    // think to check before starting a run.
+    expect(stored).not.toContain("/opt/claude/bin/claude");
+  });
+
+  it("shows the host default as a placeholder instead of prefilling the field", () => {
+    vi.spyOn(store, "useHub").mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      hosts: [{ ...host, defaultLaunchArgs: ["--effort", "max"], claudeBinaryPath: "/srv/claude" }],
+      workspaces: [workspace],
+      instances: [],
+    });
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    // Typing over a prefilled default would turn an operator's host-level
+    // choice into a session value, and the Hub merges the two differently.
+    expect(screen.getByTestId("new-session-args")).toHaveValue("");
+    expect(screen.getByTestId("new-session-args")).toHaveAttribute("placeholder", "--effort max");
+    expect(screen.getByTestId("new-session-binary")).toHaveValue("");
+    expect(screen.getByTestId("new-session-binary")).toHaveAttribute("placeholder", "/srv/claude");
   });
 });

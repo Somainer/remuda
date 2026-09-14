@@ -200,6 +200,10 @@ struct Engine {
 pub fn run(opts: Options) -> Result<i32, RunError> {
     let stopping = Arc::new(AtomicBool::new(false));
     install_signal_handler(stopping.clone());
+    // Die with the spawner (aborted gate / test timeout / ctrl-c of the
+    // driver). The flag gives this loop a chance to tear down the terminal
+    // gracefully; the watcher hard-exits if that ever wedges.
+    let _parent_watch = crate::parent_watch::install_with_flag(Some(stopping.clone()));
 
     let dialect = opts.kind;
     let scenario = match &opts.script_path {

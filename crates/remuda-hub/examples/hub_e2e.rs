@@ -403,8 +403,16 @@ async fn fake_node(
                 } else {
                     format!("echo: {prompt} [attachments: {}]", attachments.join(","))
                 };
-                append_n =
-                    append_journal(&mut ws, &instance_id, append_n, "assistant", &reply).await?;
+                if prompt.starts_with("stream ") {
+                    // D-028 §7: reply as an open/append chain so the web e2e
+                    // sees text arrive mid-turn, the way `MessageDisplay`
+                    // deltas do on a real agent-in-PTY session.
+                    append_n =
+                        append_stream_chunks(&mut ws, &instance_id, append_n, &reply).await?;
+                } else {
+                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                        .await?;
+                }
                 // D-028 §6: a steer/queue send happens mid-turn; report the
                 // native agent status so the web composer projects working.
                 if params.get("mode").and_then(Value::as_str) == Some("new-turn") {
@@ -493,6 +501,66 @@ async fn append_journal(
     .await?;
     // Drain the Hub RPC result so it is not mistaken for a later request.
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
+}
+
+/// Append one assistant message as several `append` mutations.
+///
+/// This is the fake-node stand-in for a `MessageDisplay` delta chain: one node
+/// id, contiguous revisions, `status: "streaming"` until the last chunk closes
+/// it as `complete`. The web assembler must merge these into one growing
+/// bubble rather than drawing a bubble per chunk.
+async fn append_stream_chunks(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+) -> Result<u64> {
+    // Split in the middle so both halves are non-empty and visibly partial.
+    let split = text
+        .char_indices()
+        .nth(text.chars().count() / 2)
+        .map_or(text.len(), |(i, _)| i);
+    let chunks = [&text[..split], &text[split..]];
+    let node = format!("stream-{n}");
+    let mut seq = n;
+    for (index, chunk) in chunks.iter().enumerate() {
+        seq += 1;
+        let last = index + 1 == chunks.len();
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("j{seq}"),
+                "method": "journal.append",
+                "params": {
+                    "instanceId": instance_id,
+                    "event": {
+                        "kind": "message",
+                        "completeness": "structured",
+                        "payload": {
+                            "nodeId": node,
+                            "messageId": node,
+                            "role": "assistant",
+                            "phase": "final",
+                            "revision": (index + 1).to_string(),
+                            "baseRevision": (index > 0).then(|| index.to_string()),
+                            "operation": if index == 0 { "open" } else { "append" },
+                            "status": if last { "complete" } else { "streaming" },
+                            "blocks": [{ "type": "text", "text": chunk }],
+                            "targetBlock": 0,
+                            "origin": "human",
+                        }
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    }
     Ok(seq)
 }
 

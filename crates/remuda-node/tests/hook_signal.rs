@@ -236,3 +236,107 @@ fn the_hook_path_is_off_until_the_operator_turns_it_on() {
     assert!(!hooks_enabled(None), "P1 default is off");
     assert!(hooks_enabled(Some("1")));
 }
+
+/// Drive the bus with the multi-chunk recording and fold it the way the
+/// observation pump does, returning the journal in order.
+async fn journal_streamed_session() -> Vec<Observation> {
+    let (tx, mut rx) = mpsc::channel(64);
+    let bus = SignalBus::new(
+        BusContext {
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").unwrap(),
+            run_id: RunId::new(),
+            driver_kind: remuda_protocol::DriverKind::ShellPty,
+            adapter_version: "test".into(),
+        },
+        tx,
+        Arc::new(AtomicU64::new(0)),
+    );
+    for line in remuda_testing::hook_message_stream_fixture().lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        bus.handle(HookEnvelope {
+            credential: "fixture".into(),
+            event: value["event"].as_str().unwrap().to_owned(),
+            ppid: i32::try_from(value["ppid"].as_i64().unwrap()).unwrap(),
+            payload: value["payload"].clone(),
+        })
+        .await;
+    }
+    drop(bus);
+    // Mirror `spawn_observation_pump`: journal the hook, then the message it
+    // yields, so the two stay interleaved in arrival order.
+    let mut assembler = remuda_node::MessageAssembler::new();
+    let mut out = Vec::new();
+    while let Ok(observation) = rx.try_recv() {
+        let folded = remuda_node::message_delta(&observation)
+            .and_then(|delta| assembler.fold(&delta))
+            .map(|payload| remuda_node::MessageAssembler::observation(&observation, payload));
+        out.push(observation);
+        out.extend(folded);
+    }
+    out
+}
+
+/// The P3 acceptance: «结构视图行级增量出现». Text must reach the journal as an
+/// open/append chain while the turn runs, not as one payload at the end.
+#[tokio::test]
+async fn streamed_deltas_reach_the_journal_as_incremental_message_mutations() {
+    use remuda_protocol::{ContentStatus, MutationOperation};
+    let journal = journal_streamed_session().await;
+    let messages: Vec<_> = journal
+        .iter()
+        .filter_map(|observation| match &observation.body {
+            ObservationPayload::Message(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages.len(),
+        2,
+        "each recorded chunk becomes its own visible mutation"
+    );
+    assert_eq!(messages[0].mutation.operation, MutationOperation::Open);
+    assert_eq!(messages[0].status, ContentStatus::Streaming);
+    assert_eq!(messages[1].mutation.operation, MutationOperation::Append);
+    assert_eq!(messages[1].status, ContentStatus::Complete);
+    assert_eq!(
+        messages[0].mutation.node_id, messages[1].mutation.node_id,
+        "both chunks are one message, not two bubbles"
+    );
+}
+
+/// A streamed message must appear *before* the turn ends, or the user is still
+/// staring at an empty pane for the whole turn — the thing they complained
+/// about.
+#[tokio::test]
+async fn the_first_text_is_journaled_before_the_turn_stops() {
+    let journal = journal_streamed_session().await;
+    let first_text = journal
+        .iter()
+        .position(|observation| matches!(observation.body, ObservationPayload::Message(_)))
+        .expect("text reached the journal");
+    let stop = journal
+        .iter()
+        .position(|observation| native_name(observation) == Some("Stop"))
+        .expect("the turn ended");
+    assert!(
+        first_text < stop,
+        "text must be visible mid-turn, not only once the turn is over"
+    );
+}
+
+/// The hook event itself stays in the journal beside the message it produced:
+/// it is the evidence, and dropping it would make the message unexplainable.
+#[tokio::test]
+async fn the_hook_evidence_survives_beside_the_derived_message() {
+    let journal = journal_streamed_session().await;
+    let deltas = journal
+        .iter()
+        .filter(|observation| native_name(observation) == Some("MessageDisplay"))
+        .count();
+    assert_eq!(deltas, 2, "both hook events are still journaled");
+}

@@ -99,6 +99,10 @@ export type Host = EntityMeta & {
   instanceCount?: number;
   /** `auto` | `native` | `profile:<id>` */
   providerBinding?: string;
+  /** Per-host default extra CLI args, used when a create omits `args`. */
+  defaultLaunchArgs?: string[];
+  /** Per-host default claude executable. Validated by the Node, not the Hub. */
+  claudeBinaryPath?: string;
   online?: boolean;
   /** Raw Node-reported capability object (may carry `driverInventory`; D-028 §5.1). */
   capabilities?: Record<string, unknown> | null;

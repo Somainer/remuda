@@ -328,27 +328,41 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
   await page.getByTestId("model-effort-chip").click();
   const slider = page.getByTestId("effort-slider");
   await expect(slider).toBeVisible();
-  await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+  await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
   const box = await slider.boundingBox();
   expect(box).toBeTruthy();
   await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2);
   await page.mouse.down();
   await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2, { steps: 3 });
   await page.mouse.up();
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+  // The far-right stop is ultracode: the xhigh tier plus the workflow flag.
+  // The chip only re-renders once instance.configure round-trips through the
+  // Hub, so these wait on the wire like every other live assertion here.
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode", {
+    timeout: 20_000,
+  });
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1", {
+    timeout: 20_000,
+  });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1", {
+    timeout: 20_000,
+  });
   await expect
     .poll(() =>
       configureBodies.some(
-        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "max",
+        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "ultracode",
       ),
     )
     .toBeTruthy();
 
   await slider.focus();
   await page.keyboard.press("Home");
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "low");
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0");
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "low", {
+    timeout: 20_000,
+  });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0", {
+    timeout: 20_000,
+  });
   await expect
     .poll(() =>
       configureBodies.some(
@@ -528,12 +542,68 @@ test("a hook-carried approval shows the real tool input and an always-allow opti
   await expect(page.getByTestId("session-page")).toBeVisible();
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
 
-  // Give the slot back. The suite runs every spec against one Hub with
-  // maxInstances 8, so a session left running here makes a *later* spec fail
-  // at creation with PLACEMENT_UNSATISFIABLE — which reads as host contention
-  // rather than as this test's litter.
-  await page.evaluate(
-    (id) => fetch(`/v1/instances/${id}?force=1`, { method: "DELETE", credentials: "include" }),
-    instanceId,
-  );
+  // Release the placement slot. The fake host advertises maxInstances 8 and
+  // the suite is serial, so a session left live here makes a later spec fail
+  // placement (PLACEMENT_UNSATISFIABLE) far from the spec that leaked it. The
+  // fake Node never exits, so only a forced DELETE settles the row.
+  const deleted = await page.request.delete(`/v1/instances/${instanceId}?force=1`);
+  expect(deleted.ok()).toBe(true);
+  await expect
+    .poll(async () => (await page.request.get(`/v1/instances/${instanceId}`)).status())
+    .toBe(404);
+});
+
+/**
+ * D-028 §7 in the browser: assistant text must grow in place as deltas land,
+ * and records the human did not write must not render as their bubble.
+ *
+ * «现在 Structural 的界面不是按文本流式出现的…我觉得它的实时性不够» and
+ * «结构化界面会把追加的 prompt 信息也额外展示了 … 容易让人误解是我发了这些信息».
+ */
+test("structured view streams assistant text and separates injected records", async ({ page }) => {
+  test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
+  await login(page);
+  await page.goto("/sessions/new");
+  await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", { timeout: 20_000 });
+  await page.getByTestId("new-session-prompt").fill("stream please");
+  await page.getByTestId("new-session-start").click();
+  await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+  const instanceId = new URL(page.url()).pathname.split("/").pop()!;
+  await answerPendingApprovals(page, instanceId);
+
+  // The fake Node replies to a `stream ` prompt as an open/append chain. The
+  // assembler must merge it into ONE bubble carrying the whole text — a bubble
+  // per chunk is exactly the "not streaming, just re-rendering" failure.
+  await page.getByTestId("composer-input").fill("stream the reply");
+  await page.getByTestId("composer-send").click();
+  const streamed = page.getByTestId("message").filter({ hasText: "echo: stream the reply" });
+  await expect(streamed).toHaveCount(1, { timeout: 20_000 });
+
+  // Injected records are collapsed, not drawn as "You", and the toggle hides
+  // them entirely. The fake Node emits none, so assert the invariant that
+  // holds either way: nothing claiming to be the user that the user never sent.
+  const bubbles = await page.getByTestId("message").filter({ hasText: /^You/ }).allTextContents();
+  expect(bubbles.every((text) => !text.includes("<task-notification>"))).toBe(true);
+  expect(bubbles.every((text) => !text.includes("<command-name>"))).toBe(true);
+
+  await shot(page, "native-pty-web-3-structured-stream-1440.png");
+  await page.setViewportSize({ width: 400, height: 840 });
+  await shot(page, "native-pty-web-3-structured-stream-400.png");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Release the placement slot. The fake host advertises `maxInstances: 8`
+  // and the suite is serial, so a spec that leaves its instance live spends
+  // one of those slots for the rest of the run — a later spec creating
+  // several sessions then fails placement with a non-OK POST /v1/instances,
+  // far from the spec that actually leaked.
+  //
+  // The fake Node never emits an exit lifecycle (there is no real process to
+  // lose), so `instance.close` alone leaves the row `running` and the slot
+  // counted. DELETE settles to `exited` best-effort regardless, which is the
+  // cleanup path the rest of the suite relies on.
+  const deleted = await page.request.delete(`/v1/instances/${instanceId}?force=1`);
+  expect(deleted.ok()).toBe(true);
+  await expect
+    .poll(async () => (await page.request.get(`/v1/instances/${instanceId}`)).status())
+    .toBe(404);
 });

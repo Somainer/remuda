@@ -436,6 +436,8 @@ mod tests {
             max_instances: max,
             hostname: None,
             provider_binding: "auto".into(),
+            default_launch_args: None,
+            claude_binary_path: None,
         }
     }
 

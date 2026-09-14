@@ -3192,6 +3192,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "nix",
  "remuda-testing",
  "serde",
  "serde_json",

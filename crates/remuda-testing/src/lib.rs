@@ -13,6 +13,7 @@ mod fake;
 pub mod fake_harness;
 mod fake_herdr;
 mod flags;
+mod parent_watch;
 mod paths;
 mod script;
 mod stub;
@@ -33,8 +34,8 @@ pub use fake_herdr::{
 };
 pub use flags::ClaudeFlags;
 pub use paths::{
-    FIXED_SESSION_ID, ScriptKind, fixtures_dir, hook_session_fixture, hook_session_path,
-    script_kind_from_name, script_path,
+    FIXED_SESSION_ID, ScriptKind, fixtures_dir, hook_message_stream_fixture, hook_session_fixture,
+    hook_session_path, script_kind_from_name, script_path,
 };
 pub use script::{load_script, load_script_from_env};
 pub use stub::install_executable;

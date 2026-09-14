@@ -48,6 +48,10 @@ export type HostView = {
   herdr?: { version?: string; socket?: string; path?: string };
   /** `auto` | `native` | `profile:<id>` */
   providerBinding: string;
+  /** Per-host default extra CLI args, applied when a create omits `args`. */
+  defaultLaunchArgs?: string[];
+  /** Per-host default claude executable. Validated by the Node, not the Hub. */
+  claudeBinaryPath?: string;
 };
 
 export type Placement =

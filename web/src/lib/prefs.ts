@@ -9,6 +9,8 @@ export type NewSessionPrefs = {
   delegation: string;
   effortIndex: number;
   effortName: string;
+  /** Extra CLI args from the last successful create, as typed. */
+  launchArgs: string;
   recentHostIds: string[];
   recentWorkspaceIds: string[];
 };
@@ -22,6 +24,7 @@ const empty: NewSessionPrefs = {
   delegation: "none",
   effortIndex: 2,
   effortName: "",
+  launchArgs: "",
   recentHostIds: [],
   recentWorkspaceIds: [],
 };
@@ -44,7 +47,15 @@ function touch(list: string[], value: string): string[] {
 export function rememberNewSessionSuccess(
   patch: Pick<
     NewSessionPrefs,
-    "hostId" | "workspaceId" | "model" | "permissionMode" | "driver" | "delegation" | "effortIndex" | "effortName"
+    | "hostId"
+    | "workspaceId"
+    | "model"
+    | "permissionMode"
+    | "driver"
+    | "delegation"
+    | "effortIndex"
+    | "effortName"
+    | "launchArgs"
   >,
 ): void {
   const prev = readNewSessionPrefs();

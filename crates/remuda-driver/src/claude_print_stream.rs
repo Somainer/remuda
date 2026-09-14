@@ -2,6 +2,7 @@
 //! message and block index; assistant records may contain only one finished block.
 
 use super::*;
+use remuda_protocol::MessageOrigin;
 use std::collections::{BTreeMap, HashSet};
 
 #[cfg(test)]
@@ -66,6 +67,8 @@ impl Block {
                 target_block: Some(0),
                 parent_tool_call_id: parent,
                 native_origin: known_or_unknown(Some(native)),
+                // Assistant text is never an injection.
+                origin: Some(MessageOrigin::Human),
                 status,
             })),
             "thinking" | "redacted_thinking" => {

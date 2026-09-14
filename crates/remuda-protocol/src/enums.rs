@@ -493,6 +493,16 @@ wire_enum!(MessagePhase, "5.2", {
     Unknown => "unknown",
 });
 
+wire_enum!(MessageOrigin, "5.2", {
+    Human => "human",
+    InjectedSkill => "injected-skill",
+    InjectedCommandOutput => "injected-command-output",
+    HookContext => "hook-context",
+    ToolResult => "tool-result",
+    Compaction => "compaction",
+    Unknown => "unknown",
+});
+
 wire_enum!(ContentStatus, "5.2", {
     Queued => "queued",
     Streaming => "streaming",

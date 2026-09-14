@@ -1261,7 +1261,9 @@ export type InstanceSnapshot = ({
 /** InstanceSpec; `protocol.md` §4.1. */
 export type InstanceSpec = ({
   "args": (((string))[]);
+  "binaryPath"?: (string | null);
   "binaryRef": Id;
+  "binarySha256"?: (Digest | (null));
   "carrier": CarrierSpec;
   "completionScope": CompletionScope;
   "cwd": (string);
@@ -1889,6 +1891,9 @@ export type MediaBlock = ({
   [key: string]: unknown;
 });
 
+/** MessageOrigin wire values; `protocol.md` §5.2. */
+export type MessageOrigin = ("human" | "injected-skill" | "injected-command-output" | "hook-context" | "tool-result" | "compaction" | "unknown");
+
 /** MessagePayload; `protocol.md` §5.2. */
 export type MessagePayload = ({
   "baseRevision": (U64 | (null));
@@ -1897,6 +1902,7 @@ export type MessagePayload = ({
   "nativeOrigin": Knowledge2;
   "nodeId": Id;
   "operation": MutationOperation;
+  "origin"?: (MessageOrigin | (null));
   "parentToolCallId": (Id | (null));
   "phase": MessagePhase;
   "revision": U64;

@@ -348,6 +348,7 @@ function renderNode(
         result={node.result}
         completeness={node.completeness}
         diffState={node.diffState}
+        workflow={node.workflow}
         defaultFolded={opts.defaultFolded}
         settle={opts.settle}
       />
@@ -371,6 +372,7 @@ function renderNode(
               result={child.result}
               completeness={child.completeness}
               diffState={child.diffState}
+              workflow={child.workflow}
               defaultFolded={opts.defaultFolded}
               settle={opts.settle}
             />

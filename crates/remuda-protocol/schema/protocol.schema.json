@@ -15871,6 +15871,29 @@
         }
       ]
     },
+    "WorkflowLive": {
+      "description": "The card's live line under the header; additive r-ux-w, §5.3.",
+      "properties": {
+        "agentLabel": {
+          "$ref": "#/$defs/Knowledge2",
+          "description": "Label of the currently (or last) active agent."
+        },
+        "phaseTitle": {
+          "$ref": "#/$defs/Knowledge2",
+          "description": "Phase title of the currently (or last) active agent."
+        },
+        "summary": {
+          "$ref": "#/$defs/Knowledge2",
+          "description": "Terminal one-line result summary, when the run has finished."
+        }
+      },
+      "required": [
+        "phaseTitle",
+        "agentLabel",
+        "summary"
+      ],
+      "type": "object"
+    },
     "WorkflowMemberPayload": {
       "description": "WorkflowMemberPayload; `protocol.md` §5.3.",
       "properties": {
@@ -15878,9 +15901,53 @@
           "$ref": "#/$defs/Knowledge3",
           "description": "`attempt`; protocol §5.3."
         },
+        "calls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Number of tool calls; additive r-ux-w."
+        },
+        "durationMs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-agent wall time; additive r-ux-w."
+        },
+        "endedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Stop timestamp; additive r-ux-w."
+        },
         "label": {
           "$ref": "#/$defs/Knowledge2",
           "description": "`label`; protocol §5.3."
+        },
+        "latestTool": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Knowledge2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Last tool the agent called; additive r-ux-w timeline card."
         },
         "memberId": {
           "$ref": "#/$defs/Id",
@@ -15928,9 +15995,31 @@
           "$ref": "#/$defs/U64",
           "description": "`revision`; protocol §5.3."
         },
+        "startedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Spawn timestamp; additive r-ux-w."
+        },
         "state": {
           "$ref": "#/$defs/WorkflowState",
           "description": "`state`; protocol §5.3."
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Summed token usage (input + output + cache); additive r-ux-w."
         },
         "workflowId": {
           "$ref": "#/$defs/Id",
@@ -16006,9 +16095,42 @@
     "WorkflowRunPayload": {
       "description": "WorkflowRunPayload; `protocol.md` §5.3.",
       "properties": {
+        "description": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Knowledge2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Script meta `description`; additive r-ux-w."
+        },
         "engine": {
           "$ref": "#/$defs/WorkflowEngine",
           "description": "`engine`; protocol §5.3."
+        },
+        "live": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowLive"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Live \"current phase: agent\" line / terminal result line; additive."
+        },
+        "name": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Knowledge2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Script meta `name` (e.g. `review-changes`); additive r-ux-w. Absent on\nproducers/journals written before the timeline card."
         },
         "nativeRunId": {
           "$ref": "#/$defs/Knowledge2",
@@ -16017,6 +16139,13 @@
         "nativeTaskId": {
           "$ref": "#/$defs/Knowledge2",
           "description": "`native_task_id`; protocol §5.3."
+        },
+        "note": {
+          "description": "When phase detail cannot be provided the card degrades to a plain tool\nrow plus this explanation; additive r-ux-w.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "resultRef": {
           "anyOf": [
@@ -16051,6 +16180,17 @@
             }
           ],
           "description": "`tool_call_id`; protocol §5.3."
+        },
+        "totals": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowTotals"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Aggregate counters for the card's summary rail; additive r-ux-w."
         },
         "workflowId": {
           "$ref": "#/$defs/Id",
@@ -16104,6 +16244,59 @@
           "type": "string"
         }
       ]
+    },
+    "WorkflowTotals": {
+      "description": "Aggregate counters shown on a Workflow card; additive r-ux-w, §5.3.\n\nAll values are a point-in-time snapshot: a running run's `tokens` /\n`elapsed_ms` keep moving until the terminal revision.",
+      "properties": {
+        "agentsDone": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents in a terminal success state."
+        },
+        "agentsFailed": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents that failed."
+        },
+        "agentsKilled": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents stopped with the run (TaskStop)."
+        },
+        "agentsRunning": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents currently running."
+        },
+        "agentsTotal": {
+          "$ref": "#/$defs/U64",
+          "description": "Total agent slots (done + running + queued). Meaningful with `total_known`."
+        },
+        "calls": {
+          "$ref": "#/$defs/U64",
+          "description": "Summed subagent tool calls."
+        },
+        "elapsedMs": {
+          "$ref": "#/$defs/U64",
+          "description": "Wall time since launch."
+        },
+        "tokens": {
+          "$ref": "#/$defs/U64",
+          "description": "Summed subagent token usage."
+        },
+        "totalKnown": {
+          "description": "Whether `agents_total` is a real denominator. Dynamic scripts whose\nqueued calls cannot be counted statically report `false`, and the card\nshows a running count without \"/ total\".",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "totalKnown",
+        "agentsTotal",
+        "agentsDone",
+        "agentsFailed",
+        "agentsKilled",
+        "agentsRunning",
+        "tokens",
+        "calls",
+        "elapsedMs"
+      ],
+      "type": "object"
     },
     "WorkflowWaitParams": {
       "description": "WorkflowWaitParams; `protocol.md` §7.2.",

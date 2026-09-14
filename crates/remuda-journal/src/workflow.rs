@@ -182,6 +182,11 @@ impl WorkflowJournalTailer {
                         state: WorkflowState::Running,
                         revision: U64(1),
                         title,
+                        name: None,
+                        description: None,
+                        totals: None,
+                        live: None,
+                        note: None,
                         result_ref: None,
                     })),
                 )?])
@@ -223,6 +228,12 @@ impl WorkflowJournalTailer {
                         model_resolved: model,
                         result_ref: None,
                         revision: U64(1),
+                        latest_tool: None,
+                        tokens: None,
+                        calls: None,
+                        duration_ms: None,
+                        started_at: None,
+                        ended_at: None,
                     })),
                 )?])
             }
@@ -251,6 +262,12 @@ impl WorkflowJournalTailer {
                         model_resolved: unknown("not-emitted"),
                         result_ref: None,
                         revision: U64(2),
+                        latest_tool: None,
+                        tokens: None,
+                        calls: None,
+                        duration_ms: None,
+                        started_at: None,
+                        ended_at: None,
                     })),
                 )?])
             }

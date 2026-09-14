@@ -1,0 +1,372 @@
+/*
+ * Workflow timeline card (workbench batch W).
+ *
+ * One structure for running and finished states: the header IS the summary
+ * line while collapsed; the body holds phase heads and agent rows. Status is
+ * driven entirely by `data-status` (card) / `data-state` (rows).
+ *
+ * Tokens come from styles/tokens.css (warm paper/ink palette); no per-app RGB
+ * channels exist here. New module per the workbench ownership contract.
+ */
+.card {
+  --wf-accent: var(--paper);
+  font-size: var(--text);
+  line-height: 22px;
+  color: var(--mute);
+  padding: 2px 0;
+}
+.card[data-status="failed"] { --wf-accent: var(--danger); }
+.card[data-status="killed"] { --wf-accent: var(--mute); }
+.card[data-status="paused"] { --wf-accent: var(--dust); }
+
+/* Header = the Workflow tool row itself; collapsed, it is the one-liner. */
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 4px 2px 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  line-height: 22px;
+  color: var(--mute);
+  text-align: left;
+  border-radius: var(--radius);
+}
+.head:hover { color: var(--paper); }
+.head:focus-visible { outline: 1px solid var(--cold); outline-offset: 1px; }
+.head:disabled { cursor: default; }
+.head:disabled:hover { color: var(--mute); }
+
+.chev {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  transition: transform 140ms ease;
+}
+.head[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.card[data-flat="1"] .chev { visibility: hidden; }
+
+.ico {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--mute);
+}
+
+.name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-1);
+  font-weight: 500;
+}
+.name em {
+  font-style: normal;
+  font-weight: 400;
+  color: var(--mute);
+  margin-right: 4px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: none;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--paper);
+}
+.chipDot { width: 6px; height: 6px; border-radius: 9999px; background: var(--mute); }
+.card[data-status="completed"] .chip {
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+.card[data-status="completed"] .chipDot { background: var(--ok); }
+.card[data-status="failed"] .chip {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  color: #d98a78;
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.card[data-status="failed"] .chipDot { background: #d98a78; }
+.card[data-status="paused"] .chip {
+  border-color: color-mix(in srgb, var(--dust) 45%, transparent);
+  color: var(--dust);
+  background: color-mix(in srgb, var(--dust) 12%, transparent);
+}
+.card[data-status="paused"] .chipDot { background: var(--dust); }
+.card[data-status="killed"] .chip { background: none; color: var(--mute); }
+.card[data-status="killed"] .chipDot { background: var(--mute); }
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--mute);
+}
+.meta i { font-style: normal; color: var(--paper); }
+
+/* Dotted 72px progress rail with an accent fill. */
+.rail {
+  position: relative;
+  display: block;
+  flex: none;
+  width: 72px;
+  max-width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background-color: var(--canvas);
+  background-image: radial-gradient(circle, var(--mute) 1px, transparent 1.35px);
+  background-size: 4px 4px;
+}
+.railFill {
+  display: block;
+  height: 100%;
+  background-color: var(--wf-accent);
+  background-image: linear-gradient(90deg, transparent 0 10px, color-mix(in srgb, var(--canvas) 55%, transparent) 10px 11px);
+  background-size: 11px 100%;
+  transition: width 240ms ease;
+}
+
+/* Live / result line under the header. */
+.live {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  padding: 0 0 4px 22px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--mute);
+}
+.live b { font-weight: 400; color: var(--paper); flex: none; }
+.live span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Indented body track. */
+.body {
+  margin: 2px 0 4px 7px;
+  border-left: 1px solid var(--line);
+  padding-left: 12px;
+}
+
+.phase + .phase { margin-top: 1px; }
+.phaseHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 4px 2px 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--mute);
+  border-radius: var(--radius);
+}
+.phaseHead:hover { color: var(--ink-1); }
+.phaseHead:focus-visible { outline: 1px solid var(--cold); outline-offset: 1px; }
+.phaseHead .chev { width: 12px; height: 12px; }
+.phaseTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-1);
+  font-weight: 500;
+}
+.phaseCount {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--mute);
+}
+.phaseMeta {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--mute);
+}
+
+/* Agent list: rows shared by list and grid layouts. */
+.agents {
+  list-style: none;
+  margin: 0 0 2px;
+  padding: 0 0 0 16px;
+}
+.agentsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+  column-gap: 16px;
+}
+.agentsGrid .more { grid-column: 1 / -1; }
+
+.agent {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0 8px;
+  padding: 2px 0;
+  min-height: 22px;
+  font-size: 12px;
+  line-height: 18px;
+}
+.state { display: inline-flex; align-items: center; justify-content: center; }
+.stateIco { width: 12px; height: 12px; flex: none; color: var(--mute); }
+.stateIcoDone { color: var(--ok); }
+.stateIcoFailed { color: #d98a78; }
+.stateIcoKilled { color: var(--mute); }
+
+.agentLabel {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--mute);
+}
+.agentName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent[data-state="running"] .agentLabel { color: var(--paper); }
+.agent[data-state="failed"] .agentLabel { color: #d98a78; }
+.agent[data-state="queued"] .agentLabel { color: var(--mute); }
+.agent[data-state="killed"] .agentLabel { color: var(--mute); }
+
+.agentMeta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--mute);
+}
+.agentMeta b { font-weight: 400; color: var(--ink-1); }
+
+.model {
+  max-width: 144px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 10px;
+  line-height: 15px;
+  font-weight: 500;
+  color: var(--mute);
+}
+.tool {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.retry {
+  flex: none;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 15px;
+  color: var(--mute);
+}
+
+/* 「… 还有 n 个」 in-place fold. */
+.more { padding: 1px 0; }
+.more button {
+  border: 0;
+  background: none;
+  cursor: pointer;
+  padding: 2px 0;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--mute);
+  border-radius: var(--radius);
+}
+.more button:hover { color: var(--ink-1); text-decoration: underline; }
+.more button:focus-visible { outline: 1px solid var(--cold); outline-offset: 1px; }
+
+.note {
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.spin { animation: wfSpin 1s linear infinite; transform-origin: 50% 50%; }
+@keyframes wfSpin { to { transform: rotate(360deg); } }
+
+/* Narrow: agent rows stay one line — drop model short name and latest tool,
+   and wrap the header numbers to a second line. */
+@media (max-width: 560px) {
+  .soft { display: none; }
+  .meta {
+    margin-left: 0;
+    width: 100%;
+    padding-left: 22px;
+    justify-content: flex-start;
+  }
+  .phaseMeta { margin-left: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin { animation: none; }
+  .chev, .railFill { transition: none; }
+}

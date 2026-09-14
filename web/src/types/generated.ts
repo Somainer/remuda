@@ -3590,10 +3590,22 @@ export type WaitReason = ("condition-met" | "timeout" | "unknown");
 /** WorkflowEngine wire values; `protocol.md` §5.3. */
 export type WorkflowEngine = ("claude-workflow");
 
+/** The card's live line under the header; additive r-ux-w, §5.3. */
+export type WorkflowLive = ({
+  "agentLabel": Knowledge2;
+  "phaseTitle": Knowledge2;
+  "summary": Knowledge2;
+  [key: string]: unknown;
+});
+
 /** WorkflowMemberPayload; `protocol.md` §5.3. */
 export type WorkflowMemberPayload = ({
   "attempt": Knowledge3;
+  "calls"?: (U64 | (null));
+  "durationMs"?: (U64 | (null));
+  "endedAt"?: (Timestamp | (null));
   "label": Knowledge2;
+  "latestTool"?: (Knowledge2 | (null));
   "memberId": Id;
   "modelRequested": Knowledge2;
   "modelResolved": Knowledge2;
@@ -3602,7 +3614,9 @@ export type WorkflowMemberPayload = ({
   "phaseId": (Id | (null));
   "resultRef": (Id | (null));
   "revision": U64;
+  "startedAt"?: (Timestamp | (null));
   "state": WorkflowState;
+  "tokens"?: (U64 | (null));
   "workflowId": Id;
   [key: string]: unknown;
 });
@@ -3621,20 +3635,39 @@ export type WorkflowPhasePayload = ({
 
 /** WorkflowRunPayload; `protocol.md` §5.3. */
 export type WorkflowRunPayload = ({
+  "description"?: (Knowledge2 | (null));
   "engine": WorkflowEngine;
+  "live"?: (WorkflowLive | (null));
+  "name"?: (Knowledge2 | (null));
   "nativeRunId": Knowledge2;
   "nativeTaskId": Knowledge2;
+  "note"?: (string | null);
   "resultRef": (Id | (null));
   "revision": U64;
   "state": WorkflowState;
   "title": Knowledge2;
   "toolCallId": (Id | (null));
+  "totals"?: (WorkflowTotals | (null));
   "workflowId": Id;
   [key: string]: unknown;
 });
 
 /** WorkflowState wire values; `protocol.md` §5.3. */
 export type WorkflowState = ("queued" | "running" | "completed" | "failed" | "cancelled" | "unknown");
+
+/** Aggregate counters shown on a Workflow card; additive r-ux-w, §5.3.  All values are a point-in-time snapshot: a running run's `tokens` / `elapsed_ms` keep moving until the terminal revision. */
+export type WorkflowTotals = ({
+  "agentsDone": U64;
+  "agentsFailed": U64;
+  "agentsKilled": U64;
+  "agentsRunning": U64;
+  "agentsTotal": U64;
+  "calls": U64;
+  "elapsedMs": U64;
+  "tokens": U64;
+  "totalKnown": (boolean);
+  [key: string]: unknown;
+});
 
 /** WorkflowWaitParams; `protocol.md` §7.2. */
 export type WorkflowWaitParams = ({

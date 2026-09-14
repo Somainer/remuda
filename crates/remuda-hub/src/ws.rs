@@ -13,7 +13,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use remuda_protocol::hubnode::{
-    self, HubNodeMethod, JournalAppendParams, NodeHelloParams, TtyFrameParams,
+    self, HubNodeMethod, JournalAppendParams, NodeHelloParams, TtyFrameParams, TtyModeParams,
 };
 use remuda_protocol::{
     ConnectionLease, HeartbeatResult, HelloResult, PROTOCOL_VERSION, TransportLimits, U64,
@@ -540,20 +540,10 @@ pub(crate) async fn handle_node_method(
         }
         "tty.mode" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            let instance_id = params
-                .get("instanceId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| HubError::BadRequest("tty.mode requires instanceId".into()))?;
-            let stream_id = params
-                .get("streamId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| HubError::BadRequest("tty.mode requires streamId".into()))?;
-            let alt_screen = params
-                .get("altScreen")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| {
-                    HubError::BadRequest("tty.mode requires boolean altScreen".into())
-                })?;
+            let mode: TtyModeParams = serde_json::from_value(params)
+                .map_err(|error| HubError::BadRequest(format!("tty.mode: {error}")))?;
+            let instance_id = mode.instance_id.as_str();
+            let stream_id = mode.stream_id.as_str();
             let uuid = stream_uuid_of(stream_id)
                 .ok_or_else(|| HubError::BadRequest("tty.mode has invalid streamId".into()))?;
             let instance = state
@@ -569,11 +559,7 @@ pub(crate) async fn handle_node_method(
             state.bus.publish(FollowEvent::json(
                 instance_id,
                 0,
-                json!({ "type": "tty.mode", "params": {
-                    "instanceId": instance_id,
-                    "streamId": stream_id,
-                    "altScreen": alt_screen,
-                }}),
+                json!({ "type": "tty.mode", "params": mode }),
             ));
             Ok(Some(json!({ "ok": true })))
         }

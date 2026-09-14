@@ -14,6 +14,7 @@ mod agent_scope;
 mod alerts;
 mod attachments;
 mod auth;
+mod bot;
 mod config;
 mod devices;
 mod error;
@@ -37,6 +38,7 @@ mod rate_limit;
 mod registry;
 pub mod ssh_hosts;
 mod store;
+mod store_tickets;
 mod transport;
 mod tty;
 mod web;
@@ -382,7 +384,8 @@ pub fn router(state: AppState) -> Router {
         .merge(agent_scope::routes())
         .merge(objects::routes())
         .merge(attachments::routes())
-        .merge(workspaces::routes());
+        .merge(workspaces::routes())
+        .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }

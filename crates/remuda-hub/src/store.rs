@@ -3458,6 +3458,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::workspaces::migrate(&conn)?;
     crate::projects::migrate(&conn)?;
     migrate_provider_models(&conn)?;
+    crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;
     Ok(conn)
 }

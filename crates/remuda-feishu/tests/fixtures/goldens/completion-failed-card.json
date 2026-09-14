@@ -1,0 +1,22 @@
+{
+  "schema": "2.0",
+  "config": {
+    "compact_width": false,
+    "update_multi": true,
+    "streaming_mode": false,
+    "enable_forward": false
+  },
+  "header": {
+    "template": "red",
+    "title": { "tag": "plain_text", "content": "Done", "text_align": "left" }
+  },
+  "body": {
+    "elements": [
+      {
+        "tag": "markdown",
+        "content": "failed: tool-exit-1",
+        "text_align": "left"
+      }
+    ]
+  }
+}

@@ -114,17 +114,30 @@ listener never attaches.
 
 ## Verification
 
-- `pnpm --dir web lint`: clean.
+- `pnpm --dir web lint`: clean (the six remaining oxlint warnings are all on
+  pre-existing files).
 - `pnpm --dir web exec tsc -b`: clean.
-- `pnpm --dir web test`: all unit suites green, including new cases for the
-  platform (Mac/Win/Linux/iPad/Android), the hook (hold/release, blur,
+- `pnpm --dir web test`: 674/674 unit suites green, including new cases for
+  the platform (Mac/Win/Linux/iPad/Android), the hook (hold/release, blur,
   repeat, IME, typing-focus, touch, disable) and the slot ordering
   (cap at nine, dismissed tabs, blocked resurface), plus SessionList cases
   asserting the visible-row/group-order distinction and both platform
   glyphs.
 - `pnpm --dir web run test:e2e:hub` under `flock /tmp/remuda-agents/e2e.lock`
-  with the fake node: results recorded below at merge time.
+  with the fake node: **the five ux-keys scenarios pass (5/5)** in both a
+  standalone file run and the full serial suite. The full suite was observed
+  with one unrelated failure (`providers-discovery` gateway probe), a known
+  host-contention flake on this shared devbox — it passes in isolation
+  (`-g`, 1/1) and never touches the surfaces changed here.
 - `./scripts/ci/secret-scan.sh`: clean.
+
+Test-isolation note: the hub config runs every spec against one serial Hub
+whose fake node ships `maxInstances 8`, and some earlier files intentionally
+leave sessions live (e.g. `spaces-hub-live` has no cleanup). The spec's
+`beforeAll` therefore sweeps the board with `?force=1` deletes and waits for
+three consecutive empty reads, and raises the fixture cap to 32 for the run
+(the same technique `ux-status.spec.ts` uses), restoring 8 in `afterAll`.
+The wire list field is `instanceId`, not `id`.
 
 ## Out of scope
 

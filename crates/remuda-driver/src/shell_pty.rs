@@ -259,6 +259,7 @@ struct PtyState {
     pgid: AtomicI32,
     output: broadcast::Sender<Vec<u8>>,
     ring: std::sync::Mutex<VecDeque<u8>>,
+    interruption_output: std::sync::Mutex<promotion::InterruptionOutput>,
     /// Terminal emulator, when [`EMULATOR_ENV`] is on. Fed the same bytes as
     /// the ring, never instead of it: §4.6 keeps the ring as the fallback for
     /// any emulator failure, so the emulator can never cost a byte of output.
@@ -273,6 +274,15 @@ struct PtyState {
 }
 
 impl PtyState {
+    fn screen_evidence(&self) -> (u64, ScreenGrid) {
+        // The reader holds this same lock while updating both the rendered
+        // grid and marker count. Sampling them separately can consume a new
+        // marker against the preceding frame and lose its confirmation.
+        let output = self.interruption_output.lock().ok();
+        let count = output.as_ref().map_or(0, |output| output.count());
+        (count, self.screen_grid())
+    }
+
     /// Current screen as a grid: the emulator's when it is on, otherwise the
     /// ANSI-stripped ring tail, which is what the matchers read before D-028.
     pub(super) fn screen_grid(&self) -> ScreenGrid {
@@ -384,6 +394,9 @@ pub struct ShellPtyDriver {
     /// proved it did not apply (§14 risk 1). Lives on the driver because the
     /// budget has to outlive the call that spends it.
     fallbacks: crate::hook_answer::FallbackLedger,
+    /// Foreground Claude whose cancel key awaits native turn-end evidence.
+    interrupt_pid: Arc<AtomicI32>,
+    interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
     seq: Arc<AtomicU64>,
 }
 
@@ -411,6 +424,10 @@ impl ShellPtyDriver {
             hooks: Mutex::new(None),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
+            interrupt_pid: Arc::new(AtomicI32::new(0)),
+            interrupt_screen_markers: Arc::new(std::sync::Mutex::new(
+                promotion::InterruptBaseline::default(),
+            )),
             seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -448,11 +465,14 @@ impl ShellPtyDriver {
     ///
     /// `false` whenever hooks are off, which drops the caller to rung 2.
     fn hook_receipt(&self) -> bool {
+        let Some(pid) = self.session_pid() else {
+            return false;
+        };
         self.hooks
             .try_lock()
             .ok()
             .and_then(|slot| slot.as_ref().and_then(|session| session.binding()))
-            .is_some()
+            .is_some_and(|binding| binding.pid == pid)
     }
 
     /// Screen-derived readiness of the promoted agent, when the poller has one.
@@ -576,28 +596,32 @@ impl ShellPtyDriver {
         &self,
         ctx: &promotion::PromoteCtx,
         events: &mpsc::Sender<remuda_protocol::Observation>,
+        base_settings: Option<serde_json::Value>,
     ) -> DriverResult<Option<Arc<crate::launch::HookSession>>> {
         let Some(config) = self.options.hooks.clone() else {
             return Ok(None);
         };
-        let bus = Arc::new(remuda_signal::SignalBus::new(
-            remuda_signal::BusContext {
-                instance_id: ctx.instance_id.clone(),
-                host_id: ctx.host_id.clone(),
-                journal_id: ctx.journal_id.clone(),
-                run_id: ctx.run_id.clone(),
-                driver_kind: DriverKind::ShellPty,
-                adapter_version: crate::capabilities::ADAPTER_VERSION.to_owned(),
-            },
-            events.clone(),
-            Arc::clone(&self.seq),
-        ));
+        let bus = Arc::new(
+            remuda_signal::SignalBus::new(
+                remuda_signal::BusContext {
+                    instance_id: ctx.instance_id.clone(),
+                    host_id: ctx.host_id.clone(),
+                    journal_id: ctx.journal_id.clone(),
+                    run_id: ctx.run_id.clone(),
+                    driver_kind: DriverKind::ShellPty,
+                    adapter_version: crate::capabilities::ADAPTER_VERSION.to_owned(),
+                },
+                events.clone(),
+                Arc::clone(&self.seq),
+            )
+            .with_interrupt_tracker(Arc::clone(&self.interrupt_pid)),
+        );
         Ok(Some(Arc::new(crate::launch::HookSession::start(
             &crate::launch::HookSessionOptions {
                 instance_dir: config.instance_dir,
                 relay_binary: config.relay_binary,
                 tui: config.tui,
-                base_settings: None,
+                base_settings,
             },
             bus,
         )?)))
@@ -620,9 +644,30 @@ impl ShellPtyDriver {
             .or_else(|| self.options.target.agent_kind())
     }
 
+    /// The live promoted process, or our direct agent child before detection.
+    /// A login shell's PID is never evidence for a hand-typed agent.
+    fn session_pid(&self) -> Option<i32> {
+        if let Some(pid) = self
+            .promoted
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|found| found.pid))
+            .filter(|pid| *pid > 0)
+        {
+            return Some(pid);
+        }
+        self.options.target.agent_kind()?;
+        self.inner
+            .try_lock()
+            .ok()?
+            .as_ref()
+            .map(|state| state.pgid.load(Ordering::SeqCst))
+            .filter(|pid| *pid > 0)
+    }
+
     /// Runtime capability overrides for `kind` (§4.3, §6).
     fn runtime_ref(&self, kind: AgentKind) -> remuda_protocol::NativeRef {
-        let tier = if self.options.hooks.is_some() {
+        let tier = if self.hook_receipt() {
             remuda_protocol::SignalTier::Hook
         } else if self.options.emulator {
             // The emulator retains OSC titles and `9;4` progress in VT state,
@@ -731,11 +776,10 @@ impl ShellPtyDriver {
         // immediately must not lose their SessionStart to a race.
         let (tx, rx) = mpsc::channel(256);
         let hook_ctx = promote_ctx(&self.options, cwd, spec)?;
-        let hooks = self.start_hooks(&hook_ctx, &tx)?;
         // §5.1: the recipe decides argv, and for an agent it is the real
         // materialized one — env allowlist, settings digest and provider all
         // filled in, not the stub the shell path used to emit for everything.
-        let recipe = self.recipe_for(cwd, spec)?;
+        let (recipe, hooks) = self.prepare_launch(cwd, spec, &hook_ctx, &tx)?;
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
@@ -764,6 +808,7 @@ impl ShellPtyDriver {
             pgid: AtomicI32::new(pgid.unwrap_or(0)),
             output: output.clone(),
             ring: std::sync::Mutex::new(VecDeque::new()),
+            interruption_output: std::sync::Mutex::new(promotion::InterruptionOutput::default()),
             emulator,
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
@@ -782,7 +827,7 @@ impl ShellPtyDriver {
             })
             .map_err(DriverError::Io)?;
         *self.inner.lock().await = Some(Arc::clone(&state));
-        *self.hooks.lock().await = hooks;
+        *self.hooks.lock().await = hooks.clone();
         if self.options.promote {
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
@@ -791,6 +836,10 @@ impl ShellPtyDriver {
                 Arc::clone(&self.promoted),
                 Arc::clone(&self.status),
                 self.bindings.clone(),
+                hooks,
+                matches!(self.options.target, Target::Shell),
+                Arc::clone(&self.interrupt_pid),
+                Arc::clone(&self.interrupt_screen_markers),
                 tx.clone(),
                 Arc::clone(&self.seq),
             ));
@@ -815,7 +864,12 @@ impl ShellPtyDriver {
     /// The launch recipe for this PTY's target.    ///
     /// A shell keeps the lightweight recipe it always had; an agent goes
     /// through the materializer so §5.1 step 4's audit fields are real.
-    fn recipe_for(&self, cwd: &str, spec: Option<&InstanceSpec>) -> DriverResult<LaunchRecipe> {
+    fn recipe_for(
+        &self,
+        cwd: &str,
+        spec: Option<&InstanceSpec>,
+        settings_overlay: Option<&Path>,
+    ) -> DriverResult<LaunchRecipe> {
         let Target::Agent { kind, resume } = &self.options.target else {
             return shell_recipe(&self.options, cwd);
         };
@@ -835,7 +889,41 @@ impl ShellPtyDriver {
                 spec.kind
             )));
         }
-        launch::agent_recipe(spec, agent, cwd, resume.as_deref())
+        let mut agent = agent.as_ref().clone();
+        if let Some(path) = settings_overlay {
+            agent.settings_overlay = Some(path.to_path_buf());
+        }
+        launch::agent_recipe(spec, &agent, cwd, resume.as_deref())
+    }
+
+    /// Validate the caller's native recipe first, then layer the hook overlay
+    /// into that same materializer so its argv and audit describe one file.
+    fn prepare_launch(
+        &self,
+        cwd: &str,
+        spec: Option<&InstanceSpec>,
+        ctx: &promotion::PromoteCtx,
+        events: &mpsc::Sender<remuda_protocol::Observation>,
+    ) -> DriverResult<(LaunchRecipe, Option<Arc<crate::launch::HookSession>>)> {
+        let mut recipe = self.recipe_for(cwd, spec, None)?;
+        let native_claude = self.options.target.agent_kind() == Some(AgentKind::Claude);
+        let base_settings = if native_claude && self.options.hooks.is_some() {
+            recipe
+                .materialized_files
+                .iter()
+                .find(|file| file.role == crate::recipe::FileRole::Settings)
+                .map(|file| {
+                    Ok::<_, DriverError>(serde_json::from_slice(&std::fs::read(&file.path)?)?)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let hooks = self.start_hooks(ctx, events, base_settings)?;
+        if native_claude && let Some(hooks) = &hooks {
+            recipe = self.recipe_for(cwd, spec, Some(&hooks.overlay.path))?;
+        }
+        Ok((recipe, hooks))
     }
 
     /// Run the stop ladder against this PTY's process group (§5.3).
@@ -893,7 +981,7 @@ impl ShellPtyDriver {
         // A resumed driver is a fresh launch with the resume flag set. Cloning
         // options rather than mutating `self` keeps `resume` callable on a
         // driver whose original target is still meaningful for diagnostics.
-        let resumed = Self::with_process_table(
+        let mut resumed = Self::with_process_table(
             ShellPtyOptions {
                 target: Target::Agent {
                     kind,
@@ -903,6 +991,15 @@ impl ShellPtyDriver {
             },
             Arc::clone(&self.table),
         );
+        // The adopted poller/bus must update the same control handles that
+        // callers retain on `self`, including native cancel confirmation.
+        resumed.promoted = Arc::clone(&self.promoted);
+        resumed.status = Arc::clone(&self.status);
+        resumed.bindings = self.bindings.clone();
+        resumed.interrupt_pid = Arc::clone(&self.interrupt_pid);
+        resumed.interrupt_screen_markers = Arc::clone(&self.interrupt_screen_markers);
+        resumed.exited = Arc::clone(&self.exited);
+        resumed.seq = Arc::clone(&self.seq);
         let handle = match spec {
             Some(spec) => resumed.spawn_at(&spec.cwd.clone(), Some(&spec)).await?,
             None => resumed.spawn().await?,
@@ -1104,6 +1201,18 @@ impl Driver for ShellPtyDriver {
         let Some(_) = self.session_kind() else {
             return Ok(());
         };
+        if self.screen_status() == Some(ScreenStatus::Blocked) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        let hooks = self.hooks.lock().await.clone();
+        let activity = self
+            .session_pid()
+            .and_then(|pid| hooks.as_ref().and_then(|hooks| hooks.turn_active(pid)));
+        match activity {
+            Some(true) => return Err(DriverError::ControlUnavailable),
+            Some(false) => return Ok(()),
+            None => {}
+        }
         let rung = send::ready_rung(
             true,
             self.hook_receipt(),
@@ -1213,32 +1322,23 @@ impl Driver for ShellPtyDriver {
     /// `CAPABILITY_UNKNOWN` rather than a plausible keystroke and a false
     /// success.
     async fn cancel(&self) -> DriverResult<DriverAck> {
-        // `session_kind`, not `promoted_kind`: for a Remuda-launched agent the
-        // kind is known from the launch target before the first promotion poll
-        // lands. Reading only the poller left a window — measured live, not
-        // hypothetical — in which `instance.cancel` fell through to the shell
-        // branch and sent `\x03` to a Claude TUI, which killed the session it
-        // was supposed to interrupt.
+        // A direct launch knows its kind before the first promotion poll.
+        // Keep P2's per-harness key table on both launch paths.
         let Some(kind) = self.session_kind() else {
             return self.write_tty(b"\x03").await;
         };
-        // An interrupt key is only an interrupt while there is a turn to
-        // interrupt. Measured live against claude 2.1.221: `Esc` sent to an
-        // *idle* composer quits the session (the instance landed `failed` with
-        // `native-exit-code-1`). The evidence that `Esc` interrupts —
-        // claude-queue-steer-1 — is all from a running turn, so sending it
-        // outside one is extrapolation, and the failure mode is losing the
-        // session the caller meant to keep.
-        //
-        // Idle is therefore a no-op that says so rather than an error: there is
-        // nothing to cancel, and having asked is not a mistake. `unknown` still
-        // sends, because refusing to interrupt a turn that might be running is
-        // the worse of the two risks.
-        if self.screen_status() == Some(ScreenStatus::Idle) {
-            tracing::debug!(
-                ?kind,
-                "cancel on an idle composer: nothing to interrupt, and the key would quit"
-            );
+        let pid = self.session_pid();
+        let hooks = self.hooks.lock().await.clone();
+        let active = if kind == AgentKind::Claude {
+            pid.and_then(|pid| hooks.as_ref().and_then(|hooks| hooks.turn_active(pid)))
+        } else {
+            None
+        };
+        // A hook turn boundary outranks a stale idle/working frame. Without
+        // hook evidence, preserve P2's idle no-op and unknown-screen send.
+        if active == Some(false)
+            || (active.is_none() && self.screen_status() == Some(ScreenStatus::Idle))
+        {
             return Ok(DriverAck::not_dispatched());
         }
         let Some(bytes) = keys::interrupt_bytes(kind) else {
@@ -1247,12 +1347,20 @@ impl Driver for ShellPtyDriver {
                  refusing to send a guess and report success"
             )));
         };
-        let row = keys::keys_for(kind);
-        // Grok's interrupt is two Ctrl+C with the first only clearing the
-        // draft, so the keys go out as separate writes: coalesced into one they
-        // are a single keypress to the TUI's reader.
         let state = self.state().await?;
-        if let Some(row) = row
+        // Writing the key proves only transport. Native hook/screen evidence
+        // settles Claude's pending cancel, including before its first poll.
+        if kind == AgentKind::Claude
+            && let Some(pid) = pid
+        {
+            if let Ok(mut baseline) = self.interrupt_screen_markers.lock() {
+                let (count, grid) = state.screen_evidence();
+                baseline.arm(count, &grid);
+            }
+            self.interrupt_pid.store(pid, Ordering::SeqCst);
+        }
+        // Grok's two Ctrl+C keys need distinct reads; the first clears draft.
+        if let Some(row) = keys::keys_for(kind)
             && row.interrupt.keys.len() > 1
         {
             for key in row.interrupt.keys {
@@ -1372,6 +1480,7 @@ impl Driver for ShellPtyDriver {
         // stay for `instance.purge` to remove with the rest of the instance
         // directory — they are launch audit evidence until then.
         self.hooks.lock().await.take();
+        self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();
         let Some(state) = self.inner.lock().await.take() else {
@@ -1562,6 +1671,9 @@ fn read_pty(state: Arc<PtyState>, mut reader: Box<dyn Read + Send>) {
             Ok(0) => break,
             Ok(n) => {
                 let chunk = buf[..n].to_vec();
+                // Keep cancellation evidence on one output generation. All
+                // snapshot/update paths acquire this before ring/emulator.
+                let mut markers = state.interruption_output.lock().ok();
                 if let Ok(mut ring) = state.ring.lock() {
                     ring.extend(chunk.iter().copied());
                     while ring.len() > TTY_SNAPSHOT_MAX {
@@ -1581,6 +1693,10 @@ fn read_pty(state: Arc<PtyState>, mut reader: Box<dyn Read + Send>) {
                 }
                 // Quiescence is measured from this counter (§5.2).
                 state.reads.fetch_add(1, Ordering::SeqCst);
+                if let Some(markers) = markers.as_mut() {
+                    markers.feed(&chunk);
+                }
+                drop(markers);
                 let _ = state.output.send(chunk);
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1798,6 +1914,254 @@ fn shell_quote(path: &str) -> String {
 mod tests {
     use super::*;
 
+    struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_claude_recipe_preserves_settings_and_audits_the_hook_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = dir.path().join("instance");
+        let operator = dir.path().join("operator-settings.json");
+        let settings = serde_json::json!({
+            "env": {"ANTHROPIC_BASE_URL": "https://provider.example", "CUSTOM": "retained"},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "operator-stop"}]}]}
+        });
+        std::fs::write(&operator, settings.to_string()).unwrap();
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["sonnet".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance.join("launch"),
+                native_home: dir.path().to_path_buf(),
+                binary: Some(PathBuf::from("/bin/sh")),
+                origin: crate::materializer::LaunchOrigin::Human,
+                settings_overlay: Some(operator.clone()),
+            },
+        );
+        options.hooks = Some(HookConfig {
+            instance_dir: instance.clone(),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        let mut driver = ShellPtyDriver::new(options);
+        let ctx = promote_ctx(&driver.options, &spec.cwd, Some(&spec)).unwrap();
+        let (events, _rx) = mpsc::channel(8);
+        let (recipe, hooks) = driver
+            .prepare_launch(&spec.cwd, Some(&spec), &ctx, &events)
+            .unwrap();
+        let hooks = hooks.unwrap();
+        assert!(recipe.argv.windows(2).any(|args| {
+            args[0] == "--settings" && args[1] == hooks.overlay.path.to_string_lossy()
+        }));
+        assert_eq!(
+            recipe.audit.settings_digest.as_ref(),
+            Some(&hooks.overlay.digest)
+        );
+        let merged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hooks.overlay.path).unwrap()).unwrap();
+        assert_eq!(merged["env"], settings["env"]);
+        assert_eq!(merged["hooks"]["Stop"][0], settings["hooks"]["Stop"][0]);
+        for event in crate::launch::overlay::HOOK_EVENTS {
+            assert!(
+                merged["hooks"][event].to_string().contains("hook emit"),
+                "{event}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&operator).unwrap(),
+            settings.to_string()
+        );
+        drop(hooks);
+
+        let invalid_instance = dir.path().join("invalid-instance");
+        driver.options.hooks.as_mut().unwrap().instance_dir = invalid_instance.clone();
+        driver.options.agent.as_mut().unwrap().binary = Some(dir.path().join("missing-binary"));
+        assert!(
+            driver
+                .prepare_launch(&spec.cwd, Some(&spec), &ctx, &events)
+                .is_err()
+        );
+        assert!(
+            !invalid_instance.exists(),
+            "validate before creating hook artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn interruption_snapshot_waits_for_the_complete_screen_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+        options.emulator = true;
+        let driver = ShellPtyDriver::new(options);
+        let _events = driver.spawn().await.unwrap().into_events();
+        let state = driver.state().await.unwrap();
+        let marker = "Interrupted · What should Claude do instead?\r\n❯";
+        {
+            // Pause the reader at the old race: the emulator has the next frame,
+            // but that frame's interruption count has not yet been committed.
+            let mut output = state.interruption_output.lock().unwrap();
+            state
+                .emulator
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .feed(marker.as_bytes());
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+            let sampled = Arc::clone(&state);
+            let reader = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                snapshot_tx.send(sampled.screen_evidence()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                snapshot_rx
+                    .recv_timeout(std::time::Duration::from_millis(25))
+                    .is_err(),
+                "a snapshot cannot observe a partly updated output generation"
+            );
+            output.feed(marker.as_bytes());
+            drop(output);
+            let (count, grid) = snapshot_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            reader.join().unwrap();
+            assert_eq!(count, 1);
+            assert!(grid.flat().contains("Interrupted"));
+        }
+        Driver::close(&driver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_uses_escape_only_for_a_promoted_claude_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+        options.hooks = Some(HookConfig {
+            instance_dir: dir.path().join("instance"),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver.spawn().await.unwrap().into_events();
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        *driver.state().await.unwrap().writer.lock().await =
+            Box::new(RecordingWriter(Arc::clone(&written)));
+        Driver::cancel(&driver).await.unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"\x03");
+        written.lock().unwrap().clear();
+        *driver.promoted.lock().unwrap() = Some(Detected {
+            kind: AgentKind::Claude,
+            pid: 42,
+            session_id: None,
+            hydrates_transcript: true,
+        });
+        let hooks = driver.hooks.lock().await.clone().unwrap();
+        assert!(
+            !driver.hook_receipt(),
+            "configuration alone is not a receipt"
+        );
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            remuda_signal::send_event(
+                &hooks.socket_path,
+                &remuda_signal::HookEnvelope {
+                    credential: hooks.child_env("")["REMUDA_HOOK_CREDENTIAL"].clone(),
+                    event: event.into(),
+                    ppid: 42,
+                    payload: serde_json::json!({"session_id": "cancel-fixture"}),
+                },
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(driver.hook_receipt());
+        // The hook has already accepted a turn while the screen still shows
+        // the old composer. That stale idle frame must not swallow cancel.
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
+        assert!(
+            Driver::wait_control(&driver).await.is_err(),
+            "a SessionStart receipt cannot admit a prompt during a hook-confirmed turn"
+        );
+        Driver::cancel(&driver).await.unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"\x1b");
+        assert_eq!(driver.interrupt_pid.load(Ordering::SeqCst), 42);
+        assert!(
+            events.try_recv().is_err(),
+            "writing a key alone must not manufacture an interrupted observation"
+        );
+        written.lock().unwrap().clear();
+        hooks.confirm_screen_interrupt(42);
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Working);
+        assert!(Driver::wait_control(&driver).await.is_ok());
+        let ack = Driver::cancel(&driver).await.unwrap();
+        assert_eq!(ack.dispatch, remuda_protocol::DispatchState::NotDispatched);
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "Esc on an idle Claude can quit the session"
+        );
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Blocked);
+        assert!(Driver::wait_control(&driver).await.is_err());
+        Driver::close(&driver).await.unwrap();
+    }
+
+    #[test]
+    fn a_plain_shell_prompt_is_one_write_of_text_plus_a_carriage_return() {
+        let delivery = send::encode("ls -la", false, None);
+        assert_eq!(delivery.body, b"ls -la\r");
+        assert_eq!(delivery.submit, None);
+        assert_eq!(send::encode("ls\n", false, None).body, b"ls\n");
+    }
+
+    #[test]
+    fn a_promoted_prompt_sends_its_enter_as_a_separate_write() {
+        let delivery = send::encode("hello\r\n", true, None);
+        assert_eq!(delivery.body, b"hello");
+        assert_eq!(delivery.submit, Some(b"\r".to_vec()));
+    }
+
+    #[test]
+    fn a_promoted_multiline_prompt_is_bracketed_when_the_tui_requested_paste() {
+        let delivery = send::encode(
+            "first\nsecond",
+            true,
+            Some(ModeSet {
+                bracketed_paste: true,
+                ..ModeSet::default()
+            }),
+        );
+        assert_eq!(delivery.body, b"\x1b[200~first\nsecond\x1b[201~");
+        assert_eq!(delivery.submit, Some(b"\r".to_vec()));
+    }
+
     #[tokio::test]
     async fn a_launched_agent_is_an_agent_before_the_first_promotion_poll() {
         // Measured live (native-pty-2 §5): `cancel` read only the promotion
@@ -1806,13 +2170,11 @@ mod tests {
         // `\x03` — which does not interrupt a Claude turn, it quits the
         // session. The launch target knows the kind immediately; the poller
         // only confirms it.
-        let dir = tempfile::tempdir().unwrap();
-        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
-        options.target = Target::Agent {
+        let mut driver = agent_pty(None).await;
+        driver.options.target = Target::Agent {
             kind: AgentKind::Claude,
             resume: None,
         };
-        let driver = ShellPtyDriver::new(options);
         assert_eq!(
             driver.session_kind(),
             Some(AgentKind::Claude),
@@ -1823,6 +2185,17 @@ mod tests {
             None,
             "and the poller has indeed not run"
         );
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = driver.state().await.unwrap();
+        *state.writer.lock().await = Box::new(RecordingWriter(Arc::clone(&written)));
+        Driver::cancel(&driver).await.unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"\x1b");
+        assert_eq!(
+            driver.interrupt_pid.load(Ordering::SeqCst),
+            state.pgid.load(Ordering::SeqCst),
+            "native evidence follows the direct child before promotion"
+        );
+        Driver::close(&driver).await.unwrap();
     }
 
     /// A driver whose PTY runs an inert process, carrying `kind` as its

@@ -82,7 +82,7 @@ async fn store_records_the_session_a_driver_reports() {
         )
         .expect("append");
     let updated = store
-        .set_native_session(&instance_id, session, Some("/tmp/resume-test.jsonl"))
+        .set_native_session(&instance_id, session, Some("/tmp/resume-test.jsonl"), None)
         .expect("record")
         .expect("changed");
     assert_eq!(session_id_of(&updated), Some(session));
@@ -102,7 +102,7 @@ async fn store_records_the_session_a_driver_reports() {
     // Repeating the same evidence must not churn revisions or journal noise.
     assert!(
         store
-            .set_native_session(&instance_id, session, Some("/tmp/resume-test.jsonl"))
+            .set_native_session(&instance_id, session, Some("/tmp/resume-test.jsonl"), None)
             .expect("repeat")
             .is_none(),
         "unchanged evidence reports no update"

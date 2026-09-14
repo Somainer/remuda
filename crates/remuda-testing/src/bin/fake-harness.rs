@@ -21,6 +21,9 @@ struct Args {
     /// Claude-style settings overlay containing hooks.
     #[arg(long)]
     settings: Option<PathBuf>,
+    /// Accept the launch shim's source selection; only --settings is loaded.
+    #[arg(long = "setting-sources")]
+    _setting_sources: Option<String>,
     /// Harness home (CLAUDE_CONFIG_DIR / CODEX_HOME / GROK_HOME equivalent).
     #[arg(long)]
     home: Option<PathBuf>,

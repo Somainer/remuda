@@ -88,16 +88,19 @@ impl HookSession {
             tui: options.tui,
             base: options.base_settings.clone(),
         })?;
-        let shims = materialize_shims(
+        let mut shims = materialize_shims(
             &launch_dir,
             &overlay.path,
             &credential,
             shim_off,
-            // No override plumbed through this path yet: the shell-pty session
-            // builder that owns these options is in flight elsewhere. `None`
-            // is the pre-existing behaviour (search PATH), not a regression.
+            // No per-session override is supplied on the shell path yet.
+            // Native agent launches use the materializer's pinned executable.
             None,
         )?;
+        shims.env.insert(
+            "REMUDA_HOOK_RELAY".into(),
+            options.relay_binary.to_string_lossy().into_owned(),
+        );
         Ok(Self {
             _server: server,
             overlay,
@@ -123,13 +126,13 @@ impl HookSession {
         self.bus.is_parked(id)
     }
 
-    /// Hand a device's answer to the hook parked under `id`.
+    /// Deliver a device's answer to the hook parked under interaction `id`.
     ///
     /// The [`Outcome`](remuda_signal::Outcome) is the honesty gate: only
-    /// `Answered` means a waiting process received the decision. `Abandoned`
-    /// is the ignored/confined case the screen-key fallback exists for
-    /// (§14 risk 1).
-    #[must_use]
+    /// [`Answered`](remuda_signal::Outcome::Answered) means a waiting process
+    /// received the decision. [`Abandoned`](remuda_signal::Outcome::Abandoned)
+    /// is the ignored/confined case the screen-key fallback exists for — the
+    /// decision was real but nothing heard it (§14 risk 1).
     pub fn resolve_answer(
         &self,
         id: &remuda_protocol::InteractionId,
@@ -138,7 +141,7 @@ impl HookSession {
         self.bus.resolve_answer(id, answer)
     }
 
-    /// Release every parked hook with a deny. Called when the instance stops.
+    /// Deny every parked hook (instance is closing).
     ///
     /// Without it each parked hook holds its agent's turn open until its own
     /// deadline, minutes after the session is gone.
@@ -146,30 +149,15 @@ impl HookSession {
         self.bus.retire_all();
     }
 
-    /// True while interaction `id` still has a blocking hook parked on it.
+    /// Hook-derived turn state for the exact foreground agent, when observed.
     #[must_use]
-    pub fn is_hook_waiting(&self, id: &remuda_protocol::InteractionId) -> bool {
-        self.bus.is_parked(id)
+    pub fn turn_active(&self, pid: i32) -> Option<bool> {
+        self.bus.turn_active(pid)
     }
 
-    /// Deliver a device's answer to the hook parked under interaction `id`.
-    ///
-    /// Returns whether the decision actually reached a live hook
-    /// ([`Outcome::Answered`](remuda_signal::Outcome::Answered)). An
-    /// [`Abandoned`](remuda_signal::Outcome::Abandoned) answer is the
-    /// §14-risk-1 signal: the decision was real but nothing heard it, and the
-    /// caller owes the on-screen key fallback.
-    pub fn answer_hook(
-        &self,
-        id: &remuda_protocol::InteractionId,
-        answer: &remuda_protocol::InteractionAnswer,
-    ) -> remuda_signal::Outcome {
-        self.bus.resolve_answer(id, answer)
-    }
-
-    /// Deny every parked hook (instance is closing).
-    pub fn retire_hooks(&self) {
-        self.bus.retire_all();
+    /// The PTY observed a fresh native interruption marker after cancel.
+    pub fn confirm_screen_interrupt(&self, pid: i32) {
+        self.bus.confirm_screen_interrupt(pid);
     }
 
     /// Environment additions for the PTY child, given the `PATH` it inherited.

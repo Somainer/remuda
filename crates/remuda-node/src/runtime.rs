@@ -797,7 +797,20 @@ fn spawn_observation_pump(
         // append, not in a path of their own — is what makes the 结构 view
         // fill in line by line instead of a whole message at a time.
         let mut assembler = crate::signal_messages::MessageAssembler::new();
-        while let Some(observation) = observations.recv().await {
+        let mut promoted_hooks = crate::signal::PromotedHooks::default();
+        while let Some(mut observation) = observations.recv().await {
+            if observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty
+                && observation.source.channel == remuda_protocol::SourceChannel::Hook
+                && !store.get_instance(&instance_id).is_ok_and(|instance| {
+                    // This receiver already belongs to the Node instance.
+                    // Drivers mint local envelope ids; the store replaces
+                    // them with Node identity when committing the journal.
+                    observation.process_generation == instance.process_ref.process_generation
+                })
+            {
+                tracing::warn!("stale hook observation ignored");
+                continue;
+            }
             // §5.5 before the generic failure fold: a clean exit carries
             // `Severity::Info` and would otherwise fall through both, leaving
             // a finished instance reported as `ready`.
@@ -823,14 +836,56 @@ fn spawn_observation_pump(
                     refresh_capabilities(store.as_ref(), &instance_id, driver.as_ref()).await;
                 }
             }
-            if let Some(session) = native_session_evidence(&observation) {
+            let promoted_hook =
+                observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty;
+            let bound = promoted_hooks.observe(&observation);
+            if let Some(session) = bound {
+                record_native_session(
+                    store.as_ref(),
+                    &instance_id,
+                    &NativeSessionEvidence {
+                        session_id: session.session_id,
+                        transcript_path: session.transcript_path,
+                        signal_tier: Some(remuda_protocol::SignalTier::Hook),
+                    },
+                );
+            } else if !(promoted_hook
+                && observation.source.channel == remuda_protocol::SourceChannel::Hook)
+                && let Some(session) = native_session_evidence(&observation)
+            {
                 record_native_session(store.as_ref(), &instance_id, &session);
             }
             // D-028 §4.3: Hook outranks Screen. Without this the hook events
             // are journaled but the instance still follows `agent_status`,
             // which is a screen guess — the composer would keep believing the
             // screen over the harness's own account of what it is doing.
-            if let Some(activity) = crate::signal::hook_activity(&observation)
+            let hook_activity = if promoted_hook {
+                promoted_hooks.activity(&observation)
+            } else {
+                crate::signal::hook_activity(&observation)
+            };
+            let mut activity_annotated = false;
+            if promoted_hook
+                && let ObservationPayload::Lifecycle(payload) = &mut observation.body
+                && let LifecyclePayload::Native(native) = payload.as_mut()
+            {
+                // This annotation belongs to the Node, never to the harness.
+                // Carry validated state on its causal event so Hub/web need
+                // not wait for a second serialized journal append/ACK.
+                native.related_ids.remove("remudaActivity");
+                let activity = match hook_activity {
+                    Some(Activity::Working) => Some("working"),
+                    Some(Activity::Idle) => Some("idle"),
+                    _ => None,
+                };
+                if let Some(activity) = activity {
+                    native
+                        .related_ids
+                        .insert("remudaActivity".into(), activity.into());
+                    activity_annotated = true;
+                }
+            }
+            if let Some(activity) = hook_activity
                 && let Err(error) = store.set_instance_state(
                     &instance_id,
                     None,
@@ -848,8 +903,10 @@ fn spawn_observation_pump(
                     // above; this is the readable message derived from it. It
                     // follows the hook so the two stay in seq order, and is
                     // built from `committed` so it inherits the envelope the
-                    // store just stamped.
-                    if let Some(delta) = crate::signal_messages::message_delta(&committed)
+                    // store just stamped. Unbound/foreign shell hooks remain
+                    // raw evidence; only the verified foreground can add text.
+                    if (!promoted_hook || promoted_hooks.owns_hook(&committed))
+                        && let Some(delta) = crate::signal_messages::message_delta(&committed)
                         && let Some(payload) = assembler.fold(&delta)
                     {
                         let message = crate::signal_messages::MessageAssembler::observation(
@@ -858,6 +915,9 @@ fn spawn_observation_pump(
                         if let Err(error) = store.append_driver_observation(&instance_id, message) {
                             tracing::warn!(%error, "streamed message not journaled");
                         }
+                    }
+                    if hook_activity.is_some() && !activity_annotated {
+                        record_hook_activity(store.as_ref(), &instance_id);
                     }
                 }
                 Err(error) => {
@@ -1374,6 +1434,7 @@ fn agent_kind(wire: &str) -> Option<AgentKind> {
 struct NativeSessionEvidence {
     session_id: String,
     transcript_path: Option<String>,
+    signal_tier: Option<remuda_protocol::SignalTier>,
 }
 
 /// Read the real Claude session id out of a driver observation.
@@ -1422,6 +1483,10 @@ fn native_session_evidence(
     Some(NativeSessionEvidence {
         session_id,
         transcript_path,
+        // Legacy claude-pty registers SessionStart for identity only and still
+        // derives turn activity from its screen. Only the authenticated
+        // promoted-hook fold proves the complete turn-hook path above.
+        signal_tier: None,
     })
 }
 
@@ -1435,6 +1500,7 @@ fn record_native_session(
         instance_id,
         &evidence.session_id,
         evidence.transcript_path.as_deref(),
+        evidence.signal_tier,
     ) {
         Ok(Some(instance)) => instance,
         Ok(None) => return,
@@ -1455,6 +1521,22 @@ fn record_native_session(
         "native-session-recorded",
     ) {
         tracing::warn!(%error, "native session lifecycle append failed");
+    }
+}
+
+fn record_hook_activity(store: &dyn LocalStore, instance_id: &InstanceId) {
+    let result = store.get_instance(instance_id).and_then(|instance| {
+        let state = serde_json::to_value(instance.lifecycle)?;
+        append_instance_lifecycle(
+            store,
+            instance_id,
+            None,
+            state.as_str().unwrap_or("ready"),
+            "hook-activity",
+        )
+    });
+    if let Err(error) = result {
+        tracing::warn!(%error, "hook activity lifecycle append failed");
     }
 }
 
@@ -2219,6 +2301,422 @@ mod tests {
             evidence.transcript_path.as_deref(),
             Some("/tmp/session.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_claude_pty_session_start_keeps_screen_activity_enabled() {
+        use remuda_protocol::{DriverKind, SourceChannel};
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePty,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+        );
+        let mut session = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Hook,
+            "SessionStart",
+            "legacy-session",
+            &[("transcriptPath", "/tmp/legacy-session.jsonl")],
+        );
+        session.source.driver_kind = DriverKind::ClaudePty;
+        session.source.channel = SourceChannel::Hook;
+        tx.send(session).await.unwrap();
+        for (status, expected) in [("working", Activity::Working), ("idle", Activity::Idle)] {
+            let mut screen = native_lifecycle(
+                remuda_protocol::LifecycleTopic::Turn,
+                "agent_status",
+                "",
+                &[],
+            );
+            screen.source.driver_kind = DriverKind::ClaudePty;
+            screen.source.channel = SourceChannel::Pty;
+            if let ObservationPayload::Lifecycle(payload) = &mut screen.body
+                && let LifecyclePayload::Native(native) = payload.as_mut()
+            {
+                native.status = Knowledge::Known {
+                    value: status.into(),
+                };
+            }
+            tx.send(screen).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let current = store.get_instance(&id).unwrap();
+                    if current.activity == (Knowledge::Known { value: expected }) {
+                        assert_eq!(current.native_ref.signal_tier, None);
+                        assert!(matches!(current.native_ref.session_id,
+                            Knowledge::Known { value } if value == "legacy-session"));
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("legacy screen activity remains authoritative");
+        }
+        drop(tx);
+        pump.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promoted_signal_bus_drives_activity_only_for_the_bound_session() {
+        use remuda_protocol::{DriverKind, RunId, SignalTier, SourceChannel};
+        use remuda_signal::{BusContext, HookEnvelope, SignalBus};
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ShellPty,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance.clone()).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(32);
+        let bus = SignalBus::new(
+            BusContext {
+                // Real drivers mint a local id before the Node binds their
+                // dedicated observation receiver to its own instance id.
+                instance_id: InstanceId::new(),
+                host_id: instance.host_id.clone(),
+                journal_id: instance.journal_id.clone(),
+                run_id: RunId::new(),
+                driver_kind: DriverKind::ShellPty,
+                adapter_version: "test".into(),
+            },
+            tx.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+        );
+
+        async fn settled(
+            store: &Arc<dyn LocalStore>,
+            id: &InstanceId,
+            tx: &mpsc::Sender<remuda_protocol::Observation>,
+        ) -> Instance {
+            let marker = Id::new("obj").unwrap().to_string();
+            tx.send(native_lifecycle(
+                remuda_protocol::LifecycleTopic::Diagnostic,
+                "pump_barrier",
+                &marker,
+                &[],
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let instance = store.get_instance(id).unwrap();
+                    let page = store.read_events(&instance.journal_id, None, 256).unwrap();
+                    if page.events.iter().any(|event| match event {
+                        JournalEvent::Instance(event) => matches!(&event.body, ObservationPayload::Lifecycle(payload)
+                            if matches!(payload.as_ref(), LifecyclePayload::Native(native)
+                                if native.native_name == "pump_barrier" && matches!(&native.native_id, Knowledge::Known { value } if value == &marker))),
+                        _ => false,
+                    }) {
+                        return instance;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("observation pump must settle within one second")
+        }
+        let hook = |name: &str, pid, session: &str| HookEnvelope {
+            credential: "test".into(),
+            event: name.into(),
+            ppid: pid,
+            // Native payloads cannot opt into the Node-owned annotation.
+            payload: serde_json::json!({"session_id": session, "transcript_path": "/tmp/hook-session.jsonl", "remudaActivity":"working"}),
+        };
+        bus.handle(hook("SessionStart", 42, "session-a")).await;
+        bus.handle(hook("UserPromptSubmit", 42, "session-a")).await;
+        let first = settled(&store, &id, &tx).await;
+        assert_eq!(
+            first.native_ref.signal_tier, None,
+            "SessionStart alone cannot claim another foreground"
+        );
+        let mut promoted = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Session,
+            "agent_promoted",
+            "",
+            &[("kind", "claude"), ("pid", "42")],
+        );
+        promoted.source.driver_kind = DriverKind::ShellPty;
+        promoted.source.channel = SourceChannel::Runtime;
+        tx.send(promoted).await.unwrap();
+        let bound = settled(&store, &id, &tx).await;
+        assert_eq!(bound.native_ref.signal_tier, Some(SignalTier::Hook));
+        assert_eq!(
+            bound.activity,
+            Knowledge::Known {
+                value: Activity::Working
+            },
+            "a prompt accepted before the promotion poll must not be lost"
+        );
+        assert!(
+            matches!(bound.native_ref.session_id, Knowledge::Known { value } if value == "session-a")
+        );
+        let deferred = store
+            .read_events(&instance.journal_id, Some(first.durable_seq), 16)
+            .unwrap();
+        assert!(deferred.events.iter().any(|event| matches!(event,
+            JournalEvent::Instance(event) if matches!(&event.body,
+                ObservationPayload::Lifecycle(payload) if matches!(payload.as_ref(),
+                    LifecyclePayload::Native(native) if native.native_name == "agent_promoted"
+                        && native.related_ids.get("remudaActivity").map(String::as_str) == Some("working"))))));
+        let before_foreign = bound.durable_seq;
+        for (pid, session) in [(99, "session-a"), (42, "foreign-session")] {
+            let mut display = hook("MessageDisplay", pid, session);
+            // Reusing the following owned message id proves a rejected final
+            // chunk cannot close or otherwise poison its assembler state.
+            display.payload["message_id"] = serde_json::json!("streamed-message");
+            display.payload["index"] = serde_json::json!(9);
+            display.payload["delta"] = serde_json::json!("foreign text");
+            display.payload["final"] = serde_json::json!(true);
+            bus.handle(display).await;
+        }
+        let before_stream = settled(&store, &id, &tx).await.durable_seq;
+        let foreign_events = store
+            .read_events(&instance.journal_id, Some(before_foreign), 16)
+            .unwrap();
+        assert_eq!(
+            foreign_events
+                .events
+                .iter()
+                .filter(|event| matches!(event,
+            JournalEvent::Instance(event) if matches!(&event.body,
+                ObservationPayload::Lifecycle(payload) if matches!(payload.as_ref(),
+                    LifecyclePayload::Native(native) if native.native_name == "MessageDisplay"))))
+                .count(),
+            2,
+            "foreign hooks remain raw journal evidence"
+        );
+        assert!(!foreign_events.events.iter().any(|event| matches!(event,
+            JournalEvent::Instance(event) if matches!(&event.body, ObservationPayload::Message(_)))),
+            "foreign hooks cannot create foreground assistant messages");
+
+        // The same pump must retain P3 streaming while binding hook activity.
+        for (index, text, final_chunk) in [(0, "first ", false), (1, "second", true)] {
+            let mut display = hook("MessageDisplay", 42, "session-a");
+            display.payload["message_id"] = serde_json::json!("streamed-message");
+            display.payload["index"] = serde_json::json!(index);
+            display.payload["delta"] = serde_json::json!(text);
+            display.payload["final"] = serde_json::json!(final_chunk);
+            bus.handle(display).await;
+        }
+        let streamed = settled(&store, &id, &tx).await;
+        assert_eq!(
+            streamed.activity,
+            Knowledge::Known {
+                value: Activity::Working
+            }
+        );
+        assert_eq!(streamed.native_ref.signal_tier, Some(SignalTier::Hook));
+        let stream_events = store
+            .read_events(&instance.journal_id, Some(before_stream), 16)
+            .unwrap();
+        let mut displays = Vec::new();
+        let mut messages = Vec::new();
+        for event in &stream_events.events {
+            let JournalEvent::Instance(event) = event else {
+                continue;
+            };
+            match &event.body {
+                ObservationPayload::Lifecycle(payload)
+                    if matches!(payload.as_ref(),
+                    LifecyclePayload::Native(native) if native.native_name == "MessageDisplay") =>
+                {
+                    displays.push(event.seq)
+                }
+                ObservationPayload::Message(payload) => messages.push((event.seq, payload)),
+                _ => {}
+            }
+        }
+        assert_eq!(displays.len(), 2);
+        assert_eq!(messages.len(), 2, "streaming remains in the merged pump");
+        assert!(
+            messages
+                .iter()
+                .zip(&displays)
+                .all(|((seq, _), hook_seq)| seq > hook_seq)
+        );
+        assert_eq!(
+            messages[0].1.mutation.node_id,
+            messages[1].1.mutation.node_id
+        );
+        assert_eq!(
+            messages[0].1.mutation.operation,
+            remuda_protocol::MutationOperation::Open
+        );
+        assert_eq!(
+            messages[1].1.mutation.operation,
+            remuda_protocol::MutationOperation::Append
+        );
+        assert_eq!(messages[1].1.mutation.base_revision, Some(U64(1)));
+        for ((_, message), (text, status)) in messages.iter().zip([
+            ("first ", remuda_protocol::ContentStatus::Streaming),
+            ("second", remuda_protocol::ContentStatus::Complete),
+        ]) {
+            assert_eq!(message.status, status);
+            assert!(
+                matches!(&message.blocks[0], remuda_protocol::ContentBlock::Text(block) if block.text == text)
+            );
+        }
+        bus.handle(hook("Stop", 42, "session-a")).await;
+        settled(&store, &id, &tx).await;
+
+        for (name, pid, session, expected) in [
+            ("UserPromptSubmit", 99, "session-a", Activity::Idle),
+            ("UserPromptSubmit", 42, "foreign-session", Activity::Idle),
+            ("UserPromptSubmit", 42, "session-a", Activity::Working),
+            ("Stop", 99, "session-a", Activity::Working),
+            ("SubagentStop", 42, "session-a", Activity::Working),
+            ("Stop", 42, "session-a", Activity::Idle),
+            ("SubagentStop", 42, "session-a", Activity::Idle),
+            ("UserPromptSubmit", 42, "session-a", Activity::Working),
+            ("StopFailure", 42, "session-a", Activity::Idle),
+            (
+                "PermissionRequest",
+                42,
+                "session-a",
+                Activity::WaitingInteraction,
+            ),
+            ("Stop", 42, "session-a", Activity::Idle),
+        ] {
+            let before = store.get_instance(&id).unwrap().durable_seq;
+            bus.handle(hook(name, pid, session)).await;
+            let current = settled(&store, &id, &tx).await;
+            assert_eq!(
+                current.activity,
+                Knowledge::Known { value: expected },
+                "{name} from {pid}/{session}"
+            );
+            let events = store
+                .read_events(&instance.journal_id, Some(before), 16)
+                .unwrap();
+            let raw = events
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    JournalEvent::Instance(event) => match &event.body {
+                        ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+                            LifecyclePayload::Native(native) if native.native_name == name => {
+                                Some((event.seq, native))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("causal hook observation");
+            let marker = if pid == 42 && session == "session-a" {
+                match name {
+                    "UserPromptSubmit" => Some("working"),
+                    "Stop" | "StopFailure" => Some("idle"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            assert_eq!(
+                raw.1.related_ids.get("remudaActivity").map(String::as_str),
+                marker,
+                "only owned turn evidence may carry the annotation"
+            );
+            let mirrored = events.events.iter().find_map(|event| match event {
+                JournalEvent::Instance(event) if event.seq > raw.0 => match &event.body {
+                    ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+                        LifecyclePayload::Entity(entity)
+                            if entity.reason_code == "hook-activity" =>
+                        {
+                            match &entity.entity_value {
+                                LifecycleEntity::Instance(instance) => Some(&instance.activity),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            });
+            if marker.is_some() {
+                assert!(
+                    mirrored.is_none(),
+                    "annotated turn evidence is not duplicated"
+                );
+            } else if expected == Activity::WaitingInteraction {
+                assert_eq!(
+                    mirrored,
+                    Some(&Knowledge::Known {
+                        value: Activity::WaitingInteraction
+                    }),
+                    "waiting-interaction retains its full-entity propagation"
+                );
+            }
+        }
+        // Lower-tier screen evidence must not overwrite the harness boundary.
+        let mut screen = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Session,
+            "agent_status",
+            "",
+            &[],
+        );
+        screen.source.driver_kind = DriverKind::ShellPty;
+        screen.source.channel = SourceChannel::Pty;
+        if let ObservationPayload::Lifecycle(payload) = &mut screen.body
+            && let LifecyclePayload::Native(native) = payload.as_mut()
+        {
+            native.status = Knowledge::Known {
+                value: "working".into(),
+            };
+        }
+        tx.send(screen).await.unwrap();
+        assert_eq!(
+            settled(&store, &id, &tx).await.activity,
+            Knowledge::Known {
+                value: Activity::Idle
+            }
+        );
+
+        let mut demoted = native_lifecycle(
+            remuda_protocol::LifecycleTopic::Session,
+            "agent_demoted",
+            "",
+            &[("kind", "terminal")],
+        );
+        demoted.source.driver_kind = DriverKind::ShellPty;
+        demoted.source.channel = SourceChannel::Runtime;
+        tx.send(demoted).await.unwrap();
+        assert_eq!(settled(&store, &id, &tx).await.native_ref.signal_tier, None);
+        bus.handle(hook("UserPromptSubmit", 42, "session-a")).await;
+        assert_eq!(
+            settled(&store, &id, &tx).await.activity,
+            Knowledge::Known {
+                value: Activity::Idle
+            }
+        );
+        drop(bus);
+        drop(tx);
+        pump.await.unwrap();
     }
 
     #[tokio::test]

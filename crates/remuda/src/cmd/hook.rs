@@ -52,6 +52,17 @@ pub(crate) struct CommandArgs {
 enum HookCommand {
     /// Forward one hook event and print the harness decision.
     Emit(EmitArgs),
+    /// Merge a hand-typed Claude's settings and exec it without changing pid.
+    Launch(LaunchArgs),
+}
+
+#[derive(Args)]
+struct LaunchArgs {
+    #[arg(long)]
+    overlay: PathBuf,
+    /// Real executable followed by its original arguments.
+    #[arg(last = true, required = true)]
+    argv: Vec<String>,
 }
 
 #[derive(Args)]
@@ -72,8 +83,32 @@ pub(crate) struct EmitArgs {
 
 impl super::registry::Entrypoint for CommandArgs {
     fn enter(self, _context: super::registry::Context) -> Result<i32> {
-        let HookCommand::Emit(args) = self.command;
-        emit(args)
+        match self.command {
+            HookCommand::Emit(args) => emit(args),
+            HookCommand::Launch(mut args) => {
+                let binary = args.argv.remove(0);
+                remuda_driver::launch::overlay::merge_explicit_settings(
+                    &args.overlay,
+                    &mut args.argv,
+                )?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    Err(std::process::Command::new(binary)
+                        .args(args.argv)
+                        .exec()
+                        .into())
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(std::process::Command::new(binary)
+                        .args(args.argv)
+                        .status()?
+                        .code()
+                        .unwrap_or(1))
+                }
+            }
+        }
     }
 
     /// A hook runs inside the agent's own process tree and its stderr can end

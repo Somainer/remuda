@@ -29,6 +29,7 @@ fake-harness --kind claude|codex|grok [选项]
 |---|---|
 | `--script <file>` | 场景文件（`.json`，或 `.yaml`/`.yml`）；缺省内置 RUN_TOOL/SLOW 场景 |
 | `--settings <file>` | claude 风格 `--settings` 钩子 overlay |
+| `--setting-sources <list>` | 接受生产 shim 的参数；fake 仍只读取 `--settings`，不加载宿主配置 |
 | `--home <dir>` | harness home：claude 项目目录 / codex `CODEX_HOME` / grok `GROK_HOME` 的落点 |
 | `--cwd <dir>` | 会话上报的工作目录（默认真实 cwd，取 canonicalize） |
 | `--session-id <id>` | 固定会话 id（默认 `00000000-…-001`） |
@@ -195,7 +196,7 @@ golden 覆盖三种方言 × idle/working/approval/trust × 80×24 与 40×20
 | codex | `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"…"}}}` |
 | grok | `{"decision":"allow"|"deny"|"ask", "reason":"…"}`（PreToolUse） |
 
-事件：`SessionStart`（new/resume 都发）、`UserPromptSubmit`
+事件：`SessionStart`（new/resume 都发，claude 包含 `transcript_path` 供生产绑定）、`UserPromptSubmit`
 （claude 在**入队时**就触发，不是投递时）、`PreToolUse`、
 `PermissionRequest`（阻塞，受 handler `timeout` 约束）、`PostToolUse`
 （仅成功工具；被中断的工具不发，对齐证据）、`MessageDisplay`

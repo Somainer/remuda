@@ -97,7 +97,10 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   expect(followUrls.every((url) => !new URL(url).searchParams.has("token"))).toBe(true);
   await page.reload();
   await expectCookieSession(page);
-  await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1);
+  // Reload waits for cookie-backed bootstrap and the durable journal read again.
+  await expect(page.getByTestId("message").filter({ hasText: "echo: hello from web hub" })).toHaveCount(1, {
+    timeout: 20_000,
+  });
   await expect(page.getByTestId("composer-bar")).toBeVisible();
 
   await page.goto("/approvals");

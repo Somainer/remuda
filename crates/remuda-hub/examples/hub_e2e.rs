@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -313,6 +312,8 @@ async fn fake_node(
         let Ok(frame) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        // Journal append acknowledgements share this socket with Hub requests.
+        // Only this loop reads frames so concurrent RPCs are never discarded.
         if frame.get("method").is_none() {
             continue;
         }
@@ -499,8 +500,6 @@ async fn append_journal(
         .into(),
     ))
     .await?;
-    // Drain the Hub RPC result so it is not mistaken for a later request.
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 
@@ -559,7 +558,6 @@ async fn append_stream_chunks(
             .into(),
         ))
         .await?;
-        let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     }
     Ok(seq)
 }
@@ -594,7 +592,6 @@ async fn append_native_status(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 

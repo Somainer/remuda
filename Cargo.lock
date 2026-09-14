@@ -3142,6 +3142,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chacha20poly1305",
+ "nix",
  "portable-pty",
  "rand_core 0.6.4",
  "remuda-acp-wire",

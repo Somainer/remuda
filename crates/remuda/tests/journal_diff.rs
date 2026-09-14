@@ -32,6 +32,11 @@ fn diff(args: &[&str]) -> (i32, String) {
         .current_dir(repo_root())
         .args(["journal", "diff"])
         .args(args)
+        // `--color auto` reads `NO_COLOR`, so a runner that exports it would
+        // make the "piped output is plain" assertion pass for the wrong reason
+        // and could only ever weaken the test. Removed rather than set, so the
+        // tool decides from the pipe alone — which is what is being asserted.
+        .env_remove("NO_COLOR")
         .output()
         .expect("run remuda journal diff");
     (
@@ -244,22 +249,19 @@ fn a_malformed_dump_is_an_error_not_a_silent_pass() {
 fn the_fixtures_match_what_the_generator_produces() {
     // Regenerating must be a no-op: a hand-edited fixture would silently
     // decouple the two sides and the gate would stop proving anything.
+    //
+    // Generated into a temp dir and compared, rather than regenerated in
+    // place. Rewriting the checked-in files made this test mutate shared
+    // state: every other test that reads those fixtures could catch a
+    // truncated write, which is how a colour assertion three tests away ended
+    // up failing under the gate's parallel run. A test that proves the
+    // fixtures are current has no reason to touch them.
     let generator = fixture("generate.py");
-    let before: Vec<(PathBuf, String)> = [
-        "print-3turn.json",
-        "pty-3turn.json",
-        "pty-3turn-missing-tool-result.json",
-    ]
-    .iter()
-    .map(|name| {
-        let path = fixture(name);
-        let body = std::fs::read_to_string(&path).expect("read fixture");
-        (path, body)
-    })
-    .collect();
-
+    let out = tempfile::tempdir().expect("temp dir");
     let output = Command::new("python3")
         .arg(&generator)
+        .arg("--out")
+        .arg(out.path())
         .output()
         .expect("python3 is available");
     assert!(
@@ -267,13 +269,17 @@ fn the_fixtures_match_what_the_generator_produces() {
         "generator failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    for (path, body) in before {
-        let now = std::fs::read_to_string(&path).expect("read regenerated fixture");
+    for name in [
+        "print-3turn.json",
+        "pty-3turn.json",
+        "pty-3turn-missing-tool-result.json",
+    ] {
+        let committed = std::fs::read_to_string(fixture(name)).expect("read fixture");
+        let generated =
+            std::fs::read_to_string(out.path().join(name)).expect("read generated fixture");
         assert_eq!(
-            now,
-            body,
-            "{} drifted from generate.py; regenerate instead of hand-editing",
-            path.display()
+            generated, committed,
+            "{name} drifted from generate.py; regenerate instead of hand-editing"
         );
     }
 }

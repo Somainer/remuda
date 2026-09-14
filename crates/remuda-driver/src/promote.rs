@@ -31,6 +31,15 @@ pub struct AgentSignature {
 
 /// Known agent CLIs, in match order. Only `claude` hydrates a transcript in the
 /// MVP; the others switch `kind` so the UI stops calling them a plain terminal.
+///
+/// Names are matched against the basename with any executable suffix removed,
+/// because the same agent reaches the process table under more than one
+/// spelling. A human typing `claude` runs the npm bin shim, which `exec`s and
+/// so shows as `claude`; Remuda launching the *pinned* binary runs
+/// `.../claude-code/bin/claude.exe` directly and shows as `claude.exe`. Both
+/// are the same program and D-028 §1.0 rule 2 requires both to promote through
+/// this one table — a launch path that failed to promote would be exactly the
+/// "only when Remuda starts it" divergence rule 5 calls a P-level defect.
 pub const AGENT_TABLE: &[AgentSignature] = &[
     AgentSignature {
         kind: AgentKind::Claude,
@@ -99,14 +108,41 @@ impl ProcessTable for SystemProcessTable {
         if pgid <= 0 {
             return Vec::new();
         }
+        // `ps -g` is **not** portable shorthand for "this process group".
+        // POSIX and the BSD `ps` read it that way, but procps-ng — every
+        // mainstream Linux — reads `-g` as *session* and silently returns
+        // nothing for a pgid that is not also a session id. Since a PTY's
+        // foreground group is a child of the session leader, that is the
+        // normal case, so D-025 detection found no rows at all on Linux and
+        // promotion never fired. Listing every process and filtering on the
+        // `pgid` column asks the question directly and means the same thing
+        // on both families.
         let output = std::process::Command::new("ps")
-            .args(["-o", "pid=,args=", "-g", &pgid.to_string()])
+            .args(["-eo", "pgid=,pid=,args="])
             .output();
         match output {
-            Ok(out) if out.status.success() => parse_ps_rows(&String::from_utf8_lossy(&out.stdout)),
+            Ok(out) if out.status.success() => {
+                parse_grouped_rows(&String::from_utf8_lossy(&out.stdout), pgid)
+            }
             _ => Vec::new(),
         }
     }
+}
+
+/// Rows of `ps -eo pgid=,pid=,args=` whose group is `pgid`.
+#[must_use]
+pub fn parse_grouped_rows(stdout: &str, pgid: i32) -> Vec<ProcessRow> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (group, rest) = line.split_once(char::is_whitespace)?;
+            if group.parse::<i32>().ok()? != pgid {
+                return None;
+            }
+            parse_ps_rows(rest.trim_start()).into_iter().next()
+        })
+        .collect()
 }
 
 /// Parse `ps -o pid=,args=` output into rows.
@@ -218,10 +254,22 @@ fn split_argv(line: &str) -> Vec<String> {
 }
 
 fn basename(program: &str) -> String {
-    Path::new(program)
+    let name = Path::new(program)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.to_owned())
+        .unwrap_or_else(|| program.to_owned());
+    // Drop an executable suffix so one table row covers every spelling of the
+    // same program. `claude.exe` is not hypothetical Windows support: it is the
+    // real filename inside the npm package, which Remuda execs directly when it
+    // launches the pinned binary while a human's `claude` goes through the bin
+    // shim. Only known executable suffixes are stripped, so a program whose
+    // name genuinely ends in a dotted word is unaffected.
+    for suffix in [".exe", ".cmd", ".bat"] {
+        if let Some(stem) = name.strip_suffix(suffix) {
+            return stem.to_owned();
+        }
+    }
+    name
 }
 
 /// Foreground process group of a live PTY.
@@ -246,6 +294,75 @@ pub fn foreground_pgid(master: &dyn portable_pty::MasterPty) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_same_agent_promotes_under_every_spelling_of_its_executable() {
+        // D-028 §1.0 rule 2: one detection path for both launches. A human's
+        // `claude` is the npm bin shim; Remuda's is the pinned
+        // `.../claude-code/bin/claude.exe`. Measured against a live 2.1.221:
+        // before this, the launched path never promoted and the hand-typed one
+        // did — precisely the divergence rule 5 forbids.
+        let typed = detect(&[ProcessRow {
+            pid: 10,
+            args: "/home/u/.nvm/versions/node/v22.22.2/bin/claude --settings /tmp/o.json".into(),
+        }])
+        .expect("the shim spelling promotes");
+        let launched = detect(&[ProcessRow {
+            pid: 11,
+            args: "/home/u/.nvm/versions/node/v22.22.2/lib/node_modules/@anthropic-ai/\
+claude-code/bin/claude.exe --setting-sources user,project,local"
+                .into(),
+        }])
+        .expect("the pinned-binary spelling must promote too");
+        assert_eq!(typed.kind, AgentKind::Claude);
+        assert_eq!(launched.kind, AgentKind::Claude);
+        assert_eq!(typed.kind, launched.kind);
+    }
+
+    #[test]
+    fn a_dotted_program_name_is_not_truncated_into_an_agent() {
+        // Only known executable suffixes come off; `claude.backup` is not
+        // `claude`, and a shell is still never an agent whatever it is called.
+        assert_eq!(basename("/usr/bin/claude.backup"), "claude.backup");
+        assert!(
+            detect(&[ProcessRow {
+                pid: 1,
+                args: "/bin/bash -l".into()
+            }])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn grouped_rows_keep_only_the_requested_process_group() {
+        // The regression this guards: `ps -g <pgid>` means *session* on
+        // procps-ng, so on Linux the old query returned nothing for a PTY's
+        // foreground group and D-025 promotion never fired. Filtering on the
+        // pgid column is the portable question.
+        let stdout = "\
+  1000  1000 /bin/bash -l
+  2000  2000 claude
+  2000  2001 node /usr/lib/claude/cli.js
+  3000  3000 codex
+";
+        let rows = parse_grouped_rows(stdout, 2000);
+        assert_eq!(
+            rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![2000, 2001],
+            "both members of group 2000, and nothing from 1000 or 3000"
+        );
+        assert_eq!(rows[0].args, "claude");
+        assert!(parse_grouped_rows(stdout, 9999).is_empty());
+    }
+
+    #[test]
+    fn a_grouped_row_still_detects_the_agent_it_names() {
+        // End to end through the real parser: group 2000 is a promoted claude.
+        let stdout = "  1000  1000 /bin/bash -l\n  2000  2000 claude\n";
+        let found = detect(&parse_grouped_rows(stdout, 2000)).expect("detects claude");
+        assert_eq!(found.kind, AgentKind::Claude);
+        assert_eq!(found.pid, 2000);
+    }
 
     /// Table-backed process table for detection tests.
     struct FakeTable(Vec<ProcessRow>);

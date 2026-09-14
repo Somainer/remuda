@@ -344,25 +344,59 @@ impl DriverFactory for NativeClaudeFactory {
                 Arc::new(GenericPtyDriver::new(options))
             }
             DriverKind::ShellPty => {
-                let mut options = ShellPtyOptions::login(launch.workspace_root.clone());
+                // D-028 §5.1: one driver, two launches. `terminal` / `generic`
+                // is the login shell it always was; an agent kind under the
+                // native carrier is that agent's CLI started directly. The
+                // difference ends at `target` — promotion, hooks, the emulator
+                // and the stop ladder are the same code either way, which is
+                // what makes §1.0's "the two paths produce one journal" a
+                // property of the design rather than a thing to maintain.
+                let agent_kind = agent_pty_kind(launch.request.kind);
+                let mut options = match agent_kind {
+                    Some(kind) => {
+                        let agent = remuda_driver::shell_pty::AgentLaunch {
+                            profile: Box::new(profile),
+                            launch_dir,
+                            native_home,
+                            binary: match &binary {
+                                BinarySource::Path(path) => Some(path.clone()),
+                                // The preset names the binary; letting it
+                                // resolve on PATH is what makes the shim (which
+                                // is *first* on PATH) able to intercept.
+                                _ => None,
+                            },
+                            origin: launch.request.origin.into(),
+                            settings_overlay: overlay.clone(),
+                        };
+                        ShellPtyOptions::agent(launch.workspace_root.clone(), kind, agent)
+                    }
+                    None => ShellPtyOptions::login(launch.workspace_root.clone()),
+                };
                 options.extra_env = crate::origin::instance_env(&self.config.extra_env);
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
-                options.args = launch.request.args.clone();
-                // D-025: watch for an agent CLI taking the foreground so the
-                // structured view and composer follow what the human started.
-                options.promote = self.config.promote_terminal_agents;
+                if agent_kind.is_none() {
+                    // An agent's argv comes from its recipe (§5.1 step 3), not
+                    // from the request; only the shell path forwards args.
+                    options.args = launch.request.args.clone();
+                    // D-025: watch for an agent CLI taking the foreground so
+                    // the structured view and composer follow what the human
+                    // started. An agent target sets this itself, because for it
+                    // promotion is not optional.
+                    options.promote = self.config.promote_terminal_agents;
+                }
                 options.claude_home = self.config.claude_native_home.clone();
                 // D-028 §4.2: the hook path only exists when the operator
-                // opted in. Promotion is its precondition — a shell nobody can
-                // start an agent in has nothing to hook.
-                if self.config.pty_hooks && self.config.promote_terminal_agents {
+                // opted in. For a shell, promotion is its precondition — one
+                // nobody can start an agent in has nothing to hook. An agent
+                // target is already an agent, so the precondition is met.
+                if self.config.pty_hooks && (agent_kind.is_some() || options.promote) {
                     options.hooks = Some(remuda_driver::shell_pty::HookConfig {
                         instance_dir: instance_dir.clone(),
                         relay_binary: relay_binary(&self.config)?,
-                        // P1 only runs under a promoted terminal, whose
-                        // renderer is whatever the human chose. Pinning
-                        // `default` here would fight them; P2 takes this from
-                        // the launch request once Remuda owns the launch.
+                        // §9.2 wants the renderer pinned in both directions.
+                        // Under a promoted terminal the human already chose it
+                        // and pinning `default` would fight them; when Remuda
+                        // owns the launch, it owns the choice.
                         tui: remuda_driver::TuiMode::Fullscreen,
                     });
                 }
@@ -389,6 +423,29 @@ impl DriverFactory for NativeClaudeFactory {
             startup_error: std::sync::Mutex::new(None),
         }))
     }
+}
+
+/// Whether this kind should be launched as an agent CLI in the PTY (§5.1).
+///
+/// Three conditions, all required. The kind has to name an agent — `terminal`
+/// and `generic` mean a login shell and always will. The operator has to have
+/// opted into the native carrier, because until P6/P7 flip the default these
+/// kinds still have herdr-backed drivers that work. And the harness has to be
+/// one whose launch recipe exists.
+///
+/// `None` falls back to a login shell, which is the pre-D-028 behaviour and
+/// still the D-025 promotion entry point: a human can type `claude` into it and
+/// reach the same place by the other road.
+fn agent_pty_kind(kind: remuda_protocol::AgentKind) -> Option<remuda_protocol::AgentKind> {
+    use remuda_protocol::AgentKind;
+    if !remuda_driver::shell_pty::native_carrier_enabled() {
+        return None;
+    }
+    matches!(
+        kind,
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Grok | AgentKind::Agy
+    )
+    .then_some(kind)
 }
 
 /// The binary a hook re-enters as `remuda hook emit`.
@@ -486,6 +543,27 @@ impl Driver for NativeAdapter {
 
     fn startup_error(&self) -> Option<String> {
         self.startup_error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Ask the live driver what this session can do (§4.3, §6).
+    ///
+    /// A failure is not fatal and not a downgrade: the create-time snapshot
+    /// stays, which is the honest fallback — "we could not ask" must not be
+    /// written down as "it cannot".
+    fn capabilities(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Option<remuda_protocol::CapabilitySnapshot>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            match NativeDriver::capabilities(&*self.native).await {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::debug!(%error, "driver did not report capabilities; keeping the static row");
+                    None
+                }
+            }
+        })
     }
 
     fn wait_control(&self) -> DriverFuture<'_> {

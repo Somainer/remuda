@@ -40,6 +40,13 @@ tracing.workspace = true
 uuid.workspace = true
 zeroize = "1.9"
 
+# D-028 §5.3 needs `killpg` on the PTY's process group: the stop ladder has to
+# reach everything the session started, and `std` can only signal a direct
+# child. Unix-only, matching the `tcgetpgrp` identity path this pairs with;
+# `remuda-node` already depends on the same version for its access probe.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", features = ["process", "signal"] }
+
 [dev-dependencies]
 remuda-testing.workspace = true
 tempfile = "3"

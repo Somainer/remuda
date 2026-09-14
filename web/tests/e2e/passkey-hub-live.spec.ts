@@ -7,6 +7,13 @@ import { bootstrapToken, expectCookieSession, logout, useAccessCode } from "./hu
 // 127.0.0.1, hence a self-contained login instead of ./hub-auth's login()).
 const origin = `http://localhost:${process.env.HUB_E2E_WEB_PORT ?? "58889"}`;
 
+// A passkey round trip is register/start -> CDP virtual-authenticator
+// attestation -> register/finish -> GET list -> render, each leg crossing the
+// Vite proxy (and the attestation crossing CDP). On a loaded remote browser
+// that chain measures several seconds end to end, so the post-ceremony UI
+// assertions must wait on the rendered state rather than the 5 s default.
+const CEREMONY_UI_TIMEOUT = 20_000;
+
 async function virtualAuthenticator(page: Page): Promise<{ client: CDPSession; id: string }> {
   const client = await page.context().newCDPSession(page);
   await client.send("WebAuthn.enable");
@@ -48,7 +55,7 @@ async function expectPasskeySession(page: Page) {
     await expect(page.getByTestId("login-page")).toHaveCount(0, { timeout: 20_000 });
   }
   await page.goto(`${origin}/sessions`);
-  await expect(page.getByTestId("session-list")).toBeVisible();
+  await expect(page.getByTestId("session-list")).toBeVisible({ timeout: CEREMONY_UI_TIMEOUT });
 }
 
 test.describe("passkey login (CDP virtual authenticator)", () => {
@@ -62,7 +69,7 @@ test.describe("passkey login (CDP virtual authenticator)", () => {
     await page.getByTestId("settings-passkey-name").fill("virtual-ctap2");
     await page.getByTestId("settings-passkey-add").click();
     const row = page.getByTestId("settings-passkey-row").filter({ hasText: "virtual-ctap2" });
-    await expect(row).toBeVisible();
+    await expect(row).toBeVisible({ timeout: CEREMONY_UI_TIMEOUT });
     await expect(row).toContainText("本机");
 
     // The conditional ceremony the login page fires on mount races the logout
@@ -87,7 +94,9 @@ test.describe("passkey login (CDP virtual authenticator)", () => {
 
     // The new session is a different device; the passkey row still exists.
     await page.goto(`${origin}/settings`);
-    await expect(page.getByTestId("settings-passkey-row").filter({ hasText: "virtual-ctap2" })).toBeVisible();
+    await expect(
+      page.getByTestId("settings-passkey-row").filter({ hasText: "virtual-ctap2" }),
+    ).toBeVisible({ timeout: CEREMONY_UI_TIMEOUT });
     await client.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: id });
   });
 
@@ -98,27 +107,38 @@ test.describe("passkey login (CDP virtual authenticator)", () => {
     await page.goto(`${origin}/settings`);
     await page.getByTestId("settings-passkey-name").fill("doomed-key");
     await page.getByTestId("settings-passkey-add").click();
-    await expect(page.getByTestId("settings-passkey-row").filter({ hasText: "doomed-key" })).toBeVisible();
+    await expect(
+      page.getByTestId("settings-passkey-row").filter({ hasText: "doomed-key" }),
+    ).toBeVisible({ timeout: CEREMONY_UI_TIMEOUT });
 
     // Remove the authenticator: no discoverable credential remains.
     await client.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: id });
 
     await logout(page);
     await expect(page).toHaveURL(new RegExp(`${origin}/login`));
-    await page.getByTestId("login-passkey-submit").click();
-    // With no authenticator the get() ceremony neither resolves nor navigates.
+    const passkeySubmit = page.getByTestId("login-passkey-submit");
+    await passkeySubmit.click();
+    // With no authenticator the get() ceremony stays pending (it neither
+    // resolves nor rejects): the button holds its busy state and no session is
+    // ever established. Wait on that state deterministically instead of a fixed
+    // delay, then assert we never left /login.
+    await expect(passkeySubmit).toBeDisabled({ timeout: CEREMONY_UI_TIMEOUT });
+    await expect(passkeySubmit).toHaveText("等待验证设备…");
     await expect(page.getByTestId("session-list")).toHaveCount(0);
-    await page.waitForTimeout(1500);
     await expect(page).toHaveURL(new RegExp(`${origin}/login`));
 
-    // Access code remains the fallback.
-    await useAccessCode(page);
+    // Access code remains the fallback. Expanding it aborts the pending get()
+    // ceremony, so the bootstrap login is not racing a passkey finish.
+    const useCode = page.getByTestId("login-use-code");
+    await useCode.click();
+    await expect(page.getByTestId("login-codes")).toBeVisible();
+    await expect(passkeySubmit).toBeEnabled();
     await page.getByTestId("login-tab-bootstrap").click();
     await page.getByTestId("login-bootstrap-token").fill(bootstrapToken);
     await page.getByTestId("login-device-name").fill("passkey-e2e-fallback");
     await page.getByTestId("login-submit").click();
     await expect(page.getByTestId("login-page")).toHaveCount(0, { timeout: 20_000 });
     await page.goto(`${origin}/sessions`);
-    await expect(page.getByTestId("session-list")).toBeVisible();
+    await expect(page.getByTestId("session-list")).toBeVisible({ timeout: CEREMONY_UI_TIMEOUT });
   });
 });

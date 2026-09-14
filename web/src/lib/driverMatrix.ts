@@ -62,7 +62,10 @@ export function shellPtyAllowed(host: HostMatrix | undefined, kind: AgentKindId 
   if (kind === "terminal") return true;
   if (!cliHasKind(host, kind)) return false;
   const inventory = matrixDrivers(host);
-  if (inventory.length === 0) return true;
+  // An unreported matrix means the Node cannot prove it launches agents inside its own PTY
+  // (D-028 P2 core not enabled) — fall back to the legacy carriers instead of typing the
+  // first prompt into a bare shell. Only a reported `shell-pty` row with launchable=true opts in.
+  if (inventory.length === 0) return false;
   const shell = inventory.find((d) => d.kind === "shell-pty");
   return Boolean(shell && shell.launchable !== false);
 }

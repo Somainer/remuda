@@ -147,7 +147,7 @@ fake node 自身无法产生的故障——被拒绝的命令、`nodePurge !== "
 `/commands`、`/input`、`/interrupt`、`/interactions/*/answer` 的写请求，
 断线刷新后断言增量为 0；被拒绝的命令在 2 秒后断言计数未变。
 
-### 三个必须记录的坑
+### 四个必须记录的坑
 
 1. **fake node 宣告 `maxInstances: 8`**，而 hub 配置串行跑所有 spec、共用一个
    Hub。本 spec 的用例跑到一半就撞配额（更早的 spec 也占着槽位），
@@ -167,6 +167,10 @@ fake node 自身无法产生的故障——被拒绝的命令、`nodePurge !== "
    handler 再 `route.continue()` 就抛 `Route is already handled!`。
    改成 handler 自己 `route.fetch()` 后 `setTimeout` 再 `fulfill`——
    延迟的是响应而不是 handler 的生命周期，语义等价但不依赖拆解顺序。
+4. **一轮结束后 fake node 仍短暂报 `working`**，所以紧接着的第二次 Enter
+   会变成*排队*（`You · queued`）而不是新一轮。播报区用例原本连发三轮，
+   于是卡在第二轮；改成只发一轮——会话本来就带着创建时的 prompt 与 echo，
+   正文有没有量不是重点，「正文一个字都没进播报区」才是。
 
 ### 与已知基线 flake 的关系
 

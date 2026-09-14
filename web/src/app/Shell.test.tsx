@@ -99,6 +99,14 @@ describe("ShellNotify — blocking errors persist", () => {
     expect(error).toHaveTextContent("主机离线，数据待清理");
   });
 
+  it("is a discoverable landmark rather than an anonymous div", () => {
+    // P0-3 asks for a *discoverable* error area: a named region is how a
+    // screen-reader user finds it without hunting the whole page.
+    render(<ShellNotify />);
+    post({ subject: "会话 alpha", stage: "删除", severity: "blocking" });
+    expect(screen.getByRole("region", { name: "需要处理的问题" })).toBeInTheDocument();
+  });
+
   it("is still visible after a later success notification", async () => {
     vi.useFakeTimers();
     render(<ShellNotify />);

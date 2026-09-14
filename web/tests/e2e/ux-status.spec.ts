@@ -34,6 +34,15 @@ async function recordNativeActions(page: Page): Promise<Recorder> {
   return { count: () => urls.length, urls: () => [...urls] };
 }
 
+/**
+ * Sessions created by this spec, deleted after each test.
+ *
+ * The fake node advertises `maxInstances: 8` and the hub config runs every
+ * spec serially against one Hub, so leaking a session here starves whatever
+ * runs next (and the later tests in this file).
+ */
+const created: string[] = [];
+
 async function createSession(page: Page, prompt: string): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
@@ -49,21 +58,145 @@ async function createSession(page: Page, prompt: string): Promise<string> {
     (response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/instances",
   );
   await page.getByTestId("new-session-start").click();
-  const created = await creating;
-  expect(created.ok()).toBe(true);
-  const instanceId = (await created.json()).instance.instanceId as string;
+  const created_ = await creating;
+  expect(created_.ok(), `instance create failed: ${created_.status()} ${await created_.text()}`).toBe(true);
+  const instanceId = (await created_.json()).instance.instanceId as string;
   expect(instanceId).toBeTruthy();
+  created.push(instanceId);
   await expect(page).toHaveURL(new RegExp(`/s/${instanceId}`), { timeout: 20_000 });
+  return instanceId;
+}
+
+/**
+ * Answer the approval the fake node raises on every `instance.create`.
+ *
+ * It keeps the session blocked (`activity: waiting-interaction`), which
+ * disables the composer — so any test that wants to send has to clear it
+ * first. Returns the number answered.
+ */
+async function clearPendingApprovals(page: Page, instanceId: string): Promise<number> {
+  return page.evaluate(async (id) => {
+    const list = await fetch("/v1/interactions", { credentials: "include" });
+    const body = (await list.json()) as {
+      items?: {
+        id: string;
+        instanceId?: string;
+        state?: string;
+        request?: { inputDigest?: string; options?: { id: string }[] };
+      }[];
+    };
+    const mine = (body.items ?? []).filter((item) => item.instanceId === id && item.state === "pending");
+    for (const item of mine) {
+      const optionId = item.request?.options?.[0]?.id;
+      if (!optionId) continue;
+      await fetch(`/v1/interactions/${item.id}/answer`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ answer: { kind: "approval", optionId, inputDigest: item.request?.inputDigest ?? "" } }),
+      });
+    }
+    return mine.length;
+  }, instanceId);
+}
+
+/** A session whose opening approval is answered, so the composer is usable. */
+async function createReadySession(page: Page, prompt: string): Promise<string> {
+  const instanceId = await createSession(page, prompt);
+  await clearPendingApprovals(page, instanceId);
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 30_000 });
   return instanceId;
 }
 
 /** Post a notification through the app's own surface (mirrors `__ttyLab`). */
 async function post(page: Page, input: Record<string, unknown>) {
-  await page.evaluate((value) => window.__notifyLab?.notify(value as never), input);
+  await page.waitForFunction(() => Boolean(window.__notifyLab), null, { timeout: 10_000 });
+  const posted = await page.evaluate((value) => {
+    const lab = window.__notifyLab;
+    if (!lab) return null;
+    return lab.notify(value as never);
+  }, input);
+  expect(posted, "window.__notifyLab must be installed by ShellNotify").toBeTruthy();
 }
+
+/**
+ * Make room on the fake node.
+ *
+ * It advertises `maxInstances: 8` and every spec in this config shares one
+ * Hub serially, so by the time this file runs the earlier specs have usually
+ * filled the host — `POST /v1/instances` then returns 422
+ * `PLACEMENT_UNSATISFIABLE` and the symptom (create never navigates) looks
+ * exactly like the host-contention flake documented for this box.
+ *
+ * `maxInstances` is a property of the *fake* Node fixture, not a product
+ * assertion this spec makes, so raising it for the duration is test
+ * isolation rather than hiding a capacity bug. The original value is put
+ * back in `afterAll` so a later spec still sees the fixture it expects.
+ */
+async function raiseCap(page: Page, to: number): Promise<{ hostId: string; previous: number } | null> {
+  const hosts = await page.evaluate(async () => {
+    const response = await fetch("/v1/hosts", { credentials: "include" });
+    return response.json();
+  });
+  const host = (hosts.items ?? []).find((h: { label?: string }) => h.label === "e2e-fake-node");
+  if (!host) return null;
+
+  const hostId = (host.hostId ?? host.id) as string;
+  const previous = (host.maxInstances ?? 8) as number;
+  if (previous >= to) return { hostId, previous };
+
+  await page.evaluate(
+    ({ id, value }) =>
+      fetch(`/v1/hosts/${id}`, {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ maxInstances: value }),
+      }),
+    { id: hostId, value: to },
+  );
+  return { hostId, previous };
+}
+
+let cap: { hostId: string; previous: number } | null = null;
 
 test.beforeEach(async ({ page }) => {
   await login(page);
+  if (!cap) cap = await raiseCap(page, 24);
+});
+
+test.afterAll(async ({ browser }) => {
+  if (!cap) return;
+  const page = await browser.newPage();
+  try {
+    await login(page);
+    await page.evaluate(
+      ({ id, value }) =>
+        fetch(`/v1/hosts/${id}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ maxInstances: value }),
+        }),
+      { id: cap!.hostId, value: cap!.previous },
+    );
+  } finally {
+    await page.close();
+  }
+});
+
+/**
+ * Release the host slot. Routes are unrouted first so a fault this test
+ * installed cannot swallow its own cleanup.
+ */
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+  const ids = created.splice(0, created.length);
+  for (const id of ids) {
+    await page
+      .evaluate((value) => fetch(`/v1/instances/${value}?force=1`, { method: "DELETE", credentials: "include" }), id)
+      .catch(() => {});
+  }
 });
 
 test("a blocking error stays visible after a later success", async ({ page }) => {
@@ -80,9 +213,20 @@ test("a blocking error stays visible after a later success", async ({ page }) =>
   await expect(error).toBeVisible();
   await expect(error).toContainText("主机离线，数据待清理");
 
-  // A later success, exactly the case the 2.4s toast used to lose.
+  // A later success, exactly the case the 2.4s toast used to lose. It stacks
+  // above the standing error rather than replacing it — both stay readable.
   await post(page, { subject: "会话 beta", stage: "保存", severity: "info" });
   await expect(page.getByTestId("info-toast")).toBeVisible();
+  await expect(page.getByTestId("info-toast")).toHaveText("会话 beta · 保存");
+  await expect(error).toBeVisible();
+
+  // The error is not covered: its box and the toast's do not overlap.
+  const errorBox = await error.boundingBox();
+  const toastBox = await page.getByTestId("info-toast").boundingBox();
+  expect(errorBox && toastBox).toBeTruthy();
+  const overlaps =
+    errorBox!.y < toastBox!.y + toastBox!.height && toastBox!.y < errorBox!.y + errorBox!.height;
+  expect(overlaps, "a success toast must not overlap the standing error").toBe(false);
 
   // Well past the info TTL: the success is gone, the error is not.
   await expect(page.getByTestId("info-toast")).toHaveCount(0, { timeout: 10_000 });
@@ -127,7 +271,7 @@ test("disconnect: the session shows an unconfirmed state and refresh sends no na
 });
 
 test("slow ack: a pending command never reads as success while it is in flight", async ({ page }) => {
-  const instanceId = await createSession(page, "status-slow-ack");
+  const instanceId = await createReadySession(page, "status-slow-ack");
   const recorder = await recordNativeActions(page);
 
   // Hold the command response open, so the UI sits in the written-but-
@@ -158,7 +302,7 @@ test("slow ack: a pending command never reads as success while it is in flight",
 });
 
 test("rejection: a refused command surfaces and does not auto-resend", async ({ page }) => {
-  const instanceId = await createSession(page, "status-rejected");
+  const instanceId = await createReadySession(page, "status-rejected");
   const recorder = await recordNativeActions(page);
 
   await page.route(`**/v1/instances/${instanceId}/commands`, (route) =>
@@ -209,11 +353,13 @@ test("delayed purge: an unconfirmed cleanup is reported as pending, not as done"
   expect(deleted).toMatchObject({ deleted: true, nodePurge: "node-offline" });
   expect(deleted.nodePurge).not.toBe("purged");
 
+  // The route answered instead of the Hub, so the row still exists and
+  // afterEach still has to release the slot.
   await page.unroute(`**/v1/instances/${instanceId}`);
 });
 
 test("the live region carries status text only, never streamed transcript body", async ({ page }) => {
-  const instanceId = await createSession(page, "status-live-region");
+  const instanceId = await createReadySession(page, "status-live-region");
   const region = page.getByTestId("live-region");
   await expect(region).toHaveAttribute("role", "status");
   await expect(region).toHaveAttribute("aria-live", "polite");

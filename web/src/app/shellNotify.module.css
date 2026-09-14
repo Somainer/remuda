@@ -6,17 +6,30 @@
  * the reason the toast could be removed — a failure now has somewhere to stay.
  */
 
-/* Transient confirmations. Bottom-centre, where the old toast was. */
-.info {
+/*
+ * One anchored stack holds both regions, so they can never overlap however
+ * tall either grows. Confirmations sit above the standing errors; the errors
+ * keep the anchored position nearest the user's attention.
+ */
+.stack {
   position: fixed;
   bottom: calc(var(--bar) + var(--safe-bottom) + 12px);
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  width: min(92vw, 520px);
+  z-index: 30;
+}
+
+/* Transient confirmations, above the errors in the same stack. */
+.info {
+  display: flex;
+  flex-direction: column;
   gap: 6px;
   align-items: center;
-  z-index: 30;
   pointer-events: none;
 }
 
@@ -29,25 +42,15 @@
 }
 
 /*
- * Standing errors. Sits *above* the info strip so a later success is
- * physically incapable of covering it, which is the P0-3 requirement the old
- * single-toast slot could not meet.
+ * Standing errors. A later success is laid out above them rather than over
+ * them, which is the P0-3 requirement the old single-toast slot could not
+ * meet: there was one slot, so the next message took it.
  */
 .blocking {
-  position: fixed;
-  bottom: calc(var(--bar) + var(--safe-bottom) + 12px);
-  left: 50%;
-  transform: translateX(-50%);
   display: flex;
   flex-direction: column;
   gap: 8px;
-  width: min(92vw, 520px);
-  z-index: 31;
-}
-
-/* When both are up, the info strip drops below the error area. */
-.blocking ~ .info {
-  display: none;
+  width: 100%;
 }
 
 .blockingItem {

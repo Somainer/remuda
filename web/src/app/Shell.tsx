@@ -90,63 +90,73 @@ export function ShellNotify() {
         {announcement}
       </div>
 
-      {blocking.length ? (
-        <div className={notifyCss.blocking} data-testid="blocking-errors" aria-label="需要处理的问题">
-          {blocking.map((n) => (
-            <div key={n.id} className={notifyCss.blockingItem} data-testid="blocking-error" data-key={n.key}>
-              <div className={notifyCss.blockingHead}>
-                <span className={notifyCss.blockingText}>
-                  {n.subject}
-                  {n.stage ? ` · ${n.stage}` : ""}
-                  {n.reason ? <span className={notifyCss.blockingReason}>{n.reason}</span> : null}
-                </span>
-                <button
-                  type="button"
-                  className={notifyCss.dismiss}
-                  aria-label={`忽略：${n.text}`}
-                  data-testid="blocking-dismiss"
-                  onClick={() => notifyStore.dismiss(n.id)}
-                >
-                  ×
-                </button>
-              </div>
-              {n.actions?.length || n.diagnostic ? (
-                <div className={notifyCss.actions}>
-                  {n.actions?.map((action) => (
-                    <button
-                      key={action.id}
-                      type="button"
-                      className={notifyCss.action}
-                      data-testid={`blocking-action-${action.id}`}
-                      onClick={() => void action.run?.()}
-                    >
-                      {action.label}
-                    </button>
-                  ))}
-                  {n.diagnostic ? (
+      {blocking.length || info.length ? (
+        <div className={notifyCss.stack}>
+          {/* Confirmations lay out above the errors, never over them. */}
+          {info.length ? (
+            <div className={notifyCss.info} data-testid="info-toasts" aria-hidden="true">
+              {info.map((n) => (
+                <div key={n.id} className={notifyCss.infoItem} data-testid="info-toast">
+                  {n.text}
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {blocking.length ? (
+            <div
+              className={notifyCss.blocking}
+              data-testid="blocking-errors"
+              role="region"
+              aria-label="需要处理的问题"
+            >
+              {blocking.map((n) => (
+                <div key={n.id} className={notifyCss.blockingItem} data-testid="blocking-error" data-key={n.key}>
+                  <div className={notifyCss.blockingHead}>
+                    <span className={notifyCss.blockingText}>
+                      {n.subject}
+                      {n.stage ? ` · ${n.stage}` : ""}
+                      {n.reason ? <span className={notifyCss.blockingReason}>{n.reason}</span> : null}
+                    </span>
                     <button
                       type="button"
-                      className={notifyCss.action}
-                      data-testid="blocking-copy-diagnostic"
-                      onClick={() => void copyDiagnostic(n)}
+                      className={notifyCss.dismiss}
+                      aria-label={`忽略：${n.text}`}
+                      data-testid="blocking-dismiss"
+                      onClick={() => notifyStore.dismiss(n.id)}
                     >
-                      {copied === n.id ? "已复制" : "复制诊断"}
+                      ×
                     </button>
+                  </div>
+                  {n.actions?.length || n.diagnostic ? (
+                    <div className={notifyCss.actions}>
+                      {n.actions?.map((action) => (
+                        <button
+                          key={action.id}
+                          type="button"
+                          className={notifyCss.action}
+                          data-testid={`blocking-action-${action.id}`}
+                          onClick={() => void action.run?.()}
+                        >
+                          {action.label}
+                        </button>
+                      ))}
+                      {n.diagnostic ? (
+                        <button
+                          type="button"
+                          className={notifyCss.action}
+                          data-testid="blocking-copy-diagnostic"
+                          onClick={() => void copyDiagnostic(n)}
+                        >
+                          {copied === n.id ? "已复制" : "复制诊断"}
+                        </button>
+                      ) : null}
+                    </div>
                   ) : null}
                 </div>
-              ) : null}
+              ))}
             </div>
-          ))}
-        </div>
-      ) : null}
-
-      {info.length ? (
-        <div className={notifyCss.info} data-testid="info-toasts" aria-hidden="true">
-          {info.map((n) => (
-            <div key={n.id} className={notifyCss.infoItem} data-testid="info-toast">
-              {n.text}
-            </div>
-          ))}
+          ) : null}
         </div>
       ) : null}
     </>

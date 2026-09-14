@@ -137,7 +137,8 @@ remuda merge --queue wt/a wt/b \
 Each lane builds in `<target-dir>` / `<target-dir>-lane2`, gets its own Hub
 e2e port pair (58980/58989 and 58990/58999 by default), and shares one
 Playwright endpoint; only the browser step serialises, on
-`<repo>/.git/remuda/e2e.lock` (`--e2e-lock`, `--e2e-port-base` to change).
+`<git-common-dir>/remuda/e2e.lock` (that is `<repo>/.git/remuda/e2e.lock` in a
+normal checkout; override with `--e2e-lock`, ports with `--e2e-port-base`).
 Landing stays serial: main only ever advances to a merge whose exact tree
 passed a gate. Exit 0 all landed, 1 at least one gate failed (landed
 branches stay landed; send only the failures back), 2 an unresolved base

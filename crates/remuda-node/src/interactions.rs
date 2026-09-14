@@ -175,6 +175,12 @@ impl InteractionRuntime {
             if let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
                 && matches!(native.native_name.as_str(), "agent_status" | "session")
                 && let remuda_protocol::Knowledge::Known { value } = &native.status
+                && self
+                    .store
+                    .get_instance(&observation.instance_id)?
+                    .native_ref
+                    .signal_tier
+                    != Some(remuda_protocol::SignalTier::Hook)
             {
                 let activity = match value.as_str() {
                     "blocked" => Some(remuda_protocol::Activity::WaitingInteraction),

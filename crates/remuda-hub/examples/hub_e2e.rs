@@ -439,13 +439,18 @@ async fn fake_node(
             "tty.attach" => {
                 // C2 terminal typing: give the follower a real stream and echo
                 // its input back as PTY output so the screen visibly types.
-                let stream_id = format!("tty_{}", uuid7());
+                // One stable stream per instance: the web client mounts the
+                // terminal twice under dev StrictMode, and a remounted socket
+                // must keep addressing the stream it already bound.
+                let stream_id = {
+                    let mut state = tty.lock().await;
+                    let entry = state.entry(instance_id.clone()).or_default();
+                    entry
+                        .stream_id
+                        .get_or_insert_with(|| format!("tty_{}", uuid7()))
+                        .clone()
+                };
                 let snapshot = format!("fake-pty\r\n{instance_id} $ ");
-                tty.lock()
-                    .await
-                    .entry(instance_id.clone())
-                    .or_default()
-                    .stream_id = Some(stream_id.clone());
                 send_rpc_ok(
                     &mut ws,
                     id,

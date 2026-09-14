@@ -23,7 +23,9 @@ function recordNativeActions(page: Page): Recorder {
   page.on("request", (request) => {
     if (request.method() === "POST" && NATIVE_ACTION.test(new URL(request.url()).pathname)) urls.push(request.url());
   });
-  return { count: () => urls.length, urls: () => [...urls] };
+  // Exclude approval answers — setup answers them and they are not sends.
+  const sends = () => urls.filter((u) => !/\/interactions\/[^/]+\/answer$/.test(u));
+  return { count: () => sends().length, urls: () => [...sends()] };
 }
 
 /** Sessions created, deleted after each test (the fake node caps at 8). */
@@ -193,11 +195,13 @@ test("a delayed POST shows 等待发送, never a duplicate, then upgrades in pla
   const setupActions = recorder.count();
   const prompt = `cid slow post ${Date.now()}`;
 
-  // Hold the command response for 1.2 s; the handler answers itself so the
-  // teardown unroute cannot race it.
+  // Hold only the command POST for 1.2 s; the subsequent catchup reads
+  // (GET events) must pass straight through or the bubble never settles.
   await page.route("**/v1/instances/*/commands", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
     await new Promise((resolve) => setTimeout(resolve, 1200));
-    await route.fetch();
+    const response = await route.fetch();
+    return route.fulfill({ response });
   });
 
   await page.getByTestId("composer-input").fill(prompt);
@@ -218,7 +222,7 @@ test("a delayed POST shows 等待发送, never a duplicate, then upgrades in pla
 
 test("a 5xx POST projects 状态待确认 and reload creates no native action or duplicate", async ({ page }) => {
   const recorder = recordNativeActions(page);
-  await createReadySession(page, "cid create prompt for fail test");
+  const instanceId = await createReadySession(page, "cid create prompt for fail test");
   const setupActions = recorder.count();
   const prompt = `cid failed post ${Date.now()}`;
 
@@ -232,9 +236,10 @@ test("a 5xx POST projects 状态待确认 and reload creates no native action or
   // Bubble and header speak the unconfirmed vocabulary; nothing retries.
   await expect(page.getByTestId("optimistic-bubble")).toContainText("状态待确认", { timeout: 10_000 });
   await expect(page.getByTestId("session-status-label")).toContainText("状态待确认");
-  // Nothing retries the failed send.
+  // The single POST attempt is the only command request; nothing retries it.
+  await expect.poll(() => recorder.count()).toBe(setupActions + 1);
   await page.waitForTimeout(1500);
-  expect(recorder.count()).toBe(setupActions);
+  expect(recorder.count()).toBe(setupActions + 1);
 
   // Reload: the optimistic bubble is client state and is gone; the failed
   // send is never replayed, and no native action is generated on our behalf.
@@ -242,9 +247,16 @@ test("a 5xx POST projects 状态待确认 and reload creates no native action or
   await page.reload();
   await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
   await page.waitForTimeout(1000);
-  // Reload created no native action either.
-  expect(recorder.count()).toBe(setupActions);
+  // Reload created no additional native action.
+  expect(recorder.count()).toBe(setupActions + 1);
   await expect(page.getByTestId("optimistic-bubble")).toHaveCount(0);
-  // The fake node journaled nothing for the failed send.
-  await expect(userRows(page, prompt)).toHaveCount(0);
+  // The failed POST never reached the Node, so it journaled nothing:
+  // assert against the source of truth rather than the rendered transcript.
+  const journalHasPrompt = await page.evaluate(async (id) => {
+    const body = (await (await fetch(`/v1/instances/${id}/journal`, { credentials: "include" })).json()) as {
+      events?: { payload?: { text?: string } }[];
+    };
+    return (body.events ?? []).some((e) => typeof e.payload?.text === "string" && e.payload.text.includes("cid failed post"));
+  }, instanceId);
+  expect(journalHasPrompt).toBe(false);
 });

@@ -780,6 +780,11 @@ fn spawn_observation_pump(
     mut observations: mpsc::Receiver<remuda_protocol::Observation>,
 ) {
     tokio::spawn(async move {
+        // D-028 §7: `MessageDisplay` deltas are the only live text an
+        // agent-in-PTY session has. Folding them here — beside the journal
+        // append, not in a path of their own — is what makes the 结构 view
+        // fill in line by line instead of a whole message at a time.
+        let mut assembler = crate::signal_messages::MessageAssembler::new();
         while let Some(observation) = observations.recv().await {
             if let Some(reason) = native_failure_reason(&observation) {
                 record_task_exit(store.as_ref(), &instance_id, &reason);
@@ -814,6 +819,21 @@ fn spawn_observation_pump(
                 Ok(committed) => {
                     if let Err(error) = interactions.ingest(&committed).await {
                         tracing::debug!(%error, "interaction ingest failed");
+                    }
+                    // The hook event itself is the evidence and is journaled
+                    // above; this is the readable message derived from it. It
+                    // follows the hook so the two stay in seq order, and is
+                    // built from `committed` so it inherits the envelope the
+                    // store just stamped.
+                    if let Some(delta) = crate::signal_messages::message_delta(&committed)
+                        && let Some(payload) = assembler.fold(&delta)
+                    {
+                        let message = crate::signal_messages::MessageAssembler::observation(
+                            &committed, payload,
+                        );
+                        if let Err(error) = store.append_driver_observation(&instance_id, message) {
+                            tracing::warn!(%error, "streamed message not journaled");
+                        }
                     }
                 }
                 Err(error) => {

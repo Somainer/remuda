@@ -99,9 +99,7 @@ struct Card {
 }
 
 /// Pull the approval card off the journal the bus emits.
-async fn await_card(
-    rx: &mut mpsc::Receiver<remuda_protocol::Observation>,
-) -> Card {
+async fn await_card(rx: &mut mpsc::Receiver<remuda_protocol::Observation>) -> Card {
     loop {
         let observation = rx.recv().await.expect("an observation");
         // The card must be a hook-channel, structured, blocking approval.
@@ -196,7 +194,8 @@ async fn an_unanswered_permission_request_denies_on_timeout() {
     let stdout: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     assert_eq!(
-        stdout["hookSpecificOutput"]["hookEventName"], "PermissionRequest"
+        stdout["hookSpecificOutput"]["hookEventName"],
+        "PermissionRequest"
     );
     assert_eq!(
         stdout["hookSpecificOutput"]["decision"]["behavior"], "deny",

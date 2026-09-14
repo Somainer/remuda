@@ -550,6 +550,22 @@ impl ShellPtyDriver {
         }
     }
 
+    /// Whether an on-screen approval left the screen after the hook accepted
+    /// the decision.
+    ///
+    /// `false` when there is no PTY or no confirmation window, so a caller that
+    /// cannot see the screen never *invents* a failure — but a live PTY that
+    /// still shows the dialog after a hook `Answered` is the confined case, and
+    /// that `false` is what arms the one fallback.
+    async fn approval_cleared_on_screen(&self) -> bool {
+        let Some(state) = self.inner.lock().await.clone() else {
+            // No PTY: there is nothing to verify, and nothing to fall back to.
+            return true;
+        };
+        self.dialog_cleared_within(&state, FALLBACK_CONFIRM_WINDOW)
+            .await
+    }
+
     /// Stand up this instance's hook path, when one was configured.
     ///
     /// The [`SignalBus`](remuda_signal::SignalBus) shares the promotion
@@ -1270,18 +1286,48 @@ impl Driver for ShellPtyDriver {
         id: remuda_protocol::InteractionId,
         answer: remuda_protocol::InteractionAnswer,
     ) -> DriverResult<DriverAck> {
-        if let Some(hooks) = self.hooks.lock().await.clone()
-            && hooks.is_parked(&id)
-        {
-            let outcome = hooks.resolve_answer(&id, &answer);
-            if !crate::hook_answer::needs_fallback(outcome) {
-                tracing::debug!(interaction = %id.as_id().as_str(), "hook decision delivered");
-                return Ok(DriverAck::transport_written());
+        // Route by what the answer *is*, not by whether a hook is still parked.
+        // An abandoned hook is no longer in the table, and the whole point of
+        // §14 risk 1 is that that case still needs answering — routing on
+        // `is_parked` would send it to the transcript picker, which would
+        // reject it as the wrong answer kind and lose the decision entirely.
+        // The picker is the only thing that asks a Question here; approvals
+        // and elicitations can only have come from a hook.
+        let hook_carried = matches!(
+            &answer,
+            remuda_protocol::InteractionAnswer::Approval(_)
+                | remuda_protocol::InteractionAnswer::Elicitation(_)
+        );
+        if hook_carried {
+            let outcome = match self.hooks.lock().await.clone() {
+                Some(hooks) => hooks.resolve_answer(&id, &answer),
+                // Hooks are off for this instance, so nothing was ever parked
+                // and the agent's own dialog is the only place to answer.
+                None => remuda_signal::Outcome::Abandoned,
+            };
+            if crate::hook_answer::needs_fallback(outcome) {
+                // The hook stopped listening before the human decided, or the
+                // wait expired. The dialog may still be on screen, so spend
+                // the single fallback attempt on it (§14 risk 1).
+                return self.fallback_to_screen(&id, &answer).await;
             }
-            // The hook stopped listening before the human decided, or the
-            // harness ignored the reply. The dialog may still be on screen, so
-            // spend the single fallback attempt on it (§14 risk 1).
-            return self.fallback_to_screen(&id, &answer).await;
+            // Outcome::Answered means the reply reached the process — but a
+            // confined (or otherwise restricted) session can accept the reply
+            // and still keep its own dialog up. §14 risk 1: never report
+            // applied unless confirmed, so for an approval verify the prompt
+            // actually left the screen, and fall back exactly once if it did
+            // not.
+            if matches!(&answer, remuda_protocol::InteractionAnswer::Approval(_))
+                && !self.approval_cleared_on_screen().await
+            {
+                tracing::warn!(
+                    interaction = %id.as_id().as_str(),
+                    "the hook accepted the decision but the approval dialog is still up; answering on screen once"
+                );
+                return self.fallback_to_screen(&id, &answer).await;
+            }
+            tracing::debug!(interaction = %id.as_id().as_str(), "hook decision delivered");
+            return Ok(DriverAck::transport_written());
         }
         // The only structured question a shell-pty asks is the manual
         // transcript picker; its answer deterministically binds the epoch.

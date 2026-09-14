@@ -781,7 +781,12 @@ fn spawn_observation_pump(
 ) {
     tokio::spawn(async move {
         while let Some(observation) = observations.recv().await {
-            if let Some(reason) = native_failure_reason(&observation) {
+            // §5.5 before the generic failure fold: a clean exit carries
+            // `Severity::Info` and would otherwise fall through both, leaving
+            // a finished instance reported as `ready`.
+            if let Some(exit) = native_exit(&observation) {
+                record_native_exit(store.as_ref(), &instance_id, &exit);
+            } else if let Some(reason) = native_failure_reason(&observation) {
                 record_task_exit(store.as_ref(), &instance_id, &reason);
             }
             if let Some(promotion) = promotion_change(&observation)
@@ -1399,6 +1404,85 @@ fn native_failure_reason(observation: &remuda_protocol::Observation) -> Option<S
     match &native.status {
         Knowledge::Known { value } if !value.is_empty() => Some(value.clone()),
         _ => Some(native.native_name.clone()),
+    }
+}
+
+/// A PTY process that ended, as reported by the driver's exit waiter (§5.5).
+///
+/// Separate from [`native_failure_reason`] because a *clean* exit is not a
+/// failure and must not be journaled as one: the `Severity::Info` a code-0 exit
+/// carries is exactly what keeps it out of that path, and without this it would
+/// be journaled and then silently dropped, leaving the instance `ready` — which
+/// is the §5.5 defect in a new place rather than a fix for it.
+struct NativeExit {
+    /// `exited` or `failed`.
+    state: String,
+    /// Reason naming the evidence, e.g. `native-exit-code-0`.
+    reason: String,
+}
+
+fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit> {
+    let ObservationPayload::Lifecycle(payload) = &observation.body else {
+        return None;
+    };
+    let LifecyclePayload::Native(native) = payload.as_ref() else {
+        return None;
+    };
+    if native.native_name != remuda_driver::shell_pty::NATIVE_EXIT {
+        return None;
+    }
+    let Knowledge::Known { value: state } = &native.status else {
+        return None;
+    };
+    Some(NativeExit {
+        state: state.clone(),
+        reason: native
+            .related_ids
+            .get("reason")
+            .cloned()
+            .unwrap_or_else(|| state.clone()),
+    })
+}
+
+/// Settle an instance whose PTY process ended (§5.5).
+///
+/// §5.5's other half: a *promoted* instance distinguishes two deaths. The agent
+/// going away while the shell survives is a demote, and the driver reports that
+/// as `agent_demoted`, never as this event — the exit waiter watches the child
+/// the driver itself spawned. So anything arriving here really is the instance
+/// ending.
+fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &NativeExit) {
+    let Ok(instance) = store.get_instance(instance_id) else {
+        return;
+    };
+    if matches!(
+        instance.lifecycle,
+        InstanceLifecycle::Exited | InstanceLifecycle::Failed
+    ) {
+        return;
+    }
+    if let Err(error) = store.mark_unsettled_unknown(instance_id) {
+        tracing::warn!(%error, "unsettled commands not marked before native exit");
+    }
+    if exit.state == "failed"
+        && let Err(error) = store.set_instance_failure(instance_id, &exit.reason)
+    {
+        tracing::warn!(%error, "native exit failure reason not recorded");
+    }
+    if let Err(error) = store.set_instance_state(
+        instance_id,
+        Some(InstanceLifecycle::Exited),
+        Some(Knowledge::Known {
+            value: Activity::Idle,
+        }),
+    ) {
+        tracing::error!(%error, "instance not marked exited after its process ended");
+        return;
+    }
+    if let Err(error) =
+        append_instance_lifecycle(store, instance_id, Some("ready"), &exit.state, &exit.reason)
+    {
+        tracing::error!(%error, "native exit lifecycle not appended");
     }
 }
 

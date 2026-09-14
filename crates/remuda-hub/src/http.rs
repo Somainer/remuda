@@ -765,7 +765,20 @@ impl ResumeMode {
     }
 
     /// Structured keeps whatever the parent used; terminal always needs a PTY.
+    ///
+    /// D-028 §5.6: a `shell-pty` parent resumes as `shell-pty` on **both**
+    /// modes. That driver now has a semantic resume (a new PTY with the
+    /// harness's own resume flag prefilled), and unification means it already
+    /// has both projections — so there is nothing for the mode to choose
+    /// between, and routing it to `claude-pty` would move a native-carrier
+    /// session onto herdr just because the user clicked a different button.
+    /// This is the second of the two spots §5.6 names as "necessarily 409
+    /// today": the driver's was `CapabilityUnsupported`, and this was a Hub
+    /// that could not name the driver at all.
     fn driver(self, parent_driver: &str) -> &'static str {
+        if parent_driver == "shell-pty" {
+            return "shell-pty";
+        }
         match self {
             Self::Terminal => "claude-pty",
             Self::Structured if parent_driver == "claude-pty" => "claude-pty",

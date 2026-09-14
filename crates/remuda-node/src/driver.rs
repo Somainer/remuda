@@ -424,8 +424,12 @@ impl Driver for NativeShellAdapter {
                         .map_err(|error| DriverError::Failed(error.to_string()))?;
                 }
                 DriverRequest::Cancel => {
+                    // D-028 §5.3: the driver picks the key, because which key
+                    // interrupts a turn depends on the harness in the PTY — and
+                    // for a promoted Claude, the `\x03` that used to be sent
+                    // here is not an interrupt at all.
                     self.inner
-                        .write_tty(&[0x03])
+                        .cancel()
                         .await
                         .map_err(|error| DriverError::Failed(error.to_string()))?;
                 }

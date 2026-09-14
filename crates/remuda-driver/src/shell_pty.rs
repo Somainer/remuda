@@ -82,7 +82,10 @@ pub fn emulator_enabled() -> bool {
 /// Detection is then visible within ~2 poll intervals (D-025 budget: ~2 s).
 const PROMOTE_POLL: std::time::Duration = std::time::Duration::from_millis(800);
 
-/// How long EOF waits for `wait()` to upgrade it to a real status (§5.5).
+/// How often the exit waiter asks whether the child has been reaped (§5.5).
+const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long EOF waits for the reaper to upgrade it to a real status (§5.5).
 ///
 /// Well inside §5.5's 2 s budget from process death to lifecycle event, and
 /// long enough for a normally-exiting child to be reaped.
@@ -233,7 +236,14 @@ impl ShellPtyOptions {
 
 struct PtyState {
     writer: Mutex<Box<dyn Write + Send>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    /// The PTY master. `None` once the stop ladder has dropped it.
+    ///
+    /// §5.3 step 2 pairs `SIGHUP` with closing the master, and that has to be
+    /// a real close: while any fd to the master is open, the slave's other end
+    /// stays open too, so a shell blocked on input never sees the hangup and
+    /// the ladder escalates to `SIGKILL` for no reason. Dropping the box is the
+    /// close — `portable-pty` releases the fd in `Drop`.
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     /// Signals the child independently of whoever holds `child`.
     ///
@@ -600,7 +610,7 @@ impl ShellPtyDriver {
         });
         let state = Arc::new(PtyState {
             writer: Mutex::new(writer),
-            master: Mutex::new(master),
+            master: Mutex::new(Some(master)),
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             pgid: AtomicI32::new(pgid.unwrap_or(0)),
@@ -696,14 +706,19 @@ impl ShellPtyDriver {
             state.killer.lock().await.kill().map_err(DriverError::Io)?;
             return Ok(StopOutcome::already_gone());
         }
-        // Closing the master is what turns SIGHUP into a real hangup: a reader
-        // still holding it keeps the other end of the slave open. `master` is
-        // behind an async mutex the caller cannot hold across the ladder, so
-        // the close is expressed as dropping our read side — the reader thread
-        // exits on the resulting EOF.
-        let closed = Arc::clone(state);
+        // §5.3 step 2: the hangup only lands if the master is really closed.
+        // An fd that is still open holds the slave's other end open, so the
+        // shell inside never notices the SIGHUP and the ladder escalates to
+        // SIGKILL for a process that would have hung up politely.
+        //
+        // The box is taken out here, before the ladder runs, and moved into the
+        // closure — so the close is a plain `drop` of an owned value at exactly
+        // the rung that needs it, with no lock acquired from inside a
+        // synchronous callback on a runtime thread.
+        let mut master = state.master.lock().await.take();
+        state.closed.store(true, Ordering::SeqCst);
         lifecycle::stop_group(pgid, move || {
-            closed.closed.store(true, Ordering::SeqCst);
+            drop(master.take());
         })
         .await
     }
@@ -848,6 +863,10 @@ impl LocalPty for PtyState {
             ));
         }
         let master = self.master.lock().await;
+        let Some(master) = master.as_ref() else {
+            // The stop ladder already released it; there is no PTY to resize.
+            return Err(DriverError::ControlUnavailable);
+        };
         master
             .resize(PtySize {
                 rows,
@@ -1324,37 +1343,45 @@ fn spawn_exit_waiter(
     eof: tokio::sync::oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let waited = {
+        // `try_wait` on a timer rather than a blocking `wait()`. A blocking
+        // wait parks a thread inside `child`'s lock until the process ends —
+        // which is both the lock `close` would then contend for and a thread
+        // the tokio runtime cannot join at shutdown, so dropping a runtime
+        // while an agent is alive would hang until that agent happened to
+        // exit. The poll interval is far inside §5.5's 2 s budget.
+        let reaped = {
             let state = Arc::clone(&state);
-            tokio::task::spawn_blocking(move || {
-                // `blocking_lock` is correct here and only here: this closure
-                // owns a dedicated blocking thread, and holding `child` for the
-                // whole wait is exactly why `close` must never contend for it.
-                let mut child = state.child.blocking_lock();
-                child
-                    .wait()
-                    .map(|status| lifecycle::evidence_from_status(&status))
-            })
+            async move {
+                loop {
+                    {
+                        let mut child = state.child.lock().await;
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                return Some(lifecycle::evidence_from_status(&status));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(%error, "pty child wait failed");
+                                return None;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(EXIT_POLL).await;
+                }
+            }
         };
-        tokio::pin!(waited);
+        tokio::pin!(reaped);
         let evidence = tokio::select! {
-            status = &mut waited => match status {
-                Ok(Ok(evidence)) => evidence,
+            status = &mut reaped => match status {
+                Some(evidence) => evidence,
                 // The wait itself failed; EOF still tells us it is over.
-                Ok(Err(error)) => {
-                    tracing::debug!(%error, "pty child wait failed; falling back to EOF evidence");
-                    ExitEvidence::Eof
-                }
-                Err(error) => {
-                    tracing::debug!(%error, "pty exit waiter task failed");
-                    return;
-                }
+                None => ExitEvidence::Eof,
             },
             _ = eof => {
-                // EOF won. Give `wait()` a moment to upgrade this to a real
+                // EOF won. Give the reaper a moment to upgrade this to a real
                 // status before settling for the weaker witness.
-                match tokio::time::timeout(EXIT_STATUS_GRACE, waited).await {
-                    Ok(Ok(Ok(evidence))) => evidence,
+                match tokio::time::timeout(EXIT_STATUS_GRACE, reaped).await {
+                    Ok(Some(evidence)) => evidence,
                     _ => ExitEvidence::Eof,
                 }
             }

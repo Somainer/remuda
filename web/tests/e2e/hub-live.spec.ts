@@ -336,9 +336,17 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
   await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2, { steps: 3 });
   await page.mouse.up();
   // The far-right stop is ultracode: the xhigh tier plus the workflow flag.
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+  // The chip only re-renders once instance.configure round-trips through the
+  // Hub, so these wait on the wire like every other live assertion here.
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode", {
+    timeout: 20_000,
+  });
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1", {
+    timeout: 20_000,
+  });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1", {
+    timeout: 20_000,
+  });
   await expect
     .poll(() =>
       configureBodies.some(
@@ -349,8 +357,12 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
 
   await slider.focus();
   await page.keyboard.press("Home");
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "low");
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0");
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "low", {
+    timeout: 20_000,
+  });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0", {
+    timeout: 20_000,
+  });
   await expect
     .poll(() =>
       configureBodies.some(

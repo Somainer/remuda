@@ -473,3 +473,67 @@ test("composer steer / queue / interrupt states on a working native session", as
   await expect(page.getByTestId("composer-queue-btn")).toHaveCount(0);
   await expect(page.getByTestId("composer-send")).toHaveAttribute("data-mode", "new-turn");
 });
+
+test("a hook-carried approval shows the real tool input and an always-allow option", async ({
+  page,
+}) => {
+  // D-028 §4.4 tier A end to end through the Hub: the card the Node builds
+  // from a real PermissionRequest carries the harness-hook carrier, the tool's
+  // actual input rather than a screen scrape, and an always-allow button that
+  // exists only because the harness offered a permission_suggestion.
+  test.skip(
+    process.env.HUB_E2E_EXTERNAL === "1",
+    "External Node is covered by the real shell workspace flow",
+  );
+  await login(page);
+
+  await page.getByTitle("新建", { exact: true }).click();
+  await expect(page.getByTestId("new-session-sheet")).toBeVisible();
+  await expect(page.getByTestId("new-session-host")).toContainText("e2e-fake-node", {
+    timeout: 20_000,
+  });
+  const host = await page
+    .getByTestId("new-session-host")
+    .locator("option")
+    .filter({ hasText: "e2e-fake-node" })
+    .getAttribute("value");
+  await page.getByTestId("new-session-host").selectOption(host!);
+  await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0);
+  // The fake Node raises the tier A card for a prompt naming the hook path.
+  await page.getByTestId("new-session-prompt").fill("hook-approval please");
+  await page.getByTestId("new-session-start").click();
+  await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
+  const instanceId = new URL(page.url()).pathname.split("/").pop()!;
+
+  await page.goto("/approvals");
+  await expect(page.getByTestId("approvals-page")).toBeVisible();
+  const row = page.getByTestId("approval-row").filter({ hasText: "/tmp/hook-approval.txt" });
+  // The real tool input is what the human reads before deciding (§2.2).
+  await expect(row).toBeVisible({ timeout: 20_000 });
+  await expect(row).toContainText("Write");
+  // All three options the card carried, including the suggested grant.
+  await expect(row.getByRole("button", { name: "允许一次" })).toBeVisible();
+  await expect(row.getByRole("button", { name: "拒绝" })).toBeVisible();
+  const always = row.getByRole("button", { name: "始终允许 (acceptEdits)" });
+  await expect(always).toBeVisible();
+
+  await always.click();
+  await expect(
+    page.getByTestId("approval-row").filter({ hasText: "/tmp/hook-approval.txt" }),
+  ).toHaveCount(0, { timeout: 20_000 });
+
+  // A blocking approval holds the composer; answering it releases the session.
+  await answerPendingApprovals(page, instanceId);
+  await page.goto(`/s/${instanceId}`);
+  await expect(page.getByTestId("session-page")).toBeVisible();
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+
+  // Give the slot back. The suite runs every spec against one Hub with
+  // maxInstances 8, so a session left running here makes a *later* spec fail
+  // at creation with PLACEMENT_UNSATISFIABLE — which reads as host contention
+  // rather than as this test's litter.
+  await page.evaluate(
+    (id) => fetch(`/v1/instances/${id}?force=1`, { method: "DELETE", credentials: "include" }),
+    instanceId,
+  );
+});

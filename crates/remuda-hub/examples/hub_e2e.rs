@@ -340,11 +340,23 @@ async fn fake_node(
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
                 let interaction_id = InteractionId::new();
-                let card = fake_approval(
-                    &instance_id,
-                    host_id.as_id().as_str(),
-                    interaction_id.as_id().as_str(),
-                );
+                // A prompt naming the hook path raises the D-028 §4.4 tier A
+                // card instead: harness-hook carrier, the real tool input as
+                // its description, and an always-allow option built from the
+                // permission_suggestion the harness offered.
+                let card = if prompt.contains("hook-approval") {
+                    fake_hook_approval(
+                        &instance_id,
+                        host_id.as_id().as_str(),
+                        interaction_id.as_id().as_str(),
+                    )
+                } else {
+                    fake_approval(
+                        &instance_id,
+                        host_id.as_id().as_str(),
+                        interaction_id.as_id().as_str(),
+                    )
+                };
                 pending
                     .lock()
                     .await
@@ -516,6 +528,60 @@ async fn append_native_status(
     .await?;
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
+}
+
+/// A hook-carried approval, shaped like the one the Node builds from a real
+/// `PermissionRequest` (D-028 §4.4; payload measured in
+/// `docs/design/evidence/native-pty-5.md`).
+///
+/// Three things differ from the control-channel card above and each is the
+/// point of a tier A approval: the carrier is `harness-hook`, the description
+/// is the *real* `tool_input` rather than a screen scrape, and there is an
+/// always-allow option — which exists only because the harness sent a
+/// `permission_suggestion`, so a request without one must not grow one.
+fn fake_hook_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    json!({
+        "id": interaction_id,
+        "revision": "1",
+        "createdAt": "2026-09-12T00:00:00.000Z",
+        "updatedAt": "2026-09-12T00:00:00.000Z",
+        "instanceId": instance_id,
+        "runId": null,
+        "hostId": host_id,
+        "kind": "approval",
+        "requestKey": {
+            // The parked hook's identity: a PermissionRequest carries no
+            // tool_use_id of its own, so the id is the way back to it.
+            "native": { "type": "hook", "invocationId": interaction_id },
+            "processGeneration": "1",
+            "runGeneration": "1",
+            "connectionEpoch": host_id
+        },
+        "requestVersion": "1",
+        "state": "pending",
+        "blocking": true,
+        "answerable": true,
+        "carrier": "harness-hook",
+        "request": {
+            "kind": "approval",
+            "title": "Write",
+            "description": "/tmp/hook-approval.txt",
+            "toolCallId": null,
+            "actionRef": interaction_id,
+            "options": [
+                { "id": "allow-once", "label": "允许一次", "effect": "allow-once", "nativeValueRef": interaction_id },
+                { "id": "allow-always-0", "label": "始终允许 (acceptEdits)", "effect": "allow-session", "nativeValueRef": interaction_id },
+                { "id": "deny", "label": "拒绝", "effect": "deny", "nativeValueRef": interaction_id }
+            ],
+            "requestedPermissionsRef": null,
+            "inputDigest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        "deadline": { "state": "unknown", "reason": "none", "evidenceEventIds": [] },
+        "deadlineSource": "runtime-policy",
+        "answer": { "state": "not-applicable" },
+        "delivery": "not-sent",
+        "resolution": { "state": "not-applicable" }
+    })
 }
 
 fn fake_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {

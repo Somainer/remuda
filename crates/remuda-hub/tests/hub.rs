@@ -192,6 +192,36 @@ async fn enroll_token(addr: std::net::SocketAddr, cookie: &str) -> Result<String
         .context("enroll token")
 }
 
+/// Poll the host index until the Hub's live-link projection reports the
+/// expected `online` value. Closing a WebSocket is observed on the server
+/// asynchronously, so a fixed sleep before the assertion races that
+/// observation under `--test-threads` load.
+async fn wait_host_online(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    host_id: &str,
+    expected: bool,
+) -> Result<()> {
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (status, _, body) =
+                http(addr, "GET", "/v1/hosts", &[("Cookie", cookie)], None).await?;
+            anyhow::ensure!(status == 200, "list hosts {status} {body}");
+            let hosts: Value = serde_json::from_str(body.trim())?;
+            let current = hosts["items"]
+                .as_array()
+                .and_then(|items| items.iter().find(|host| host["hostId"] == json!(host_id)))
+                .and_then(|host| host["online"].as_bool());
+            if current == Some(expected) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("host {host_id} did not reach online={expected} within {TIMEOUT:?}"))?
+}
+
 /// Pair a device and mint an enroll token in one step.
 async fn device_and_enroll(
     addr: std::net::SocketAddr,
@@ -677,7 +707,7 @@ async fn command_stays_queued_when_node_offline_and_is_not_resent() -> Result<()
     let body: Value = serde_json::from_str(body.trim())?;
     let instance_id = body["instance"]["instanceId"].as_str().unwrap().to_string();
     node.close(None).await.ok();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_host_online(hub.addr, &cookie, host_id.as_id().as_str(), false).await?;
 
     let (status, _, hosts) =
         http(hub.addr, "GET", "/v1/hosts", &[("Cookie", &cookie)], None).await?;
@@ -1452,19 +1482,32 @@ async fn stale_socket_does_not_offline_live_host() -> Result<()> {
     assert!(hello_b.get("result").is_some(), "{hello_b}");
 
     drop(node_a);
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    let (status, _, hosts) = http(
-        hub.addr,
-        "GET",
-        "/v1/hosts",
-        &[("Cookie", cookie.as_str())],
-        None,
-    )
-    .await?;
-    assert_eq!(status, 200, "{hosts}");
-    let hosts: Value = serde_json::from_str(hosts.trim())?;
-    assert_eq!(hosts["items"][0]["online"], json!(true), "{hosts}");
+    // The stale socket must be retired without offlining the host the live
+    // socket (b) still serves. Poll across the close landing: a single read
+    // could pass before the close is processed, while an unbounded wait-for
+    // could never prove the close was absorbed.
+    let fence_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let (status, _, hosts) = http(
+            hub.addr,
+            "GET",
+            "/v1/hosts",
+            &[("Cookie", cookie.as_str())],
+            None,
+        )
+        .await?;
+        assert_eq!(status, 200, "{hosts}");
+        let hosts: Value = serde_json::from_str(hosts.trim())?;
+        assert_eq!(
+            hosts["items"][0]["online"],
+            json!(true),
+            "retiring the stale socket must not offline a live host: {hosts}"
+        );
+        if tokio::time::Instant::now() >= fence_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     node_b
         .send(Message::Text(

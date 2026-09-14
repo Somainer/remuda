@@ -54,6 +54,36 @@ async fn http(
     Ok((status, head.to_string(), rest.to_string()))
 }
 
+/// Poll the host index until the Hub's live-link projection reports the
+/// expected `online` value. A socket close is observed on the server
+/// asynchronously, so a fixed sleep before the placement call races that
+/// observation under `--test-threads` load.
+async fn wait_host_online(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    host_id: &str,
+    expected: bool,
+) -> Result<()> {
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (status, _, body) =
+                http(addr, "GET", "/v1/hosts", &[("Cookie", cookie)], None).await?;
+            anyhow::ensure!(status == 200, "list hosts {status} {body}");
+            let hosts: Value = serde_json::from_str(body.trim())?;
+            let current = hosts["items"]
+                .as_array()
+                .and_then(|items| items.iter().find(|host| host["hostId"] == json!(host_id)))
+                .and_then(|host| host["online"].as_bool());
+            if current == Some(expected) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("host {host_id} did not reach online={expected} within {TIMEOUT:?}"))?
+}
+
 fn cookie_from(head: &str) -> Option<String> {
     for line in head.lines() {
         if line.to_ascii_lowercase().starts_with("set-cookie:") {
@@ -247,7 +277,7 @@ async fn two_nodes_placement_fleet_and_unsatisfiable() -> Result<()> {
     );
 
     cn_ws.close(None).await.ok();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_host_online(hub.addr, &cookie, &cn_id, false).await?;
 
     let body = json!({
         "spec": { "driver": "claude-print", "kind": "claude", "delegation": "none" },

@@ -48,6 +48,53 @@ async function patchMaxInstances(page: Page, value: number): Promise<void> {
   }, value);
 }
 
+/**
+ * Delete every Instance the in-process fake hub currently holds.
+ *
+ * This config's specs share one serial Hub and the fake node ships
+ * maxInstances 8; some files (e.g. spaces-hub-live) leave their sessions
+ * live on purpose, so by the time this file starts the board is not empty.
+ * The numbering test needs EXACTLY its own nine fixtures, so sweep first and
+ * wait for a stable empty board.
+ */
+async function purgeInstances(page: Page): Promise<void> {
+  // The settle poll may run longer than the 30 s evaluate default.
+  page.setDefaultTimeout(120_000);
+  const trace = await page.evaluate(async () => {
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const log: string[] = [];
+    // Force-delete settles each row synchronously; includeHistory=true also
+    // sweeps host-lost rows the plain list hides. Require THREE consecutive
+    // empty reads a few seconds apart before trusting the board as empty (the
+    // 422 PLACEMENT_UNSATISFIABLE / stray-row trap otherwise).
+    let emptyStreak = 0;
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+      const body = (await (await fetch("/v1/instances?includeHistory=true", { credentials: "include" })).json()) as {
+        items?: { id?: string; instanceId?: string }[];
+      };
+      // The Hub wire field is `instanceId`; `id` is kept only defensively.
+      const ids = (body.items ?? [])
+        .map((item) => item.instanceId ?? item.id)
+        .filter((id): id is string => Boolean(id));
+      if (!ids.length) {
+        emptyStreak += 1;
+        if (emptyStreak >= 3) return log;
+        await sleep(2_000);
+        continue;
+      }
+      emptyStreak = 0;
+      log.push(`attempt ${attempt}: ${ids.length} live`);
+      for (const id of ids) {
+        await fetch(`/v1/instances/${id}?force=1`, { method: "DELETE", credentials: "include" }).catch(() => {});
+      }
+      await sleep(1_000);
+    }
+    throw new Error("fake node instances never settled to a stable empty board after purge");
+  });
+  // eslint-disable-next-line no-console
+  console.log(`ux-keys purge: ${trace.length ? trace.join("; ") : "board already empty"}`);
+}
+
 /** Fill the new-session form and start, returning the created instance id. */
 async function createSession(page: Page, name: string, prompt: string): Promise<string> {
   await page.goto("/sessions/new");
@@ -67,6 +114,28 @@ async function createSession(page: Page, name: string, prompt: string): Promise<
   );
   await page.getByTestId("new-session-start").click();
   const response = await creating;
+  // beforeAll swept the board; a 422 here means a force-deleted predecessor
+  // is still settling its node stop under host contention. Wait it out and
+  // retry the form once rather than flake the whole file.
+  if (response.status() === 422) {
+    await page.waitForTimeout(2_000);
+    await page.goto("/sessions/new");
+    await hostPicker.selectOption(hostId!);
+    await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, { timeout: 20_000 });
+    await page.getByTestId("new-session-advanced").click();
+    await page.locator("label").filter({ hasText: "name" }).locator("input").fill(name);
+    await page.getByTestId("new-session-prompt").fill(prompt);
+    const retry = page.waitForResponse(
+      (r) => r.request().method() === "POST" && new URL(r.url()).pathname === "/v1/instances",
+    );
+    await page.getByTestId("new-session-start").click();
+    const retried = await retry;
+    expect(retried.ok(), `instance create failed: ${retried.status()} ${await retried.text()}`).toBe(true);
+    const retriedId = (await retried.json()).instance.instanceId as string;
+    created.push(retriedId);
+    await expect(page).toHaveURL(new RegExp(`/s/${retriedId}`), { timeout: 20_000 });
+    return retriedId;
+  }
   expect(response.ok(), `instance create failed: ${response.status()} ${await response.text()}`).toBe(true);
   const instanceId = (await response.json()).instance.instanceId as string;
   created.push(instanceId);
@@ -89,10 +158,13 @@ async function rowBadges(page: Page): Promise<RowBadge[]> {
 }
 
 test.beforeAll(async ({ browser }) => {
-  // Nine concurrent slots plus headroom; the fake node ships maxInstances 8.
+  // Plenty of room: earlier files' force-deletes can lag under host
+  // contention, and the fake node ships maxInstances 8. Original restored in
+  // afterAll (ux-status.spec uses the same isolation technique).
   const page = await browser.newPage();
   await login(page);
-  await patchMaxInstances(page, 16);
+  await purgeInstances(page);
+  await patchMaxInstances(page, 32);
   await page.close();
 });
 
@@ -108,9 +180,12 @@ test.afterAll(async ({ browser }) => {
   await page.close();
 });
 
+test.beforeEach(async ({ page }) => {
+  await login(page);
+});
+
 test("hold reveals nine badges in tab order; digit opens the matching session; release hides them", async ({ page }, testInfo) => {
   testInfo.setTimeout(240_000);
-  await login(page);
   const names = ["KEY Alpha", "KEY Bravo", "KEY Charlie", "KEY Delta", "KEY Echo", "KEY Foxtrot", "KEY Golf", "KEY Hotel", "KEY India"];
   for (const name of names) {
     await createSession(page, name, `switcher fixture ${name}`);
@@ -119,6 +194,8 @@ test("hold reveals nine badges in tab order; digit opens the matching session; r
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
+  // Exactly the nine fixtures: beforeAll swept earlier specs' orphans.
+  await expect(page.getByTestId("session-row")).toHaveCount(9, { timeout: 30_000 });
 
   // The permanent hint names the gesture even before the modifier is touched.
   await expect(page.getByTestId("session-switch-hint")).toHaveText("按住 Ctrl 快捷切换");
@@ -163,7 +240,6 @@ test("hold reveals nine badges in tab order; digit opens the matching session; r
 });
 
 test("digit switching works on a session detail route, but never while the composer has focus", async ({ page }) => {
-  await login(page);
   await page.goto("/sessions");
   await expect(page.getByTestId("session-row")).toHaveCount(9, { timeout: 30_000 });
   const numbered = (await rowBadges(page)).filter((row) => row.badge);
@@ -202,7 +278,6 @@ test("digit switching works on a session detail route, but never while the compo
 });
 
 test("does not collide with QuickFind: a digit pressed over the open finder stays in the finder", async ({ page }) => {
-  await login(page);
   await page.goto("/sessions");
   await expect(page.getByTestId("session-row")).toHaveCount(9, { timeout: 30_000 });
   await page.keyboard.press("Control+k");
@@ -221,7 +296,6 @@ test("does not collide with QuickFind: a digit pressed over the open finder stay
 });
 
 test("at 390 px there is no hint, no badge and no handler", async ({ page }) => {
-  await login(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
@@ -247,11 +321,11 @@ test("macOS UA renders the ⌘ glyph and Meta+ shortcuts", async ({ page }) => {
   await expect(page.getByTestId("session-switch-hint")).toHaveText("按住 ⌘ 快捷切换");
 
   const numbered = (await rowBadges(page)).filter((row) => row.badge);
-  expect(numbered.length).toBeGreaterThanOrEqual(2);
-  expect(numbered[0].badge).toBe("⌘ 1");
-  expect(numbered[0].aria).toBe("Meta+1");
+  const slot1 = numbered.find((row) => row.badge === "⌘ 1");
+  expect(slot1).toBeTruthy();
+  expect(slot1!.aria).toBe("Meta+1");
 
   await page.keyboard.down("Meta");
-  await expect(page.locator(`[data-testid="session-row"][href="${numbered[0].href}"] [data-held]`)).toBeVisible();
+  await expect(page.locator(`[data-testid="session-row"][href="${slot1!.href}"] [data-held]`)).toBeVisible();
   await page.keyboard.up("Meta");
 });

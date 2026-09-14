@@ -109,12 +109,11 @@ describe("no new default permissions", () => {
 const originalSetItem = Storage.prototype.setItem;
 
 describe("save states and rollback", () => {
-  it("shows 保存中 then 已保存 for the appearance group and persists the choice", async () => {
+  it("shows 保存中 then 已保存 for a theme change and persists it immediately", async () => {
     renderSettings(["/settings"]);
+    // Local appearance prefs commit on selection — no draft save button.
     fireEvent.click(screen.getByTestId("settings-theme-ledger"));
-    expect(screen.getByTestId("settings-appearance-save")).toBeEnabled();
 
-    fireEvent.click(screen.getByTestId("settings-appearance-save"));
     // The saving state is rendered before the persist settles.
     expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saving");
     expect(screen.getByTestId("settings-appearance-status")).toHaveTextContent("保存中");
@@ -126,8 +125,6 @@ describe("save states and rollback", () => {
     expect(saved).toHaveTextContent("已保存");
     expect(localStorage.getItem("runtime.theme.v1")).toBe("ledger");
     expect(document.documentElement.dataset.theme).toBe("ledger");
-    // Saved groups settle clean: a second save has nothing to send.
-    expect(screen.getByTestId("settings-appearance-save")).toBeDisabled();
   });
 
   it("marks a failed theme save, rolls that field back, and keeps the error visible", async () => {
@@ -139,7 +136,6 @@ describe("save states and rollback", () => {
       });
     renderSettings(["/settings"]);
     fireEvent.click(screen.getByTestId("settings-theme-ledger"));
-    fireEvent.click(screen.getByTestId("settings-appearance-save"));
     await waitFor(() =>
       expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error"),
     );
@@ -148,12 +144,13 @@ describe("save states and rollback", () => {
     // The rejected field is back at its last committed value…
     await waitFor(() => expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true"));
     expect(screen.getByTestId("settings-theme-ledger")).toHaveAttribute("aria-pressed", "false");
+    expect(document.documentElement.dataset.theme).toBe("night");
     // …and the failure is not covered by a later "saved".
     expect(failed).toHaveTextContent("失败");
     setItem.mockRestore();
   });
 
-  it("settles sibling fields that did commit even when another field rejected", async () => {
+  it("keeps a committed permission choice even when a later theme change rejects", async () => {
     const setItem = vi
       .spyOn(Storage.prototype, "setItem")
       .mockImplementation(function (this: Storage, key: string, value: string) {
@@ -161,17 +158,19 @@ describe("save states and rollback", () => {
         originalSetItem.call(this, key, value);
       });
     renderSettings(["/settings"]);
-    // Two edits in one group; only the theme write is denied.
-    fireEvent.click(screen.getByTestId("settings-theme-ledger"));
+    // The permission pref is a separate immediate commit and lands first.
     fireEvent.click(screen.getByTestId("settings-perm-acceptEdits"));
-    fireEvent.click(screen.getByTestId("settings-appearance-save"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved"),
+    );
+    expect(readDeviceSettings().permissionDefault).toBe("acceptEdits");
+    // The later theme change fails and rolls only the theme back.
+    fireEvent.click(screen.getByTestId("settings-theme-ledger"));
     await waitFor(() =>
       expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error"),
     );
-    // Theme rolls back…
-    await waitFor(() => expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true"));
-    // …but the permission choice committed and is re-read as committed.
     expect(screen.getByTestId("settings-perm-acceptEdits")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true");
     expect(readDeviceSettings().permissionDefault).toBe("acceptEdits");
     setItem.mockRestore();
   });
@@ -216,13 +215,13 @@ describe("save states and rollback", () => {
     expect(screen.getByTestId("settings-push")).toHaveAttribute("aria-pressed", "false");
   });
 
-  it("reset discards the draft and the pending status", async () => {
+  it("reset discards an unsaved identity draft and the pending status", async () => {
     renderSettings(["/settings"]);
-    fireEvent.click(screen.getByTestId("settings-perm-acceptEdits"));
-    expect(screen.getByTestId("settings-perm-manual")).toHaveAttribute("aria-pressed", "false");
-    fireEvent.click(screen.getByTestId("settings-appearance-reset"));
-    expect(screen.getByTestId("settings-perm-manual")).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByTestId("settings-appearance-save")).toBeDisabled();
+    fireEvent.change(screen.getByTestId("settings-device-name"), { target: { value: "desk-9" } });
+    expect(screen.getByTestId("settings-identity-save")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("settings-identity-reset"));
+    expect(screen.getByTestId("settings-device-name")).toHaveValue("this-device");
+    expect(screen.getByTestId("settings-identity-save")).toBeDisabled();
   });
 });
 

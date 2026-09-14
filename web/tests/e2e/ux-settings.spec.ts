@@ -56,10 +56,8 @@ test("evidence: settings groups, both themes, three widths", async ({ browser, b
   await setTheme(page, "night");
   await shot(page, "workbench-f-settings-1-groups-1440-night");
 
-  // 1440, ledger: the light theme with a completed save row.
-  await setTheme(page, "ledger");
+  // 1440, ledger: the light theme with the completed immediate-save status.
   await page.getByTestId("settings-theme-ledger").click();
-  await page.getByTestId("settings-appearance-save").click();
   await expect(page.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved");
   await shot(page, "workbench-f-settings-1-saved-1440-ledger");
 
@@ -69,6 +67,9 @@ test("evidence: settings groups, both themes, three widths", async ({ browser, b
   await broken.emulateMedia({ reducedMotion: "reduce" });
   await broken.setViewportSize({ width: 1440, height: 900 });
   await broken.addInitScript(() => {
+    // Same browser context may remember ledger from the frame above; start
+    // the failure scenario from the night default.
+    localStorage.clear();
     const original = Storage.prototype.setItem;
     Storage.prototype.setItem = function (this: Storage, key: string, value: string) {
       if (key === "runtime.theme.v1") throw new DOMException("denied", "QuotaExceededError");
@@ -76,9 +77,7 @@ test("evidence: settings groups, both themes, three widths", async ({ browser, b
     };
   });
   await broken.goto("/settings");
-  await setTheme(broken, "night");
   await broken.getByTestId("settings-theme-ledger").click();
-  await broken.getByTestId("settings-appearance-save").click();
   await expect(broken.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error");
   await shot(broken, "workbench-f-settings-1-failed-1440-night");
   await broken.close();
@@ -163,8 +162,8 @@ test.describe("settings groups and deep links", () => {
 test.describe("save states", () => {
   test("theme change runs through 保存中 and 已保存 and persists", async ({ page }) => {
     await page.goto("/settings");
+    // Appearance prefs commit immediately on selection.
     await page.getByTestId("settings-theme-ledger").click();
-    await page.getByTestId("settings-appearance-save").click();
 
     const status = page.getByTestId("settings-appearance-status");
     // The intermediate state has to be painted, not just visited in state.
@@ -190,7 +189,6 @@ test.describe("save states", () => {
     await expect(page.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true");
 
     await page.getByTestId("settings-theme-ledger").click();
-    await page.getByTestId("settings-appearance-save").click();
     const status = page.getByTestId("settings-appearance-status");
     await expect(status).toHaveAttribute("data-phase", "error");
     await expect(status).toContainText("失败");
@@ -252,9 +250,8 @@ test.describe("responsive settings", () => {
     expect(await page.evaluate(() => window.innerWidth)).toBe(720);
     await expect(page.getByTestId("settings-nav-notifications")).toBeVisible();
 
-    // A full save cycle has to complete while zoomed.
+    // A full immediate-save cycle has to complete while zoomed.
     await page.getByTestId("settings-theme-ledger").click();
-    await page.getByTestId("settings-appearance-save").click();
     await expect(page.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved");
     const dims = await page.evaluate(() => ({
       scroll: document.documentElement.scrollWidth,
@@ -294,7 +291,7 @@ test.describe("44px touch targets", () => {
     await expectMinTarget(page.getByTestId("settings-perm-manual"), "perm chip");
     await expectMinTarget(page.getByTestId("settings-effort-high"), "effort chip");
     await expectMinTarget(page.getByTestId("settings-theme-night"), "theme chip");
-    await expectMinTarget(page.getByTestId("settings-appearance-save"), "save");
+    await expectMinTarget(page.getByTestId("settings-identity-save"), "save");
   });
 
   test("settings controls keep 44px at 768 and 1440", async ({ page }) => {
@@ -305,7 +302,7 @@ test.describe("44px touch targets", () => {
         "settings-back",
         "settings-nav-appearance",
         "settings-perm-manual",
-        "settings-appearance-save",
+        "settings-identity-save",
       ] as const) {
         const box = await page.getByTestId(testId).boundingBox();
         expect(box, `${testId}@${width}`).toBeTruthy();

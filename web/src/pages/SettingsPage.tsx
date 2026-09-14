@@ -1,6 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { iosStandaloneHint, readDeviceSettings, writeDeviceSettings, type PermissionDefault } from "../features/settings";
+import {
+  iosStandaloneHint,
+  readDeviceSettings,
+  writeDeviceSettings,
+  type DeviceSettings,
+  type PermissionDefault,
+} from "../features/settings";
 import { effortTable, isEmberTier } from "../features/session/effort";
 import css from "../features/settings/settings.module.css";
 import { readAccessCode, writeAccessCode } from "../lib/accessCode";
@@ -165,8 +171,43 @@ function useGroupDraft<D extends Record<string, unknown>>(committed: D) {
   return { draft, patch, dirty, phase, message, save, reset };
 }
 
-function SaveStatus({ testId, phase, message }: { testId: string; phase: SavePhase; message: string | null }) {
-  if (phase === "idle") return null;
+/**
+ * Runner for immediate local preferences (exploration §P1-3: 本地即时偏好).
+ * A choice commits the instant it is made — there is no draft or save button
+ * in the group — but every commit still walks 保存中 → 已保存 / 失败, and a
+ * failed commit leaves the caller free to roll its optimistic value back.
+ * Newer edits supersede the status of older ones.
+ */
+function useCommitRunner() {
+  const [phase, setPhase] = useState<SavePhase>("idle");
+  const [message, setMessage] = useState<string | null>(null);
+  const seq = useRef(0);
+
+  const run = async (persist: () => void | Promise<void>): Promise<boolean> => {
+    const mine = ++seq.current;
+    setPhase("saving");
+    setMessage(null);
+    await paintFrame();
+    const started = Date.now();
+    try {
+      await persist();
+      const elapsed = Date.now() - started;
+      if (elapsed < SAVING_MIN_MS) await new Promise((resolve) => setTimeout(resolve, SAVING_MIN_MS - elapsed));
+      if (seq.current === mine) setPhase("saved");
+      return true;
+    } catch (err) {
+      if (seq.current === mine) {
+        setMessage(err instanceof Error ? err.message : String(err));
+        setPhase("error");
+      }
+      return false;
+    }
+  };
+
+  return { phase, message, run };
+}
+
+function SaveStatus({ testId, phase, message }: { testId: string; phase: SavePhase; message: string | null }) {  if (phase === "idle") return null;
   const glyph = phase === "saving" ? "◌" : phase === "saved" ? "✓" : "⚠";
   const text =
     phase === "saving" ? "保存中…" : phase === "saved" ? "已保存" : `失败${message ? `：${message}` : "，已恢复上一次的有效值"}`;
@@ -406,16 +447,11 @@ export function SettingsPage() {
     element?.focus({ preventScroll: true });
   }, [activeGroup]);
 
-  /* Group 1 — 外观与输入 (local prefs; nothing here is synced). */
-  const appearance = useGroupDraft({
-    theme,
-    compact: hub.compact,
-    permissionDefault: settings.permissionDefault,
-    defaultEffortIndex: settings.defaultEffortIndex,
-    autoRevealTty: settings.autoRevealTty,
-  });
+  /* Group 1 — 外观与输入: immediate local prefs (本地即时偏好). */
+  const appearance = useCommitRunner();
 
-  /* Group 3 — 连接与登录 identity fields (also local-only). */
+  /* Group 3 — 连接与登录 identity fields: explicit save (a name/code is text
+     the operator expects to review before it persists). */
   const identity = useGroupDraft({
     deviceName: settings.deviceName,
     accessCode: access,
@@ -430,30 +466,35 @@ export function SettingsPage() {
     else navigate("/sessions");
   };
 
-  const saveAppearance = () =>
-    appearance.save(async (next) => {
-      const failed: string[] = [];
+  const chooseTheme = (choice: ThemeChoice) =>
+    appearance.run(() => {
+      // Optimistic so the selection reads instantly; a denied write restores
+      // the last committed theme and surfaces 失败.
+      setTheme(choice);
+      applyTheme(choice);
       try {
-        writeDeviceSettings({
-          permissionDefault: next.permissionDefault,
-          defaultEffortIndex: next.defaultEffortIndex,
-          autoRevealTty: next.autoRevealTty,
-        });
-      } catch {
-        failed.push("permissionDefault", "defaultEffortIndex", "autoRevealTty");
+        writeTheme(choice);
+      } catch (err) {
+        setTheme(readTheme());
+        applyTheme(readTheme());
+        throw err;
       }
-      try {
-        writeTheme(next.theme);
-      } catch {
-        failed.push("theme");
-      }
-      hubStore.setCompact(next.compact);
-      // Re-read whichever store committed, so successful fields settle even
-      // when a sibling field rejected this save.
-      setSettings(readDeviceSettings());
-      if (!failed.includes("theme")) setTheme(next.theme);
-      if (failed.length) throw new GroupSaveError("浏览器存储不可用，设置未保存", failed);
     });
+
+  const commitDevicePrefs = (patch: Partial<DeviceSettings>) =>
+    appearance.run(() => {
+      setSettings((current) => ({ ...current, ...patch }));
+      try {
+        writeDeviceSettings(patch);
+        setSettings(readDeviceSettings());
+      } catch (err) {
+        // Roll the rejected fields back to their last committed values.
+        setSettings(readDeviceSettings());
+        throw err;
+      }
+    });
+
+  const toggleCompact = () => hubStore.setCompact(!hub.compact);
 
   const saveIdentity = () =>
     identity.save((next) => {
@@ -517,7 +558,7 @@ export function SettingsPage() {
             tabIndex={-1}
             aria-labelledby="appearance-title"
           >
-            <GroupHeading id="appearance" label="外观与输入" hint="本分组偏好只保存在此浏览器，不会同步。" />
+            <GroupHeading id="appearance" label="外观与输入" hint="本分组偏好只保存在此浏览器，不会同步；选择即时生效。" />
 
             <div className={css.section}>
               <div className={css.label}>主题</div>
@@ -529,10 +570,10 @@ export function SettingsPage() {
                   <button
                     key={choice}
                     type="button"
-                    className={`${css.chip} ${appearance.draft.theme === choice ? css.chipOn : ""}`}
+                    className={`${css.chip} ${theme === choice ? css.chipOn : ""}`}
                     data-testid={`settings-theme-${choice}`}
-                    aria-pressed={appearance.draft.theme === choice}
-                    onClick={() => appearance.patch({ theme: choice })}
+                    aria-pressed={theme === choice}
+                    onClick={() => void chooseTheme(choice)}
                   >
                     {choice === "night" ? "Night Corral" : "Ledger（浅色）"}
                   </button>
@@ -547,10 +588,10 @@ export function SettingsPage() {
                   type="button"
                   className={css.action}
                   data-testid="settings-compact"
-                  aria-pressed={appearance.draft.compact}
-                  onClick={() => appearance.patch({ compact: !appearance.draft.compact })}
+                  aria-pressed={hub.compact}
+                  onClick={toggleCompact}
                 >
-                  Compact {appearance.draft.compact ? "开" : "关"}
+                  Compact {hub.compact ? "开" : "关"}
                 </button>
               </div>
             </div>
@@ -563,10 +604,10 @@ export function SettingsPage() {
                   <button
                     key={opt.id}
                     type="button"
-                    className={`${css.chip} ${appearance.draft.permissionDefault === opt.id ? css.chipOn : ""}`}
+                    className={`${css.chip} ${settings.permissionDefault === opt.id ? css.chipOn : ""}`}
                     data-testid={`settings-perm-${opt.id}`}
-                    aria-pressed={appearance.draft.permissionDefault === opt.id}
-                    onClick={() => appearance.patch({ permissionDefault: opt.id })}
+                    aria-pressed={settings.permissionDefault === opt.id}
+                    onClick={() => void commitDevicePrefs({ permissionDefault: opt.id })}
                   >
                     {opt.label}
                   </button>
@@ -579,7 +620,7 @@ export function SettingsPage() {
               <p className={css.hint}>存序号，换 harness 后按新表就近映射。档位名保持英文。最高档为 ember。</p>
               <div className={css.row} data-testid="settings-effort">
                 {effortTable("claude").map((tier, index) => {
-                  const on = appearance.draft.defaultEffortIndex === index;
+                  const on = settings.defaultEffortIndex === index;
                   const top = isEmberTier("claude", index);
                   return (
                     <button
@@ -590,7 +631,7 @@ export function SettingsPage() {
                       data-ember={top ? "1" : "0"}
                       data-selected={on ? "1" : "0"}
                       aria-pressed={on}
-                      onClick={() => appearance.patch({ defaultEffortIndex: index })}
+                      onClick={() => void commitDevicePrefs({ defaultEffortIndex: index })}
                     >
                       {tier.name}
                     </button>
@@ -605,22 +646,15 @@ export function SettingsPage() {
                 <input
                   type="checkbox"
                   data-testid="settings-auto-reveal-tty"
-                  checked={appearance.draft.autoRevealTty}
-                  onChange={(e) => appearance.patch({ autoRevealTty: e.target.checked })}
+                  checked={settings.autoRevealTty}
+                  onChange={(e) => void commitDevicePrefs({ autoRevealTty: e.target.checked })}
                 />
                 自动切 tty（autoRevealTty）
               </label>
               <p className={css.hint}>默认关。打开后仍须 capabilities.artifact；M3 才考虑生产打开。</p>
             </div>
 
-            <SaveBar
-              testId="settings-appearance"
-              dirty={appearance.dirty}
-              phase={appearance.phase}
-              message={appearance.message}
-              onSave={() => void saveAppearance()}
-              onReset={appearance.reset}
-            />
+            <SaveStatus testId="settings-appearance-status" phase={appearance.phase} message={appearance.message} />
           </section>
 
           <section

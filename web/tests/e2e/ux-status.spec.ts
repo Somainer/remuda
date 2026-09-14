@@ -386,7 +386,10 @@ test("the live region carries status text only, never streamed transcript body",
   await expect(composer).toBeEnabled({ timeout: 20_000 });
   await composer.fill("streamed body text");
   await composer.press("Enter");
-  await expect(page.getByTestId("transcript")).toContainText("echo: streamed body text", { timeout: 20_000 });
+  // The echo round-trip is command dispatch + journal append + WS propagation;
+  // under several concurrent gates on the shared devbox it has exceeded 20s, so
+  // use the same 30s allowance hub-live gives equivalent fake-node round-trips.
+  await expect(page.getByTestId("transcript")).toContainText("echo: streamed body text", { timeout: 30_000 });
 
   // Whatever the transcript rendered, none of it was announced.
   const announced = (await region.textContent()) ?? "";

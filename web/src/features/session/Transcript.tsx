@@ -14,6 +14,28 @@ import { OpaqueRow } from "./OpaqueRow";
 import css from "./Transcript.module.css";
 import session from "./session.module.css";
 import { DEFAULT_ROW, OVERSCAN, visibleRange } from "./virtualWindow";
+import { readShowInjected, writeShowInjected } from "./injectedPref";
+import type { MessageOrigin } from "../../types/generated";
+
+/** Human-readable name for an injected origin, for the collapsed row. */
+const ORIGIN_LABEL: Record<Exclude<MessageOrigin, "human">, string> = {
+  "injected-skill": "skill",
+  "injected-command-output": "命令输出",
+  "hook-context": "hook 上下文",
+  "tool-result": "工具结果",
+  compaction: "对话压缩",
+  unknown: "未知来源",
+};
+
+/**
+ * Whether this node is text the human actually wrote.
+ *
+ * Assistant and system messages are never injections — only `user`-role
+ * records can be, because that is the role Claude files injected text under.
+ */
+function isInjected(node: TranscriptNode): boolean {
+  return node.type === "message" && node.role === "user" && node.origin !== "human";
+}
 
 export function Transcript({
   events,
@@ -28,10 +50,18 @@ export function Transcript({
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
 }) {
-  const nodes = useMemo(
+  const [showInjected, setShowInjected] = useState(readShowInjected);
+  const assembled = useMemo(
     () => compactTranscript(assembleTranscript(events, bubbles), compact),
     [events, bubbles, compact],
   );
+  // Injected records are dropped from the list rather than hidden with CSS so
+  // the virtual window measures the rows it actually draws.
+  const nodes = useMemo(
+    () => (showInjected ? assembled : assembled.filter((node) => !isInjected(node))),
+    [assembled, showInjected],
+  );
+  const injectedCount = useMemo(() => assembled.filter(isInjected).length, [assembled]);
   const [collapseTick, setCollapseTick] = useState(0);
   const [activeTurn, setActiveTurn] = useState<string | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -139,6 +169,21 @@ export function Transcript({
         <button type="button" className={ui.chip} data-testid="collapse-all" onClick={() => setCollapseTick((n) => n + 1)}>
           全部折叠
         </button>
+        {injectedCount > 0 ? (
+          <button
+            type="button"
+            className={ui.chip}
+            data-testid="toggle-injected"
+            aria-pressed={showInjected}
+            onClick={() => {
+              const next = !showInjected;
+              setShowInjected(next);
+              writeShowInjected(next);
+            }}
+          >
+            {showInjected ? `隐藏注入内容 · ${injectedCount}` : `显示注入内容 · ${injectedCount}`}
+          </button>
+        ) : null}
       </div>
       <div
         ref={scrollerRef}
@@ -239,16 +284,37 @@ function renderNode(
 ): ReactNode {
   if (node.type === "message") {
     const user = node.role === "user";
+    // Injected text keeps its place in the turn but is collapsed to a muted
+    // row: it is not the user's words, and drawing it as a "You" bubble is
+    // what made people think they had sent it themselves.
+    if (user && node.origin !== "human") {
+      const kind = ORIGIN_LABEL[node.origin] ?? node.origin;
+      return (
+        <details className={session.thought} data-testid="injected-row" data-origin={node.origin}>
+          <summary>
+            系统注入 · {kind} · {node.text.length} 字
+          </summary>
+          <p className={session.bubble}>{node.text}</p>
+        </details>
+      );
+    }
+    const streaming = node.status === "streaming";
     return (
       <section
         className={user ? session.user : session.assistant}
         data-testid={node.local ? "optimistic-bubble" : "message"}
+        data-status={node.status}
       >
         <div className={session.you}>
           {user ? "You" : node.role}
           {node.local ? ` · ${node.local.state}` : ""}
+          {/* Status order the composer and transcript share: a queued message
+              has not been sent, a streaming one is still arriving. */}
+          {node.status === "queued" ? <span className={session.stat}> · 排队中</span> : null}
+          {node.status === "interrupted" ? <span className={session.stat}> · 已打断</span> : null}
         </div>
         {node.role === "assistant" ? <MarkdownText text={node.text} /> : <p className={session.bubble}>{node.text}</p>}
+        {streaming ? <span className={session.cursor} data-testid="streaming-cursor" aria-hidden /> : null}
         {node.local?.attachments?.length ? (
           <SentAttachments attachments={node.local.attachments} />
         ) : null}

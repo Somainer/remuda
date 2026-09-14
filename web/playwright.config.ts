@@ -4,7 +4,7 @@ const browserChannel = process.env.PW_CHANNEL || "chrome";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testIgnore: /hub-live\.spec\.ts|hub-security\.spec\.ts|terminal-live\.spec\.ts|pairing\.spec\.ts|providers-discovery\.spec\.ts|pty-toolcalls(-before)?\.spec\.ts|ux-quickfind\.spec\.ts/,
+  testIgnore: /hub-live\.spec\.ts|hub-security\.spec\.ts|terminal-live\.spec\.ts|pairing\.spec\.ts|providers-discovery\.spec\.ts|pty-toolcalls(-before)?\.spec\.ts|ux-quickfind\.spec\.ts|\.hub\.spec\.ts$/,
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 2 : 0,

@@ -10,6 +10,7 @@ import { readPushStatus, subscribePush, unsubscribePush, type PushStatus } from 
 import { defaultPasskeyName, passkeyErrorText } from "../lib/passkeys";
 import { hubStore, useHub } from "../lib/store";
 import { LoginPage } from "./LoginPage";
+import { HostTuiDefaults } from "../features/settings/HostTuiDefaults";
 
 function formatPasskeyTime(iso: string | null | undefined): string {
   if (!iso) return "从未使用";
@@ -255,6 +256,8 @@ export function SettingsPage() {
         </section>
 
         <PasskeysSection />
+
+        <HostTuiDefaults hosts={hub.hosts} />
 
         <section className={css.section}>
           <div className={css.label}>推送</div>

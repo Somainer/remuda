@@ -61,3 +61,14 @@ describe("HostLaunchDefaults", () => {
     );
   });
 });
+
+
+it("saves a renderer change as the per-host default", async () => {
+  const onSave = vi.fn();
+  const user = userEvent.setup();
+  render(<HostLaunchDefaults args={undefined} binaryPath={undefined} tui="default" onSave={onSave} />);
+  expect(screen.getByTestId("host-default-tui")).toHaveValue("default");
+  await user.selectOptions(screen.getByTestId("host-default-tui"), "fullscreen");
+  await user.click(screen.getByTestId("host-default-save"));
+  expect(onSave).toHaveBeenCalledWith({ defaultLaunchArgs: null, claudeBinaryPath: null, defaultTui: "fullscreen" });
+});

@@ -41,8 +41,8 @@ export type TtyHandlers = {
   /**
    * The attached session is (or is no longer) showing a full-screen TUI.
    *
-   * Reported by the Node on attach (D-028 §4.6) rather than sniffed from the
-   * byte stream, because attaching mid-session never sees the `?1049h` that
+   * Reported by the Node on attach and on mode changes (D-028 §4.6), rather
+   * than sniffed from the byte stream: attaching mid-session never sees the `?1049h` that
    * put the terminal there. Not called at all when the Node does not report
    * it, so the caller keeps whatever default it had.
    */
@@ -231,6 +231,16 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     if (inputQueue.length) flushInput();
   };
 
+  const reportMode = (event: Record<string, unknown>) => {
+    const params = event.params && typeof event.params === "object"
+      ? event.params as Record<string, unknown>
+      : event;
+    if (typeof params.instanceId === "string" && params.instanceId !== instance.id) return;
+    const sid = extractStreamId(event);
+    if (sid && streamId && sid !== streamId) return;
+    if (typeof params.altScreen === "boolean") handlers.onAltScreen?.(params.altScreen);
+  };
+
   const handleJson = (raw: string) => {
     let msg: Record<string, unknown>;
     try {
@@ -240,7 +250,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     }
     const type = typeof msg.type === "string" ? msg.type : "";
     if (type === "tty.mode") {
-      if (typeof msg.altScreen === "boolean") handlers.onAltScreen?.(msg.altScreen);
+      reportMode(msg);
       return;
     }
     if (type === "snapshot" || type === "tty.snapshot") {
@@ -271,6 +281,10 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
         : typeof event.method === "string"
           ? event.method
           : "";
+    if (eventType === "tty.mode") {
+      reportMode(event);
+      return;
+    }
     if (eventType === "tty.frame" || type === "tty.frame") {
       const sid = extractStreamId(event) ?? extractStreamId(msg);
       if (sid) {

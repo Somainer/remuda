@@ -10,6 +10,7 @@ import { hubStore } from "../../../lib/store";
 import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
+import { TuiModeIndicator } from "./TuiModeIndicator";
 import { openTtySession, type TtySession, type TtyStatus } from "./client";
 import { binaryStringToBytes } from "./ids";
 import { LocalInput } from "./LocalInput";
@@ -78,6 +79,7 @@ export function TerminalView({
   // display. `undefined` = not reported (older Node, or the raw-ring carrier
   // which cannot know), and the wheel behaviour is then unchanged.
   const [altScreen, setAltScreen] = useState<boolean | undefined>(undefined);
+  const [hasEngagedAltScreen, setHasEngagedAltScreen] = useState(false);
   // A3: a narrow *desktop* window is still a mouse+keyboard terminal. Only a
   // coarse pointer (no hardware keyboard) should default to the local dock.
   const directInput = inputOverride?.direct ?? !coarsePointer;
@@ -163,6 +165,8 @@ export function TerminalView({
     setStatus("connecting");
     setMouseMode(term.modes.mouseTrackingMode);
     setMouseReports(true);
+    setAltScreen(undefined);
+    setHasEngagedAltScreen(false);
     setPreview("");
     setRawTail("");
     const font = createFontMeasure(host, TERMINAL_FONT_FAMILY);
@@ -334,10 +338,16 @@ export function TerminalView({
       },
       onStatus: (next, message) => {
         setStatus(next);
-        if (next === "connecting") resetStreamRef.current = true;
+        if (next === "connecting") {
+          resetStreamRef.current = true;
+          setAltScreen(undefined);
+        }
         if (next === "failed") failRef.current?.(message ?? "tty follow failed");
       },
-      onAltScreen: setAltScreen,
+      onAltScreen: (active) => {
+        setAltScreen(active);
+        if (active) setHasEngagedAltScreen(true);
+      },
     });
     sessionRef.current = session;
     generationRef.current += 1;
@@ -450,12 +460,18 @@ export function TerminalView({
       data-tty-mouse={mouseMode}
       data-tty-mouse-reports={mouseReports ? "1" : "0"}
       data-tty-fullscreen={fullscreen ? "1" : "0"}
+      data-tty-alt-screen={altScreen === undefined ? "unknown" : String(altScreen)}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
       <header className={css.toolbar}>
         <span className={css.geo} data-testid="tty-io-mode">
           {cols}×{rows} · {ioMode} · {renderer} · {mode}
         </span>
+        <TuiModeIndicator
+          altScreen={altScreen}
+          requestedTui={instance.kind === "claude" ? instance.tui : undefined}
+          hasEngagedAltScreen={hasEngagedAltScreen}
+        />
         <div className={css.seg}>
           <button
             type="button"

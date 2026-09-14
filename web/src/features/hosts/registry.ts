@@ -70,6 +70,7 @@ class HostRegistry {
             hostname: host.hostname ?? extra.hostname,
             providerBinding: host.providerBinding ?? extra.providerBinding ?? "auto",
             defaultLaunchArgs: host.defaultLaunchArgs,
+            defaultTui: host.defaultTui,
             claudeBinaryPath: host.claudeBinaryPath,
           }
         : {
@@ -90,6 +91,7 @@ class HostRegistry {
             herdr: host.herdr,
             providerBinding: host.providerBinding ?? "auto",
             defaultLaunchArgs: host.defaultLaunchArgs,
+            defaultTui: host.defaultTui,
             claudeBinaryPath: host.claudeBinaryPath,
           };
       const count = instances.filter((i) => i.hostId === host.id).length;

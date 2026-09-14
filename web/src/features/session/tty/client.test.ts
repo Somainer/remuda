@@ -150,6 +150,29 @@ describe("follow tty client", () => {
     await session.detach();
   });
 
+  it("follows live mode events on the current stream after an in-session renderer switch", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const modes: boolean[] = [];
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb04" as const };
+    const session = openTtySession(instance, {
+      onFrame: () => {}, onStatus: () => {}, onAltScreen: (mode) => modes.push(mode),
+    });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    const ws = FakeSocket.latest!;
+    ws.emitJson({ type: "snapshot", tty: { streamId: TTY_LAB_STREAM_ID } });
+    const event = (altScreen: unknown, streamId = TTY_LAB_STREAM_ID, instanceId: string = instance.id) => ({
+      type: "event", instanceId, seq: "0", event: { type: "tty.mode", params: { instanceId, streamId, altScreen } },
+    });
+    ws.emitJson(event(false));
+    ws.emitJson(event(true));
+    ws.emitJson(event(false));
+    ws.emitJson(event(true, "tty_other"));
+    ws.emitJson(event(true, TTY_LAB_STREAM_ID, "ins_other"));
+    ws.emitJson(event(null));
+    expect(modes).toEqual([false, true, false]);
+    await session.detach();
+  });
+
   it("does not require onAltScreen — an older caller keeps working", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb03" as const };

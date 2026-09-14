@@ -56,6 +56,13 @@ const created: string[] = [];
 
 test.beforeEach(async ({ page }) => {
   await login(page);
+  // The shared fake Node serves the whole serial hub suite with maxInstances 8;
+  // earlier specs already occupy slots. Raise the cap for these read-only
+  // scenarios so placement never reports PLACEMENT_UNSATISFIABLE.
+  const patched = await page.request.patch(`/v1/hosts/${await resolveHost(page)}`, {
+    data: { maxInstances: 64 },
+  });
+  expect(patched.ok(), `raise maxInstances: ${await patched.text()}`).toBe(true);
 });
 
 test.afterEach(async ({ page }) => {

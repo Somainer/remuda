@@ -106,6 +106,8 @@ describe("no new default permissions", () => {
   });
 });
 
+const originalSetItem = Storage.prototype.setItem;
+
 describe("save states and rollback", () => {
   it("shows 保存中 then 已保存 for the appearance group and persists the choice", async () => {
     renderSettings(["/settings"]);
@@ -129,9 +131,12 @@ describe("save states and rollback", () => {
   });
 
   it("marks a failed theme save, rolls that field back, and keeps the error visible", async () => {
-    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation((key) => {
-      if (key === "runtime.theme.v1") throw new Error("quota");
-    });
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key === "runtime.theme.v1") throw new Error("quota");
+        originalSetItem.call(this, key, value);
+      });
     renderSettings(["/settings"]);
     fireEvent.click(screen.getByTestId("settings-theme-ledger"));
     fireEvent.click(screen.getByTestId("settings-appearance-save"));
@@ -145,6 +150,29 @@ describe("save states and rollback", () => {
     expect(screen.getByTestId("settings-theme-ledger")).toHaveAttribute("aria-pressed", "false");
     // …and the failure is not covered by a later "saved".
     expect(failed).toHaveTextContent("失败");
+    setItem.mockRestore();
+  });
+
+  it("settles sibling fields that did commit even when another field rejected", async () => {
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key === "runtime.theme.v1") throw new Error("quota");
+        originalSetItem.call(this, key, value);
+      });
+    renderSettings(["/settings"]);
+    // Two edits in one group; only the theme write is denied.
+    fireEvent.click(screen.getByTestId("settings-theme-ledger"));
+    fireEvent.click(screen.getByTestId("settings-perm-acceptEdits"));
+    fireEvent.click(screen.getByTestId("settings-appearance-save"));
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error"),
+    );
+    // Theme rolls back…
+    await waitFor(() => expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true"));
+    // …but the permission choice committed and is re-read as committed.
+    expect(screen.getByTestId("settings-perm-acceptEdits")).toHaveAttribute("aria-pressed", "true");
+    expect(readDeviceSettings().permissionDefault).toBe("acceptEdits");
     setItem.mockRestore();
   });
 

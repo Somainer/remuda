@@ -448,9 +448,11 @@ export function SettingsPage() {
         failed.push("theme");
       }
       hubStore.setCompact(next.compact);
-      if (failed.length) throw new GroupSaveError("浏览器存储不可用，设置未保存", failed);
-      setTheme(next.theme);
+      // Re-read whichever store committed, so successful fields settle even
+      // when a sibling field rejected this save.
       setSettings(readDeviceSettings());
+      if (!failed.includes("theme")) setTheme(next.theme);
+      if (failed.length) throw new GroupSaveError("浏览器存储不可用，设置未保存", failed);
     });
 
   const saveIdentity = () =>

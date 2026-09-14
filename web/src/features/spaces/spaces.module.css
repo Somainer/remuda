@@ -2,7 +2,7 @@
 .panelHead { min-height: 48px; display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 600; gap: 8px; }
 .muted, .groupMeta, .count, .empty, .panelFoot, .tabHint { color: var(--mute); }
 .tool, .disclosure, .spaceSelect, .tabSelect, .tabClose, .drawerOpen, .drawerClose { border: 0; background: transparent; color: var(--paper); }
-.tool { min-width: 28px; min-height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 4px 6px; font-size: 12px; }
+.tool { min-width: 28px; min-height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 4px 6px; font-size: var(--text-aux); }
 .tool:hover, .sessionRow:hover, .tabClose:hover, .drawerOpen:hover { background: var(--ink-2); }
 .tool:disabled { opacity: .3; cursor: default; }
 .groups { flex: 1; overflow-y: auto; min-height: 0; padding: 8px 0; }
@@ -15,9 +15,9 @@
 .disclosure { width: 25px; flex: none; color: var(--mute); }
 .spaceSelect { display: flex; align-items: center; width: 100%; min-width: 0; gap: 10px; text-align: left; padding: 8px; font-weight: 500; }
 .spaceName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
-.count { font: 10px var(--mono); flex: none; }
+.count { font: var(--text-label) var(--mono); flex: none; }
 .blocked { color: var(--dust); }
-.groupMeta { font-size: 10px; padding: 4px 8px 2px 25px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.groupMeta { font-size: var(--text-label); padding: 4px 8px 2px 25px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .groupTools { display: flex; justify-content: flex-end; gap: 2px; }
 .sessionRow { display: flex; gap: 8px; align-items: center; min-height: 34px; padding: 6px 8px 6px 25px; color: var(--paper); font-size: 12px; box-shadow: inset 3px 0 transparent; }
 .sessionRow[data-active="true"] { background: var(--ink-2); box-shadow: inset 3px 0 var(--dust); color: var(--paper); font-weight: 700; }
@@ -33,7 +33,7 @@
 .panel[data-collapsed="true"] .panelHead { justify-content: center; padding: 6px; }
 .panel[data-collapsed="true"] .group { padding: 4px; }
 .panel[data-collapsed="true"] .spaceSelect { min-height: 44px; padding: 4px; }
-.panelFoot { border-top: 1px solid var(--line); padding: 10px 12px; font: 10px var(--mono); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; }
+.panelFoot { border-top: 1px solid var(--line); padding: 10px 12px; font: var(--text-label) var(--mono); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; }
 .empty { padding: 10px 12px; font-size: 12px; }
 .rename { display: flex; padding: 4px; gap: 4px; }
 .rename input { min-width: 0; width: 100%; padding: 5px; font-size: 12px; }
@@ -60,11 +60,13 @@
   .tab[data-revealed="true"] .tabClose { opacity: 1; background: var(--ink-2); }
 }
 .newTab { display: grid; place-items: center; min-width: 44px; flex: none; color: var(--paper); }
-.tabHint { align-self: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0 12px 0 auto; font: 10px var(--mono); }
+.tabHint { align-self: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0 12px 0 auto; font: var(--text-label) var(--mono); }
 .mobileSpaces { display: flex; border-bottom: 1px solid var(--line); background: var(--ink-0); flex: none; min-width: 0; }
 .drawerOpen { width: 44px; flex: none; border-right: 1px solid var(--line); }
 .chips { display: flex; overflow-x: auto; min-width: 0; gap: 6px; padding: 6px; }
-.chip { flex: none; min-height: 32px; border: 1px solid var(--line); border-radius: var(--radius); background: transparent; padding: 4px 10px; color: var(--mute); font-size: 12px; max-width: 210px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Space chips are the phone's primary space switcher: full 44 px targets
+   even though the glyph row sits on one strip. */
+.chip { flex: none; min-height: var(--touch); border: 1px solid var(--line); border-radius: var(--radius); background: transparent; padding: 4px 10px; color: var(--mute); font-size: var(--text-aux); max-width: 210px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: inline-flex; align-items: center; }
 .chip[aria-pressed="true"] { border-color: var(--dust); color: var(--paper); background: var(--ink-2); }
 .drawerBackdrop { position: fixed; inset: 0; z-index: 45; background: var(--scrim); }
 .drawer { width: min(340px, calc(100vw - 44px)); height: 100%; display: flex; flex-direction: column; background: var(--ink-0); border-right: 1px solid var(--line); padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
@@ -76,7 +78,8 @@
   .tab { max-width: 230px; }
   .tabClose { width: 44px; }
   .tabTitle { max-width: 126px; }
-  .drawer .tool, .drawer .disclosure, .drawer .sessionRow, .drawer .exitedHead { min-height: 44px; }
+  .drawer .tool, .drawer .disclosure, .drawer .sessionRow, .drawer .exitedHead { min-height: var(--touch); }
+  .drawer .groupHead, .drawer .spaceSelect { min-height: var(--touch); }
 }
 
 .sheetBackdrop { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-end; justify-content: center; background: var(--scrim); }
@@ -84,7 +87,7 @@
 .sheetTitle { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: var(--paper); }
 .sheetDetail { margin: 0 0 14px; font-size: 12px; color: var(--mute); }
 .sheetActions { display: flex; flex-direction: column; gap: 8px; }
-.sheetButton { min-height: 40px; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: transparent; color: var(--paper); font-size: 13px; }
+.sheetButton { min-height: var(--touch); padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: transparent; color: var(--paper); font-size: 13px; }
 .sheetButton:hover:not(:disabled) { background: var(--ink-1); }
 .sheetButton:disabled { opacity: .5; }
 .sheetPrimary { border-color: var(--dust); background: var(--dust); color: var(--on-dust); }

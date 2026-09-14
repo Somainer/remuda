@@ -11,7 +11,14 @@ export function SessionsPage({ dimmed = false }: { dimmed?: boolean }) {
       {hub.hosts.length === 0 && hub.instances.length === 0 ? (
         <div className={css.placeholder}>无主机。请添加主机。</div>
       ) : null}
-      <SessionList key={active?.id ?? "empty"} variant="full" instances={active?.instances ?? []} title={active?.name ?? "会话"} newHref={newHref} />
+      <SessionList
+        key={active?.id ?? "empty"}
+        variant="full"
+        instances={active?.instances ?? []}
+        title={active?.name ?? "会话"}
+        newHref={newHref}
+        space={active ? { id: active.id, name: active.name, hostId: active.hostId, workspaceId: active.workspaceId } : undefined}
+      />
     </div>
   );
 }

@@ -27,6 +27,10 @@ function messagePayload(value: unknown, eventId: Id): Record<string, unknown> {
     targetBlock: payload.targetBlock ?? null,
     parentToolCallId: payload.parentToolCallId ?? null,
     nativeOrigin: payload.nativeOrigin ?? unknownKnowledge("legacy journal message"),
+    // `origin` is additive (protocol §5.2, D-028 P3). A journal that predates
+    // it leaves it undefined, and the transcript reads that as the human's own
+    // words rather than hiding the message.
+    origin: payload.origin,
   };
 }
 

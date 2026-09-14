@@ -125,17 +125,20 @@ impl HookSession {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let shims = crate::launch::shim::materialize_shims_with_env(
+        let mut shims = crate::launch::shim::materialize_shims_with_env(
             &launch_dir,
             &overlay.path,
             &credential,
             shim_off,
-            // No override plumbed through this path yet: the shell-pty session
-            // builder that owns these options is in flight elsewhere. `None`
-            // is the pre-existing behaviour (search PATH), not a regression.
+            // No per-session override is supplied on the shell path yet.
+            // Native agent launches use the materializer's pinned executable.
             None,
             &shim_exports,
         )?;
+        shims.env.insert(
+            "REMUDA_HOOK_RELAY".into(),
+            options.relay_binary.to_string_lossy().into_owned(),
+        );
         Ok(Self {
             _server: server,
             overlay,
@@ -150,6 +153,17 @@ impl HookSession {
     #[must_use]
     pub fn binding(&self) -> Option<SessionBinding> {
         self.bus.binding()
+    }
+
+    /// Hook-derived turn state for the exact foreground agent, when observed.
+    #[must_use]
+    pub fn turn_active(&self, pid: i32) -> Option<bool> {
+        self.bus.turn_active(pid)
+    }
+
+    /// The PTY observed a fresh native interruption marker after cancel.
+    pub fn confirm_screen_interrupt(&self, pid: i32) {
+        self.bus.confirm_screen_interrupt(pid);
     }
 
     /// Environment additions for the PTY child, given the `PATH` it inherited.

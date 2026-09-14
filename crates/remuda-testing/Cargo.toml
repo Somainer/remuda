@@ -30,7 +30,7 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 fs2 = "0.4"
-nix = { version = "0.28", default-features = false, features = ["fs", "poll", "term"] }
+nix = { version = "0.28", default-features = false, features = ["fs", "poll", "process", "signal", "term"] }
 portable-pty.workspace = true
 remuda-driver.workspace = true
 remuda-herdr.workspace = true

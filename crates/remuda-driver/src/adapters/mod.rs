@@ -237,6 +237,10 @@ pub fn message_payload(message_id: Id, role: MessageRole, text: String) -> Obser
         target_block: Some(0),
         parent_tool_call_id: None,
         native_origin: Knowledge::NotApplicable,
+        // codex/grok completed items classify by role only; they do not
+        // distinguish skill/hook-injected user records the way the Claude
+        // transcript does, so leave origin unclassified (renders as human).
+        origin: None,
         status: ContentStatus::Complete,
     }))
 }
@@ -259,6 +263,7 @@ pub fn message_chunk(node_id: Id, revision: u64, first: bool, text: String) -> O
         target_block: Some(0),
         parent_tool_call_id: None,
         native_origin: Knowledge::NotApplicable,
+        origin: None,
         status: ContentStatus::Streaming,
     }))
 }
@@ -287,6 +292,7 @@ pub fn message_close(
         target_block: Some(0),
         parent_tool_call_id: None,
         native_origin: Knowledge::NotApplicable,
+        origin: None,
         status,
     }))
 }

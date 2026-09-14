@@ -14,9 +14,8 @@
 //!   there is no extra pid, signals and the controlling terminal go straight
 //!   to the agent, and the exit status is the agent's own.
 //! - **The user's flags win.** Their arguments are appended after ours, so
-//!   `claude --resume X` still resumes X. An explicit `--settings` of their own
-//!   suppresses ours entirely rather than being silently overridden — losing
-//!   signal is better than ignoring what the user asked for.
+//!   `claude --resume X` still resumes X. Explicit `--settings` are merged into
+//!   a private per-invocation overlay, keeping their configuration and hooks.
 //! - **It resolves the real binary by skipping itself.** The shim searches PATH
 //!   with its own directory removed, so it cannot recurse into itself, and
 //!   `command -v claude` from inside the session still reports a working path.
@@ -123,10 +122,13 @@ pub fn materialize_shims_with_env(
     let bin_dir = launch_dir.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
     set_mode(&bin_dir, 0o700)?;
+    let markers = launch_dir.join("shim-pids");
+    std::fs::create_dir_all(&markers)?;
+    set_mode(&markers, 0o700)?;
     let mut commands = Vec::new();
     for command in SHIMMED {
         let body = if *command == "claude" {
-            claude_shim(command, overlay, real_binary)
+            claude_shim(command, overlay, real_binary, &markers)
         } else {
             let exports: Vec<(&str, &str)> = shim_env
                 .iter()
@@ -263,8 +265,13 @@ unset REMUDA_SHIM_ACTIVE_{upper}
     )
 }
 
-/// The claude shim: add the overlay unless the user brought their own.
-fn claude_shim(command: &str, overlay: &Path, real_binary: Option<&Path>) -> String {
+/// The claude shim: add the overlay, merging explicit settings when present.
+fn claude_shim(
+    command: &str,
+    overlay: &Path,
+    real_binary: Option<&Path>,
+    markers: &Path,
+) -> String {
     let resolver = match real_binary {
         Some(path) => pinned_resolver(command, path),
         None => resolver(command),
@@ -279,8 +286,8 @@ fn claude_shim(command: &str, overlay: &Path, real_binary: Option<&Path>) -> Str
 {resolver}
 overlay={overlay}
 
-# An explicit --settings from the user wins outright. Overriding it would be
-# worse than losing our signal: they asked for that file.
+# Explicit settings are merged by the shipped Rust helper, with no dependency
+# on jq/python and no writes to the user's own configuration.
 user_settings=0
 for arg in "$@"; do
     case "$arg" in
@@ -292,14 +299,23 @@ case "${{REMUDA_SHIM:-on}}" in
     off|0|false|no) exec "$real_path" "$@" ;;
 esac
 
-if [ "$user_settings" = 1 ] || [ ! -f "$overlay" ]; then
+if [ ! -f "$overlay" ]; then
     exec "$real_path" "$@"
+fi
+
+# The detector can distinguish PATH/alias bypass even if Claude rewrites argv.
+# exec preserves this pid through both the merger and the real agent.
+marker_dir={markers}
+(umask 077; : > "$marker_dir/$$") || exit 1
+if [ "$user_settings" = 1 ]; then
+    exec "${{REMUDA_HOOK_RELAY:?missing Remuda hook relay}}" hook launch --overlay "$overlay" -- "$real_path" "$@"
 fi
 
 # Our flags first, the user's after, so theirs take precedence on any clash.
 exec "$real_path" --settings "$overlay" --setting-sources user,project,local "$@"
 "#,
         overlay = single_quote(&overlay.to_string_lossy()),
+        markers = single_quote(&markers.to_string_lossy()),
     )
 }
 

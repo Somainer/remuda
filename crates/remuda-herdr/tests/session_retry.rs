@@ -103,7 +103,8 @@ async fn ensure_waits_for_a_shutting_down_predecessor_then_starts_fresh() {
     let server = HerdrServer::ensure_with(
         EnsureOptions::new("remuda-node-retry-test", Some(socket_dir.clone()))
             .with_policy(fast(Duration::from_secs(20)))
-            .with_binary(remuda_testing::fake_herdr_bin()),
+            .with_binary(remuda_testing::fake_herdr_bin())
+            .with_kill_on_drop(true),
     )
     .await
     .expect("ensure recovers instead of failing");
@@ -142,7 +143,8 @@ async fn a_predecessor_that_never_exits_forces_a_suffixed_session() {
     let server = HerdrServer::ensure_with(
         EnsureOptions::new("remuda-node-stuck-test", Some(socket_dir.clone()))
             .with_policy(fast(Duration::from_millis(120)))
-            .with_binary(remuda_testing::fake_herdr_bin()),
+            .with_binary(remuda_testing::fake_herdr_bin())
+            .with_kill_on_drop(true),
     )
     .await
     .expect("a stuck predecessor must not fail the Node");

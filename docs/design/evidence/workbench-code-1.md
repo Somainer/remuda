@@ -112,6 +112,10 @@ Owner nits（verbatim intent）:
 `lucide-react` 的三个图标（tree-shake 后）；只有真出现围栏代码时才拉
 core，出现某种语言时才拉对应语法 chunk。
 
+> 注：上表是本分支相对基线 `9df9099` 的净增量。合并最新 `origin/main`
+> （批次 E/F 等已进入）后主 chunk 为 353.86 kB gzip，差异来自其它批次；
+> 懒加载的 highlight core/语法 chunk 与上表一致，仍不在主 chunk。
+
 ## 验收对照（owner nits）
 
 - 图标化、块内右上圆角浮层、低对比 hover/focus 显现、中文 tooltip、

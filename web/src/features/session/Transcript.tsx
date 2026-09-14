@@ -1,20 +1,23 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useInRouterContext, useParams } from "react-router-dom";
 import type { Observation } from "../../types/observation";
 import { MarkdownText } from "../../components/MarkdownText";
 import type { LocalBubble } from "../../lib/store";
 import { SentAttachments } from "./AttachmentChips";
 import { hubStore } from "../../lib/store";
 import ui from "../../styles/ui.module.css";
-import { assembleTranscript, compactTranscript, type TranscriptNode } from "./assemble";
+import { assembleTranscript, compactTranscript, isToolFailure, type TranscriptNode } from "./assemble";
 import { JournalBanner, type JournalUiStatus } from "./JournalBanner";
 import { ToolCard } from "./ToolCard";
 import { WorkflowTree } from "./WorkflowTree";
 import { UsageFooter } from "./UsageFooter";
 import { OpaqueRow } from "./OpaqueRow";
-import css from "./Transcript.module.css";
+import css from "./transcript.module.css";
 import session from "./session.module.css";
-import { DEFAULT_ROW, OVERSCAN, visibleRange } from "./virtualWindow";
+import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "./virtualWindow";
 import { readShowInjected, writeShowInjected } from "./injectedPref";
+import { readPosition, writePosition } from "./readingPosition";
+import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSearch";
 import type { MessageOrigin } from "../../types/generated";
 
 /** Human-readable name for an injected origin, for the collapsed row. */
@@ -37,19 +40,66 @@ function isInjected(node: TranscriptNode): boolean {
   return node.type === "message" && node.role === "user" && node.origin !== "human";
 }
 
-export function Transcript({
-  events,
-  bubbles = [],
-  compact = true,
-  journalStatus = "live",
-  onRetryJournal,
-}: {
+/** Where a node id lives in the top-level list: directly or in a compact fold. */
+type NodeLocation = { index: number; compactId: string | null };
+
+function locateNode(nodes: readonly TranscriptNode[], nodeId: string): NodeLocation | null {
+  for (let i = 0; i < nodes.length; i += 1) {
+    const node = nodes[i];
+    if (node.id === nodeId) return { index: i, compactId: null };
+    if (node.type === "compact" && node.children.some((child) => child.id === nodeId)) {
+      return { index: i, compactId: node.id };
+    }
+  }
+  return null;
+}
+
+export function Transcript(props: {
   events: Observation[];
   bubbles?: LocalBubble[];
   compact?: boolean;
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
 }) {
+  // SessionPage mounts this inside a route; standalone unit tests do not.
+  // useParams throws outside a Router, so only read it when one is present.
+  const inRouter = useInRouterContext();
+  if (inRouter) return <TranscriptWithRoute {...props} />;
+  return <TranscriptInner {...props} routeInstanceId="" />;
+}
+
+function TranscriptWithRoute(props: {
+  events: Observation[];
+  bubbles?: LocalBubble[];
+  compact?: boolean;
+  journalStatus?: JournalUiStatus;
+  onRetryJournal?: () => void;
+}) {
+  const { instanceId = "" } = useParams();
+  return <TranscriptInner {...props} routeInstanceId={instanceId} />;
+}
+
+function TranscriptInner({
+  events,
+  bubbles = [],
+  compact = true,
+  journalStatus = "live",
+  onRetryJournal,
+  routeInstanceId,
+}: {
+  events: Observation[];
+  bubbles?: LocalBubble[];
+  compact?: boolean;
+  journalStatus?: JournalUiStatus;
+  onRetryJournal?: () => void;
+  routeInstanceId: string;
+}) {
+  // Per-instance reading position/follow persistence. The id comes from the
+  // route (read by the wrapper) so SessionPage needs no new prop; tests that
+  // mount without a router simply get no persistence.
+  const instanceId = routeInstanceId;
+  const saved = useMemo(() => (instanceId ? readPosition(instanceId) : null), [instanceId]);
+
   const [showInjected, setShowInjected] = useState(readShowInjected);
   const assembled = useMemo(
     () => compactTranscript(assembleTranscript(events, bubbles), compact),
@@ -68,18 +118,80 @@ export function Transcript({
   const [viewport, setViewport] = useState(720);
   const [sizes, setSizes] = useState<number[]>([]);
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const pinRef = useRef(true);
+  // Latest scroll offset in a ref: passive-effect cleanup runs after refs are
+  // detached on unmount, so the leave-session flush cannot read the DOM.
+  const scrollTopRef = useRef(0);
+  const viewportRef = useRef(720);
+  // Per-row height used for geometry the window has not measured yet. It is
+  // seeded from the last visit's measured average and converges to this
+  // visit's average as rows mount; without it, restoring a position deep in a
+  // 2,000-row journal drifts by the difference between the 96px placeholder
+  // and real row heights.
+  const [estimate, setEstimate] = useState(saved && saved.avgRow > 0 ? saved.avgRow : DEFAULT_ROW);
+  const estimateRef = useRef(estimate);
+  useLayoutEffect(() => {
+    estimateRef.current = estimate;
+  }, [estimate]);
+  // Follow state restores from the last visit; a brand-new session pins.
+  const pinRef = useRef(saved ? saved.follow : true);
   const nodesRef = useRef(nodes);
   const sizesHold = useRef(sizes);
+  const restoredRef = useRef(false);
+  const saveTimer = useRef<number | null>(null);
+  // A scroll request toward a row whose size the window has not measured yet
+  // is declared with the scroll effects below (it can target an index or a
+  // saved scroll ratio) and refined as ResizeObserver reports real heights.
   useEffect(() => {
     sizesHold.current = sizes;
   }, [sizes]);
 
+  // --- in-transcript search -------------------------------------------------
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [selectedIdx, setSelectedIdx] = useState(-1);
+  const lastMatchRef = useRef<SearchMatch | null>(null);
+  const openButtonRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Bumped to force the compact fold holding the current hit open.
+  const [expandTick, setExpandTick] = useState(0);
+  const [compactHit, setCompactHit] = useState<{ compactId: string; childId: string } | null>(null);
+
+  const matches = useMemo(() => (searchOpen ? findMatches(nodes, query) : []), [nodes, query, searchOpen]);
+
+  // Keep the current hit on its node while streaming appends/revisions
+  // rebuild the list, instead of letting index N point at a different node.
+  useEffect(() => {
+    if (!searchOpen) return;
+    setSelectedIdx((current) => {
+      const previous = current >= 0 ? matches[current] : null;
+      return resolveSelection(matches, previous ?? lastMatchRef.current);
+    });
+  }, [matches, searchOpen]);
+  const currentMatch: SearchMatch | null = selectedIdx >= 0 ? matches[selectedIdx] ?? null : null;
+  useEffect(() => {
+    lastMatchRef.current = currentMatch;
+  }, [currentMatch]);
+
+  const hitNodes = useMemo(() => {
+    const map = new Map<string, { current: boolean; childId: string | null }>();
+    matches.forEach((match, i) => {
+      const located = locateNode(nodes, match.nodeId);
+      if (!located) return;
+      const topId = nodes[located.index].id;
+      const prev = map.get(topId);
+      map.set(topId, {
+        current: i === selectedIdx || Boolean(prev?.current),
+        childId: located.compactId ? match.nodeId : prev?.childId ?? null,
+      });
+    });
+    return map;
+  }, [matches, nodes, selectedIdx]);
+
   const settle = journalStatus !== "gap-backfill";
   const defaultFolded = collapseTick > 0;
   const range = useMemo(
-    () => visibleRange(nodes.length, sizes, scrollTop, viewport, OVERSCAN, DEFAULT_ROW),
-    [nodes.length, sizes, scrollTop, viewport],
+    () => visibleRange(nodes.length, sizes, scrollTop, viewport, OVERSCAN, estimate),
+    [nodes.length, sizes, scrollTop, viewport, estimate],
   );
 
   const setRowSize = useCallback((index: number, height: number) => {
@@ -93,12 +205,29 @@ export function Transcript({
     });
   }, []);
 
+  // Converge the unmeasured-row estimate on this visit's real average so
+  // offsets outside the window (search hits, saved position) stop drifting.
+  // While a saved position is being restored, the estimate is frozen at the
+  // previous visit's average: the rows above the anchor were estimates at
+  // save time too, so freezing reproduces their contribution exactly instead
+  // of biasing the total toward the rows this window happened to mount.
+  const restoringRef = useRef(false);
+  useLayoutEffect(() => {
+    if (restoringRef.current) return;
+    const measured = sizes.filter((h) => h > 0);
+    if (measured.length < 6) return;
+    const avg = measured.reduce((sum, h) => sum + h, 0) / measured.length;
+    setEstimate((prev) => (Math.abs(prev - avg) / prev > 0.03 ? avg : prev));
+  }, [sizes]);
+
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
     const measure = () => {
       const next = el.clientHeight;
-      setViewport(next < 32 ? 720 : next);
+      const viewport = next < 32 ? 720 : next;
+      viewportRef.current = viewport;
+      setViewport(viewport);
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
@@ -111,34 +240,190 @@ export function Transcript({
     nodesRef.current = nodes;
   }, [nodes]);
 
+  const applyOffset = useCallback((index: number, offset: number) => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const { offsets, total } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
+    const base = offsets[index] ?? 0;
+    const max = Math.max(0, total - el.clientHeight);
+    const top = Math.min(max, Math.max(0, base + offset));
+    el.scrollTop = top;
+    scrollTopRef.current = top;
+  }, []);
+
+  // Refine an estimated scroll (search hit, saved position) as the window
+  // measures the rows around it.
+  const pendingScroll = useRef<
+    | { kind: "index"; index: number; offset: number; tries: number }
+    | { kind: "restore"; anchorId: string; offset: number; tries: number }
+    | null
+  >(null);
+  useLayoutEffect(() => {
+    const el = scrollerRef.current;
+    const pending = pendingScroll.current;
+    if (!el || !pending || !nodesRef.current.length) return;
+    if (pending.kind === "restore") {
+      // Estimate a starting position from the saved average, then correct
+      // against the anchor's real DOM position once the window mounts it.
+      // Pure estimate math drifts because the sets of already-measured rows
+      // differ between visits (follow opens at the bottom, a restored visit
+      // opens at the top); a DOM-relative correction is independent of which
+      // other rows happen to have been measured.
+      const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(pending.anchorId)}"]`);
+      if (rowEl) {
+        const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - pending.offset;
+        if (Math.abs(delta) <= 2) {
+          pendingScroll.current = null;
+          restoringRef.current = false;
+          return;
+        }
+        el.scrollTop += delta;
+        scrollTopRef.current = el.scrollTop;
+      } else {
+        const index = nodesRef.current.findIndex((n) => n.id === pending.anchorId);
+        if (index >= 0) {
+          const { offsets } = rowOffsets(nodesRef.current.length, sizesHold.current, estimateRef.current);
+          const top = Math.round((offsets[index] ?? 0) + pending.offset);
+          el.scrollTop = top;
+          scrollTopRef.current = top;
+        }
+      }
+      pending.tries += 1;
+      if (pending.tries >= 24) {
+        pendingScroll.current = null;
+        restoringRef.current = false;
+      }
+      return;
+    }
+    const measured = (sizesHold.current[pending.index] ?? 0) > 0;
+    applyOffset(pending.index, pending.offset);
+    if (measured || pending.tries >= 8) {
+      pendingScroll.current = null;
+      return;
+    }
+    pending.tries += 1;
+  }, [sizes, nodes, estimate, applyOffset]);
+
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el || !pinRef.current) return;
     el.scrollTop = el.scrollHeight;
+    scrollTopRef.current = el.scrollTop;
   }, [nodes.length, sizes]);
+
+  const flushPosition = useCallback((top: number) => {
+    if (!instanceId) return;
+    const list = nodesRef.current;
+    if (!list.length) return;
+    const est = estimateRef.current;
+    const { offsets, total } = rowOffsets(list.length, sizesHold.current, est);
+    const scrollable = Math.max(0, total - viewportRef.current);
+    const index = Math.min(indexAtOffset(list.length, sizesHold.current, top, est), list.length - 1);
+    const anchorId = list[index]?.id;
+    if (!anchorId) return;
+    writePosition(instanceId, {
+      anchorId,
+      offset: Math.max(0, top - (offsets[index] ?? 0)),
+      ratio: scrollable > 0 ? Math.min(1, Math.max(0, top / scrollable)) : 0,
+      avgRow: est,
+      follow: pinRef.current,
+    });
+  }, [instanceId]);
+
+  const persistSoon = useCallback(() => {
+    if (!instanceId) return;
+    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+    const top = scrollTopRef.current;
+    saveTimer.current = window.setTimeout(() => flushPosition(top), 250);
+  }, [instanceId, flushPosition]);
+
+  // Restore the saved reading position once nodes are available, then leave
+  // the transcript to normal pin/scroll behavior.
+  useEffect(() => {
+    if (restoredRef.current || !saved || saved.follow || !nodes.length) return;
+    const located = locateNode(nodes, saved.anchorId);
+    if (!located) return;
+    pinRef.current = false;
+    restoringRef.current = true;
+    pendingScroll.current = { kind: "restore", anchorId: saved.anchorId, offset: saved.offset, tries: 0 };
+    restoredRef.current = true;
+  }, [nodes, saved]);
+
+  // Leaving the session: flush whatever the debounce has not written. The DOM
+  // ref is already detached when passive cleanup runs, so use the tracked
+  // offset and node/size refs instead of reading the element.
+  useEffect(() => {
+    return () => {
+      if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+      flushPosition(scrollTopRef.current);
+    };
+  }, [flushPosition]);
 
   const scrollToIndex = useCallback((index: number) => {
     const el = scrollerRef.current;
     if (!el || index < 0) return;
     pinRef.current = index >= nodesRef.current.length - 1;
-    let acc = 0;
-    const current = sizesHold.current;
-    for (let i = 0; i < index; i++) {
-      const sz = current[i];
-      acc += sz > 0 ? sz : DEFAULT_ROW;
-    }
-    el.scrollTop = acc;
-  }, []);
+    pendingScroll.current = { kind: "index", index, offset: 0, tries: 0 };
+    applyOffset(index, 0);
+  }, [applyOffset]);
 
   const turnIds = useMemo(
     () => nodes.filter((n) => n.type === "message").map((n) => n.id),
     [nodes],
   );
 
+  const openSearch = useCallback(() => {
+    setSearchOpen(true);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setQuery("");
+    setSelectedIdx(-1);
+    setCompactHit(null);
+    openButtonRef.current?.focus();
+  }, []);
+
+  const gotoMatch = useCallback((next: number) => {
+    const match = matches[next];
+    if (!match) return;
+    setSelectedIdx(next);
+    const located = locateNode(nodesRef.current, match.nodeId);
+    if (!located) return;
+    pinRef.current = false;
+    if (located.compactId) {
+      setCompactHit({ compactId: located.compactId, childId: match.nodeId });
+      setExpandTick((n) => n + 1);
+    } else {
+      setCompactHit(null);
+    }
+    pendingScroll.current = { kind: "index", index: located.index, offset: 0, tries: 0 };
+    applyOffset(located.index, 0);
+  }, [matches, applyOffset]);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target?.closest("textarea, input, select, [contenteditable='true']")) return;
+      const editable = Boolean(target?.closest("textarea, input, select, [contenteditable='true']"));
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f" && !event.altKey) {
+        // Browser find cannot see outside the virtual window; own it.
+        event.preventDefault();
+        openSearch();
+        return;
+      }
+      if (searchOpen && event.key === "Escape") {
+        event.preventDefault();
+        closeSearch();
+        return;
+      }
+      if (!searchOpen && event.key === "/" && !editable && !event.metaKey && !event.ctrlKey && !event.altKey && !event.isComposing) {
+        event.preventDefault();
+        openSearch();
+        return;
+      }
+      if (editable) return;
+      if (target?.closest(".xterm")) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.key !== "j" && event.key !== "k") return;
       event.preventDefault();
@@ -156,7 +441,7 @@ export function Transcript({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [activeTurn, turnIds, scrollToIndex]);
+  }, [activeTurn, turnIds, scrollToIndex, searchOpen, openSearch, closeSearch]);
 
   const atBottom = range.total - scrollTop - viewport < 64;
   const showJump = nodes.length > 0 && !atBottom;
@@ -168,6 +453,16 @@ export function Transcript({
       <div className={css.toolbar}>
         <button type="button" className={ui.chip} data-testid="collapse-all" onClick={() => setCollapseTick((n) => n + 1)}>
           全部折叠
+        </button>
+        <button
+          ref={openButtonRef}
+          type="button"
+          className={ui.chip}
+          data-testid="transcript-search-open"
+          aria-expanded={searchOpen}
+          onClick={() => (searchOpen ? closeSearch() : openSearch())}
+        >
+          搜索正文
         </button>
         {injectedCount > 0 ? (
           <button
@@ -185,6 +480,56 @@ export function Transcript({
           </button>
         ) : null}
       </div>
+      {searchOpen ? (
+        <div className={css.searchbar} role="search" aria-label="正文搜索">
+          <input
+            ref={inputRef}
+            className={css.searchInput}
+            data-testid="transcript-search-input"
+            type="text"
+            value={query}
+            placeholder="搜索已加载正文（Enter 下一项，Shift+Enter 上一项）"
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setSelectedIdx(-1);
+              lastMatchRef.current = null;
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                if (!matches.length) return;
+                const delta = event.shiftKey ? -1 : 1;
+                const base = selectedIdx < 0 ? (delta === 1 ? -1 : 0) : selectedIdx;
+                gotoMatch((base + delta + matches.length) % matches.length);
+              }
+            }}
+          />
+          <span className={css.searchCount} data-testid="transcript-search-count" aria-live="off">
+            {query.trim() ? (matches.length ? `${selectedIdx < 0 ? 0 : selectedIdx + 1}/${matches.length}` : `0/${matches.length}`) : "0/0"}
+          </span>
+          <button
+            type="button"
+            className={ui.chip}
+            data-testid="transcript-search-prev"
+            disabled={!matches.length}
+            onClick={() => gotoMatch((selectedIdx - 1 + matches.length) % matches.length)}
+          >
+            上一项
+          </button>
+          <button
+            type="button"
+            className={ui.chip}
+            data-testid="transcript-search-next"
+            disabled={!matches.length}
+            onClick={() => gotoMatch((selectedIdx + 1) % matches.length)}
+          >
+            下一项
+          </button>
+          <button type="button" className={ui.chip} data-testid="transcript-search-close" onClick={closeSearch}>
+            退出
+          </button>
+        </div>
+      ) : null}
       <div
         ref={scrollerRef}
         className={css.scroller}
@@ -192,13 +537,16 @@ export function Transcript({
         onScroll={(event) => {
           const el = event.currentTarget;
           setScrollTop(el.scrollTop);
+          scrollTopRef.current = el.scrollTop;
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          persistSoon();
         }}
       >
         <div className={css.list}>
           <div style={{ height: range.padTop }} aria-hidden />
           {slice.map((node, i) => {
             const index = range.start + i;
+            const hit = hitNodes.get(node.id);
             return (
               <TranscriptRow
                 key={node.id}
@@ -209,6 +557,10 @@ export function Transcript({
                 collapseTick={collapseTick}
                 settle={settle}
                 onSize={setRowSize}
+                searchHit={Boolean(hit)}
+                searchCurrent={Boolean(hit?.current)}
+                expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
+                hitChildId={node.type === "compact" ? compactHit?.childId ?? null : null}
               />
             );
           })}
@@ -226,6 +578,7 @@ export function Transcript({
             if (el) el.scrollTop = el.scrollHeight;
             const last = turnIds[turnIds.length - 1];
             if (last) setActiveTurn(last);
+            persistSoon();
           }}
         >
           跳到最新
@@ -243,6 +596,10 @@ function TranscriptRow({
   collapseTick,
   settle,
   onSize,
+  searchHit,
+  searchCurrent,
+  expandTick,
+  hitChildId,
 }: {
   node: TranscriptNode;
   index: number;
@@ -251,6 +608,10 @@ function TranscriptRow({
   collapseTick: number;
   settle: boolean;
   onSize: (index: number, height: number) => void;
+  searchHit: boolean;
+  searchCurrent: boolean;
+  expandTick: number;
+  hitChildId: string | null;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -262,7 +623,7 @@ function TranscriptRow({
     const ro = new ResizeObserver(report);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [index, onSize, node, collapseTick]);
+  }, [index, onSize, node, collapseTick, expandTick]);
   return (
     <div
       ref={ref}
@@ -271,16 +632,55 @@ function TranscriptRow({
       data-anchor={node.id}
       data-kind={node.type}
       data-turn-active={active ? "1" : "0"}
-      className={active ? `${css.row} ${css.rowActive}` : css.row}
+      data-search-hit={searchHit ? "1" : "0"}
+      data-search-current={searchCurrent ? "1" : "0"}
+      className={[
+        css.row,
+        active ? css.rowActive : "",
+        searchHit ? css.rowHit : "",
+        searchCurrent ? css.rowCurrent : "",
+      ].join(" ").trim()}
     >
-      {renderNode(node, { defaultFolded, collapseTick, settle })}
+      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId })}
+    </div>
+  );
+}
+
+/** A failed tool gets a visible inline tag and never obeys collapse-all. */
+function ToolRow({
+  node,
+  opts,
+}: {
+  node: Extract<TranscriptNode, { type: "tool" }>;
+  opts: { defaultFolded: boolean; collapseTick: number; settle: boolean };
+}): ReactNode {
+  const failed = isToolFailure(node);
+  const card = (
+    <ToolCard
+      key={`${node.id}:${opts.collapseTick}`}
+      driverKind={node.driverKind}
+      call={node.call}
+      result={node.result}
+      completeness={node.completeness}
+      diffState={node.diffState}
+      defaultFolded={failed ? false : opts.defaultFolded}
+      settle={opts.settle}
+    />
+  );
+  if (!failed) return card;
+  return (
+    <div className={css.failWrap} data-testid="tool-failure" data-tool-outcome={node.result?.outcome}>
+      <span className={css.failTag} data-testid="tool-failure-tag">
+        工具失败 · {node.result?.outcome === "denied" ? "已拒绝" : "失败"}
+      </span>
+      {card}
     </div>
   );
 }
 
 function renderNode(
   node: TranscriptNode,
-  opts: { defaultFolded: boolean; collapseTick: number; settle: boolean },
+  opts: { defaultFolded: boolean; collapseTick: number; settle: boolean; expandTick?: number; hitChildId?: string | null },
 ): ReactNode {
   if (node.type === "message") {
     const user = node.role === "user";
@@ -340,18 +740,7 @@ function renderNode(
     );
   }
   if (node.type === "tool") {
-    return (
-      <ToolCard
-        key={`${node.id}:${opts.collapseTick}`}
-        driverKind={node.driverKind}
-        call={node.call}
-        result={node.result}
-        completeness={node.completeness}
-        diffState={node.diffState}
-        defaultFolded={opts.defaultFolded}
-        settle={opts.settle}
-      />
-    );
+    return <ToolRow node={node} opts={opts} />;
   }
   if (node.type === "workflow") {
     return <WorkflowTree run={node.run} phases={node.phases} members={node.members} />;
@@ -361,18 +750,18 @@ function renderNode(
   }
   if (node.type === "compact") {
     return (
-      <CompactFold toolCount={node.toolCount} thoughtCount={node.thoughtCount}>
+      <CompactFold
+        toolCount={node.toolCount}
+        thoughtCount={node.thoughtCount}
+        expandTick={opts.expandTick ?? 0}
+        hitChildId={opts.hitChildId ?? null}
+      >
         {node.children.map((child) =>
           child.type === "tool" ? (
-            <ToolCard
-              key={`${child.id}:${opts.collapseTick}`}
-              driverKind={child.driverKind}
-              call={child.call}
-              result={child.result}
-              completeness={child.completeness}
-              diffState={child.diffState}
-              defaultFolded={opts.defaultFolded}
-              settle={opts.settle}
+            <ToolRow
+              key={child.id}
+              node={child}
+              opts={{ defaultFolded: opts.defaultFolded, collapseTick: opts.collapseTick, settle: opts.settle}}
             />
           ) : child.type === "thought" ? (
             <details key={child.id} className={session.thought}>
@@ -403,16 +792,24 @@ function renderNode(
 function CompactFold({
   toolCount,
   thoughtCount,
+  expandTick,
+  hitChildId,
   children,
 }: {
   toolCount: number;
   thoughtCount: number;
+  expandTick: number;
+  hitChildId: string | null;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  // A search hit inside the fold opens it and keeps it open.
+  useEffect(() => {
+    if (expandTick > 0) setOpen(true);
+  }, [expandTick]);
   return (
-    <div>
-      <button className={session.fold} data-testid="compact-fold" onClick={() => setOpen(!open)}>
+    <div data-testid="compact-fold-wrap" data-hit-child={hitChildId ?? undefined}>
+      <button className={session.fold} data-testid="compact-fold" aria-expanded={open} onClick={() => setOpen(!open)}>
         <span>▸</span>
         <span>{open ? "收起过程" : `${toolCount} 次工具 · ${thoughtCount} 段思考`}</span>
       </button>

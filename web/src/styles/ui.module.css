@@ -354,14 +354,33 @@
 }
 
 @media (max-width: 767px) {
+  /* Every action, not just the primary/danger pair, meets the 44 px touch
+     target on phones (P1-3). Desktop density is unchanged. */
+  .btn,
   .btnPrimary,
-  .btnDanger {
-    min-height: 44px;
+  .btnDanger,
+  .btnGhost {
+    min-height: var(--touch);
+  }
+
+  /* Toolbar chips (RawEvents kinds, transcript actions) are finger-operated
+     on the phone layout even though they sit at desktop density on desktop. */
+  .chip {
+    min-height: var(--touch);
+    display: inline-flex;
+    align-items: center;
   }
 
   .modal {
     padding-bottom: var(--safe-bottom);
   }
+}
+
+/* Explicit shared target for callers whose icon glyph is smaller than the
+   required hit area; additive, nothing adopts it without opting in. */
+.touchTarget {
+  min-width: var(--touch);
+  min-height: var(--touch);
 }
 
 .approval {

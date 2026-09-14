@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useNavigationType, useSearchParams } from "react-router-dom";
 import { hubStore, useHub } from "../lib/store";
 import { composing, useWorkbenchViewport } from "../lib/viewport";
 import { readNewSessionPrefs, rememberNewSessionSuccess, sortRecent } from "../lib/prefs";
@@ -18,6 +18,7 @@ import {
 } from "../lib/sessionOptions";
 import { readDeviceSettings } from "../features/settings";
 import { useNewSessionSpaceDefaults } from "../features/spaces/useNewSessionSpaceDefaults";
+import { spaceKey, spaceStore } from "../features/spaces/store";
 import {
   effortAt,
   effortCaps,
@@ -28,6 +29,14 @@ import {
   type EffortSelection,
 } from "../features/session/effort";
 import { EffortSlider } from "../features/session/EffortSlider";
+import { Sheet } from "../components/Sheet";
+import { HubHttpError } from "../lib/httpError";
+import {
+  clearNewSessionDraft,
+  draftAuthSubject,
+  loadNewSessionDraft,
+  saveNewSessionDraft,
+} from "../lib/newSessionDraft";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
@@ -53,19 +62,58 @@ import { WorkspaceRegistration } from "../features/workspaces/WorkspaceRegistrat
 import { workspaceCwd } from "../features/workspaces/path";
 import css from "./NewSessionPage.module.css";
 
-/** New Session writes the tier into the spec; the session can still change it later. */
-const EFFORT_SPEC_HINT = "写进 InstanceSpec，会话内可再改";
+/**
+ * Layout A keeps a muted helper under the effort field (composer-slider-4).
+ * Copy is user vocabulary — the InstanceSpec it writes is an implementation
+ * detail and lives with the other carrier details under 高级设置.
+ */
+const EFFORT_HELP = "会话开始后仍可在会话内调整";
+
+/** P0-3 vocabulary: the create request left the page but its result is unknown. */
+const STATUS_UNCERTAIN = "状态待确认";
 
 type CreateKind = Exclude<Kind, "generic">;
 type CwdMode = "existing" | "worktree";
+type SubmitPhase = "idle" | "creating" | "unknown";
 
 const KINDS: { id: CreateKind; label: string }[] = [
   { id: "claude", label: "Claude" },
   { id: "codex", label: "Codex" },
   { id: "grok", label: "Grok" },
   { id: "agy", label: "agy" },
-  { id: "terminal", label: "Terminal" },
+  { id: "terminal", label: "终端" },
 ];
+
+/** User-facing names for the model-source choice; raw ids stay in test ids. */
+const DELEGATION_LABELS: Record<DelegationId, string> = {
+  host: "跟随主机",
+  none: "原生登录态",
+  gateway: "网关",
+};
+
+function hostStateText(state: string | undefined, online?: boolean): string {
+  return state === "online" || state === "enrolled" || online ? "在线" : "离线";
+}
+
+/** Client-side request identity for one create attempt (P0-2.5). */
+function newClientRequestId(): string {
+  const cryptoObj = globalThis.crypto as Crypto | undefined;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") return `creq_${cryptoObj.randomUUID()}`;
+  const rand =
+    typeof globalThis.crypto?.getRandomValues === "function"
+      ? Array.from(globalThis.crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("")
+      : Math.random().toString(16).slice(2, 18);
+  return `creq_${Date.now().toString(16)}-${rand}`;
+}
+
+/**
+ * A 4xx (except 408) is a definite refusal the user can fix on the form.
+ * Anything else — aborted connection, gateway timeout, 5xx — leaves the
+ * server-side outcome unknown, and the page must not offer a second create.
+ */
+function isDefiniteFailure(err: unknown): err is HubHttpError {
+  return err instanceof HubHttpError && err.status >= 400 && err.status < 500 && err.status !== 408;
+}
 
 export function NewSessionPage() {
   const hub = useHub();
@@ -75,6 +123,9 @@ export function NewSessionPage() {
   const { mobile } = useWorkbenchViewport();
   const prefs = { ...readNewSessionPrefs(), ...useNewSessionSpaceDefaults() };
   const device = readDeviceSettings();
+  // The Hub-issued device id is the reliable draft-isolation subject. With no
+  // session (logged out / shared machine) drafts stay in tab memory only.
+  const authSubject = draftAuthSubject(hub.session);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const [prompt, setPrompt] = useState("");
   const [hostId, setHostId] = useState(params.get("host") ?? prefs.hostId);
@@ -109,13 +160,39 @@ export function NewSessionPage() {
   const [launchArgs, setLaunchArgs] = useState(prefs.launchArgs ?? "");
   const [binaryPath, setBinaryPath] = useState("");
   const [name, setName] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState<SubmitPhase>("idle");
+  // `error` is a definite, fixable refusal; `uncertain` means the create may
+  // have reached the host and must never be automatically retried.
   const [error, setError] = useState<string | null>(null);
+  const [statusChecked, setStatusChecked] = useState(false);
+  const [clientRequestId, setClientRequestId] = useState<string | null>(null);
   const [gatewayProfiles, setGatewayProfiles] = useState<ProviderProfile[]>([]);
 
-  useEffect(() => {
-    promptRef.current?.focus();
-  }, []);
+  // Where the sheet was opened from. It has an origin when the browser history
+  // already has an entry in this tab (real browser) or when the router
+  // transitioned here via PUSH (an in-app link/button). Escape/取消 then go
+  // back to that session/list; a fresh deep link falls back to this space's
+  // list.
+  const navigationType = useNavigationType();
+  const canReturnRef = useRef<boolean>(
+    navigationType === "PUSH" ||
+      (typeof window !== "undefined" &&
+        typeof window.history.state?.idx === "number" &&
+        window.history.state.idx > 0),
+  );
+  // Guards the submit async path against a second requestSubmit between renders.
+  const phaseRef = useRef<SubmitPhase>("idle");
+  phaseRef.current = phase;
+
+  const close = () => {
+    if (canReturnRef.current) {
+      navigate(-1);
+      return;
+    }
+    // Deep link with no origin: land on this space's list when we know it.
+    if (hostId && workspaceId) spaceStore.selectSpace(spaceKey(hostId, workspaceId));
+    navigate("/sessions");
+  };
 
   useEffect(() => {
     void api
@@ -170,7 +247,7 @@ export function NewSessionPage() {
   const canStart = Boolean(
     hostId &&
       !offline &&
-      !busy &&
+      phase === "idle" &&
       workspace && (cwdMode === "existing" ? existingCwd : worktreeName.trim()),
   );
   const hosts = pickerHosts;
@@ -194,10 +271,13 @@ export function NewSessionPage() {
   const plainTerminal = activeKind === "terminal";
   // D-028 §5.1: the matrix comes from the Node-reported driver inventory on
   // the host, never from a hardcoded driver table.
-  const hostMatrix: HostMatrix = {
-    cli: hostView?.cli ?? host?.cli,
-    capabilities: host?.capabilities ?? null,
-  };
+  const hostMatrix: HostMatrix = useMemo(
+    () => ({
+      cli: hostView?.cli ?? host?.cli,
+      capabilities: host?.capabilities ?? null,
+    }),
+    [hostView?.cli, host?.cli, host?.capabilities],
+  );
   const legacy = plainTerminal ? [] : legacyDrivers(activeKind as AgentKindId);
   const driver: DriverKind = plainTerminal
     ? "shell-pty"
@@ -227,91 +307,200 @@ export function NewSessionPage() {
   // Launch and remember what the picker shows, not a remembered id the
   // catalog has since stopped exposing.
   const launchModel = gatewayModel ?? model;
-  const close = () => navigate("/sessions");
+
+  const contextKey = workspace?.id ? `${authSubject ?? ""}|${hostId}|${workspace.id}` : "";
+  // Restoring is one effect behind the context switch; persistence waits for
+  // the restore render so the mount-time empty state can't overwrite the
+  // stored draft before its text is applied.
+  const [restoredKey, setRestoredKey] = useState("");
+  // Restore this context's draft once each time host/workspace/identity changes.
+  // Options the draft never stores (auth, overlay paths, argv, executable)
+  // simply keep their defaults.
+  useEffect(() => {
+    if (!hostId || !workspace?.id) return;
+    const draft = loadNewSessionDraft(authSubject, hostId, workspace.id);
+    if (draft) {
+      if (draft.prompt) setPrompt(draft.prompt);
+      if (draft.kind && KINDS.some((item) => item.id === draft.kind)) setKind(draft.kind as CreateKind);
+      if (draft.model) setModel(draft.model);
+      if (draft.permissionMode) setPermissionMode(normalizePermissionMode(draft.permissionMode));
+      if (draft.delegation) setDelegation(normalizeDelegation(draft.delegation));
+      if (draft.cwdMode === "existing" || draft.cwdMode === "worktree") setCwdMode(draft.cwdMode);
+      if (draft.cwdPath !== undefined) setCwdPath(draft.cwdPath);
+      if (draft.worktreeName !== undefined) setWorktreeName(draft.worktreeName);
+      if (draft.effortKind && draft.effortIndex !== undefined && KINDS.some((item) => item.id === draft.effortKind)) {
+        setEffort(effortAt(draft.effortKind as EffortKind, draft.effortIndex, draft.effortUltracode === true));
+      }
+    }
+    setRestoredKey(contextKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contextKey, authSubject, hostId, workspace?.id]);
+
+  // Continuously persist the body plus non-sensitive options for this
+  // context — only after that context's restore has run. Escape/取消 close
+  // over a restorable draft; only an explicit 丢弃草稿 or a confirmed create
+  // removes it.
+  useEffect(() => {
+    if (!hostId || !workspace?.id || restoredKey !== contextKey) return;
+    saveNewSessionDraft(authSubject, hostId, workspace.id, {
+      prompt,
+      kind,
+      model,
+      permissionMode,
+      delegation,
+      cwdMode,
+      cwdPath,
+      worktreeName,
+      effortKind: effort.kind,
+      effortIndex: effort.index,
+      effortUltracode: effort.ultracode === true,
+    });
+  }, [
+    restoredKey,
+    contextKey,
+    authSubject,
+    hostId,
+    workspace?.id,
+    prompt,
+    kind,
+    model,
+    permissionMode,
+    delegation,
+    cwdMode,
+    cwdPath,
+    worktreeName,
+    effort,
+  ]);
+
+  const draftHasBody = Boolean(prompt.trim() || cwdPath.trim() || worktreeName.trim());
+
+  const discardDraftAndClose = () => {
+    if (hostId && workspace?.id) clearNewSessionDraft(authSubject, hostId, workspace.id);
+    setPrompt("");
+    setCwdPath("");
+    setWorktreeName("");
+    close();
+  };
+
+  const refreshStatusOnly = async () => {
+    // Read-only reconciliation. Without a server-bound command id we do not
+    // guess which instance is ours and never navigate or create again — the
+    // list is where the user confirms whether the session appeared.
+    await hubStore.refresh().catch(() => undefined);
+    setStatusChecked(true);
+  };
 
   return (
-    <div className={css.overlay}>
-      <button type="button" className={css.scrim} aria-label="关闭遮罩" onClick={close} />
+    <Sheet
+      open
+      onClose={close}
+      variant={mobile ? "sheet" : "popover"}
+      labelledBy="new-session-title"
+      initialFocusRef={promptRef}
+      className={css.sheet}
+      testId="new-session-sheet"
+    >
       <form
-        className={css.sheet}
-        data-testid="new-session-sheet"
+        className={css.sheetForm}
+        data-client-request={clientRequestId ?? ""}
         onSubmit={(e) => {
           e.preventDefault();
-          if (!canStart) return;
-          setBusy(true);
+          if (!canStart || phaseRef.current !== "idle" || !workspace) return;
+          const requestId = newClientRequestId();
+          setClientRequestId(requestId);
+          setPhase("creating");
+          phaseRef.current = "creating";
           setError(null);
+          setStatusChecked(false);
           void (async () => {
-            let cwd = existingCwd ?? "";
-            let worktree: string | undefined;
-            if (cwdMode === "worktree") {
-              const created = await hubStore.createWorktree({
+            try {
+              let cwd = existingCwd ?? "";
+              let worktree: string | undefined;
+              if (cwdMode === "worktree") {
+                const created = await hubStore.createWorktree({
+                  hostId,
+                  workspaceId: workspace.id,
+                  name: worktreeName.trim(),
+                  base: "main",
+                });
+                cwd = created.path;
+                worktree = created.name;
+              }
+              const instance = await hubStore.create({
                 hostId,
-                workspaceId: workspace?.id,
-                name: worktreeName.trim(),
-                base: "main",
+                workspaceId: workspace.id,
+                kind: activeKind,
+                driver,
+                model: launchModel,
+                providerProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
+                permissionMode: activeKind === "claude" ? permissionMode : "bypassPermissions",
+                delegation: delegation === "host" ? undefined : delegation,
+                prompt,
+                cwd,
+                worktree,
+                settingsOverlayPath: settingsOverlayPath || undefined,
+                claudeConfigDir: claudeConfigDir || undefined,
+                maxBudgetUsd: maxBudgetUsd || undefined,
+                args: launchArgTokens.length ? launchArgTokens : undefined,
+                binaryPath: binaryPath.trim() || undefined,
+                name: name || worktree || (plainTerminal ? "terminal" : undefined),
+                effortIndex: sessionEffort.index,
+                effortName: effortWireName(sessionEffort),
               });
-              cwd = created.path;
-              worktree = created.name;
+              // The create is confirmed: this context's draft is spent.
+              clearNewSessionDraft(authSubject, hostId, workspace.id);
+              rememberNewSessionSuccess({
+                hostId,
+                workspaceId: workspace.id ?? cwd,
+                model: launchModel,
+                permissionMode,
+                driver,
+                delegation,
+                effortIndex: sessionEffort.index,
+                effortName: effortWireName(sessionEffort),
+                // Args are remembered; the executable deliberately is not. A
+                // path silently restored into a later session is the kind of
+                // thing you would not think to check before starting a run.
+                launchArgs,
+              });
+              phaseRef.current = "idle";
+              navigate(`/s/${instance.id}`);
+            } catch (err) {
+              if (isDefiniteFailure(err)) {
+                // Definite refusal: keep every input (and its draft) and let
+                // the user fix the form and submit once.
+                setError(err.message || "create failed");
+                setPhase("idle");
+                phaseRef.current = "idle";
+              } else {
+                // The request may have been created on the host. We do not
+                // know which instance is ours, so we never resend.
+                setPhase("unknown");
+                phaseRef.current = "unknown";
+              }
             }
-            const instance = await hubStore.create({
-              hostId,
-              workspaceId: workspace?.id,
-              kind: activeKind,
-              driver,
-              model: launchModel,
-              providerProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
-              permissionMode: activeKind === "claude" ? permissionMode : "bypassPermissions",
-              delegation: delegation === "host" ? undefined : delegation,
-              prompt,
-              cwd,
-              worktree,
-              settingsOverlayPath: settingsOverlayPath || undefined,
-              claudeConfigDir: claudeConfigDir || undefined,
-              maxBudgetUsd: maxBudgetUsd || undefined,
-              args: launchArgTokens.length ? launchArgTokens : undefined,
-              binaryPath: binaryPath.trim() || undefined,
-              name: name || worktree || (plainTerminal ? "terminal" : undefined),
-              effortIndex: sessionEffort.index,
-              effortName: effortWireName(sessionEffort),
-            });
-            rememberNewSessionSuccess({
-              hostId,
-              workspaceId: workspace?.id ?? cwd,
-              model: launchModel,
-              permissionMode,
-              driver,
-              delegation,
-              effortIndex: sessionEffort.index,
-              effortName: effortWireName(sessionEffort),
-              // Args are remembered; the executable deliberately is not. A
-              // path silently restored into a later session is the kind of
-              // thing you would not think to check before starting a run.
-              launchArgs,
-            });
-            navigate(`/s/${instance.id}`);
-          })()
-            .catch((err: unknown) => setError(err instanceof Error ? err.message : "create failed"))
-            .finally(() => setBusy(false));
+          })();
         }}
       >
         <div className={css.handle}>
           <div className={css.handleBar} />
         </div>
         <header className={css.head}>
-          <h1 className={css.headTitle}>新建会话</h1>
-          <button type="button" className={css.close} onClick={close} aria-label="关闭">
+          <h1 className={css.headTitle} id="new-session-title">
+            新建会话
+          </h1>
+          <button type="button" className={css.close} onClick={close} aria-label="关闭并保留草稿">
             ✕
           </button>
         </header>
         <div className={css.body}>
           <label className={css.field}>
-            <span className={css.label}>{plainTerminal ? "启动命令（可空，默认 shell）" : "提示词 · 第一焦点"}</span>
+            <span className={css.label}>{plainTerminal ? "启动命令（可空，默认打开登录 shell）" : "要做什么"}</span>
             <textarea
               ref={promptRef}
               className={css.prompt}
               data-testid="new-session-prompt"
-              autoFocus
-              placeholder={plainTerminal ? "empty = login shell in cwd/worktree" : undefined}
+              placeholder={plainTerminal ? "留空则在工作目录打开登录 shell" : "描述这次要完成的事"}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onKeyDown={(e) => {
@@ -335,15 +524,15 @@ export function NewSessionPage() {
                 >
                   {hosts.map((h) => (
                     <option key={h.id} value={h.id}>
-                      {h.label} · {h.state}
+                      {h.label} · {hostStateText(h.state, h.online)}
                       {cliSummary(h.cli) ? ` · ${cliSummary(h.cli)}` : ""}
                     </option>
                   ))}
                 </select>
               </div>
               <span className={css.hint}>
-                {host?.state === "online" || host?.online ? "在线" : host?.state}
-                {hostCli ? ` · ${hostCli}` : ""}
+                {offline ? "离线" : "在线"}
+                {hostCli ? ` · 已安装 ${hostCli}` : ""}
               </span>
             </label>
             <div className={css.field}>
@@ -363,7 +552,7 @@ export function NewSessionPage() {
                   data-testid="cwd-mode-worktree"
                   onClick={() => setCwdMode("worktree")}
                 >
-                  新 worktree from main
+                  新建 worktree
                 </button>
               </div>
               <div className={css.selectWrap}>
@@ -385,7 +574,7 @@ export function NewSessionPage() {
                   ))}
                 </select>
               </div>
-              <WorkspaceRegistration key={hostId} hostId={hostId} disabled={!hostId || offline || busy}
+              <WorkspaceRegistration key={hostId} hostId={hostId} disabled={!hostId || offline || phase !== "idle"}
                 onRegistered={(added) => { setWorkspaceId(added.id); setCwdPath(""); }} />
               {cwdMode === "existing" ? (
                 <>
@@ -408,7 +597,7 @@ export function NewSessionPage() {
                   <input
                     className={css.select}
                     data-testid="new-session-worktree-name"
-                    placeholder="name (e.g. grok-pong)"
+                    placeholder="名称，例如 feat-spill"
                     value={worktreeName}
                     onChange={(e) => setWorktreeName(e.target.value.toLowerCase())}
                   />
@@ -423,7 +612,7 @@ export function NewSessionPage() {
           </div>
           <div className={css.pair}>
             <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
-              <legend className={css.label}>运行时</legend>
+              <legend className={css.label}>执行 agent</legend>
               <div className={css.seg}>
                 {KINDS.map((k) => (
                   <button
@@ -431,7 +620,7 @@ export function NewSessionPage() {
                     type="button"
                     className={`${css.choice} ${activeKind === k.id ? css.choiceOn : ""} ${kindEnabled(k.id) ? "" : css.choiceDisabled}`}
                     data-testid={`new-session-kind-${k.id}`}
-                    disabled={!kindEnabled(k.id)}
+                    disabled={!kindEnabled(k.id) || phase !== "idle"}
                     onClick={() => {
                       if (!kindEnabled(k.id)) return;
                       setKind(k.id);
@@ -444,12 +633,14 @@ export function NewSessionPage() {
               </div>
             </fieldset>
             {plainTerminal ? (
-              <label className={css.field}>
-                <span className={css.label}>driver</span>
+              <div className={css.field}>
+                <span className={css.label}>终端</span>
+                {/* Terminal is itself the technical surface: its one carrier is
+                    named here so terminal launches are never a hidden choice. */}
                 <span className={css.hint} data-testid="new-session-terminal-driver">
-                  shell-pty · cwd/worktree 上的真实 PTY
+                  shell-pty · 在工作目录上打开真实终端，默认进入终端视图，也可切换结构化记录。
                 </span>
-              </label>
+              </div>
             ) : (
               <label className={css.field}>
                 <span className={css.label}>模型</span>
@@ -493,37 +684,6 @@ export function NewSessionPage() {
               </label>
             )}
           </div>
-          <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }} data-testid="new-session-driver-row">
-            <legend className={css.label}>驱动 · launch prefill</legend>
-            <div className={css.driverChoices}>
-              {driverChoices.map((choice) => (
-                <button
-                  key={choice.id}
-                  type="button"
-                  className={`${css.driverChoice} ${driver === choice.id ? css.driverChoiceOn : ""} ${choice.allowed ? "" : css.choiceDisabled}`}
-                  data-testid={`new-session-driver-${choice.id}`}
-                  data-default={choice.id === nativeDefault ? "1" : "0"}
-                  disabled={!choice.allowed}
-                  onClick={() => setDriverOverride(choice.id === nativeDefault ? null : choice.id)}
-                >
-                  <span className={`${css.radio} ${driver === choice.id ? css.radioOn : ""}`} />
-                  <span className={css.driverName}>{DRIVER_LABELS[choice.id]}</span>
-                  {choice.id === nativeDefault ? <span className={css.driverDefault}>默认</span> : null}
-                </button>
-              ))}
-            </div>
-            <pre className={css.launchPreview} data-testid="new-session-launch-preview">
-              {preview}
-            </pre>
-            <span className={css.hint}>
-              {driver === "shell-pty"
-                ? "Remuda 在自持 PTY 里预填 launch 命令并回车 · 终端与结构两个投影都可用"
-                : "legacy carrier · 结构化能力以该 driver 实际上报为准"}
-              {!shellPtyAllowed(hostMatrix, activeKind as AgentKindId) && !plainTerminal
-                ? " · 该主机未上报 shell-pty 可用（矩阵以 Node driverInventory 为准）"
-                : ""}
-            </span>
-          </fieldset>
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
             <legend className={css.label}>权限</legend>
             <div className={`${css.seg} ${css.permRow}`} data-testid="new-session-perm-row">
@@ -536,7 +696,6 @@ export function NewSessionPage() {
                   onClick={() => setPermissionMode(opt.id)}
                 >
                   {opt.label}
-                  <span className={css.choiceId}>{opt.id}</span>
                 </button>
               ))}
             </div>
@@ -544,7 +703,7 @@ export function NewSessionPage() {
               <div className={css.yolo} data-testid="new-session-yolo-hint">
                 <div className={css.yoloHead}>
                   <span className={css.yoloDot} />
-                  <span className={css.yoloTitle}>yolo · 该会话不再产生任何审批</span>
+                  <span className={css.yoloTitle}>绕过全部：该会话不再产生任何审批</span>
                   <label className={css.yoloAck}>
                     <input
                       type="checkbox"
@@ -556,35 +715,6 @@ export function NewSessionPage() {
                   </label>
                 </div>
                 <div className={css.yoloBody}>{YOLO_HINT}</div>
-              </div>
-            ) : null}
-            {plainTerminal ? (
-              <div className={css.yolo} data-testid="new-session-terminal-hint">
-                <div className={css.yoloHead}>
-                  <span className={css.yoloDot} />
-                  <span className={css.yoloTitle}>driver shell-pty</span>
-                </div>
-                <div className={css.yoloBody}>plain terminal · 默认打开终端 tab · 键鼠走 raw PTY</div>
-              </div>
-            ) : driver === "shell-pty" ? (
-              <div className={css.yolo} data-testid="new-session-pty-hint">
-                <div className={css.yoloHead}>
-                  <span className={css.yoloDot} />
-                  <span className={css.yoloTitle}>driver shell-pty · 原生终端</span>
-                </div>
-                <div className={css.yoloBody}>
-                  launch shim + per-session overlay · {PTY_YOLO_FLAGS[activeKind as keyof typeof PTY_YOLO_FLAGS] ?? ""} 仅在绕过全部时追加
-                </div>
-              </div>
-            ) : activeKind === "codex" || activeKind === "grok" || activeKind === "agy" ? (
-              <div className={css.yolo} data-testid="new-session-pty-hint">
-                <div className={css.yoloHead}>
-                  <span className={css.yoloDot} />
-                  <span className={css.yoloTitle}>driver generic-pty</span>
-                </div>
-                <div className={css.yoloBody}>
-                  {ptyYoloHint(activeKind)} · {PTY_YOLO_FLAGS[activeKind]}
-                </div>
               </div>
             ) : null}
           </fieldset>
@@ -599,10 +729,10 @@ export function NewSessionPage() {
             >
               {/*
                * Layout A: no card. The label row, the dotted pill spanning the
-               * same column as the 权限 row, the six stop tick labels and the
-               * spec helper all use the form's own tokens. Remounting on the
-               * harness drops the drag draft, so the pill re-snaps onto the
-               * new table instead of showing the stop the pointer left behind.
+               * same column as the 权限 row, the tick labels and the helper
+               * all use the form's own tokens. Remounting on the harness
+               * drops the drag draft, so the pill re-snaps onto the new table
+               * instead of showing the stop the pointer left behind.
                */}
               <EffortSlider
                 key={activeKind}
@@ -612,13 +742,13 @@ export function NewSessionPage() {
                 variant="inline"
                 idPrefix="new-session-effort"
                 label="effort"
-                footer={EFFORT_SPEC_HINT}
+                footer={EFFORT_HELP}
                 onChange={(next) => setEffort(next)}
               />
             </fieldset>
           ) : null}
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
-            <legend className={css.label}>Provider / 鉴权</legend>
+            <legend className={css.label}>模型来源</legend>
             <div className={css.seg}>
               {DELEGATION_OPTIONS.map((opt) => (
                 <button
@@ -628,7 +758,7 @@ export function NewSessionPage() {
                   data-testid={`new-session-delegation-${opt.id}`}
                   onClick={() => setDelegation(opt.id)}
                 >
-                  {opt.label}
+                  {DELEGATION_LABELS[opt.id]}
                 </button>
               ))}
             </div>
@@ -646,21 +776,81 @@ export function NewSessionPage() {
             ) : null}
           </fieldset>
           <div className={css.advanced}>
-            <button type="button" className={css.advancedToggle} data-testid="new-session-advanced" onClick={() => setAdvanced(!advanced)}>
-              <span>{advanced ? "▾" : "▸"}</span>
-              <span>高级 · overlay / 覆写</span>
-              <span className={css.m3}>{driver}</span>
+            <button
+              type="button"
+              className={css.advancedToggle}
+              data-testid="new-session-advanced"
+              aria-expanded={advanced}
+              onClick={() => setAdvanced(!advanced)}
+            >
+              <span aria-hidden="true">{advanced ? "▾" : "▸"}</span>
+              <span>高级设置</span>
             </button>
             {advanced ? (
               <div className={css.driverList}>
                 {plainTerminal ? (
-                  <p className={css.hint}>kind terminal · driver shell-pty · 空 prompt 打开 login shell。</p>
+                  <p className={css.hint}>
+                    终端 kind 固定由 shell-pty 承载：在 cwd/worktree 上打开真实 PTY，空启动命令打开 login shell。
+                  </p>
                 ) : (
                   <p className={css.hint}>
-                    driver {driver} · 可在上方「驱动 · launch prefill」切换；shell-pty 时 Node 按 {activeKind} recipe
-                    过 flags 白名单后拼 argv，不接受原样透传。
+                    承载方式（driver）{driver}：Node 按 {activeKind} 的启动模板过 flags 白名单后拼 argv，不接受原样透传。
                   </p>
                 )}
+                {!plainTerminal ? (
+                  <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }} data-testid="new-session-driver-row">
+                    <legend className={css.label}>承载方式 · launch prefill</legend>
+                    <div className={css.driverChoices}>
+                      {driverChoices.map((choice) => (
+                        <button
+                          key={choice.id}
+                          type="button"
+                          className={`${css.driverChoice} ${driver === choice.id ? css.driverChoiceOn : ""} ${choice.allowed ? "" : css.choiceDisabled}`}
+                          data-testid={`new-session-driver-${choice.id}`}
+                          data-default={choice.id === nativeDefault ? "1" : "0"}
+                          disabled={!choice.allowed}
+                          onClick={() => setDriverOverride(choice.id === nativeDefault ? null : choice.id)}
+                        >
+                          <span className={`${css.radio} ${driver === choice.id ? css.radioOn : ""}`} />
+                          <span className={css.driverName}>{DRIVER_LABELS[choice.id]}</span>
+                          {choice.id === nativeDefault ? <span className={css.driverDefault}>默认</span> : null}
+                        </button>
+                      ))}
+                    </div>
+                    <pre className={css.launchPreview} data-testid="new-session-launch-preview">
+                      {preview}
+                    </pre>
+                    <span className={css.hint}>
+                      {driver === "shell-pty"
+                        ? "Remuda 在自持 PTY 里预填启动命令并回车 · 终端与结构化两个视图都可用"
+                        : "旧承载方式 · 结构化能力以该承载实际上报为准"}
+                      {!shellPtyAllowed(hostMatrix, activeKind as AgentKindId)
+                        ? " · 该主机未上报 shell-pty 可用（以 Node 上报的能力清单为准）"
+                        : ""}
+                    </span>
+                    {driver === "shell-pty" ? (
+                      <div className={css.yolo} data-testid="new-session-pty-hint">
+                        <div className={css.yoloHead}>
+                          <span className={css.yoloDot} />
+                          <span className={css.yoloTitle}>shell-pty · 原生终端</span>
+                        </div>
+                        <div className={css.yoloBody}>
+                          launch shim + per-session overlay · {PTY_YOLO_FLAGS[activeKind as keyof typeof PTY_YOLO_FLAGS] ?? ""} 仅在绕过全部时追加
+                        </div>
+                      </div>
+                    ) : activeKind === "codex" || activeKind === "grok" || activeKind === "agy" ? (
+                      <div className={css.yolo} data-testid="new-session-pty-hint">
+                        <div className={css.yoloHead}>
+                          <span className={css.yoloDot} />
+                          <span className={css.yoloTitle}>generic-pty</span>
+                        </div>
+                        <div className={css.yoloBody}>
+                          {ptyYoloHint(activeKind)} · {PTY_YOLO_FLAGS[activeKind]}
+                        </div>
+                      </div>
+                    ) : null}
+                  </fieldset>
+                ) : null}
                 <label className={css.field}>
                   <span className={css.label}>settings overlay 路径</span>
                   <div className={css.selectWrap}>
@@ -731,22 +921,65 @@ export function NewSessionPage() {
             ) : null}
           </div>
           {error ? (
-            <p data-testid="new-session-error" className={css.error}>
+            <p data-testid="new-session-error" className={css.error} role="alert">
               {error}
             </p>
+          ) : null}
+          {phase === "unknown" ? (
+            <div className={css.uncertain} data-testid="new-session-unknown" role="status">
+              <p className={css.uncertainTitle}>
+                {STATUS_UNCERTAIN}
+                <span className={css.uncertainId} data-testid="new-session-client-request-id">
+                  {clientRequestId}
+                </span>
+              </p>
+              <p className={css.uncertainBody}>
+                创建请求可能已经送达主机，但结果没有确认。为避免出现第二个会话，不会自动再次创建；请刷新后到会话列表确认。
+              </p>
+              <div className={css.uncertainActions}>
+                <button type="button" className={css.checkButton} data-testid="new-session-check" onClick={refreshStatusOnly}>
+                  刷新状态
+                </button>
+                <button type="button" className={css.cancel} onClick={close}>
+                  返回列表
+                </button>
+              </div>
+              {statusChecked ? (
+                <p className={css.hint} data-testid="new-session-check-note">
+                  已刷新。若会话已创建，它会出现在列表中；在此之前不要再次提交。
+                </p>
+              ) : null}
+            </div>
           ) : null}
           {offline ? <p className={css.hint}>主机离线，不能开始。</p> : null}
         </div>
         <footer className={css.foot}>
-          <div className={css.footNote}>Provider {delegation === "host" ? "跟随主机" : delegation} · 默认全填上次成功值</div>
+          {draftHasBody ? (
+            <button
+              type="button"
+              className={css.discard}
+              data-testid="new-session-discard"
+              onClick={discardDraftAndClose}
+            >
+              丢弃草稿
+            </button>
+          ) : (
+            <span className={css.footNote}>默认选项取自上次成功创建 · 当前模型来源：{DELEGATION_LABELS[delegation]}</span>
+          )}
           <button type="button" className={css.cancel} onClick={close}>
             取消
           </button>
-          <button type="submit" className={css.start} disabled={!canStart} data-testid="new-session-start">
-            {busy ? "启动中" : "开始"}
+          <button
+            type="submit"
+            className={css.start}
+            disabled={!canStart}
+            data-testid="new-session-start"
+            data-phase={phase}
+          >
+            {phase === "creating" ? "启动中…" : phase === "unknown" ? STATUS_UNCERTAIN : "开始"}
           </button>
         </footer>
       </form>
-    </div>
+    </Sheet>
   );
 }

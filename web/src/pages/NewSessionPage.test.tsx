@@ -1,8 +1,10 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
+import { HubHttpError } from "../lib/httpError";
 import * as store from "../lib/store";
+import { clearNewSessionDraft } from "../lib/newSessionDraft";
 import { mockDb } from "../lib/mock";
 import { NewSessionPage } from "./NewSessionPage";
 
@@ -13,8 +15,40 @@ vi.mock("../lib/viewport", () => ({
 const host = { ...mockDb.hosts[0], state: "online" as const };
 const workspace = { ...mockDb.workspaces[0], id: "wsp_project", hostId: host.id, rootPath: "/home/dev/projects/app" };
 
+function Probe() {
+  const location = useLocation();
+  return (
+    <div>
+      <div data-testid="probe">{location.pathname}</div>
+      <Link to="/sessions/new" data-testid="open-new">新建</Link>
+    </div>
+  );
+}
+
+/** Render the page inside real routes so origin-return can be observed. */
+function renderAt(entries: string[]) {
+  return render(
+    <MemoryRouter initialEntries={entries} initialIndex={entries.length - 1}>
+      <Routes>
+        <Route path="/sessions/new" element={<NewSessionPage />} />
+        <Route path="/sessions" element={<Probe />} />
+        <Route path="/s/:id" element={<Probe />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+/** Open New Session the way the app does — an in-app PUSH from an origin. */
+function openFrom(origin: string) {
+  renderAt([origin]);
+  fireEvent.click(screen.getByTestId("open-new"));
+}
+
 beforeEach(() => {
   localStorage.clear();
+  // Drafts have a memory-only mode (no session in these tests); the memory map
+  // is module state, so clear the context the fixtures use between cases.
+  clearNewSessionDraft(null, host.id, workspace.id);
   vi.spyOn(api, "providerList").mockResolvedValue({ items: [] });
   vi.spyOn(store, "useHub").mockReturnValue({
     ...store.hubStore.getSnapshot(), hosts: [host], workspaces: [workspace], instances: [],
@@ -24,7 +58,7 @@ afterEach(() => vi.restoreAllMocks());
 
 it("creates with the registered ID and a cwd inside the chosen workspace", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
-  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  renderAt(["/sessions/new"]);
   expect(screen.getByTestId("new-session-cwd")).toHaveValue("");
   fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "src" } });
   fireEvent.click(screen.getByTestId("new-session-start"));
@@ -34,7 +68,7 @@ it("creates with the registered ID and a cwd inside the chosen workspace", async
 });
 
 it("blocks absolute or escaping cwd text instead of sending it to another root", () => {
-  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  renderAt(["/sessions/new"]);
   fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "~" } });
   expect(screen.getByRole("alert")).toHaveTextContent("相对子路径");
   expect(screen.getByTestId("new-session-start")).toBeDisabled();
@@ -43,7 +77,7 @@ it("blocks absolute or escaping cwd text instead of sending it to another root",
 it("creates a worktree in the selected project and uses its returned path", async () => {
   const createTree = vi.spyOn(store.hubStore, "createWorktree").mockResolvedValue({ name: "feature", path: "/home/dev/projects/app-wt/feature" });
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
-  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  renderAt(["/sessions/new"]);
   fireEvent.click(screen.getByTestId("cwd-mode-worktree"));
   expect(screen.getByTestId("new-session-workspace")).toHaveValue(workspace.id);
   fireEvent.change(screen.getByTestId("new-session-worktree-name"), { target: { value: "feature" } });
@@ -58,7 +92,7 @@ it("does not invent a root for a host with no registered workspace", () => {
   vi.mocked(store.useHub).mockReturnValue({
     ...store.hubStore.getSnapshot(), hosts: [host], workspaces: [], instances: [],
   });
-  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  renderAt(["/sessions/new"]);
   expect(screen.getByTestId("new-session-start")).toBeDisabled();
   expect(screen.getByTestId("new-session-workspace")).toHaveTextContent("添加目录");
   expect(screen.getByTestId("workspace-add")).toBeEnabled();
@@ -74,11 +108,11 @@ const cliHost = {
   ],
 };
 
-function renderWithCli() {
+function renderWithCli(entries = ["/sessions/new"]) {
   vi.mocked(store.useHub).mockReturnValue({
     ...store.hubStore.getSnapshot(), hosts: [cliHost], workspaces: [workspace], instances: [],
   });
-  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  renderAt(entries);
 }
 
 /** A host whose Node reports that it can launch agents inside its own PTY (D-028 P2 core). */
@@ -90,7 +124,7 @@ function renderWithLaunchableMatrix() {
   vi.mocked(store.useHub).mockReturnValue({
     ...store.hubStore.getSnapshot(), hosts: [launchable], workspaces: [workspace], instances: [],
   });
-  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  renderAt(["/sessions/new"]);
 }
 
 it("mounts the inline slider (layout A, no card) with the six Claude stops", () => {
@@ -106,10 +140,10 @@ it("mounts the inline slider (layout A, no card) with the six Claude stops", () 
   expect(screen.getByTestId("new-session-effort-track")).toBeInTheDocument();
   // Layout A: the label row and tick labels are present, with no card frame.
   expect(screen.getByTestId("new-session-effort-slider-panel")).toHaveAttribute("data-variant", "inline");
-  expect(screen.getByTestId("new-session-effort-foot")).toHaveTextContent(
-    "写进 InstanceSpec，会话内可再改",
-  );
-  expect(screen.getByTestId("new-session-effort")).toHaveTextContent("写进 InstanceSpec，会话内可再改");
+  // The helper stays user vocabulary; the InstanceSpec implementation name no
+  // longer appears anywhere on the New Session form.
+  expect(screen.getByTestId("new-session-effort-foot")).toHaveTextContent("会话开始后仍可在会话内调整");
+  expect(screen.getByTestId("new-session-effort")).toHaveTextContent("会话开始后仍可在会话内调整");
   // The standalone ultracode chip is gone; ultracode is the last tick.
   expect(screen.queryByTestId("new-session-effort-ultracode")).toBeNull();
 });
@@ -193,7 +227,7 @@ it("the ultracode stop is reached on the one slider and the create carries the u
   );
 });
 
-it("writes the slider's tier into the InstanceSpec it creates", async () => {
+it("writes the slider's tier into the instance it creates", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();
   const slider = screen.getByTestId("new-session-effort-slider");
@@ -230,10 +264,136 @@ it("writes the harness-native tier after a runtime switch", async () => {
   })));
 });
 
+describe("return to origin", () => {
+  it("goes back to the session it was opened from instead of always the list", () => {
+    openFrom("/s/inst_origin");
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.getByTestId("probe")).toHaveTextContent("/s/inst_origin");
+  });
+
+  it("the header close button and Escape return to the origin too", () => {
+    openFrom("/sessions");
+    fireEvent.keyDown(screen.getByTestId("new-session-sheet"), { key: "Escape" });
+    expect(screen.getByTestId("probe")).toHaveTextContent("/sessions");
+  });
+
+  it("falls back to the list for a fresh deep link with no in-app origin", () => {
+    renderAt(["/sessions/new"]);
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.getByTestId("probe")).toHaveTextContent("/sessions");
+  });
+});
+
+describe("drafts", () => {
+  it("keeps the draft when closing with Escape and restores it on reopen", async () => {
+    openFrom("/s/inst_origin");
+    fireEvent.change(screen.getByTestId("new-session-prompt"), { target: { value: "查一半的事" } });
+    fireEvent.keyDown(screen.getByTestId("new-session-sheet"), { key: "Escape" });
+    expect(screen.getByTestId("probe")).toHaveTextContent("/s/inst_origin");
+
+    // Reopen the deep link (same tab): the body is restored for this context.
+    renderAt(["/sessions/new"]);
+    await waitFor(() => expect(screen.getByTestId("new-session-prompt")).toHaveValue("查一半的事"));
+  });
+
+  it("explicit 丢弃草稿 clears it before returning", async () => {
+    openFrom("/s/inst_origin");
+    fireEvent.change(screen.getByTestId("new-session-prompt"), { target: { value: "不要了" } });
+    fireEvent.click(screen.getByTestId("new-session-discard"));
+    expect(screen.getByTestId("probe")).toHaveTextContent("/s/inst_origin");
+
+    renderAt(["/sessions/new"]);
+    await waitFor(() => expect(screen.getByTestId("new-session-prompt")).toHaveValue(""));
+  });
+});
+
+describe("first layer uses user vocabulary", () => {
+  const IMPLEMENTATION_WORDS = [
+    "InstanceSpec",
+    "driver",
+    "Driver",
+    "carrier",
+    "shell-pty",
+    "claude-print",
+    "claude-pty",
+    "generic-pty",
+    "PTY",
+    "provider",
+    "Provider",
+  ];
+
+  it("hides carrier and implementation ids behind 高级设置 on the default claude form", () => {
+    renderWithCli();
+    const sheet = screen.getByTestId("new-session-sheet");
+    // User-facing first layer: what / where / which agent / permission.
+    expect(sheet).toHaveTextContent("要做什么");
+    expect(sheet).toHaveTextContent("工作目录");
+    expect(sheet).toHaveTextContent("执行 agent");
+    expect(sheet).toHaveTextContent("权限");
+    expect(sheet).toHaveTextContent("模型来源");
+    for (const word of IMPLEMENTATION_WORDS) {
+      expect(sheet.textContent).not.toContain(word);
+    }
+    // The driver matrix moves into 高级设置 and is reachable from there.
+    expect(screen.queryByTestId("new-session-driver-row")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    expect(screen.getByTestId("new-session-driver-row")).toBeInTheDocument();
+    expect(sheet.textContent).toContain("shell-pty");
+  });
+
+  it("names the one terminal carrier on the terminal surface", () => {
+    renderWithCli();
+    fireEvent.click(screen.getByTestId("new-session-kind-terminal"));
+    expect(screen.getByTestId("new-session-terminal-driver")).toHaveTextContent("shell-pty");
+  });
+});
+
+describe("idempotent submit when the ACK is unknown", () => {
+  it("shows 状态待确认 and never issues a second create", async () => {
+    const create = vi
+      .spyOn(store.hubStore, "create")
+      .mockRejectedValue(new TypeError("network error: response lost"));
+    renderAt(["/sessions/new"]);
+    fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "src" } });
+    fireEvent.click(screen.getByTestId("new-session-start"));
+
+    const unknown = await screen.findByTestId("new-session-unknown");
+    expect(unknown).toHaveAttribute("role", "status");
+    expect(unknown).toHaveTextContent("状态待确认");
+    // One attempt only...
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    // ...and the primary action can not start a second one.
+    expect(screen.getByTestId("new-session-start")).toBeDisabled();
+    const form = screen.getByTestId("new-session-sheet").querySelector("form")!;
+    fireEvent.submit(form);
+    await Promise.resolve();
+    expect(create).toHaveBeenCalledTimes(1);
+    // The client request id is shown so the attempt can be reconciled manually.
+    expect(screen.getByTestId("new-session-client-request-id").textContent).toMatch(/^creq_/);
+  });
+
+  it("treats a definite 4xx refusal as a fixable error and allows one corrected submit", async () => {
+    const create = vi
+      .spyOn(store.hubStore, "create")
+      .mockRejectedValueOnce(new HubHttpError(422, "PLACEMENT_UNSATISFIABLE", "主机没有空闲实例槽位"))
+      .mockResolvedValueOnce(mockDb.instances[0]);
+    renderAt(["/sessions/new"]);
+    fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "src" } });
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    const error = await screen.findByTestId("new-session-error");
+    expect(error).toHaveTextContent("主机没有空闲实例槽位");
+    expect(screen.queryByTestId("new-session-unknown")).toBeNull();
+    expect(screen.getByTestId("new-session-start")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+  });
+});
+
 describe("D-028 native PTY default", () => {
   it("offers 原生终端 shell-pty as the default for claude and creates with it", async () => {
     const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
     renderWithLaunchableMatrix();
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
     const row = screen.getByTestId("new-session-driver-shell-pty");
     expect(row).toHaveAttribute("data-default", "1");
     expect(screen.getByTestId("new-session-launch-preview")).toHaveTextContent(/claude/);
@@ -245,6 +405,7 @@ describe("D-028 native PTY default", () => {
 
   it("keeps claude-print selectable as a secondary choice", () => {
     renderWithLaunchableMatrix();
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
     const print = screen.getByTestId("new-session-driver-claude-print");
     expect(print).toHaveAttribute("data-default", "0");
     fireEvent.click(print);
@@ -263,7 +424,8 @@ describe("D-028 native PTY default", () => {
       workspaces: [workspace],
       instances: [],
     });
-    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    renderAt(["/sessions/new"]);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
     const shell = screen.getByTestId("new-session-driver-shell-pty");
     expect(shell).toBeDisabled();
     expect(shell).toHaveAttribute("data-default", "0");
@@ -282,8 +444,9 @@ describe("D-028 native PTY default", () => {
       workspaces: [workspace],
       instances: [],
     });
-    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    renderAt(["/sessions/new"]);
     fireEvent.click(screen.getByTestId("new-session-kind-grok"));
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
     expect(screen.getByTestId("new-session-driver-generic-pty")).toHaveAttribute("data-default", "1");
     expect(screen.getByTestId("new-session-driver-shell-pty")).toBeDisabled();
   });
@@ -292,7 +455,7 @@ describe("D-028 native PTY default", () => {
 describe("特殊参数 and claude 可执行文件", () => {
   it("splits args on whitespace into an argv array rather than sending a shell string", async () => {
     const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
-    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    renderAt(["/sessions/new"]);
     fireEvent.click(screen.getByTestId("new-session-advanced"));
     fireEvent.change(screen.getByTestId("new-session-args"), {
       target: { value: "  --effort   high --ide " },
@@ -317,7 +480,7 @@ describe("特殊参数 and claude 可执行文件", () => {
 
   it("omits both fields when they are blank so the host default still applies", async () => {
     const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
-    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    renderAt(["/sessions/new"]);
     fireEvent.click(screen.getByTestId("new-session-advanced"));
     fireEvent.change(screen.getByTestId("new-session-args"), { target: { value: "   " } });
     fireEvent.click(screen.getByTestId("new-session-start"));
@@ -331,7 +494,7 @@ describe("特殊参数 and claude 可执行文件", () => {
 
   it("remembers args across sessions but never the executable", async () => {
     const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
-    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    renderAt(["/sessions/new"]);
     fireEvent.click(screen.getByTestId("new-session-advanced"));
     fireEvent.change(screen.getByTestId("new-session-args"), { target: { value: "--effort high" } });
     fireEvent.change(screen.getByTestId("new-session-binary"), {
@@ -353,7 +516,7 @@ describe("特殊参数 and claude 可执行文件", () => {
       workspaces: [workspace],
       instances: [],
     });
-    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    renderAt(["/sessions/new"]);
     fireEvent.click(screen.getByTestId("new-session-advanced"));
     // Typing over a prefilled default would turn an operator's host-level
     // choice into a session value, and the Hub merges the two differently.

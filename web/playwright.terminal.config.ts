@@ -36,7 +36,8 @@ export default defineConfig({
       name: "chromium",
       use: {
         ...devices["Desktop Chrome"],
-        ...(process.env.CI ? {} : { channel: "chrome" as const }),
+        // Google Chrome locally; bundled Chromium on CI or when PW_CHANNEL=chromium (hosts without Chrome).
+        ...(process.env.CI || process.env.PW_CHANNEL === "chromium" ? {} : { channel: "chrome" as const }),
       },
     },
   ],

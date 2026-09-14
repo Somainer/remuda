@@ -396,9 +396,11 @@ async fn fake_node(
                 // D-028 §6: a steer/queue send happens mid-turn; report the
                 // native agent status so the web composer projects working.
                 if params.get("mode").and_then(Value::as_str) == Some("new-turn") {
-                    append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                 } else {
-                    append_n = append_native_status(&mut ws, &instance_id, append_n, "working").await?;
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "working").await?;
                 }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }

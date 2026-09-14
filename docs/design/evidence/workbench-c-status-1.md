@@ -132,16 +132,30 @@ e2e `a blocking error stays visible after a later success` 现在直接比较两
 | `pnpm --dir web lint` | 我的文件 0 warning |
 | `pnpm --dir web exec tsc -b` | 0 error |
 | `./scripts/ci/secret-scan.sh` | pass |
-| `pnpm --dir web run test:e2e:hub` | 见 §7 |
+| `pnpm --dir web run test:e2e:hub` | 21 passed / 1 failed（失败项为既有 `providers-discovery`，见 §7） |
 
 ## 7 e2e 实跑（fake node）
 
 `web/tests/e2e/ux-status.spec.ts`，8 个用例，已加进
 `playwright.hub.config.ts` 的 `testMatch`（不加就会被静默跳过）。
 
+**最后一轮结果：21 passed / 1 failed / 1 skipped，本 spec 的 8 个用例全通过**，
+唯一失败的是 `providers-discovery`（见下）。逐条：
+
+| 用例 | 验收点 |
+|---|---|
+| a blocking error stays visible after a later success | 阻断错误不被后续成功覆盖；两个 `boundingBox` 不相交；只有显式关闭才消失 |
+| the standing error area survives a reload… | 通知是客户端状态，刷新后为空——**如实断言，不假装持久化** |
+| disconnect… refresh sends no native action | 断线后刷新，原生动作计数增量为 0 |
+| slow ack… never reads as success | written-but-unconfirmed 窗口内不出现「本轮已结束」，且不二次发送 |
+| rejection… does not auto-resend | 409 后不出现「本轮已结束」，2 秒内计数不变 |
+| delayed purge… reported as pending | `nodePurge: "node-offline"` ≠ `purged` |
+| the live region carries status text only | 正文进 transcript，播报区不含 `echo:`；transcript `aria-live="off"` |
+| a burst… announced once | 真实浏览器里轮询播报区，不同取值 ≤ 2 |
+
 fake node 自身无法产生的故障——被拒绝的命令、`nodePurge !== "purged"` 的删除——
 用 `page.route` 在 HTTP 边界注入，这样被测的仍然是 Hub 契约，
-也不需要改 Rust。断线用 `route.abort` 模拟，慢确认用挂起的响应模拟。
+也不需要改 Rust。断线用 `route.abort` 模拟，慢确认用延迟 `fulfill` 模拟。
 
 「刷新不新增原生动作」是**可测量**的：`recordNativeActions()` 统计所有打到
 `/commands`、`/input`、`/interrupt`、`/interactions/*/answer` 的写请求，

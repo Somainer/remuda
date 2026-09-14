@@ -241,7 +241,31 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
             "--dialect-version modern is only defined for --kind claude".into(),
         ));
     }
-    let scenario = match &opts.script_path {
+    // Test-only environment knobs. They let the binary run installed under a
+    // different argv[0] (a `claude` symlink the Remuda materializer pinned)
+    // while still selecting the modern dialect, scenario and event log the
+    // latency test needs — the materializer builds argv itself, so these cannot
+    // arrive as flags. The names deliberately avoid the `REMUDA_` prefix:
+    // that whole namespace is stripped from instance env by the child env
+    // allowlist, and these are test doubles, not Remuda config. Explicit CLI
+    // flags always win.
+    let env_dialect = std::env::var("FAKE_HARNESS_DIALECT_VERSION")
+        .ok()
+        .map(|raw| DialectVersion::parse(raw.trim()))
+        .transpose()
+        .map_err(RunError::Args)?;
+    let dialect_version = if opts.dialect_version.is_modern() {
+        opts.dialect_version
+    } else {
+        env_dialect.unwrap_or(opts.dialect_version)
+    };
+    let script_path = opts
+        .script_path
+        .or_else(|| std::env::var_os("FAKE_HARNESS_SCRIPT").map(PathBuf::from));
+    let events_path = opts
+        .events_path
+        .or_else(|| std::env::var_os("FAKE_HARNESS_EVENTS_OUT").map(PathBuf::from));
+    let scenario = match &script_path {
         Some(path) => Scenario::load(path).map_err(RunError::Args)?,
         None => default_scenario(),
     };
@@ -296,7 +320,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         None => ArtifactSet::create(artifact_kind, &home, meta.clone(), &clock)?,
     };
 
-    let events_file = match &opts.events_path {
+    let events_file = match &events_path {
         Some(path) => Some(OpenOptions::new().create(true).append(true).open(path)?),
         None => None,
     };
@@ -307,7 +331,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         .unwrap_or_else(|| "work".into());
     let mut view = View::new(dialect, model.clone(), dir_name);
     view.alt_screen = !opts.no_alt_screen;
-    view.dialect_version = opts.dialect_version;
+    view.dialect_version = dialect_version;
     if dialect == Dialect::Codex && !resuming {
         view.transcript
             .push(format!(">_ OpenAI Codex (v{})", dialect.version()));
@@ -626,6 +650,13 @@ impl Engine {
     fn event(&mut self, name: &str, extra: Value) {
         if let Some(file) = self.events_file.as_mut() {
             let mut record = json!({ "t_ms": self.clock.ms(), "event": name });
+            // Real wall-clock epoch millis alongside the deterministic clock,
+            // so an external driver can measure hook→journal latency against
+            // the journal's own UTC timestamps. The deterministic `t_ms`
+            // advances by the same real sleeps but on a fixed epoch.
+            if let Some(wall) = wall_ms() {
+                record["wallMs"] = json!(wall);
+            }
             if let (Some(obj), Some(extra)) = (record.as_object_mut(), extra.as_object()) {
                 for (key, value) in extra {
                     obj.insert(key.clone(), value.clone());
@@ -635,6 +666,14 @@ impl Engine {
             let _ = file.flush();
         }
     }
+}
+
+/// Current Unix epoch milliseconds on the real wall clock, if available.
+fn wall_ms() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,6 +1445,12 @@ impl Engine {
                 let streamed = self.turn.as_ref().unwrap().streamed_text.clone();
                 self.show_assistant_text(&streamed);
                 let message_id = self.claude_message_id();
+                // Timing anchor immediately before the MessageDisplay relay:
+                // the harness-side edge the latency budget is measured from.
+                self.event(
+                    "message_hook",
+                    json!({ "index": index, "final": left == 1 }),
+                );
                 self.fire_hook(
                     HookEvent::MessageDisplay,
                     json!({
@@ -1549,6 +1594,12 @@ impl Engine {
             "transcript_path": self.paths.main.to_string_lossy(),
             "transcriptPath": self.paths.main.to_string_lossy()
         });
+        // Timing anchor immediately before the PreToolUse relay: the
+        // harness-side tool start the latency budget is measured from.
+        self.event(
+            "tool_start_hook",
+            json!({ "toolUseId": tool_id, "toolName": tool.name }),
+        );
         let outcome = self.fire_hook(HookEvent::PreToolUse, extra);
         self.pre_tool_decision = outcome
             .decision
@@ -1740,6 +1791,11 @@ impl Engine {
                         tool.is_error(),
                     );
                     self.artifacts.append(record)?;
+                    // Timing anchor immediately before the PostToolUse relay.
+                    self.event(
+                        "tool_finish_hook",
+                        json!({ "toolUseId": tool_id, "toolName": tool.name }),
+                    );
                     self.fire_hook(
                         HookEvent::PostToolUse,
                         json!({
@@ -1943,6 +1999,9 @@ impl Engine {
                 )?;
             }
         }
+        // Timing anchor immediately before the Stop relay runs: it is the
+        // harness-side edge the latency test measures the journal against.
+        self.event("stop_hook", json!({}));
         self.fire_hook(
             HookEvent::Stop,
             json!({

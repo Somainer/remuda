@@ -17,6 +17,7 @@
 //!   re-capture.
 
 use crate::event::HookEvent;
+use crate::live::Phase;
 use remuda_protocol::{
     Completeness, Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle, ObservationPayload,
     Severity,
@@ -39,6 +40,15 @@ pub enum MappedKind {
     /// `Notification` / `PermissionRequest` / `Elicitation`: the agent wants a
     /// human. Observed only in P1; no answer is sent.
     InteractionObserved,
+    /// `PreToolUse`: a tool is about to run.
+    ToolStarted,
+    /// `PostToolUse` / `PostToolBatch`: a tool finished.
+    ToolFinished,
+    /// `PostToolUseFailure`: a tool finished with an error.
+    ///
+    /// Not registered by the overlay yet (design §3.1): the classify arm is
+    /// real but inert until c-hookgap registers the event.
+    ToolFailed,
     /// Tool activity and anything else: journaled, no state change.
     Diagnostic,
 }
@@ -199,6 +209,28 @@ fn classify(event: &HookEvent) -> (MappedKind, LifecycleTopic, &'static str, Sev
             "waiting",
             Severity::Info,
         ),
+        // Tool events keep the inert `"observed"` status on purpose: they are
+        // intra-turn progress, never turn boundaries (D-6), so `hook_activity`
+        // and `InteractionRuntime::ingest` see exactly what they saw before.
+        // The live layer gives them real payloads from a second emission.
+        "PreToolUse" => (
+            MappedKind::ToolStarted,
+            LifecycleTopic::Diagnostic,
+            "observed",
+            Severity::Info,
+        ),
+        "PostToolUse" | "PostToolBatch" => (
+            MappedKind::ToolFinished,
+            LifecycleTopic::Diagnostic,
+            "observed",
+            Severity::Info,
+        ),
+        "PostToolUseFailure" => (
+            MappedKind::ToolFailed,
+            LifecycleTopic::Diagnostic,
+            "observed",
+            Severity::Info,
+        ),
         // SubagentStop reaches us only if something registers it; it is never
         // turn evidence, so it lands as an inert diagnostic.
         _ => (
@@ -208,6 +240,27 @@ fn classify(event: &HookEvent) -> (MappedKind, LifecycleTopic, &'static str, Sev
             Severity::Info,
         ),
     }
+}
+
+/// The live [`Phase`] a classified event opens, if any (design §2.2).
+///
+/// `SessionStart` / `SessionEnd` / `SubagentStop` and unknown events have no
+/// phase: a phase nobody produces is absent, and the projection latches the
+/// previous one instead of collapsing to idle. `thinking` and `tool-output`
+/// have no claude channel and are intentionally unreachable here.
+#[must_use]
+pub fn phase(_event: &HookEvent, kind: MappedKind) -> Option<Phase> {
+    Some(match kind {
+        MappedKind::TurnStarted => Phase::PromptAccepted,
+        MappedKind::TurnEnded => Phase::TurnEnded,
+        MappedKind::InteractionObserved => Phase::Blocked,
+        MappedKind::MessageDelta => Phase::TextStreaming,
+        MappedKind::ToolStarted => Phase::ToolStarted,
+        MappedKind::ToolFinished | MappedKind::ToolFailed => Phase::ToolFinished,
+        MappedKind::SessionStarted | MappedKind::SessionEnded | MappedKind::Diagnostic => {
+            return None;
+        }
+    })
 }
 
 #[cfg(test)]

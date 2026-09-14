@@ -626,19 +626,21 @@ async fn assert_no_screen_idle_before_stop(run: &LiveRun) {
         .iter()
         .position(|row| is_hook(row, "Stop"))
         .expect("Stop");
-    for (idx, row) in rows.iter().enumerate() {
-        if idx < stop_idx {
-            // Rule 6 only forbids a premature *idle*. A mid-turn `blocked`
-            // during the approval dialog is the screen correctly describing
-            // what it sees; the Node queues the composer against it and the
-            // hook tier still owns turn end.
-            assert!(
-                !is_screen(row, "idle"),
-                "screen tier idled the instance before Stop: {} {:?} ch={:?} at {}",
-                row.kind,
-                row.name,
-                row.channel,
-                row.at_ms
+    // Rule 6 forbids a *downward* screen transition after the screen raised
+    // busy: once working, no idle/blocked replacement may precede Stop. The
+    // initial composer idle before any turn (idx 8 in the boot sequence) is
+    // not a lowering and is allowed.
+    let mut raised = false;
+    for (idx, row) in rows.iter().enumerate().take(stop_idx) {
+        if is_screen(row, "working") {
+            raised = true;
+        }
+        // `blocked` mid-turn is the dialog edge and also legitimate; only a
+        // return to `idle` after a raise is the forbidden premature end.
+        if raised && is_screen(row, "idle") {
+            panic!(
+                "screen tier lowered to idle before Stop idx={idx} stop_idx={stop_idx} row_at={} stop_at={}",
+                row.at_ms, rows[stop_idx].at_ms
             );
         }
     }

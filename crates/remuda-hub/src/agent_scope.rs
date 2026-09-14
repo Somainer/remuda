@@ -98,6 +98,16 @@ fn read_target(path: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
+/// The two D-028 attachment reads, which authorize themselves against the
+/// caller's own session id rather than a path segment.
+fn attachment_read(path: &str) -> bool {
+    path == "/v1/attachments"
+        || path
+            .strip_prefix("/v1/attachments/")
+            .and_then(|rest| rest.strip_suffix("/content"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<bool, HubError> {
     let Some(caller) = device.instance_id.as_deref() else {
         return Ok(false);
@@ -364,6 +374,11 @@ pub async fn restrict_agent_routes(
         if origin(&device) == InputOrigin::Agent {
             let read = request.method() == axum::http::Method::GET
                 && (path == "/v1/caller"
+                    // D-028 §4.5: the in-session MCP server reads its own
+                    // session's attachments. The handlers pin every read to
+                    // the credential's own instance — strictly narrower than
+                    // `owns`, which also admits direct children.
+                    || attachment_read(path)
                     || match read_target(path) {
                         Some(id) => owns(&state, &device, id).await?,
                         None => false,
@@ -406,5 +421,23 @@ mod tests {
         assert_eq!(payload["input"]["origin"], "agent");
         assert!(payload.get("actor").is_none());
         assert!(payload.get("agentCredential").is_none());
+    }
+
+    /// The middleware only lets the two D-028 shapes through; anything else
+    /// under `/v1/attachments` stays behind the Agent-origin refusal.
+    #[test]
+    fn only_the_two_attachment_read_shapes_bypass_the_instance_path_check() {
+        for path in ["/v1/attachments", "/v1/attachments/obj_1/content"] {
+            assert!(attachment_read(path), "{path} must be readable");
+        }
+        for path in [
+            "/v1/attachments/",
+            "/v1/attachments/obj_1",
+            "/v1/attachments/obj_1/content/extra",
+            "/v1/attachments/obj_1/bytes",
+            "/v1/attachmentsx",
+        ] {
+            assert!(!attachment_read(path), "{path} must not be readable");
+        }
     }
 }

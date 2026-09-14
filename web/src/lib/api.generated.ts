@@ -70,6 +70,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a session's live attachments (D-028 §4.5)
+         * @description Discovery for the in-session MCP tool `remuda_attachments_list`. An instance-bound credential reads its own session and may omit `instanceId`; naming a different session is 403. A Human/Bot device must name one. Expired objects are filtered out.
+         */
+        get: operations["attachmentList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/attachments/{objectId}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one attachment as base64 for an MCP content block (D-028 §4.5)
+         * @description Backs the in-session MCP tool `remuda_attachment`. Unlike `GET /v1/objects/{id}`, this route admits the instance credential the MCP server runs with, and pins the read to that credential's own session — not a child's, not a parent's. Bytes come back base64 in JSON because the caller is building an MCP content block. Attachments over 3670016 bytes (3.5 MiB, mirroring the claude-print inline budget) are refused with RESOURCE_LIMIT naming the size and media type. Expired objects read as 404.
+         */
+        get: operations["attachmentContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/caller": {
         parameters: {
             query?: never;
@@ -679,6 +719,29 @@ export interface components {
             code: "HUMAN_APPROVAL_REQUIRED";
             error: string;
             interactionId: string;
+        };
+        AttachmentContent: components["schemas"]["AttachmentRef"] & {
+            /** @description Standard base64 of the stored bytes, ready for an MCP image or text content block. */
+            data: string;
+            /** @constant */
+            encoding: "base64";
+        };
+        AttachmentPage: {
+            instanceId: string;
+            items: components["schemas"]["AttachmentRef"][];
+        };
+        /** @description One staged attachment as the in-session MCP tools see it (D-028 §4.5). Metadata only; `AttachmentContent` adds the bytes. */
+        AttachmentRef: {
+            /** @description Lowercase hex SHA-256 of the stored bytes. */
+            digest: string;
+            expiresAt: string;
+            /** @description Session this attachment is staged for; also the read-authorization key. */
+            instanceId: string;
+            mediaType: string;
+            /** @description Derived `<objectId>.<ext>`; a caller-supplied filename never survives. */
+            name: string;
+            objectId: string;
+            size: number;
         };
         /** @description Staged attachment metadata (D-027). The media type and name are the Hub's own: the type is sniffed from the bytes and the name is derived as <objectId>.<ext>, so a caller-supplied filename never survives. */
         AttachmentUpload: {
@@ -1342,6 +1405,60 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    attachmentList: {
+        parameters: {
+            query?: {
+                /** @description Session to enumerate. Required for operator devices; for an instance credential it may only be that instance's own id. */
+                instanceId?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Live attachments for the session */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentPage"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    attachmentContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description `obj_…` from the staging upload. */
+                objectId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Attachment metadata plus base64 bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentContent"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     callerGet: {

@@ -16,6 +16,7 @@ pub(super) struct Tool {
     schema: Value,
     handler: Handler,
     structured_report: bool,
+    content_blocks: bool,
 }
 
 impl Tool {
@@ -32,6 +33,7 @@ impl Tool {
             schema,
             handler,
             structured_report: false,
+            content_blocks: false,
         }
     }
 
@@ -41,12 +43,32 @@ impl Tool {
         self
     }
 
+    /// The handler already returns `{"content": [...]}`, so the result is
+    /// passed through instead of being stringified into one text block.
+    ///
+    /// This is what lets a tool hand back an `image` block (D-028 §4.5); every
+    /// other tool returns JSON an agent reads as text.
+    pub fn blocks(mut self) -> Self {
+        self.content_blocks = true;
+        self
+    }
+
     pub fn catalog(&self) -> Value {
         json!({"name": self.name, "description": self.description, "inputSchema": self.schema})
     }
 
     pub async fn call(&self, client: &HubClient, args: Value) -> Value {
         let result = (self.handler)(client, args).await;
+        if self.content_blocks {
+            return match result {
+                // The handler owns the whole result object, isError included.
+                Ok(mut value) => {
+                    value["isError"] = json!(false);
+                    value
+                }
+                Err(error) => tool_content(Err(error)),
+            };
+        }
         let report = self
             .structured_report
             .then(|| result.as_ref().ok().cloned())

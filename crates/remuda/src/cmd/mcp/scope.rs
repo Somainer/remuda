@@ -97,6 +97,18 @@ pub(super) fn mcp_requires_approval(
     }
     match name {
         "remuda_instance_list" | "remuda_fleet_send" => Ok(false),
+        // D-028 §4.5: an instance reads the attachments staged for its own
+        // session. Narrower than the read rule above, which also admits direct
+        // children: an attachment belongs to exactly one `instance.send`, so a
+        // child has no claim on its parent's images. The Hub pins the same
+        // rule server-side; this is the earlier, louder half of it.
+        "remuda_attachments_list" | "remuda_attachment" => {
+            let target = opt_str(args, "instanceId");
+            if target.is_some_and(|id| Some(id) != caller.instance_id.as_deref()) {
+                bail!("{name} is limited to this Agent instance's own session");
+            }
+            Ok(false)
+        }
         "remuda_instance_read" | "remuda_instance_wait" => {
             if !caller.owns(required_str(args, "instanceId")?) {
                 bail!("{name} is limited to this Agent instance and its direct children");

@@ -6,14 +6,15 @@
 //! the approval shows what will actually run instead of whatever the TUI
 //! happened to render (§2.2, "precise tool input summary").
 //!
-//! Two identities travel with the entity and they are not the same thing:
+//! One identity serves both ends:
 //!
 //! - `meta.id` is the `InteractionId` devices answer through.
-//! - `request_key.native` is [`NativeRequestKey::Hook`], holding the
-//!   [`DecisionKey`](crate::pending::DecisionKey) the parked hook is filed
-//!   under. Claude's `PermissionRequest` carries no `tool_use_id` of its own
-//!   (measured), so this key is minted here and is the only way back to the
-//!   waiting process.
+//! - `request_key.native` is [`NativeRequestKey::Hook`], holding that same id
+//!   as the [`DecisionKey`](crate::pending::DecisionKey) the parked hook is
+//!   filed under. Claude's `PermissionRequest` carries no `tool_use_id` of its
+//!   own (measured), so reusing the interaction id is both necessary — it is
+//!   the only way back to the waiting process — and convenient: the driver
+//!   answers by interaction id with no mapping table.
 
 use crate::decision::PermissionRequestEvent;
 use crate::event::HookEvent;
@@ -43,8 +44,10 @@ pub struct ApprovalContext {
     pub host_id: HostId,
     /// Current run.
     pub run_id: RunId,
-    /// Key the waiting hook is parked under.
-    pub decision_key: Id,
+    /// One identity used for both the Interaction id and the hook's decision
+    /// key, so a `respond_interaction(id)` reaches the parked process with no
+    /// lookup table (the payload carries no `tool_use_id` of its own).
+    pub interaction_id: InteractionId,
     /// Stamp for `created_at` / `updated_at`.
     pub now: Timestamp,
     /// Deadline the bounded wait will enforce.
@@ -93,7 +96,7 @@ pub fn approval_interaction(
     });
     Ok(Interaction {
         meta: EntityMeta {
-            id: InteractionId::new(),
+            id: context.interaction_id.clone(),
             revision: U64(1),
             created_at: context.now.clone(),
             updated_at: context.now.clone(),
@@ -104,7 +107,7 @@ pub fn approval_interaction(
         kind: InteractionKind::Approval,
         request_key: InteractionRequestKey {
             native: NativeRequestKey::Hook {
-                invocation_id: context.decision_key.clone(),
+                invocation_id: context.interaction_id.as_id().clone(),
             },
             process_generation: U64(1),
             run_generation: Some(U64(1)),
@@ -164,7 +167,7 @@ pub fn elicitation_interaction(
         .to_owned();
     Ok(Interaction {
         meta: EntityMeta {
-            id: InteractionId::new(),
+            id: context.interaction_id.clone(),
             revision: U64(1),
             created_at: context.now.clone(),
             updated_at: context.now.clone(),
@@ -175,7 +178,7 @@ pub fn elicitation_interaction(
         kind: InteractionKind::Elicitation,
         request_key: InteractionRequestKey {
             native: NativeRequestKey::Hook {
-                invocation_id: context.decision_key.clone(),
+                invocation_id: context.interaction_id.as_id().clone(),
             },
             process_generation: U64(1),
             run_generation: Some(U64(1)),
@@ -242,7 +245,7 @@ mod tests {
             instance_id: InstanceId::new(),
             host_id: HostId::new(),
             run_id: RunId::new(),
-            decision_key: Id::new("hook").unwrap(),
+            interaction_id: InteractionId::new(),
             now: Timestamp::try_from("2026-09-14T00:00:00.000Z".to_owned()).unwrap(),
             deadline: Timestamp::try_from("2026-09-14T00:15:00.000Z".to_owned()).unwrap(),
         }
@@ -289,15 +292,17 @@ mod tests {
     }
 
     #[test]
-    fn the_decision_key_travels_as_the_native_request_key() {
-        // It is the only route back to the parked process: the payload has no
-        // tool_use_id of its own.
+    fn the_decision_key_is_the_interaction_id_and_travels_as_the_native_key() {
+        // One identity: the parked hook is filed under the same id the human
+        // answers through, so respond_interaction needs no lookup table. The
+        // payload carries no tool_use_id of its own.
         let context = context();
         let interaction = approval_interaction(&recorded(), &context).unwrap();
+        assert_eq!(interaction.meta.id, context.interaction_id);
         assert_eq!(
             interaction.request_key.native,
             NativeRequestKey::Hook {
-                invocation_id: context.decision_key.clone()
+                invocation_id: context.interaction_id.as_id().clone()
             }
         );
     }

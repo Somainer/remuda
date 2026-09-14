@@ -32,7 +32,7 @@ pub use decision::{
 pub use event::{HookEnvelope, HookEvent, HookReply};
 pub use map::{Mapped, MappedKind, map_event};
 pub use pending::{DecisionKey, Outcome, PendingDecisions, RetireReason};
-pub use socket::{HookServer, SignalSink, SocketError, send_event};
+pub use socket::{Delivery, HookServer, SignalSink, SocketError, deliver_event, send_event};
 
 /// How long a blocking hook waits for a decision before falling back.
 ///

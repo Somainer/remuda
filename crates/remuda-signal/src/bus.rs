@@ -158,16 +158,19 @@ impl SignalBus {
     }
 
     /// Build the entity a device answers, plus the key its hook is filed under.
+    ///
+    /// The interaction id *is* the decision key, so a `respond_interaction` for
+    /// that id resolves the parked hook directly.
     fn open_interaction(
         &self,
         event: &HookEvent,
     ) -> Option<(remuda_protocol::Interaction, crate::pending::DecisionKey)> {
-        let invocation = Id::new("hook").ok()?;
+        let interaction_id = remuda_protocol::InteractionId::new();
         let context = crate::approval::ApprovalContext {
             instance_id: self.context.instance_id.clone(),
             host_id: self.context.host_id.clone(),
             run_id: self.context.run_id.clone(),
-            decision_key: invocation.clone(),
+            interaction_id: interaction_id.clone(),
             now: now_ts()?,
             deadline: deadline_ts(self.blocking_wait)?,
         };
@@ -181,7 +184,7 @@ impl SignalBus {
         };
         Some((
             interaction,
-            crate::pending::DecisionKey::new(invocation.as_str()),
+            crate::pending::DecisionKey::new(interaction_id.as_id().as_str()),
         ))
     }
 
@@ -567,13 +570,16 @@ mod tests {
         let key = next_decision_key(&mut rx).await;
         let suggestion =
             serde_json::json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"});
-        pending.resolve(
-            &key,
-            crate::HookDecision::Allow {
-                updated_input: None,
-                updated_permissions: vec![suggestion.clone()],
-            },
-        );
+        assert!(matches!(
+            pending.resolve(
+                &key,
+                crate::HookDecision::Allow {
+                    updated_input: None,
+                    updated_permissions: vec![suggestion.clone()],
+                },
+            ),
+            crate::Outcome::Answered
+        ));
         let json = handle.await.expect("handler").to_hook_json();
         assert_eq!(
             json["hookSpecificOutput"]["decision"]["updatedPermissions"],
@@ -590,12 +596,15 @@ mod tests {
                 .await
         });
         let key = next_decision_key(&mut rx).await;
-        pending.resolve(
-            &key,
-            crate::HookDecision::Deny {
-                message: "not that file".into(),
-            },
-        );
+        assert!(matches!(
+            pending.resolve(
+                &key,
+                crate::HookDecision::Deny {
+                    message: "not that file".into(),
+                },
+            ),
+            crate::Outcome::Answered
+        ));
         let json = handle.await.expect("handler").to_hook_json();
         assert_eq!(
             json["hookSpecificOutput"]["decision"],

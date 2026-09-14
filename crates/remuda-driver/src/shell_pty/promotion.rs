@@ -44,7 +44,7 @@ use remuda_protocol::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -75,6 +75,8 @@ pub(super) const TRANSCRIPT_BOUND: &str = "transcript_bound";
 pub(super) const TRANSCRIPT_UNBOUND: &str = "transcript_unbound";
 /// Lifecycle announcing a bound file that vanished or failed its cwd check.
 pub(super) const TRANSCRIPT_DEGRADED: &str = "transcript_degraded";
+
+const SHIM_BYPASSED: &str = "claude_shim_bypassed";
 
 /// Wire name for an agent kind, matching the `AgentKind` wire values.
 pub(super) fn kind_name(kind: AgentKind) -> &'static str {
@@ -485,6 +487,7 @@ fn detected_none() -> (Completeness, ObservationPayload) {
 fn promoted(found: &Detected, at: &Timestamp) -> (Completeness, ObservationPayload) {
     let mut related = BTreeMap::new();
     related.insert("kind".into(), kind_name(found.kind).to_owned());
+    related.insert("pid".into(), found.pid.to_string());
     related.insert("mode".into(), "promoted".to_owned());
     related.insert("promotedAt".into(), String::from(at.clone()));
     if let Some(session) = &found.session_id {
@@ -652,6 +655,10 @@ pub(super) fn spawn(
     current: Arc<std::sync::Mutex<Option<Detected>>>,
     status_slot: Arc<std::sync::Mutex<Option<ScreenStatus>>>,
     bindings: BindingHandle,
+    hooks: Option<Arc<crate::launch::HookSession>>,
+    expect_shim: bool,
+    interrupt_pid: Arc<AtomicI32>,
+    interrupt_screen_markers: Arc<Mutex<InterruptBaseline>>,
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
@@ -662,6 +669,7 @@ pub(super) fn spawn(
         // Last announced binding state, deduping lifecycle emission:
         // None = nothing announced yet this epoch.
         let mut announced: Option<String> = None;
+        let mut bypass_announced = false;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -701,6 +709,7 @@ pub(super) fn spawn(
             }
             // Epoch boundaries reset tail, hydrated state, and the picker.
             if saw_demote {
+                interrupt_pid.store(0, Ordering::SeqCst);
                 if let Some(payload) = bindings.invalidate_picker()
                     && emit(
                         &events,
@@ -723,6 +732,55 @@ pub(super) fn spawn(
                 bindings.begin_epoch(&ctx.cwd, &ctx.claude_home);
                 hydrator = None;
                 announced = None;
+                bypass_announced = false;
+            }
+
+            // The socket's SessionStart is also channel A for transcript
+            // binding. Without this bridge only Claude's separate pid file
+            // could hydrate, leaving a spurious manual picker over a hooked
+            // session. begin_epoch must happen first so it cannot erase it.
+            if let Some(binding) = hooks.as_ref().and_then(|hooks| hooks.binding())
+                && found.as_ref().is_some_and(|found| found.pid == binding.pid)
+                && let Some(path) = binding.transcript_path
+            {
+                bindings.ingest_session_start(SessionStartReport {
+                    session_id: binding.session_id,
+                    transcript_path: path.into(),
+                    cwd: None,
+                    ppid: Some(i64::from(binding.pid)),
+                });
+            }
+
+            if !bypass_announced
+                && let (Some(found), Some(hooks)) = (found.as_ref(), hooks.as_ref())
+                && shim_bypassed(found, hooks, expect_shim)
+            {
+                bypass_announced = true;
+                let (completeness, payload) = native(
+                    LifecycleTopic::Diagnostic,
+                    SHIM_BYPASSED,
+                    Knowledge::NotApplicable,
+                    "claude 未经 shim 启动，hook 不可用",
+                    BTreeMap::from([
+                        ("kind".into(), "claude".into()),
+                        ("pid".into(), found.pid.to_string()),
+                        ("signalTier".into(), "screen".into()),
+                    ]),
+                    Severity::Warning,
+                );
+                if emit(
+                    &events,
+                    &seq,
+                    &ctx,
+                    SourceChannel::Runtime,
+                    completeness,
+                    payload,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
             }
 
             // Screen-derived readiness, on the same evidence class claude-pty
@@ -731,9 +789,53 @@ pub(super) fn spawn(
             // The grid is the emulator's when `REMUDA_PTY_EMULATOR=1`, and the
             // ANSI-stripped ring tail otherwise — the same input the matchers
             // read before D-028, so the default path is unchanged (§13 P0).
+            let (interruption_count, grid) = state.screen_evidence();
             let status = promote
                 .kind
-                .and_then(|_| remuda_screen::screen_status(&state.screen_grid()));
+                .and_then(|_| remuda_screen::screen_status(&grid));
+            // Esc can end a Claude turn without a Stop hook. A newly rendered
+            // native interruption marker settles the pending request, while an
+            // old marker already present when cancel was sent cannot do so.
+            if let Some(found) = found.as_ref()
+                && found.kind == AgentKind::Claude
+                && found.pid > 0
+                && interrupt_pid.load(Ordering::SeqCst) == found.pid
+                && interrupt_screen_markers
+                    .lock()
+                    .is_ok_and(|mut baseline| baseline.confirmed(interruption_count, &grid))
+                && interrupt_pid
+                    .compare_exchange(found.pid, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                if let Some(hooks) = hooks.as_ref() {
+                    hooks.confirm_screen_interrupt(found.pid);
+                }
+                let (_, payload) = native(
+                    LifecycleTopic::Turn,
+                    "interrupted",
+                    Knowledge::NotApplicable,
+                    "idle",
+                    BTreeMap::from([
+                        ("kind".into(), "claude".into()),
+                        ("pid".into(), found.pid.to_string()),
+                        ("requestedBy".into(), "instance.cancel".into()),
+                    ]),
+                    Severity::Info,
+                );
+                if emit(
+                    &events,
+                    &seq,
+                    &ctx,
+                    SourceChannel::Pty,
+                    Completeness::ScreenDerived,
+                    payload,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
             if let Ok(mut slot) = status_slot.lock() {
                 *slot = status;
             }
@@ -777,6 +879,181 @@ pub(super) fn spawn(
             }
         }
     })
+}
+
+/// A shim records its exec PID before Claude can enter the foreground. Missing
+/// marker plus no SessionStart for that process is bypass evidence; elapsed
+/// time without events and unreadable marker directories are not.
+fn shim_bypassed(found: &Detected, hooks: &crate::launch::HookSession, expect_shim: bool) -> bool {
+    let Some(launch) = hooks.bin_dir().parent() else {
+        return false;
+    };
+    shim_bypass_evidence(
+        found,
+        hooks.binding().map(|binding| binding.pid),
+        &launch.join("shim-pids"),
+        expect_shim,
+    )
+}
+
+fn shim_bypass_evidence(
+    found: &Detected,
+    hook_pid: Option<i32>,
+    markers: &Path,
+    expect_shim: bool,
+) -> bool {
+    // P2 intentionally execs a pinned agent directly with its overlay. That
+    // launch did not bypass a shell PATH shim: no shell was involved.
+    if !expect_shim
+        || found.kind != AgentKind::Claude
+        || found.pid <= 0
+        || hook_pid == Some(found.pid)
+    {
+        return false;
+    }
+    markers.is_dir() && matches!(markers.join(found.pid.to_string()).try_exists(), Ok(false))
+}
+
+/// A bounded stream recognizer, independent of scrolling and viewport reuse.
+/// Escape state survives reads, so OSC titles cannot forge rendered evidence.
+#[derive(Default)]
+pub(super) struct InterruptionOutput {
+    text: Vec<u8>,
+    escape: u8,
+    count: u64,
+}
+
+impl InterruptionOutput {
+    pub(super) fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.escape {
+                1 => {
+                    self.escape = match byte {
+                        b'[' => 2,
+                        b']' => 3,
+                        b'P' | b'_' | b'^' => 5,
+                        b'(' | b')' | b'#' => 6,
+                        _ => 0,
+                    }
+                }
+                2 => {
+                    if (0x40..=0x7e).contains(&byte) {
+                        self.escape = 0;
+                        if byte != b'm' {
+                            self.text.clear();
+                        }
+                    }
+                }
+                3 => match byte {
+                    7 => self.escape = 0,
+                    27 => self.escape = 4,
+                    _ => {}
+                },
+                4 => self.escape = if byte == b'\\' { 0 } else { 3 },
+                5 => {
+                    if byte == 27 {
+                        self.escape = 7;
+                    }
+                }
+                6 => self.escape = 0,
+                7 => self.escape = if byte == b'\\' { 0 } else { 5 },
+                _ => match byte {
+                    27 => self.escape = 1,
+                    0..=31 | 127 => self.text.clear(),
+                    _ => {
+                        self.text.push(byte.to_ascii_lowercase());
+                        if self.text.len() > 64 {
+                            self.text.remove(0);
+                        }
+                        if self
+                            .text
+                            .ends_with("interrupted · what should claude do instead?".as_bytes())
+                            || self.text.ends_with(b"[request interrupted by user")
+                        {
+                            self.count = self.count.saturating_add(1);
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct InterruptBaseline {
+    count: u64,
+    screen: String,
+}
+
+impl InterruptBaseline {
+    pub(super) fn arm(&mut self, count: u64, grid: &remuda_screen::ScreenGrid) {
+        self.count = count;
+        self.screen = grid.flat();
+    }
+
+    fn confirmed(&mut self, count: u64, grid: &remuda_screen::ScreenGrid) -> bool {
+        if count <= self.count {
+            return false;
+        }
+        let Some(current_turn) = current_turn_interrupted(grid) else {
+            // The marker can precede its composer in another PTY read. Keep
+            // that evidence pending until the native frame is complete.
+            return false;
+        };
+        self.count = count;
+        // A known unchanged repaint is not a new interruption, even though
+        // its old marker was printed again. Idle without fresh text is inert.
+        self.screen != grid.flat() && current_turn
+    }
+}
+
+/// A repaint may repeat an older turn's interruption text while the current
+/// spinner changes. Require an empty native composer and a marker in the current
+/// transcript turn, below its most recent submitted prompt. The live Claude
+/// spinner can omit `esc to interrupt`, so status alone is insufficient.
+fn current_turn_interrupted(grid: &remuda_screen::ScreenGrid) -> Option<bool> {
+    let composer = grid
+        .lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('❯'))?;
+    if grid.lines[composer].trim() != "❯" {
+        // A submitted prompt or draft is not proof that input was restored.
+        return None;
+    }
+    let transcript = grid.lines[..composer]
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let current_turn = transcript
+        .rsplit_once('❯')
+        .map_or(transcript.as_str(), |(_, turn)| turn);
+    let has_marker = |text: &str| {
+        text.contains("interrupted · what should claude do instead?")
+            || text.contains("[request interrupted by user")
+    };
+    // The last prompt may still be the submitted user row: a freshly
+    // printed marker below it awaits the final composer in a later read.
+    // Check this before looking above it, where an older turn may also have
+    // an interruption marker.
+    let below = grid.lines[composer + 1..]
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if has_marker(&below) {
+        return None;
+    }
+    if !has_marker(current_turn) {
+        return Some(false);
+    }
+    (remuda_screen::screen_status(grid) == Some(ScreenStatus::Idle)).then_some(true)
 }
 
 /// One tick of the deterministic binding state machine for a promoted Claude.
@@ -1212,6 +1489,150 @@ mod tests {
     const CORRECT: &str = "aaaaaaaa-2222-4333-8444-aaaaaaaaaaaa";
     const BUSY_OTHER: &str = "bbbbbbbb-8888-4777-8666-bbbbbbbbbbbb";
     const LATE_STARTER: &str = "cccccccc-9999-4777-8666-cccccccccccc";
+
+    #[test]
+    fn bypass_needs_a_real_foreground_pid_missing_its_exec_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let markers = dir.path().join("shim-pids");
+        let found = detected_claude(42, None);
+        assert!(!shim_bypass_evidence(&found, None, &markers, true));
+        std::fs::create_dir(&markers).unwrap();
+        assert!(shim_bypass_evidence(&found, None, &markers, true));
+        assert!(
+            !shim_bypass_evidence(&found, None, &markers, false),
+            "P2's direct pinned launch intentionally does not traverse the shell shim"
+        );
+        assert!(
+            !shim_bypass_evidence(&found, Some(42), &markers, true),
+            "matching hooks outrank a missing marker"
+        );
+        assert!(
+            !shim_bypass_evidence(&detected_claude(0, None), None, &markers, true),
+            "screen-only detection has no PID proof"
+        );
+        std::fs::write(markers.join("42"), "").unwrap();
+        assert!(!shim_bypass_evidence(&found, None, &markers, true));
+    }
+
+    #[test]
+    fn interruption_output_recognizes_split_ansi_and_excludes_osc_titles() {
+        let mut output = InterruptionOutput::default();
+        let bytes = concat!(
+            "\x1b]0;[Request interrupted by user\x1b\\",
+            "❯ What should Claude do instead?\r\n",
+            "\x1b[31mInterrup\x1b[0mted · What should Claude do instead?\r\n",
+            "[Request interrupted by user for tool use]"
+        )
+        .as_bytes();
+        for byte in bytes {
+            output.feed(std::slice::from_ref(byte));
+        }
+        assert_eq!(output.count(), 2);
+    }
+
+    #[test]
+    fn fresh_replacement_marker_confirms_but_unchanged_redraw_and_idle_do_not() {
+        use remuda_screen::{Emulator, ScreenGrid};
+        let mut emulator = Emulator::with_scrollback(100, 4, 0);
+        let mut output = InterruptionOutput::default();
+        let old = "Interrupted · What should Claude do instead?\r\nfirst prompt working";
+        output.feed(old.as_bytes());
+        emulator.feed(old.as_bytes());
+        let mut baseline = InterruptBaseline::default();
+        baseline.arm(output.count(), &emulator.grid());
+        assert!(
+            !baseline.confirmed(output.count(), &ScreenGrid::from_raw("❯")),
+            "idle alone proves no interruption"
+        );
+
+        let replacement =
+            "\x1b[2J\x1b[Hsecond prompt\r\nInterrupted · What should Claude do instead?\r\n❯";
+        // The old marker disappears: the final viewport still contains one.
+        for chunk in replacement.as_bytes().chunks(3) {
+            output.feed(chunk);
+            emulator.feed(chunk);
+        }
+        assert_eq!(output.count(), 2);
+        assert_eq!(emulator.grid().flat().matches("Interrupted").count(), 1);
+        assert!(baseline.confirmed(output.count(), &emulator.grid()));
+
+        baseline.arm(output.count(), &emulator.grid());
+        output.feed(replacement.as_bytes());
+        emulator.feed(replacement.as_bytes());
+        assert_eq!(output.count(), 3);
+        assert!(
+            !baseline.confirmed(output.count(), &emulator.grid()),
+            "an unchanged historical repaint is not new turn evidence"
+        );
+        assert!(
+            !baseline.confirmed(output.count(), &ScreenGrid::from_raw("❯")),
+            "the ignored repaint cannot settle a later screen change"
+        );
+    }
+
+    #[test]
+    fn a_historical_marker_with_a_changing_native_spinner_cannot_settle_cancel() {
+        use remuda_screen::ScreenGrid;
+        let working = |seconds| {
+            // The saved Claude 2.1.270 tool screen has this elapsed spinner,
+            // not `esc to interrupt`; the old general matcher calls it idle.
+            ScreenGrid::from_lines([
+                "❯ earlier turn".into(),
+                "⎿ Interrupted · What should Claude do instead?".into(),
+                "❯ Use Bash to run sleep 30, then reply FINISHED.".into(),
+                "Running 1 shell command…".into(),
+                format!("·Befuddling… ({seconds}s · ↓ 200 tokens · thought for 4s)"),
+                "────────────────".into(),
+                "❯".into(),
+            ])
+        };
+        let mut output = InterruptionOutput::default();
+        let mut baseline = InterruptBaseline::default();
+        let before = working(39);
+        output.feed(before.text().as_bytes());
+        baseline.arm(output.count(), &before);
+        let repaint = working(40);
+        output.feed(repaint.text().as_bytes());
+        assert_eq!(output.count(), 2, "the historical marker was repainted");
+        assert_eq!(
+            remuda_screen::screen_status(&repaint),
+            Some(ScreenStatus::Idle)
+        );
+        let partial_repaint = ScreenGrid::from_lines(repaint.lines[..5].iter().cloned());
+        assert!(
+            !baseline.confirmed(output.count(), &partial_repaint),
+            "a submitted user row is not the missing final composer"
+        );
+        assert!(!baseline.confirmed(output.count(), &repaint));
+
+        let after = ScreenGrid::from_lines([
+            "❯ earlier turn",
+            "⎿ Interrupted · What should Claude do instead?",
+            "❯ Use Bash to run sleep 30, then reply FINISHED.",
+            "Ran 1 shell command",
+            "⎿ Interrupted · What should Claude do instead?",
+            "⎿ Interrupted · What should Claude do instead?",
+            "────────────────",
+            "❯",
+        ]);
+        assert!(
+            !baseline.confirmed(output.count(), &after),
+            "an ignored historical repaint cannot settle a later frame"
+        );
+        let partial = ScreenGrid::from_lines(after.lines[..after.lines.len() - 1].iter().cloned());
+        output.feed(partial.text().as_bytes());
+        assert!(
+            !baseline.confirmed(output.count(), &partial),
+            "the new marker can arrive before its composer in a separate read"
+        );
+        let marker_count = output.count();
+        output.feed("\n❯".as_bytes());
+        assert_eq!(output.count(), marker_count);
+        assert!(
+            baseline.confirmed(output.count(), &after),
+            "the later composer completes that same fresh marker evidence"
+        );
+    }
 
     #[test]
     fn a_terminal_with_no_agent_journals_nothing() {

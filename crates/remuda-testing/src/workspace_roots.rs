@@ -66,13 +66,11 @@ mod tests {
 
     #[test]
     fn a_crate_dir_inside_the_temp_dir_collapses_to_one_root() {
-        let temp = std::env::temp_dir();
-        let nested = temp.join("remuda-nested-crate");
-        std::fs::create_dir_all(&nested).unwrap();
-        let roots = test_workspace_roots(&nested);
+        let nested = tempfile::tempdir().unwrap();
+        let canonical = nested.path().canonicalize().unwrap();
+        let roots = test_workspace_roots(&canonical);
         assert_eq!(roots.len(), 1, "nested crate dir must not add a root");
-        assert!(nested.starts_with(&roots[0]));
-        let _ = std::fs::remove_dir(&nested);
+        assert!(canonical.starts_with(&roots[0]));
     }
 
     #[test]

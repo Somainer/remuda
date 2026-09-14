@@ -17,6 +17,87 @@ fn fixture_token(i: usize) -> String {
 }
 
 #[tokio::test]
+async fn device_verification_yields_writer_and_rechecks_revocation_hash_and_scope() {
+    for mutation in ["none", "delete", "replace-hash", "change-scope"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let token = fixture_token(7);
+        let device = store
+            .insert_device("original".into(), token.clone(), token[..16].into())
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_verifier = entered.clone();
+        let (release, paused) = std::sync::mpsc::channel();
+        let auth_store = store.clone();
+        let authentication = tokio::spawn(async move {
+            auth_store
+                .find_device_by_token(token, None, move |token, hash| {
+                    entered_verifier.notify_one();
+                    paused.recv_timeout(Duration::from_secs(5)).is_ok() && token == hash
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("verifier entered");
+
+        let id = device.id.clone();
+        let progress = tokio::time::timeout(Duration::from_secs(1), async {
+            // This uses the same actor queue as native journal appends.
+            assert_eq!(store.list_devices().await?.len(), 1);
+            match mutation {
+                "delete" => {
+                    store.delete_device(id).await?;
+                }
+                "replace-hash" => {
+                    store
+                        .run(move |conn| {
+                            conn.execute(
+                                "UPDATE devices SET token_hash = 'replacement' WHERE id = ?1",
+                                params![id],
+                            )?;
+                            Ok(())
+                        })
+                        .await?;
+                }
+                "change-scope" => {
+                    store.run(move |conn| {
+                        conn.execute(
+                            "UPDATE devices SET name = 'current', kind = 'agent', instance_id = 'ins_current_scope' WHERE id = ?1",
+                            params![id],
+                        )?;
+                        Ok(())
+                    }).await?;
+                }
+                _ => {}
+            }
+            Ok::<_, StoreError>(())
+        })
+        .await;
+        // Unblock before asserting so the old writer-bound implementation
+        // fails promptly instead of leaving a blocked thread during cleanup.
+        release.send(()).unwrap();
+        let authenticated = authentication.await.unwrap().unwrap();
+        progress
+            .expect("paused verification must not block store work")
+            .unwrap();
+        match mutation {
+            "delete" | "replace-hash" => assert!(authenticated.is_none(), "{mutation}"),
+            "change-scope" => {
+                let current = authenticated.unwrap();
+                assert_eq!(current.id, device.id);
+                assert_eq!(current.name, "current");
+                assert_eq!(current.kind, "agent");
+                assert_eq!(current.instance_id.as_deref(), Some("ins_current_scope"));
+            }
+            _ => assert_eq!(authenticated.unwrap().id, device.id),
+        }
+        store.close().await;
+    }
+}
+
+#[tokio::test]
 async fn opening_legacy_schema_preserves_records_and_adds_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let token = fixture_token(7);

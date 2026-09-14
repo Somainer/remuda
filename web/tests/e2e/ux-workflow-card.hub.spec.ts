@@ -72,6 +72,12 @@ async function openWorkflowSession(page: Page, prompt: string): Promise<string> 
   return instanceId;
 }
 
+async function ensurePhaseOpen(page: Page, nth = 0) {
+  const head = page.locator("[data-testid='workflow-phase'] button").nth(nth);
+  if ((await head.getAttribute("aria-expanded")) !== "true") await head.click();
+  await expect(head).toHaveAttribute("aria-expanded", "true");
+}
+
 test("card runs live then auto-collapses to the one-line summary", async ({ page }) => {
   const instanceId = await openWorkflowSession(page, "workflow card demo running");
   void instanceId;
@@ -93,9 +99,10 @@ test("card runs live then auto-collapses to the one-line summary", async ({ page
   await expect(head).toContainText("4/4 agents");
   await expect(head).toContainText("tokens");
 
-  // Click expands the detail again.
+  // Click expands the detail again; completed phases stay collapsed, open Verify.
   await head.click();
   await expect(head).toHaveAttribute("aria-expanded", "true");
+  await ensurePhaseOpen(page, 1);
   await expect(page.getByTestId("workflow-agent").filter({ hasText: "verify:auth.ts" })).toBeVisible();
 });
 
@@ -104,14 +111,16 @@ test("a 20-agent phase folds 8 quiet rows behind 还有 n 个", async ({ page })
   const card = page.getByTestId("workflow-card").first();
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
   await card.locator("button").first().click();
-  const phase = page.getByTestId("workflow-phase");
-  await phase.locator("button").first().click();
+  await ensurePhaseOpen(page, 0);
 
   const visibleRows = () => page.locator("[data-testid='workflow-agent']:visible");
   await expect(visibleRows()).toHaveCount(12);
-  const toggle = page.getByRole("button", { name: /还有 8 个/ });
+  // The toggle changes text (还有 ↔ 收起); locate its row stably.
+  const toggle = page.locator("[data-testid='workflow-phase'] ul li button").filter({ hasText: /个/ });
+  await expect(toggle).toContainText("还有");
   await toggle.click();
   await expect(visibleRows()).toHaveCount(20);
+  await expect(toggle).toContainText("收起");
   await toggle.click();
   await expect(visibleRows()).toHaveCount(12);
 });
@@ -121,17 +130,20 @@ test("a failed agent row is never folded", async ({ page }) => {
   const card = page.getByTestId("workflow-card").first();
   await expect(card).toHaveAttribute("data-status", "failed", { timeout: 20_000 });
   await card.locator("button").first().click();
-  const phase = page.getByTestId("workflow-phase");
-  await phase.locator("button").first().click();
+  await ensurePhaseOpen(page, 0);
   const failed = page.getByTestId("workflow-agent").filter({ hasText: "review:security" });
   await expect(failed).toBeVisible();
   await expect(failed).toHaveAttribute("data-state", "failed");
   // The quiet tail folds, but the failed row stays outside the fold toggle.
-  await expect(page.getByRole("button", { name: /还有 3 个/ })).toBeVisible();
+  await expect(
+    page.locator("[data-testid='workflow-phase'] ul li button").filter({ hasText: /还有 3 个/ }),
+  ).toBeVisible();
 });
 
 test("at 390px every agent stays on one line; model/tool meta hidden", async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  // Start at desktop width: on a 390px shell the 新建 link lives behind the
+  // mobile nav and is not clickable.
+  await page.setViewportSize({ width: 1280, height: 900 });
   await openWorkflowSession(page, "workflow card demo running");
   const card = page.getByTestId("workflow-card").first();
   await expect(card).toHaveAttribute("data-status", "running", { timeout: 20_000 });
@@ -139,8 +151,9 @@ test("at 390px every agent stays on one line; model/tool meta hidden", async ({ 
   await page.getByTestId("composer-send").click();
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
   await card.locator("button").first().click();
-  const phase = page.getByTestId("workflow-phase");
-  await phase.locator("button").first().click();
+  await ensurePhaseOpen(page, 0);
+  // Now shrink: agent rows must stay one line with model/tool meta hidden.
+  await page.setViewportSize({ width: 390, height: 844 });
   const rows = page.getByTestId("workflow-agent");
   await expect(rows.first()).toBeVisible();
   const count = await rows.count();
@@ -169,14 +182,16 @@ test("Escape in the terminal / outside the card never closes the open card", asy
   const head = card.locator("button").first();
   await expect(head).toHaveAttribute("aria-expanded", "true");
 
-  // Keys sent to an attached terminal (or anywhere outside the card's own
-  // toggle) must not act on the card: Escape stays in the xterm.
+  // Keys sent to an attached terminal must not act on the card: Escape stays
+  // in the xterm. If no terminal is attached (the fake-node session can come
+  // up without one), Escape from the composer textarea must also be a no-op
+  // for the card — never click the page body, whose centre may be the card.
   const terminal = page.locator(".xterm-helper-textarea");
   if (await terminal.count()) {
     await terminal.first().focus();
     await page.keyboard.press("Escape");
   } else {
-    await page.locator("body").click();
+    await page.getByTestId("composer-input").focus();
     await page.keyboard.press("Escape");
   }
   await expect(head).toHaveAttribute("aria-expanded", "true");

@@ -9,7 +9,7 @@ const upstream = process.env.HUB_E2E_UPSTREAM_LISTEN ?? "127.0.0.1:58881";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  testMatch: /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status)\.spec\.ts/,
+  testMatch: /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|session-virtual)\.spec\.ts/,
   fullyParallel: false,
   workers: 1,
   forbidOnly: Boolean(process.env.CI),
@@ -53,6 +53,10 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
+      // session-virtual is dual-mode: its 2,000-event synthetic fixture runs
+      // against the Vite mock; hub mode runs the fake-node subset. The spec
+      // branches on this metadata so mock-only tests skip against the Hub.
+      metadata: { appMode: "hub" },
       use: {
         ...devices["Desktop Chrome"],
         // Google Chrome locally; bundled Chromium on CI or when PW_CHANNEL=chromium (hosts without Chrome).

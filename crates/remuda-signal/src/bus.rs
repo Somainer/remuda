@@ -61,7 +61,19 @@ pub struct SignalBus {
     seq: Arc<AtomicU64>,
     binding: std::sync::Mutex<Option<SessionBinding>>,
     pending: crate::pending::PendingDecisions,
+    /// What each parked hook needs to turn a device's protocol answer back
+    /// into the decision JSON the harness reads. Keyed by the interaction id,
+    /// which is also the decision key.
+    parked: std::sync::Mutex<std::collections::HashMap<crate::pending::DecisionKey, ParkedHook>>,
     blocking_wait: std::time::Duration,
+}
+
+/// The context kept for one parked blocking hook, so an answer arriving later
+/// can be turned back into the decision the harness reads.
+#[derive(Clone)]
+struct ParkedHook {
+    /// Suggestions the harness offered; an allow-always answer echoes one.
+    suggestions: Vec<crate::PermissionSuggestion>,
 }
 
 impl SignalBus {
@@ -78,6 +90,7 @@ impl SignalBus {
             seq,
             binding: std::sync::Mutex::new(None),
             pending: crate::pending::PendingDecisions::new(),
+            parked: std::sync::Mutex::new(std::collections::HashMap::new()),
             blocking_wait: crate::BLOCKING_WAIT,
         }
     }
@@ -97,6 +110,72 @@ impl SignalBus {
     #[must_use]
     pub fn pending(&self) -> crate::pending::PendingDecisions {
         self.pending.clone()
+    }
+
+    /// True while the interaction `id` belongs to a hook still waiting.
+    #[must_use]
+    pub fn is_parked(&self, id: &remuda_protocol::InteractionId) -> bool {
+        self.pending
+            .is_waiting(&crate::pending::DecisionKey::new(id.as_id().as_str()))
+    }
+
+    /// Resolve the hook behind interaction `id` with a device's answer.
+    ///
+    /// The returned [`Outcome`](crate::Outcome) is the honesty gate: only
+    /// [`Answered`](crate::Outcome::Answered) means the decision actually
+    /// reached a waiting process. [`Abandoned`](crate::Outcome::Abandoned) is
+    /// the confined/ignored case the screen-key fallback exists for — the
+    /// answer was real but the hook had already stopped listening.
+    pub fn resolve_answer(
+        &self,
+        id: &remuda_protocol::InteractionId,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> crate::Outcome {
+        let key = crate::pending::DecisionKey::new(id.as_id().as_str());
+        let parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        let Some(parked) = parked else {
+            // No parked context: the hook already ended. Still report
+            // honestly rather than claiming a delivery we cannot prove.
+            return self.pending.resolve(
+                &key,
+                crate::HookDecision::Deny {
+                    message: "Remuda: the answer arrived after the request closed".to_owned(),
+                },
+            );
+        };
+        let Some(decision) = parked.to_decision(answer) else {
+            tracing::warn!(?answer, "a hook answer did not match its interaction kind");
+            return self.pending.resolve(
+                &key,
+                crate::HookDecision::Deny {
+                    message: "Remuda: the answer did not match the request".to_owned(),
+                },
+            );
+        };
+        self.pending.resolve(&key, decision)
+    }
+
+    /// Retire every parked hook, denying them; called when the instance stops.
+    pub fn retire_all(&self) {
+        let keys: Vec<crate::pending::DecisionKey> = self
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for key in keys {
+            self.pending.retire(&key, crate::RetireReason::Shutdown);
+        }
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// The session this bus has seen a `SessionStart` for, if any.
@@ -150,7 +229,18 @@ impl SignalBus {
             tracing::debug!(event = %event.name, "interaction not journaled; not waiting on it");
             return HookReply::empty();
         }
-        let (decision, outcome) = self.pending.wait(key, self.blocking_wait).await;
+        let suggestions = crate::decision::PermissionRequestEvent::from_event(event)
+            .map(|request| request.suggestions)
+            .unwrap_or_default();
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), ParkedHook { suggestions });
+        let (decision, outcome) = self.pending.wait(key.clone(), self.blocking_wait).await;
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
         tracing::debug!(event = %event.name, ?outcome, "blocking hook resolved");
         HookReply {
             decision: Some(decision.to_hook_json(&event.name)),
@@ -313,6 +403,64 @@ fn deadline_ts(wait: std::time::Duration) -> Option<Timestamp> {
 /// Completeness every hook observation carries. Exposed so tests elsewhere can
 /// assert the channel/completeness pair without rebuilding a bus.
 pub const HOOK_COMPLETENESS: Completeness = Completeness::Structured;
+
+impl ParkedHook {
+    /// Turn a device's protocol answer into the harness decision for this hook.
+    ///
+    /// Returns `None` when the answer kind does not match the interaction the
+    /// hook actually opened; the caller then denies rather than sending the
+    /// harness something it cannot interpret.
+    fn to_decision(
+        &self,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> Option<crate::HookDecision> {
+        use remuda_protocol::InteractionAnswer;
+        match answer {
+            InteractionAnswer::Approval(answer) => {
+                // The option ids are exactly the ones the card offered (see
+                // approval.rs); anything else is an answer for a different
+                // request and must not be guessed.
+                if answer.option_id == crate::approval::ALLOW_ONCE {
+                    Some(crate::HookDecision::Allow {
+                        updated_input: None,
+                        updated_permissions: Vec::new(),
+                    })
+                } else if answer.option_id == crate::approval::DENY {
+                    Some(crate::HookDecision::Deny {
+                        message: "Denied through Remuda".to_owned(),
+                    })
+                } else if let Some(index) = crate::approval::allow_always_index(&answer.option_id) {
+                    // Echo the exact suggestion the button was built from. An
+                    // out-of-range index means the answer named a grant that
+                    // was never offered, which is the deny case, not an allow.
+                    let suggestion = self.suggestions.get(index)?.value.clone();
+                    Some(crate::HookDecision::Allow {
+                        updated_input: None,
+                        updated_permissions: vec![suggestion],
+                    })
+                } else {
+                    None
+                }
+            }
+            InteractionAnswer::Elicitation(answer) => {
+                let action = match answer.action {
+                    remuda_protocol::ElicitationAction::Accept => crate::ElicitationAction::Accept,
+                    remuda_protocol::ElicitationAction::Decline => {
+                        crate::ElicitationAction::Decline
+                    }
+                    remuda_protocol::ElicitationAction::Cancel => crate::ElicitationAction::Cancel,
+                };
+                Some(crate::HookDecision::Elicitation {
+                    action,
+                    content: answer.content.clone(),
+                })
+            }
+            // A Question / PlanReview answer cannot answer a hook that opened
+            // an Approval / Elicitation.
+            InteractionAnswer::Question(_) | InteractionAnswer::PlanReview(_) => None,
+        }
+    }
+}
 
 /// `ObservationPayload` accessor used by the Node's fold; keeps the match on
 /// lifecycle payloads in one place.

@@ -20,6 +20,7 @@ mod error;
 mod flags;
 pub mod generic_pty;
 pub mod grok_session;
+pub mod hook_answer;
 pub mod interaction;
 pub mod launch;
 mod materializer;

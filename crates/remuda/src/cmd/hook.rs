@@ -8,10 +8,12 @@
 //! Three properties matter more than anything else here, because this process
 //! sits between a human's keystroke and the agent responding to it:
 //!
-//! 1. **It never fails the agent.** A missing socket, a stopped Node, a Node
-//!    that never answers — all print `{}` and exit 0, which every hook event
-//!    reads as "no opinion". The agent then does exactly what it would have
-//!    done without Remuda.
+//! 1. **It never fails the agent.** A missing socket or a stopped Node prints
+//!    `{}` and exits 0, which every hook event reads as "no opinion": the agent
+//!    does exactly what it would have done without Remuda. The one deliberate
+//!    exception is a *blocking* event that reached the Node and got no answer
+//!    in time — see [`decide`], where §4.4's fail-closed rule makes that a deny
+//!    rather than a shrug.
 //! 2. **The wait is bounded.** Blocking events wait up to the interaction
 //!    broker's TTL; everything else gets a short wait, because a
 //!    fire-and-forget event has nothing worth waiting for.

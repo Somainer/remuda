@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, Ordering};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+pub mod answer;
 pub mod keys;
 pub mod launch;
 pub mod lifecycle;
@@ -343,6 +344,17 @@ impl PtyState {
     }
 }
 
+/// How long the screen fallback waits for the dialog to clear before it
+/// refuses to call the decision applied (§14 risk 1).
+///
+/// Generous enough for a TUI repaint on a loaded machine, short enough that a
+/// caller is not left hanging: the answer "we could not confirm it" is useful
+/// promptly, and the operator can look at the terminal.
+const FALLBACK_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Gap between repaint checks while confirming.
+const FALLBACK_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A PTY running a login shell or an agent CLI, with promotion (D-025).
 pub struct ShellPtyDriver {
     options: ShellPtyOptions,
@@ -368,6 +380,10 @@ pub struct ShellPtyDriver {
     /// Set once the exit waiter has concluded, so `close` on an already-dead
     /// process reports the real cause rather than "the ladder found nothing".
     exited: Arc<std::sync::Mutex<Option<ExitEvidence>>>,
+    /// One screen-key fallback per interaction, for decisions the hook path
+    /// proved it did not apply (§14 risk 1). Lives on the driver because the
+    /// budget has to outlive the call that spends it.
+    fallbacks: crate::hook_answer::FallbackLedger,
     seq: Arc<AtomicU64>,
 }
 
@@ -391,6 +407,7 @@ impl ShellPtyDriver {
             poller: Mutex::new(None),
             waiter: Mutex::new(None),
             table,
+            fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
@@ -445,6 +462,92 @@ impl ShellPtyDriver {
     #[must_use]
     pub fn screen_status(&self) -> Option<ScreenStatus> {
         self.status.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Answer an ignored hook decision on the agent's own dialog, once (§14 risk 1).
+    ///
+    /// Reached only when the hook path *proved* it did not take the decision.
+    /// Everything here is deliberately conservative, because a stray keystroke
+    /// in an agent TUI answers whatever question happens to be showing:
+    ///
+    /// - **One attempt ever**, claimed before the write. A lost ACK must not
+    ///   become a replayed Enter (D-022).
+    /// - **No guessing.** A screen that is truncated, ambiguous, or offers no
+    ///   matching choice gets nothing pressed, and the caller is told so.
+    /// - **No unconfirmed success.** After writing, the dialog has to be
+    ///   observed to clear. If it does not, this reports `not-dispatched`
+    ///   rather than a success the user would read as "approved".
+    async fn fallback_to_screen(
+        &self,
+        id: &remuda_protocol::InteractionId,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> DriverResult<DriverAck> {
+        let Some(state) = self.inner.lock().await.clone() else {
+            // No PTY at all: there is no dialog to answer, and nothing to
+            // report but the truth.
+            return Ok(DriverAck::not_dispatched());
+        };
+        let keys = match answer::keys_for(&state.screen_grid(), answer) {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::warn!(
+                    interaction = %id.as_id().as_str(),
+                    %error,
+                    "the hook did not apply the decision and the screen cannot be answered safely"
+                );
+                return Ok(DriverAck::not_dispatched());
+            }
+        };
+        // Claim before writing: when a write's outcome is unknown we must
+        // assume it landed rather than send it twice (D-022).
+        if !self.fallbacks.claim(id) {
+            tracing::warn!(
+                interaction = %id.as_id().as_str(),
+                "the screen fallback for this interaction was already spent; not replaying"
+            );
+            return Ok(DriverAck::not_dispatched());
+        }
+        tracing::info!(
+            interaction = %id.as_id().as_str(),
+            ?keys,
+            "hook decision was not applied; answering on screen once"
+        );
+        state.write_bytes(&logical_keys_to_bytes(&keys)).await?;
+        if self
+            .dialog_cleared_within(&state, FALLBACK_CONFIRM_WINDOW)
+            .await
+        {
+            return Ok(DriverAck::transport_written());
+        }
+        // The keys went out and the prompt is still there. Saying "written"
+        // here is what §14 risk 1 forbids: the user would read it as approved.
+        tracing::warn!(
+            interaction = %id.as_id().as_str(),
+            "the approval dialog did not clear after the fallback; not reporting it as applied"
+        );
+        Ok(DriverAck::not_dispatched())
+    }
+
+    /// Poll until the approval dialog leaves the screen, or `budget` elapses.
+    ///
+    /// This is the "confirmed by screen change" half of the honesty rule: a
+    /// keypress has no receipt, so the only evidence that it was taken is the
+    /// prompt going away.
+    async fn dialog_cleared_within(
+        &self,
+        state: &Arc<PtyState>,
+        budget: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if answer::dialog_cleared(&state.screen_grid()) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(FALLBACK_CONFIRM_POLL).await;
+        }
     }
 
     /// Stand up this instance's hook path, when one was configured.
@@ -1148,11 +1251,38 @@ impl Driver for ShellPtyDriver {
         Ok(DriverAck::transport_written())
     }
 
+    /// Answer an interaction, by whichever carrier opened it (§4.4).
+    ///
+    /// Three carriers land here and they are answered differently:
+    ///
+    /// 1. **Hook** — a `PermissionRequest` / `Elicitation` whose agent is
+    ///    parked on the socket. The decision goes to that process; no keys are
+    ///    pressed. Only this path can be *confirmed*.
+    /// 2. **Hook, ignored** — the decision was real but nothing received it
+    ///    (§14 risk 1). One screen-key attempt follows, and only one.
+    /// 3. **Transcript picker** — Remuda's own question, which binds the epoch.
+    ///
+    /// The return value never claims more than happened: a fallback that could
+    /// not find a matching choice on screen reports `not-dispatched` rather
+    /// than a success the user would read as "approved".
     async fn respond_interaction(
         &self,
         id: remuda_protocol::InteractionId,
         answer: remuda_protocol::InteractionAnswer,
     ) -> DriverResult<DriverAck> {
+        if let Some(hooks) = self.hooks.lock().await.clone()
+            && hooks.is_parked(&id)
+        {
+            let outcome = hooks.resolve_answer(&id, &answer);
+            if !crate::hook_answer::needs_fallback(outcome) {
+                tracing::debug!(interaction = %id.as_id().as_str(), "hook decision delivered");
+                return Ok(DriverAck::transport_written());
+            }
+            // The hook stopped listening before the human decided, or the
+            // harness ignored the reply. The dialog may still be on screen, so
+            // spend the single fallback attempt on it (§14 risk 1).
+            return self.fallback_to_screen(&id, &answer).await;
+        }
         // The only structured question a shell-pty asks is the manual
         // transcript picker; its answer deterministically binds the epoch.
         self.bindings
@@ -1185,6 +1315,12 @@ impl Driver for ShellPtyDriver {
         }
         if let Ok(mut slot) = self.status.lock() {
             *slot = None;
+        }
+        // Release any hook parked on an approval before the socket goes away.
+        // Otherwise each one holds its agent's turn open until its own
+        // deadline, minutes after the session has stopped.
+        if let Some(hooks) = self.hooks.lock().await.as_ref() {
+            hooks.retire_parked();
         }
         // Unbinds the socket and removes the socket file. The overlay and shims
         // stay for `instance.purge` to remove with the rest of the instance

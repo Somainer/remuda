@@ -104,6 +104,65 @@ impl HookSession {
         self.bus.binding()
     }
 
+    /// Whether a blocking hook for `id` is parked on this socket right now.
+    ///
+    /// The driver asks before answering so it can tell a hook-carried
+    /// interaction from a screen-carried one without consulting a second
+    /// table (D-028 §4.4).
+    #[must_use]
+    pub fn is_parked(&self, id: &remuda_protocol::InteractionId) -> bool {
+        self.bus.is_parked(id)
+    }
+
+    /// Hand a device's answer to the hook parked under `id`.
+    ///
+    /// The [`Outcome`](remuda_signal::Outcome) is the honesty gate: only
+    /// `Answered` means a waiting process received the decision. `Abandoned`
+    /// is the ignored/confined case the screen-key fallback exists for
+    /// (§14 risk 1).
+    #[must_use]
+    pub fn resolve_answer(
+        &self,
+        id: &remuda_protocol::InteractionId,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> remuda_signal::Outcome {
+        self.bus.resolve_answer(id, answer)
+    }
+
+    /// Release every parked hook with a deny. Called when the instance stops.
+    ///
+    /// Without it each parked hook holds its agent's turn open until its own
+    /// deadline, minutes after the session is gone.
+    pub fn retire_parked(&self) {
+        self.bus.retire_all();
+    }
+
+    /// True while interaction `id` still has a blocking hook parked on it.
+    #[must_use]
+    pub fn is_hook_waiting(&self, id: &remuda_protocol::InteractionId) -> bool {
+        self.bus.is_parked(id)
+    }
+
+    /// Deliver a device's answer to the hook parked under interaction `id`.
+    ///
+    /// Returns whether the decision actually reached a live hook
+    /// ([`Outcome::Answered`](remuda_signal::Outcome::Answered)). An
+    /// [`Abandoned`](remuda_signal::Outcome::Abandoned) answer is the
+    /// §14-risk-1 signal: the decision was real but nothing heard it, and the
+    /// caller owes the on-screen key fallback.
+    pub fn answer_hook(
+        &self,
+        id: &remuda_protocol::InteractionId,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> remuda_signal::Outcome {
+        self.bus.resolve_answer(id, answer)
+    }
+
+    /// Deny every parked hook (instance is closing).
+    pub fn retire_hooks(&self) {
+        self.bus.retire_all();
+    }
+
     /// Environment additions for the PTY child, given the `PATH` it inherited.
     ///
     /// Deliberately injected rather than inherited (§4.2): `PATH` is rewritten

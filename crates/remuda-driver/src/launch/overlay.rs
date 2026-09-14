@@ -105,27 +105,29 @@ impl HookOverlay {
             if entry.path() != self.path && !generated {
                 continue;
             }
-            let path = entry.path();
-            let mut settings: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-            let object = settings.as_object_mut().ok_or_else(|| {
-                DriverError::SettingsIsolationUnavailable(
-                    "settings overlay is not an object".into(),
-                )
-            })?;
-            if object.remove("tui").is_some() {
-                let temporary = launch.join(format!(
-                    ".settings-{}.tmp",
-                    remuda_protocol::RunId::new().as_id()
-                ));
-                write_private(&temporary, &serde_json::to_vec_pretty(&settings)?, 0o600)?;
-                if let Err(error) = std::fs::rename(&temporary, &path) {
-                    let _ = std::fs::remove_file(&temporary);
-                    return Err(error.into());
-                }
-            }
+            release_tui_in_file(&entry.path(), launch)?;
         }
         Ok(())
     }
+}
+
+fn release_tui_in_file(path: &Path, launch: &Path) -> DriverResult<()> {
+    let mut settings: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let object = settings.as_object_mut().ok_or_else(|| {
+        DriverError::SettingsIsolationUnavailable("settings overlay is not an object".into())
+    })?;
+    if object.remove("tui").is_some() {
+        let temporary = launch.join(format!(
+            ".settings-{}.tmp",
+            remuda_protocol::RunId::new().as_id()
+        ));
+        write_private(&temporary, &serde_json::to_vec_pretty(&settings)?, 0o600)?;
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 /// Hook events registered against the relay.
@@ -380,6 +382,12 @@ pub fn merge_explicit_settings(overlay: &Path, argv: &mut Vec<String>) -> Driver
             remuda_protocol::RunId::new().as_id()
         ));
         write_private(&destination, &serde_json::to_vec_pretty(&settings)?, 0o600)?;
+        // Release marks before scanning. If this file appeared after that scan,
+        // the post-write check strips its pin; if release starts after this
+        // check, its scan will find the file that already exists.
+        if launch.join(TUI_RELEASED_MARKER).is_file() {
+            release_tui_in_file(&destination, launch)?;
+        }
     }
     let mut injected = vec![
         "--settings".into(),
@@ -636,6 +644,11 @@ mod tests {
         let relaunched: Value = serde_json::from_slice(&std::fs::read(&argv[1]).unwrap()).unwrap();
         assert!(relaunched.get("tui").is_none());
         assert_eq!(relaunched["env"]["KEEP"], "yes");
+        let mut concurrent = vec!["--settings".into(), json!({"tui":"fullscreen"}).to_string()];
+        merge_explicit_settings(&overlay.path, &mut concurrent).unwrap();
+        let concurrent: Value =
+            serde_json::from_slice(&std::fs::read(&concurrent[1]).unwrap()).unwrap();
+        assert!(concurrent.get("tui").is_none());
 
         let fresh = materialize_overlay(&options(dir.path())).unwrap();
         assert_eq!(read(&fresh)["tui"], "fullscreen");

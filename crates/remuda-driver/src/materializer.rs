@@ -74,7 +74,7 @@ pub struct MaterializeRequest<'a> {
     pub launch_id: Id,
     /// Binary to pin.
     pub binary: BinarySource,
-    /// Override `--setting-sources`. Default `user,project,local`.
+    /// Optional explicit `--setting-sources`; omitted for normal source loading.
     pub setting_sources: Option<Vec<String>>,
     /// Who originated this launch. Bot/dispatcher specs cannot request bypass/yolo.
     pub origin: LaunchOrigin,
@@ -260,7 +260,7 @@ fn materialize_inner(
                 request.spec.driver,
                 &ClaudeArgv {
                     permission: &permission,
-                    setting_sources: &setting_sources,
+                    setting_sources: request.setting_sources.as_deref().unwrap_or(&[]),
                     settings_path: settings_path.as_deref(),
                     model: &model,
                     effort: request.spec.effort,
@@ -534,8 +534,10 @@ fn materialize_shell_pty_agent(
 
     let mut argv: Vec<String> = Vec::new();
     if preset.settings_flag {
-        argv.push("--setting-sources".into());
-        argv.push(setting_sources.join(","));
+        if request.setting_sources.is_some() {
+            argv.push("--setting-sources".into());
+            argv.push(setting_sources.join(","));
+        }
         if let Some(path) = overlay.as_ref() {
             argv.push("--settings".into());
             argv.push(path.to_string_lossy().into_owned());
@@ -1119,8 +1121,10 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
         }
     }
     argv.extend(permission.extra_flags.iter().cloned());
-    argv.push("--setting-sources".into());
-    argv.push(setting_sources.join(","));
+    if !setting_sources.is_empty() {
+        argv.push("--setting-sources".into());
+        argv.push(setting_sources.join(","));
+    }
     if let Some(settings_path) = settings_path {
         argv.push("--settings".into());
         argv.push(settings_path.to_string_lossy().into_owned());

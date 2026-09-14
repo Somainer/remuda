@@ -14,6 +14,7 @@ pub mod hooks;
 pub mod input;
 pub mod screen;
 pub mod script;
+pub mod settings;
 
 pub use artifacts::{
     ArtifactKind, ArtifactPaths, ArtifactSet, ClaudeCounters, CodexCounters, GrokTurnIds,

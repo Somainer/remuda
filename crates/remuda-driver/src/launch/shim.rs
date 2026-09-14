@@ -287,7 +287,7 @@ if [ "$user_settings" = 1 ]; then
 fi
 
 # Our flags first, the user's after, so theirs take precedence on any clash.
-exec "$real_path" --settings "$overlay" --setting-sources user,project,local "$@"
+exec "$real_path" --settings "$overlay" "$@"
 "#,
         overlay = single_quote(&overlay.to_string_lossy()),
         markers = single_quote(&markers.to_string_lossy()),

@@ -6,61 +6,81 @@ import css from "./AttachmentChips.module.css";
  *
  * A failed chip stays in place with its message rather than disappearing, so
  * the upload can be retried without re-picking the file.
+ *
+ * Each chip carries its 1-based anchor number (2026-09-15): the same number
+ * is in the prompt's `[Image #n]` token. A chip whose token was edited out of
+ * the text is marked "未引用" — the image is still sent — rather than removed.
  */
 export function AttachmentChips({
   attachments,
+  unreferenced,
   onRemove,
   onRetry,
 }: {
   attachments: Attachment[];
+  /** localIds whose `[Image #n]` token no longer appears in the draft text. */
+  unreferenced?: ReadonlySet<string>;
   onRemove: (localId: string) => void;
   onRetry?: (localId: string) => void;
 }) {
   if (attachments.length === 0) return null;
   return (
     <div className={css.row} data-testid="attachment-chips">
-      {attachments.map((attachment) => (
-        <div
-          key={attachment.localId}
-          className={css.chip}
-          data-state={attachment.state}
-          data-testid="attachment-chip"
-        >
-          <img className={css.thumb} src={attachment.previewUrl} alt={attachment.name} />
-          <span className={css.meta}>
-            <span className={css.name} title={attachment.name}>
-              {attachment.name}
+      {attachments.map((attachment, position) => {
+        const index = position + 1;
+        const orphan = unreferenced?.has(attachment.localId) === true;
+        return (
+          <div
+            key={attachment.localId}
+            className={css.chip}
+            data-state={attachment.state}
+            data-unreferenced={orphan ? "1" : "0"}
+            data-index={index}
+            data-testid="attachment-chip"
+          >
+            <span className={css.thumbWrap}>
+              <img className={css.thumb} src={attachment.previewUrl} alt={attachment.name} />
+              <span className={css.indexBadge} data-testid="attachment-index" aria-hidden>
+                {index}
+              </span>
             </span>
-            <span className={css.status}>
-              {attachment.state === "uploading"
-                ? "上传中…"
-                : attachment.state === "failed"
-                  ? (attachment.error ?? "上传失败")
-                  : formatSize(attachment.size)}
+            <span className={css.meta}>
+              <span className={css.name} title={attachment.name}>
+                {attachment.name}
+              </span>
+              <span className={css.status}>
+                {attachment.state === "uploading"
+                  ? "上传中…"
+                  : attachment.state === "failed"
+                    ? (attachment.error ?? "上传失败")
+                    : orphan
+                      ? "未引用（仍会发送）"
+                      : formatSize(attachment.size)}
+              </span>
             </span>
-          </span>
-          {attachment.state === "failed" && onRetry ? (
+            {attachment.state === "failed" && onRetry ? (
+              <button
+                type="button"
+                className={css.remove}
+                aria-label={`重试 ${attachment.name}`}
+                data-testid="attachment-retry"
+                onClick={() => onRetry(attachment.localId)}
+              >
+                ↻
+              </button>
+            ) : null}
             <button
               type="button"
               className={css.remove}
-              aria-label={`重试 ${attachment.name}`}
-              data-testid="attachment-retry"
-              onClick={() => onRetry(attachment.localId)}
+              aria-label={`移除 ${attachment.name}（图片 ${index}）`}
+              data-testid="attachment-remove"
+              onClick={() => onRemove(attachment.localId)}
             >
-              ↻
+              ×
             </button>
-          ) : null}
-          <button
-            type="button"
-            className={css.remove}
-            aria-label={`移除 ${attachment.name}`}
-            data-testid="attachment-remove"
-            onClick={() => onRemove(attachment.localId)}
-          >
-            ×
-          </button>
-        </div>
-      ))}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -69,18 +89,25 @@ export function AttachmentChips({
 export function SentAttachments({
   attachments,
 }: {
-  attachments: { objectId: string; name: string; previewUrl: string }[];
+  attachments: { objectId: string; name: string; previewUrl: string; index?: number }[];
 }) {
   if (attachments.length === 0) return null;
   return (
     <div className={css.sent} data-testid="sent-attachments">
       {attachments.map((attachment) => (
-        <img
-          key={attachment.objectId}
-          className={css.sentThumb}
-          src={attachment.previewUrl}
-          alt={attachment.name}
-        />
+        <span key={attachment.objectId} className={css.sentWrap}>
+          <img
+            className={css.sentThumb}
+            src={attachment.previewUrl}
+            alt={attachment.name}
+            data-index={attachment.index ?? ""}
+          />
+          {attachment.index ? (
+            <span className={css.indexBadge} data-testid="sent-attachment-index" aria-hidden>
+              {attachment.index}
+            </span>
+          ) : null}
+        </span>
       ))}
     </div>
   );

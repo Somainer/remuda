@@ -17,13 +17,25 @@ import {
  * staged refs at send time.
  *
  * Lives apart from the Composer so the composer itself gains only a few lines.
+ *
+ * Image anchors (2026-09-15): every chip's position in the `attachments`
+ * array is its 1-based anchor number, so `add` returns the numbers it just
+ * claimed and the composer can insert matching `[Image #n]` tokens at the
+ * caret. The list ref mirrors state synchronously — React state updates are
+ * async, but two pastes in the same tick must claim different numbers.
  */
 export function useAttachments(instanceId: string) {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   // Files are kept so a failed upload can be retried without re-picking.
   const files = useRef(new Map<string, File>());
+  // Synchronous mirror of `attachments`, for anchor-position arithmetic.
+  const listRef = useRef<Attachment[]>([]);
   const live = useRef(true);
+
+  useEffect(() => {
+    listRef.current = attachments;
+  }, [attachments]);
 
   useEffect(() => {
     live.current = true;
@@ -42,6 +54,7 @@ export function useAttachments(instanceId: string) {
         current.forEach(releaseAttachment);
         return [];
       });
+      listRef.current = [];
       pending.clear();
     };
   }, [instanceId]);
@@ -83,40 +96,57 @@ export function useAttachments(instanceId: string) {
     [instanceId],
   );
 
-  /** Stage a batch of picked, pasted, or dropped images. */
+  /**
+   * Stage a batch of picked, pasted, or dropped images.
+   *
+   * Returns the 1-based anchor numbers the accepted files claimed (their
+   * eventual chip positions), in input order, so the caller inserts matching
+   * `[Image #n]` tokens. Over-capacity files are rejected here and only the
+   * accepted count is returned.
+   */
   const add = useCallback(
-    (incoming: File[]) => {
-      if (incoming.length === 0) return;
+    (incoming: File[]): number[] => {
+      if (incoming.length === 0) return [];
       setNotice(null);
-      setAttachments((current) => {
-        const room = MAX_ATTACHMENTS - current.length;
-        if (room <= 0) {
-          setNotice(`一条消息最多 ${MAX_ATTACHMENTS} 张图片`);
-          return current;
-        }
-        const accepted = incoming.slice(0, room);
-        if (accepted.length < incoming.length) {
-          setNotice(`一条消息最多 ${MAX_ATTACHMENTS} 张图片`);
-        }
-        const staged = accepted.map((file) => {
-          const attachment = pendingAttachment(file);
-          files.current.set(attachment.localId, file);
-          void upload(attachment.localId, file);
-          return attachment;
-        });
-        return [...current, ...staged];
+      const base = listRef.current.length;
+      const room = MAX_ATTACHMENTS - base;
+      if (room <= 0) {
+        setNotice(`一条消息最多 ${MAX_ATTACHMENTS} 张图片`);
+        return [];
+      }
+      const accepted = incoming.slice(0, room);
+      if (accepted.length < incoming.length) {
+        setNotice(`一条消息最多 ${MAX_ATTACHMENTS} 张图片`);
+      }
+      const staged = accepted.map((file) => {
+        const attachment = pendingAttachment(file);
+        files.current.set(attachment.localId, file);
+        void upload(attachment.localId, file);
+        return attachment;
       });
+      const next = [...listRef.current, ...staged];
+      listRef.current = next;
+      setAttachments(next);
+      return accepted.map((_, offset) => base + offset + 1);
     },
     [upload],
   );
 
-  const remove = useCallback((localId: string) => {
-    setAttachments((current) => {
-      const target = current.find((attachment) => attachment.localId === localId);
-      if (target) releaseAttachment(target);
-      files.current.delete(localId);
-      return current.filter((attachment) => attachment.localId !== localId);
-    });
+  /**
+   * Remove one chip. Returns the anchor number it held, so the caller can pull
+   * the token out of the prompt and renumber the rest.
+   */
+  const remove = useCallback((localId: string): number | null => {
+    const current = listRef.current;
+    const position = current.findIndex((attachment) => attachment.localId === localId);
+    if (position < 0) return null;
+    const target = current[position];
+    releaseAttachment(target);
+    files.current.delete(localId);
+    const next = current.filter((attachment) => attachment.localId !== localId);
+    listRef.current = next;
+    setAttachments(next);
+    return position + 1;
   }, []);
 
   const retry = useCallback(
@@ -136,23 +166,20 @@ export function useAttachments(instanceId: string) {
   );
 
   /**
-   * Handle a paste. Returns true when images were consumed, so the caller
-   * only calls `preventDefault` then — swallowing every paste would break
-   * plain-text pasting and the iOS caret.
+   * Handle a paste. Returns the anchor numbers inserted (empty when the paste
+   * carried no usable image), so the caller both knows whether to
+   * `preventDefault` and which tokens to place at the caret.
    */
   const onPaste = useCallback(
-    (data: DataTransfer | null): boolean => {
+    (data: DataTransfer | null): number[] => {
       const images = imagesFromClipboard(data);
-      if (images.length > 0) {
-        add(images);
-        return true;
-      }
+      if (images.length > 0) return add(images);
       if (clipboardHasUnreadableImage(data)) {
         // iOS can declare an image while exposing no file; point at the
         // explicit button, which goes through the async clipboard API.
         setNotice("没能读到剪贴板里的图片，试试「粘贴图片」按钮或用 📎 选择文件");
       }
-      return false;
+      return [];
     },
     [add],
   );
@@ -162,7 +189,7 @@ export function useAttachments(instanceId: string) {
    * gesture: Chromium wants transient activation, and WebKit shows a platform
    * confirmation that a later click would cancel.
    */
-  const pasteFromClipboard = useCallback(async () => {
+  const pasteFromClipboard = useCallback(async (): Promise<number[]> => {
     setNotice(null);
     try {
       const items = await navigator.clipboard.read();
@@ -175,20 +202,21 @@ export function useAttachments(instanceId: string) {
       }
       if (picked.length === 0) {
         setNotice("剪贴板里没有图片");
-        return;
+        return [];
       }
-      add(picked);
+      return add(picked);
     } catch {
       setNotice("浏览器不允许读取剪贴板，请用 📎 选择文件");
+      return [];
     }
   }, [add]);
 
   /** Drop every chip, after a successful send or an explicit discard. */
   const clear = useCallback(() => {
-    setAttachments((current) => {
-      current.forEach(releaseAttachment);
-      return [];
-    });
+    const current = listRef.current;
+    current.forEach(releaseAttachment);
+    listRef.current = [];
+    setAttachments([]);
     files.current.clear();
     setNotice(null);
   }, []);
@@ -198,11 +226,9 @@ export function useAttachments(instanceId: string) {
    * can keep showing the thumbnails. The bubble owns them from here.
    */
   const handOff = useCallback(() => {
-    setAttachments((current) => {
-      files.current.clear();
-      void current;
-      return [];
-    });
+    files.current.clear();
+    listRef.current = [];
+    setAttachments([]);
     setNotice(null);
   }, []);
 
@@ -218,6 +244,7 @@ export function useAttachments(instanceId: string) {
     pasteFromClipboard,
     clear,
     handOff,
-    refs: () => refsOf(attachments),
+    /** Manifest refs in token order; `tokenText` is the prompt being sent. */
+    refs: (tokenText?: string) => refsOf(listRef.current, tokenText),
   };
 }

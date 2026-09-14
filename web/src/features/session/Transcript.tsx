@@ -3,6 +3,7 @@ import type { Observation } from "../../types/observation";
 import { MarkdownText } from "../../components/MarkdownText";
 import type { LocalBubble } from "../../lib/store";
 import { SentAttachments } from "./AttachmentChips";
+import { AnchorText } from "./AnchorText";
 import { hubStore } from "../../lib/store";
 import ui from "../../styles/ui.module.css";
 import { assembleTranscript, compactTranscript, type TranscriptNode } from "./assemble";
@@ -313,7 +314,20 @@ function renderNode(
           {node.status === "queued" ? <span className={session.stat}> · 排队中</span> : null}
           {node.status === "interrupted" ? <span className={session.stat}> · 已打断</span> : null}
         </div>
-        {node.role === "assistant" ? <MarkdownText text={node.text} /> : <p className={session.bubble}>{node.text}</p>}
+        {node.role === "assistant" ? (
+          <MarkdownText text={node.text} />
+        ) : node.local ? (
+          // TODO(batch E, r-ux-imgref): local-bubble-only adoption of the
+          // inline [Image #n] chip renderer. Journaled user messages get the
+          // same treatment once attachments are echoed on the journal.
+          <AnchorText
+            text={node.text}
+            attachments={node.local.attachments}
+            className={session.bubble}
+          />
+        ) : (
+          <p className={session.bubble}>{node.text}</p>
+        )}
         {streaming ? <span className={session.cursor} data-testid="streaming-cursor" aria-hidden /> : null}
         {node.local?.attachments?.length ? (
           <SentAttachments attachments={node.local.attachments} />

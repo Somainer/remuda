@@ -459,6 +459,99 @@ Validation on the resolved `230532e` source base:
 | `./scripts/ci/secret-scan.sh` and `./scripts/ci/no-tunnel-scan.sh` | PASS |
 
 Full-suite artifacts and real-run logs were archived outside the repository.
-Generated Spaces screenshots were removed. The two rebased commits retain the
-worker's changes and explain the P2/launchopts integration without adding a
-third implementation commit.
+Generated Spaces screenshots were removed. The two rebased worker commits retain the hook changes and explain the
+P2/launchopts integration.
+
+
+### Final main update: macOS parent-watch portability
+
+The final fetch advanced main again to `7ae99e6`, adding fake-helper parent
+watching and server cleanup. The two worker commits rebased cleanly, but the
+requested clippy command then failed with `E0432`: nix 0.28 does not expose
+`unistd::pipe2` on macOS. This was new main code, not a hook merge conflict.
+
+A third, narrowly scoped commit supplies a notification pipe with the same
+flags: Linux keeps atomic `pipe2`; other Unix platforms use `pipe` and set
+`FD_CLOEXEC` and `O_NONBLOCK` on both owned descriptors before starting the
+watcher. The regression checks both ends' flags, empty-pipe `EAGAIN`, and that
+the notification byte wakes the async waiter. It does not start a watcher that
+could terminate the test runner. The parent-death and stdin-hangup behavior is
+preserved. The requested Rust checks and full Hub suite are repeated on this
+final source base, including the existing helper lifecycle tests.
+
+Final validation completed after rebasing onto `e97c200` (the new web
+filters/overlay changes). A tree comparison confirmed that Rust sources,
+`Cargo.toml` and `Cargo.lock` were identical to the five-crate run on
+`7ae99e6` plus the pipe fix. Web tests/build and the full Hub suite used the
+new `e97c200` web source.
+
+| Final check | Result |
+| --- | --- |
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy -p remuda-driver -p remuda-node -p remuda-signal -p remuda -p remuda-testing --all-targets --locked -- -D warnings` | PASS |
+| `cargo test -p remuda-driver -p remuda-node -p remuda-signal -p remuda -p remuda-testing --locked` | PASS: 68 targets, 924 passed, 0 failed, 10 existing ignored |
+| Notification pipe / fake server drop and orphan cleanup regressions | PASS |
+| `pnpm --dir web test --maxWorkers=2` | PASS: 73 files, 487 tests |
+| Web build and API generation | PASS; no generated API diff |
+| Full Hub e2e, same dedicated ports, CI Chromium, no retries | PASS: 17 passed, one existing conditional skip, 3.5 minutes |
+
+The final promoted spec took 19.1 s: two native Esc interruptions, two journal
+interruptions, two completed turns in one process, and hook signal tier. Its
+working assertions took 77–78 ms; idle assertions took 1–2 ms after completion
+checks. Final artifacts were archived, generated Spaces screenshots removed,
+and all five worker listener ports verified unused. Four older orphan fake
+servers from this worker's own Cargo targets were also terminated; other
+workers' processes were left alone.
+
+Final secret scan, no-tunnel scan and whitespace checks also passed.
+
+### Rebase onto inventory extraction and streaming (`eefcbba`)
+
+The next merge gate found a runtime conflict after the inventory extraction,
+P3 streaming and UX-C1 status changes reached main. This rebase keeps
+`driver_inventory()` and `driver_capability_snapshot()` exclusively in
+`inventory.rs`; runtime still calls those shared builders. Host snapshots and
+the Node hello/heartbeat retain `driverInventory`. The stdio test's synthetic
+host now supplies the new inventory field explicitly.
+
+The observation pump keeps both P3 message assembly and the promoted-hook
+binding/activity fold. A joint SignalBus regression verifies early
+SessionStart/prompt binding, hook tier, two MessageDisplay chunks with ordered
+`open`/`append` mutations, streaming/completed status, and the existing turn
+ownership behavior. Message synthesis uses the same bound PID/session
+check as activity: foreign hooks remain raw evidence and cannot add foreground
+text or close its message. The regression sends foreign final chunks with the
+same message id before the valid chunks to prove they cannot poison assembly.
+Unbound early display hooks remain raw evidence for transcript hydration;
+non-shell-pty streaming keeps its existing behavior.
+
+The P3 fake-Hub streaming helper had also introduced a second blind socket read.
+Removing that read preserves the fixture's sole RPC reader, so an append ACK
+cannot cause a concurrent Hub command to be discarded. The streaming chunks,
+revisions and test cleanup remain unchanged. The full suite includes the new
+streaming and UX status cases alongside the promoted-Claude spec.
+
+Validation on this source base:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all` | PASS |
+| `cargo clippy -p remuda-driver -p remuda-node -p remuda-signal -p remuda --all-targets --locked -- -D warnings` | PASS |
+| `cargo test -p remuda-driver -p remuda-node -p remuda-signal -p remuda --locked` | PASS: 59 targets, 901 passed, 0 failed, 11 marked ignored; the inventory child fixture is re-executed by its passing parent test |
+| `pnpm --dir web test --maxWorkers=2` | PASS: 78 files, 601 tests |
+| Web build and API generation | PASS; no generated API diff |
+| Web lint | Exit 0; five existing warnings in untouched web files |
+| Full Hub e2e on Hub `58580`, web `58589`, upstream `58581`, CI Chromium, no retries | PASS: 26 passed, one existing conditional skip, 4.3 minutes |
+
+The promoted-Claude case passed in 20.8 s. Its captured instance is
+`kind=claude`, `mode=promoted`, `launchedBy=user`, `signalTier=hook`, and still
+running/idle after two completed turns and two interruptions. The native log
+records two `interrupt` events with `by=esc`, matching two journal
+`interrupted` lifecycle events. Working assertions completed in 77–82 ms;
+idle assertions completed in 1–2 ms after their completion checks. The new
+P3 streaming case and all eight UX status cases passed in the same full run.
+
+Final formatting, secret scan, no-tunnel scan and whitespace checks passed.
+The run's artifacts were archived and its six untracked Spaces screenshots
+removed. All five worker ports were unused afterward, with no remaining native
+helpers from this worker's target directory.

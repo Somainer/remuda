@@ -120,8 +120,15 @@ function compareMessages(a: MessageEvent, b: MessageEvent): number {
   return BigInt(a.seq) < BigInt(b.seq) ? -1 : BigInt(a.seq) > BigInt(b.seq) ? 1 : 0;
 }
 
-/** Rebuild each message in revision order; keep its first transcript position. */
-function assembleMessages(events: Observation[]): Map<MessageEvent, MessageNode> {
+/**
+ * Rebuild each message in revision order; keep its first transcript position.
+ *
+ * `anchors` records each node's position key: the smallest journal seq of any
+ * event that produced it. Gap backfill appends earlier-seq events to the end
+ * of the store array, so encounter order cannot be used for placement — the
+ * final transcript is sorted by this anchor in {@link assembleTranscript}.
+ */
+function assembleMessages(events: Observation[], anchors: Map<TranscriptNode, bigint>): Map<MessageEvent, MessageNode> {
   const identities = new Map<string, MessageEvent[]>();
   for (const ev of events) {
     if (ev.kind !== "message") continue;
@@ -135,7 +142,17 @@ function assembleMessages(events: Observation[]): Map<MessageEvent, MessageNode>
     let mutation: NodeMutation | undefined;
     let blocks: ContentBlock[] = [];
     let node: MessageNode | undefined;
-    for (const ev of group.slice().sort(compareMessages)) {
+    // Identity must be a pure function of the event *set*, never of array
+    // order: gap backfill appends earlier-seq events to the end of the store's
+    // array, and re-follow rebuilds it in seq order. A group[0]-derived key
+    // could switch between assemblies (a regrouped message whose rename
+    // arrives before its open), which would make search hits and the saved
+    // reading anchor jump to another node. `nodeId` is the mutation-chain
+    // identity in protocol §5.2 and survives a native `messageId` rename on
+    // close, so the earliest revision's nodeId is the canonical key.
+    const ordered = group.slice().sort(compareMessages);
+    const stableId = ordered[0].payload.nodeId;
+    for (const ev of ordered) {
       const payload = ev.payload;
       if (node && mutation?.revision === payload.revision && payload.operation === "append") {
         node.status = payload.status;
@@ -148,7 +165,7 @@ function assembleMessages(events: Observation[]): Map<MessageEvent, MessageNode>
       blocks = messageBlocks(hasBase ? blocks : [], payload.blocks, payload.operation, payload.targetBlock);
       node ??= {
         type: "message",
-        id: group[0].payload.messageId,
+        id: stableId,
         role: payload.role,
         text: "",
         status: payload.status,
@@ -162,13 +179,33 @@ function assembleMessages(events: Observation[]): Map<MessageEvent, MessageNode>
       node.origin = payload.origin ?? "human";
       mutation = payload;
     }
-    if (node) messages.set(group[0], node);
+    if (node) {
+      // Place the bubble at the group's earliest journal seq even when that
+      // event reached the store late (gap backfill, out-of-order replay).
+      const anchorSeq = group.reduce((min, ev) => {
+        const v = BigInt(ev.seq);
+        return v < min ? v : min;
+      }, BigInt(group[0].seq));
+      anchors.set(node, anchorSeq);
+      let anchorEvent: MessageEvent = group[0];
+      for (const ev of group) {
+        if (BigInt(ev.seq) === anchorSeq) {
+          anchorEvent = ev;
+          break;
+        }
+      }
+      messages.set(anchorEvent, node);
+    }
   }
   return messages;
 }
 
 export function assembleTranscript(events: Observation[], bubbles: LocalBubble[] = []): TranscriptNode[] {
-  const messages = assembleMessages(events);
+  // node -> earliest journal seq that produced it; the transcript is sorted
+  // by this so a gap backfill (which appends late-arriving events to the
+  // store array) cannot move a node to the bottom.
+  const anchors = new Map<TranscriptNode, bigint>();
+  const messages = assembleMessages(events, anchors);
   const thoughts = new Map<string, { mutation: NodeMutation; node: Extract<TranscriptNode, { type: "thought" }> }>();
   const tools = new Map<string, ToolNode>();
   const workflows = new Map<
@@ -177,6 +214,11 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   >();
   const nodes: TranscriptNode[] = [];
   const seenUser = new Set<string>();
+  const anchor = (node: TranscriptNode, ev: Observation) => {
+    const seq = BigInt(ev.seq);
+    const prev = anchors.get(node);
+    if (prev === undefined || seq < prev) anchors.set(node, seq);
+  };
 
   const pushTool = (node: ToolNode) => {
     tools.set(node.call.toolCallId, node);
@@ -219,7 +261,10 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       current.mutation = payload;
       thoughts.set(`thought:${payload.thoughtId}`, current);
       thoughts.set(`node:${payload.nodeId}`, current);
-      if (!existing) nodes.push(node);
+      if (!existing) {
+        nodes.push(node);
+        anchor(node, ev);
+      }
       continue;
     }
     if (ev.kind === "tool_call") {
@@ -250,6 +295,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
         existing.diffState = diffState(call, existing.result, ev.completeness);
       } else {
         pushTool(node);
+        anchor(node, ev);
       }
       continue;
     }
@@ -267,8 +313,8 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     if (ev.kind === "workflow.run" || ev.kind === "workflow.phase" || ev.kind === "workflow.member") {
       // Keep the per-workflow accumulator (mutated in place so a card already
       // mounted on a tool row stays live), then either mount it on the
-      // Workflow tool row (decision 1) or keep a standalone node when the
-      // producer gave no tool call id to attach it to.
+      // Workflow tool row (r-ux-w decision 1) or keep a standalone node when
+      // the producer gave no tool call id to attach it to.
       const wfId = ev.payload.workflowId;
       const current =
         workflows.get(wfId) ??
@@ -303,44 +349,65 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
         if (standaloneAt >= 0) nodes.splice(standaloneAt, 1);
       } else if (standaloneAt < 0) {
         nodes.push(current);
+        anchor(current, ev);
       }
       continue;
     }
     if (ev.kind === "usage") {
-      nodes.push({ type: "usage", id: ev.eventId, payload: ev.payload });
+      const node = { type: "usage" as const, id: ev.eventId, payload: ev.payload };
+      nodes.push(node);
+      anchor(node, ev);
       continue;
     }
     if (ev.kind === "interaction.requested") {
       const interaction = ev.payload.interaction;
-      nodes.push({
-        type: "interaction",
+      const node = {
+        type: "interaction" as const,
         id: ev.eventId,
         interaction,
         pending: interaction.state === "pending",
-      });
+      };
+      nodes.push(node);
+      anchor(node, ev);
       continue;
     }
     if (ev.kind === "lifecycle") continue;
     if (ev.kind === "interaction.answered" || ev.kind === "interaction.expired") continue;
     if (ev.kind === "opaque") {
       const payload = ev.payload;
-      nodes.push({
-        type: "opaque",
+      const node = {
+        type: "opaque" as const,
         id: ev.eventId,
         kind: payload.nativeType ?? ev.kind,
         summary: payload.summary ?? payload.reason ?? null,
         raw: ev.payload,
-      });
+      };
+      nodes.push(node);
+      anchor(node, ev);
       continue;
     }
-    nodes.push({
-      type: "opaque",
+    const node = {
+      type: "opaque" as const,
       id: ev.eventId,
       kind: ev.kind,
       summary: null,
       raw: ev.payload,
-    });
+    };
+    nodes.push(node);
+    anchor(node, ev);
   }
+
+  // Stable seq order: nodes met only through late backfill land in their
+  // journal position, not at the point the store happened to see them.
+  nodes
+    .map((node, index) => ({ node, index, seq: anchors.get(node) }))
+    .sort((a, b) => {
+      if (a.seq !== undefined && b.seq !== undefined && a.seq !== b.seq) return a.seq < b.seq ? -1 : 1;
+      return a.index - b.index;
+    })
+    .forEach((entry, i) => {
+      nodes[i] = entry.node;
+    });
 
   for (const node of nodes) {
     if (node.type === "message" && node.role === "user" && node.origin === "human") {
@@ -365,22 +432,33 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   return nodes;
 }
 
+/**
+ * A tool whose own result says it did not run successfully. `denied` is
+ * included: a refused permission is exactly the kind of thing the reader
+ * needs to see, not discover hidden behind a fold.
+ */
+export function isToolFailure(node: TranscriptNode): boolean {
+  return node.type === "tool" && (node.result?.outcome === "failed" || node.result?.outcome === "denied");
+}
+
 /** Compact only after a turn ends (assistant or usage). In-flight tools stay expanded. */
 export function compactTranscript(nodes: TranscriptNode[], enabled: boolean): TranscriptNode[] {
   if (!enabled) return nodes;
   const out: TranscriptNode[] = [];
   let pending: TranscriptNode[] = [];
   const compactPending = () => {
-    const tools = pending.filter((n) => n.type === "tool");
+    // Failed tools keep their inline position in `rest`; the fold only
+    // swallows successful/routine tools and thoughts.
+    const tools = pending.filter((n) => n.type === "tool" && !isToolFailure(n));
     const thoughts = pending.filter((n) => n.type === "thought");
-    const rest = pending.filter((n) => n.type !== "tool" && n.type !== "thought");
+    const rest = pending.filter((n) => (n.type !== "tool" || isToolFailure(n)) && n.type !== "thought");
     if (tools.length + thoughts.length >= 2) {
       out.push({
         type: "compact",
         id: `compact:${tools[0]?.id ?? thoughts[0]?.id}`,
         toolCount: tools.length,
         thoughtCount: thoughts.length,
-        children: pending.filter((n) => n.type === "tool" || n.type === "thought"),
+        children: pending.filter((n) => (n.type === "tool" && !isToolFailure(n)) || n.type === "thought"),
       });
       out.push(...rest);
     } else {

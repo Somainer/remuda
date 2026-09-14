@@ -17,6 +17,71 @@ test.afterEach(async ({ page }) => {
   expect(res.ok() || res.status() === 404).toBeTruthy();
 });
 
+/** maxInstances 8 is shared across the whole serial hub suite; raise it for
+ * this file and restore the default afterwards (same pattern as
+ * session-virtual.hub.spec.ts). */
+async function raiseCap(page: Page, to: number): Promise<void> {
+  const hosts = await page.evaluate(async () => {
+    const response = await fetch("/v1/hosts", { credentials: "include" });
+    return response.json() as Promise<{
+      items?: { hostId?: string; id?: string; label?: string; maxInstances?: number }[];
+    }>;
+  });
+  const host = (hosts.items ?? []).find((h) => h.label === "e2e-fake-node");
+  if (!host) return;
+  const hostId = (host.hostId ?? host.id) as string;
+  if ((host.maxInstances ?? 8) >= to) return;
+  await page.evaluate(
+    async ({ id, value }) => {
+      await fetch(`/v1/hosts/${id}`, {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ maxInstances: value }),
+      });
+    },
+    { id: hostId, value: to },
+  );
+}
+
+let hubRan = false;
+
+test.beforeEach(async ({ page }) => {
+  await login(page);
+  await raiseCap(page, 24);
+  hubRan = true;
+});
+
+test.afterAll(async ({ browser }) => {
+  if (!hubRan) return;
+  const page = await browser.newPage();
+  try {
+    await login(page);
+    const hosts = await page.evaluate(async () => {
+      const response = await fetch("/v1/hosts", { credentials: "include" });
+      return response.json() as Promise<{
+        items?: { hostId?: string; id?: string; label?: string }[];
+      }>;
+    });
+    const host = (hosts.items ?? []).find((h) => h.label === "e2e-fake-node");
+    if (host) {
+      await page.evaluate(
+        async (id) => {
+          await fetch(`/v1/hosts/${id}`, {
+            method: "PATCH",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ maxInstances: 8 }),
+          }).catch(() => {});
+        },
+        (host.hostId ?? host.id) as string,
+      );
+    }
+  } finally {
+    await page.close();
+  }
+});
+
 async function answerPending(page: Page, instanceId: string) {
   await expect
     .poll(
@@ -52,7 +117,6 @@ async function answerPending(page: Page, instanceId: string) {
 }
 
 async function openWorkflowSession(page: Page, prompt: string): Promise<string> {
-  await login(page);
   await page.getByTitle("新建", { exact: true }).click();
   await expect(page.getByTestId("new-session-sheet")).toBeVisible();
   const host = await page

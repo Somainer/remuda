@@ -525,4 +525,20 @@ test("structured view streams assistant text and separates injected records", as
   await page.setViewportSize({ width: 400, height: 840 });
   await shot(page, "native-pty-web-3-structured-stream-400.png");
   await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Release the placement slot. The fake host advertises `maxInstances: 8`
+  // and the suite is serial, so a spec that leaves its instance live spends
+  // one of those slots for the rest of the run — a later spec creating
+  // several sessions then fails placement with a non-OK POST /v1/instances,
+  // far from the spec that actually leaked.
+  //
+  // The fake Node never emits an exit lifecycle (there is no real process to
+  // lose), so `instance.close` alone leaves the row `running` and the slot
+  // counted. DELETE settles to `exited` best-effort regardless, which is the
+  // cleanup path the rest of the suite relies on.
+  const deleted = await page.request.delete(`/v1/instances/${instanceId}?force=1`);
+  expect(deleted.ok()).toBe(true);
+  await expect
+    .poll(async () => (await page.request.get(`/v1/instances/${instanceId}`)).status())
+    .toBe(404);
 });

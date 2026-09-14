@@ -68,13 +68,36 @@ impl Harness {
     /// calls out that a non-login shell must still get the injection, and it
     /// does because PATH is inherited rather than sourced from a profile.
     fn sh(&self, script: &str) -> std::process::Output {
-        Command::new("/bin/sh")
+        self.sh_env(script, &[])
+    }
+
+    /// [`Self::sh`] with `extra` added on top of the fixed environment.
+    ///
+    /// `env_clear` first, deliberately. These tests are *about* which
+    /// environment reaches the agent, so inheriting the runner's own is the
+    /// one thing they must not do: a `REMUDA_SHIM=off` in the ambient shell
+    /// silently turns the shim into a passthrough and the assertions then
+    /// describe the operator's machine rather than the code. Verified by
+    /// running this binary under `REMUDA_SHIM=off`, which failed two tests
+    /// before this and passes after.
+    ///
+    /// `HOME` is kept because the shadow `ZDOTDIR` logic reads it, and nothing
+    /// else is: `sh -c` needs no more than `PATH`.
+    fn sh_env(&self, script: &str, extra: &[(&str, &str)]) -> std::process::Output {
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(script)
+            .env_clear()
             .env("PATH", self.path())
-            .env("REMUDA_HOOK_CREDENTIAL", "cred-test")
-            .output()
-            .expect("shell runs")
+            .env("REMUDA_HOOK_CREDENTIAL", "cred-test");
+        if let Some(home) = std::env::var_os("HOME") {
+            command.env("HOME", home);
+        }
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        command.output().expect("shell runs")
     }
 
     fn recorded(&self) -> Vec<String> {
@@ -156,13 +179,11 @@ fn a_user_who_passes_their_own_settings_keeps_it() {
 #[test]
 fn remuda_shim_off_makes_the_shim_a_plain_passthrough() {
     let harness = harness();
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg("claude --resume abc123")
-        .env("PATH", harness.path())
-        .env("REMUDA_SHIM", "off")
-        .output()
-        .unwrap();
+    // Through the same fixed-environment helper as every other case, with the
+    // switch set explicitly: this test asserts what `REMUDA_SHIM=off` does, so
+    // the value has to come from the test rather than from whatever the
+    // runner's shell happened to export.
+    let output = harness.sh_env("claude --resume abc123", &[("REMUDA_SHIM", "off")]);
     assert!(output.status.success(), "{output:?}");
     let argv = harness.recorded();
     assert!(

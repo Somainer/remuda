@@ -154,6 +154,10 @@ impl Machine {
         self.tentative[idx] = Some(merge);
     }
 
+    fn has_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
     fn finished(&mut self, job: FinishedJob) {
         self.in_flight.remove(&job.idx);
         let speculative = self.launched_speculative[job.idx];
@@ -466,6 +470,18 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
                 break;
             }
             Decision::StopBaseMoved { idx, current_main } => {
+                // Drain still-running speculative lanes so their child
+                // processes and temporary worktrees do not outlive the queue.
+                while machine.has_in_flight() {
+                    match rx.recv() {
+                        Ok(Event::Prepared { .. }) => {}
+                        Ok(Event::Finished(job)) => {
+                            busy.remove(&job.idx);
+                            machine.finished(job);
+                        }
+                        Err(_) => break,
+                    }
+                }
                 let mut outcomes = machine.records(&names);
                 outcomes[idx].status = "base_moved".into();
                 outcomes[idx].why = format!(

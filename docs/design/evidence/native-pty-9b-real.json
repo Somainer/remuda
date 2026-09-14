@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "observedAtUtc": "2026-09-14T16:56:49+00:00",
+  "harness": {
+    "name": "Claude Code",
+    "version": "2.1.270",
+    "platform": "macOS arm64",
+    "versionEvidence": "native TUI banner and versioned installed executable"
+  },
+  "scope": {
+    "method": "stdlib Python PTY with raw byte counters and two synthetic SessionStart command hooks",
+    "configIsolation": "CLAUDE_CONFIG_DIR, project settings, local settings, relay overlay, and temporary files under worktree target",
+    "credentialsCopied": false,
+    "modelPromptSubmitted": false,
+    "screenshotsCaptured": false,
+    "runtimeSettings": "authorized relay settings merged into a private overlay; gateway values omitted from this artifact"
+  },
+  "staticBundleResearch": {
+    "status": "VERIFIED",
+    "researchOrigin": "coordinator research independently checked against installed 2.1.270 bundle",
+    "forkRestrictedPredicate": "cPn",
+    "definedOptionsThatRestrictRendererSwitch": [
+      "systemPrompt",
+      "systemPromptFile",
+      "appendSystemPromptFile",
+      "permissionPromptTool",
+      "settingSources",
+      "managedSettings"
+    ],
+    "toolsRestriction": "any tools entry differs from default",
+    "settingsOptionIsARestrictionTrigger": false,
+    "rendererResolution": "merged settings tui takes precedence over the environment latch",
+    "rendererResolutionEvidence": "renderer switch evaluates Ge().tui before Lje(); Lje reads the environment latch",
+    "relaunchLatch": "CLAUDE_CODE_TUI_JUST_SWITCHED",
+    "environmentNotes": {
+      "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "forces the classic renderer",
+      "CLAUDE_CODE_NO_FLICKER": "overrides selected automatic renderer disables; probe initially set it to 1"
+    },
+    "launchArgvAudit": {
+      "common": [
+        "--settings",
+        "<private-overlay>"
+      ],
+      "legacyOnly": [
+        "--setting-sources",
+        "user,project,local"
+      ],
+      "otherPredicateTriggerFlags": []
+    }
+  },
+  "legacyRestrictedLaunch": {
+    "status": "VERIFIED",
+    "settingsInputs": {
+      "userTui": "default",
+      "projectTui": "default",
+      "localTui": "default",
+      "overlayTui": "fullscreen"
+    },
+    "rawAlternateScreenEnterCountBeforeSwitch": 1,
+    "rawAlternateScreenExitCountAfterSwitchAttempt": 0,
+    "sessionStartHookOrigins": [
+      "overlay",
+      "user"
+    ],
+    "sessionStartHookCount": 2,
+    "command": "/tui default",
+    "result": "refused",
+    "refusalText": "Cannot switch renderers in this session",
+    "textEvidence": "normalized adjacent styled terminal spans; no screenshot retained"
+  },
+  "unrestrictedLaunchAndSwitch": {
+    "status": "VERIFIED",
+    "settingSourcesFlagPresent": false,
+    "initialSettingsInputs": {
+      "userTui": "default",
+      "projectTui": "default",
+      "localTui": "default",
+      "overlayTui": "fullscreen"
+    },
+    "initialRawAlternateScreenEnterCount": 1,
+    "initialSessionStartHookOrigins": [
+      "user",
+      "overlay"
+    ],
+    "overlayRelease": {
+      "afterBothSessionStartHooks": true,
+      "removedOnlyTui": true,
+      "retainedPinnedKeys": [
+        "showStatusInTerminalTab",
+        "terminalProgressBarEnabled"
+      ],
+      "retainedHooks": true
+    },
+    "firstDefaultSwitch": {
+      "command": "/tui default",
+      "refused": false,
+      "cumulativeEnterCount": 1,
+      "cumulativeExitCount": 1
+    },
+    "nativePrecedenceLimitation": {
+      "status": "VERIFIED",
+      "trigger": "synthetic project and local settings still contained tui=default",
+      "command": "/tui fullscreen",
+      "refused": false,
+      "userSettingsTuiAfterCommand": "fullscreen",
+      "cumulativeEnterCount": 1,
+      "cumulativeExitCount": 1,
+      "conclusion": "project/local settings override the user preference written by /tui; releasing the overlay cannot override that native precedence"
+    },
+    "ordinarySwitchControl": {
+      "precondition": "removed only the synthetic project/local tui keys after recording the precedence limitation; overlay tui remained absent",
+      "fullscreenCommand": "/tui fullscreen",
+      "fullscreenCumulativeEnterCount": 2,
+      "fullscreenCumulativeExitCount": 1,
+      "defaultCommand": "/tui default",
+      "defaultCumulativeEnterCount": 2,
+      "defaultCumulativeExitCount": 2,
+      "refused": false
+    },
+    "sessionStartHooks": {
+      "total": 12,
+      "perOrigin": {
+        "user": 6,
+        "overlay": 6
+      },
+      "distinctNativeSessionIds": 3,
+      "sources": [
+        "resume",
+        "startup"
+      ]
+    },
+    "processIdentity": {
+      "status": "VERIFIED",
+      "distinctObservedHarnessPids": 1,
+      "observation": "the installed native renderer relaunch kept the same OS PID; SessionStart emitted new native session IDs before a resumable transcript existed, then resume events with the existing native session ID",
+      "newPidRelaunch": "not observed in this native probe; covered separately by fake-harness replacement-process tests"
+    },
+    "remudaNodeBinding": "not exercised by this standalone native probe; Node binding requires the separate fake-harness evidence"
+  },
+  "cleanup": {
+    "ownedHarnessPidsAbsent": true,
+    "ownedProcessGroupMemberCount": 0,
+    "privateRelayCopiesRemoved": true,
+    "isolatedConfigAndTranscriptFilesRemoved": true,
+    "realUserSettingsWritten": false,
+    "note": "the controller encountered an already-exited process-group cleanup error; subsequent direct PID and process-group inventory found no remaining owned processes"
+  },
+  "limitations": [
+    "No model request or native task completion was tested.",
+    "Raw terminal bytes were counted during the PTY run; only sanitized semantic counters and hook counts are committed.",
+    "Managed-settings precedence was not exercised in this native probe.",
+    "The observed native renderer process retained its PID; no claim of a new native PID is made."
+  ]
+}

@@ -263,6 +263,29 @@ async fn fake_node(
                         "absolutePath": "/usr/bin/claude",
                         "authState": "logged_in"
                     }]
+                },
+                // D-028 §5.1: the kind/driver matrix the web reads to default
+                // New Session to the native shell-pty carrier. The Hub stores
+                // this verbatim on the host view; nothing is hardcoded in the
+                // web client.
+                "capabilities": {
+                    "driverInventory": [
+                        {
+                            "kind": "shell-pty",
+                            "launchable": true,
+                            "reasonCode": "fake-node-native-pty"
+                        },
+                        {
+                            "kind": "claude-print",
+                            "launchable": true,
+                            "reasonCode": "fake-node-legacy"
+                        },
+                        {
+                            "kind": "generic-pty",
+                            "launchable": true,
+                            "reasonCode": "fake-node-legacy"
+                        }
+                    ]
                 }
             }
         })
@@ -335,6 +358,9 @@ async fn fake_node(
                     &format!("echo: {prompt}"),
                 )
                 .await?;
+                // A freshly launched native-PTY agent is mid-turn until the
+                // web drives it; the approval keeps it blocked until answered.
+                append_n = append_native_status(&mut ws, &instance_id, append_n, "working").await?;
                 send_rpc_ok(
                     &mut ws,
                     id,
@@ -367,9 +393,21 @@ async fn fake_node(
                 };
                 append_n =
                     append_journal(&mut ws, &instance_id, append_n, "assistant", &reply).await?;
+                // D-028 §6: a steer/queue send happens mid-turn; report the
+                // native agent status so the web composer projects working.
+                if params.get("mode").and_then(Value::as_str) == Some("new-turn") {
+                    append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                } else {
+                    append_n = append_native_status(&mut ws, &instance_id, append_n, "working").await?;
+                }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
-            "instance.close" | "instance.cancel" | "instance.resume" => {
+            "instance.cancel" => {
+                // §5.3: the turn ends but the instance keeps running.
+                append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
+            "instance.close" | "instance.resume" => {
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
             "interaction.list" => {
@@ -440,6 +478,40 @@ async fn append_journal(
     ))
     .await?;
     // Drain the Hub RPC result so it is not mistaken for a later request.
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
+}
+
+async fn append_native_status(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    n: u64,
+    status: &str,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": format!("j{seq}"),
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "native",
+                        "nativeName": "agent_status",
+                        "status": status
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }

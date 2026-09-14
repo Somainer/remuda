@@ -145,6 +145,18 @@ pub(super) fn load(repo: &Path, reference: &str, base: &str) -> Result<MergeRepo
     serde_json::from_str(&contents).context("parse verification report")
 }
 
+/// Delete every merge pin left for a branch after the queue settles.
+/// Landed merges are reachable from main; dead speculative merges must not
+/// stay pinned in the object store.
+pub(super) fn cleanup_pins(repo: &Path, reference: &str) -> Result<()> {
+    let prefix = format!("refs/remuda/merge/{}/", slug(reference));
+    let listing = super::git(repo, &["for-each-ref", "--format=%(refname)", &prefix])?;
+    for reference in listing.lines().filter(|line| !line.is_empty()) {
+        let _ = super::git(repo, &["update-ref", "-d", reference]);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

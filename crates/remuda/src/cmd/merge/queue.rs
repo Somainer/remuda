@@ -413,6 +413,15 @@ struct QueueCtx {
     lock: PathBuf,
 }
 
+/// Remove leftover merge pins for every queued branch.
+fn cleanup_queue_pins(ctx: &QueueCtx) {
+    for reference in &ctx.references {
+        if let Err(error) = reports::cleanup_pins(&ctx.repo, reference) {
+            tracing::error!(%error, %reference, "could not remove merge pin");
+        }
+    }
+}
+
 fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     ensure!(args.gate, "--queue requires --gate");
     ensure!(args.lanes >= 1, "--lanes must be at least 1");
@@ -482,6 +491,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
                         Err(_) => break,
                     }
                 }
+                cleanup_queue_pins(&ctx);
                 let mut outcomes = machine.records(&names);
                 outcomes[idx].status = "base_moved".into();
                 outcomes[idx].why = format!(
@@ -531,6 +541,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     }
 
     // Landed branches settle in order; failed branches remain unlanded.
+    cleanup_queue_pins(&ctx);
     let outcomes = machine.records(&names);
     let failed = outcomes
         .iter()

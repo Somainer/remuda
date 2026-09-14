@@ -489,6 +489,9 @@ fn queue_verifies_lane_two_on_main_plus_b1_and_lands_both() {
         .collect();
     assert!(hub_ports.contains(&"127.0.0.1:58980".to_owned()));
     assert!(hub_ports.contains(&"127.0.0.1:58990".to_owned()));
+    // No merge pins linger after every branch has settled.
+    let pins = git(&repo.root, &["for-each-ref", "refs/remuda/merge/"]);
+    assert!(pins.is_empty(), "leftover merge pins: {pins}");
     repo.assert_cleaned();
 }
 
@@ -535,6 +538,8 @@ fn queue_catches_a_semantic_conflict_between_independent_branches() {
         git(&repo.root, &["cat-file", "-e", "main:expect-ok.txt"]),
         ""
     );
+    // Dead speculative merges must not stay pinned after the queue ends.
+    assert!(git(&repo.root, &["for-each-ref", "refs/remuda/merge/"]).is_empty());
     repo.assert_cleaned();
 }
 
@@ -579,5 +584,7 @@ fn queue_reverifies_b2_onto_main_when_b1_fails() {
         git(&repo.root, &["show", "-s", "--format=%P", &merge_b]),
         format!("{} {}", repo.base, head_b)
     );
+    // b1's failed merge pin and b2's speculative pin are both swept.
+    assert!(git(&repo.root, &["for-each-ref", "refs/remuda/merge/"]).is_empty());
     repo.assert_cleaned();
 }

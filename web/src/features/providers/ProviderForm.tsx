@@ -173,6 +173,7 @@ export function ProviderForm({
           <ModelList
             models={models}
             defaultModel={defaultModel}
+            profileId={initial?.id}
             discovered={discovered}
             discovering={discovering}
             discoverError={discoverError}

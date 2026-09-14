@@ -280,7 +280,62 @@ export function modelGroupKey(id: string): string {
   return cut === -1 ? id : id.slice(0, cut + 1);
 }
 
+/**
+ * Split an id so CSS can ellipsize its middle: the head shrinks, the tail
+ * stays. Ids differ in their last segment far more than their first
+ * (`passthrough/ark/seed-1-250918` vs `…-251120`), so an end-truncated row
+ * would show a column of identical prefixes. Short ids are left whole.
+ */
+export function splitModelId(id: string, tail = 10): [string, string] {
+  if (id.length <= tail + 4) return [id, ""];
+  return [id.slice(0, id.length - tail), id.slice(id.length - tail)];
+}
+
 export type ModelGroup = { key: string; models: ProviderModel[] };
+
+/** How much of a set is enabled: the state a group checkbox renders. */
+export type TriState = "all" | "some" | "none";
+
+/** `some` is the indeterminate box; an empty set reads as `none`. */
+export function triState(models: ProviderModel[]): TriState {
+  const on = models.filter((m) => m.enabled).length;
+  if (!on) return "none";
+  return on === models.length ? "all" : "some";
+}
+
+/**
+ * Flip `ids` to `enabled`, leaving every other entry — and the catalog order —
+ * untouched. Bulk actions act on the ids currently on screen, so the caller
+ * passes the filtered subset rather than the whole catalog.
+ */
+export function setEnabled(
+  models: ProviderModel[],
+  ids: Iterable<string>,
+  enabled: boolean,
+): ProviderModel[] {
+  const want = new Set(ids);
+  return models.map((m) => (want.has(m.id) && m.enabled !== enabled ? { ...m, enabled } : m));
+}
+
+/** Invert `ids`; entries outside the set keep their choice. */
+export function invertEnabled(models: ProviderModel[], ids: Iterable<string>): ProviderModel[] {
+  const want = new Set(ids);
+  return models.map((m) => (want.has(m.id) ? { ...m, enabled: !m.enabled } : m));
+}
+
+/**
+ * The default model after an edit: the current one while the catalog still
+ * offers it, else the first enabled entry, else `""`. The Hub rejects a
+ * default that names a disabled model, so every path that can disable one
+ * (a row, a group, a bulk action, a removal) settles the default through here.
+ */
+export function nextDefaultModel(
+  models: ProviderModel[],
+  current: string | null | undefined,
+): string {
+  if (current && models.some((m) => m.id === current && m.enabled)) return current;
+  return models.find((m) => m.enabled)?.id ?? "";
+}
 
 /**
  * Group by id prefix for catalogs too long to scan (astergate serves ~300).

@@ -29,6 +29,10 @@ pub enum FakeClaudeError {
 
 /// Run the fake until stdin EOF. Returns the process exit code.
 pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
+    // Exit with the spawner if the test is killed. The harness hands us a
+    // piped stdin, so its death shows up as EOF anyway; pdeathsig and the
+    // parent-pid poll cover the cases where stdin was redirected elsewhere.
+    let _parent_watch = crate::parent_watch::install();
     if std::env::args()
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")

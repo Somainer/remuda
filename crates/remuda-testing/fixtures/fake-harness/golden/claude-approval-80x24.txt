@@ -1,0 +1,24 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+RUN_TOOL                                                                        
+                                                                                
+Do you want to run this command?                                                
+⏺ Bash(printf SPIKE_TOOL_OK > spike-result.txt)                                 
+Write the fixed probe marker.                                                   
+                                                                                
+❯ 1. Yes, proceed once                                                          
+  2. Yes, and don't ask again for this command                                  
+  3. No, and tell Claude what to do differently (esc)                           

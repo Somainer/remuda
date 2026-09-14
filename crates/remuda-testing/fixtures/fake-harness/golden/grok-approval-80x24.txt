@@ -1,0 +1,24 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+RUN_TOOL                                                                        
+                                                                                
+┃                                                                               
+┃  Write the fixed probe marker.                                                
+┃  printf SPIKE_TOOL_OK > spike-result.txt                                      
+┃  ← → narrow scope                                                             
+┃                                                                               
+┃  1 (●) Yes, and don't ask again for anything (always-approve mode)            
+┃  2 (○) Yes, proceed                                                           
+┃  3 (○) No, reject (type to add feedback)                                      
+┃  4 (○) Never allow: printf                                                    
+┃                                                                               
+┃  1/4:select  │  Tab:next option  │  ←/→:scope  │  Ctrl+o:always-approve  │  Ct

@@ -1,0 +1,24 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+SLOW_QUEUE                                                                      
+◆ Sleep for 20 seconds                                                          
+                                                                                
+⠸ Running… 2.0s      [stop]                                                     
+#1 QUEUED_FOLLOWUP                                                              
+╭────────────────────────────────────────────────────────────────────────────╮  
+│ ❯ QUEUED_FOLLOWUP                                                            │
+╰───────────────────────────────────────────────────────────── Local spike ─╯   
+Enter:send now  │  Ctrl+;:queue  │  Ctrl+c:cancel  │  Shift+Tab:mode  │  Ctrl+.:

@@ -1,0 +1,20 @@
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+SLOW_QUEUE                              
+◆ Sleep for 20 seconds                  
+                                        
+⠸ Running… 2.0s      [stop]             
+#1 QUEUED_FOLLOWUP                      
+╭───────────────────────────────────────
+│ ❯ QUEUED_FOLLOWUP                     
+╰───────────────────────────────────────
+Enter:send now  │  Ctrl+;:queue  │  Ctrl

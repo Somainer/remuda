@@ -1,0 +1,20 @@
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+SLOW_QUEUE                              
+$ sleep 20                              
+                                        
+Working (2s • esc to interrupt)         
+                                        
+› QUEUED_FOLLOWUP                       
+tab to queue message                    

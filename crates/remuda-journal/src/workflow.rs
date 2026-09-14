@@ -27,12 +27,13 @@ pub struct WorkflowJournalTailer {
 impl WorkflowJournalTailer {
     /// `session_dir` is `<projects>/<enc>/<sid>/` (the directory that contains `subagents/`).
     pub fn new(session_dir: impl Into<PathBuf>, mut ctx: MapContext) -> Self {
+        let ids = NativeIds::new(ctx.instance_id.as_id().as_str());
         ctx.channel = SourceChannel::WorkflowJournal;
         Self {
             session_dir: session_dir.into(),
             ctx,
             tails: HashMap::new(),
-            ids: NativeIds::new(),
+            ids,
             meta: HashMap::new(),
         }
     }

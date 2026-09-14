@@ -18,6 +18,8 @@
   --diff-del: rgba(231, 220, 200, 0.05);
   --diff-ctx: rgba(231, 220, 200, 0.03);
   --danger: #8f3d2c;
+  /* Brighter danger text for dark surfaces; --danger stays the border/fill. */
+  --danger-strong: #d98a70;
 }
 
 [data-theme="ledger"] {
@@ -38,13 +40,37 @@
   --diff-del: rgba(143, 61, 44, 0.1);
   --diff-ctx: rgba(30, 42, 50, 0.03);
   --danger: #8f3d2c;
+  /* Dark enough to read as text/focus on a light ground. */
+  --danger-strong: #7a3022;
 }
 
 :root {
   --font: "IBM Plex Sans", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --radius: 4px;
+
+  /* Type scale (P1-3): body 14, inputs/emphasis 16, aux 12-13, labels 11.
+     Important status never relies on sub-12 px text. */
   --text: 14px;
+  --text-lg: 16px;
+  --text-body: 14px;
+  --text-aux: 12px;
+  --text-label: 11px;
+
+  /* Spacing scale. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  /* Unified touch target; icons inside may be smaller, the hit box is not. */
+  --touch: 44px;
+
+  /* Visible focus ring, shared by every surface. */
+  --focus-ring: 1px solid var(--cold);
+  --focus-offset: 2px;
+
   --rail: 48px;
   --list: 280px;
   --aside: 300px;
@@ -71,6 +97,13 @@ body,
 html {
   background: var(--canvas);
   color-scheme: dark;
+}
+
+/* Ledger is a light surface: native controls (scrollbars, form widgets) and
+   the UA colour-scheme follow it instead of staying dark. */
+:root[data-theme="ledger"],
+[data-theme="ledger"] {
+  color-scheme: light;
 }
 
 body {
@@ -120,8 +153,8 @@ kbd {
 }
 
 :focus-visible {
-  outline: 1px solid var(--cold);
-  outline-offset: 2px;
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-offset);
 }
 
 @keyframes dim {

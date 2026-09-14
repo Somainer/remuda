@@ -3282,6 +3282,7 @@ dependencies = [
  "clap",
  "futures",
  "nix",
+ "portable-pty",
  "remuda-driver",
  "remuda-herdr",
  "remuda-hub",

@@ -727,6 +727,7 @@ fn user_message(
             parent_tool_call_id: None,
             native_origin: known("claude-jsonl".into()),
             origin: Some(user_origin(value)),
+            command_id: None,
             status: ContentStatus::Complete,
         })),
     )
@@ -772,6 +773,7 @@ fn assistant_message(
             native_origin: known("claude-jsonl".into()),
             // Assistant output is never an injected user record.
             origin: Some(MessageOrigin::Human),
+            command_id: None,
             status: ContentStatus::Complete,
         })),
     )

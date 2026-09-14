@@ -251,6 +251,16 @@ pub struct MessagePayload {
     /// silently hiding what someone said is not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<MessageOrigin>,
+    /// `command_id`; protocol §5.2 (C2). Set only when this prompt text was
+    /// delivered through a Remuda command: the Node attaches the delivering
+    /// command's id to the next matching prompt observation (the hook
+    /// `UserPromptSubmit` turn event carries it in `related_ids`, and the
+    /// transcript user record carries it here and joins onto the queued
+    /// message's node). Additive exactly like `origin`: a prompt typed
+    /// natively into the PTY has no command and serialises without this
+    /// field, which clients must read as "human typed, no command".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<CommandId>,
     /// `status`; protocol §5.2.
     pub status: ContentStatus,
 }

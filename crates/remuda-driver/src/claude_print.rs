@@ -867,6 +867,7 @@ fn user_text_message(
             // Overwritten by the transcript mapper, which has the evidence to
             // classify. stdout `user` frames are the prompt we just sent.
             origin: Some(remuda_protocol::MessageOrigin::Human),
+            command_id: None,
             status: ContentStatus::Complete,
         })),
     )

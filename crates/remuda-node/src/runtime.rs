@@ -722,6 +722,9 @@ impl DevNode {
         let data_dir = self.data_dir();
         let id = instance_id.clone();
         let carrier = self.carrier_supervisor();
+        // An adopted instance starts with no live prompt correlations: pending
+        // registrations are in-memory and die with the Node that owned them.
+        let prompts = Arc::new(crate::prompt_correlation::PromptCorrelator::new());
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             if let Err(error) = instance_worker(
@@ -731,6 +734,7 @@ impl DevNode {
                 receiver,
                 interactions,
                 carrier,
+                prompts,
             )
             .await
             {
@@ -790,6 +794,7 @@ fn spawn_observation_pump(
     instance_id: InstanceId,
     mut observations: mpsc::Receiver<remuda_protocol::Observation>,
     driver: Arc<dyn Driver>,
+    prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // D-028 §7: `MessageDisplay` deltas are the only live text an
@@ -797,7 +802,12 @@ fn spawn_observation_pump(
         // append, not in a path of their own — is what makes the 结构 view
         // fill in line by line instead of a whole message at a time.
         let mut assembler = crate::signal_messages::MessageAssembler::new();
-        while let Some(observation) = observations.recv().await {
+        while let Some(mut observation) = observations.recv().await {
+            // C2: stamp this observation with the command that delivered its
+            // prompt, if any. Runs before anything else reads the payload so
+            // the hook activity fold and the journal both see the joined
+            // shape. Natively typed prompts match nothing and pass through.
+            prompts.correlate(&mut observation);
             // §5.5 before the generic failure fold: a clean exit carries
             // `Severity::Info` and would otherwise fall through both, leaving
             // a finished instance reported as `ready`.
@@ -892,6 +902,9 @@ async fn materialize_instance(
     // would be a second way to do the same thing.
     pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
 ) -> Result<(), NodeError> {
+    // C2: per-instance registry joining command-delivered prompts onto the
+    // hook/transcript observations that confirm them.
+    let prompts = Arc::new(crate::prompt_correlation::PromptCorrelator::new());
     let observations = match driver.start().await {
         Ok(observations) => observations,
         Err(error) => {
@@ -933,6 +946,7 @@ async fn materialize_instance(
             instance_id.clone(),
             observations,
             Arc::clone(&driver),
+            Arc::clone(&prompts),
         );
         pumps.lock().await.insert(instance_id.clone(), pump);
     }
@@ -977,6 +991,7 @@ async fn materialize_instance(
             interactions,
             Some((create_command, initial_prompt)),
             carrier,
+            Arc::clone(&prompts),
         )
         .await;
         tty.stop(&instance_id).await;
@@ -1003,6 +1018,7 @@ async fn materialize_instance(
             },
             Arc::clone(&interactions),
             carrier.clone(),
+            Arc::clone(&prompts),
         )
         .await?;
     }
@@ -1014,6 +1030,7 @@ async fn materialize_instance(
         receiver,
         interactions,
         carrier,
+        prompts,
     )
     .await;
     tty.stop(&instance_id).await;
@@ -1076,6 +1093,7 @@ async fn instance_worker(
     mut receiver: mpsc::Receiver<QueuedCommand>,
     interactions: Arc<InteractionRuntime>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
+    prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> Result<(), NodeError> {
     if pty_queue::is_pty(driver.kind()) {
         return pty_queue::run(
@@ -1086,6 +1104,7 @@ async fn instance_worker(
             interactions,
             None,
             carrier,
+            prompts,
         )
         .await;
     }
@@ -1098,6 +1117,7 @@ async fn instance_worker(
             queued,
             Arc::clone(&interactions),
             carrier.clone(),
+            Arc::clone(&prompts),
         )
         .await?;
         if close_after {
@@ -1114,6 +1134,7 @@ async fn execute_queued(
     queued: QueuedCommand,
     interactions: Arc<InteractionRuntime>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
+    prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> Result<(), NodeError> {
     let mut command = store.get_command(&queued.command_id)?;
     if let DriverRequest::Send { prompt, .. } = &queued.request {
@@ -1124,13 +1145,22 @@ async fn execute_queued(
                 value: Activity::Working,
             }),
         )?;
-        store.append_observation(
-            instance_id,
-            None,
-            Completeness::Structured,
-            crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?,
-        )?;
+        // C2: the non-PTY synthesized user message carries the delivering
+        // command id, and stdout/transcript user frames join its node the same
+        // way the PTY transcript does — one user node per command, everywhere.
+        let mut payload =
+            crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?;
+        if let ObservationPayload::Message(message) = &mut payload {
+            message.command_id = Some(queued.command_id.clone());
+            prompts.register(
+                queued.command_id.clone(),
+                message.mutation.node_id.clone(),
+                prompt.clone(),
+            );
+        }
+        store.append_observation(instance_id, None, Completeness::Structured, payload)?;
         if let Err(error) = driver.wait_control().await {
+            prompts.cancel(&queued.command_id);
             notify_carrier(carrier.as_ref(), &error);
             let diagnostic = DriverEmission::NativeLifecycle {
                 name: "control-wait".to_owned(),

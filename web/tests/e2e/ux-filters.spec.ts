@@ -65,6 +65,8 @@ async function applyFixture(page: Page) {
       mockDb.titles.set(row.id, row.title);
     }
     mockDb.interactions.length = 0;
+    // `refresh()` reloads instances only; hosts and workspaces come from here.
+    await hubStore.refreshHosts();
     await hubStore.refresh();
   });
   await expect(page.getByTestId("session-list")).toBeVisible();

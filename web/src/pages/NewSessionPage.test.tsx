@@ -81,32 +81,42 @@ function renderWithCli() {
   render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
 }
 
-it("mounts the composer's slider inline, not the old tier chips", () => {
+it("mounts the inline slider (layout A, no card) with the five real levels", () => {
   renderWithCli();
   const slider = screen.getByTestId("new-session-effort-slider");
   expect(slider).toHaveAttribute("role", "slider");
-  expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
+  expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+  // The device default is Claude `high`, the third of five.
+  expect(slider).toHaveAttribute("data-name", "high");
+  expect(slider).toHaveAttribute("data-index", "2");
   expect(screen.getByTestId("new-session-effort-knob")).toBeInTheDocument();
   expect(screen.getByTestId("new-session-effort-track")).toBeInTheDocument();
-  // The tier chips are gone; the hint that names the spec is not.
-  expect(screen.queryByTestId("new-session-effort-think")).toBeNull();
+  // Layout A: the label row and tick labels are present, with no card frame.
+  expect(screen.getByTestId("new-session-effort-slider-panel")).toHaveAttribute("data-variant", "inline");
+  expect(screen.getByTestId("new-session-effort-foot")).toHaveTextContent(
+    "写进 InstanceSpec，会话内可再改",
+  );
   expect(screen.getByTestId("new-session-effort")).toHaveTextContent("写进 InstanceSpec，会话内可再改");
+  // The ultracode toggle sits at the far right of the label row.
+  expect(screen.getByTestId("new-session-effort-ultracode")).toHaveAttribute("data-on", "0");
 });
 
 it("re-snaps the slider onto the new harness table when the runtime changes", () => {
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");
-  // Settings default: claude `think`, the second of four.
-  expect(slider()).toHaveAttribute("data-name", "think");
-  expect(slider()).toHaveAttribute("data-index", "1");
+  // Settings default: claude `high` at the midpoint.
+  expect(slider()).toHaveAttribute("data-name", "high");
+  expect(slider()).toHaveAttribute("data-index", "2");
 
-  // codex has the same four stops, so the position is kept and renamed.
+  // codex: the midpoint (2/4) maps onto `high` by nearest position.
   fireEvent.click(screen.getByTestId("new-session-kind-codex"));
   expect(slider()).toHaveAttribute("data-tiers", "low,medium,high,ultra");
-  expect(slider()).toHaveAttribute("data-name", "medium");
-  expect(slider()).toHaveAttribute("data-index", "1");
+  expect(slider()).toHaveAttribute("data-name", "high");
+  expect(slider()).toHaveAttribute("data-index", "2");
+  // ultracode is Claude-only.
+  expect(screen.queryByTestId("new-session-effort-ultracode")).toBeNull();
 
-  // grok has three: 1/3 of the way along snaps onto `standard`.
+  // grok has three: the midpoint snaps onto `standard`.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
   expect(slider()).toHaveAttribute("data-tiers", "quick,standard,max");
   expect(slider()).toHaveAttribute("data-name", "standard");
@@ -119,7 +129,7 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   const slider = () => screen.getByTestId("new-session-effort-slider");
   slider().focus();
   fireEvent.keyDown(slider(), { key: "End" });
-  expect(slider()).toHaveAttribute("data-name", "ultracode");
+  expect(slider()).toHaveAttribute("data-name", "max");
   expect(slider()).toHaveAttribute("data-ember", "1");
 
   // grok's table is shorter; the ember tier must stay the ember tier.
@@ -128,7 +138,7 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   expect(slider()).toHaveAttribute("data-index", "2");
   expect(slider()).toHaveAttribute("data-ember", "1");
 
-  // ...and back, without the stale `ultracode` draft the unmounted card held.
+  // ...and back, without the stale draft the unmounted card held.
   fireEvent.click(screen.getByTestId("new-session-kind-codex"));
   expect(slider()).toHaveAttribute("data-name", "ultra");
   expect(slider()).toHaveAttribute("data-ember", "1");
@@ -139,16 +149,56 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
+it("ultracode locks the slider on xhigh and the create carries the ultracode wire name", async () => {
+  const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+  renderWithCli();
+  const slider = () => screen.getByTestId("new-session-effort-slider");
+  fireEvent.click(screen.getByTestId("new-session-effort-ultracode"));
+  // xhigh locked, ember playing, track refuses tier input.
+  expect(slider()).toHaveAttribute("data-name", "xhigh");
+  expect(slider()).toHaveAttribute("data-index", "3");
+  expect(slider()).toHaveAttribute("data-ultracode", "1");
+  expect(slider()).toHaveAttribute("data-ember", "1");
+  expect(slider()).toHaveAttribute("aria-disabled", "true");
+  expect(screen.getByTestId("new-session-effort-ultracode")).toHaveAttribute("data-on", "1");
+  // Arrow keys cannot move the locked track off xhigh.
+  slider().focus();
+  fireEvent.keyDown(slider(), { key: "End" });
+  fireEvent.keyDown(slider(), { key: "ArrowLeft" });
+  expect(slider()).toHaveAttribute("data-index", "3");
+
+  fireEvent.click(screen.getByTestId("new-session-start"));
+  await waitFor(() =>
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "claude", effortIndex: 3, effortName: "ultracode" }),
+    ),
+  );
+});
+
 it("writes the slider's tier into the InstanceSpec it creates", async () => {
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();
   const slider = screen.getByTestId("new-session-effort-slider");
+  // Start on high (index 2); one step right is xhigh.
   fireEvent.keyDown(slider, { key: "ArrowRight" });
-  expect(slider).toHaveAttribute("data-name", "think-hard");
+  expect(slider).toHaveAttribute("data-name", "xhigh");
   fireEvent.click(screen.getByTestId("new-session-start"));
   await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
-    kind: "claude", effortIndex: 2, effortName: "think-hard",
+    kind: "claude", effortIndex: 3, effortName: "xhigh",
   })));
+});
+
+it("normalizes a remembered legacy tier name when the sheet opens", () => {
+  localStorage.setItem(
+    "runtime.new-session",
+    JSON.stringify({ effortIndex: 3, effortName: "think-hard" }),
+  );
+  renderWithCli();
+  const slider = screen.getByTestId("new-session-effort-slider");
+  // think-hard → xhigh (index 3), no ultracode.
+  expect(slider).toHaveAttribute("data-name", "xhigh");
+  expect(slider).toHaveAttribute("data-index", "3");
+  expect(slider).toHaveAttribute("data-ultracode", "0");
 });
 
 it("writes the harness-native tier after a runtime switch", async () => {

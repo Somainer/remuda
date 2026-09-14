@@ -21,7 +21,9 @@ import { useNewSessionSpaceDefaults } from "../features/spaces/useNewSessionSpac
 import {
   effortAt,
   effortCaps,
+  effortWireName,
   mapEffort,
+  normalizeClaudeName,
   type EffortKind,
   type EffortSelection,
 } from "../features/session/effort";
@@ -73,7 +75,14 @@ export function NewSessionPage() {
     normalizePermissionMode(prefs.permissionMode || device.permissionDefault),
   );
   const [yoloAck, setYoloAck] = useState(false);
-  const [effort, setEffort] = useState<EffortSelection>(() => effortAt("claude", device.defaultEffortIndex));
+  const [effort, setEffort] = useState<EffortSelection>(() => {
+    // Remembered tier names predate the real --effort levels; map them by name.
+    if (prefs.effortName) {
+      const norm = normalizeClaudeName(prefs.effortName);
+      return effortAt("claude", norm.index, norm.ultracode);
+    }
+    return effortAt("claude", device.defaultEffortIndex);
+  });
   const [delegation, setDelegation] = useState<DelegationId>(normalizeDelegation(prefs.delegation));
   const [kind, setKind] = useState<CreateKind>("claude");
   const [wantTty, setWantTty] = useState(false);
@@ -213,7 +222,7 @@ export function NewSessionPage() {
               maxBudgetUsd: maxBudgetUsd || undefined,
               name: name || worktree || (plainTerminal ? "terminal" : undefined),
               effortIndex: sessionEffort.index,
-              effortName: sessionEffort.name,
+              effortName: effortWireName(sessionEffort),
             });
             rememberNewSessionSuccess({
               hostId,
@@ -223,7 +232,7 @@ export function NewSessionPage() {
               driver,
               delegation,
               effortIndex: sessionEffort.index,
-              effortName: sessionEffort.name,
+              effortName: effortWireName(sessionEffort),
             });
             navigate(`/s/${instance.id}`);
           })()
@@ -490,28 +499,27 @@ export function NewSessionPage() {
               style={{ border: 0, padding: 0, margin: 0 }}
               data-testid="new-session-effort"
               data-harness={activeKind}
-              data-effort={sessionEffort.name}
+              data-effort={effortWireName(sessionEffort)}
+              data-ultracode={sessionEffort.ultracode ? "1" : "0"}
             >
-              <legend className={css.label}>effort</legend>
-              <div className={css.effortRow}>
-                {/*
-                 * The composer's slider, inline. Remounting on the harness
-                 * drops the drag draft, so the card re-snaps onto the new
-                 * table's tier instead of showing the one the pointer left
-                 * behind. The model axis is the page's own field above, so the
-                 * card's hint line stays on the tier description.
-                 */}
-                <EffortSlider
-                  key={activeKind}
-                  kind={activeKind}
-                  index={sessionEffort.index}
-                  variant="inline"
-                  idPrefix="new-session-effort"
-                  footer={EFFORT_SPEC_HINT}
-                  onChange={(next) => setEffort(next)}
-                />
-                <span className={css.hint}>{EFFORT_SPEC_HINT}</span>
-              </div>
+              {/*
+               * Layout A: no card. The label row, the dotted pill spanning the
+               * same column as the 权限 row, the five tick labels and the spec
+               * helper all use the form's own tokens. Remounting on the
+               * harness drops the drag draft, so the pill re-snaps onto the
+               * new table instead of showing the stop the pointer left behind.
+               */}
+              <EffortSlider
+                key={activeKind}
+                kind={activeKind}
+                index={sessionEffort.index}
+                ultracode={sessionEffort.ultracode === true}
+                variant="inline"
+                idPrefix="new-session-effort"
+                label="effort"
+                footer={EFFORT_SPEC_HINT}
+                onChange={(next) => setEffort(next)}
+              />
             </fieldset>
           ) : null}
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>

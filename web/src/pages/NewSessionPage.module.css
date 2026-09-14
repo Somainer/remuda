@@ -212,20 +212,6 @@
   min-width: max-content;
 }
 
-/* effort is the composer's slider card inline, with its caption beside it. */
-.effortRow {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-/* The card keeps its 400px until the sheet is narrower; then the hint wraps under it. */
-.effortRow > .hint {
-  flex: 1 1 220px;
-  min-width: 0;
-}
-
 .yoloHead {
   display: flex;
   align-items: center;

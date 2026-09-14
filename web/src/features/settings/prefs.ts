@@ -16,7 +16,7 @@ export const DEFAULT_SETTINGS: DeviceSettings = {
   autoRevealTty: false,
   permissionDefault: "manual",
   theme: "night-corral",
-  defaultEffortIndex: 1,
+  defaultEffortIndex: 2,
 };
 
 export function readDeviceSettings(): DeviceSettings {
@@ -36,7 +36,7 @@ export function readDeviceSettings(): DeviceSettings {
       autoRevealTty: parsed.autoRevealTty === true,
       permissionDefault,
       theme: "night-corral",
-      defaultEffortIndex: Number.isFinite(effortRaw) ? Math.max(0, Math.min(3, Math.round(effortRaw))) : 1,
+      defaultEffortIndex: Number.isFinite(effortRaw) ? Math.max(0, Math.min(4, Math.round(effortRaw))) : 2,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };

@@ -143,7 +143,7 @@ test.describe("composer control bar and effort", () => {
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
     await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
-    await expect(page.getByTestId("model-effort-chip")).toContainText(/think|default/);
+    await expect(page.getByTestId("model-effort-chip")).toContainText(/high/);
     await expect(page.getByTestId("model-effort-chip")).not.toContainText(/opus|sonnet/);
     await expect(page.getByTestId("context-chip")).toBeVisible();
     await expect(page.getByTestId("permission-chip")).toContainText(/询问|可改|全自动|绕过/);
@@ -160,14 +160,16 @@ test.describe("composer control bar and effort", () => {
     const menu = page.getByTestId("effort-menu");
     await expect(menu).toBeVisible();
     const slider = page.getByTestId("effort-slider");
-    await expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
-    await expect(slider).toHaveAttribute("data-name", /think|default/);
+    await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+    await expect(slider).toHaveAttribute("data-name", /high/);
     await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
     await expect(page.getByTestId("effort-title")).toBeVisible();
     await expect(page.getByTestId("effort-model")).toBeVisible();
     // Compact card: no tier list and no model list until the chevron is tapped.
-    await expect(page.getByTestId("effort-tier-ultracode")).toHaveCount(0);
+    await expect(page.getByTestId("effort-tier-max")).toHaveCount(0);
     await expect(page.getByTestId("model-option-opus")).toHaveCount(0);
+    // The ultracode toggle lives in the card header, not the tier list.
+    await expect(page.getByTestId("effort-ultracode")).toHaveAttribute("data-on", "0");
     await assertPillGeometry(page);
     const card = await menu.boundingBox();
     expect(card).toBeTruthy();
@@ -177,10 +179,43 @@ test.describe("composer control bar and effort", () => {
       await shot(page, "composer-1-effort-menu.png");
     }
     await dragSlider(page, "end");
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
     await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
-    await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
+    await expect(page.getByTestId("model-effort-chip")).toContainText("max");
     await expect(slider).toHaveAttribute("data-ember", "1");
+  });
+
+  test("ultracode locks the track on xhigh, plays ember and reads ultracode on the composer", async ({ page }) => {
+    await page.goto("/sessions");
+    await row(page, "空闲会话").click();
+    await openEffort(page);
+    const slider = page.getByTestId("effort-slider");
+    await page.getByTestId("effort-ultracode").click();
+    await expect(page.getByTestId("effort-ultracode")).toHaveAttribute("data-on", "1");
+    await expect(slider).toHaveAttribute("data-ultracode", "1");
+    await expect(slider).toHaveAttribute("data-name", "xhigh");
+    await expect(slider).toHaveAttribute("data-index", "3");
+    await expect(slider).toHaveAttribute("data-ember", "1");
+    // The track is locked onto xhigh while ultracode is on.
+    await expect(slider).toHaveAttribute("aria-disabled", "true");
+    await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(0);
+    await expect(page.getByTestId("effort-embers")).toBeVisible();
+    // Arrows cannot drag it off xhigh.
+    await slider.focus();
+    await page.keyboard.press("End");
+    await page.keyboard.press("ArrowLeft");
+    await expect(slider).toHaveAttribute("data-index", "3");
+    // The composer stamps the wire name but the chip still names the tier xhigh.
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
+    await expect(page.getByTestId("model-effort-chip")).toContainText("xhigh");
+    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+    // Toggle off: back to a plain, non-ember xhigh, track unlocked.
+    await page.getByTestId("effort-ultracode").click();
+    await expect(slider).toHaveAttribute("data-ultracode", "0");
+    await expect(slider).toHaveAttribute("data-name", "xhigh");
+    await expect(slider).toHaveAttribute("data-ember", "0");
+    await expect(slider).toHaveAttribute("aria-disabled", "false");
   });
 
   test("the tier name opens the tier and model list, then returns to the pill", async ({ page }) => {
@@ -191,16 +226,17 @@ test.describe("composer control bar and effort", () => {
     const panel = page.getByTestId("effort-slider-panel");
     await expect(panel).toHaveAttribute("data-view", "list");
     await expect(page.getByTestId("effort-slider")).toHaveCount(0);
-    await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ember", "1");
-    await expect(page.getByTestId("effort-list")).toContainText(/默认档|不额外思考|跨文件|最高档/);
+    await expect(page.getByTestId("effort-tier-max")).toHaveAttribute("data-ember", "1");
+    await expect(page.getByTestId("effort-list")).toContainText(/默认档|最省|日常|跨文件|最高档/);
     await expect(page.getByTestId("effort-menu")).toContainText("切换只影响后续回合，不重写已发出的 prompt");
     await page.getByTestId("effort-list-back").click();
     await expect(panel).toHaveAttribute("data-view", "slider");
     await page.getByTestId("effort-open-list").click();
-    await page.getByTestId("effort-tier-ultracode").click();
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+    await page.getByTestId("effort-tier-xhigh").click();
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "xhigh");
     await expect(panel).toHaveAttribute("data-view", "slider");
-    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "1");
+    // Plain xhigh is not the ember tier.
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "0");
   });
 
   test("grok session lists the native grok effort table", async ({ page }) => {
@@ -278,12 +314,14 @@ test.describe("composer control bar and effort", () => {
       expect(ackBox).toBeTruthy();
       expect(ackBox!.y).toBeGreaterThanOrEqual(yoloBox!.y - 2);
       expect(ackBox!.y + ackBox!.height).toBeLessThanOrEqual(yoloBox!.y + yoloBox!.height + 2);
-      // effort is the composer's slider inline, sized to the sheet's column.
+      // effort is the frameless inline slider spanning the sheet's column.
       await expect(page.getByTestId("new-session-effort-slider")).toBeVisible();
-      await expect(page.getByTestId("new-session-effort-title")).toHaveText("think");
-      const card = await page.getByTestId("new-session-effort-slider-panel").boundingBox();
-      expect(card).toBeTruthy();
-      expect(card!.width).toBeLessThanOrEqual(Math.min(width, 401));
+      await expect(page.getByTestId("new-session-effort-title")).toHaveText("high");
+      const panel = await page.getByTestId("new-session-effort-slider-panel").boundingBox();
+      expect(panel).toBeTruthy();
+      expect(panel!.width).toBeLessThanOrEqual(width);
+      // The ultracode toggle never wraps the level/description off the label row.
+      await expect(page.getByTestId("new-session-effort-ultracode")).toBeVisible();
       if (test.info().project.name === "chromium") {
         await shot(page, `composer-1-new-session-${width}.png`);
       }
@@ -293,11 +331,12 @@ test.describe("composer control bar and effort", () => {
   test("Settings default effort flows into New Session", async ({ page }) => {
     await page.goto("/settings");
     await expect(page.getByTestId("settings-effort")).toBeVisible();
-    await page.getByTestId("settings-effort-ultracode").click();
-    await expect(page.getByTestId("settings-effort-ultracode")).toHaveAttribute("data-selected", "1");
+    await page.getByTestId("settings-effort-max").click();
+    await expect(page.getByTestId("settings-effort-max")).toHaveAttribute("data-selected", "1");
     await page.goto("/sessions/new");
     const slider = page.getByTestId("new-session-effort-slider");
-    await expect(slider).toHaveAttribute("data-name", "ultracode");
+    await expect(slider).toHaveAttribute("data-name", "max");
+    await expect(slider).toHaveAttribute("data-index", "4");
     await expect(slider).toHaveAttribute("data-ember", "1");
     // Switching the harness re-snaps onto the new native table, ember to ember.
     await page.getByTestId("new-session-kind-grok").click();
@@ -313,10 +352,10 @@ test.describe("composer control bar and effort", () => {
     await openEffort(page);
     await page.getByTestId("effort-slider").focus();
     await page.keyboard.press("End");
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
     await page.reload();
-    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
-    await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
+    await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
+    await expect(page.getByTestId("model-effort-chip")).toContainText("max");
   });
 
   test("grok pty shows four chips including a read-only yolo permission", async ({ page }) => {
@@ -345,11 +384,16 @@ test.describe("composer control bar and effort", () => {
     await expect(slider).toHaveAttribute("data-index", "0");
     await assertFillReachesKnob(page);
     await expect(page.getByTestId("effort-embers")).toHaveCount(0);
+    // Walk every stop; embers stay off through plain xhigh (index 3).
     for (const index of ["1", "2", "3"] as const) {
       await page.keyboard.press("ArrowRight");
       await expect(slider).toHaveAttribute("data-index", index);
+      await expect(slider).toHaveAttribute("data-ember", "0");
       await assertFillReachesKnob(page);
     }
+    await page.keyboard.press("ArrowRight");
+    await expect(slider).toHaveAttribute("data-index", "4");
+    await assertFillReachesKnob(page);
     // Top tier: a glow wash plus three drifting spark layers over the gradient.
     await expect(slider).toHaveAttribute("data-ember", "1");
     const embers = page.getByTestId("effort-embers");
@@ -397,7 +441,7 @@ test.describe("composer control bar and effort", () => {
     for (const name of names) expect(name).toBe("none");
   });
 
-  test("effort slider evidence: night/ledger at 1440 and 390", async ({ page }, info) => {
+  test("effort slider evidence: night/ledger at 1440 and 400", async ({ page }, info) => {
     test.skip(info.project.name !== "chromium", "evidence shots from chromium only");
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.goto("/sessions");
@@ -409,12 +453,12 @@ test.describe("composer control bar and effort", () => {
       }, theme);
       for (const [width, height, tag] of [
         [1440, 900, "1440"],
-        [390, 844, "390"],
+        [400, 844, "400"],
       ] as const) {
         await page.setViewportSize({ width, height });
-        // mid = a middle non-top tier, top = the ember tier.
+        // mid = the xhigh tier (plain, non-ember), top = the ember max tier.
         for (const [state, keys] of [
-          ["mid", ["Home", "ArrowRight", "ArrowRight"]],
+          ["mid", ["Home", "ArrowRight", "ArrowRight", "ArrowRight"]],
           ["top", ["End"]],
         ] as const) {
           await page.keyboard.press("Escape");
@@ -422,6 +466,7 @@ test.describe("composer control bar and effort", () => {
           await page.getByTestId("effort-slider").focus();
           for (const key of keys) await page.keyboard.press(key);
           const slider = page.getByTestId("effort-slider");
+          await expect(slider).toHaveAttribute("data-name", state === "top" ? "max" : "xhigh");
           await expect(slider).toHaveAttribute("data-ember", state === "top" ? "1" : "0");
           await expect(page.getByTestId("effort-knob")).toBeVisible();
           await assertPillGeometry(page);
@@ -429,7 +474,7 @@ test.describe("composer control bar and effort", () => {
           expect(box).toBeTruthy();
           expect(box!.width).toBeLessThanOrEqual(Math.min(width, 301));
           await assertFillReachesKnob(page);
-          await shotComposer(page, `composer-slider-3-${state}-${theme}-${tag}.png`);
+          await shotComposer(page, `composer-slider-4-${state}-${theme}-${tag}.png`);
         }
       }
     }

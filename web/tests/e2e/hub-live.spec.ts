@@ -272,29 +272,31 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
   await page.getByTestId("model-effort-chip").click();
   const slider = page.getByTestId("effort-slider");
   await expect(slider).toBeVisible();
-  await expect(slider).toHaveAttribute("data-tiers", "default,think,think-hard,ultracode");
+  await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
   const box = await slider.boundingBox();
   expect(box).toBeTruthy();
   await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2);
   await page.mouse.down();
   await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2, { steps: 3 });
   await page.mouse.up();
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
   await expect
     .poll(() =>
       configureBodies.some(
-        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "ultracode",
+        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "max",
       ),
     )
     .toBeTruthy();
 
   await slider.focus();
   await page.keyboard.press("Home");
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "default");
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "low");
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0");
   await expect
     .poll(() =>
       configureBodies.some(
-        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "default",
+        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "low",
       ),
     )
     .toBeTruthy();

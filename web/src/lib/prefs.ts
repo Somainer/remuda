@@ -20,8 +20,8 @@ const empty: NewSessionPrefs = {
   permissionMode: "manual",
   driver: "claude-print",
   delegation: "none",
-  effortIndex: 1,
-  effortName: "think",
+  effortIndex: 2,
+  effortName: "",
   recentHostIds: [],
   recentWorkspaceIds: [],
 };

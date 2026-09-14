@@ -806,17 +806,29 @@
   flex: 1;
 }
 
-.effortCard {
-  /* Knob face reads as the palette's "white": cream on night, paper-white on ledger. */
+/*
+ * Pill scale shared by both frames: the composer's framed card and New
+ * Session's frameless inline field. Knob face reads as the palette's "white":
+ * cream on night, paper-white on ledger. --knob is half the knob, fed in
+ * inline from KNOB_INSET in EffortSlider.tsx: it is both the knob's radius and
+ * the inset its centre travels within.
+ */
+.effortCard,
+.effortForm {
   --knob-face: var(--paper);
   --knob-edge: rgba(12, 15, 20, 0.3);
-  /*
-   * --knob is half the knob, fed in inline from KNOB_INSET in EffortSlider.tsx:
-   * it is both the knob's radius and the inset its centre travels within.
-   */
   --pill: 40px;
   --knob-size: 36px;
   --brand: var(--cold);
+}
+
+:global([data-theme="ledger"]) .effortCard,
+:global([data-theme="ledger"]) .effortForm {
+  --knob-face: #ffffff;
+  --knob-edge: rgba(30, 42, 50, 0.2);
+}
+
+.effortCard {
   padding: 8px 10px 10px;
   display: flex;
   flex-direction: column;
@@ -824,28 +836,174 @@
   min-width: 0;
 }
 
-:global([data-theme="ledger"]) .effortCard {
-  --knob-face: #ffffff;
-  --knob-edge: rgba(30, 42, 50, 0.2);
+/*
+ * New Session layout A: no card at all. The slider sits in the form's own
+ * column with the same outline/spacing/typography tokens as the other fields —
+ * a label row (label · level + description · ultracode), the dotted pill with
+ * tick labels under its stops, then the spec helper in the muted field slot.
+ */
+.effortForm {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
 }
 
-/*
- * Inline variant: the same card, framed by itself instead of by a popover, so
- * New Session can mount it in the sheet's flow. 400px is the sheet's column
- * width; the popover keeps its 300px via .popoverCard.
- */
-.effortInline {
-  width: min(400px, 100%);
-  max-width: 100%;
+/* Label row: label left, current level + description muted, ultracode far right. */
+.effortFormRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.effortFormLabel {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  letter-spacing: 0.06em;
+  flex: none;
+}
+
+.effortFormMeta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.effortFormName {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--paper);
+  white-space: nowrap;
+  flex: none;
+}
+
+.effortFormDesc {
+  font-size: 12px;
+  color: var(--mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* Same muted helper slot/position as every other New Session field. */
+.effortFormFoot {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  line-height: 1.5;
+}
+
+/* Tick labels under the pill stops. Full names on wide tracks, shortened on narrow. */
+.effortTicks {
+  position: relative;
+  height: 14px;
+  margin: 0 var(--knob, 18px);
+}
+
+.effortTick {
+  position: absolute;
+  top: 0;
+  left: calc(var(--tick, 0) * 100%);
+  transform: translateX(-50%);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--mute);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.effortTickOn {
+  color: var(--paper);
+}
+
+.effortTickEmber {
+  color: var(--dust);
+}
+
+/* Full tier names at every supported width. */
+.effortTickFull {
+  display: inline;
+}
+
+
+/* The ultracode workflow toggle — a small chip, Claude only, not a tier. */
+.ultraChip {
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-2);
-  padding: 8px 12px 12px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  flex: none;
+  position: relative;
+}
+
+.ultraChip:hover:not(:disabled) {
+  border-color: var(--mute);
+  color: var(--paper);
+}
+
+.ultraChipOn {
+  border-color: var(--dust);
+  color: var(--dust);
+  background-image: linear-gradient(90deg, transparent, rgba(201, 132, 42, 0.18), transparent);
+  background-size: 200% 100%;
+  animation: ember 4.5s linear infinite, emberChipGlow 3.4s ease-in-out infinite;
+}
+
+.ultraChipDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  background: transparent;
+  flex: none;
+}
+
+.ultraChipSpark {
+  position: relative;
+  width: 0;
+  height: 10px;
+  flex: none;
+}
+
+/* Sparks inside the chip reuse the composer keyframes but are scoped to this box. */
+.ultraChipSpark .emberSpark {
+  width: 3px;
+  height: 3px;
+  left: 1px;
+  bottom: 1px;
+}
+
+.ultraChipSpark .emberSpark2 {
+  left: -7px;
+}
+
+.ultraChipSpark .emberSpark3 {
+  left: -15px;
+}
+
+/* The compact popover head wraps the chip so the title keeps its centre slot. */
+.effortHeadUltra {
+  display: inline-flex;
+  align-items: center;
 }
 
 .effortHead {
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) 26px;
+  grid-template-columns: 26px minmax(0, 1fr) auto 26px;
   align-items: center;
   gap: 4px;
 }
@@ -945,8 +1103,11 @@
 }
 
 .effortHit[aria-disabled="true"] {
-  opacity: 0.45;
   cursor: not-allowed;
+}
+
+.effortHit[aria-disabled="true"]:not([data-ember="1"]) {
+  opacity: 0.45;
 }
 
 .effortHit:focus-visible {
@@ -1309,6 +1470,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .ultraChipSpark {
+    display: none;
+  }
+
   .ember,
   .emberSpark,
   .emberSpark2,

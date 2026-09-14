@@ -72,7 +72,9 @@ export function shellPtyAllowed(host: HostMatrix | undefined, kind: AgentKindId 
 
 /** Legacy carriers still offered, secondary to the native PTY. */
 export function legacyDrivers(kind: AgentKindId): DriverKind[] {
-  if (kind === "claude") return ["claude-print", "claude-pty", "generic-pty"];
+  // claude-pty first: it keeps a multi-turn TUI alive; claude-print is a one-shot legacy
+  // path kept only until D-028 retires it, so it is offered last and never defaulted.
+  if (kind === "claude") return ["claude-pty", "generic-pty", "claude-print"];
   return ["generic-pty"];
 }
 
@@ -83,7 +85,7 @@ export function legacyDrivers(kind: AgentKindId): DriverKind[] {
 export function defaultDriver(host: HostMatrix | undefined, kind: AgentKindId | "terminal"): DriverKind {
   if (kind === "terminal") return "shell-pty";
   if (shellPtyAllowed(host, kind)) return "shell-pty";
-  if (kind === "claude") return "claude-print";
+  if (kind === "claude") return "claude-pty";
   return "generic-pty";
 }
 

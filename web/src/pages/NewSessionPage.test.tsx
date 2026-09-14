@@ -245,7 +245,7 @@ describe("D-028 native PTY default", () => {
     expect(print.className).toMatch(/driverChoiceOn/);
   });
 
-  it("falls back to claude-print when the host's matrix says shell-pty is not launchable", () => {
+  it("falls back to claude-pty when the host's matrix says shell-pty is not launchable", () => {
     vi.mocked(store.useHub).mockReturnValue({
       ...store.hubStore.getSnapshot(),
       hosts: [
@@ -261,7 +261,7 @@ describe("D-028 native PTY default", () => {
     const shell = screen.getByTestId("new-session-driver-shell-pty");
     expect(shell).toBeDisabled();
     expect(shell).toHaveAttribute("data-default", "0");
-    expect(screen.getByTestId("new-session-driver-claude-print")).toHaveAttribute("data-default", "1");
+    expect(screen.getByTestId("new-session-driver-claude-pty")).toHaveAttribute("data-default", "1");
   });
 
   it("falls back to generic-pty for grok when the installed CLI meets a matrix refusing shell-pty", () => {

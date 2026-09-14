@@ -14,7 +14,7 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
   it("falls back to legacy drivers when the CLI exists but no driver matrix was reported", () => {
     const host = withCli(["claude", "codex", "grok", "agy"]);
     expect(shellPtyAllowed(host, "claude")).toBe(false);
-    expect(defaultDriver(host, "claude")).toBe("claude-print");
+    expect(defaultDriver(host, "claude")).toBe("claude-pty");
     for (const kind of ["codex", "grok", "agy"] as const) {
       expect(shellPtyAllowed(host, kind)).toBe(false);
       expect(defaultDriver(host, kind)).toBe("generic-pty");
@@ -29,7 +29,7 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     const host = withCli(["codex"]);
     expect(shellPtyAllowed(host, "grok")).toBe(false);
     expect(defaultDriver(host, "grok")).toBe("generic-pty");
-    expect(defaultDriver(host, "claude")).toBe("claude-print");
+    expect(defaultDriver(host, "claude")).toBe("claude-pty");
     // codex IS installed but no matrix was reported → still a legacy carrier.
     expect(defaultDriver(host, "codex")).toBe("generic-pty");
   });
@@ -48,7 +48,7 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
       capabilities: { driverInventory: [{ kind: "shell-pty", launchable: false }] },
     };
     expect(shellPtyAllowed(host, "claude")).toBe(false);
-    expect(defaultDriver(host, "claude")).toBe("claude-print");
+    expect(defaultDriver(host, "claude")).toBe("claude-pty");
   });
 
   it("an inventory without a shell-pty row also falls back (the matrix says no)", () => {
@@ -66,7 +66,7 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
   });
 
   it("keeps the legacy drivers selectable but secondary", () => {
-    expect(legacyDrivers("claude")).toEqual(["claude-print", "claude-pty", "generic-pty"]);
+    expect(legacyDrivers("claude")).toEqual(["claude-pty", "generic-pty", "claude-print"]);
     expect(legacyDrivers("grok")).toEqual(["generic-pty"]);
   });
 

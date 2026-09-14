@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use remuda_testing::fake_harness::{Dialect, Options, run};
+use remuda_testing::fake_harness::{Dialect, DialectVersion, Options, run};
 
 /// Script-driven fake agent harness for PTY tests.
 #[derive(Parser, Debug)]
@@ -54,6 +54,9 @@ struct Args {
     /// Pin the deterministic clock epoch (Unix milliseconds).
     #[arg(long)]
     epoch_ms: Option<i64>,
+    /// Screen dialect version: `legacy` (default) or `modern` (claude 2.1.270).
+    #[arg(long, default_value = "legacy", value_parser = DialectVersion::parse)]
+    dialect_version: DialectVersion,
     /// Append semantic debug events to this JSONL file.
     #[arg(long)]
     events_out: Option<PathBuf>,
@@ -79,6 +82,7 @@ fn main() {
         cols: args.cols,
         rows: args.rows,
         epoch_ms: args.epoch_ms,
+        dialect_version: args.dialect_version,
         events_path: args.events_out,
     };
     match run(options) {

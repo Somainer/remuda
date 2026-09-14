@@ -37,8 +37,8 @@ use crate::fake_harness::hooks::{
 };
 use crate::fake_harness::input::Input;
 use crate::fake_harness::screen::{
-    ApprovalView, Dialect, ScreenMode, View, WorkingPhase, default_choices, enter, repaint,
-    teardown,
+    ApprovalView, Dialect, DialectVersion, ScreenMode, View, WorkingPhase, default_choices, enter,
+    osc_transitions, repaint, teardown,
 };
 use crate::fake_harness::script::{ApprovalMode, Scenario, TurnSpec, UsageSpec};
 
@@ -84,6 +84,9 @@ pub struct Options {
     pub epoch_ms: Option<i64>,
     /// Append semantic debug events to this JSONL file.
     pub events_path: Option<PathBuf>,
+    /// Screen dialect version (`modern` = claude 2.1.270, no `esc to
+    /// interrupt`, live OSC edges with an empty percent).
+    pub dialect_version: DialectVersion,
 }
 
 impl Default for Options {
@@ -103,6 +106,7 @@ impl Default for Options {
             rows: 24,
             epoch_ms: None,
             events_path: None,
+            dialect_version: DialectVersion::Legacy,
         }
     }
 }
@@ -190,6 +194,32 @@ struct Engine {
     should_exit: bool,
     dirty: bool,
     last_second: u64,
+    /// Last OSC 0 title emitted, so live edges only resend changes.
+    osc_title: String,
+    /// Last raw OSC 9;4 payload emitted (`"3;"` / `"0;"` in modern).
+    osc_progress: String,
+}
+
+impl Engine {
+    /// Write one full repaint, preceded by any OSC edges the modern dialect
+    /// owes the observer since the last paint. The legacy dialect writes OSC
+    /// only at [`enter`], so this prepends nothing for it.
+    fn paint(&mut self, cols: u16, rows: u16) {
+        if self.dialect == Dialect::Claude && self.view.dialect_version.is_modern() {
+            let (edges, title, progress) =
+                osc_transitions(&self.view, &self.osc_title, &self.osc_progress);
+            if let Some(title) = title {
+                self.osc_title = title;
+            }
+            if let Some(progress) = progress {
+                self.osc_progress = progress;
+            }
+            if !edges.is_empty() {
+                let _ = write_stdout(&edges);
+            }
+        }
+        let _ = write_stdout(&repaint(&self.view, cols, rows));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +236,11 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     let _parent_watch = crate::parent_watch::install_with_flag(Some(stopping.clone()));
 
     let dialect = opts.kind;
+    if opts.dialect_version.is_modern() && dialect != Dialect::Claude {
+        return Err(RunError::Args(
+            "--dialect-version modern is only defined for --kind claude".into(),
+        ));
+    }
     let scenario = match &opts.script_path {
         Some(path) => Scenario::load(path).map_err(RunError::Args)?,
         None => default_scenario(),
@@ -272,11 +307,16 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         .unwrap_or_else(|| "work".into());
     let mut view = View::new(dialect, model.clone(), dir_name);
     view.alt_screen = !opts.no_alt_screen;
+    view.dialect_version = opts.dialect_version;
     if dialect == Dialect::Codex && !resuming {
         view.transcript
             .push(format!(">_ OpenAI Codex (v{})", dialect.version()));
         view.transcript.push(format!("model: {model} low"));
     }
+    // `enter()` emits these before the first paint; seed the last-sent values
+    // so the first live edge compares against them.
+    let initial_title = view.title();
+    let initial_progress = view.osc_progress_payload();
 
     let mut engine = Engine {
         dialect,
@@ -309,6 +349,8 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         should_exit: false,
         dirty: true,
         last_second: 0,
+        osc_title: initial_title,
+        osc_progress: initial_progress,
     };
 
     if resuming {
@@ -619,7 +661,7 @@ impl Engine {
             }
             if self.dirty {
                 let (w, h) = terminal_size().unwrap_or((cols, rows));
-                let _ = write_stdout(&repaint(&self.view, w, h));
+                self.paint(w, h);
                 self.dirty = false;
             }
             if self.should_exit || self.stopping.load(Ordering::Relaxed) {
@@ -644,7 +686,7 @@ impl Engine {
             }
         }
         let (w, h) = terminal_size().unwrap_or((cols, rows));
-        let _ = write_stdout(&repaint(&self.view, w, h));
+        self.paint(w, h);
         Ok(0)
     }
 

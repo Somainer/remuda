@@ -129,9 +129,11 @@ pub fn materialize_overlay(options: &OverlayOptions) -> DriverResult<HookOverlay
 ///
 /// The credential is deliberately *not* here: it reaches the relay through the
 /// child environment, because a command line is world-readable via `ps`.
+/// Explicit `exec` preserves the harness as the relay's parent even when the
+/// hook runner's `/bin/sh` does not optimize away its command interpreter.
 fn relay_command(options: &OverlayOptions, event: &str) -> String {
     format!(
-        "{} hook emit --socket {} --event {}",
+        "exec {} hook emit --socket {} --event {}",
         quote(&options.relay_binary.to_string_lossy()),
         quote(&options.socket_path.to_string_lossy()),
         quote(event),

@@ -7,6 +7,7 @@
 //! usable `{}` and exits 0.
 #![cfg(unix)]
 
+use remuda_driver::{OverlayOptions, TuiMode, materialize_overlay};
 use remuda_signal::{HookEnvelope, HookReply, HookServer, SignalSink};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -116,6 +117,63 @@ async fn the_relay_forwards_stdin_and_prints_the_nodes_reply() {
     assert!(
         seen[0].ppid > 0,
         "the relay must report the agent pid the Node binds the session on"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_generated_shell_hook_reports_the_harness_parent_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let server = HookServer::bind(
+        &dir.path().join("hook.sock"),
+        "cred-shell".into(),
+        Arc::clone(&recorder) as Arc<dyn SignalSink>,
+    )
+    .unwrap();
+    let overlay = materialize_overlay(&OverlayOptions {
+        launch_dir: dir.path().join("launch"),
+        relay_binary: env!("CARGO_BIN_EXE_remuda").into(),
+        socket_path: server.path().to_path_buf(),
+        tui: TuiMode::Default,
+        base: None,
+    })
+    .unwrap();
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(overlay.path).unwrap()).unwrap();
+    let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    // A trailing builtin prevents optional final-command exec optimization.
+    // The generated command itself must replace the interpreter, as required
+    // by shells such as Linux dash, or its PPID is a short-lived shell PID.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", &format!("{command}\n:")])
+        .env("REMUDA_HOOK_CREDENTIAL", "cred-shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(SESSION_START.as_bytes())
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("shell hook must finish")
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let seen = recorder.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].event, "SessionStart");
+    assert_eq!(
+        seen[0].ppid,
+        i32::try_from(std::process::id()).unwrap(),
+        "the hook envelope must bind to the harness, not an intermediate shell"
     );
 }
 

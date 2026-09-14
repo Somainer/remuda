@@ -278,3 +278,187 @@ The skipped test requires the suite's external real Node mode. This suite's
 new native-hook test independently starts a disposable production Node.
 The own dev and e2e listeners were stopped; the five real-run instances and
 their native agents exited, and generated Spaces screenshots were removed.
+
+## Gate follow-up: native fixture portability (2026-09-14)
+
+The coordinator reported a second Hub gate failure on dedicated ports after
+merging `30e0755` with main `3da158d`; the failing spec names were unavailable.
+Fetching and rebasing locally left that same base. On this Mac, the unchanged
+branch passed the complete suite with both Chrome and CI's bundled Chromium:
+17 passed, one existing conditional skip, about two minutes per run. The
+remote failure itself has therefore **not** been reproduced here. Review did
+not establish a new `store.ts`, provider-discovery, or Passkey regression.
+
+Three independent problems were reproduced or covered by focused regressions:
+
+1. **The native spec depended on warm executable artifacts.** The standalone
+   Hub command built only `hub_e2e`, while the new spec accessed `debug/remuda`
+   and `debug/fake-harness`. Parking just those two files in this worker's
+   Cargo target made the original spec fail with `ENOENT` before enrollment.
+   Its `beforeAll` now builds the default executables unconditionally, retaining
+   explicit binary overrides and the inherited Cargo target/build settings.
+   This also refreshes stale binaries and works when an external Hub is reused.
+   Build setup has its own bounded deadline; turn activity still has 1.5 s.
+2. **Linux selected a session instead of the foreground process group.**
+   Numeric `ps -g` selects a session ID in Linux procps, as documented in the
+   [procps manual](https://man7.org/linux/man-pages/man1/ps.1.html).
+   A disposable Debian container created a job with PID/PGID 190 and SID 1.
+   The old query returned zero rows; querying explicit PID/PGID columns and
+   filtering PGID returned the job. Linux now uses that explicit filter; BSD
+   keeps its existing selector. A parser regression excludes other groups,
+   and a real Unix process-group test checks an owned child whose PGID differs
+   from its inherited session. The child is killed and reaped on every path.
+3. **Linux's hook shell changed the reported parent PID.** In the same
+   disposable container, `/bin/sh -c` retained an interpreter: the relay-shaped
+   process had PPID 197 while the harness-shaped caller was PID 1. With an
+   explicit `exec`, PPID was 1. Every generated relay command now starts with
+   `exec`. The CLI regression materializes a real overlay, runs its command
+   through `/bin/sh`, receives it over the authenticated hook socket, and
+   asserts the envelope's PPID is the harness process. A trailing shell builtin
+   prevents an optional shell optimization from hiding this bug on macOS.
+
+The Linux container probes establish command and parent-PID semantics; they
+are not a Linux run of the complete Remuda gate. All containers used for these
+probes were disposable. Local Hub runs used worker-owned ports 58580/58589 and
+upstream 58581. All local run logs, both successful baseline artifacts, and
+the missing-binary reproduction artifacts were retained outside the repository.
+
+The corrected complete Hub suite started with **both native executables
+absent** and passed on CI's bundled Chromium with retries disabled: 17 passed,
+one existing conditional skip, 3.4 minutes including the automatic build.
+The native spec took 21.7 s and retained exactly two native Esc interruptions,
+two journal `interrupted` events, two completed turns in the same process, and
+`signalTier=hook`. Its three working assertions passed 34–83 ms after the CR
+request returned; idle assertions passed in 1–4 ms after the native/journal
+completion checks. These are fake-harness measurements, not model latency.
+
+Follow-up validation on main `3da158d`:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy -p remuda-driver -p remuda --all-targets --locked -- -D warnings` | PASS |
+| `cargo test -p remuda-driver -p remuda --locked` | PASS: 36 targets, 555 passed, 0 failed, 10 existing ignored tests |
+| `pnpm --dir web test` | PASS: 69 files, 420 tests |
+| `pnpm --dir web run build` | PASS |
+| `pnpm --dir web run lint` | PASS: four existing warnings in unchanged components |
+| `CI=1 pnpm --dir web run test:e2e:hub --retries=0 --reporter=list` | PASS: 17 passed, one existing conditional skip; missing binaries rebuilt by setup |
+| `./scripts/ci/secret-scan.sh` | PASS |
+
+The owned Hub, web, upstream and native Node processes were stopped. Temporary
+binary backups and generated Spaces screenshots were removed; test artifacts
+remain outside the committed tree for diagnosing any subsequent gate failure.
+
+Main advanced to `26371ad` during delivery. Both commits rebased cleanly, then
+fmt, the same two-crate clippy/test commands (555 passed), web tests (420 passed),
+and both CI scans passed again. The complete Hub suite also passed again on
+that base with CI Chromium and no retries: 17 passed, one existing conditional
+skip, 3.8 minutes including builds. The native spec took 22.6 s and again
+recorded exactly two Esc interruptions, two journal interruptions, two completed
+turns in one process, and hook signal tier. Final artifacts were archived and
+the worker's listeners and generated screenshots were cleaned up.
+
+## Integration with P2 native carriers and launch options (2026-09-14)
+
+The coordinator's next gate stopped on merge conflicts after main advanced to
+`230532e`. The two worker commits were rebased with P2's intent from
+`native-pty-2.md` and the launch-option commits reviewed before resolution.
+
+- P2 retains the native agent recipe, process-group stop ladder and exit waiter,
+  observed launch origin, driver inventory, per-harness key table, and first
+  prompt readiness. Hook working/idle and readiness use the current agent PID;
+  a stale SessionStart cannot unlock another foreground process. Cancel uses
+  P2's key table, with the existing hook/native-screen interruption confirmation.
+- Native Claude now merges the configured settings into the HookSession overlay,
+  then rematerializes its recipe so argv and the settings digest agree. The
+  original recipe validates before hook artifacts are created. A regression
+  preserves provider/custom environment and user hooks, checks every registered
+  event and the audited digest, and verifies rejection before hook setup.
+- The shell shim retains launchopts' pinned executable resolver and the Rust
+  explicit-settings merger. PID markers use their materialized directory in
+  both resolver modes. The CLI regression tests file and inline settings with
+  both PATH and a pin; a failing PATH decoy proves the pinned executable wins.
+  Direct native agent launches intentionally skip the PATH shim, so they do not
+  receive the hand-typed shim-bypass diagnostic.
+- P2's portable `ps -eo pgid=,pid=,args=` implementation supersedes this branch's
+  earlier platform-specific implementation. Both its detection coverage and the
+  worker's actual process-group regression survive, as does relay `exec` for
+  parent-PID fidelity. The journal parity test uses main's isolated `--out`
+  generator API. Node pump shutdown, capability refresh and pending SessionStart
+  binding remain in one observation path.
+
+The rebased full Hub suite used CI Chromium, no retries, Hub/web ports
+58580/58589 and upstream 58581: **17 passed, one existing conditional skip,
+3.9 minutes**. The promoted native spec took 22.7 s, with two native Esc
+interruptions, two journal interruptions, two completed turns and hook tier.
+Its three working assertions passed in 77–79 ms after their CR requests;
+idle assertions passed in 1–8 ms after native/journal completion checks.
+Passkey, effort slider, native PTY selection, provider discovery and Spaces
+all passed in the same full run.
+
+### Fresh real Claude run after the shim resolution
+
+A disposable `remuda dev` ran on Hub 62780 / Node 62787 with
+`REMUDA_PTY_CARRIER=native`, `REMUDA_PTY_EMULATOR=1` and `REMUDA_PTY_HOOKS=1`.
+A Hub-created `kind=terminal`, `driver=shell-pty` instance received the original
+hand-typed command:
+
+```sh
+claude --settings ~/.claude/settings.relay.json --model 'claude-opus-5[1m]'
+```
+
+Claude Code **2.1.270** ran as PID **3782**, with session
+`6d4bf208-eac9-4a29-836e-0c0fb95444bb`. The instance was
+`ins_01a0a00c-cffe-737f-8621-5f3dde534a3e`. Hub showed `mode=promoted`,
+`launchedBy=user`, and `signalTier=hook`. Its private per-invocation settings
+file was mode 0600, preserved every non-hook source setting, and contained all
+13 registered events. The shim PID marker and SessionStart PPID both matched
+3782. No source settings or credentials were changed or copied into this doc.
+
+| Journal seq | Evidence | Result |
+| --- | --- | --- |
+| 5 / 8 | Promotion / SessionStart with PPID 3782 | Native session and hook tier bound |
+| 10 / 13 / 16 | UserPromptSubmit / MessageDisplay / Stop | `HOOK_REBASE_OK` completed; working → idle |
+| 17 / 19 | UserPromptSubmit / PreToolUse | `sleep 60` turn working |
+| 24 / 25 | PostToolUse / PostToolBatch | Real tool hooks arrive through the merged settings |
+| 29 | Fresh PTY `interrupted` | `instance.cancel` sends Esc; native Interrupted composer and Hub idle; PID 3782 still alive |
+| 31 / 33 / 34 | UserPromptSubmit / MessageDisplay / Stop | Same process replies `HOOK_AFTER_ESC` and completes |
+| 37 / 41 | Background-completion UserPromptSubmit / second `interrupted` | New native turn encountered upstream API retries; another Esc returns it to idle |
+| 43 | SubagentStop | No working annotation or new working transition |
+
+The three user prompts were observed working through Hub polling at 499, 964,
+and 897 ms from the CR request start. Normal Stop events took 7–8 ms from Node
+observation to Hub persistence. The two Esc-to-interrupted polling measurements
+were **1,315 ms and 1,531 ms**; these include the command request and polling.
+The first interruption reached Hub 14 ms after its native PTY observation.
+Real Claude did not emit Stop for Esc, so the fresh native Interrupted screen
+remains necessary evidence; neither command settlement nor old screen history
+was counted as turn completion. The later background completion was its own
+UserPromptSubmit, distinct from SubagentStop.
+
+The hook/interrupt checks passed. Cleanup exposed a separate close limitation:
+P2's stop ladder logged `Operation not permitted (os error 1)`, while the
+existing close path still settled `explicit-close` as exited. The login shell
+and its separate foreground Claude process were still present at that point.
+The close/stop error handling is unchanged from main in this resolution. The
+worker explicitly terminated its owned PIDs and stopped its dev process;
+all three PIDs and all five owned listener ports were then verified absent.
+This is recorded as a stop-reporting follow-up, not a successful native close.
+
+Validation on the resolved `230532e` source base:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all` | PASS |
+| `cargo clippy -p remuda-driver -p remuda-node -p remuda-signal -p remuda --all-targets --locked -- -D warnings` | PASS |
+| `cargo test -p remuda-driver -p remuda-node -p remuda-signal -p remuda --locked` | PASS: 56 targets, 860 passed, 0 failed, 10 existing ignored |
+| `pnpm --dir web test --maxWorkers=2` | PASS: 70 files, 432 tests |
+| `pnpm --dir web run gen:api` | PASS: no generated diff |
+| `pnpm --dir web run build` | PASS |
+| Full `pnpm --dir web run test:e2e:hub` with CI Chromium and no retries | PASS: 17 passed, one existing conditional skip |
+| `./scripts/ci/secret-scan.sh` and `./scripts/ci/no-tunnel-scan.sh` | PASS |
+
+Full-suite artifacts and real-run logs were archived outside the repository.
+Generated Spaces screenshots were removed. The two rebased commits retain the
+worker's changes and explain the P2/launchopts integration without adding a
+third implementation commit.

@@ -1,15 +1,32 @@
 import { expect, test, type Page } from "@playwright/test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { login } from "./hub-auth";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const target = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target");
 const remuda = process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda");
 const harness = process.env.HUB_E2E_FAKE_HARNESS_BIN ?? path.join(target, "debug/fake-harness");
+
+// A standalone Hub gate only builds its fake Hub example. Always refresh the
+// default native executables so a clean or stale Cargo target tests this tree.
+// Keep this in the spec: an externally reused Hub also needs the local Node.
+test.beforeAll(async ({}, testInfo) => {
+  testInfo.setTimeout(600_000);
+  const args = ["build", "--locked"];
+  if (!process.env.HUB_E2E_REMUDA_BIN) args.push("-p", "remuda", "--bin", "remuda");
+  if (!process.env.HUB_E2E_FAKE_HARNESS_BIN) args.push("-p", "remuda-testing", "--bin", "fake-harness");
+  if (args.length > 2) {
+    await promisify(execFile)("cargo", args, {
+      cwd: root, env: process.env, timeout: 570_000, maxBuffer: 8 * 1024 * 1024,
+    });
+  }
+  await Promise.all([access(remuda), access(harness)]);
+});
 
 type NativeEvent = { event: string; by?: string; outcome?: string };
 type JournalEvent = { source?: { channel?: string }; kind?: string; payload?: { nativeName?: string } };
@@ -62,12 +79,11 @@ async function stopNode(node: ChildProcess) {
 /**
  * This spec attaches a disposable production Node to the suite's Hub. The
  * existing fake WebSocket Node cannot prove hook relay, PTY keys, or native
- * interrupt settlement. Build remuda and fake-harness before running the suite;
- * CARGO_TARGET_DIR (or the two HUB_E2E_*_BIN overrides) locates those binaries.
+ * interrupt settlement. Setup builds remuda and fake-harness in CARGO_TARGET_DIR;
+ * the two HUB_E2E_*_BIN overrides opt into explicit prebuilt executables.
  */
 test("promoted Claude: hooks drive activity and 打断 sends a native Esc without closing", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
-  await Promise.all([access(remuda), access(harness)]);
   // Keep Unix socket paths below sockaddr_un's macOS limit.
   const dir = await realpath(await mkdtemp("/tmp/hge-"));
   const bin = path.join(dir, "bin");

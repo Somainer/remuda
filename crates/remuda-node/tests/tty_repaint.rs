@@ -6,9 +6,11 @@
 //! workspace forbids `unsafe`, so `set_var` is unavailable, and a process-wide
 //! flag would leak between tests sharing a process regardless.
 
+use remuda_driver::shell_pty::HookConfig;
 use remuda_driver::{Driver, ShellPtyDriver, ShellPtyOptions};
 use remuda_node::{TtyAttach, TtyRegistry};
 use remuda_protocol::InstanceId;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Paints two frames over each other, then sits still. The second frame is the
@@ -34,6 +36,12 @@ time.sleep(30)
 /// Spawn a shell-pty running `script`, bridge it into a registry, and return
 /// the attach once its snapshot shows `marker`.
 async fn attach_when(script: &str, emulator: bool, marker: &str) -> TtyAttach {
+    attach_with(script, emulator, false, marker).await
+}
+
+/// As [`attach_when`], optionally standing up the P1 hook path too, so the two
+/// flags can be exercised together (D-028 §13 rule ⑤: they are orthogonal).
+async fn attach_with(script: &str, emulator: bool, hooks: bool, marker: &str) -> TtyAttach {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
     options.args = vec![
@@ -43,6 +51,13 @@ async fn attach_when(script: &str, emulator: bool, marker: &str) -> TtyAttach {
         script.to_owned(),
     ];
     options.emulator = emulator;
+    if hooks {
+        options.hooks = Some(HookConfig {
+            instance_dir: dir.path().join("instance"),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: remuda_driver::TuiMode::Fullscreen,
+        });
+    }
     let driver = ShellPtyDriver::new(options);
     driver.spawn().await.expect("spawn shell-pty");
     let bridge = driver.tty_bridge().await.expect("local bridge");
@@ -141,4 +156,30 @@ async fn a_primary_screen_session_reports_alt_screen_false() {
     assert!(!attached.alt_screen);
     let json = attached.into_json().expect("attach json");
     assert_eq!(json["altScreen"], serde_json::Value::Bool(false));
+}
+
+#[tokio::test]
+async fn the_emulator_and_hook_flags_do_not_interfere() {
+    // §13 rule ⑤: the five flags are orthogonal. The hook path binds a socket
+    // before the child starts and the emulator consumes bytes after the PTY
+    // exists, so neither reads the other — but "should not interfere" is worth
+    // an assertion rather than an argument, since both now touch `spawn_at`.
+    let with_both = attach_with(ALT_SCREEN, true, true, "fullscreen tui frame").await;
+    assert!(
+        with_both.alt_screen,
+        "the repaint path must still report ?1049 with the hook path also up"
+    );
+    let text = String::from_utf8_lossy(&with_both.snapshot).into_owned();
+    assert!(
+        !text.contains("scrollback line before the tui"),
+        "alt-grid-only snapshotting must survive the hook path: {text:?}"
+    );
+
+    // And the emulator staying off is still the raw ring when hooks are on.
+    let hooks_only = attach_with(REPAINT, false, true, "second frame").await;
+    assert!(
+        String::from_utf8_lossy(&hooks_only.snapshot).contains("first frame"),
+        "with the emulator off the snapshot is the ring, hook path or not"
+    );
+    assert!(!hooks_only.alt_screen);
 }

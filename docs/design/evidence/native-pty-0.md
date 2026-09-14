@@ -244,7 +244,7 @@ P0 的验收是「抽取零行为变更」。三层证据：
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | 通过 |
 | `cargo test --workspace --locked` | 见下 |
-| `pnpm test`（web） | 315 passed / 61 files |
+| `pnpm test`（web） | 342 passed / 62 files |
 | `pnpm run test:e2e:hub` | 11 passed，退出码 0；未改动任何**已跟踪**文件 |
 | `./scripts/ci/secret-scan.sh` | pass |
 | `pnpm --dir web run gen:api` | 无 diff（本改动不触及 Hub REST OpenAPI 面） |
@@ -292,7 +292,8 @@ main    test result: FAILED. 124 passed; 2 failed;  （remuda-node --lib）
 
 **未交付，留给后续期**：
 
-- **把 `remuda-screen` 的网格接到 `remuda-rules` 的引擎上**。本分支 rebase 时，主干
+- **把 `remuda-screen` 的网格接到 `remuda-rules` 的引擎上**（与下面 P1 的
+  `startup_dialog` 一并收口）。本分支 rebase 时，主干
   已经并入了 §10 的规则表引擎（`crates/remuda-rules`，从 herdr 0.9.0 提取的 TOML
   清单 + evaluator）。两者是互补的、而且接口正好对得上——`remuda-rules` 的
   `Screen::new(rows).with_cursor(..).with_osc_title(..).with_osc_progress(..)
@@ -305,3 +306,12 @@ main    test result: FAILED. 124 passed; 2 failed;  （remuda-node --lib）
   两家的清单，所以缺的只是上一条的接线。
 - `?1049` 之外的 alt-screen 细节（如 `?47` / `?1047`）未处理：三家 harness 都用
   `?1049`，需要时再补。
+- **与 P1 的 `claude_onboarding::startup_dialog` 尚未收口**。rebase 时主干并入了
+  首启向导识别，它同样吃「去 ANSI 的视口 + 扁平化短语匹配」，与 `ScreenGrid::flat()`
+  是同一形状。两边目前各写各的，没有冲突也没有重复代码；真正的收口点是上面那条——
+  三者（signature / onboarding / rules）都应改吃同一个网格。本期不动，理由同上。
+
+**与 P1 flag 的关系**：`REMUDA_PTY_EMULATOR` 与 `REMUDA_PTY_HOOKS` 正交（§13 规则
+⑤）。rebase 后 `ShellPtyOptions` 上 `hooks` 与 `emulator` 是两个独立字段，互不读取：
+hook 通路在子进程起来之前建好 socket，模拟器在 PTY 建好之后开始吃字节，两者都可
+单独开关。任一为默认值时，另一条路径的行为与其单独存在时逐字节相同。

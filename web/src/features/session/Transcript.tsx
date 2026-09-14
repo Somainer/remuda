@@ -139,8 +139,8 @@ function TranscriptInner({
   const restoredRef = useRef(false);
   const saveTimer = useRef<number | null>(null);
   // A scroll request toward a row whose size the window has not measured yet
-  // is declared with the scroll effects below (it can target an index or a
-  // saved scroll ratio) and refined as ResizeObserver reports real heights.
+  // (a search hit, j/k navigation, or a saved anchor) is refined as
+  // ResizeObserver reports the real heights — see the pendingScroll effect.
   useEffect(() => {
     sizesHold.current = sizes;
   }, [sizes]);

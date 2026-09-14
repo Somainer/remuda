@@ -291,6 +291,35 @@ test.describe("batch E: Hub fake-node invariants", () => {
     }
   });
 
+  test.afterAll(async ({ browser }) => {
+    // Restore the shared fake node's fixture default (maxInstances:8) for
+    // the specs that run later in the serial suite.
+    const page = await browser.newPage();
+    try {
+      await login(page);
+      const hosts = await page.evaluate(async () => {
+        const response = await fetch("/v1/hosts", { credentials: "include" });
+        return response.json() as Promise<{ items?: { hostId?: string; id?: string; label?: string }[] }>;
+      });
+      const host = (hosts.items ?? []).find((h) => h.label === "e2e-fake-node");
+      if (host) {
+        await page.evaluate(
+          async (id) => {
+            await fetch(`/v1/hosts/${id}`, {
+              method: "PATCH",
+              credentials: "include",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ maxInstances: 8 }),
+            }).catch(() => {});
+          },
+          (host.hostId ?? host.id) as string,
+        );
+      }
+    } finally {
+      await page.close();
+    }
+  });
+
   async function createSession(page: Page, prompt: string): Promise<string> {
     await page.goto("/sessions/new");
     const hostPicker = page.getByTestId("new-session-host");
@@ -379,12 +408,18 @@ test.describe("batch E: Hub fake-node invariants", () => {
 
   test("reading position and follow state survive leaving and re-entering", async ({ page }) => {
     const instanceId = await readySession(page, "batch-e restore seed");
-    // Enough turns that the transcript actually scrolls in the viewport. The
-    // fake node reports `working` between turns, so later sends may queue;
-    // every send still appends and echoes regardless.
-    for (let i = 0; i < 10; i += 1) await sendTurn(page, `restore filler turn ${i} xyz`);
-
+    // Make the transcript scrollable WITHOUT relying on multiple turns: the
+    // fake node keeps reporting working after a send, so a second Enter
+    // becomes a queue rather than a turn. One long (wrapping) prompt produces
+    // a tall user bubble and an equally tall echo from a single instance.send.
+    const filler = `restore-filler ${Array.from({ length: 200 }, (_, i) => `line-${i}-padding`).join(" ")}`;
+    const composer = page.getByTestId("composer-input");
+    await composer.fill(filler);
+    await composer.press("Enter");
+    await expect(page.getByTestId("transcript")).toContainText("echo: restore-filler", { timeout: 30_000 });
     const scroller = page.getByTestId("transcript-scroller");
+    await expect.poll(async () => scroller.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeGreaterThan(600);
+
     await scroller.evaluate((el) => {
       el.scrollTop = 0;
       el.dispatchEvent(new Event("scroll", { bubbles: true }));
@@ -444,7 +479,7 @@ test.describe("batch E: Hub fake-node invariants", () => {
   });
 });
 
-/** maxInstances:8 is shared across every hub spec; bump it for this run. */
+/** maxInstances:8 is shared across every hub spec; raise it for this file. */
 async function raiseCap(page: Page, to: number): Promise<void> {
   const hosts = await page.evaluate(async () => {
     const response = await fetch("/v1/hosts", { credentials: "include" });

@@ -1964,11 +1964,59 @@ fn fixture_host(host_id: HostId) -> Result<Host, NodeError> {
         },
         last_seen_at: Knowledge::Known { value: now },
         lease_expires_at: unknown("local-dev-no-lease"),
-        // TODO(inventory): Hub enroll should call crate::inventory::collect; DevNode stays fixture-only.
-        driver_inventory: Vec::new(),
+        driver_inventory: driver_inventory(),
         journal_id: Id::new("obj")?,
         durable_seq: U64(0),
     })
+}
+
+/// What this Node can actually launch, for the Hub host view (D-028 §5.1).
+///
+/// The demo this exists to prevent: New Session offered `claude` on
+/// `shell-pty`, the Node silently fell back to a login shell because
+/// `REMUDA_PTY_CARRIER` was unset, and the first prompt was typed into zsh —
+/// which ran it as a command. Nothing anywhere reported that native launch was
+/// off, so the UI could not have known. `launchable` is that report, and the
+/// web keys its `shell-pty` default on it.
+///
+/// Only `shell-pty` is described: it is the one driver whose ability to launch
+/// an agent depends on a runtime flag rather than on a binary being present.
+/// The rest keep the host's existing (empty) inventory, which is honest —
+/// absence means "not reported", and no caller reads it as "cannot".
+fn driver_inventory() -> Vec<remuda_protocol::DriverDescriptor> {
+    let native = remuda_driver::shell_pty::native_carrier_enabled();
+    let Ok(capabilities) = fixture_capabilities(remuda_protocol::DriverKind::ShellPty) else {
+        return Vec::new();
+    };
+    let Ok(empty_digest) = remuda_protocol::Digest::try_from(format!(
+        "sha256:{:x}",
+        <Sha256 as sha2::Digest>::digest([])
+    )) else {
+        return Vec::new();
+    };
+    vec![remuda_protocol::DriverDescriptor {
+        kind: remuda_protocol::DriverKind::ShellPty,
+        adapter_version: remuda_driver::ADAPTER_VERSION.to_owned(),
+        // The binary is per-launch here — a login shell or whichever agent the
+        // recipe pins — so there is nothing host-wide to name or hash. Left
+        // empty rather than filled with a plausible-looking `$SHELL`, which
+        // would be wrong for every agent launch. The digest is the sha256 of
+        // no bytes, which is what "nothing was hashed" spells in a field the
+        // wire type requires to be a well-formed sha256.
+        binary_path: String::new(),
+        binary_version: String::new(),
+        binary_digest: empty_digest,
+        launchable: native,
+        reason_code: if native {
+            "carrier-native".to_owned()
+        } else {
+            // Names the flag's absence, not a defect: `shell-pty` still
+            // launches a login shell, and D-025 promotion still works inside
+            // it. What is unavailable is Remuda running the agent command.
+            "carrier-not-enabled".to_owned()
+        },
+        capabilities,
+    }]
 }
 
 pub(crate) fn fixture_workspace(

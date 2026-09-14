@@ -182,16 +182,46 @@ end: `child.wait()` produced the status, the journal carried
 no longer reads `ready` forever. Exit code 0 settles `exited`; a non-zero
 code, a signal, or a bare EOF settle `failed`.
 
-**Known wrong, and not mine to fix:** both instances read back
-`launchedBy: remuda`. The Hub derives that field from `mode == "promoted"`,
-which meant "a human typed it" before P2 — but §1.0 rule 2 now makes *every*
-agent promote, so the inference no longer holds. The Node already stores the
-right answer explicitly (it knows which one it started); the Hub needs to
-persist and read that column rather than infer it. Left as
-`TODO(x-protocol)` in `crates/remuda-hub/src/store.rs`. It is provenance only
-and gates nothing, but it is the single entity field P2's parity check cannot
-currently verify, so the §2 comparison is over the journal rather than over
-the entity.
+**`launchedBy` was wrong here, and is now fixed.** The run recorded both
+instances reading back `launchedBy: remuda`: the Hub derived that field from
+`mode == "promoted"`, which meant "a human typed it" before P2 — but §1.0
+rule 2 makes *every* agent promote, so the inference no longer held.
+
+It is now stored rather than inferred, on both sides, from the same
+discriminator: what the instance was **before** its first promotion. A
+session created as `terminal` that becomes `claude` is a human typing into a
+shell; one created as `claude` that becomes `claude` is the launch Remuda
+ran. Written once, so a demote/repromote cycle cannot rewrite a session's
+origin, and rows predating the column keep the old derivation, which was
+sound for them. §2's comparison is still stated over the journal, because
+that is where the unification claim actually lives.
+
+## 6.1 — What the host now reports about itself
+
+The demo that prompted this: New Session offered `claude` on `shell-pty`, the
+Node silently fell back to a login shell because `REMUDA_PTY_CARRIER` was
+unset, and the first prompt was typed into zsh — which ran it as a command.
+Nothing anywhere reported that native launch was off, so the UI could not
+have known.
+
+The Node now describes itself. `Host.driver_inventory` carries a
+`DriverDescriptor` for `shell-pty` whose `launchable` is
+`native_carrier_enabled()`, with `reason_code: carrier-not-enabled` when the
+flag is off, and the hello frame sends it under `capabilities` — which the
+Hub stores verbatim and the web already reads as
+`capabilities.driverInventory[].launchable`. `capabilities` was previously
+hardcoded `None`, which is why the field never arrived.
+
+Only `shell-pty` is described: it is the one driver whose ability to launch
+an agent depends on a runtime flag rather than on a binary existing. A Node
+that reports no inventory is read as "not reported", never as "cannot".
+
+Relatedly, `wait_control` no longer gates on `promoted_kind`. That was the
+other half of the same demo — a Remuda-launched agent has no promotion yet at
+create time, so the create-time prompt bypassed the ready ladder entirely.
+It now runs §5.2's ladder (hook receipt > emulator modes + quiescence > glyph)
+from the first byte, and an agent that is booting, working or blocked holds
+the prompt in the D-022 queue instead of typing into whatever is on screen.
 
 ## 7 — Delete and purge
 

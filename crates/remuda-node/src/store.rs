@@ -604,6 +604,27 @@ impl LocalStore for MemoryStore {
         if unchanged {
             return Ok(record.instance.clone());
         }
+        // D-028 §1.0 rule 4: `launchedBy` records who ran the launch command,
+        // and this is the only moment that can tell. §1.0 rule 2 makes
+        // promotion the sole detection path, so *both* launches promote and
+        // `mode == promoted` no longer implies a human typed it — the Hub's
+        // old inference read every Remuda-launched agent as `user`.
+        //
+        // What separates them is what the instance was *before*. A session
+        // created as `terminal` that becomes `claude` is a human typing into a
+        // shell; a session created as `claude` that becomes `claude` is the
+        // launch Remuda ran. Settled once, on the first promotion, so a later
+        // demote/repromote cycle cannot rewrite the session's origin.
+        if mode == remuda_protocol::InstanceMode::Promoted && record.instance.promoted_at.is_none()
+        {
+            record.instance.launched_by = Some(
+                if record.instance.kind == remuda_protocol::AgentKind::Terminal {
+                    remuda_protocol::LaunchedBy::User
+                } else {
+                    remuda_protocol::LaunchedBy::Remuda
+                },
+            );
+        }
         record.instance.kind = kind;
         record.instance.mode = Some(mode);
         record.instance.promoted_at = promoted_at;

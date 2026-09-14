@@ -418,6 +418,26 @@ impl ShellPtyDriver {
             .and_then(|slot| slot.as_ref().map(|found| found.kind))
     }
 
+    /// Whether the hook path has produced a session binding for this PTY.
+    ///
+    /// Rung 1 of §5.2's ladder, and deliberately the *weaker* reading of it.
+    /// The ladder's ideal is a `UserPromptSubmit` receipt proving the composer
+    /// accepted the previous prompt; what the bus exposes today is the
+    /// `SessionStart` binding, which proves the agent booted far enough to run
+    /// hooks and to name its own session. That is strictly more than the screen
+    /// knows and strictly less than a delivery receipt, so it is used to answer
+    /// "has this TUI finished starting" and not "was the last prompt taken".
+    /// The stronger form arrives with the hook adjudication path in P5.
+    ///
+    /// `false` whenever hooks are off, which drops the caller to rung 2.
+    fn hook_receipt(&self) -> bool {
+        self.hooks
+            .try_lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|session| session.binding()))
+            .is_some()
+    }
+
     /// Screen-derived readiness of the promoted agent, when the poller has one.
     ///
     /// `None` means "no rule matched", which §10 insists never collapses into
@@ -941,20 +961,51 @@ impl Driver for ShellPtyDriver {
         self.spawn_at(&spec.cwd.clone(), Some(&spec)).await
     }
 
-    /// A plain shell always takes bytes. A promoted agent TUI only takes a
-    /// prompt when its screen says it is idle: typing into a running turn or a
-    /// native dialog would be swallowed or would answer the dialog by accident,
-    /// so the D-022 queue holds the prompt until the screen is ready.
+    /// Whether a prompt can be delivered right now (D-028 §5.2's ready ladder).
+    ///
+    /// A plain shell always takes bytes — it reads a line, and a line typed
+    /// early just waits in the tty buffer. An agent TUI does not: a prompt
+    /// arriving while it is still booting is painted over by the splash, and
+    /// one arriving during a dialog answers the dialog. So an agent session is
+    /// **not ready until something says it is**, and the ladder decides which
+    /// something: a hook receipt if the hook path is live, else the emulator's
+    /// mode set plus quiescence, else a screen signature.
+    ///
+    /// The `promoted_kind` check this replaces was the demo defect: a
+    /// Remuda-launched `claude` has no promotion yet at create time, so it took
+    /// the plain-shell branch and the first prompt was typed into the login
+    /// shell — which ran it as a command. `session_kind` knows an agent from
+    /// the launch target, so the gate applies from the first byte.
+    ///
+    /// Never an error that should tear down a PTY: `ControlUnavailable` means
+    /// "hold this in the D-022 queue and ask again", which is exactly what the
+    /// Node's 200 ms delivery tick does.
     async fn wait_control(&self) -> DriverResult<()> {
-        let _ = self.state().await?;
-        if self.promoted_kind().is_none() {
+        let state = self.state().await?;
+        let Some(_) = self.session_kind() else {
             return Ok(());
-        }
-        match self.status.lock().ok().and_then(|slot| *slot) {
-            Some(ScreenStatus::Idle) => Ok(()),
-            // Booting, working, or blocked: not ready, and never a reason to
-            // tear down a healthy PTY.
-            _ => Err(DriverError::ControlUnavailable),
+        };
+        let rung = send::ready_rung(
+            true,
+            self.hook_receipt(),
+            state.modes(),
+            self.screen_status() == Some(ScreenStatus::Idle),
+        );
+        match rung {
+            // Rung 2 observed the composer's mode set but says nothing about
+            // *this* instant, so it is paired with the quiescence wait `send`
+            // also uses; the screen must additionally not be mid-turn.
+            Some(send::ReadyEvidence::Quiescence) => {
+                match self.screen_status() {
+                    // `unknown` here is the booting TUI: no rule has matched
+                    // yet. §10 forbids reading that as idle, and §5.2 says to
+                    // queue rather than hard-send.
+                    Some(ScreenStatus::Idle) => Ok(()),
+                    _ => Err(DriverError::ControlUnavailable),
+                }
+            }
+            Some(_) => Ok(()),
+            None => Err(DriverError::ControlUnavailable),
         }
     }
 
@@ -1587,6 +1638,76 @@ mod tests {
             None,
             "and the poller has indeed not run"
         );
+    }
+
+    /// A driver whose PTY runs an inert process, carrying `kind` as its
+    /// session.
+    ///
+    /// Promoted rather than launched: §1.0 makes the two the same session to
+    /// everything below the spawn, and the promoted shape needs no materializer
+    /// inputs. What is being tested is the gate, which reads `session_kind` —
+    /// satisfied by either.
+    async fn agent_pty(kind: Option<AgentKind>) -> ShellPtyDriver {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let driver = ShellPtyDriver::new(options);
+        driver.spawn().await.expect("spawns");
+        if let Some(kind) = kind {
+            *driver.promoted.lock().unwrap() = Some(crate::promote::Detected {
+                kind,
+                pid: 1,
+                session_id: None,
+                hydrates_transcript: true,
+            });
+        }
+        driver
+    }
+
+    #[tokio::test]
+    async fn a_booting_agent_is_not_ready_for_a_prompt() {
+        // The demo defect: `wait_control` gated on `promoted_kind`, which is
+        // None until the first poll, so a Remuda-launched claude took the
+        // plain-shell branch and the create-time prompt was typed into the
+        // login shell — which ran it as a command. An agent is an agent from
+        // the launch target, and nothing has said it is ready yet.
+        let driver = agent_pty(Some(AgentKind::Claude)).await;
+        assert!(
+            Driver::wait_control(&driver).await.is_err(),
+            "no hook receipt, no emulator, no idle signature: queue it"
+        );
+        let _ = Driver::close(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_whose_screen_says_idle_is_ready() {
+        let driver = agent_pty(Some(AgentKind::Claude)).await;
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
+        assert!(Driver::wait_control(&driver).await.is_ok());
+        let _ = Driver::close(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_mid_turn_holds_the_prompt() {
+        // Typing into a running turn is how a prompt gets swallowed.
+        let driver = agent_pty(Some(AgentKind::Claude)).await;
+        for status in [ScreenStatus::Working, ScreenStatus::Blocked] {
+            *driver.status.lock().unwrap() = Some(status);
+            assert!(
+                Driver::wait_control(&driver).await.is_err(),
+                "{status:?} must not accept a prompt"
+            );
+        }
+        let _ = Driver::close(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn a_plain_shell_is_always_ready() {
+        // A shell reads a line; one typed early just waits in the tty buffer.
+        // Gating it would break every `terminal` instance.
+        let driver = agent_pty(None).await;
+        assert!(Driver::wait_control(&driver).await.is_ok());
+        let _ = Driver::close(&driver).await;
     }
 
     #[tokio::test]

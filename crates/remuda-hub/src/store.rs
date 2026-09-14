@@ -369,20 +369,17 @@ pub struct InstanceRecord {
     pub promoted_at: Option<String>,
     /// `remuda` or `user` — who ran the launch command (D-028 §1.0 rule 4).
     ///
-    /// Derived from `mode` / `promoted_at` for rows written before D-028, so
-    /// it is always populated on read even though no column stores it.
-    /// Provenance only: it never gates a capability.
+    /// Written on the first promotion from what the row was *before* it: a
+    /// `terminal` that becomes an agent is a human typing into a shell,
+    /// anything else is the launch Remuda ran. Settled once, so a later
+    /// demote/repromote cycle cannot rewrite a session's origin.
     ///
-    /// TODO(x-protocol): the derivation is wrong now that P2 has landed and is
-    /// measured wrong on a live Node (native-pty-2 §6). §1.0 rule 2 makes D-025
-    /// promotion the *only* detection path, so a Remuda-launched agent is
-    /// promoted too — and `mode == promoted` therefore no longer means a human
-    /// typed the command. Both paths currently read back as `user` once they
-    /// promote. The Node already stores the right answer explicitly on its own
-    /// `Instance.launched_by` (it knows which one it started), so the fix is to
-    /// persist and read that column here rather than to infer it. Harmless
-    /// until then — the field is provenance only and gates nothing — but it is
-    /// the one entity field P2's parity check cannot currently verify.
+    /// Stored rather than inferred because §1.0 rule 2 makes promotion the only
+    /// detection path — both launches promote, so `mode == promoted` stopped
+    /// meaning "a human typed it" and read every Remuda-launched agent as
+    /// `user` (measured in native-pty-2 §6). Rows written before the column
+    /// existed still fall back to that derivation, which was sound for them.
+    /// Provenance only: it never gates a capability.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -2997,6 +2994,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "instances", "mode", "TEXT")?;
     ensure_column(&conn, "instances", "promoted_at", "TEXT")?;
+    // D-028 §1.0 rule 4. Stored rather than inferred: §1.0 rule 2 makes
+    // promotion the only detection path, so `mode == promoted` stopped meaning
+    // "a human typed it" once Remuda-launched agents began promoting too.
+    ensure_column(&conn, "instances", "launched_by", "TEXT")?;
     // Operator ceiling survives Node hello/heartbeat inventory and Hub restarts.
     ensure_column(&conn, "hosts", "max_instances_override", "INTEGER")?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
@@ -3105,6 +3106,21 @@ fn apply_instance_projection(
                 })
                 .flatten();
             if let Some(promoted_kind) = promoted_kind {
+                // Settle provenance on the *first* promotion, using what the
+                // row was before it: a `terminal` that becomes an agent is a
+                // human typing into a shell, anything else is the launch
+                // Remuda ran. Once written it never changes — a later
+                // demote/repromote cycle must not rewrite where a session came
+                // from. Mirrors the Node's own rule in `set_instance_promotion`
+                // so the two cannot disagree.
+                if name == "agent_promoted" {
+                    conn.execute(
+                        "UPDATE instances
+                         SET launched_by = CASE WHEN kind = 'terminal' THEN 'user' ELSE 'remuda' END
+                         WHERE id = ?1 AND launched_by IS NULL",
+                        params![instance_id],
+                    )?;
+                }
                 conn.execute(
                     "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3, updated_at = ?4
                      WHERE id = ?5",
@@ -4019,6 +4035,75 @@ mod tests {
         assert_eq!(promoted.launched_by.as_deref(), Some("user"));
     }
 
+    /// D-028 §1.0 rule 4, the case the legacy derivation gets wrong.
+    #[tokio::test]
+    async fn a_remuda_launched_agent_stays_remuda_after_it_promotes() {
+        // §1.0 rule 2 makes promotion the only detection path, so a
+        // Remuda-launched agent promotes too and `mode == promoted` stopped
+        // meaning "a human typed it". Measured on a live Node before this fix:
+        // both launch paths read back as `user`. What separates them is what
+        // the row was *before* — `terminal` is a shell someone typed into.
+        let (_dir, store, host) = store_with_host("enroll-launched-by-native").await;
+        for (created_as, expected) in [("claude", "remuda"), ("terminal", "user")] {
+            let instance = store
+                .insert_instance(
+                    host.clone(),
+                    None,
+                    created_as.into(),
+                    "shell-pty".into(),
+                    Some(format!("{created_as}-session")),
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            let id = instance.instance_id.clone();
+            store
+                .append_journal(
+                    host.clone(),
+                    id.clone(),
+                    None,
+                    json!({
+                        "kind": "lifecycle",
+                        "payload": {
+                            "type": "native",
+                            "nativeName": "agent_promoted",
+                            "relatedIds": {"kind": "claude", "mode": "promoted",
+                                           "promotedAt": now_rfc3339()},
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+            let promoted = store.get_instance(id.clone()).await.unwrap().unwrap();
+            assert_eq!(
+                promoted.launched_by.as_deref(),
+                Some(expected),
+                "a session created as {created_as} that promotes to claude"
+            );
+
+            // A demote/repromote cycle must not rewrite where it came from.
+            store
+                .append_journal(
+                    host.clone(),
+                    id.clone(),
+                    None,
+                    json!({
+                        "kind": "lifecycle",
+                        "payload": {
+                            "type": "native",
+                            "nativeName": "agent_promoted",
+                            "relatedIds": {"kind": "claude", "mode": "promoted",
+                                           "promotedAt": now_rfc3339()},
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+            let again = store.get_instance(id).await.unwrap().unwrap();
+            assert_eq!(again.launched_by.as_deref(), Some(expected));
+        }
+    }
+
     /// Backdate a row so time-window behaviour is testable without sleeping.
     async fn backdate_instance(store: &Store, instance_id: &str, minutes: i64) {
         let instance_id = instance_id.to_owned();
@@ -4613,7 +4698,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
     conn.query_row(
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
-                mode, promoted_at
+                mode, promoted_at, launched_by
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -4686,14 +4771,19 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 });
             let mode: Option<String> = row.get(15)?;
             let promoted_at: Option<String> = row.get(16)?;
-            let launched_by = Some(
+            let stored: Option<String> = row.get(17)?;
+            // The stored value wins. The derivation below is only for rows
+            // written before the column existed, where `mode == promoted` was
+            // still a sound proxy because Remuda-launched agents did not yet
+            // promote (§1.0 rule 2 is what changed that).
+            let launched_by = Some(stored.unwrap_or_else(|| {
                 if mode.as_deref() == Some("promoted") || promoted_at.is_some() {
                     "user"
                 } else {
                     "remuda"
                 }
-                .to_string(),
-            );
+                .to_string()
+            }));
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 parent_instance_id: spec

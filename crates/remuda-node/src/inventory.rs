@@ -7,9 +7,13 @@
 //! are advertised for Node use; Hub ignores unknown keys. Auth never carries
 //! secret values.
 
+use remuda_protocol::{
+    AdapterTransport, Capability, CapabilitySet, CapabilitySnapshot, CapabilityState, Digest,
+    DriverDescriptor, DriverKind, Id, Knowledge, U64,
+};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
@@ -207,6 +211,11 @@ pub struct HostSnapshot {
     /// glibc / musl / libSystem.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub libc: Option<String>,
+    /// D-028 §5.1 driver launch inventory, echoed by every hello under
+    /// `capabilities.driverInventory`. Skipped when empty so a Node that
+    /// cannot describe itself is read as "not reported", never as a refusal.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub driver_inventory: Vec<DriverDescriptor>,
 }
 
 impl HostSnapshot {
@@ -300,6 +309,131 @@ fn assemble(parts: &ProbeParts, config: &CollectRequest, env: &ProbeEnv) -> Host
         os: parts.os.clone(),
         kernel: parts.kernel.clone(),
         libc: parts.libc.clone(),
+        driver_inventory: driver_inventory(),
+    }
+}
+
+/// What this Node can actually launch, for the Hub host view (D-028 §5.1).
+///
+/// The demo this exists to prevent: New Session offered `claude` on
+/// `shell-pty`, the Node silently fell back to a login shell because
+/// `REMUDA_PTY_CARRIER` was unset, and the first prompt was typed into zsh —
+/// which ran it as a command. Nothing anywhere reported that native launch was
+/// off, so the UI could not have known. `launchable` is that report, and the
+/// web keys its `shell-pty` default on it.
+///
+/// Only `shell-pty` is described: it is the one driver whose ability to launch
+/// an agent depends on a runtime flag rather than on a binary being present.
+/// An empty inventory means "not reported", and no caller reads it as
+/// "cannot" — [`super::transport::hubnode::hello_capabilities`] sends no
+/// capabilities at all in that case, never `{}`.
+#[must_use]
+pub fn driver_inventory() -> Vec<DriverDescriptor> {
+    let native = remuda_driver::shell_pty::native_carrier_enabled();
+    let Ok(empty_digest) = Digest::try_from(format!("sha256:{:x}", Sha256::digest([]))) else {
+        return Vec::new();
+    };
+    vec![DriverDescriptor {
+        kind: DriverKind::ShellPty,
+        adapter_version: remuda_driver::ADAPTER_VERSION.to_owned(),
+        // The binary is per-launch here — a login shell or whichever agent the
+        // recipe pins — so there is nothing host-wide to name or hash. Left
+        // empty rather than filled with a plausible-looking `$SHELL`, which
+        // would be wrong for every agent launch. The digest is the sha256 of
+        // no bytes, which is what "nothing was hashed" spells in a field the
+        // wire type requires to be a well-formed sha256.
+        binary_path: String::new(),
+        binary_version: String::new(),
+        binary_digest: empty_digest,
+        launchable: native,
+        reason_code: if native {
+            "carrier-native".to_owned()
+        } else {
+            // Names the flag's absence, not a defect: `shell-pty` still
+            // launches a login shell, and D-025 promotion still works inside
+            // it. What is unavailable is Remuda running the agent command.
+            "carrier-not-enabled".to_owned()
+        },
+        capabilities: driver_capability_snapshot(DriverKind::ShellPty),
+    }]
+}
+
+/// Capability snapshot the Node reports for a locally registered driver.
+///
+/// Used both for the host's `driverInventory` descriptor and for the in-process
+/// fake-driver instance records, so the two never drift apart.
+#[must_use]
+pub fn driver_capability_snapshot(driver: DriverKind) -> CapabilitySnapshot {
+    let unknown_capability = Capability {
+        state: CapabilityState::Unknown,
+        provision: remuda_protocol::CapabilityProvision::Unknown,
+        scope: Vec::new(),
+        reason_code: "not-verified".to_owned(),
+        prerequisites: Vec::new(),
+        evidence: Vec::new(),
+    };
+    let unsupported = Capability {
+        state: CapabilityState::Unsupported,
+        provision: remuda_protocol::CapabilityProvision::Unknown,
+        scope: Vec::new(),
+        reason_code: "fake-driver".to_owned(),
+        prerequisites: Vec::new(),
+        evidence: Vec::new(),
+    };
+    let supported = Capability {
+        state: CapabilityState::Supported,
+        provision: remuda_protocol::CapabilityProvision::Native,
+        scope: vec!["local-fixture".to_owned()],
+        reason_code: "fake-driver".to_owned(),
+        prerequisites: Vec::new(),
+        evidence: Vec::new(),
+    };
+    CapabilitySnapshot {
+        adapter_transport: AdapterTransport::NativeRustWire,
+        id: Id::new("obj").expect("constant valid id"),
+        driver_kind: driver,
+        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+        binary_version: "fake".to_owned(),
+        binary_digest: Digest::try_from(format!("sha256:{:064x}", 0)).expect("constant digest"),
+        native_protocol_version: Knowledge::NotApplicable,
+        settings_revision: U64(1),
+        provider_profile_revision: U64(1),
+        capabilities: CapabilitySet {
+            resume: unsupported.clone(),
+            steer: unsupported.clone(),
+            // D-028 §6: unmeasured for the fake driver as for every real
+            // one; `unknown` keeps the fixture honest rather than teaching
+            // tests that a fake can queue or interrupt.
+            queue: unknown_capability.clone(),
+            interrupt: unknown_capability.clone(),
+            model_switch: unsupported.clone(),
+            fork: unsupported.clone(),
+            structured_workflow: unsupported.clone(),
+            artifact: unsupported.clone(),
+            tty_attach: if matches!(
+                driver,
+                DriverKind::GenericPty | DriverKind::ClaudePty | DriverKind::ShellPty
+            ) {
+                supported.clone()
+            } else {
+                unsupported.clone()
+            },
+            hooks: unsupported,
+            interactive_approval: unknown_capability.clone(),
+            question: unknown_capability.clone(),
+            plan_review: unknown_capability.clone(),
+            elicitation: unknown_capability.clone(),
+            live_attach: unknown_capability,
+            completion_native_turn: supported,
+            completion_task: Capability {
+                state: CapabilityState::Unsupported,
+                provision: remuda_protocol::CapabilityProvision::Unknown,
+                scope: Vec::new(),
+                reason_code: "fake-native-turn-only".to_owned(),
+                prerequisites: Vec::new(),
+                evidence: Vec::new(),
+            },
+        },
     }
 }
 

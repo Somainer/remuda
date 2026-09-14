@@ -56,8 +56,12 @@ The final web gates were run after the rebase onto main `9df9099` and the batch 
 | `cargo clippy --locked -p remuda-driver -p remuda-node -p remuda-hub -p remuda-protocol --all-targets -- -D warnings` | **VERIFIED**: passed |
 | `cargo test --locked -p remuda-driver -p remuda-node -p remuda-hub -p remuda-protocol` | **VERIFIED**: 900 passed, zero failed, 11 existing ignored cases |
 | `cargo test --locked -p remuda-testing --test fake_harness` | **VERIFIED**: full rerun passed all 21 cases, including two renderer relaunches |
-| Hub e2e | **PENDING**: final result to be recorded after completion |
+| `pnpm --dir web test:e2e:hub` | **VERIFIED**: final complete run passed 33 cases; 14 configuration-specific cases skipped; zero failures |
+| `pnpm --dir web gen:api` | **VERIFIED**: regenerated output matched the committed API files |
+| `./scripts/ci/secret-scan.sh` and `git diff --check` | **VERIFIED**: passed after fixture cleanup |
 
 Hub e2e uses the isolated fake Node and fake harness on `127.0.0.1:58580` with web port `58589`. The coordinator demo was not used. Screenshots, if retained by the test runner, contain synthetic fixture output; this evidence package contains no real-terminal screenshot.
+
+The first full Hub run passed 32 cases and failed the native fixture before launch because the worktree's absolute socket path exceeded macOS's limit. The fixture now uses macOS's existing volfs alias for its own worktree data directory, checks its device/inode identity, and creates no external directory or symlink. The focused native rerun and then the complete suite passed, including requested `default` in the created spec, both indicator states, two changed PIDs with stable binding, continued hook events, and a completed turn after switching. The coordinator's generic `.hub.spec.ts` matcher was absent on final main, so its requested fallback pattern was added; this task extends two existing specs.
 
 The Rust suite used a short worktree-local temporary directory and two test threads. An earlier cold run exceeded macOS's Unix socket path limit with a longer temporary directory; a process-group exit assertion also passed on focused rerun. The first full fake-harness run timed out in the existing body-plus-CR batching test; both its focused rerun and the full 21-case rerun passed. A delayed reader combining the two writes is the source-supported explanation, not a captured runtime fact. No input parser or production process-lifecycle behavior was changed to bypass these failures.

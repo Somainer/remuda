@@ -1,0 +1,352 @@
+/* QuickFind (exploration §5 P1-1). Only the finder's own surfaces are styled
+   here; the scrim/panel geometry comes from components/overlay.module.css. */
+
+.sheet {
+  width: min(560px, calc(100vw - 24px));
+  padding: 14px 14px 12px;
+  gap: 10px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.close {
+  margin-left: auto;
+  height: 32px;
+  min-width: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-size: 13px;
+}
+
+.close:hover {
+  color: var(--paper);
+}
+
+.input {
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  color: var(--paper);
+  font: 14px var(--font);
+}
+
+.input::placeholder {
+  color: var(--mute);
+}
+
+.cacheNote {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--dust);
+  border-radius: var(--radius);
+  color: var(--dust);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.listHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.scopeNote {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list {
+  /* The Sheet panel already scrolls; this just bounds the list on desktop. */
+  max-height: min(46vh, 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 -4px;
+  padding: 0 4px;
+}
+
+.optionSlot {
+  border-radius: var(--radius);
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  text-align: left;
+  cursor: pointer;
+}
+
+.option[data-selected="true"] {
+  background: var(--ink-1);
+  box-shadow: inset 2px 0 0 var(--dust);
+}
+
+.optionBody {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.optionTitle {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optionMeta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.optionScope {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.optionStatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.optionTime {
+  margin-left: auto;
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.empty {
+  padding: 14px 10px 6px;
+  color: var(--paper);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.empty p {
+  margin: 0 0 6px;
+}
+
+.emptyHint {
+  color: var(--mute);
+  font-size: 12px;
+}
+
+.clear {
+  margin-top: 4px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 13px;
+}
+
+/* Entry point wrapper in the Spaces panel. */
+.panelSearch {
+  display: flex;
+  padding: 0 8px;
+}
+
+.panelSearch[data-collapsed="true"] {
+  justify-content: center;
+  padding: 0;
+}
+
+.trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  margin: 6px 0 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-1);
+  color: var(--mute);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.trigger:hover {
+  color: var(--paper);
+  border-color: var(--cold);
+}
+
+.triggerIcon {
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.triggerText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kbd {
+  flex: none;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font: 11px var(--mono);
+  color: var(--mute);
+  background: var(--ink-2);
+}
+
+.railTrigger {
+  width: 30px;
+  min-height: 30px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.railTrigger:hover {
+  background: var(--ink-2);
+}
+
+/* Delete-session confirmation rendered through the shared Sheet (the panel's
+   old bespoke ActionSheet mask is gone). */
+.confirmSheet {
+  width: min(420px, calc(100vw - 24px));
+}
+
+.confirmTitle {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.confirmDetail {
+  margin: 0;
+  color: var(--mute);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.confirmActions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.confirmButton {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 13px;
+}
+
+.confirmButton:hover:not(:disabled) {
+  border-color: var(--cold);
+}
+
+.confirmDanger {
+  border-color: var(--danger);
+  color: var(--paper);
+}
+
+.confirmButton:disabled {
+  opacity: 0.5;
+}
+
+/* Phones: bottom-sheet geometry and the project's 44px touch targets
+   (exploration §5 P1-3). min-height survives fractional borders under
+   border-box, unlike height. */
+@media (max-width: 767px) {
+  .confirmSheet {
+    width: 100%;
+  }
+
+  .confirmButton {
+    min-height: 44px;
+  }
+
+  .sheet {
+    width: 100%;
+  }
+
+  .close,
+  .clear {
+    min-height: 44px;
+  }
+
+  .input {
+    height: 44px;
+  }
+
+  .option {
+    min-height: 44px;
+    padding: 6px 8px;
+  }
+
+  .trigger {
+    min-height: 44px;
+  }
+
+  .railTrigger {
+    width: 44px;
+    min-height: 44px;
+  }
+
+  .list {
+    max-height: 56vh;
+  }
+
+  .optionTime {
+    display: none;
+  }
+}

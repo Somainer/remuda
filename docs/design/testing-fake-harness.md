@@ -282,3 +282,7 @@ cargo test -p remuda-testing --locked
   `ctrl_c_clear_draft` / `esc_notice` / `turn_end` / `exit` /
   `empty_submit` / `trust_accepted`。这是测试便利通道，不属于三个
   真实 harness 的协议面。
+
+## 11 Hub-live Playwright 命名约定
+
+Hub-backed（fake node）的 Playwright 规格一律命名为 `*.hub.spec.ts`；`web/playwright.hub.config.ts` 的 `testMatch` 会自动收录该后缀，**新增 hub 规格时不要编辑该配置**（旧名仍在显式列表中，仅用于历史兼容）。

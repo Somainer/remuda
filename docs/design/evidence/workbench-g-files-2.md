@@ -13,7 +13,7 @@
 | --- | --- |
 | Node | `crates/remuda-node/src/workspace_scm.rs`（新模块 + 10 个单测）；`server.rs` / `runtime_link.rs` / `stdio.rs` / `transport/hubnode_codec.rs` 仅新增显式派发分支 |
 | Hub | `crates/remuda-hub/src/workspaces.rs`（三个 GET 代理路由）；`openapi/openapi.json`（三条路径）；`tests/changes.rs`（403/409/422/400/401/404 + 无缓存）；`examples/hub_e2e.rs`（合成 SCM 夹具）；`lib.rs` / `transport.rs` 的 `#[doc(hidden)]` 测试辅助 |
-| Web | `web/src/features/files/{FilesView.tsx,filesView.ts,filesView.test.ts,filesApi.ts,files.module.css}`（新目录，未碰 `session.module.css`）；`web/src/types/scm.ts`；`web/src/pages/SessionPage.tsx` 仅 files 分支与手机入口；`web/src/lib/api.generated.ts`（`gen:api` 重新生成）；`web/tests/e2e/ux-files.spec.ts` |
+| Web | `web/src/features/files/{FilesView.tsx,filesView.ts,filesView.test.ts,filesApi.ts,files.module.css}`（新目录，未碰 `session.module.css`）；`web/src/types/scm.ts`；`web/src/pages/SessionPage.tsx` 仅 files 分支与手机入口；`web/src/lib/api.generated.ts`（`gen:api` 重新生成）；`web/tests/e2e/ux-files.hub.spec.ts` |
 | 文档 | `docs/design/protocol.md` 新增 §2.7；本文 |
 
 未触碰：`store.ts`（files 自带只读 `filesApi.ts`）、`Shell.tsx`、`SpacesPanel.tsx`、`Transcript.tsx/assemble.ts`、`styles/ui.module.css`、journal/observation 类型、任何写侧 git 命令。
@@ -61,7 +61,7 @@
 - `cargo clippy -p remuda-node -p remuda-hub --all-targets -- -D warnings`：干净；`cargo fmt` 后 `--check` 干净。
 - `pnpm --dir web run lint` / `tsc --noEmit` / `vitest run`：无 files 相关告警，450 个单测全过。
 - `pnpm --dir web run gen:api` 后 `git diff --exit-code -- web/src/lib/api.generated.ts` 干净。
-- hub-live `ux-files.spec.ts`（8 个用例，含手机）：8 passed，全程 fake node + 合成夹具。
+- hub-live `ux-files.hub.spec.ts`（8 个用例，含手机）：8 passed，全程 fake node + 合成夹具。
 
 ## 局限与未做（契约 §5）
 

@@ -314,6 +314,8 @@ async fn an_agent_process_fetches_its_session_image_as_a_content_block() -> Resu
     assert_eq!(listed["items"][0]["objectId"], json!(object_id));
     assert_eq!(listed["items"][0]["mediaType"], json!("image/png"));
     assert_eq!(listed["items"][0]["size"], json!(168));
+    // A staged-but-not-yet-numbered object still resolves [Image #1].
+    assert_eq!(listed["items"][0]["index"], json!(1));
 
     let fetched = &replies[2]["result"];
     assert_eq!(fetched["isError"], json!(false), "{fetched}");

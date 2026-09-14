@@ -1,31 +1,31 @@
 [
   {
-    "description": "Fetch one attachment staged for this session by objectId. Images come back as an image content block you can see directly; text comes back as text. Other media types are refused with their size and type.",
+    "name": "remuda_attachment",
+    "description": "Fetch one attachment staged for this session by objectId — resolve `[Image #n]` through remuda_attachments_list, which pairs each index with its objectId. Images come back as an image content block you can see directly; text comes back as text. Other media types are refused with their size and type.",
     "inputSchema": {
-      "properties": {
-        "objectId": {
-          "description": "`obj_…` id, as named in the prompt's attachment mention or by remuda_attachments_list.",
-          "type": "string"
-        }
-      },
+      "type": "object",
       "required": [
         "objectId"
       ],
-      "type": "object"
-    },
-    "name": "remuda_attachment"
+      "properties": {
+        "objectId": {
+          "type": "string",
+          "description": "`obj_…` id, as paired with the prompt's `[Image #n]` index by remuda_attachments_list."
+        }
+      }
+    }
   },
   {
-    "description": "List attachments staged for this session (objectId, mediaType, size). Call this to discover what `remuda_attachment` can fetch.",
+    "name": "remuda_attachments_list",
+    "description": "List attachments staged for this session (index, objectId, mediaType, size). `index` is the 1-based number in the prompt's `[Image #n]` token: to answer about `[Image #2]`, call remuda_attachment with the objectId listed at index 2. Call this to discover what `remuda_attachment` can fetch.",
     "inputSchema": {
+      "type": "object",
       "properties": {
         "instanceId": {
-          "description": "Session to list. Omit inside an agent session: it defaults to your own, and naming another session is refused.",
-          "type": "string"
+          "type": "string",
+          "description": "Session to list. Omit inside an agent session: it defaults to your own, and naming another session is refused."
         }
-      },
-      "type": "object"
-    },
-    "name": "remuda_attachments_list"
+      }
+    }
   }
 ]

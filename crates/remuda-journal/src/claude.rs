@@ -17,8 +17,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Maps native message / tool ids to Remuda `obj_` identities across a tail.
-#[derive(Debug, Default, Clone)]
+///
+/// Tool / message / thought ids are a pure function of `(scope, native id)` via
+/// [`Id::derive`], with `scope` = owning instance id. That is what lets the hook
+/// relay and this transcript tailer converge on one node for one tool call
+/// (live-view design §2.3): the hook observes `tool_use_id` at tool start and
+/// the transcript records the same string seconds later, and both draw the
+/// same card. Workflow/member ids stay random: no live channel shares their id
+/// space.
+#[derive(Debug, Clone)]
 pub struct NativeIds {
+    scope: String,
     messages: HashMap<String, (Id, u64)>,
     tools: HashMap<String, Id>,
     thoughts: HashMap<String, Id>,
@@ -27,9 +36,21 @@ pub struct NativeIds {
 }
 
 impl NativeIds {
-    /// Empty identity map.
-    pub fn new() -> Self {
-        Self::default()
+    /// Empty identity map scoped to one instance.
+    pub fn new(scope: impl Into<String>) -> Self {
+        Self {
+            scope: scope.into(),
+            messages: HashMap::new(),
+            tools: HashMap::new(),
+            thoughts: HashMap::new(),
+            workflows: HashMap::new(),
+            members: HashMap::new(),
+        }
+    }
+
+    /// Deterministic id for a native object in this instance's scope.
+    fn derived(&self, native: &str) -> Result<Id, Error> {
+        Ok(Id::derive("obj", &self.scope, native)?)
     }
 
     pub(crate) fn message(&mut self, native: &str) -> Result<(Id, U64, MutationOperation), Error> {
@@ -37,7 +58,7 @@ impl NativeIds {
             *rev += 1;
             return Ok((id.clone(), U64(*rev), MutationOperation::Append));
         }
-        let id = Id::new("obj")?;
+        let id = self.derived(native)?;
         self.messages.insert(native.to_owned(), (id.clone(), 1));
         Ok((id, U64(1), MutationOperation::Open))
     }
@@ -46,7 +67,7 @@ impl NativeIds {
         if let Some(id) = self.tools.get(native) {
             return Ok(id.clone());
         }
-        let id = Id::new("obj")?;
+        let id = self.derived(native)?;
         self.tools.insert(native.to_owned(), id.clone());
         Ok(id)
     }
@@ -55,7 +76,7 @@ impl NativeIds {
         if let Some(id) = self.thoughts.get(native) {
             return Ok(id.clone());
         }
-        let id = Id::new("obj")?;
+        let id = self.derived(native)?;
         self.thoughts.insert(native.to_owned(), id.clone());
         Ok(id)
     }
@@ -90,19 +111,21 @@ pub struct ClaudeJsonlTailer {
 impl ClaudeJsonlTailer {
     /// Tail `path` from offset 0.
     pub fn new(path: impl Into<PathBuf>, ctx: MapContext) -> Result<Self, Error> {
+        let ids = NativeIds::new(ctx.instance_id.as_id().as_str());
         Ok(Self {
             tail: FileTail::new(path)?,
             ctx,
-            ids: NativeIds::new(),
+            ids,
         })
     }
 
     /// Resume a previous tail.
     pub fn resume(path: impl Into<PathBuf>, ctx: MapContext, resume: SourceResume) -> Self {
+        let ids = NativeIds::new(ctx.instance_id.as_id().as_str());
         Self {
             tail: FileTail::from_resume(path, resume),
             ctx,
-            ids: NativeIds::new(),
+            ids,
         }
     }
 

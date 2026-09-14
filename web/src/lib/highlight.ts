@@ -77,7 +77,7 @@ function loadCore(): Promise<CoreHighlighter> {
  */
 export function resolveLanguage(info: string | null | undefined): string | null {
   if (!info) return null;
-  const token = info.trim().split(/\s+/, 1)[0]!.toLowerCase().replace(/^\\./, "");
+  const token = info.trim().split(/\s+/, 1)[0]!.toLowerCase();
   if (!token) return null;
   if (LOADERS[token]) return token;
   return ALIASES[token] ?? null;
@@ -98,7 +98,13 @@ export function languageLabel(info: string | null | undefined): string {
 async function ensureLanguage(hljs: CoreHighlighter, name: string): Promise<void> {
   let loading = registered.get(name);
   if (!loading) {
-    loading = LOADERS[name]!().then((mod) => hljs.registerLanguage(name, mod.default));
+    loading = LOADERS[name]!()
+      .then((mod) => hljs.registerLanguage(name, mod.default))
+      .catch((error) => {
+        // Don't cache the failure: a flaky chunk fetch can succeed on retry.
+        registered.delete(name);
+        throw error;
+      });
     registered.set(name, loading);
   }
   await loading;

@@ -31,6 +31,8 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         driver: DriverKind::ClaudePrint,
         model: "fake".to_owned(),
         args: Vec::new(),
+        binary_path: None,
+        binary_sha256: None,
         provider_profile_id: "dev-fake".to_owned(),
         permission_mode: "dontAsk".to_owned(),
         prompt: prompt.to_owned(),

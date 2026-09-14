@@ -288,3 +288,78 @@ describe("D-028 native PTY default", () => {
     expect(screen.getByTestId("new-session-driver-shell-pty")).toBeDisabled();
   });
 });
+
+describe("特殊参数 and claude 可执行文件", () => {
+  it("splits args on whitespace into an argv array rather than sending a shell string", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    fireEvent.change(screen.getByTestId("new-session-args"), {
+      target: { value: "  --effort   high --ide " },
+    });
+    fireEvent.change(screen.getByTestId("new-session-binary"), {
+      target: { value: " /opt/claude/bin/claude " },
+    });
+    // The chips are the argv the Hub will receive, so a user can see that
+    // runs of whitespace collapse and nothing is shell-parsed.
+    expect(screen.getByTestId("new-session-args-chips")).toHaveTextContent("--effort");
+    expect(screen.getByTestId("new-session-args-chips")).toHaveTextContent("--ide");
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() =>
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          args: ["--effort", "high", "--ide"],
+          binaryPath: "/opt/claude/bin/claude",
+        }),
+      ),
+    );
+  });
+
+  it("omits both fields when they are blank so the host default still applies", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    fireEvent.change(screen.getByTestId("new-session-args"), { target: { value: "   " } });
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const spec = create.mock.calls[0][0] as { args?: string[]; binaryPath?: string };
+    // Sending `[]` would replace the host default with "no args", which is a
+    // different request from "I did not choose".
+    expect(spec.args).toBeUndefined();
+    expect(spec.binaryPath).toBeUndefined();
+  });
+
+  it("remembers args across sessions but never the executable", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    fireEvent.change(screen.getByTestId("new-session-args"), { target: { value: "--effort high" } });
+    fireEvent.change(screen.getByTestId("new-session-binary"), {
+      target: { value: "/opt/claude/bin/claude" },
+    });
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    const stored = localStorage.getItem("runtime.new-session") ?? "";
+    expect(stored).toContain("--effort high");
+    // A silently restored executable is the kind of thing you would not
+    // think to check before starting a run.
+    expect(stored).not.toContain("/opt/claude/bin/claude");
+  });
+
+  it("shows the host default as a placeholder instead of prefilling the field", () => {
+    vi.spyOn(store, "useHub").mockReturnValue({
+      ...store.hubStore.getSnapshot(),
+      hosts: [{ ...host, defaultLaunchArgs: ["--effort", "max"], claudeBinaryPath: "/srv/claude" }],
+      workspaces: [workspace],
+      instances: [],
+    });
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    // Typing over a prefilled default would turn an operator's host-level
+    // choice into a session value, and the Hub merges the two differently.
+    expect(screen.getByTestId("new-session-args")).toHaveValue("");
+    expect(screen.getByTestId("new-session-args")).toHaveAttribute("placeholder", "--effort max");
+    expect(screen.getByTestId("new-session-binary")).toHaveValue("");
+    expect(screen.getByTestId("new-session-binary")).toHaveAttribute("placeholder", "/srv/claude");
+  });
+});

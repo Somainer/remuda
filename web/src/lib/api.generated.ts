@@ -998,6 +998,10 @@ export interface components {
             nextCursor?: string | null;
         };
         HostPatch: {
+            /** @description Per-host default claude executable. Empty string clears the default. */
+            claudeBinaryPath?: string | null;
+            /** @description Per-host default extra CLI args. Null clears the default. */
+            defaultLaunchArgs?: string[] | null;
             labels?: string[];
             maxInstances?: number;
             name?: string;
@@ -1008,7 +1012,11 @@ export interface components {
             capabilities?: {
                 [key: string]: unknown;
             };
+            /** @description Per-host default claude executable. Validated by the Node, not the Hub. */
+            claudeBinaryPath?: string | null;
             cli?: components["schemas"]["HostCli"][];
+            /** @description Per-host default extra CLI args, used when a create omits args. */
+            defaultLaunchArgs?: string[] | null;
             herdr?: {
                 [key: string]: unknown;
             } | null;
@@ -1062,6 +1070,12 @@ export interface components {
             path: string;
         };
         InstanceCreate: {
+            /** @description Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present. */
+            args?: string[];
+            /** @description Host-absolute executable override. The Node validates and pins it; the Hub only stores the string. */
+            binaryPath?: string;
+            /** @description Expected sha256: digest of binaryPath. The launch is refused when the Node's pin disagrees. */
+            binarySha256?: string;
             claudeConfigDir?: string;
             /** @description Working directory on the host. */
             cwd?: string;

@@ -291,6 +291,26 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             ));
         }
     };
+    // A non-string binaryPath is a caller bug, not something to coerce: the
+    // value ends up on an exec, so guessing at it is the wrong instinct.
+    let binary_path = match spec.get("binaryPath") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.trim().to_owned()).filter(|v| !v.is_empty()),
+        Some(_) => {
+            return Err(NodeError::InvalidRequest(
+                "instance.create binaryPath must be a string".into(),
+            ));
+        }
+    };
+    let binary_sha256 = match spec.get("binarySha256") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.trim().to_owned()).filter(|v| !v.is_empty()),
+        Some(_) => {
+            return Err(NodeError::InvalidRequest(
+                "instance.create binarySha256 must be a string".into(),
+            ));
+        }
+    };
     let mut request = CreateInstanceRequest {
         origin: crate::origin::wire_origin(params),
         agent_credential: params
@@ -317,6 +337,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         driver,
         model,
         args,
+        binary_path,
+        binary_sha256,
         provider_profile_id: spec
             .get("providerProfileId")
             .and_then(Value::as_str)
@@ -978,6 +1000,54 @@ mod tests {
         );
         assert_eq!(request.max_budget_usd.as_deref(), Some("0.3"));
         assert_eq!(request.prompt, "你好，你是什么模型");
+    }
+
+    #[tokio::test]
+    async fn create_params_round_trip_binary_path_and_reject_a_non_string() {
+        let node = DevNode::new(
+            &DevServerConfig::loopback(0)
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        )
+        .expect("node");
+        let request = create_from_params(
+            &node,
+            &json!({
+                "instanceId": InstanceId::new(),
+                "spec": {
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "model": "haiku",
+                    "binaryPath": "/opt/claude/bin/claude",
+                    "binarySha256": "sha256:abc123",
+                },
+                "initialInput": { "text": "custom executable" }
+            }),
+        )
+        .expect("create params");
+        assert_eq!(
+            request.binary_path.as_deref(),
+            Some("/opt/claude/bin/claude")
+        );
+        assert_eq!(request.binary_sha256.as_deref(), Some("sha256:abc123"));
+
+        // Absent stays absent, so the Node's own resolution order is untouched
+        // for every request that does not ask for a specific binary.
+        let plain = create_from_params(
+            &node,
+            &json!({
+                "instanceId": InstanceId::new(),
+                "spec": { "kind": "claude", "driver": "claude-print", "model": "haiku" },
+                "initialInput": { "text": "stock" }
+            }),
+        )
+        .expect("create params");
+        assert_eq!(plain.binary_path, None);
+
+        // A non-string is a caller bug. The value ends up on an exec, so
+        // coercing it is the wrong instinct.
+        let error = create_from_params(&node, &json!({ "spec": { "binaryPath": 7 } }))
+            .expect_err("numeric binaryPath must fail closed");
+        assert!(error.to_string().contains("binaryPath must be a string"));
     }
 
     #[tokio::test]

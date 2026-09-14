@@ -86,11 +86,19 @@ pub fn shim_disabled(value: Option<&str>) -> bool {
 /// thing to remove), but nothing is put on `PATH` and the generated `claude`
 /// is a plain pass-through. The agent then resolves exactly what the user
 /// installed and the signal tier degrades to screen.
+///
+/// `real_binary` is the pinned executable from a `spec.binaryPath` override.
+/// When present the claude shim `exec`s exactly that path instead of searching
+/// `PATH`: an operator who named a binary meant that one, and the PATH loop
+/// would silently find whichever `claude` came first instead. It is already
+/// validated and pinned by [`crate::validate_binary_override`], so no check is
+/// repeated here — but it is still single-quoted, because this is `sh`.
 pub fn materialize_shims(
     launch_dir: &Path,
     overlay: &Path,
     credential: &str,
     disabled: bool,
+    real_binary: Option<&Path>,
 ) -> DriverResult<ShimSet> {
     let bin_dir = launch_dir.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
@@ -98,7 +106,7 @@ pub fn materialize_shims(
     let mut commands = Vec::new();
     for command in SHIMMED {
         let body = if *command == "claude" {
-            claude_shim(command, overlay)
+            claude_shim(command, overlay, real_binary)
         } else {
             passthrough_shim(command)
         };
@@ -197,8 +205,45 @@ unset REMUDA_SHIM_ACTIVE_{upper}
     )
 }
 
+/// The re-entry guard, without the PATH search.
+///
+/// A pinned binary is already an absolute path, so there is nothing to look
+/// up — but the guard still matters: the pinned file could itself be (or
+/// become) a wrapper that calls `claude`, and without the guard that is an
+/// exec loop. The 127 branch is kept too, because a pinned path can be deleted
+/// between materialization and the user typing the command.
+fn pinned_resolver(command: &str, real_binary: &Path) -> String {
+    format!(
+        r#"# Guard against re-entry before anything else. The pinned binary may
+# itself invoke {command}; without this that is an exec loop, which would
+# fork-bomb the machine of whoever typed the command.
+if [ -n "${{REMUDA_SHIM_ACTIVE_{upper}:-}}" ]; then
+    unset REMUDA_SHIM_ACTIVE_{upper}
+    exec {command} "$@"
+fi
+REMUDA_SHIM_ACTIVE_{upper}=1
+export REMUDA_SHIM_ACTIVE_{upper}
+
+# Pinned by the launch spec (binaryPath). Not a PATH lookup: the operator named
+# this file, and searching would find whichever {command} came first instead.
+real_path={pinned}
+if [ ! -x "$real_path" ]; then
+    echo "remuda: pinned {command} $real_path is not executable" >&2
+    exit 127
+fi
+unset REMUDA_SHIM_ACTIVE_{upper}
+"#,
+        upper = command.to_ascii_uppercase(),
+        pinned = single_quote(&real_binary.to_string_lossy()),
+    )
+}
+
 /// The claude shim: add the overlay unless the user brought their own.
-fn claude_shim(command: &str, overlay: &Path) -> String {
+fn claude_shim(command: &str, overlay: &Path, real_binary: Option<&Path>) -> String {
+    let resolver = match real_binary {
+        Some(path) => pinned_resolver(command, path),
+        None => resolver(command),
+    };
     format!(
         r#"#!/bin/sh
 # Remuda per-session launch shim (D-028 §4.2). Transparent: it execs the real
@@ -229,7 +274,6 @@ fi
 # Our flags first, the user's after, so theirs take precedence on any clash.
 exec "$real_path" --settings "$overlay" --setting-sources user,project,local "$@"
 "#,
-        resolver = resolver(command),
         overlay = single_quote(&overlay.to_string_lossy()),
     )
 }
@@ -402,8 +446,14 @@ mod tests {
         // before the Node started gets nothing on PATH at all rather than a
         // dormant shim directory.
         let dir = tempfile::tempdir().unwrap();
-        let set =
-            materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", true).unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            true,
+            None,
+        )
+        .unwrap();
         assert!(!set.enabled);
         assert_eq!(set.path_with("/usr/bin:/bin"), "/usr/bin:/bin");
         assert!(
@@ -419,8 +469,14 @@ mod tests {
     #[test]
     fn the_shim_directory_goes_in_front_of_the_inherited_path() {
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         let path = set.path_with("/usr/bin:/bin");
         assert!(
             path.starts_with(&set.bin_dir.to_string_lossy().into_owned()),
@@ -432,8 +488,14 @@ mod tests {
     #[test]
     fn every_shim_is_generated_and_executable_by_its_owner_only() {
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         for command in SHIMMED {
             let path = set.bin_dir.join(command);
             assert!(path.is_file(), "{command} shim missing");
@@ -454,6 +516,7 @@ mod tests {
             &dir.path().join("settings.json"),
             "cred-x",
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -472,8 +535,14 @@ mod tests {
         // A subprocess would add a pid, break signal delivery and change the
         // foreground process group the promotion poller reads.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         let body = std::fs::read_to_string(set.bin_dir.join("claude")).unwrap();
         assert!(body.contains(r#"exec "$real_path""#), "{body}");
         assert!(
@@ -486,8 +555,14 @@ mod tests {
     fn the_shim_removes_itself_from_path_before_resolving() {
         // Otherwise it finds itself and recurses until the process limit.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         let body = std::fs::read_to_string(set.bin_dir.join("claude")).unwrap();
         assert!(
             body.contains(r#""$shim_dir") IFS=:; continue ;;"#),
@@ -505,8 +580,14 @@ mod tests {
         // unable to recognise itself — which is exactly the case where it then
         // resolves to itself and exec-loops.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         for command in SHIMMED {
             let body = std::fs::read_to_string(set.bin_dir.join(command)).unwrap();
             let invokes_dirname = body
@@ -526,8 +607,14 @@ mod tests {
         // The last line of defence: if resolution is ever wrong, one extra
         // pass-through beats a fork bomb on the machine of whoever typed it.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         for command in SHIMMED {
             let body = std::fs::read_to_string(set.bin_dir.join(command)).unwrap();
             let guard = format!("REMUDA_SHIM_ACTIVE_{}", command.to_ascii_uppercase());
@@ -546,8 +633,14 @@ mod tests {
         // shim to position 22 of 35, so the user's own claude won. Ordering is
         // the fix — their file first, our directory back in front after.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         for name in ZSH_RC_FILES {
             let body = std::fs::read_to_string(set.zdotdir.join(name)).unwrap();
             let sourced = body
@@ -571,8 +664,14 @@ mod tests {
         // the first of our files ever ran — the shim was never re-asserted and
         // PATH stayed at position 22.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         for name in ZSH_RC_FILES {
             let body = std::fs::read_to_string(set.zdotdir.join(name)).unwrap();
             if *name == LAST_ZSH_RC {
@@ -591,8 +690,14 @@ mod tests {
         // So the interactive shell the human ends up in is indistinguishable
         // from the one they would have had.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         let body = std::fs::read_to_string(set.zdotdir.join(LAST_ZSH_RC)).unwrap();
         let reassert = body
             .find(r#"PATH="$__remuda_bin:$__remuda_path""#)
@@ -609,8 +714,14 @@ mod tests {
         // Anything the user's rc sources must see their configuration, not
         // ours, and a nested shell must behave normally.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         let body = std::fs::read_to_string(set.zdotdir.join(".zshrc")).unwrap();
         let saved = body
             .find("__remuda_our_zdotdir=$ZDOTDIR")
@@ -629,8 +740,14 @@ mod tests {
         // A user who sources ~/.zshrc by hand, or a nested login shell, must
         // not accumulate copies of the shim directory.
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         let body = std::fs::read_to_string(set.zdotdir.join(".zshrc")).unwrap();
         assert!(
             body.contains(r#"while [ "$__remuda_path" !="#),
@@ -648,8 +765,14 @@ mod tests {
     fn the_shadow_zdotdir_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let set = materialize_shims(dir.path(), &dir.path().join("settings.json"), "cred", false)
-            .unwrap();
+        let set = materialize_shims(
+            dir.path(),
+            &dir.path().join("settings.json"),
+            "cred",
+            false,
+            None,
+        )
+        .unwrap();
         let mode = std::fs::metadata(&set.zdotdir)
             .unwrap()
             .permissions()
@@ -666,6 +789,7 @@ mod tests {
             Path::new("/tmp/it's/settings.json"),
             "cred",
             false,
+            None,
         )
         .unwrap();
         let body = std::fs::read_to_string(set.bin_dir.join("claude")).unwrap();

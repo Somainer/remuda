@@ -90,6 +90,16 @@ pub struct LaunchAudit {
     pub settings_digest: Option<Digest>,
     /// Always true when a recipe exists: banned flags were checked.
     pub prohibited_options_checked: BoolLiteral<true>,
+    /// Whether `spec.binaryPath` replaced the driver's default executable.
+    ///
+    /// The pin itself is already on [`LaunchRecipe::binary`]; this records that
+    /// the choice was the caller's, so an audit can tell a stock launch from
+    /// one that ran an operator-nominated binary without diffing paths.
+    ///
+    /// `#[serde(default)]` keeps recipes persisted before this field existed
+    /// readable — an old record predates the feature, so `false` is correct.
+    #[serde(default)]
+    pub binary_override: bool,
     /// Who will answer permission prompts for this launch.
     pub approval_authority: ApprovalAuthority,
 }

@@ -102,6 +102,12 @@ export function NewSessionPage() {
   const [settingsOverlayPath, setSettingsOverlayPath] = useState("");
   const [claudeConfigDir, setClaudeConfigDir] = useState("");
   const [maxBudgetUsd, setMaxBudgetUsd] = useState("");
+  // Args are kept as the raw string the user typed and split on submit, so
+  // the field stays editable mid-word. `launchArgTokens` is what actually
+  // goes on the wire, and is shown as chips so the argv-not-shell rule is
+  // visible rather than something you have to know.
+  const [launchArgs, setLaunchArgs] = useState(prefs.launchArgs ?? "");
+  const [binaryPath, setBinaryPath] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -148,6 +154,15 @@ export function NewSessionPage() {
   }, [pickerHosts, hostId, prefs.hostId]);
 
   const host = hub.hosts.find((h) => h.id === hostId);
+  const launchArgTokens = launchArgs.split(/\s+/).filter(Boolean);
+  // The host default is shown as a placeholder rather than written into the
+  // field: typing over it would make a session value out of something the
+  // operator set once, and the two are merged differently by the Hub.
+  const hostArgsDefault = host?.defaultLaunchArgs?.join(" ") ?? "";
+  const hostBinaryDefault =
+    host?.claudeBinaryPath ??
+    host?.cli?.find((entry) => entry.kind === "claude")?.path ??
+    "";
   const offline = host?.state !== "online" && host?.state !== "enrolled";
   const hostWorkspaces = hub.workspaces.filter((w) => w.hostId === hostId);
   const workspace = hostWorkspaces.find((w) => w.id === workspaceId) ?? hostWorkspaces[0];
@@ -253,6 +268,8 @@ export function NewSessionPage() {
               settingsOverlayPath: settingsOverlayPath || undefined,
               claudeConfigDir: claudeConfigDir || undefined,
               maxBudgetUsd: maxBudgetUsd || undefined,
+              args: launchArgTokens.length ? launchArgTokens : undefined,
+              binaryPath: binaryPath.trim() || undefined,
               name: name || worktree || (plainTerminal ? "terminal" : undefined),
               effortIndex: sessionEffort.index,
               effortName: effortWireName(sessionEffort),
@@ -266,6 +283,10 @@ export function NewSessionPage() {
               delegation,
               effortIndex: sessionEffort.index,
               effortName: effortWireName(sessionEffort),
+              // Args are remembered; the executable deliberately is not. A
+              // path silently restored into a later session is the kind of
+              // thing you would not think to check before starting a run.
+              launchArgs,
             });
             navigate(`/s/${instance.id}`);
           })()
@@ -658,6 +679,48 @@ export function NewSessionPage() {
                     <input className={css.select} data-testid="new-session-budget" value={maxBudgetUsd} onChange={(e) => setMaxBudgetUsd(e.target.value)} />
                   </div>
                 </label>
+                <label className={css.field}>
+                  <span className={css.label}>特殊参数</span>
+                  <div className={css.selectWrap}>
+                    <input
+                      className={css.select}
+                      data-testid="new-session-args"
+                      placeholder={hostArgsDefault || "--effort high --add-dir /srv"}
+                      value={launchArgs}
+                      onChange={(e) => setLaunchArgs(e.target.value)}
+                    />
+                  </div>
+                </label>
+                {launchArgTokens.length ? (
+                  <p className={css.hint} data-testid="new-session-args-chips">
+                    {launchArgTokens.map((token, index) => (
+                      <code key={`${token}-${index}`} className={css.m3}>
+                        {token}
+                      </code>
+                    ))}
+                  </p>
+                ) : null}
+                <p className={css.hint}>
+                  按空格切成 argv 数组，不是 shell 字符串——引号和 <code>|</code> 不会被解析。只接受白名单
+                  flag，与模板重复或重复出现都会被拒。留空则用主机默认
+                  {hostArgsDefault ? `（${hostArgsDefault}）` : "（无）"}。
+                </p>
+                <label className={css.field}>
+                  <span className={css.label}>claude 可执行文件</span>
+                  <div className={css.selectWrap}>
+                    <input
+                      className={css.select}
+                      data-testid="new-session-binary"
+                      placeholder={hostBinaryDefault || "/opt/claude/bin/claude"}
+                      value={binaryPath}
+                      onChange={(e) => setBinaryPath(e.target.value)}
+                    />
+                  </div>
+                </label>
+                <p className={css.hint}>
+                  host 上的绝对路径。Node 校验并 pin（必须可执行、不能落在实例目录或工作区内、不能 group/other
+                  可写），不通过就直接失败，不会悄悄回落到 PATH 上的 claude。
+                </p>
                 <label className={css.field}>
                   <span className={css.label}>name</span>
                   <div className={css.selectWrap}>

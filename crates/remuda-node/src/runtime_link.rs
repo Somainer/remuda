@@ -228,6 +228,26 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
                 })
         })
         .map(str::to_string);
+    // A non-string binaryPath is a caller bug, not something to coerce: the
+    // value ends up on an exec, so guessing at it is the wrong instinct.
+    let binary_path = match spec.get("binaryPath") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.trim().to_owned()).filter(|v| !v.is_empty()),
+        Some(_) => {
+            return Err(NodeError::InvalidRequest(
+                "instance.create binaryPath must be a string".into(),
+            ));
+        }
+    };
+    let binary_sha256 = match spec.get("binarySha256") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.trim().to_owned()).filter(|v| !v.is_empty()),
+        Some(_) => {
+            return Err(NodeError::InvalidRequest(
+                "instance.create binarySha256 must be a string".into(),
+            ));
+        }
+    };
     let mut request = CreateInstanceRequest {
         origin: crate::origin::wire_origin(params),
         agent_credential: params
@@ -253,6 +273,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .unwrap_or("fake")
             .to_owned(),
         args,
+        binary_path,
+        binary_sha256,
         provider_profile_id: spec
             .get("providerProfileId")
             .and_then(Value::as_str)

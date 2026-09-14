@@ -274,6 +274,21 @@ pub struct InstanceSpec {
     pub driver: DriverKind,
     /// `binary_ref`; protocol §4.1.
     pub binary_ref: Id,
+    /// Host-absolute executable override, Node-validated; §4.1.
+    ///
+    /// Absent means the Node resolves the driver's default command the way it
+    /// always has (host default, then `REMUDA_CLAUDE_BIN`, then `PATH`). The
+    /// Hub stores the string but cannot stat the Node's filesystem, so every
+    /// containment, ownership, and mode check happens on the Node and a path
+    /// that fails them fails the launch — there is no fallback to `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Expected digest of [`Self::binary_path`], for pin-on-record; §4.1.
+    ///
+    /// When present the Node's own pin must equal it or the launch is refused,
+    /// so a caller that recorded a binary can detect it changing underneath.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<Digest>,
     /// `cwd`; protocol §4.1.
     pub cwd: String,
     /// `worktree`; protocol §4.1.

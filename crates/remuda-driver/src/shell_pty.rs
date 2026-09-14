@@ -1581,6 +1581,9 @@ fn shell_recipe(options: &ShellPtyOptions, cwd: &str) -> DriverResult<LaunchReci
             redacted_argv: argv_redacted(&options.args, &options.shell),
             settings_digest: None,
             prohibited_options_checked: BoolLiteral,
+            // Login shell, not an agent CLI: `spec.binaryPath` is not read on
+            // this path, so the executable is never a caller's choice.
+            binary_override: false,
             approval_authority: ApprovalAuthority::NativeTty,
         },
     })

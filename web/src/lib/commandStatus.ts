@@ -4,7 +4,7 @@ import type { Connectivity, Host, Lifecycle } from "../types/instance";
 import type { Interaction } from "../types/interaction";
 import type { CapabilitySnapshot } from "../types/nativeRef";
 import { provisionOf } from "./capabilities";
-import { projectInteraction } from "./interactionStatus";
+import { nativeCleared as nativeClearedFact, projectInteraction } from "./interactionStatus";
 
 /**
  * P0-3 display vocabulary: a pure projection of facts the backend already
@@ -231,9 +231,7 @@ export function projectCommandStatus(facts: CommandStatusFacts): CommandStatusRo
       connectivity: facts.instance?.connectivity,
       deviceId: pending.deviceId,
     });
-    const cleared =
-      pending.interaction.resolution.state === "known" &&
-      pending.interaction.resolution.value.reason === "native-cleared";
+    const cleared = nativeClearedFact(pending.interaction);
     if (ui === "pending" && pending.interaction.answerable) return ROW_NEEDS_ANSWER;
     if (!cleared && (ui === "settled" || ui === "superseded" || ui === "answering")) {
       // An answer whose own delivery is unknown is not a submitted answer.
@@ -309,18 +307,8 @@ export function projectDeletion(result: { nodePurge?: string | null } | null | u
 }
 
 /**
- * Whether a human may still submit an answer for this interaction.
- *
- * Guards the double-submit case P0-3 calls out: an answer is committed but the
- * native side has not cleared the request, so the UI still has a form on
- * screen. The old request must not be submittable again — not while the
- * commit is in flight, not after another device answered, and not when the
- * state is simply unknown.
+ * Re-exported so a component rendering the "需要你回答" / "回答已提交" rows can
+ * get the row and its submittability from one import. Defined next to
+ * `projectInteraction`, whose rules it depends on.
  */
-export function canSubmitAnswer(
-  interaction: Interaction,
-  opts: { answering?: boolean; host?: Host; connectivity?: string; deviceId?: string } = {},
-): boolean {
-  if (!interaction.answerable) return false;
-  return projectInteraction(interaction, opts) === "pending";
-}
+export { canSubmitAnswer, answerPendingNative, nativeCleared } from "./interactionStatus";

@@ -284,13 +284,12 @@ export function useLiveAnnouncement(info: Notification[], delay = INFO_DEBOUNCE_
   const [announced, setAnnounced] = useState("");
 
   useEffect(() => {
-    if (!latest) {
-      setAnnounced("");
-      return;
-    }
+    if (!latest) return;
     const timer = setTimeout(() => setAnnounced(latest), delay);
     return () => clearTimeout(timer);
   }, [latest, delay]);
 
-  return announced;
+  // Derived, not stored: with nothing to announce the region empties during
+  // render rather than through a second render pass.
+  return latest ? announced : "";
 }

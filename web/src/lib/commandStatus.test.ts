@@ -4,6 +4,7 @@ import type { Connectivity, Host, Lifecycle } from "../types/instance";
 import type { Interaction } from "../types/interaction";
 import type { Capability, CapabilityProvision, CapabilitySnapshot } from "../types/nativeRef";
 import { known, unknownKnowledge, type Id } from "../types/wire";
+import { printCapabilities } from "./capabilities";
 import {
   acceptedLabel,
   canSubmitAnswer,
@@ -85,19 +86,18 @@ function answeredBy(deviceId: string): Interaction["answer"] {
 }
 
 function capabilities(state: Capability["state"], provision: CapabilityProvision): CapabilitySnapshot {
-  return {
-    id: "obj" as Id,
-    driverKind: "claude-print",
-    adapterVersion: "0.1.0",
-    binaryVersion: "0",
-    binaryDigest: "sha256:00",
-    nativeProtocolVersion: unknownKnowledge("not-negotiated"),
-    settingsRevision: "1",
-    providerProfileRevision: "1",
-    capabilities: {
-      "completion-native-turn": { state, provision, scope: [], reasonCode: "test", prerequisites: [], evidence: [] },
-    } as CapabilitySnapshot["capabilities"],
+  // Start from the real snapshot so every CapabilityName is present, then
+  // override only the one this projection reads.
+  const snapshot = printCapabilities();
+  snapshot.capabilities["completion-native-turn"] = {
+    state,
+    provision,
+    scope: [],
+    reasonCode: "test",
+    prerequisites: [],
+    evidence: [],
   };
+  return snapshot;
 }
 
 describe("projectCommandStatus — the eight P0-3 rows", () => {

@@ -43,6 +43,8 @@ fn create_req(kind: AgentKind, driver: DriverKind) -> CreateInstanceRequest {
         delegation: None,
         settings_overlay_path: None,
         claude_config_dir: None,
+        binary_path: None,
+        binary_sha256: None,
         max_budget_usd: None,
         provider_overlay: None,
         provider_auth_token: None,

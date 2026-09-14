@@ -63,7 +63,9 @@ describe("coerceObservation", () => {
     };
     const observation = coerceObservation({ kind: "message", payload, eventId: "evt_typed", seq: "3" }, "obj_j", "ins_1");
     expect(observation!.payload).toEqual(payload);
-    expect(assembleTranscript([observation!])).toMatchObject([{ id: "msg_stream", text: "", status: "streaming" }]);
+    // The node id is the stable mutation-chain identity (protocol §5.2), not
+    // the native message id, which a producer can rename on regroup/close.
+    expect(assembleTranscript([observation!])).toMatchObject([{ id: "node_stream", text: "", status: "streaming" }]);
   });
 
   it("opens unknown operations and recovers missing identities without aliasing unrelated messages", () => {

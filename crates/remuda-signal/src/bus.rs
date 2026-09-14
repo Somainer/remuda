@@ -226,6 +226,20 @@ impl SignalBus {
         // agent's own dialog stays the single place a decision is made, so
         // there is never a moment where Remuda thinks it answered and the
         // agent thinks it did not.
+        //
+        // TODO(x-p5) D-028 P6: codex's `PermissionRequest` and grok's
+        // `PreToolUse{deny,ask}` are *blocking* hook events. The P6 adapters
+        // journal them (so the waiting interaction is visible) but the verdict
+        // transport belongs to P5's `InteractionRuntime`:
+        //   1. on a blocking event, insert a pending `InteractionRequested`
+        //      (carrier `ClaudeHook`/new `HarnessHook`) and await the broker;
+        //   2. return `{"behavior":"allow"|"deny"}` (claude) or the codex
+        //      `{"hookSpecificOutput":{"hookEventName":"PermissionRequest",
+        //      "decision":{"behavior":…},"message":…}}` wrapper;
+        //   3. on broker timeout, reply deny (§4.4: timeout is always deny).
+        // Until that lands, `{}` keeps the harness's own screen dialog as the
+        // authority — the measured grok path and the confined-session fallback
+        // both require exactly that.
         HookReply::empty()
     }
 

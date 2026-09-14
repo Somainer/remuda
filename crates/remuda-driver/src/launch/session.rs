@@ -17,7 +17,7 @@
 
 use crate::error::DriverResult;
 use crate::launch::overlay::{HookOverlay, OverlayOptions, TuiMode, materialize_overlay};
-use crate::launch::shim::{ShimSet, materialize_shims};
+use crate::launch::shim::ShimSet;
 use remuda_signal::{HookServer, SessionBinding, SignalBus};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,10 @@ pub struct HookSessionOptions {
     pub tui: TuiMode,
     /// An existing settings overlay to merge into.
     pub base_settings: Option<serde_json::Value>,
+    /// Agent this session runs. `Codex` / `Grok` additionally get a shadow
+    /// native home with their own hook files (D-028 P6). `Claude` uses the
+    /// `--settings` overlay; other kinds get neither.
+    pub kind: remuda_protocol::AgentKind,
 }
 
 /// A live hook path for one instance.
@@ -52,6 +56,8 @@ pub struct HookSession {
     pub shims: ShimSet,
     /// `<instance dir>/hook.sock`.
     pub socket_path: PathBuf,
+    /// Shadow `CODEX_HOME` / `GROK_HOME`, when the agent kind has one (P6).
+    pub shadow: Option<crate::launch::ShadowHome>,
     /// The bus serving this socket, so the driver can read what it learned.
     bus: Arc<SignalBus>,
 }
@@ -88,7 +94,38 @@ impl HookSession {
             tui: options.tui,
             base: options.base_settings.clone(),
         })?;
-        let mut shims = materialize_shims(
+        // P6: codex/grok hooks live in a per-session shadow home rather than a
+        // `--settings` merge. Materialized before the shims so their
+        // pass-through wrappers can export the shadow `CODEX_HOME` /
+        // `GROK_HOME` to a hand-typed command in a promoted terminal.
+        let shadow = match options.kind {
+            remuda_protocol::AgentKind::Codex | remuda_protocol::AgentKind::Grok => {
+                Some(crate::launch::shadow::materialize(
+                    options.kind,
+                    &crate::launch::ShadowOptions {
+                        launch_dir: &launch_dir,
+                        relay_binary: &options.relay_binary,
+                        socket_path: &socket_path,
+                    },
+                )?)
+            }
+            _ => None,
+        };
+        let shim_exports: Vec<(&str, &str, &str)> = shadow
+            .as_ref()
+            .map(|home| {
+                let target = match options.kind {
+                    remuda_protocol::AgentKind::Codex => "codex",
+                    remuda_protocol::AgentKind::Grok => "grok",
+                    _ => unreachable!("shadow exists only for codex/grok"),
+                };
+                home.env
+                    .iter()
+                    .map(|(key, value)| (target, key.as_str(), value.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut shims = crate::launch::shim::materialize_shims_with_env(
             &launch_dir,
             &overlay.path,
             &credential,
@@ -96,6 +133,7 @@ impl HookSession {
             // No per-session override is supplied on the shell path yet.
             // Native agent launches use the materializer's pinned executable.
             None,
+            &shim_exports,
         )?;
         shims.env.insert(
             "REMUDA_HOOK_RELAY".into(),
@@ -106,6 +144,7 @@ impl HookSession {
             overlay,
             shims,
             socket_path,
+            shadow,
             bus,
         })
     }
@@ -163,6 +202,15 @@ impl HookSession {
         if let Some(value) = user_zdotdir.map(str::trim).filter(|v| !v.is_empty()) {
             env.insert("REMUDA_USER_ZDOTDIR".into(), value.to_owned());
         }
+        // P6: point codex/grok at the shadow home and, for grok, switch off its
+        // cross-read of the user's `~/.claude` hooks. Applied after the shim
+        // env so it also overrides the recipe's store-home `CODEX_HOME` when
+        // the driver layers recipe env earlier in `build_command`.
+        if let Some(shadow) = &self.shadow {
+            for (key, value) in &shadow.env {
+                env.insert(key.clone(), value.clone());
+            }
+        }
         env
     }
 
@@ -195,7 +243,7 @@ fn mint_credential() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remuda_protocol::{HostId, Id, InstanceId, RunId};
+    use remuda_protocol::{AgentKind, HostId, Id, InstanceId, RunId};
     use remuda_signal::{BusContext, HookEnvelope};
     use tokio::sync::mpsc;
 
@@ -205,6 +253,7 @@ mod tests {
             relay_binary: PathBuf::from("/opt/remuda/bin/remuda"),
             tui: TuiMode::Fullscreen,
             base_settings: None,
+            kind: AgentKind::Claude,
         }
     }
 

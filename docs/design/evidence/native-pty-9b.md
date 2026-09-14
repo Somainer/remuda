@@ -65,3 +65,21 @@ Hub e2e uses the isolated fake Node and fake harness on `127.0.0.1:58580` with w
 The first full Hub run passed 32 cases and failed the native fixture before launch because the worktree's absolute socket path exceeded macOS's limit. The fixture now uses macOS's existing volfs alias for its own worktree data directory, checks its device/inode identity, and creates no external directory or symlink. The focused native rerun and then the complete suite passed, including requested `default` in the created spec, both indicator states, two changed PIDs with stable binding, continued hook events, and a completed turn after switching. The coordinator's generic `.hub.spec.ts` matcher was absent on final main, so its requested fallback pattern was added; this task extends two existing specs.
 
 The Rust suite used a short worktree-local temporary directory and two test threads. An earlier cold run exceeded macOS's Unix socket path limit with a longer temporary directory; a process-group exit assertion also passed on focused rerun. The first full fake-harness run timed out in the existing body-plus-CR batching test; both its focused rerun and the full 21-case rerun passed. A delayed reader combining the two writes is the source-supported explanation, not a captured runtime fact. No input parser or production process-lifecycle behavior was changed to bypass these failures.
+
+## Coordinator merge follow-up: grouped settings
+
+Merged main `3542b24` after the coordinator reported conflicts. The incoming appearance, notifications and connection groups, anchors, save feedback and rollback behavior remain intact. That main did not yet contain a host-defaults group, so an anchored group was added with one renderer field per host, using the existing `useGroupDraft` and `SaveBar`. The obsolete standalone immediate-save control was removed. A rejected PATCH restores the latest confirmed value; a failed follow-up refresh cannot relabel a confirmed save or erase another group's draft.
+
+The Playwright configuration keeps the union of existing patterns plus `.hub.spec.ts`. The native test is now `promoted-claude.hub.spec.ts`; `settings-tui.hub.spec.ts` verifies explicit saving, server persistence and rejection rollback against the fake Hub, then restores the prior nullable default. The settings layout tests also cover the new anchor at each viewport and theme.
+
+| Post-merge gate | Result |
+|---|---|
+| `pnpm --dir web typecheck`, `lint`, `build` | **VERIFIED**: all passed; `typecheck` names the existing `tsc -b` command |
+| `pnpm --dir web test --maxWorkers=4` | **VERIFIED**: 86 files, 702 tests passed |
+| Settings Chromium layout/interaction spec | **VERIFIED**: 14 passed, one opt-in evidence capture skipped |
+| Renderer and host-defaults Hub specs | **VERIFIED**: both passed |
+| Full `pnpm --dir web test:e2e:hub` | **VERIFIED**: 37 passed, 14 configuration-specific skips, zero failures |
+| `cargo test --locked -p remuda-driver -p remuda-node -p remuda-hub` | **VERIFIED**: 874 passed, 11 existing ignored cases, zero failures |
+| `gen:api`, secret scan and whitespace check | **VERIFIED**: generated API unchanged; scans passed after fixture cleanup |
+
+Hub runs again used only the fake Node/fake harness on ports 58580/58589, with fresh native fixture executables. No additional real-Claude probe was needed for this settings integration.

@@ -92,6 +92,33 @@ pub fn binds_instance(agent_pid: i32, foreground_pid: Option<i32>) -> bool {
     }
 }
 
+/// The activity a file-channel turn lifecycle proves (D-028 P6).
+///
+/// Codex and grok turn boundaries arrive as `File` observations from the
+/// per-harness adapters (`task_started` / `task_complete` / `turn_aborted` and
+/// `turn_started` / `turn_ended`), not as hooks. These rank the same as a hook
+/// turn boundary in §4.3 (`Hook > File > OSC > Screen`): the file is the
+/// harness's own durable record, so it outranks the screen-derived
+/// `agent_status`.
+#[must_use]
+pub fn file_activity(observation: &Observation) -> Option<remuda_protocol::Activity> {
+    use remuda_protocol::Activity;
+    if observation.source.channel != SourceChannel::File {
+        return None;
+    }
+    let native = hook_lifecycle(observation)?;
+    if native.topic != remuda_protocol::LifecycleTopic::Turn {
+        return None;
+    }
+    match native.native_name.as_str() {
+        "task_started" | "turn_started" => Some(Activity::Working),
+        // An aborted turn still frees the composer; aborts here are user
+        // interrupts, not instance failures.
+        "task_complete" | "turn_aborted" | "turn_ended" => Some(Activity::Idle),
+        _ => None,
+    }
+}
+
 /// The activity a hook observation proves, if it proves one.
 ///
 /// This is the §4.3 priority made real: without it the hook events are

@@ -489,7 +489,7 @@ export function NewSessionPage() {
           <h1 className={css.headTitle} id="new-session-title">
             新建会话
           </h1>
-          <button type="button" className={css.close} onClick={close} aria-label="关闭并保留草稿">
+          <button type="button" className={css.close} onClick={close} aria-label="关闭" title="关闭（草稿保留，可恢复）">
             ✕
           </button>
         </header>

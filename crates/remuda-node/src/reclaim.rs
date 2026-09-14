@@ -343,10 +343,12 @@ impl DevNode {
             self.inner
                 .store
                 .set_instance_failure(&id, NODE_EPOCH_CHANGED)?;
-            self.mark_exited(&id, NODE_EPOCH_CHANGED)?;
             // The diagnostic is what the web reads: the lifecycle event says
             // the session ended, and this says *why* in a form that can be
-            // turned into a sentence and a Resume button.
+            // turned into a sentence and a Resume button. Journaled *before*
+            // the row is settled, so a reader that sees `exited` always finds
+            // the explanation already there — settling first leaves a window
+            // where a session has ended and nothing can say why.
             if let Err(error) = self.inner.store.append_observation(
                 &id,
                 None,
@@ -355,6 +357,7 @@ impl DevNode {
             ) {
                 tracing::warn!(%error, "node-epoch-changed diagnostic not journaled");
             }
+            self.mark_exited(&id, NODE_EPOCH_CHANGED)?;
         }
         Ok(())
     }
@@ -375,6 +378,14 @@ impl DevNode {
         let workers = std::mem::take(&mut *self.inner.workers.lock().await);
         for worker in workers.values() {
             worker.abort();
+        }
+        // Awaited, not just aborted. `abort()` schedules cancellation; a worker
+        // already inside a close runs to the end of that call and settles the
+        // row as `exited`. That is the correct behaviour for a real close and
+        // exactly wrong here, where the whole point is to leave the row saying
+        // `ready` so reconciliation has the casualty to find.
+        for (_, worker) in workers {
+            let _ = worker.await;
         }
         // Before the drivers, not after: closing a driver makes it emit its
         // §5.5 exit, and a pump still running would journal that — into a store

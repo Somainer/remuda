@@ -1529,6 +1529,17 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
     {
         tracing::warn!(%error, "native exit failure reason not recorded");
     }
+    // Journal first, settle second. A reader that sees `exited` will then
+    // always find the event explaining it: the other order leaves a window in
+    // which an instance has stopped and the journal cannot say why, and a UI
+    // polling for the transition lands in that window under load. Ordering it
+    // this way makes the entity state the *last* thing to change, so it is
+    // safe to treat as the signal that everything else is already written.
+    if let Err(error) =
+        append_instance_lifecycle(store, instance_id, Some("ready"), &exit.state, &exit.reason)
+    {
+        tracing::error!(%error, "native exit lifecycle not appended");
+    }
     if let Err(error) = store.set_instance_state(
         instance_id,
         Some(InstanceLifecycle::Exited),
@@ -1537,12 +1548,6 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
         }),
     ) {
         tracing::error!(%error, "instance not marked exited after its process ended");
-        return;
-    }
-    if let Err(error) =
-        append_instance_lifecycle(store, instance_id, Some("ready"), &exit.state, &exit.reason)
-    {
-        tracing::error!(%error, "native exit lifecycle not appended");
     }
 }
 

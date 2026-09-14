@@ -10,7 +10,7 @@ import type {
   WorkflowMemberPayload,
   WorkflowPhasePayload,
   WorkflowRunPayload,
-} from "../types/generated";
+} from "../../types/generated";
 import type { DiffState } from "./assemble";
 import css from "./session.module.css";
 

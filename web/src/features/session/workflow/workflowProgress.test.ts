@@ -24,7 +24,7 @@ const unknown = { state: "unknown" as const, reason: "not-emitted", evidenceEven
 const u = (n: number | string) => String(n);
 
 function agent(partial: Partial<WfAgent> & { id: string }): WfAgent {
-  return { state: "queued" as WfState, ...partial };
+  return { label: partial.id, state: "queued" as WfState, ...partial };
 }
 
 function member(partial: Partial<WorkflowMemberPayload> & { memberId: string; phaseId?: string | null }): WorkflowMemberPayload {
@@ -249,7 +249,7 @@ describe("20-agent phase fold", () => {
     expect(p1.canFold).toBe(true);
     expect(p1.folded).toHaveLength(20 - FOLD_THRESHOLD);
     const laid = layoutRows(
-      members.map((m, i) => agent({ id: `m${String(i).padStart(2, "0")}`, state: "done" })),
+      members.map((_m, i) => agent({ id: `m${String(i).padStart(2, "0")}`, state: "done" })),
     );
     expect(laid.folded).toHaveLength(20 - FOLD_THRESHOLD);
   });

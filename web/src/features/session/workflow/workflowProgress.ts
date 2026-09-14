@@ -351,7 +351,7 @@ export function projectWorkflow({ run, phases, members, phaseOrder }: ProjectInp
   // An observation stream with neither phases nor members is equally flat.
   if (run.note || (phases.length === 0 && members.length === 0)) {
     return degradedCard(
-      knowledgeValue(run.name) ?? knowledgeValue(run.title) ?? "workflow",
+      kv(run.name) ?? kv(run.title) ?? "workflow",
       runStatus(run.state),
       run.note ?? "daemon 版本较旧，暂无阶段明细",
       Number(u64(run.totals?.elapsedMs) ?? 0),

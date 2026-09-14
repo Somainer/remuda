@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload } from "../../../types/generated";
+import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload, WorkflowState } from "../../../types/generated";
 import { WorkflowTimelineCard } from "./WorkflowTimelineCard";
 
 const known = <T,>(value: T) => ({ state: "known" as const, value });
@@ -15,7 +15,7 @@ function run(partial: Partial<WorkflowRunPayload> = {}): WorkflowRunPayload {
     nativeRunId: known("wf_native"),
     nativeTaskId: known("task"),
     toolCallId: "call-1",
-    state: partial.state ?? "running",
+    state: (partial.state ?? "running") as WorkflowState,
     revision: u(1),
     title: known("demo"),
     name: partial.name ?? known("demo-wf"),
@@ -27,7 +27,7 @@ function run(partial: Partial<WorkflowRunPayload> = {}): WorkflowRunPayload {
   };
 }
 
-function phase(id = "p1", label = "Review", state: string = "running"): WorkflowPhasePayload {
+function phase(id = "p1", label = "Review", state: WorkflowState = "running"): WorkflowPhasePayload {
   return {
     workflowId: "wf_demo",
     phaseId: id,

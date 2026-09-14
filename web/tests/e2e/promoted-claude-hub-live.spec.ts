@@ -288,7 +288,7 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
       await submit(`/tui ${mode}`);
       await expect.poll(async () => (await starts()).length, { timeout: 15_000 }).toBe(index + 2);
       const current = (await starts())[index + 1];
-      expect(current.pid).not.toBe(initial.pid);
+      expect(current.pid).not.toBe((await starts())[index].pid);
       expect(current.session_id).toBe(initial.session_id);
       expect(current.tui_latch).toBe(mode);
       expect(current.alt_screen).toBe(mode === "fullscreen");

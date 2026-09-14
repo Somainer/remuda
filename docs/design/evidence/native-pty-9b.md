@@ -16,7 +16,7 @@ The coordinator's research was independently checked against the installed Claud
 
 There is no renderer launch flag or environment variable that forces fullscreen. `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` forces classic mode; `CLAUDE_CODE_NO_FLICKER=1` overrides selected automatic disables. The probe initially set the latter, so its successful fullscreen entry does not prove every host environment will choose fullscreen. The native resolution gives merged `settings.tui` priority over `CLAUDE_CODE_TUI_JUST_SWITCHED`. `CLAUDE_CONFIG_DIR` relocates the entire configuration directory and is used here only for the isolated probe, not as the production renderer control.
 
-The probe merged the authorized relay settings into private worktree scratch files, used no copied credentials, submitted no model prompt, and captured no screenshots. Two synthetic SessionStart hooks wrote only their origin labels. Full sanitized facts, raw escape-sequence counts, and cleanup results are in [native-pty-9b-real.json](./native-pty-9b-real.json).
+The probe merged the authorized relay settings into private worktree scratch files, copied no native credential files, submitted no model prompt, and captured no screenshots. Two synthetic SessionStart hooks wrote only their origin labels. Full sanitized facts, raw escape-sequence counts, and cleanup results are in [native-pty-9b-real.json](./native-pty-9b-real.json).
 
 | Observation | Result |
 |---|---|

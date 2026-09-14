@@ -7,7 +7,7 @@ use uuid::{Uuid, Variant};
 
 const ID_PREFIXES: &[&str] = &[
     "hst", "wsp", "wkt", "ins", "run", "cmd", "int", "evt", "dev", "prn", "pvp", "cred", "obj",
-    "sub", "tty", "launch", "epoch",
+    "sub", "tty", "launch", "epoch", "hook",
 ];
 
 /// Deserialize a required field whose explicit wire value may be null; §1.1.

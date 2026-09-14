@@ -51,28 +51,6 @@ impl HookReply {
     }
 }
 
-/// A decision the Node may return for a blocking event (P5; unused in P1).
-///
-/// `PermissionRequest` takes `{"behavior": …}` and **not** the
-/// `permissionDecision` key `PreToolUse` uses — that key is silently ignored
-/// here (design §3.1 [V]). Keeping the two spellings apart in the type is the
-/// cheapest guard against reintroducing that bug.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "behavior", rename_all = "lowercase")]
-pub enum HookDecision {
-    /// Let the tool call proceed.
-    Allow {
-        /// Optional replacement input.
-        #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
-        updated_input: Option<serde_json::Value>,
-    },
-    /// Refuse the tool call, with a reason shown to the model.
-    Deny {
-        /// Human-readable refusal.
-        message: String,
-    },
-}
-
 /// A decoded hook event: the name we recognise plus the payload it arrived with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HookEvent {
@@ -128,11 +106,11 @@ impl HookEvent {
     }
 }
 
-/// Every event the P1 overlay registers.
+/// Every event the overlay registers.
 ///
-/// `PermissionRequest` and `Elicitation` are registered **observe-only**: the
-/// Node journals them and replies `{}`, so the agent keeps prompting on its own
-/// screen. Answering them is P5.
+/// `PermissionRequest` and `Elicitation` are answered from P5 onward: the hook
+/// blocks on the socket until the interaction broker resolves, and the reply
+/// is the agent's decision (see [`crate::decision`]).
 pub const REGISTERED_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -150,8 +128,8 @@ pub const REGISTERED_EVENTS: &[&str] = &[
 
 /// Events whose hook blocks the agent until the Node answers.
 ///
-/// In P1 the Node answers `{}` immediately; the list exists so the relay knows
-/// which events deserve the bounded wait rather than a fire-and-forget send.
+/// The relay gives these the full broker-aligned wait; everything else is
+/// fire-and-forget and gets a short one.
 pub const BLOCKING_EVENTS: &[&str] = &["PermissionRequest", "Elicitation"];
 
 /// True when `event` blocks the agent while the hook runs.
@@ -169,24 +147,6 @@ mod tests {
         // Claude reads `{}` as "no opinion"; anything else, including `null`,
         // risks being parsed as a decision.
         assert_eq!(HookReply::empty().to_hook_json(), serde_json::json!({}));
-    }
-
-    #[test]
-    fn a_permission_decision_uses_the_behavior_key_not_permission_decision() {
-        // `permissionDecision` is silently ignored on PermissionRequest.
-        let allow = serde_json::to_value(HookDecision::Allow {
-            updated_input: None,
-        })
-        .unwrap();
-        assert_eq!(allow, serde_json::json!({"behavior": "allow"}));
-        let deny = serde_json::to_value(HookDecision::Deny {
-            message: "not allowed".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            deny,
-            serde_json::json!({"behavior": "deny", "message": "not allowed"})
-        );
     }
 
     #[test]

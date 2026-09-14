@@ -348,6 +348,24 @@ pub async fn instance_token(
     Ok(token)
 }
 
+/// Routes that establish, rather than require, a device session. They must run
+/// even when the request carries a stale or otherwise-invalid presented token:
+/// the login credential (access code, pair code, or a WebAuthn assertion) is in
+/// the body, not the bearer/cookie. Passkey register routes are deliberately
+/// absent — they require an existing device session.
+fn is_auth_establishing(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/node"
+            | "/node/v1/connect"
+            | "/v1/login"
+            | "/v1/devices/pair"
+            | "/v1/auth/passkeys/login/start"
+            | "/v1/auth/passkeys/login/finish"
+            | "/healthz"
+    )
+}
+
 /// Scoped credentials cannot mint operator credentials, answer their own
 /// approvals, mutate host/worktree administration, or use the raw tty socket.
 pub async fn restrict_agent_routes(
@@ -364,10 +382,7 @@ pub async fn restrict_agent_routes(
     let node_object_read =
         request.method() == axum::http::Method::GET && path.starts_with("/v1/objects/");
     if !node_object_read
-        && !matches!(
-            path,
-            "/v1/node" | "/node/v1/connect" | "/v1/login" | "/v1/devices/pair" | "/healthz"
-        )
+        && !is_auth_establishing(path)
         && auth::presented_token(request.headers()).is_some()
     {
         let device = caller(&state, request.headers()).await?;
@@ -399,6 +414,22 @@ pub async fn restrict_agent_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passkey_login_routes_are_auth_establishing_but_register_is_not() {
+        // A stale post-logout cookie on the immediately-fired conditional
+        // ceremony must not be resolved by `caller` (which 401s) before the
+        // WebAuthn handler runs. Both login routes sit beside /v1/login.
+        assert!(is_auth_establishing("/v1/auth/passkeys/login/start"));
+        assert!(is_auth_establishing("/v1/auth/passkeys/login/finish"));
+        assert!(is_auth_establishing("/v1/login"));
+        // Registering still requires a live device session.
+        assert!(!is_auth_establishing("/v1/auth/passkeys/register/start"));
+        assert!(!is_auth_establishing("/v1/auth/passkeys/register/finish"));
+        assert!(!is_auth_establishing("/v1/auth/passkeys"));
+        // Listing/management are not auth-establishing either.
+        assert!(!is_auth_establishing("/v1/devices"));
+    }
 
     #[test]
     fn authenticated_kind_and_instance_binding_determine_origin() {

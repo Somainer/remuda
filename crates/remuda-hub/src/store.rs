@@ -32,6 +32,9 @@ pub enum StoreError {
     /// Protocol ID.
     #[error("id: {0}")]
     Id(String),
+    /// A passkey with the same credential id is already registered.
+    #[error("duplicate credential")]
+    DuplicateCredential,
 }
 
 fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
@@ -107,6 +110,50 @@ pub struct Device {
     pub kind: String,
     /// Agent credentials are bound to one instance.
     pub instance_id: Option<String>,
+}
+
+/// A registered WebAuthn credential (D-030). `public_key` is the
+/// webauthn-rs-core `Credential` JSON; the other columns denormalize the fields
+/// that list views and the clone-detection counter need without a parse.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasskeyRecord {
+    /// `cred_…`.
+    pub id: String,
+    /// Unpadded base64url of the WebAuthn credential id (unique).
+    pub credential_id: String,
+    /// webauthn-rs-core `Credential` JSON.
+    pub public_key: String,
+    /// Stored signature counter for clone detection.
+    pub counter: i64,
+    /// JSON array of reported authenticator transports.
+    pub transports: String,
+    /// Human label.
+    pub name: String,
+    /// Authenticator attestation GUID when attestation exposed one.
+    pub aaguid: Option<String>,
+    /// Device that registered the key (drives the "this device" hint).
+    pub created_by: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
+
+impl PasskeyRecord {
+    /// rusqlite row mapper matching the explicit SELECT column lists above.
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(PasskeyRecord {
+            id: row.get(0)?,
+            credential_id: row.get(1)?,
+            public_key: row.get(2)?,
+            counter: row.get(3)?,
+            transports: row.get(4)?,
+            name: row.get(5)?,
+            aaguid: row.get(6)?,
+            created_by: row.get(7)?,
+            created_at: row.get(8)?,
+            last_used_at: row.get(9)?,
+        })
+    }
 }
 
 /// Host index row (Hub projection).
@@ -1116,6 +1163,171 @@ impl Store {
                         "createdAt": row.get::<_, String>(4)?,
                     }))
                 })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    // ----- Passkeys (D-030) -------------------------------------------------
+
+    /// Persist a freshly registered credential. A repeated credential id is a
+    /// conflict rather than a second row.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_passkey(
+        &self,
+        credential_id: String,
+        public_key: String,
+        counter: i64,
+        transports: String,
+        name: String,
+        aaguid: Option<String>,
+        created_by: String,
+    ) -> Result<PasskeyRecord, StoreError> {
+        self.run(move |conn| {
+            let id = new_id("cred").map_err(|e| StoreError::Id(e.to_string()))?;
+            let now = now_rfc3339();
+            conn.execute(
+                "INSERT INTO passkeys
+                    (id, credential_id, public_key, counter, transports, name, aaguid,
+                     created_by, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                params![
+                    id,
+                    credential_id,
+                    public_key,
+                    counter,
+                    transports,
+                    name,
+                    aaguid,
+                    created_by,
+                    now
+                ],
+            )
+            .map_err(|err| {
+                if matches!(
+                    err.sqlite_error_code(),
+                    Some(ErrorCode::ConstraintViolation)
+                ) {
+                    StoreError::DuplicateCredential
+                } else {
+                    StoreError::Sqlite(err)
+                }
+            })?;
+            Ok(PasskeyRecord {
+                id,
+                credential_id,
+                public_key,
+                counter,
+                transports,
+                name,
+                aaguid,
+                created_by,
+                created_at: now,
+                last_used_at: None,
+            })
+        })
+        .await
+    }
+
+    /// All registered credentials, newest first. A single-operator Hub keeps
+    /// this list short; lookups by credential id are indexed.
+    pub async fn list_passkeys(&self) -> Result<Vec<PasskeyRecord>, StoreError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, credential_id, public_key, counter, transports, name, aaguid,
+                        created_by, created_at, last_used_at
+                 FROM passkeys ORDER BY created_at DESC, id",
+            )?;
+            let rows = stmt
+                .query_map([], PasskeyRecord::from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Look up one credential by its WebAuthn credential id.
+    pub async fn passkey_by_credential_id(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<PasskeyRecord>, StoreError> {
+        let credential_id = credential_id.to_string();
+        self.run(move |conn| {
+            conn.query_row(
+                "SELECT id, credential_id, public_key, counter, transports, name, aaguid,
+                        created_by, created_at, last_used_at
+                 FROM passkeys WHERE credential_id = ?1",
+                params![credential_id],
+                PasskeyRecord::from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Persist the post-ceremony credential JSON/counter and stamp last-used.
+    pub async fn touch_passkey(
+        &self,
+        id: String,
+        public_key: String,
+        counter: i64,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            conn.execute(
+                "UPDATE passkeys SET public_key = ?2, counter = ?3, last_used_at = ?4
+                 WHERE id = ?1",
+                params![id, public_key, counter, now_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Change the human label. Missing row reports `None`.
+    pub async fn rename_passkey(
+        &self,
+        id: String,
+        name: String,
+    ) -> Result<Option<PasskeyRecord>, StoreError> {
+        self.run(move |conn| {
+            let updated = conn.execute(
+                "UPDATE passkeys SET name = ?2 WHERE id = ?1",
+                params![id, name],
+            )?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            let found = conn
+                .query_row(
+                    "SELECT id, credential_id, public_key, counter, transports, name, aaguid,
+                            created_by, created_at, last_used_at
+                     FROM passkeys WHERE id = ?1",
+                    params![id],
+                    PasskeyRecord::from_row,
+                )
+                .optional()?;
+            Ok(found)
+        })
+        .await
+    }
+
+    /// Delete one credential. `false` when it was already gone, keeping
+    /// `DELETE` idempotent.
+    pub async fn delete_passkey(&self, id: String) -> Result<bool, StoreError> {
+        self.run(move |conn| {
+            Ok(conn.execute("DELETE FROM passkeys WHERE id = ?1", params![id])? != 0)
+        })
+        .await
+    }
+
+    /// Base64url credential ids for register excludeCredentials.
+    pub async fn passkey_credential_ids(&self) -> Result<Vec<String>, StoreError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare("SELECT credential_id FROM passkeys")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -2731,6 +2943,20 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS passkeys (
+            id TEXT PRIMARY KEY,
+            credential_id TEXT NOT NULL,
+            public_key TEXT NOT NULL,
+            counter INTEGER NOT NULL DEFAULT 0,
+            transports TEXT NOT NULL DEFAULT 'null',
+            name TEXT NOT NULL,
+            aaguid TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS passkeys_credential_id
+            ON passkeys(credential_id);
         ",
     )?;
     ensure_column(&conn, "devices", "kind", "TEXT NOT NULL DEFAULT 'human'")?;

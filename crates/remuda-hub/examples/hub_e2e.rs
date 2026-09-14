@@ -45,6 +45,14 @@ async fn main() -> Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    // The Playwright hub suite mounts the login page dozens of times from a
+    // single loopback IP and every mount starts a passkey ceremony, so use
+    // effectively unlimited budgets. for_test keeps production defaults so
+    // the 429 integration test still exercises the real buckets.
+    config.auth_ip_burst = 1_000_000.0;
+    config.auth_ip_refill_per_sec = 1_000.0;
+    config.auth_global_burst = 1_000_000.0;
+    config.auth_global_refill_per_sec = 1_000.0;
     // Local acceptance can attach the same fake engine to an isolated remuda
     // dev Hub/Node pair. CI still starts its own disposable real Hub here.
     let addr = config.listen;

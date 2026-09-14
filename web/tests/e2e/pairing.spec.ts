@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { randomUUID } from "node:crypto";
-import { bootstrapToken, expectCookieSession, login, logout } from "./hub-auth";
+import { bootstrapToken, expectCookieSession, login, logout, useAccessCode } from "./hub-auth";
 
 test.describe("device pairing", () => {
   test.beforeEach(async ({ page }) => { await login(page); });
@@ -23,6 +23,7 @@ test.describe("device pairing", () => {
     await expect(page.getByTestId("settings-page")).toBeVisible();
     await logout(page);
     await expect(page.getByTestId("login-page")).toBeVisible();
+    await useAccessCode(page);
     await page.getByTestId("login-tab-bootstrap").click();
     await page.getByTestId("login-bootstrap-token").fill(bootstrapToken);
     await page.getByTestId("login-device-name").fill("desk");
@@ -36,6 +37,7 @@ test.describe("device pairing", () => {
   test("wrong bootstrap token stays on login", async ({ page }) => {
     await page.goto("/settings");
     await logout(page);
+    await useAccessCode(page);
     await page.getByTestId("login-tab-bootstrap").click();
     await page.getByTestId("login-bootstrap-token").fill("nope");
     await page.getByTestId("login-submit").click();
@@ -54,6 +56,7 @@ test.describe("device pairing", () => {
     expect(code.length).toBe(8);
     await logout(page);
     await expect(page.getByTestId("login-page")).toBeVisible();
+    await useAccessCode(page);
     await page.getByTestId("login-tab-pair").click();
     await page.getByTestId("login-pair-code").fill(code);
     await page.getByTestId("login-device-name").fill(deviceName);

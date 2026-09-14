@@ -66,6 +66,34 @@ pub struct HubConfig {
     /// expires to `failed` and stops holding a placement slot (default five minutes).
     #[serde(default = "default_requested_grace_ms")]
     pub requested_grace_ms: u64,
+    /// Per-IP authentication attempt burst budget (login/pair/passkey).
+    #[serde(default = "default_auth_ip_burst")]
+    pub auth_ip_burst: f64,
+    /// Per-IP authentication token refill (tokens/second).
+    #[serde(default = "default_auth_ip_refill_per_sec")]
+    pub auth_ip_refill_per_sec: f64,
+    /// Global authentication attempt burst budget.
+    #[serde(default = "default_auth_global_burst")]
+    pub auth_global_burst: f64,
+    /// Global authentication token refill (tokens/second).
+    #[serde(default = "default_auth_global_refill_per_sec")]
+    pub auth_global_refill_per_sec: f64,
+}
+
+fn default_auth_ip_burst() -> f64 {
+    10.0
+}
+
+fn default_auth_ip_refill_per_sec() -> f64 {
+    0.1
+}
+
+fn default_auth_global_burst() -> f64 {
+    64.0
+}
+
+fn default_auth_global_refill_per_sec() -> f64 {
+    8.0
 }
 
 fn default_host_lost_grace_ms() -> u64 {
@@ -120,6 +148,10 @@ impl Default for HubConfig {
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
+            auth_ip_burst: default_auth_ip_burst(),
+            auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
+            auth_global_burst: default_auth_global_burst(),
+            auth_global_refill_per_sec: default_auth_global_refill_per_sec(),
         }
     }
 }
@@ -145,6 +177,14 @@ impl HubConfig {
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
+            // Keep production rate-limit defaults here so the 429 integration
+            // test exercises real budgets; the Playwright harness relaxes them
+            // explicitly because it mounts the login page dozens of times from
+            // one loopback IP (each mount starts a passkey ceremony).
+            auth_ip_burst: default_auth_ip_burst(),
+            auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
+            auth_global_burst: default_auth_global_burst(),
+            auth_global_refill_per_sec: default_auth_global_refill_per_sec(),
         }
     }
 

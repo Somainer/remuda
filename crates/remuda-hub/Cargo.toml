@@ -37,15 +37,25 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v5"] }
+url = "2"
+# 0.5.5: the safe wrapper cannot construct RP config for IP-literal loopback
+# origins (dev/e2e serve on http://127.0.0.1), and its only constructor that
+# can, WebauthnCore::new_unsafe_experts_only, is not re-exported. We replicate
+# the wrapper's exact passkey ceremony parameters on top of core. MPL-2.0.
+webauthn-rs-core = "=0.5.5"
 
 [dev-dependencies]
 anyhow.workspace = true
 base64 = "0.22"
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
+# Software ES256 authenticator for the passkey ceremony tests (D-029).
+openssl = "0.10"
+serde_cbor_2 = "0.13"
+sha2.workspace = true
 rusqlite.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v5"] }

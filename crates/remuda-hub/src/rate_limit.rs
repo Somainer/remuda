@@ -23,6 +23,7 @@ const IDLE_TTL: Duration = Duration::from_secs(600);
 enum Endpoint {
     Login,
     Pair,
+    PasskeyRegister,
 }
 
 struct Bucket {
@@ -56,27 +57,53 @@ struct Budgets {
     global: Bucket,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LimitParams {
+    pub ip_burst: f64,
+    pub ip_refill_per_sec: f64,
+    pub global_burst: f64,
+    pub global_refill_per_sec: f64,
+}
+
 #[derive(Clone)]
-pub(crate) struct AuthRateLimits(Arc<Mutex<Budgets>>);
+pub(crate) struct AuthRateLimits {
+    limits: Arc<Mutex<Budgets>>,
+    params: LimitParams,
+}
 
 impl Default for AuthRateLimits {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(Budgets {
-            peers: HashMap::new(),
-            global: Bucket::full(GLOBAL_BURST, Instant::now()),
-        })))
+        Self::new(LimitParams {
+            ip_burst: IP_BURST,
+            ip_refill_per_sec: IP_REFILL_PER_SEC,
+            global_burst: GLOBAL_BURST,
+            global_refill_per_sec: GLOBAL_REFILL_PER_SEC,
+        })
+    }
+}
+
+impl AuthRateLimits {
+    pub(crate) fn new(params: LimitParams) -> Self {
+        Self {
+            limits: Arc::new(Mutex::new(Budgets {
+                peers: HashMap::new(),
+                global: Bucket::full(params.global_burst, Instant::now()),
+            })),
+            params,
+        }
     }
 }
 
 impl AuthRateLimits {
     fn admit(&self, peer: IpAddr, endpoint: Endpoint, now: Instant) -> bool {
-        let Ok(mut budgets) = self.0.lock() else {
+        let Ok(mut budgets) = self.limits.lock() else {
             return false;
         };
-        if !budgets
-            .global
-            .take(GLOBAL_BURST, GLOBAL_REFILL_PER_SEC, now)
-        {
+        if !budgets.global.take(
+            self.params.global_burst,
+            self.params.global_refill_per_sec,
+            now,
+        ) {
             return false;
         }
         let peer = match peer {
@@ -95,8 +122,8 @@ impl AuthRateLimits {
         budgets
             .peers
             .entry((peer, endpoint))
-            .or_insert_with(|| Bucket::full(IP_BURST, now))
-            .take(IP_BURST, IP_REFILL_PER_SEC, now)
+            .or_insert_with(|| Bucket::full(self.params.ip_burst, now))
+            .take(self.params.ip_burst, self.params.ip_refill_per_sec, now)
     }
 }
 
@@ -106,8 +133,12 @@ pub(crate) async fn limit_auth_attempts(
     next: Next,
 ) -> Response {
     let endpoint = match (request.method(), request.uri().path()) {
-        (&Method::POST, "/v1/login") => Endpoint::Login,
+        (&Method::POST, "/v1/login")
+        | (&Method::POST, "/v1/auth/passkeys/login/start")
+        | (&Method::POST, "/v1/auth/passkeys/login/finish") => Endpoint::Login,
         (&Method::POST, "/v1/devices/pair") => Endpoint::Pair,
+        (&Method::POST, "/v1/auth/passkeys/register/start")
+        | (&Method::POST, "/v1/auth/passkeys/register/finish") => Endpoint::PasskeyRegister,
         _ => return next.run(request).await,
     };
     let admitted = request
@@ -143,6 +174,7 @@ mod tests {
         assert!(!limits.admit(peer, Endpoint::Login, now));
         assert!(!limits.admit("::ffff:127.0.0.1".parse().unwrap(), Endpoint::Login, now));
         assert!(limits.admit(peer, Endpoint::Pair, now));
+        assert!(limits.admit(peer, Endpoint::PasskeyRegister, now));
         assert!(limits.admit("127.0.0.2".parse().unwrap(), Endpoint::Login, now));
         assert!(!limits.admit(peer, Endpoint::Login, now + Duration::from_secs(9)));
         assert!(limits.admit(peer, Endpoint::Login, now + Duration::from_secs(10)));
@@ -168,7 +200,7 @@ mod tests {
     fn bucket_storage_is_bounded_and_idle_entries_are_reclaimed() {
         let limits = AuthRateLimits::default();
         let now = Instant::now();
-        let mut budgets = limits.0.lock().unwrap();
+        let mut budgets = limits.limits.lock().unwrap();
         for i in 0..MAX_BUCKETS as u32 {
             budgets.peers.insert(
                 (IpAddr::V4(i.into()), Endpoint::Login),
@@ -179,6 +211,6 @@ mod tests {
         let peer = "203.0.113.1".parse().unwrap();
         assert!(!limits.admit(peer, Endpoint::Login, now));
         assert!(limits.admit(peer, Endpoint::Login, now + IDLE_TTL));
-        assert_eq!(limits.0.lock().unwrap().peers.len(), 1);
+        assert_eq!(limits.limits.lock().unwrap().peers.len(), 1);
     }
 }

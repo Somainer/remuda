@@ -11,10 +11,21 @@ import {
   api,
   observationText,
   type InstanceCreateSpec,
+  type PasskeyAssertionBody,
+  type PasskeyAttestationBody,
+  type PasskeyView,
   type PtyKey,
   type ResumeMode,
   type WorktreeCreateSpec,
 } from "./api";
+import {
+  conditionalMediationAvailable,
+  createPasskey,
+  getPasskey,
+  passkeysSupported,
+  type ServerCreationOptions,
+  type ServerRequestOptions,
+} from "./passkeys";
 import {
   DEFAULT_EFFORT_INDEX,
   effortAt,
@@ -71,6 +82,7 @@ export type HubState = {
   connection: ConnectionUi;
   session: DeviceSession | null;
   devices: PairedDevice[];
+  passkeys: PasskeyView[];
   pairCode: PairCode | null;
   instances: Instance[];
   hosts: Host[];
@@ -95,6 +107,7 @@ const initial: HubState = {
   connection: "live",
   session: readSession(),
   devices: [],
+  passkeys: [],
   pairCode: null,
   instances: [],
   hosts: [],
@@ -160,7 +173,7 @@ class HubStore {
   async bootstrap() {
     const gen = ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
-      this.emit({ ready: true, authed: false, session: null, devices: [], connection: "offline" });
+      this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
       return;
     }
     if (api.mock && !readSession()) {
@@ -175,11 +188,12 @@ class HubStore {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
         return;
       }
-      const [instances, hosts, interactions, devices] = await Promise.all([
+      const [instances, hosts, interactions, devices, passkeys] = await Promise.all([
         api.instanceList(),
         api.hostList(),
         api.interactionList(),
         api.deviceList().catch(() => ({ items: [] as PairedDevice[] })),
+        api.passkeyList().catch(() => ({ items: [] as PasskeyView[] })),
       ]);
       if (gen !== this.bootGen) return;
       const registeredHosts = mergeHostWorkspaces(hosts.items, this.state.hosts);
@@ -190,6 +204,7 @@ class HubStore {
         connection: "live",
         session: readSession(),
         devices: devices.items,
+        passkeys: passkeys.items,
         instances: instances.items,
         hosts: registeredHosts,
         workspaces: registeredHosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)),
@@ -227,6 +242,64 @@ class HubStore {
     await this.bootstrap();
   }
 
+  /** Whether the browser exposes WebAuthn on this origin. */
+  passkeysSupported(): boolean {
+    return passkeysSupported();
+  }
+
+  stateAuthed(): boolean {
+    return this.state.authed;
+  }
+
+  async conditionalMediationAvailable(): Promise<boolean> {
+    return conditionalMediationAvailable();
+  }
+
+  /**
+   * Passkey login. `conditional` keeps the ceremony pending until the user
+   * picks an autofill suggestion; abort the provided signal when starting an
+   * explicit (required) ceremony so the two do not overlap.
+   */
+  async passkeyLogin(
+    mediation: "required" | "conditional",
+    deviceName?: string,
+    signal?: AbortSignal,
+  ): Promise<{ assertion: PasskeyAssertionBody; challengeId: string } | void> {
+    const envelope = await api.passkeyLoginStart(mediation === "conditional" ? "conditional" : undefined);
+    const options = envelope.options as ServerRequestOptions;
+    const assertion = await getPasskey(options, mediation, signal);
+    const session = await api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName);
+    writeSession(session, { mock: api.mock });
+    this.emit({ session: readSession(), error: null });
+    await this.bootstrap();
+    return { assertion, challengeId: envelope.challengeId };
+  }
+
+  /** Register a new passkey from settings (requires an authenticated device). */
+  async addPasskey(name: string): Promise<PasskeyView> {
+    const envelope = await api.passkeyRegisterStart(name);
+    const options = envelope.options as ServerCreationOptions;
+    const attestation: PasskeyAttestationBody = await createPasskey(options);
+    const saved = await api.passkeyRegisterFinish(envelope.challengeId, attestation);
+    await this.refreshPasskeys();
+    return saved;
+  }
+
+  async refreshPasskeys() {
+    const page = await api.passkeyList();
+    this.emit({ passkeys: page.items });
+  }
+
+  async renamePasskey(passkeyId: string, name: string) {
+    await api.passkeyRename(passkeyId, name);
+    await this.refreshPasskeys();
+  }
+
+  async deletePasskey(passkeyId: string) {
+    await api.passkeyDelete(passkeyId);
+    await this.refreshPasskeys();
+  }
+
   startPoll() {
     if (this.pollTimer != null || typeof window === "undefined") return;
     this.pollTimer = window.setInterval(() => {
@@ -248,6 +321,7 @@ class HubStore {
       authed: false,
       session: null,
       devices: [],
+      passkeys: [],
       pairCode: null,
       instances: [],
       hosts: [],

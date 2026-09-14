@@ -19,9 +19,16 @@ export async function expectCookieSession(page: Page) {
   expect(stored.cookie).not.toContain("remuda_device=");
 }
 
+/** Expand the collapsed access-code form (passkey is the primary login). */
+export async function useAccessCode(page: Page) {
+  const toggle = page.getByTestId("login-use-code");
+  if (await toggle.isVisible().catch(() => false)) await toggle.click();
+}
+
 export async function login(page: Page, name = "e2e-browser") {
   await page.goto("/login");
   await expect(page.getByTestId("login-page")).toBeVisible();
+  await useAccessCode(page);
   await page.getByTestId("login-tab-bootstrap").click();
   await page.getByTestId("login-device-name").fill(name);
   await page.getByTestId("login-bootstrap-token").fill(bootstrapToken);

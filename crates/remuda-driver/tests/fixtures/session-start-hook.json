@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "SessionStart",
+  "session_id": "04b95a78-e876-4212-aa9c-a6482f30f583",
+  "transcript_path": "/Users/dev/work/repo/.claude/projects/-Users-dev-work-repo/04b95a78-e876-4212-aa9c-a6482f30f583.jsonl",
+  "cwd": "/Users/dev/work/repo",
+  "ppid": 5150
+}

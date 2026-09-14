@@ -133,6 +133,8 @@ pub struct ShellPtyDriver {
     promoted: Arc<std::sync::Mutex<Option<Detected>>>,
     /// Screen-derived readiness of that agent, when promoted.
     status: Arc<std::sync::Mutex<Option<ScreenStatus>>>,
+    /// Deterministic transcript binding for the current promotion epoch.
+    bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
     poller: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -159,11 +161,23 @@ impl ShellPtyDriver {
             inner: Mutex::new(None),
             promoted: Arc::new(std::sync::Mutex::new(None)),
             status: Arc::new(std::sync::Mutex::new(None)),
+            bindings: promotion::BindingHandle::empty(),
             poller: Mutex::new(None),
             table,
             hooks: Mutex::new(None),
             seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Hand a SessionStart hook report to the promotion supervisor.
+    ///
+    /// Channel A of deterministic transcript binding: the launch shim (D-028
+    /// P1) relays `{hook_event_name, session_id, transcript_path, cwd, ppid}`;
+    /// the report only binds an epoch when its `ppid` is the foreground pid.
+    /// Safe to call when promotion is off or no agent is foreground — the
+    /// report is matched at the next promotion tick.
+    pub fn ingest_session_start(&self, report: crate::claude_transcript::SessionStartReport) {
+        self.bindings.ingest_session_start(report);
     }
 
     /// Currently promoted agent kind, if the PTY's foreground is an agent CLI.
@@ -281,6 +295,7 @@ impl ShellPtyDriver {
                 Arc::clone(&self.table),
                 Arc::clone(&self.promoted),
                 Arc::clone(&self.status),
+                self.bindings.clone(),
                 tx,
                 Arc::clone(&self.seq),
             ));
@@ -478,12 +493,15 @@ impl Driver for ShellPtyDriver {
 
     async fn respond_interaction(
         &self,
-        _id: remuda_protocol::InteractionId,
-        _answer: remuda_protocol::InteractionAnswer,
+        id: remuda_protocol::InteractionId,
+        answer: remuda_protocol::InteractionAnswer,
     ) -> DriverResult<DriverAck> {
-        Err(DriverError::CapabilityUnsupported(
-            "shell-pty has no structured interaction channel".into(),
-        ))
+        // The only structured question a shell-pty asks is the manual
+        // transcript picker; its answer deterministically binds the epoch.
+        self.bindings
+            .answer(&id, &answer)
+            .map_err(DriverError::InvalidLaunchSpec)?;
+        Ok(DriverAck::transport_written())
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
@@ -500,6 +518,8 @@ impl Driver for ShellPtyDriver {
         // stay for `instance.purge` to remove with the rest of the instance
         // directory — they are launch audit evidence until then.
         self.hooks.lock().await.take();
+        // Drop any transcript claim so a respawn starts a fresh epoch.
+        self.bindings.demobilize();
         let Some(state) = self.inner.lock().await.take() else {
             return Ok(DriverAck::not_dispatched());
         };

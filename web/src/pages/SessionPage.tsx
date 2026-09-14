@@ -16,6 +16,7 @@ import { canShowTerminal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView
 import { ScreenView } from "../features/session/ScreenView";
 import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode } from "../lib/status";
+import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
 import type { Id } from "../types/wire";
@@ -110,6 +111,7 @@ export function SessionPage({
   const structuredOnly = uiMode(instance) === "structured-only";
   const genericPty = isGenericPty(instance);
   const promoted = isPromoted(instance);
+  const binding = promoted ? transcriptBinding(events) : null;
   const activity = instance.activity.state === "known" ? instance.activity.value : instance.activity.state;
 
   return (
@@ -260,6 +262,24 @@ export function SessionPage({
             <>
               <span className={session.dotSep}>·</span>
               <span>native {nativeShort(instance)}</span>
+            </>
+          ) : null}
+          {promoted ? (
+            <>
+              <span className={session.dotSep}>·</span>
+              <span
+                data-testid="transcript-binding"
+                data-state={binding?.state ?? "unknown"}
+                title={
+                  binding?.state === "degraded" && binding.reason
+                    ? binding.reason
+                    : promoted
+                      ? "promoted 终端的 transcript 绑定状态（hook / pid 文件 / argv / 手动）"
+                      : undefined
+                }
+              >
+                {binding ? bindingChipText(binding) : "transcript 绑定中…"}
+              </span>
             </>
           ) : null}
           {journalStatus === "gap-backfill" ? " · 正在补事件" : ""}

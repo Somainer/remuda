@@ -3,6 +3,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
 import ui from "../styles/ui.module.css";
+import css from "./codeBlock.module.css";
 import { CodeBlock } from "./CodeBlock";
 
 function nodeText(node: ReactNode): string {
@@ -35,7 +36,7 @@ function renderPre(children: ReactNode): ReactNode {
 /** react-markdown + remark-gfm + rehype-sanitize: GFM without raw HTML; code colour is lazy on demand. */
 export function MarkdownText({ text }: { text: string }) {
   return (
-    <div className={ui.md}>
+    <div className={`${ui.md} ${css.mdSurface}`}>
       <Markdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSanitize]}

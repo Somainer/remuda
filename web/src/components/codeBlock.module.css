@@ -30,6 +30,17 @@
   overflow: hidden;
 }
 
+/*
+ * MarkdownText is a column-flex item inside an assistant row, where the
+ * automatic minimum size would grow the wrapper to a code block's
+ * max-content and push the overflow past the transcript column. Opting into
+ * shrink here keeps every long line inside the pre instead.
+ */
+.mdSurface {
+  min-width: 0;
+  max-width: 100%;
+}
+
 :global([data-theme="ledger"]) .root {
   --tok-comment: #8a8378;
   --tok-keyword: #9a4a33;
@@ -66,18 +77,6 @@
 .root:hover .toolbar,
 .toolbar:focus-within {
   opacity: 1;
-}
-
-/* Touch has no hover: the toolbar is always shown and the buttons carry the
-   full 44px hit area. */
-@media (pointer: coarse) {
-  .toolbar {
-    opacity: 1;
-  }
-  .button {
-    width: 44px;
-    height: 44px;
-  }
 }
 
 .label,
@@ -135,9 +134,15 @@
   color: var(--ok);
 }
 
+/* Touch/narrow overrides live below — they must follow the base .button and
+   .pre rules (equal specificity; in dev, source order is the tiebreak). */
+
 .root .pre {
   margin: 0;
-  padding: 10px 12px;
+  /* The top strip is the floating toolbar's lane: it must never sit on top of
+     code text (long first lines on narrow screens), so the pre starts below
+     it. */
+  padding: 34px 12px 10px;
   border: 0;
   border-radius: var(--radius);
   background: transparent;
@@ -153,10 +158,28 @@
   scrollbar-width: thin;
 }
 
-.preWrap {
+.root .preWrap {
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
+}
+
+/* Touch has no hover, and a phone-sized window wants the fat hit area even
+   when a mouse is driving it: the toolbar is always shown, the buttons carry
+   the full 44px hit area, and the pre leaves a taller toolbar lane. Placed
+   AFTER every base rule it overrides — equal specificity, and in dev source
+   order is the cascade tiebreak. */
+@media (pointer: coarse), (max-width: 560px) {
+  .toolbar {
+    opacity: 1;
+  }
+  .button {
+    width: 44px;
+    height: 44px;
+  }
+  .root .pre {
+    padding-top: 52px;
+  }
 }
 
 /* highlight.js token classes → palette variables. */

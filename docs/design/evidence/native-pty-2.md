@@ -247,6 +247,40 @@ It runs **before** the herdr reconcile. Waiting out a predecessor's session
 server can consume the whole retry budget, and native-PTY rows must not sit at
 `ready` behind an unrelated carrier's wait.
 
+## 8.1 — Three races the merge gate found
+
+The gate failed on `UNIQUE constraint failed: events.instance_id, events.seq`.
+All three causes were ordering bugs that a serial, unloaded test run hides,
+and none were specific to restart — restart is just where two Nodes touch one
+data dir, so it hit them first.
+
+1. **Observation pumps outlived their Node.** A pump is a detached task
+   holding an `Arc<dyn LocalStore>` that it writes through. Nothing joined it,
+   so after a second Node reopened the same data dir both read the same
+   watermark from the journal's `instances.seq` and allocated the same
+   sequence. Pumps are now tracked and stopped — *awaited*, since `abort()`
+   only schedules cancellation and a pump inside `append_observation` runs to
+   the end of that call — before the drivers whose exits they would journal.
+
+2. **The row was settled before the journal explained it.** Both
+   `record_native_exit` and `reconcile_native_pty` flipped the entity to
+   `exited` and appended the event afterwards, leaving a window in which an
+   instance had stopped and the journal could not say why. Reversed: journal
+   first, settle last, so entity state is safe to treat as the signal that
+   everything explaining it is already written.
+
+3. **Aborting a worker is not stopping it.** `shutdown_processes_only`
+   aborted its workers without awaiting them, and a worker already inside a
+   close ran to completion and settled the row — correct for a real close,
+   wrong for modelling a Node death, where the row must stay `ready` for
+   reconciliation to find.
+
+Found by running the test binary 25× against six busy cores rather than by
+rerunning it as-is: at idle it passed 12/12, under load it failed about 1 in
+8, and it failed a *different* test each time — which is what pointed at
+shared state rather than at any one assertion. 25/25 under the same load
+after.
+
 ## 9 — Not covered here
 
 - **`--effort`, `CODEX_HOME` / `GROK_HOME`, yolo argv** are wired through the

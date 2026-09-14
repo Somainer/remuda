@@ -25,17 +25,22 @@
 
 ![1440 night: grouped page with the section rail](workbench-f-settings-1-groups-1440-night.png)
 
-### 2. Explicit save with three states and field rollback
+### 2. Immediate local prefs, explicit text saves, three states and field rollback
 
-Persistence was previously an implicit write on every click. Local-only prefs are now drafts inside a group, committed by an explicit 保存, and every save reports its phase in a `role="status"` line:
+The spec distinguishes 本地即时偏好 from 服务端操作, and so does the page:
+
+- **外观与输入** is a group of local-only preferences (theme, compact, permission default, default effort, autoRevealTty). Each one **commits the instant it is chosen** — this also preserves the existing contract where the settings effort chip feeds the new-session slider on the next page load. The previously implicit writes had no feedback at all; now every choice still walks **保存中… → ✓ 已保存 / ⚠ 失败**, shown in the group's `role="status"` line.
+- **连接与登录** holds text the operator expects to review (device name, access code): a draft with an explicit 保存 / 重置.
+
+Status semantics for both:
 
 - **保存中…** — shown for a minimum 450 ms. A localStorage write settles in under a frame, so without the floor the state would be *visited* without ever being *visible*; the saving affordance has to be observable, not merely internal.
-- **✓ 已保存** — settles the draft against new committed values; 保存 then disables until another edit.
-- **⚠ 失败：<原因>** — persistent (no timeout, never covered by a later success, matching the C1 notification rule), and the rejected **field** rolls back to its last committed value while unrelated edits keep theirs. An empty device name rejects `deviceName` only; a denied theme write rejects only `theme`.
+- **✓ 已保存** — the commit landed.
+- **⚠ 失败：<原因>** — persistent (no timeout, never covered by a later success, matching the C1 notification rule), and the rejected **field** rolls back to its last committed value. The denied theme choice snaps back to the committed theme (and `<html data-theme>` with it); an empty device name rejects `deviceName` only and leaves the input at the last valid name. Since each appearance choice is its own commit, a later failure (theme) can never undo an earlier committed one (permission).
 
 The push toggle has the same cycle; on failure it re-reads `readPushStatus()` so the button can never show a state the browser does not have.
 
-![1440 ledger: a completed save](workbench-f-settings-1-saved-1440-ledger.png)
+![1440 ledger: a completed immediate theme commit](workbench-f-settings-1-saved-1440-ledger.png)
 
 ![1440 night: denied write, rejected choice rolled back, failure persistent](workbench-f-settings-1-failed-1440-night.png)
 
@@ -66,7 +71,7 @@ Both palettes already existed in `tokens.css`; only the switch was missing ("v1 
 
 ## Verification
 
-- **Unit** (`pnpm --dir web test`): new `pages/SettingsPage.test.tsx`, 13 tests — group rendering and nav hrefs, deep-link `aria-current` + section focus, back-to-origin vs. direct-link fallback, the three save phases, field rollback (denied storage and invalid name), push rollback, reset, unchanged passkey/management sections, and the pinned "no new defaults" row. Full suite: **612 passed**.
+- **Unit** (`pnpm --dir web test`): new `pages/SettingsPage.test.tsx`, 14 tests — group rendering and nav hrefs, deep-link `aria-current` + section focus, back-to-origin vs. direct-link fallback, the three save phases, field rollback (denied storage and invalid name), independence of per-choice commits, push rollback, draft reset, unchanged passkey/management sections, and the pinned "no new defaults" row. Full suite: **613 passed**.
 - **E2E, mock mode** (`playwright.config.ts`): new `tests/e2e/ux-settings.spec.ts` — deep-link/back, anchor navigation, 保存中→已保存 with reload persistence, 失败 + rollback with the failing write injected at the `Storage` boundary, empty-name rejection; 390/768/1440 with no sideways overflow; **200 % zoom** modelled through the CDP device-metrics override (1440 physical → 720 CSS px at dsf 2; the spec is chromium-only and skips on webkit); both themes; 44 px targets measured with `boundingBox()` on real buttons. `mobile-qa.spec.ts` gains Space-chip and ActionSheet 44 px measurements. All hit-area assertions read layout boxes rather than CSS declarations.
 - **E2E, hub-live** (`playwright.hub.config.ts`): full suite run once under `flock`; the passkey and pairing specs exercise the kept Passkeys section and paired-devices/pair-code rows unchanged.
 - Existing `providers-bots-settings.spec.ts` assertions (device name default, iOS hint, Night mention, autoReveal off, permission chip, push) keep passing under the new layout, and `composer-effort.spec.ts` still drives the settings effort chips into the new-session slider.

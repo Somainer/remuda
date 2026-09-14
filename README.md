@@ -77,8 +77,9 @@ A longer, sanitized overview is in [docs/architecture.md](docs/architecture.md).
 The React/PWA surface ships with two themes (Night Corral and Ledger), an IBM
 Plex type scale, and 44 px touch targets throughout the phone layouts. The
 settings page (`/settings`) is organised into deep-linkable anchor groups —
-外观与输入、通知、连接与登录 — with explicit per-group save feedback
-(保存中 / 已保存 / 失败, a failed field rolling back to its last valid
+外观与输入、通知、连接与登录 — local appearance preferences apply
+immediately while text fields save explicitly, each change reporting
+保存中 / 已保存 / 失败 (a failed field rolling back to its last valid
 value). Local-only preferences are labelled as browser-local; Passkeys and
 provider management keep their existing sections.
 

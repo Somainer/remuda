@@ -616,7 +616,20 @@ impl ShellPtyDriver {
         // §5.1: the recipe decides argv, and for an agent it is the real
         // materialized one — env allowlist, settings digest and provider all
         // filled in, not the stub the shell path used to emit for everything.
-        let recipe = self.recipe_for(cwd, spec)?;
+        // Materialization is blocking (`--version`, the ~207 MB binary hash,
+        // overlay/shim writes); keep it off the async runtime's cores.
+        let recipe = {
+            let options = self.options.clone();
+            let cwd_owned = cwd.to_owned();
+            let spec_owned = spec.cloned();
+            let span = tracing::info_span!("materialize_recipe");
+            tokio::task::spawn_blocking(move || {
+                let _guard = span.entered();
+                materialize_recipe(&options, &cwd_owned, spec_owned.as_ref())
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("recipe task panicked: {error}")))??
+        };
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
@@ -696,27 +709,9 @@ impl ShellPtyDriver {
     /// The launch recipe for this PTY's target.    ///
     /// A shell keeps the lightweight recipe it always had; an agent goes
     /// through the materializer so §5.1 step 4's audit fields are real.
+    #[allow(dead_code)]
     fn recipe_for(&self, cwd: &str, spec: Option<&InstanceSpec>) -> DriverResult<LaunchRecipe> {
-        let Target::Agent { kind, resume } = &self.options.target else {
-            return shell_recipe(&self.options, cwd);
-        };
-        let Some(agent) = self.options.agent.as_ref() else {
-            return Err(DriverError::InvalidLaunchSpec(
-                "an agent target needs its launch inputs".into(),
-            ));
-        };
-        let Some(spec) = spec else {
-            return Err(DriverError::InvalidLaunchSpec(
-                "an agent target needs an InstanceSpec to materialize".into(),
-            ));
-        };
-        if spec.kind != *kind {
-            return Err(DriverError::InvalidLaunchSpec(format!(
-                "spec kind {:?} does not match the launch target {kind:?}",
-                spec.kind
-            )));
-        }
-        launch::agent_recipe(spec, agent, cwd, resume.as_deref())
+        materialize_recipe(&self.options, cwd, spec)
     }
 
     /// Run the stop ladder against this PTY's process group (§5.3).
@@ -746,9 +741,34 @@ impl ShellPtyDriver {
         // synchronous callback on a runtime thread.
         let mut master = state.master.lock().await.take();
         state.closed.store(true, Ordering::SeqCst);
-        lifecycle::stop_group(pgid, move || {
-            drop(master.take());
-        })
+        // Hold the child across the ladder so this is the only task reaping it.
+        // The leader is our direct child; a SIGKILLed child sits as a zombie
+        // until `wait`, and a zombie still answers killpg — that produced the
+        // false `stop-incomplete` against a process already in state E/Z.
+        let mut child = state.child.lock().await;
+        let mut reaped = false;
+        lifecycle::stop_group(
+            pgid,
+            move || {
+                drop(master.take());
+            },
+            &mut move || {
+                if reaped {
+                    return true;
+                }
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        reaped = true;
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        tracing::debug!(%error, "pty child reap failed");
+                        false
+                    }
+                }
+            },
+        )
         .await
     }
 
@@ -1540,6 +1560,36 @@ fn spawn_exit_waiter(
             tracing::debug!(%error, "native exit lifecycle not journaled");
         }
     })
+}
+
+/// Build the launch recipe from options: the lightweight shell recipe, or the
+/// materialized agent recipe (§5.1). Free-function form so the blocking
+/// materialization can run inside `spawn_blocking` without borrowing a driver.
+fn materialize_recipe(
+    options: &ShellPtyOptions,
+    cwd: &str,
+    spec: Option<&InstanceSpec>,
+) -> DriverResult<LaunchRecipe> {
+    let Target::Agent { kind, resume } = &options.target else {
+        return shell_recipe(options, cwd);
+    };
+    let Some(agent) = options.agent.as_ref() else {
+        return Err(DriverError::InvalidLaunchSpec(
+            "an agent target needs its launch inputs".into(),
+        ));
+    };
+    let Some(spec) = spec else {
+        return Err(DriverError::InvalidLaunchSpec(
+            "an agent target needs an InstanceSpec to materialize".into(),
+        ));
+    };
+    if spec.kind != *kind {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "spec kind {:?} does not match the launch target {kind:?}",
+            spec.kind
+        )));
+    }
+    launch::agent_recipe(spec, agent, cwd, resume.as_deref())
 }
 
 fn shell_recipe(options: &ShellPtyOptions, cwd: &str) -> DriverResult<LaunchRecipe> {

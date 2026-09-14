@@ -519,18 +519,23 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     let failed = outcomes
         .iter()
         .any(|outcome| outcome.status == "gate_failed");
+    let mut push_error = None;
     if !failed && !args.no_push {
-        git(
+        if let Err(error) = git(
             &ctx.repo,
             &[
                 "push",
                 "origin",
                 &format!("{}:refs/heads/main", main_after.clone().unwrap()),
             ],
-        )?;
-        pushed = true;
+        ) {
+            // Local landings stand, exactly like the single-branch push step.
+            push_error = Some(format!("{error:#}"));
+        } else {
+            pushed = true;
+        }
     }
-    let exit = if failed { 1 } else { 0 };
+    let exit = if failed || push_error.is_some() { 1 } else { 0 };
     finish_report(
         report,
         lanes,
@@ -540,6 +545,10 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
         outcomes,
         exit,
     );
+    if let Some(error) = push_error {
+        report.status = "queue_push_failed".into();
+        report.error = Some(error);
+    }
     Ok(())
 }
 

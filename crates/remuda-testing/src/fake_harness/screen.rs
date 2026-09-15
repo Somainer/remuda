@@ -48,6 +48,41 @@ impl Dialect {
     }
 }
 
+/// Screen-dialect version, selected with `--dialect-version`.
+///
+/// `Legacy` is the dialect the golden snapshots were captured against and must
+/// stay byte-stable. `Modern` reproduces claude 2.1.270's measured TUI: the
+/// `esc to interrupt` footer phrase is gone and turn edges ride `OSC 0` /
+/// `OSC 9;4` with an **empty** percent field (`9;4;3;`, not `9;4;3;0`). Only
+/// the claude dialect has a modern variant today.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DialectVersion {
+    /// Pre-2.1.270 phrases; OSC only at entry.
+    #[default]
+    Legacy,
+    /// 2.1.270: no `esc to interrupt`, live OSC edges with empty percent.
+    Modern,
+}
+
+impl DialectVersion {
+    /// Parse `--dialect-version`.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "modern" => Ok(Self::Modern),
+            other => Err(format!(
+                "unknown dialect version {other:?} (want legacy|modern)"
+            )),
+        }
+    }
+
+    /// Whether this is the 2.1.270 dialect.
+    #[must_use]
+    pub fn is_modern(self) -> bool {
+        self == Self::Modern
+    }
+}
+
 /// What the screen is currently doing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScreenMode {
@@ -122,6 +157,8 @@ pub struct View {
     pub dir_name: String,
     /// Whether the binary entered the alt screen (`--no-alt-screen` clears it).
     pub alt_screen: bool,
+    /// Legacy or 2.1.270 modern screen dialect (claude only).
+    pub dialect_version: DialectVersion,
 }
 
 impl View {
@@ -145,6 +182,7 @@ impl View {
             model,
             dir_name,
             alt_screen: true,
+            dialect_version: DialectVersion::Legacy,
         }
     }
 
@@ -152,6 +190,23 @@ impl View {
     #[must_use]
     pub fn title(&self) -> String {
         match self.dialect {
+            Dialect::Claude if self.dialect_version.is_modern() => {
+                // 2.1.270 (claude-channels §3.1): glyph-prefixed title. `✳` is
+                // idle *or* a dialog; `◐`/`◑` alternate ~1 Hz while busy.
+                match self.mode {
+                    ScreenMode::Working => {
+                        let glyph = if self.elapsed_secs.is_multiple_of(2) {
+                            '\u{25d0}'
+                        } else {
+                            '\u{25d1}'
+                        };
+                        format!("{glyph} {}", self.dir_name)
+                    }
+                    // Approval and plain idle share the spark; progress (not
+                    // the title) disambiguates them.
+                    _ => format!("\u{2733} {}", self.dir_name),
+                }
+            }
             Dialect::Claude => match self.mode {
                 ScreenMode::Approval => format!("⚠ Action Required - {}", self.dir_name),
                 ScreenMode::Working => format!("{} - claude", self.dir_name),
@@ -178,6 +233,21 @@ impl View {
         }
     }
 
+    /// Raw `OSC 9;4` payload after the `9;4;` prefix.
+    ///
+    /// Modern claude emits the state token with an **empty** percent
+    /// (`3;` / `0;`), exactly as measured in the 2.1.270 probes; the legacy
+    /// dialect keeps `state;value` so its existing golden bytes are unchanged.
+    #[must_use]
+    pub fn osc_progress_payload(&self) -> String {
+        let (state, value) = self.progress();
+        if self.dialect == Dialect::Claude && self.dialect_version.is_modern() {
+            format!("{state};")
+        } else {
+            format!("{state};{value}")
+        }
+    }
+
     /// OSC 9;4 parameters `(state, value)`.
     #[must_use]
     pub fn progress(&self) -> (u8, i64) {
@@ -192,6 +262,18 @@ impl View {
     fn working_line(&self) -> String {
         let elapsed = self.elapsed_secs;
         match self.dialect {
+            Dialect::Claude if self.dialect_version.is_modern() => {
+                // The defining D-2 trait: no `esc to interrupt` anywhere. The
+                // spinner verb is decoration and the elapsed counter is the
+                // only machine-readable part (design §2.4: never transported).
+                match self.phase {
+                    Some(WorkingPhase::Running) => {
+                        format!("\u{273b} Grooving… ({elapsed}s)")
+                    }
+                    Some(WorkingPhase::Responding) => "\u{273b} Responding…".to_owned(),
+                    _ => "\u{273b} Thinking…".to_owned(),
+                }
+            }
             Dialect::Claude => match self.phase {
                 Some(WorkingPhase::Running) => {
                     let tool = self.running_tool.clone().unwrap_or_else(|| "Bash".into());
@@ -559,9 +641,37 @@ pub fn enter(view: &View) -> String {
     }
     out.push_str("\x1b[?2004h");
     out.push_str(&format!("\x1b]0;{}\x07", view.title()));
-    let (state, value) = view.progress();
-    out.push_str(&format!("\x1b]9;4;{state};{value}\x07"));
+    out.push_str(&format!("\x1b]9;4;{}\x07", view.osc_progress_payload()));
     out
+}
+
+/// The OSC 0 / OSC 9;4 bytes needed to move from `(prev_title, prev_progress)`
+/// to the view's current regions.
+///
+/// The modern claude dialect calls this on every repaint: the real TUI emits
+/// these edges at turn start (+16–31 ms), at permission dialogs (−9 ms) and at
+/// turn end (`9;4;0` right after `Stop`). The legacy dialect emits OSC only at
+/// [`enter`], so its callers must not use this.
+#[must_use]
+pub fn osc_transitions(
+    view: &View,
+    prev_title: &str,
+    prev_progress: &str,
+) -> (String, Option<String>, Option<String>) {
+    let title = view.title();
+    let progress = view.osc_progress_payload();
+    let mut out = String::new();
+    let mut next_title = None;
+    let mut next_progress = None;
+    if title != prev_title {
+        out.push_str(&format!("\x1b]0;{title}\x07"));
+        next_title = Some(title);
+    }
+    if progress != prev_progress {
+        out.push_str(&format!("\x1b]9;4;{progress}\x07"));
+        next_progress = Some(progress);
+    }
+    (out, next_title, next_progress)
 }
 
 /// Full byte repaint for a PTY: home-clear, every grid row positioned
@@ -681,5 +791,62 @@ mod tests {
         let text = render_grid(&view, 80, 24).join("\n");
         assert!(text.contains("Yes, I trust this folder"));
         assert!(text.contains("Is this a project you created or one you trust?"));
+    }
+
+    #[test]
+    fn modern_claude_working_screen_has_no_esc_to_interrupt() {
+        // D-2: the phrase this defect is named for must genuinely be absent.
+        let mut view = View::new(Dialect::Claude, "m".into(), "work".into());
+        view.dialect_version = DialectVersion::Modern;
+        view.mode = ScreenMode::Working;
+        view.phase = Some(WorkingPhase::Running);
+        let text = render_grid(&view, 80, 24).join("\n");
+        assert!(!text.contains("esc to interrupt"), "modern text:\n{text}");
+        assert!(!text.contains("interrupt"));
+        // And the legacy dialect keeps it, so the goldens stay meaningful.
+        view.dialect_version = DialectVersion::Legacy;
+        let legacy = render_grid(&view, 80, 24).join("\n");
+        assert!(legacy.contains("esc to interrupt"));
+    }
+
+    #[test]
+    fn modern_claude_emits_osc_edges_with_an_empty_percent() {
+        let mut view = View::new(Dialect::Claude, "m".into(), "probe".into());
+        view.dialect_version = DialectVersion::Modern;
+        assert_eq!(view.osc_progress_payload(), "0;");
+        let idle_title = view.title();
+        assert!(idle_title.starts_with('\u{2733}'), "{idle_title:?}");
+
+        view.mode = ScreenMode::Working;
+        assert_eq!(view.osc_progress_payload(), "3;");
+        let busy_title = view.title();
+        assert!(
+            busy_title.starts_with(['\u{25d0}', '\u{25d1}']),
+            "{busy_title:?}"
+        );
+        // Legacy keeps the full state;value shape.
+        view.dialect_version = DialectVersion::Legacy;
+        assert_eq!(view.osc_progress_payload(), "3;0");
+    }
+
+    #[test]
+    fn modern_osc_transitions_fire_only_on_the_edge() {
+        let mut view = View::new(Dialect::Claude, "m".into(), "probe".into());
+        view.dialect_version = DialectVersion::Modern;
+        let prev_title = view.title();
+        let prev_progress = view.osc_progress_payload();
+        let (quiet, t, p) = osc_transitions(&view, &prev_title, &prev_progress);
+        assert!(quiet.is_empty());
+        assert!(t.is_none() && p.is_none());
+
+        view.mode = ScreenMode::Working;
+        let (edges, t, p) = osc_transitions(&view, &prev_title, &prev_progress);
+        assert!(edges.contains("\x1b]9;4;3;\x07"), "{edges:?}");
+        assert!(
+            edges.starts_with("\x1b]0;"),
+            "title edge rides the turn start"
+        );
+        assert_eq!(t, Some(view.title()));
+        assert_eq!(p, Some("3;".to_owned()));
     }
 }

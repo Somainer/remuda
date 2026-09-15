@@ -177,7 +177,9 @@ async fn create_provider(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if kind == "gateway" && token.is_none() {
-        return Err(HubError::BadRequest("authToken is required on create".into()));
+        return Err(HubError::BadRequest(
+            "authToken is required on create".into(),
+        ));
     }
     let default_gateway = body.default_gateway && kind == "gateway";
     let scope = validate_scope(&state, body.scope.as_deref()).await?;

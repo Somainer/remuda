@@ -57,6 +57,15 @@ export type TranscriptNode =
       origin: MessageOrigin;
       local?: LocalBubble;
       /**
+       * Local-only enrichment merged from the optimistic bubble that joined
+       * this journal node by commandId (C2). The journal never echoes the
+       * staged attachment thumbnails (D-027) back, so they ride in here
+       * WITHOUT marking the whole node `local` — `local` would mis-render the
+       * authoritative journal node as an optimistic bubble (withdraw button,
+       * optimistic testid).
+       */
+      localAttachments?: LocalBubble["attachments"];
+      /**
        * Server command that delivered this prompt (C2). Present only on human
        * user nodes that came through a Remuda command; natively typed prompts
        * leave it unset.
@@ -432,10 +441,10 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     // observation as soon as the command is enqueued, which can beat the HTTP
     // response, so this join happens even while the bubble is still `queued`.
     //
-    // The bubble still owns facts the journal never echoes back: the local
-    // attachment thumbnails (D-027) and the PromptMode badge. Merge those onto
-    // the joined node in place so the rendered row keeps them instead of
-    // dropping them when the optimistic bubble is hidden.
+    // The bubble still owns a fact the journal never echoes back: the local
+    // attachment thumbnails (D-027). Carry them onto the joined node in place
+    // so the rendered row keeps them instead of dropping them when the
+    // optimistic bubble is hidden.
     if (bubble.commandId) {
       const joinedIndex = nodes.findIndex(
         (node) =>
@@ -446,10 +455,14 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       if (joinedIndex >= 0) {
         const joined = nodes[joinedIndex];
         if (joined.type === "message") {
-          // Carry the bubble's local-only state (attachment thumbnails and
-          // the PromptMode badge) onto the authoritative journal node so the
-          // rendered row keeps them after the optimistic bubble is hidden.
-          nodes[joinedIndex] = { ...joined, local: bubble };
+          // Carry the bubble's local-only attachment thumbnails onto the
+          // authoritative journal node (the journal never echoes them back),
+          // but leave `local` unset so the node does not render as an
+          // optimistic bubble.
+          nodes[joinedIndex] = {
+            ...joined,
+            localAttachments: joined.localAttachments ?? bubble.attachments,
+          };
         }
         continue;
       }

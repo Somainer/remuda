@@ -298,15 +298,14 @@ describe("assembleTranscript · C2 commandId correlation", () => {
       createdAt: "2026-09-15T00:00:00.000Z",
     }) as never;
 
-  it("joins the optimistic bubble's local state onto the commandId journal node", () => {
+  it("joins the optimistic bubble's local-only attachments onto the commandId node", () => {
     const nodes = assembleTranscript([userMessage(1, "do it", "cmd_1")], [bubble("do it", { commandId: "cmd_1" })]);
     const users = nodes.filter((n): n is Extract<(typeof nodes)[number], { type: "message" }> => n.type === "message" && n.role === "user");
     expect(users).toHaveLength(1);
-    // The single row is the authoritative journal node, not the optimistic id.
+    // The single row is the authoritative journal node, not an optimistic
+    // bubble (no `local`), so it keeps the journal testid and no withdraw button.
     expect(users[0]).toMatchObject({ id: "obj_n1", commandId: "cmd_1" });
-    // …but it carries the bubble's local-only state (attachments/mode).
-    expect(users[0].local).toMatchObject({ commandId: "cmd_1" });
-    expect(users[0].local!.clientRequestId.startsWith("local_")).toBe(true);
+    expect(users[0].local).toBeUndefined();
   });
 
   it("carries attachment thumbnails onto the joined commandId node (D-027 paste + send)", () => {
@@ -322,7 +321,9 @@ describe("assembleTranscript · C2 commandId correlation", () => {
         n.type === "message" && n.role === "user" && n.commandId === "cmd_img",
     );
     expect(user).toBeDefined();
-    expect(user!.local?.attachments).toEqual([
+    // Carried as local-only enrichment, not by flipping the node to local.
+    expect(user!.local).toBeUndefined();
+    expect(user!.localAttachments).toEqual([
       { objectId: "obj_1", name: "red.png", previewUrl: "blob:red", index: 1 },
     ]);
   });

@@ -766,12 +766,20 @@ function renderNode(
             attachments={node.local.attachments}
             className={session.bubble}
           />
+        ) : node.localAttachments?.length ? (
+          // Journal node joined onto its optimistic bubble by commandId:
+          // inline [Image #n] anchors resolve against the staged previews.
+          <AnchorText
+            text={node.text}
+            attachments={node.localAttachments}
+            className={session.bubble}
+          />
         ) : (
           <p className={session.bubble}>{node.text}</p>
         )}
         {streaming ? <span className={session.cursor} data-testid="streaming-cursor" aria-hidden /> : null}
-        {node.local?.attachments?.length ? (
-          <SentAttachments attachments={node.local.attachments} />
+        {node.local?.attachments?.length || node.localAttachments?.length ? (
+          <SentAttachments attachments={(node.local?.attachments ?? node.localAttachments)!} />
         ) : null}
         {node.local?.state === "queued" ? (
           <button className={ui.chip} onClick={() => hubStore.retract(node.local!.clientRequestId)}>

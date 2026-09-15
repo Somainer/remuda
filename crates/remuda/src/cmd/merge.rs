@@ -1,15 +1,16 @@
 //! Coordinator merge: verify an immutable merge, then compare-and-swap main.
 
 mod generated_api;
+mod lock;
 mod queue;
 mod reports;
+mod scratch;
 mod web_e2e;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use clap::Args;
@@ -89,6 +90,10 @@ pub(crate) struct MergeArgs {
     #[arg(long)]
     #[serde(default)]
     pub json: bool,
+    /// Wait for another in-progress merge/queue on this repo instead of exiting 3.
+    #[arg(long)]
+    #[serde(default)]
+    pub wait: bool,
     /// Repository checkout (default: current directory).
     #[arg(long)]
     pub repo: Option<PathBuf>,
@@ -131,6 +136,12 @@ pub(crate) struct Step {
     crates: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     selection: Option<String>,
+    /// Per-step wall-clock budget the gate driver enforced (0 = disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
+    /// "timeout" | "child-lost" when the gate driver killed the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 impl Step {
@@ -146,6 +157,8 @@ impl Step {
             error: None,
             crates: None,
             selection: None,
+            timeout_seconds: None,
+            reason: None,
         }
     }
 }
@@ -287,6 +300,25 @@ pub(crate) fn run(args: MergeArgs) -> Result<i32> {
 
 /// Shared synchronous operation; MCP runs this on a blocking worker.
 pub(crate) fn execute(args: MergeArgs) -> MergeReport {
+    // Concurrency guard: one merge/queue per repository (+ one per gate
+    // target directory). Contention is a structured exit-3 report, available
+    // to both the CLI and the MCP entry points.
+    let _locks = match acquire_locks(&args) {
+        Ok(locks) => locks,
+        Err(error) => match error.downcast_ref::<lock::Contended>() {
+            Some(contended) => return locked_report(&args, &contended.0),
+            None => {
+                let mut report = new_report(
+                    args.branch.as_deref().unwrap_or(&args.queue.join(", ")),
+                    &args,
+                );
+                report.exit_code = 1;
+                report.status = "gate_failed".into();
+                report.error = Some(format!("{error:#}"));
+                return report;
+            }
+        },
+    };
     if !args.queue.is_empty() {
         return queue::run_queue(args);
     }
@@ -351,6 +383,47 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
             report.error.as_deref().unwrap_or("merge completed")
         ));
     }
+    report
+}
+
+/// Acquire the concurrency-guard locks before running a merge/queue.
+fn acquire_locks(args: &MergeArgs) -> Result<lock::MergeLocks> {
+    if args.dry_run {
+        return Ok(lock::MergeLocks::empty());
+    }
+    let cwd = args.repo.clone().unwrap_or(std::env::current_dir()?);
+    let repo = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
+    if !args.queue.is_empty() {
+        // The queue parent holds the repository lock; lane children are
+        // marked QUEUE_WORKER and lock their own per-lane target directories.
+        lock::MergeLocks::acquire_repo_lock(&repo, args.wait)
+    } else {
+        // The queue parent already suffixes per-lane target dirs before
+        // spawning children, so use the (already resolved) --target-dir as
+        // given instead of re-applying the lane suffix.
+        let target = args.gate.then(|| {
+            args.target_dir
+                .as_ref()
+                .map(|path| repo.join(path))
+                .unwrap_or_else(|| repo.join("target-gate"))
+        });
+        lock::MergeLocks::acquire(&repo, target.as_deref(), args.wait)
+    }
+}
+
+fn locked_report(args: &MergeArgs, info: &lock::LockInfo) -> MergeReport {
+    let name = if args.queue.is_empty() {
+        args.branch.clone().unwrap_or_default()
+    } else {
+        format!("queue[{}]", args.queue.join(", "))
+    };
+    let mut report = new_report(&name, args);
+    if !args.queue.is_empty() {
+        report.branch = name;
+    }
+    report.exit_code = 3;
+    report.status = "locked".into();
+    report.error = Some(lock::Contended(info.clone()).to_string());
     report
 }
 
@@ -1177,31 +1250,20 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 
 struct TemporaryWorktree {
     repo: PathBuf,
-    directory: PathBuf,
+    /// Scratch root; only it and paths strictly inside it may be removed.
+    scratch: PathBuf,
     path: PathBuf,
     removed: bool,
 }
 
 impl TemporaryWorktree {
     fn new(repo: &Path) -> Result<Self> {
-        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let parent = repo.join("data/tmp");
-        fs::create_dir_all(&parent).context("create data/tmp")?;
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let directory = parent.join(format!(
-            "merge-{}-{timestamp}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&directory).context("reserve temporary merge directory")?;
-        // Match the path recorded by Git even when data/tmp is a symlink.
-        let directory = directory
-            .canonicalize()
-            .context("resolve merge directory")?;
+        let scratch = scratch::create_root()?;
+        let path = scratch.join("worktree");
         Ok(Self {
             repo: repo.into(),
-            path: directory.join("worktree"),
-            directory,
+            scratch,
+            path,
             removed: false,
         })
     }
@@ -1224,7 +1286,8 @@ impl TemporaryWorktree {
                 ],
             )?;
         }
-        fs::remove_dir_all(&self.directory).context("remove temporary merge directory")?;
+        // Containment-checked deletion: no caller path can ever reach here.
+        scratch::remove_within(&self.scratch, &self.scratch)?;
         self.removed = true;
         Ok(())
     }

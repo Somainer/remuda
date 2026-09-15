@@ -9,6 +9,10 @@ import { formatListTime, shortId } from "../../lib/format";
 import { nativeShort, projectStatus, uiMode } from "../../lib/status";
 import { hubStore, useHub } from "../../lib/store";
 import { useWorkbenchViewport } from "../../lib/viewport";
+import { modifierAriaShortcut, modifierBadgeText, platformInfo } from "../../lib/platform";
+import { useModifierHeld } from "../../lib/useModifierHeld";
+import { buildSpaces, useSpacesPrefs } from "../spaces/store";
+import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
 import { LaunchedByMark } from "./LaunchedBy";
 import {
@@ -106,6 +110,25 @@ export function SessionList({
 
   const filterCount = conditionCount(conditions);
   const live = hub.connection === "live";
+
+  // The one shared ordering behind ⌘/Ctrl+1–9: Shell's keydown handler resolves
+  // digits through the same switchSlots() call, so a badge can never name a
+  // session the keypress would not open (filters and status groups only change
+  // where a slotted row is painted, never its number).
+  const prefs = useSpacesPrefs();
+  const slots = useMemo(() => {
+    if (!space?.id) return [] as ReturnType<typeof switchSlots>;
+    const fullSpace = buildSpaces(hub.workspaces, hub.instances, prefs).find((item) => item.id === space.id);
+    return switchSlots(fullSpace, prefs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [space?.id, hub.workspaces, hub.instances, prefs]);
+  const slotById = useMemo(() => new Map(slots.map((instance, index) => [instance.id, index + 1])), [slots]);
+  const platform = platformInfo();
+  // No hold gesture on a phone or a touch platform; the hook never attaches a
+  // listener there and neither the badge nor the shortcut claim is rendered.
+  const gestureEnabled = !mobile && platform.heldModifiersSupported;
+  const modifierHeld = useModifierHeld(gestureEnabled);
+
   const [selected, setSelected] = useState<string[]>([]);
   const [broadcast, setBroadcast] = useState("");
   const [filterOpen, setFilterOpen] = useState(false);
@@ -528,6 +551,7 @@ export function SessionList({
               const checked = selected.includes(instance.id);
               const worktree = workspace?.worktreeLabel ?? workspace?.label;
               const branch = workspace?.branch;
+              const slot = slotById.get(instance.id) ?? 0;
               return (
                 <article
                   key={instance.id}
@@ -553,6 +577,7 @@ export function SessionList({
                     data-testid="session-row"
                     data-status={status}
                     data-kind={instance.kind}
+                    aria-keyshortcuts={gestureEnabled && slot ? modifierAriaShortcut(slot, platform) : undefined}
                   >
                     <div className={css.meta} data-testid="session-lifecycle">
                       <span>{instance.lifecycle}</span>
@@ -598,6 +623,15 @@ export function SessionList({
                       ) : null}
                       {badge ? <div className={css.badge}>{badge}</div> : null}
                       {exitLabel(instance) ? <div className={css.exit}>{exitLabel(instance)}</div> : null}
+                      {gestureEnabled && slot ? (
+                        <span
+                          className={css.keyBadge}
+                          data-held={modifierHeld ? "1" : "0"}
+                          aria-hidden="true"
+                        >
+                          {modifierBadgeText(slot, platform)}
+                        </span>
+                      ) : null}
                     </div>
                     {tty && screen?.lines.length ? (
                       <pre className={css.snippet} data-testid="board-snippet">
@@ -695,6 +729,11 @@ export function SessionList({
           </section>
         );
       })}
+      {gestureEnabled && slots.length ? (
+        <footer className={css.switchHint} data-testid="session-switch-hint" aria-hidden="true">
+          按住 {platform.glyph} 快捷切换
+        </footer>
+      ) : null}
     </div>
   );
 }

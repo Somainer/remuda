@@ -4,6 +4,8 @@ import { isSessionRoute, MORE_NAV } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
 import { formatDiagnostic, notify, notifyStore, toastAdapter, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
+import { isTypingTarget } from "../lib/keyboardScope";
+import { switchSlots } from "../lib/sessionSlots";
 import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { SpaceTabs } from "../features/spaces/SpaceTabs";
@@ -197,14 +199,19 @@ export function Shell() {
     if (mobile || !onSessions || onNew) return;
     const onKey = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey || event.isComposing || event.repeat) return;
-      const target = event.target;
-      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"], .xterm')) return;
+      // Never steal a chord from the composer, a form field or an attached
+      // terminal. QuickFind's ⌘K shares this guard, so a digit can never
+      // switch tabs while the finder is open and owns the keystroke.
+      if (isTypingTarget(event.target)) return;
       if (event.key.toLowerCase() === "b") {
         event.preventDefault();
         spaceStore.setCollapsed(!workbench.prefs.collapsed);
       } else if (/^[1-9]$/.test(event.key)) {
-        const tab = workbench.tabs[Number(event.key) - 1];
-        if (!tab || !workbench.active) return;
+        if (!workbench.active) return;
+        // Same ordered list SessionList numbers its badges from: the visible
+        // tabs of the active Space, dismissal-filtered, capped at nine.
+        const tab = switchSlots(workbench.active, workbench.prefs)[Number(event.key) - 1];
+        if (!tab) return;
         event.preventDefault();
         spaceStore.selectTab(workbench.active.id, tab.id);
         navigate(`/s/${tab.id}`);

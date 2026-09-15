@@ -404,6 +404,12 @@ pub struct AttachmentRef {
     /// Stored byte length, for local budget checks before the pull.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// 1-based anchor number, matching the `[Image #n]` token in the prompt
+    /// text and the composer chip (2026-09-15). The array is ordered by token
+    /// appearance; older clients omit this and the receiver falls back to the
+    /// array position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
 }
 
 /// `instance.send` params.

@@ -69,6 +69,7 @@ fn attachment(object_id: &str, media_type: &str) -> AttachmentRef {
         media_type: media_type.to_owned(),
         name: Some(format!("{object_id}.png")),
         size: None,
+        index: None,
     }
 }
 

@@ -64,22 +64,66 @@ describe("composer attachments", () => {
 
   it("sends the staged reference, never the bytes", async () => {
     const onSend = vi.fn();
-    render(<Composer instanceId="ins_send" mobile={false} onSend={onSend} />);
-    const input = screen.getByTestId("composer-input");
+    const { container } = render(
+      <Composer instanceId="ins_send" mobile={false} onSend={onSend} />,
+    );
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: "what colour is this?" } });
+    input.setSelectionRange(20, 20);
     fireEvent.paste(input, pasteEvent([png()]));
     await waitFor(() => expect(upload).toHaveBeenCalled());
     await waitFor(() =>
       expect(screen.getByTestId("composer-send").hasAttribute("disabled")).toBe(false),
     );
+    expect(input.value).toBe("what colour is this? [Image #1]");
+    expect(container.querySelector("[data-index='1']")).toBeTruthy();
 
     fireEvent.click(screen.getByTestId("composer-send"));
     await waitFor(() => expect(onSend).toHaveBeenCalled());
     const [text, refs] = onSend.mock.calls[0];
-    expect(text).toBe("what colour is this?");
+    expect(text).toBe("what colour is this? [Image #1]");
     expect(refs).toEqual([
-      { objectId: "obj_pasted", mediaType: "image/png", name: "shot.png", size: 4 },
+      { index: 1, objectId: "obj_pasted", mediaType: "image/png", name: "shot.png", size: 4 },
     ]);
+  });
+
+  it("inserts tokens 1 and 2, and removing the first chip renumbers the rest", async () => {
+    render(<Composer instanceId="ins_renumber" mobile={false} onSend={vi.fn()} />);
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    fireEvent.paste(input, pasteEvent([png("a.png"), png("b.png")]));
+
+    const chips = await screen.findAllByTestId("attachment-chip");
+    expect(chips).toHaveLength(2);
+    expect(input.value).toBe("[Image #1] [Image #2]");
+    await waitFor(() => expect(upload).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getAllByTestId("attachment-remove")[0]);
+    await waitFor(() =>
+      expect(screen.queryAllByTestId("attachment-chip")).toHaveLength(1),
+    );
+    expect(input.value).toBe("[Image #1]");
+    expect(screen.getByTestId("attachment-index").textContent).toBe("1");
+  });
+
+  it("marks a chip 未引用 when its token is edited out, but still sends it", async () => {
+    const onSend = vi.fn();
+    render(<Composer instanceId="ins_orphan" mobile={false} onSend={onSend} />);
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    fireEvent.paste(input, pasteEvent([png()]));
+    await waitFor(() => expect(upload).toHaveBeenCalled());
+    expect(input.value).toBe("[Image #1]");
+
+    // User deletes the token but keeps the chip staged.
+    fireEvent.change(input, { target: { value: "no token here" } });
+    const chip = await screen.findByTestId("attachment-chip");
+    expect(chip.getAttribute("data-unreferenced")).toBe("1");
+    expect(screen.getByText("未引用（仍会发送）")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(onSend).toHaveBeenCalled());
+    const [, refs] = onSend.mock.calls[0];
+    expect(refs).toHaveLength(1);
+    expect(refs[0]).toMatchObject({ index: 1, objectId: "obj_pasted" });
   });
 
   // A half-uploaded reference would not resolve on the Hub.

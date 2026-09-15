@@ -119,6 +119,7 @@ describe("refsOf", () => {
     ]);
     expect(refs.map((ref) => ref.objectId)).toEqual(["obj_1", "obj_2"]);
     expect(refs[0]).toEqual({
+      index: 1,
       objectId: "obj_1",
       mediaType: "image/png",
       name: "a.png",
@@ -129,5 +130,33 @@ describe("refsOf", () => {
   it("is empty when nothing has been staged", () => {
     expect(refsOf([])).toEqual([]);
     expect(refsOf([{ ...base, state: "uploading", objectId: undefined }])).toEqual([]);
+  });
+
+  it("orders the manifest by first token appearance when given the prompt text", () => {
+    const chips = [
+      base,
+      { ...base, localId: "att_2", objectId: "obj_2", name: "b.png" },
+      { ...base, localId: "att_3", objectId: "obj_3", name: "c.png" },
+    ];
+    // Prompt references #2 before #1; #3's token was edited away so #3 is
+    // 未引用 but still sent — it trails the referenced ones.
+    const refs = refsOf(chips, "start [Image #2] then [Image #1] end");
+    expect(refs.map((ref) => [ref.objectId, ref.index])).toEqual([
+      ["obj_2", 2],
+      ["obj_1", 1],
+      ["obj_3", 3],
+    ]);
+  });
+
+  it("keeps unreferenced-but-sent attachments last, still carrying their index", () => {
+    const chips = [
+      base,
+      { ...base, localId: "att_2", objectId: "obj_2", name: "b.png" },
+    ];
+    const refs = refsOf(chips, "only the second one: [Image #2]");
+    expect(refs.map((ref) => [ref.objectId, ref.index])).toEqual([
+      ["obj_2", 2],
+      ["obj_1", 1],
+    ]);
   });
 });

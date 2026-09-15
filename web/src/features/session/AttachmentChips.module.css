@@ -84,3 +84,43 @@
   border: 1px solid var(--line);
   display: block;
 }
+
+/* Anchor number badge: the same n as the [Image #n] token in the prompt. */
+.thumbWrap {
+  position: relative;
+  flex: none;
+  line-height: 0;
+}
+
+.indexBadge {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.68);
+  color: #fff;
+  font-size: 10px;
+  line-height: 14px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.chip[data-unreferenced="1"] {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.sentWrap {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+}
+
+.sentWrap .indexBadge {
+  left: 4px;
+  top: 4px;
+}

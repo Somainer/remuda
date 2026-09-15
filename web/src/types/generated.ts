@@ -1897,6 +1897,7 @@ export type LiteralEnv = ({
 
 /** MediaBlock; `protocol.md` §5.2. */
 export type MediaBlock = ({
+  "anchor"?: (number | null);
   "mediaType": (string);
   "name": (string | null);
   "objectId": Id;

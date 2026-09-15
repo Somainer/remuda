@@ -347,10 +347,9 @@ wire_enum!(ModelEffective, "3.1", {
 
 // Native reasoning-effort vocabulary shared by the harness CLIs.
 //
-// `minimal` is not a Claude Code level: Claude exposes only `low..=max`,
-// while Codex's `model_reasoning_effort` and Grok's `--reasoning-effort`
-// also accept `minimal` (Codex parser; Grok power-user spelling). The
-// driver gates which values each kind may launch with.
+// Codex exposes `low..=ultra`; `minimal` is retained as an input alias for
+// Codex `low`. Claude exposes `low..=max`; its `ultracode` workflow flag is
+// separate from Codex's `ultra` level. The driver gates each harness's levels.
 wire_enum!(EffortName, "4.1", {
     Minimal => "minimal",
     Low => "low",
@@ -358,6 +357,7 @@ wire_enum!(EffortName, "4.1", {
     High => "high",
     Xhigh => "xhigh",
     Max => "max",
+    Ultra => "ultra",
 });
 
 // Where an *effective* effort observation came from; D-028 §9.1:

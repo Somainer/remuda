@@ -115,6 +115,27 @@ impl FileTail {
         })
     }
 
+    /// Start at the current end of the file: only bytes appended after this
+    /// tail is created are ever read. For following an already-long shared
+    /// file (e.g. the main session transcript) for a single new marker.
+    pub fn at_end(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let path = path.into();
+        let offset = match File::open(&path) {
+            Ok(file) => file.metadata()?.len(),
+            // A not-yet-created file starts at zero and begins reading once
+            // the file appears.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err.into()),
+        };
+        Ok(Self {
+            path,
+            identity: Id::new("obj")?,
+            generation: 1,
+            offset,
+            prefix_digest: None,
+        })
+    }
+
     /// Resume from a persisted cursor.
     pub fn from_resume(path: impl Into<PathBuf>, resume: SourceResume) -> Self {
         Self {

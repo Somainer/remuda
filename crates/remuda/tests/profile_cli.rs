@@ -107,7 +107,11 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
         String::from_utf8_lossy(&out.stderr)
     );
     let catalog: Value = serde_json::from_slice(&out.stdout)?;
-    assert_eq!(catalog["revision"], 1);
+    assert_eq!(
+        catalog["revision"],
+        remuda_hub::CATALOG_REVISION,
+        "catalog revision must match the built-in catalog"
+    );
 
     // 2. declare priority + concurrency + a family window
     let out = run(&[

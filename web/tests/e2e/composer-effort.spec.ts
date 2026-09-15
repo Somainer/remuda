@@ -53,6 +53,16 @@ async function openEffort(page: Page) {
   await expect(page.getByTestId("effort-slider")).toBeVisible();
 }
 
+/** Requested selections cannot stand in for native read-back in these mock sessions. */
+async function assertRequestedEffortUnknown(page: Page, name: string) {
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", name);
+  const chip = page.getByTestId("model-effort-chip");
+  await expect(chip).toHaveAttribute("aria-label", `Select effort, ${name}; effective unknown`);
+  await expect(chip).toHaveAttribute("data-effort-effective", "unknown");
+  await expect(chip).toHaveAttribute("data-effort-source", "unknown");
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
+}
+
 async function dragSlider(page: Page, at: "start" | "end") {
   const slider = page.getByTestId("effort-slider");
   const box = await slider.boundingBox();
@@ -138,12 +148,12 @@ async function assertSingleLine(chip: Locator) {
 }
 
 test.describe("composer control bar and effort", () => {
-  test("chips render collapsed with native values", async ({ page }) => {
+  test("chips render collapsed with requested effort and unknown native read-back", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
     await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
-    await expect(page.getByTestId("model-effort-chip")).toContainText(/high/);
+    await assertRequestedEffortUnknown(page, "high");
     await expect(page.getByTestId("model-effort-chip")).not.toContainText(/opus|sonnet/);
     await expect(page.getByTestId("context-chip")).toBeVisible();
     await expect(page.getByTestId("permission-chip")).toContainText(/询问|可改|全自动|绕过/);
@@ -153,7 +163,7 @@ test.describe("composer control bar and effort", () => {
     }
   });
 
-  test("effort popover is a snapping six-stop slider and selecting a tier updates the chip", async ({ page }) => {
+  test("effort popover is a snapping six-stop slider and selecting a tier updates the request", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await openEffort(page);
@@ -189,7 +199,7 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
     await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
-    await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
+    await assertRequestedEffortUnknown(page, "ultracode");
     await expect(slider).toHaveAttribute("data-name", "ultracode");
     await expect(slider).toHaveAttribute("data-index", "5");
     await expect(slider).toHaveAttribute("data-tier-index", "3");
@@ -199,7 +209,7 @@ test.describe("composer control bar and effort", () => {
     await slider.focus();
     await page.keyboard.press("ArrowLeft");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
-    await expect(page.getByTestId("model-effort-chip")).toContainText("max");
+    await assertRequestedEffortUnknown(page, "max");
     await expect(slider).toHaveAttribute("data-index", "4");
     await expect(slider).toHaveAttribute("data-effort-look", "top");
     await expect(slider).toHaveAttribute("data-ember", "0");
@@ -231,10 +241,10 @@ test.describe("composer control bar and effort", () => {
     await expect(slider).toHaveAttribute("aria-disabled", "false");
     await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(0);
     await expect(page.getByTestId("effort-embers")).toBeVisible();
-    // The composer stamps the wire name but the chip names the stop ultracode.
+    // The request and slider name the ultracode stop; native read-back stays unknown.
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
-    await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
+    await assertRequestedEffortUnknown(page, "ultracode");
     await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
     // Home leaves the stop entirely and lands back on low.
     await page.keyboard.press("Home");
@@ -292,28 +302,32 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("effort-embers")).toHaveCount(0);
   });
 
-  test("codex New Session sheet enumerates the verified minimal..xhigh vocabulary 1:1", async ({ page }) => {
+  test("codex New Session sheet enumerates the verified low..ultra vocabulary 1:1", async ({ page }) => {
     await page.goto("/sessions/new");
     await page.getByTestId("new-session-kind-codex").click();
     const slider = page.getByTestId("new-session-effort-slider");
-    await expect(slider).toHaveAttribute("data-tiers", "minimal,low,medium,high,xhigh");
-    // The invented `ultra` word is gone, along with model-gated `max`.
-    await expect(slider).not.toHaveAttribute("data-tiers", /ultra|max/);
-    await expect(slider).toHaveAttribute("aria-valuemax", "4");
-    // The CLI default is medium (index 2), not a ratio-mapped Claude high.
-    await expect(slider).toHaveAttribute("data-name", "medium");
-    // Every stop maps 1:1 onto a native word; only the top row carries an accent.
+    await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultra");
+    await expect(slider).not.toHaveAttribute("data-tiers", /minimal/);
+    await expect(slider).toHaveAttribute("aria-valuemax", "5");
+    // Switching from the device's Claude high default preserves the nearest
+    // slider position: 2/4 maps to Codex xhigh at 3/5.
+    await expect(slider).toHaveAttribute("data-name", "xhigh");
+    await expect(slider).toHaveAttribute("data-index", "3");
+    // Max shares Claude max's accent; only Ultra gets the full ember field.
     await slider.press("Home");
-    const words = ["minimal", "low", "medium", "high", "xhigh"] as const;
+    const words = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+    const labels = ["Low", "Medium", "High", "Extra high", "Max", "Ultra"] as const;
     for (const [i, word] of words.entries()) {
       await expect(slider).toHaveAttribute("data-name", word);
-      await expect(slider).toHaveAttribute("data-effort-look", i === 4 ? "top" : "plain");
-      await expect(slider).toHaveAttribute("data-ember", "0");
-      await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(0);
+      await expect(slider).toHaveAttribute("aria-valuetext", labels[i]);
+      await expect(page.getByTestId("new-session-effort-title")).toHaveText(labels[i]);
+      await expect(slider).toHaveAttribute("data-effort-look", i === 5 ? "ultracode" : i === 4 ? "top" : "plain");
+      await expect(slider).toHaveAttribute("data-ember", i === 5 ? "1" : "0");
+      await expect(slider).toHaveAttribute("data-ultracode", "0");
+      await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(i === 5 ? 1 : 0);
       if (i < words.length - 1) await slider.press("ArrowRight");
     }
-    // The stamped wire word is a current codex value — never `ultra`.
-    await expect(page.getByTestId("new-session-effort")).toHaveAttribute("data-effort", "xhigh");
+    await expect(page.getByTestId("new-session-effort")).toHaveAttribute("data-effort", "ultra");
   });
 
   test("an existing session shows the harness as a label, not a menu", async ({ page }) => {
@@ -435,10 +449,13 @@ test.describe("composer control bar and effort", () => {
     await page.reload();
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1");
-    await expect(page.getByTestId("model-effort-chip")).toContainText("ultracode");
+    await assertRequestedEffortUnknown(page, "ultracode");
+    await openEffort(page);
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-name", "ultracode");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-index", "5");
   });
 
-  test("grok pty shows four chips including a read-only yolo permission", async ({ page }) => {
+  test("structured Grok session shows four chips including its editable permission menu", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "Grok 会话").click();
     await expect(page.getByTestId("session-page")).toBeVisible();
@@ -449,8 +466,16 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
     await expect(page.getByTestId("model-effort-chip")).toBeVisible();
     await expect(page.getByTestId("context-chip")).toBeVisible();
-    await expect(page.getByTestId("permission-chip")).toHaveAttribute("data-readonly", "1");
-    await expect(page.getByTestId("permission-chip")).toContainText(/always-approve/);
+    // This fixture reports a structured-workflow capability, so SessionPage
+    // provides the permission menu rather than the raw-PTY read-only label.
+    const permission = page.getByTestId("permission-chip");
+    await expect(permission).toContainText("询问");
+    await expect(permission).toHaveAttribute("aria-expanded", "false");
+    await permission.click();
+    await expect(permission).toHaveAttribute("aria-expanded", "true");
+    await expect(page.getByTestId("permission-menu")).toBeVisible();
+    await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+    await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
   });
 
   test("the fill reaches the knob at every stop; the ember field exists on ultracode alone", async ({ page }) => {

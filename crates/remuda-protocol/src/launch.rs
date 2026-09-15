@@ -124,13 +124,13 @@ pub struct NativeHome {
 
 /// Native effort selection; `protocol.md` §4.1 (D-028 §9.1).
 ///
-/// Five Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is
-/// **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only,
-/// and is never persisted as a level name.
+/// Six Codex levels (`low..=ultra`), five Claude levels (`low..=max`), and an
+/// orthogonal Claude `ultracode` boolean. `ultracode` is `xhigh` plus dynamic
+/// workflow, is session-only, and is never persisted as a level name. It is
+/// independent of Codex's `ultra` level.
 ///
-/// [`EffortName`] additionally carries `minimal`, which Claude Code does not
-/// expose: the Codex/Grok vocabularies do. It is rejected at Claude launches
-/// by the driver, so it can never reach `claude --effort`.
+/// [`EffortName`] additionally carries the legacy `minimal` input, which maps
+/// to `low` for Codex and is rejected at Claude, agy, and Grok launches.
 ///
 /// Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes
 /// legacy tier **names** through [`normalize_legacy_effort`], so a stored row
@@ -141,7 +141,8 @@ pub struct NativeHome {
 /// | `default` | any | `low` |
 /// | `think` | claude | `high` |
 /// | `think-hard` | claude | `xhigh` |
-/// | `ultra` | any | `xhigh` (the old invented web/codex top tier) |
+/// | `minimal` | codex | `low` |
+/// | `ultra` | codex | `ultra` (a real Codex level; rejected by other harnesses) |
 /// | `quick` / `standard` / `max` | grok | `low` / `medium` / `xhigh` |
 /// | `ultracode` | claude | `xhigh` + `ultracode: true` |
 /// | anything unrecognized | any | the harness default (`high` for claude, `medium` otherwise) |
@@ -153,7 +154,7 @@ pub struct NativeHome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EffortSelection {
-    /// Claude level (`low..=max`); `minimal` is Codex/Grok-only.
+    /// Native level: Codex `low..=ultra`, Claude `low..=max`, Grok `low..=xhigh`.
     pub name: EffortName,
     /// Dynamic-workflow flag (`--effort ultracode`). Session-only.
     pub ultracode: bool,
@@ -168,14 +169,16 @@ pub struct EffortSelection {
 /// normalizer did.
 pub fn normalize_legacy_effort(kind: AgentKind, name: &str) -> EffortSelection {
     match name.trim().to_ascii_lowercase().as_str() {
-        // Current words are identities on every harness (minimal has no
-        // meaning for claude, but a current-looking word is passed through;
-        // the driver rejects it at launch if the CLI cannot parse it).
+        // Preserve current words so the driver can reject unsupported levels
+        // with its existing InvalidLaunchSpec error, rather than silently
+        // downgrading a request for another harness's level.
+        "minimal" if kind == AgentKind::Codex => EffortName::Low,
         "minimal" => EffortName::Minimal,
         "low" => EffortName::Low,
         "medium" => EffortName::Medium,
         "high" => EffortName::High,
         "xhigh" => EffortName::Xhigh,
+        "ultra" => EffortName::Ultra,
         // claude's real top.
         "max" => {
             // The invented grok table's top word was `max`; grok has no such
@@ -189,7 +192,7 @@ pub fn normalize_legacy_effort(kind: AgentKind, name: &str) -> EffortSelection {
         // Cross-harness legacy words, by name not index.
         "default" => EffortName::Low,
         "think" => EffortName::High,
-        "think-hard" | "ultra" => EffortName::Xhigh,
+        "think-hard" => EffortName::Xhigh,
         // The invented grok quick/standard/max table (slider pass 1, never a
         // grok vocabulary — grok-build parses low/medium/high/xhigh).
         "quick" if kind == AgentKind::Grok => EffortName::Low,
@@ -247,7 +250,7 @@ impl EffortSelection {
     ///
     /// Equivalent to [`normalize_legacy_effort`] with `AgentKind::Claude`.
     /// Kept for the kind-less call sites; new code should normalize with the
-    /// harness kind so codex/grok legacy words (ultra, quick/standard/max)
+    /// harness kind so codex/grok legacy words (minimal, quick/standard/max)
     /// migrate onto the right native table.
     pub fn from_legacy_name(name: &str) -> Self {
         normalize_legacy_effort(AgentKind::Claude, name)
@@ -257,7 +260,7 @@ impl EffortSelection {
     ///
     /// This is what gets persisted: `ultracode` rides along as its own boolean
     /// so a stored row still records which level it is equivalent to, rather
-    /// than collapsing into a name that is not one of the five.
+    /// than collapsing into a name that is not a native level.
     pub fn level_name(&self) -> &'static str {
         match self.name {
             EffortName::Minimal => "minimal",
@@ -266,6 +269,7 @@ impl EffortSelection {
             EffortName::High => "high",
             EffortName::Xhigh => "xhigh",
             EffortName::Max => "max",
+            EffortName::Ultra => "ultra",
         }
     }
 

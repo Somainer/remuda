@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
 import ui from "../styles/ui.module.css";
 import css from "./codeBlock.module.css";
+import mentionCss from "./fileMention.module.css";
 import { CodeBlock } from "./CodeBlock";
 
 function nodeText(node: ReactNode): string {
@@ -11,6 +12,44 @@ function nodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(nodeText).join("");
   return "";
+}
+
+/**
+ * The exact line the driver prepends to a harness prompt for a non-image
+ * attachment (D-027b): `[File #n] <name> (<mime>, <size>) saved at <path>`.
+ * It is quoted back in structured transcripts and renders collapsed.
+ */
+const FILE_MENTION_RE =
+  /^\[File #(\d+)\] (.+) \(([^,()]+), ([^)]+)\) saved at (.+)$/;
+
+export type FileMention = { index: number; name: string; mime: string; size: string; path: string };
+
+/** Parse one expansion line, or null when it is not one. */
+export function parseFileMention(line: string): FileMention | null {
+  const match = FILE_MENTION_RE.exec(line.trim());
+  if (!match) return null;
+  return {
+    index: Number(match[1]),
+    name: match[2],
+    mime: match[3],
+    size: match[4],
+    path: match[5],
+  };
+}
+
+function FileMentionRow({ mention }: { mention: FileMention }) {
+  return (
+    <details className={mentionCss.mention} data-testid="file-mention" data-index={mention.index}>
+      <summary className={mentionCss.summary}>
+        <span aria-hidden>📎</span>
+        <span className={mentionCss.name} title={mention.name}>
+          {`[File #${mention.index}] ${mention.name}`}
+        </span>
+        <span className={mentionCss.meta}>{`${mention.mime} · ${mention.size}`}</span>
+      </summary>
+      <p className={mentionCss.path}>{`saved at ${mention.path}`}</p>
+    </details>
+  );
 }
 
 /**
@@ -45,14 +84,21 @@ function FencedCode(rawProps: unknown) {
 }
 
 /**
- * react-markdown + remark-gfm + rehype-sanitize: GFM without raw HTML; code
- * colour is lazy on demand. Fenced code renders through CodeBlock (wrap /
- * copy / 评论 toolbar); inline code keeps the default element.
+ * Split text into markdown segments and collapsed D-027b file-mention lines.
+ *
+ * The driver's `[File #n] … saved at …` expansion can be quoted back inside a
+ * structured message; it is a file reference, not prose the user typed, so it
+ * renders as a collapsed row exactly like the other attachment anchors.
  */
-export function MarkdownText({ text }: { text: string }) {
-  return (
-    <div className={`${ui.md} ${css.mdSurface}`}>
+function renderWithFileMentions(text: string): ReactNode {
+  const lines = text.split("\n");
+  const out: ReactNode[] = [];
+  let markdown: string[] = [];
+  const flush = (key: number) => {
+    if (markdown.length === 0) return;
+    out.push(
       <Markdown
+        key={`md-${key}`}
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSanitize]}
         components={{
@@ -62,8 +108,31 @@ export function MarkdownText({ text }: { text: string }) {
           code: FencedCode,
         }}
       >
-        {text}
-      </Markdown>
-    </div>
+        {markdown.join("\n")}
+      </Markdown>,
+    );
+    markdown = [];
+  };
+  lines.forEach((line, index) => {
+    const mention = parseFileMention(line);
+    if (mention) {
+      flush(index);
+      out.push(<FileMentionRow key={`file-${index}`} mention={mention} />);
+    } else {
+      markdown.push(line);
+    }
+  });
+  flush(lines.length);
+  return out;
+}
+
+/**
+ * react-markdown + remark-gfm + rehype-sanitize: GFM without raw HTML; code
+ * colour is lazy on demand. Fenced code renders through CodeBlock (wrap /
+ * copy / 评论 toolbar); inline code keeps the default element.
+ */
+export function MarkdownText({ text }: { text: string }) {
+  return (
+    <div className={`${ui.md} ${css.mdSurface}`}>{renderWithFileMentions(text)}</div>
   );
 }

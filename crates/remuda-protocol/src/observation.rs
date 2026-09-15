@@ -148,11 +148,16 @@ pub struct MediaBlock {
     /// `name`; protocol §5.2.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub name: Option<String>,
-    /// 1-based anchor number matching the `[Image #n]` token in the
-    /// accompanying text block (2026-09-15). Absent for producers that do not
-    /// number attachments; consumers then use block order.
+    /// 1-based anchor number matching the `[Image #n]`/`[File #n]` token in
+    /// the accompanying text block (2026-09-15). Absent for producers that do
+    /// not number attachments; consumers then use block order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<u32>,
+    /// Stored byte length (D-027b, 2026-09-15). Used by path-reference
+    /// delivery for the human-readable `(mime, size)` line. Absent on older
+    /// frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// ResourceBlock; `protocol.md` §5.2.

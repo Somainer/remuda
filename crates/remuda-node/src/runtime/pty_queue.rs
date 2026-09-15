@@ -119,8 +119,12 @@ fn enqueue(
     origin: remuda_protocol::InputOrigin,
     prompts: &crate::prompt_correlation::PromptCorrelator,
 ) -> Result<PendingPrompt, NodeError> {
-    let ObservationPayload::Message(mut message) =
-        crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?
+    let ObservationPayload::Message(mut message) = crate::driver::message_payload(
+        MessageRole::User,
+        MessagePhase::Input,
+        prompt.clone(),
+        Vec::new(),
+    )?
     else {
         return Err(NodeError::InvalidRequest("expected user message".into()));
     };
@@ -211,6 +215,9 @@ async fn deliver(
             return Ok(true);
         }
     };
+    // Build journal metadata blocks before the send moves the materialized
+    // vec. The completed user message (below) records the absolute paths.
+    let landed_blocks = crate::attachments::content_blocks(&attachments);
     // Cancelling a readiness probe cannot submit input. Never time out or replay send().
     let execution =
         match tokio::time::timeout(Duration::from_millis(100), driver.wait_control()).await {
@@ -243,6 +250,14 @@ async fn deliver(
             return Ok(false);
         }
         Ok(emissions) => {
+            // D-027b: now that the bytes have landed, record the absolute
+            // paths as journal metadata on the completed user message. The
+            // queued placeholder (pre-resolve) deliberately stays text-only.
+            if !landed_blocks.is_empty() {
+                let text_blocks = std::mem::take(&mut prompt.message.blocks);
+                prompt.message.blocks = landed_blocks;
+                prompt.message.blocks.extend(text_blocks);
+            }
             update_message(store, instance_id, prompt, ContentStatus::Complete)?;
             for emission in emissions {
                 let observation = store.append_observation(

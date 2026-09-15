@@ -258,10 +258,16 @@ pub struct ObjectRecord {
     pub instance_id: String,
     /// Host of that instance, so a Node can only read its own attachments.
     pub host_id: String,
-    /// Sniffed media type; the caller's `Content-Type` never overrides it.
+    /// Sniffed media type; the caller's `Content-Type` never overrides an
+    /// image's sniffed type.
     pub media_type: String,
-    /// Derived `<obj_id>.<ext>` name. Original filenames are discarded.
+    /// Derived `<obj_id>.<ext>` name used internally for the blob.
     pub stored_name: String,
+    /// Sanitised original filename supplied at upload (D-027b); the Node
+    /// lands the pull under this name, with a numeric collision suffix.
+    pub original_name: Option<String>,
+    /// `image` vs `file` (D-027b).
+    pub kind: String,
     /// Lowercase hex SHA-256 of the bytes.
     pub digest: String,
     /// Stored length.
@@ -279,13 +285,16 @@ pub struct NewObject {
     pub instance_id: String,
     /// Host owning that instance.
     pub host_id: String,
-    /// Sniffed media type.
+    /// Sniffed/accepted media type.
     pub media_type: String,
-    /// Extension for the derived stored name.
+    /// Extension for the derived internal blob name.
     pub extension: String,
+    /// Sanitised original filename to echo back on refs (D-027b); `None` when
+    /// the upload carried none.
+    pub original_name: Option<String>,
     /// Lowercase hex SHA-256.
     pub digest: String,
-    /// Image bytes.
+    /// Attachment bytes.
     pub bytes: Vec<u8>,
     /// Uploading device, for the audit line.
     pub device_id: String,
@@ -1351,19 +1360,24 @@ impl Store {
                 )));
             }
             let object_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
-            // Derived, never caller-supplied: no traversal is representable.
+            // Derived, never caller-supplied: the blob name itself cannot
+            // traverse. The original name is a separate column (D-027b).
             let stored_name = format!("{object_id}.{}", new.extension);
+            let kind =
+                remuda_protocol::hubnode::AttachmentKind::from_media_type(&new.media_type).as_str();
             tx.execute(
                 "INSERT INTO objects
-                    (id, instance_id, host_id, media_type, stored_name, digest, byte_len,
-                     bytes, created_by, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    (id, instance_id, host_id, media_type, stored_name, original_name, kind,
+                     digest, byte_len, bytes, created_by, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     object_id,
                     new.instance_id,
                     new.host_id,
                     new.media_type,
                     stored_name,
+                    new.original_name,
+                    kind,
                     new.digest,
                     byte_len,
                     new.bytes,
@@ -1379,6 +1393,8 @@ impl Store {
                 host_id: new.host_id,
                 media_type: new.media_type,
                 stored_name,
+                original_name: new.original_name,
+                kind: kind.to_owned(),
                 digest: new.digest,
                 byte_len,
                 expires_at,
@@ -3459,6 +3475,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             host_id TEXT NOT NULL,
             media_type TEXT NOT NULL,
             stored_name TEXT NOT NULL,
+            original_name TEXT,
+            kind TEXT NOT NULL DEFAULT 'image',
             digest TEXT NOT NULL,
             byte_len INTEGER NOT NULL,
             bytes BLOB NOT NULL,
@@ -3665,6 +3683,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
     // 2026-09-15: [Image #n] anchor assigned by the send manifest.
     ensure_column(&conn, "objects", "anchor", "INTEGER")?;
+    // D-027b (2026-09-15): arbitrary files carry their sanitised original
+    // filename and an image/file kind; pre-D-027b rows were all images.
+    ensure_column(&conn, "objects", "original_name", "TEXT")?;
+    ensure_column(&conn, "objects", "kind", "TEXT NOT NULL DEFAULT 'image'")?;
     ensure_column(&conn, "pair_codes", "code_prefix", "TEXT")?;
     ensure_column(
         &conn,
@@ -4799,6 +4821,9 @@ mod tests {
             ("claude", "ultra"),
             ("claude", "ultracode"),
             ("claude", "whatever"),
+            ("codex", "minimal"),
+            ("codex", "xhigh"),
+            ("codex", "max"),
             ("codex", "ultra"),
             ("codex", "bogus"),
             ("grok", "quick"),
@@ -4855,6 +4880,59 @@ mod tests {
                 Some(expected.ultracode),
                 "{kind}:{legacy} disagrees with remuda-protocol"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_top_efforts_round_trip_through_configure_and_reload() {
+        let (_dir, store, host) = store_with_host("enroll-codex-top-efforts").await;
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "codex".into(),
+                "generic-pty".into(),
+                Some("codex-top-efforts".into()),
+                json!({ "effortName": "minimal" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(instance.effort_name.as_deref(), Some("low"));
+
+        for (index, name) in [(4, "max"), (5, "ultra"), (4, "max")] {
+            let payload = json!({
+                "instanceId": instance.instance_id,
+                "effort": { "index": index, "name": name, "kind": "codex", "ultracode": false }
+            });
+            let (command, created) = store
+                .queue_command(
+                    None,
+                    Some(instance.instance_id.clone()),
+                    host.clone(),
+                    "instance.configure".into(),
+                    payload.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(created);
+            assert_eq!(command.payload["effort"]["name"], json!(name));
+            assert_eq!(command.payload["effort"]["index"], json!(index));
+            let patched = store
+                .patch_instance_configure(instance.instance_id.clone(), payload)
+                .await
+                .unwrap();
+            assert_eq!(patched.effort_name.as_deref(), Some(name));
+            assert_eq!(patched.effort_ultracode, Some(false));
+            let reloaded = store
+                .get_instance(instance.instance_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.effort_name.as_deref(), Some(name));
+            assert_eq!(reloaded.effort_ultracode, Some(false));
+            let listed = store.list_instances(None).await.unwrap();
+            assert_eq!(listed[0].effort_name.as_deref(), Some(name));
         }
     }
 
@@ -5517,15 +5595,17 @@ fn object_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
         host_id: row.get(2)?,
         media_type: row.get(3)?,
         stored_name: row.get(4)?,
-        digest: row.get(5)?,
-        byte_len: row.get(6)?,
-        expires_at: row.get(7)?,
-        anchor: row.get(8)?,
+        original_name: row.get(5)?,
+        kind: row.get(6)?,
+        digest: row.get(7)?,
+        byte_len: row.get(8)?,
+        expires_at: row.get(9)?,
+        anchor: row.get(10)?,
     })
 }
 
-const OBJECT_COLUMNS: &str =
-    "id, instance_id, host_id, media_type, stored_name, digest, byte_len, expires_at, anchor";
+const OBJECT_COLUMNS: &str = "id, instance_id, host_id, media_type, stored_name, original_name, \
+                             kind, digest, byte_len, expires_at, anchor";
 
 fn load_object(conn: &Connection, id: &str) -> Result<Option<ObjectRecord>, StoreError> {
     conn.query_row(
@@ -5731,9 +5811,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .map(str::to_string);
             let effort = spec.get("effort");
             // D-028 §9.1: normalize by NAME, never by index, using the shared
-            // per-harness normalizer (remuda-protocol): codex `ultra` and the
-            // invented grok quick/standard/max table migrate onto the verified
-            // vocabulary here, exactly as the driver and the web table do.
+            // per-harness normalizer (remuda-protocol). Codex `max` / `ultra`
+            // remain native levels; legacy Codex `minimal` and Grok aliases
+            // migrate exactly as the driver and the web table do.
             let legacy_name = effort
                 .and_then(|value| value.get("name"))
                 .and_then(Value::as_str)

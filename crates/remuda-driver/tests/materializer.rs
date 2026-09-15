@@ -1187,11 +1187,13 @@ mod shell_pty_agent {
         let tmp = tempfile::tempdir().unwrap();
         let mut codex = agent_spec(AgentKind::Codex);
         for (name, expected) in [
-            (EffortName::Minimal, "minimal"),
+            (EffortName::Minimal, "low"),
             (EffortName::Low, "low"),
             (EffortName::Medium, "medium"),
             (EffortName::High, "high"),
             (EffortName::Xhigh, "xhigh"),
+            (EffortName::Max, "max"),
+            (EffortName::Ultra, "ultra"),
         ] {
             codex.effort = Some(EffortSelection {
                 name,
@@ -1211,18 +1213,19 @@ mod shell_pty_agent {
             assert_eq!(config, &format!("model_reasoning_effort=\"{expected}\""));
         }
 
-        // `max` is not in codex's offered set and must error, not pass through.
+        // `ultra` is a Codex level; the orthogonal `ultracode` workflow flag
+        // remains Claude-only and must still error rather than pass through.
         codex.effort = Some(EffortSelection {
-            name: EffortName::Max,
-            ultracode: false,
+            name: EffortName::Ultra,
+            ultracode: true,
         });
         let binary = stub_binary(tmp.path(), "1.0.0");
-        let home = tmp.path().join("home-max");
+        let home = tmp.path().join("home-ultracode");
         fs::create_dir_all(&home).unwrap();
         let mut bad = request(
             &codex,
             Box::leak(Box::new(native_profile())),
-            &tmp.path().join("launch-codex-max"),
+            &tmp.path().join("launch-codex-ultracode"),
             &home,
             pin_source(&binary),
         );
@@ -1251,7 +1254,7 @@ mod shell_pty_agent {
             assert_eq!(value, Some(expected), "{name:?}: {:?}", out.argv);
             assert!(!out.argv.iter().any(|t| t == "--effort"));
         }
-        for name in [EffortName::Minimal, EffortName::Max] {
+        for name in [EffortName::Minimal, EffortName::Max, EffortName::Ultra] {
             grok.effort = Some(EffortSelection {
                 name,
                 ultracode: false,

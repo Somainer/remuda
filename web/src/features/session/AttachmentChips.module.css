@@ -139,3 +139,67 @@
   font-size: 10px;
   flex: none;
 }
+
+/* D-027b: non-image file glyph in a draft chip — same 32px box as a thumb. */
+.fileGlyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--paper) 8%, transparent);
+  font-size: 17px;
+  flex: none;
+}
+
+/* D-027b: downloadable file chip under a sent bubble. */
+.sentFile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 240px;
+  min-width: 0;
+  padding: 6px 10px 6px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  color: var(--paper);
+  text-decoration: none;
+}
+
+.sentFile:hover {
+  border-color: var(--muted);
+}
+
+.sentFileGlyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--paper) 8%, transparent);
+  font-size: 17px;
+  flex: none;
+}
+
+.sentFileMeta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.sentFileName {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sentFileSize {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}

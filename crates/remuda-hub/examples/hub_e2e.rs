@@ -514,6 +514,35 @@ async fn fake_node(
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
                 let command_id = params.get("commandId").and_then(Value::as_str);
+                // §9.1: a terminal-side `/effort <level>` typed in the PTY is
+                // observed as a hand-typed slash command — the fake node emits
+                // the matching effort observation attributed to `slash`, and
+                // nothing calls instance.configure back (no ping-pong).
+                if let Some(word) = prompt.strip_prefix("/effort:") {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    let (tier, ultra) = if word == "ultracode" {
+                        ("xhigh", serde_json::Value::Bool(true))
+                    } else {
+                        (word, serde_json::Value::Bool(false))
+                    };
+                    append_n = append_event(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "effort",
+                        json!({
+                            "effective": {
+                                "name": tier,
+                                "ultracode": ultra,
+                                "source": "slash",
+                                "observedAt": "2026-09-14T12:00:00.000Z"
+                            },
+                            "raw": tier
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
                 // r-ux-comment: reply with a fenced code block so the browser
                 // spec can exercise the 评论 quote action. The prompt is also
                 // echoed verbatim below, proving the expanded quote arrived.
@@ -654,52 +683,80 @@ async fn fake_node(
             }
             "instance.configure" => {
                 // §9.1: emulate a native agent that accepted `/effort` and
-                // whose next assistant record reports the level back. When the
+                // whose command verdict reports the level back. When the
                 // requested level differs from what the transcript says, the
                 // fake agent reports a *clamped* level — exactly the
                 // 请求 max → 实际 xhigh path the UI must render.
+                //
+                // Test-only sentinels (the UI never sends these; the spec
+                // posts them directly to exercise the driver's lifecycle
+                // paths without a real PTY):
+                //   "__queued__:<word>"   → effort-queued lifecycle only
+                //   "__degrade__:<word>"  → effort-degraded lifecycle only
                 if let Some(effort) = params.get("effort")
                     && let Some(requested) = effort.get("name").and_then(Value::as_str)
                 {
-                    let observed = match requested {
+                    if let Some(word) = requested.strip_prefix("__queued__:") {
+                        append_n = append_configure_status(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            &format!("effort-queued:{word}"),
+                        )
+                        .await?;
+                    } else if let Some(word) = requested.strip_prefix("__degrade__:") {
+                        append_n = append_configure_status(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            &format!("effort-degraded:{word}:dialog-kept"),
+                        )
+                        .await?;
+                    } else {
                         // Keep the Claude mismatch fixture; Codex must echo
                         // both max and ultra unchanged through the Hub.
-                        "max"
-                            if instance_kinds.get(&instance_id).map(String::as_str)
-                                == Some("claude") =>
-                        {
-                            "xhigh"
-                        }
-                        other => other,
-                    };
-                    let observed_at = "2026-09-14T12:00:00.000Z";
-                    let event = json!({
-                        "kind": "effort",
-                        "completeness": "structured",
-                        "payload": {
-                            "requested": {"name": requested,
-                                "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
-                            "effective": {
-                                "name": observed,
-                                "ultracode": if requested == "ultracode" {
-                                    serde_json::Value::Bool(true)
-                                } else {
-                                    serde_json::Value::Null
+                        let clamped = requested == "max"
+                            && instance_kinds.get(&instance_id).map(String::as_str)
+                                == Some("claude");
+                        let ultra = requested == "ultracode";
+                        // ultracode reads back as tier xhigh on Claude; a
+                        // clamped max reads back xhigh too.
+                        let tier = if clamped || ultra { "xhigh" } else { requested };
+                        let observed_at = "2026-09-14T12:00:00.000Z";
+                        let event = json!({
+                            "kind": "effort",
+                            "completeness": "structured",
+                            "payload": {
+                                "requested": {"name": requested,
+                                    "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
+                                "effective": {
+                                    // Measured 2.1.272: ultracode carries the
+                                    // workflow flag; a plain level accept
+                                    // positively clears it; an unrelated clamp
+                                    // leaves the flag unknown.
+                                    "name": tier,
+                                    "ultracode": if ultra {
+                                        serde_json::Value::Bool(true)
+                                    } else if clamped {
+                                        serde_json::Value::Null
+                                    } else {
+                                        serde_json::Value::Bool(false)
+                                    },
+                                    "source": "remuda",
+                                    "observedAt": observed_at
                                 },
-                                "source": "remuda",
-                                "observedAt": observed_at
-                            },
-                            "raw": observed
-                        }
-                    });
-                    append_n = append_event(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "effort",
-                        event["payload"].clone(),
-                    )
-                    .await?;
+                                "raw": tier
+                            }
+                        });
+                        append_n = append_event(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "effort",
+                            event["payload"].clone(),
+                        )
+                        .await?;
+                    }
                 }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
@@ -1520,6 +1577,42 @@ fn workflow_kind(prompt: &str) -> Option<&'static str> {
 }
 
 /// Append one arbitrary observation and drain its RPC result.
+/// Append an `instance.configure` native lifecycle with the given status
+/// (`effort-queued:<word>` / `effort-degraded:<word>:<reason>` / …).
+async fn append_configure_status(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    n: u64,
+    status: &str,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": format!("j{seq}"),
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "native",
+                        "nativeName": "instance.configure",
+                        "status": status
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
+}
+
 async fn append_event(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,

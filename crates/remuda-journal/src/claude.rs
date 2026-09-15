@@ -305,7 +305,7 @@ pub(crate) fn map_claude_value(
             Completeness::Opaque,
             native_uuid(value),
         )?]),
-        "attachment" => map_attachment(ctx, value, line, cursor),
+        "attachment" => map_attachment(ctx, ids, value, line, cursor),
         "stream_event" => Ok(vec![opaque(
             ctx,
             cursor,
@@ -356,9 +356,26 @@ fn map_user(
     let content = message.get("content").cloned().unwrap_or(Value::Null);
     let uuid = native_uuid(value);
     let mut out = Vec::new();
-    // §9.1: a typed `/effort <word>` attributes the next level edge.
-    if let Some(word) = remuda_protocol::slash_effort_word(&user_record_text(&content)) {
+    let text = user_record_text(&content);
+    // §9.1: the `/effort` slash record arms attribution; its stdout verdict
+    // is what settles the level (the slash record lands even on reject).
+    if let Some(word) = remuda_protocol::slash_effort_word(&text) {
         ids.effort.note_slash(&word, false);
+    } else if text.contains("<local-command-stdout>") {
+        let stdout = extract_local_stdout(&text);
+        if let Some((observed, source)) = ids.effort.note_stdout(&stdout, false) {
+            out.push(effort_edge_envelope(
+                ctx,
+                ids,
+                value,
+                line,
+                cursor,
+                "effort-stdout",
+                observed,
+                source,
+                Some(&stdout),
+            )?);
+        }
     }
     match content {
         Value::String(text) => {
@@ -434,7 +451,12 @@ fn map_user(
     Ok(out)
 }
 
-/// §9.1 effective-effort envelope for an assistant-record edge.
+/// §9.1 effective-effort envelope for an effort edge.
+///
+/// `native_key` is the assistant message id for assistant-record edges (the
+/// live channel and this tailer derive the same id) or a deterministic key
+/// derived from the `/effort` stdout verdict record, which settles a switch
+/// before any next-turn assistant record exists.
 #[allow(clippy::too_many_arguments)]
 fn effort_envelope(
     ctx: &MapContext,
@@ -442,12 +464,12 @@ fn effort_envelope(
     value: &Value,
     line: &[u8],
     cursor: &FileCursor,
-    assistant_native_id: &str,
+    native_key: &str,
     observed: remuda_protocol::ObservedEffort,
     source: remuda_protocol::EffortSource,
     raw: Option<&str>,
 ) -> Result<Envelope, Error> {
-    let event_id = ids.effort_event(assistant_native_id, observed.name);
+    let event_id = ids.effort_event(native_key, observed.name);
     let mut env = envelope(
         ctx,
         cursor,
@@ -470,6 +492,28 @@ fn effort_envelope(
     Ok(env)
 }
 
+/// Envelope for an edge settled by a `/effort` stdout verdict / ultra
+/// attachment — records that carry no assistant message id.
+#[allow(clippy::too_many_arguments)]
+fn effort_edge_envelope(
+    ctx: &MapContext,
+    ids: &NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+    native_suffix: &str,
+    observed: remuda_protocol::ObservedEffort,
+    source: remuda_protocol::EffortSource,
+    raw: Option<&str>,
+) -> Result<Envelope, Error> {
+    let native = native_uuid(value)
+        .map(|uuid| format!("{native_suffix}:{uuid}"))
+        .unwrap_or_else(|| format!("{native_suffix}:{}", cursor.offset.0));
+    effort_envelope(
+        ctx, ids, value, line, cursor, &native, observed, source, raw,
+    )
+}
+
 /// Plain-text view of a user record's content (string or text-block array).
 fn user_record_text(content: &Value) -> String {
     match content {
@@ -481,6 +525,16 @@ fn user_record_text(content: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// Text inside `<local-command-stdout>…</local-command-stdout>`.
+fn extract_local_stdout(content: &str) -> String {
+    let Some(start) = content.find("<local-command-stdout>") else {
+        return content.trim().to_owned();
+    };
+    let body = &content[start + "<local-command-stdout>".len()..];
+    let end = body.find("</local-command-stdout>").unwrap_or(body.len());
+    body[..end].trim().to_owned()
 }
 
 fn map_assistant(
@@ -690,6 +744,7 @@ fn map_system(
 
 fn map_attachment(
     ctx: &MapContext,
+    ids: &mut NativeIds,
     value: &Value,
     line: &[u8],
     cursor: &FileCursor,
@@ -698,6 +753,19 @@ fn map_attachment(
         .pointer("/attachment/type")
         .and_then(Value::as_str)
         .unwrap_or("attachment");
+    // §9.1: 2.1.272 rides the ultracode enter/exit attachment on the next
+    // prompt; emit the effort flag edge it implies.
+    if atype == "ultra_effort_enter" || atype == "ultra_effort_exit" {
+        if let Some((observed, source)) = ids
+            .effort
+            .note_ultra_attachment(atype == "ultra_effort_enter")
+        {
+            return Ok(vec![effort_edge_envelope(
+                ctx, ids, value, line, cursor, atype, observed, source, None,
+            )?]);
+        }
+        return Ok(Vec::new());
+    }
     let (topic, name, completeness, reason) = match atype {
         "hook_success" | "hook_failure" => (
             Some(LifecycleTopic::Hook),

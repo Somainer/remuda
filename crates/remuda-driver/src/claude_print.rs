@@ -1943,6 +1943,22 @@ fn workflow_state(status: &str) -> WorkflowState {
 /// - **Retention.** `queue-operation`, `permission-mode` and
 ///   `attachment.queued_command` records are journaled as lifecycle rather
 ///   than dropped: they are the queue ledger and the mode-drift record.
+///
+/// §9.1 effort read-back is resolved from the `/effort` command's
+/// `<local-command-stdout>` verdict (see
+/// `remuda_protocol::parse_effort_stdout`), not from the next assistant turn.
+///
+/// Extract the text inside `<local-command-stdout>…</local-command-stdout>`.
+fn extract_local_stdout(content: &str) -> String {
+    let Some(start) = content.find("<local-command-stdout>") else {
+        return content.trim().to_owned();
+    };
+    let body = &content[start + "<local-command-stdout>".len()..];
+    let end = body.find("</local-command-stdout>").unwrap_or(body.len());
+    body[..end].trim().to_owned()
+}
+
+/// Transcript-to-observations mapper for a live claude-pty session.
 pub struct TranscriptMapper {
     mapper: Mapper,
     group: records::Group,
@@ -2109,7 +2125,9 @@ impl TranscriptMapper {
         if kind == "assistant" {
             extra = self.map_effort_assistant(&value)?;
         } else if kind == "user" {
-            self.note_effort_slash(&value);
+            extra = self.note_effort_user(&value)?;
+        } else if kind == "attachment" {
+            extra = self.note_effort_attachment(&value)?;
         }
         let mut mapped = match kind {
             "assistant" => self.map_assistant_record(value),
@@ -2130,56 +2148,103 @@ impl TranscriptMapper {
         Ok(mapped)
     }
 
-    /// §9.1: a `/effort` user record marks the source of the next changed
-    /// assistant record. When the bytes were Remuda's own pending switch the
-    /// attribution is `remuda`, not `slash` — the same transcript record is
-    /// produced in both cases, so the bridge is the only thing that can tell.
-    fn note_effort_slash(&mut self, value: &Value) {
+    /// §9.1: the `/effort` command writes TWO user records — the slash markup
+    /// and its `<local-command-stdout>` verdict. The slash record only arms
+    /// attribution (on 2.1.272 it lands even for a dismissed dialog); the
+    /// verdict settles the level and resolves or rejects the switch bridge.
+    /// Returns an effort edge observation when the verdict changes the level.
+    fn note_effort_user(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
         let Some(message) = value.get("message") else {
-            return;
-        };
-        let Some(word) = remuda_protocol::slash_effort_word(&records::record_text(message)) else {
-            return;
-        };
-        let from_remuda = self
-            .effort_bridge
-            .as_ref()
-            .and_then(|bridge| bridge.pending())
-            .is_some_and(|request| request.command_word() == word);
-        if from_remuda
-            && let Some(bridge) = &self.effort_bridge
-            && let Some((generation, request)) = bridge.pending_with_gen()
-        {
-            self.effort_generation = Some(generation);
-            self.effort.arm_awaiting(request.observed_name());
-        }
-        self.effort.note_slash(&word, from_remuda);
-    }
-
-    /// §9.1: read `effort` / `perTurnEffort` off an assistant record, arm a
-    /// Remuda switch awaiting read-back, and emit an `effort` observation on
-    /// edges. Conversation mapping is unaffected — this is a side channel.
-    fn map_effort_assistant(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
-        // Pick up a switch the driver armed since the last record.
-        if let Some(bridge) = &self.effort_bridge
-            && let Some((generation, request)) = bridge.pending_with_gen()
-            && self.effort_generation != Some(generation)
-        {
-            self.effort_generation = Some(generation);
-            self.effort.arm_awaiting(request.observed_name());
-            self.effort.note_slash(request.command_word(), true);
-        }
-        let effort = value.get("effort").and_then(Value::as_str);
-        let per_turn = value.get("perTurnEffort").and_then(Value::as_str);
-        let Some((observed, source)) = self.effort.observe(effort, per_turn) else {
             return Ok(Vec::new());
         };
-        if source == remuda_protocol::EffortSource::Remuda
-            && let Some(generation) = self.effort_generation.take()
-            && let Some(bridge) = &self.effort_bridge
-        {
-            bridge.resolve(generation, observed);
+        let text = records::record_text(message);
+        if text.contains("<command-name>/effort</command-name>") {
+            let Some(word) = remuda_protocol::slash_effort_word(&text) else {
+                return Ok(Vec::new());
+            };
+            let from_remuda = self
+                .effort_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.pending())
+                .is_some_and(|request| request.command_word() == word);
+            if from_remuda
+                && let Some(bridge) = &self.effort_bridge
+                && let Some((generation, request)) = bridge.pending_with_gen()
+            {
+                self.effort_generation = Some(generation);
+                self.effort.arm_awaiting(request.observed_name());
+            }
+            self.effort.note_slash(&word, from_remuda);
+            return Ok(Vec::new());
         }
+        if text.contains("<local-command-stdout>") {
+            let stdout = extract_local_stdout(&text);
+            let verdict = remuda_protocol::parse_effort_stdout(&stdout);
+            let from_remuda = self
+                .effort_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.pending())
+                .is_some();
+            if matches!(verdict, remuda_protocol::EffortStdout::Accepted(_)) {
+                if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
+                    if let Some(generation) = self.effort_generation.take()
+                        && let Some(bridge) = &self.effort_bridge
+                    {
+                        bridge.resolve(generation, observed);
+                    }
+                    return self.effort_observation(observed, source, Some(stdout));
+                }
+                // Non-edge accept: still resolve the switch (a switch to the
+                // level already in effect is accepted), carrying the flag.
+                if let Some(generation) = self.effort_generation.take()
+                    && let Some(bridge) = &self.effort_bridge
+                    && let remuda_protocol::EffortStdout::Accepted(observed) = verdict
+                {
+                    bridge.resolve(generation, observed);
+                }
+            } else if matches!(
+                verdict,
+                remuda_protocol::EffortStdout::Kept | remuda_protocol::EffortStdout::Invalid
+            ) && let Some(generation) = self.effort_generation.take()
+                && let Some(bridge) = &self.effort_bridge
+            {
+                let reason = if verdict == remuda_protocol::EffortStdout::Kept {
+                    "dialog-kept"
+                } else {
+                    "invalid-argument"
+                };
+                bridge.reject(generation, reason);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// §9.1: 2.1.272 rides an `ultra_effort_enter|exit` attachment on the next
+    /// prompt; it corroborates the stdout verdict's ultracode flag.
+    fn note_effort_attachment(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        match value.pointer("/attachment/type").and_then(Value::as_str) {
+            Some("ultra_effort_enter") => {
+                if let Some((observed, source)) = self.effort.note_ultra_attachment(true) {
+                    return self.effort_observation(observed, source, None);
+                }
+            }
+            Some("ultra_effort_exit") => {
+                if let Some((observed, source)) = self.effort.note_ultra_attachment(false) {
+                    return self.effort_observation(observed, source, None);
+                }
+            }
+            _ => {}
+        }
+        Ok(Vec::new())
+    }
+
+    /// Build the §9.1 effort observation for one edge.
+    fn effort_observation(
+        &mut self,
+        observed: remuda_protocol::ObservedEffort,
+        source: remuda_protocol::EffortSource,
+        raw: Option<String>,
+    ) -> DriverResult<Vec<Observation>> {
         let requested = self
             .effort_bridge
             .as_ref()
@@ -2188,10 +2253,6 @@ impl TranscriptMapper {
                 name: request.name,
                 ultracode: request.ultracode,
             });
-        let raw = effort
-            .filter(|value| !value.is_empty())
-            .or(per_turn.filter(|value| !value.is_empty()))
-            .map(str::to_owned);
         let payload = ObservationPayload::Effort(Box::new(EffortPayload {
             requested,
             effective: EffortEffective {
@@ -2207,6 +2268,23 @@ impl TranscriptMapper {
             NativeRequestKey::None,
             payload,
         )?])
+    }
+
+    /// §9.1: read `effort` / `perTurnEffort` off an assistant record and emit
+    /// an `effort` observation on edges. Assistant records corroborate the
+    /// level (and launch-time effort) but never resolve a live switch — the
+    /// command verdict does. Conversation mapping is unaffected.
+    fn map_effort_assistant(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        let effort = value.get("effort").and_then(Value::as_str);
+        let per_turn = value.get("perTurnEffort").and_then(Value::as_str);
+        let Some((observed, source)) = self.effort.observe(effort, per_turn) else {
+            return Ok(Vec::new());
+        };
+        let raw = effort
+            .filter(|value| !value.is_empty())
+            .or(per_turn.filter(|value| !value.is_empty()))
+            .map(str::to_owned);
+        self.effort_observation(observed, source, raw)
     }
 
     /// Buffer an assistant record, flushing the previous run when superseded.

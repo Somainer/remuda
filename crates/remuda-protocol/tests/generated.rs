@@ -105,6 +105,9 @@ fn public_wire_types_are_registered_for_generation() {
         // §9.1: pure transcript-mapper state shared between the driver and the
         // journal tailer; it is never serialized on the wire.
         "EffortTracker",
+        // §9.1: parsed verdict of an /effort stdout line — mapper output, not
+        // a wire type.
+        "EffortStdout",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

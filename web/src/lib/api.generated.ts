@@ -761,6 +761,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/own": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the active ownership map (agents see their scope only) */
+        get: operations["ownList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/own/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Check changed paths against a task's owns[] (the merge-gate scope check) */
+        post: operations["ownCheck"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/placement/resolve": {
         parameters: {
             query?: never;
@@ -901,6 +935,112 @@ export interface paths {
         put?: never;
         /** Probe models list / reachability against the gateway */
         post: operations["providerTest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List tasks in the caller's project scope */
+        get: operations["taskList"];
+        put?: never;
+        /** Add a root task (requires the dispatch grant) */
+        post: operations["taskAdd"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tasks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one task with its mandate chain */
+        get: operations["taskGet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Move a task along the state machine (illegal jumps → 409) */
+        patch: operations["taskSetState"];
+        trace?: never;
+    };
+    "/v1/tasks/{id}/land": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Record the landed sha; the only thing dependency edges unlock from (§7 #8) */
+        post: operations["taskLand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tasks/{id}/own": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Claim path globs; conflicting active claims → 409 */
+        post: operations["ownClaim"];
+        /** Release claimed globs (empty list releases all) */
+        delete: operations["ownRelease"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tasks/{id}/placements": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List placement ledger rows for a task */
+        get: operations["placementList"];
+        put?: never;
+        /** Append a placement ledger row (reasons[]/rejected[] = card + audit) */
+        post: operations["placementAdd"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tasks/{id}/split": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Split a child task; the mandate chain is inherited and extended */
+        post: operations["taskSplit"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1364,6 +1504,51 @@ export interface components {
             deviceKind: "human" | "bot";
             deviceName?: string;
         };
+        /** @description Root-first chain of upstream intents carried by every task. */
+        Mandate: {
+            chain: components["schemas"]["MandateLink"][];
+        };
+        /** @description One edge of the inherited owner-intent chain; design §2.5. */
+        MandateLink: {
+            depth: number;
+            intent: string;
+            taskId: string;
+            title: string;
+        };
+        /** @description remuda own check: explicit paths or a pasted diff/stat/name-only listing. */
+        OwnCheckRequest: {
+            diff?: string;
+            paths?: string[];
+            taskId: string;
+        };
+        /** @description within=false means changed paths cross the task's owns[] boundary (§4.3/§7 #3). */
+        OwnCheckResult: {
+            checked: number;
+            state?: components["schemas"]["TaskState"];
+            taskId: string;
+            violations: string[];
+            within: boolean;
+        };
+        /** @description Claim/release body; empty paths on DELETE releases all of the task's claims. */
+        OwnClaim: {
+            paths?: string[];
+        };
+        OwnClaimResult: {
+            owns: string[];
+            taskId: string;
+        };
+        OwnMap: {
+            items: components["schemas"]["OwnMapEntry"][];
+        };
+        /** @description One aggregated active-claim row in the ownership map. */
+        OwnMapEntry: {
+            /** Format: date-time */
+            claimedAt: string;
+            claimedBy: string;
+            paths: string[];
+            projectId: string;
+            taskId: string;
+        };
         PairCode: {
             code: string;
             expiresAt: string;
@@ -1421,6 +1606,48 @@ export interface components {
         };
         PasskeyRename: {
             name: string;
+        };
+        /** @description Append a placement ledger row; drives the legal task-state transition. */
+        PlacementAppend: {
+            branch?: string;
+            harness?: string;
+            hostId?: string;
+            instanceId?: string;
+            /** @enum {string} */
+            kind: "dispatch" | "switch-model" | "park" | "unplace";
+            model?: string;
+            reasons?: string[];
+            rejected?: components["schemas"]["PlacementRejection"][];
+        };
+        PlacementAppendResult: {
+            placement: components["schemas"]["PlacementLedgerRow"];
+            task: components["schemas"]["Task"];
+        };
+        /** @description Placement ledger row; reasons[]/rejected[] are audit trail and bot card (§5.6). */
+        PlacementLedgerRow: {
+            branch?: string;
+            /** Format: date-time */
+            createdAt: string;
+            createdBy: string;
+            harness?: string;
+            hostId?: string;
+            id: string;
+            instanceId?: string;
+            kind: string;
+            model?: string;
+            projectId: string;
+            reasons?: string[];
+            rejected?: components["schemas"]["PlacementRejection"][];
+            taskId: string;
+        };
+        PlacementPage: {
+            items: components["schemas"]["PlacementLedgerRow"][];
+            nextCursor?: string | null;
+        };
+        /** @description Rejected candidate and why. */
+        PlacementRejection: {
+            candidate: string;
+            reason: string;
         };
         PlacementResolve: {
             delegation?: string;
@@ -1723,6 +1950,92 @@ export interface components {
             remuda_binary_policy: "require_installed" | "upload_if_missing";
             /** @description SSH config alias or user@host, resolved by the Hub system SSH client. */
             target: string;
+        };
+        /** @description One row of the task ledger; design §2.2/§2.5/§8.1 row 4. */
+        Task: {
+            blockedReason?: string;
+            budget?: components["schemas"]["TaskBudget"];
+            class: components["schemas"]["TaskClass"];
+            /** Format: date-time */
+            createdAt: string;
+            deps?: components["schemas"]["TaskDep"][];
+            id: string;
+            landedSha?: string;
+            mandate: components["schemas"]["Mandate"];
+            owns?: string[];
+            parentTaskId?: string;
+            placement?: components["schemas"]["TaskPlacementRef"];
+            projectId: string;
+            revision: string;
+            state: components["schemas"]["TaskState"];
+            title: string;
+            /** Format: date-time */
+            updatedAt: string;
+        };
+        /** @description Estimated budget envelope; amounts are estimates (§4.5). */
+        TaskBudget: {
+            maxTurns?: number;
+            maxUsd?: string;
+            maxWallMins?: number;
+        };
+        /**
+         * @description Task class; design §4.3.
+         * @enum {string}
+         */
+        TaskClass: "research" | "implement" | "review" | "test" | "merge-gate" | "triage" | "docs";
+        /** @description remuda task add */
+        TaskCreate: {
+            budget?: components["schemas"]["TaskBudget"];
+            class?: components["schemas"]["TaskClass"];
+            deps?: components["schemas"]["TaskDepInput"][];
+            intent: string;
+            owns?: string[];
+            projectId: string;
+            title: string;
+        };
+        /** @description Dependency edge; unlocks only from the referenced task's landed sha (§7 #8). */
+        TaskDep: {
+            note?: string;
+            taskId: string;
+        };
+        TaskDepInput: {
+            note?: string;
+            taskId: string;
+        };
+        /** @description Record the landed sha from gate/land; the only dep-unlock signal (§7 #8). */
+        TaskLand: {
+            sha: string;
+        };
+        TaskPage: {
+            items: components["schemas"]["Task"][];
+            nextCursor?: string | null;
+        };
+        /** @description Current worker slot for a placed task. */
+        TaskPlacementRef: {
+            branch?: string;
+            hostId?: string;
+            instanceId?: string;
+            model?: string;
+            placementId?: string;
+        };
+        /** @description remuda task split; parent and mandate chain come from the path id */
+        TaskSplit: {
+            budget?: components["schemas"]["TaskBudget"];
+            class?: components["schemas"]["TaskClass"];
+            deps?: components["schemas"]["TaskDepInput"][];
+            intent: string;
+            owns?: string[];
+            title: string;
+        };
+        /**
+         * @description Task ledger state; design §5.3. Legal transitions are enforced Hub-side.
+         * @enum {string}
+         */
+        TaskState: "pending" | "placed" | "running" | "stalled" | "done" | "failed" | "parked" | "deferred";
+        /** @description remuda task set-state; illegal transitions are refused (409). */
+        TaskStateSet: {
+            reason?: string;
+            state: components["schemas"]["TaskState"];
         };
         /** @enum {string} */
         TuiMode: "fullscreen" | "default";
@@ -3164,6 +3477,59 @@ export interface operations {
             404: components["responses"]["Error"];
         };
     };
+    ownList: {
+        parameters: {
+            query?: {
+                /** @description prj_… project id */
+                project?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ownership map */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnMap"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    ownCheck: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OwnCheckRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnCheckResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
     placementResolve: {
         parameters: {
             query?: never;
@@ -3564,6 +3930,303 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    taskList: {
+        parameters: {
+            query?: {
+                /** @description prj_… project id */
+                project?: string;
+                /** @description ledger state filter */
+                state?: components["schemas"]["TaskState"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Task page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    taskAdd: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskCreate"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    taskGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Task */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    taskSetState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskStateSet"];
+            };
+        };
+        responses: {
+            /** @description Task */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    taskLand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskLand"];
+            };
+        };
+        responses: {
+            /** @description Task */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    ownClaim: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OwnClaim"];
+            };
+        };
+        responses: {
+            /** @description Claimed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnClaimResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    ownRelease: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OwnClaim"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnClaimResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    placementList: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Placement rows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlacementPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    placementAdd: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlacementAppend"];
+            };
+        };
+        responses: {
+            /** @description Row and task */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlacementAppendResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    taskSplit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskSplit"];
+            };
+        };
+        responses: {
+            /** @description Child task */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     worktreeList: {

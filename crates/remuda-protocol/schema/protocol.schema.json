@@ -2934,6 +2934,33 @@
         }
       ]
     },
+    "DiffScopeCheck": {
+      "description": "Result of reconciling a diff against a task's `owns[]`; design §4.3\n(`scopeCheck.diffMustStayWithin: owns`) — the single highest-value new\nprimitive (playbook), and the pure function the later merge gate calls.",
+      "properties": {
+        "checked": {
+          "description": "Number of changed paths examined.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "violations": {
+          "description": "Changed paths matched by none of the globs; empty means within scope.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "within": {
+          "description": "True when every changed path is covered by an ownership glob.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "within",
+        "checked"
+      ],
+      "type": "object"
+    },
     "Digest": {
       "pattern": "^sha256:[0-9a-f]{64}$",
       "type": "string"
@@ -5027,7 +5054,7 @@
       ]
     },
     "Id": {
-      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|prj|tsk)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|prj|tsk|plc)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
     "InputAccounting": {
@@ -8500,6 +8527,53 @@
       ],
       "type": "object"
     },
+    "Mandate": {
+      "description": "The inherited owner-intent chain carried by every task; design §2.5.",
+      "properties": {
+        "chain": {
+          "default": [],
+          "description": "Root-first chain, always ending with the owning task's own link.",
+          "items": {
+            "$ref": "#/$defs/MandateLink"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "chain"
+      ],
+      "type": "object"
+    },
+    "MandateLink": {
+      "description": "One edge of the inherited owner-intent chain.\n\nEvery delegation edge attaches the upstream's own words, so a depth-3 node\nstill reads the owner's original instruction rather than a retelling.",
+      "properties": {
+        "depth": {
+          "description": "Depth from the human root; the root task is 0.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "intent": {
+          "description": "The exact words given to that task by its delegator; the root link\ncarries the owner's original intent verbatim.",
+          "type": "string"
+        },
+        "taskId": {
+          "$ref": "#/$defs/TaskId",
+          "description": "Task whose intent this link carries."
+        },
+        "title": {
+          "description": "That task's title, denormalised for cards rendered after renames.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "depth",
+        "taskId",
+        "title",
+        "intent"
+      ],
+      "type": "object"
+    },
     "MediaBlock": {
       "description": "MediaBlock; `protocol.md` §5.2.",
       "properties": {
@@ -11661,6 +11735,119 @@
           "type": "object"
         }
       ]
+    },
+    "PlacementLedgerRow": {
+      "description": "One placement-ledger row; design §2.2 ⑥/§5.6.\n\n`reasons` / `rejected` are both the audit trail and the future bot card\nbody — the two never diverge because there is no second representation.",
+      "properties": {
+        "branch": {
+          "description": "Worktree branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Row timestamp."
+        },
+        "createdBy": {
+          "description": "Device that recorded the row.",
+          "type": "string"
+        },
+        "harness": {
+          "description": "Harness kind (`claude` / `codex` / …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Chosen host, when one was chosen."
+        },
+        "id": {
+          "$ref": "#/$defs/Id",
+          "description": "`plc_…` row id."
+        },
+        "instanceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Worker instance bound by the placement."
+        },
+        "kind": {
+          "description": "One of the `PLACEMENT_KIND_*` constants.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model pinned/selected.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectId": {
+          "$ref": "#/$defs/ProjectId",
+          "description": "Project slice copied for cross-project listings."
+        },
+        "reasons": {
+          "description": "Positive reasons the chosen slot was chosen (the card body).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rejected": {
+          "description": "Candidates rejected and why.",
+          "items": {
+            "$ref": "#/$defs/PlacementRejection"
+          },
+          "type": "array"
+        },
+        "taskId": {
+          "$ref": "#/$defs/TaskId",
+          "description": "Task this placement belongs to."
+        }
+      },
+      "required": [
+        "id",
+        "taskId",
+        "projectId",
+        "kind",
+        "createdBy",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "PlacementRejection": {
+      "description": "One rejected candidate and why; design §4.4/§5.6.",
+      "properties": {
+        "candidate": {
+          "description": "The candidate skipped — a host, `(profile, model)`, or other slot id.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Machine-readable-ish reason (`capacity`, `cooling`, `requires`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidate",
+        "reason"
+      ],
+      "type": "object"
     },
     "PlanReviewAnswer": {
       "description": "PlanReviewAnswer; `protocol.md` §5.4.",
@@ -15464,9 +15651,309 @@
       ],
       "type": "object"
     },
+    "Task": {
+      "description": "One row of the task ledger; design §2.2/§8.1 row 4.",
+      "properties": {
+        "blockedReason": {
+          "description": "Reason carried on `failed` when the worker reported `BLOCKED <reason>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "budget": {
+          "$ref": "#/$defs/TaskBudget",
+          "default": {},
+          "description": "Estimated budget envelope."
+        },
+        "class": {
+          "$ref": "#/$defs/TaskClass",
+          "default": "implement",
+          "description": "Task class; the only scheduling judgement attached at add time (§3.4)."
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "`created_at`; protocol §1.1."
+        },
+        "deps": {
+          "description": "Dependency edges, unlocked by a landed sha only.",
+          "items": {
+            "$ref": "#/$defs/TaskDep"
+          },
+          "type": "array"
+        },
+        "id": {
+          "$ref": "#/$defs/TaskId",
+          "description": "`id`; protocol §1.1."
+        },
+        "landedSha": {
+          "description": "Landed commit sha; set by the land/gate step — never by a worker status\nbit. Dependency edges unlock from this value (§7 #8).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mandate": {
+          "$ref": "#/$defs/Mandate",
+          "default": {
+            "chain": []
+          },
+          "description": "This node's task plus the inherited chain of upstream intents."
+        },
+        "owns": {
+          "description": "Repo-relative path globs this task is allowed to touch; `remuda own`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "parentTaskId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Parent task; mirrors the recursive delegation tree (§2.5). Absent for a\nroot task the top coordinator logged from an owner intent."
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskPlacementRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Current placement slot, when placed."
+        },
+        "projectId": {
+          "$ref": "#/$defs/ProjectId",
+          "description": "Owning project; the task ledger slice key."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "`revision`; protocol §1.1."
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState",
+          "description": "Ledger state; see [`TaskState`]."
+        },
+        "title": {
+          "description": "Short human title.",
+          "type": "string"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "`updated_at`; protocol §1.1."
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "createdAt",
+        "updatedAt",
+        "projectId",
+        "title",
+        "mandate",
+        "class",
+        "state",
+        "budget"
+      ],
+      "type": "object"
+    },
+    "TaskBudget": {
+      "description": "Estimated budget envelope; design §4.3. Amounts are estimates (§4.5).",
+      "properties": {
+        "maxTurns": {
+          "description": "Turn cap.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxUsd": {
+          "description": "Estimated USD cap; serialised as a string to stay exact on the wire.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "maxWallMins": {
+          "description": "Wall-clock cap, minutes.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "TaskClass": {
+      "description": "TaskClass wire values; `protocol.md` §4.3.",
+      "oneOf": [
+        {
+          "const": "research",
+          "description": "Wire value `research`.",
+          "type": "string"
+        },
+        {
+          "const": "implement",
+          "description": "Wire value `implement`.",
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "Wire value `review`.",
+          "type": "string"
+        },
+        {
+          "const": "test",
+          "description": "Wire value `test`.",
+          "type": "string"
+        },
+        {
+          "const": "merge-gate",
+          "description": "Wire value `merge-gate`.",
+          "type": "string"
+        },
+        {
+          "const": "triage",
+          "description": "Wire value `triage`.",
+          "type": "string"
+        },
+        {
+          "const": "docs",
+          "description": "Wire value `docs`.",
+          "type": "string"
+        }
+      ]
+    },
+    "TaskDep": {
+      "description": "One dependency edge. Edges unlock only when the referenced task carries a\nlanded sha (invariant I1, design §7 #8).",
+      "properties": {
+        "note": {
+          "description": "Why the edge exists (audit/card text).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "$ref": "#/$defs/TaskId",
+          "description": "Task that must land first."
+        }
+      },
+      "required": [
+        "taskId"
+      ],
+      "type": "object"
+    },
     "TaskId": {
       "pattern": "^(tsk)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "TaskPlacementRef": {
+      "description": "Where the task's worker is (or was) placed; updated from placement rows.",
+      "properties": {
+        "branch": {
+          "description": "Worktree branch being worked on.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host the worker runs on."
+        },
+        "instanceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Instance holding the worker."
+        },
+        "model": {
+          "description": "Model the placement pinned (pin means no auto-resolve, §4.3).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "placementId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Latest placement-ledger row describing this slot."
+        }
+      },
+      "type": "object"
+    },
+    "TaskState": {
+      "description": "TaskState wire values; `protocol.md` §2.2/5.3.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Wire value `pending`.",
+          "type": "string"
+        },
+        {
+          "const": "placed",
+          "description": "Wire value `placed`.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "Wire value `running`.",
+          "type": "string"
+        },
+        {
+          "const": "stalled",
+          "description": "Wire value `stalled`.",
+          "type": "string"
+        },
+        {
+          "const": "done",
+          "description": "Wire value `done`.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Wire value `failed`.",
+          "type": "string"
+        },
+        {
+          "const": "parked",
+          "description": "Wire value `parked`.",
+          "type": "string"
+        },
+        {
+          "const": "deferred",
+          "description": "Wire value `deferred`.",
+          "type": "string"
+        }
+      ]
     },
     "TerminalEvidence": {
       "description": "TerminalEvidence; `protocol.md` §2.4.",

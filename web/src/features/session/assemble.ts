@@ -15,6 +15,7 @@ import type { Id } from "../../types/wire";
 import { knowledgeValue } from "../../types/command";
 import { familyFor, type ToolFamily } from "./toolRegistry";
 import type { LocalBubble } from "../../lib/store";
+import { supersedeStreamed } from "./live/supersede";
 
 export type DiffState = "proposed" | "applied" | "unknown";
 
@@ -485,7 +486,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     });
   }
 
-  return nodes;
+  // Hook-streamed assistant bubbles are display echoes: collapse them onto
+  // the authoritative transcript message in the projection (design §2.3).
+  return supersedeStreamed(nodes, events);
 }
 
 /**

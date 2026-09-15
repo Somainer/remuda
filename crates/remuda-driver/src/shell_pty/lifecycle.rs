@@ -39,6 +39,10 @@ pub(super) const GRACE_KILL: Duration = Duration::from_millis(500);
 /// How often the ladder rechecks whether the group has gone.
 const POLL: Duration = Duration::from_millis(25);
 
+/// Reap poll used by the driver after the ladder reports the group gone, while
+/// waiting for an exiting leader (macOS `E`) to become reapable.
+pub(super) const EXIT_REAP_POLL: Duration = POLL;
+
 /// Which rung actually ended the process group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopRung {
@@ -144,8 +148,29 @@ pub fn group_alive(pgid: i32) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GroupMember {
     pub pid: i32,
-    /// Zombie / defunct — dead but not yet reaped by its parent.
+    /// Dead but not yet reaped by its parent: zombie (`Z`), a process stuck in
+    /// exit (`E` on macOS, `X`/`x` on Linux), or any later dead-state letter.
     pub zombie: bool,
+}
+
+/// Whether a process-table state letter names a process that is already dead
+/// and only needs (or will need) reaping.
+///
+/// The demo defect (native-carrier-3): macOS reports a SIGKILLed session
+/// leader as `?Es` — `E` = "exiting", a session leader stuck in the kernel's
+/// exit path — and the old classifier only recognised `Z`, so the ladder named
+/// it in `stop-incomplete` and it lingered for minutes as a child of the Node.
+/// Linux's analogous letters are `Z` (zombie) and `X`/`x` (dead); BSD/macOS
+/// adds `E` (exiting). A process in any of these cannot be killed again or
+/// make progress; the only honest question left is when its parent reaps it.
+#[must_use]
+pub(crate) fn state_is_dead(state: &str) -> bool {
+    // macOS `stat` prefixes `?` when the process has no controlling terminal —
+    // the demo row `?Es` is that marker, then `E` exiting, then `s` session
+    // leader. Linux never emits it. Skip it before reading the state letter;
+    // subsequent chars (`s`, `+`, `l`) are flags and are ignored.
+    let state = state.strip_prefix('?').unwrap_or(state);
+    matches!(state.chars().next(), Some('Z' | 'X' | 'x' | 'E'))
 }
 
 /// List group members with their liveness state.
@@ -219,51 +244,38 @@ fn proc_group_members(pgid: i32) -> Vec<GroupMember> {
         let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
             continue;
         };
-        let mut fields = after_comm.split_whitespace();
-        let Some(state) = fields.next() else {
-            continue;
-        };
-        let _ppid = fields.next();
-        let Some(group) = fields.next() else {
-            continue;
-        };
-        if group.parse::<i32>().ok() == Some(pgid) {
-            members.push(GroupMember {
-                pid,
-                zombie: state == "Z",
-            });
+        if let Some(member) = parse_proc_stat_line(pgid, pid, after_comm) {
+            members.push(member);
         }
     }
     members
 }
 
-/// `ps -eo pgid=,pid=,stat=` scan for non-Linux unixes (macOS zombies are `Z`).
-#[cfg(all(unix, not(target_os = "linux")))]
-fn ps_group_members(pgid: i32) -> Vec<GroupMember> {
+/// Parse the post-`comm` tail of a `/proc/<pid>/stat` line:
+/// `state ppid pgrp …`. Exposed for tests; [`proc_group_members`] does the
+/// directory scan.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn parse_proc_stat_line(pgid: i32, pid: i32, after_comm: &str) -> Option<GroupMember> {
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?;
+    let _ppid = fields.next();
+    let group = fields.next()?;
+    (group.parse::<i32>().ok() == Some(pgid)).then_some(GroupMember {
+        pid,
+        zombie: state_is_dead(state),
+    })
+}
+
+/// `ps -eo pgid=,pid=,stat=` scan for non-Linux unixes (macOS zombies are `Z`,
+/// a process stuck exiting is `E`).
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[cfg_attr(test, allow(dead_code))]
+fn ps_group_members_via_ps(pgid: i32) -> Vec<GroupMember> {
     let output = std::process::Command::new("ps")
         .args(["-eo", "pgid=,pid=,stat="])
         .output();
     match output {
-        Ok(out) if out.status.success() => {
-            let mut members = Vec::new();
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let mut parts = line.split_whitespace();
-                let Some(group) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
-                    continue;
-                };
-                let Some(pid) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
-                    continue;
-                };
-                let state = parts.next().unwrap_or("");
-                if group == pgid {
-                    members.push(GroupMember {
-                        pid,
-                        zombie: state.starts_with('Z'),
-                    });
-                }
-            }
-            members
-        }
+        Ok(out) if out.status.success() => parse_ps_table(pgid, &out.stdout),
         _ => {
             if group_alive(pgid) {
                 vec![GroupMember {
@@ -275,6 +287,38 @@ fn ps_group_members(pgid: i32) -> Vec<GroupMember> {
             }
         }
     }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_group_members(pgid: i32) -> Vec<GroupMember> {
+    ps_group_members_via_ps(pgid)
+}
+
+/// Parse `ps -eo pgid=,pid=,stat=` output into the members of `pgid`.
+///
+/// Split out from the `ps` invocation so the macOS `?Es` classification has a
+/// unit test on every host: the parsing is the platform-specific part, not the
+/// `ps` call.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+pub(crate) fn parse_ps_table(pgid: i32, bytes: &[u8]) -> Vec<GroupMember> {
+    let mut members = Vec::new();
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let mut parts = line.split_whitespace();
+        let Some(group) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(pid) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let state = parts.next().unwrap_or("");
+        if group == pgid {
+            members.push(GroupMember {
+                pid,
+                zombie: state_is_dead(state),
+            });
+        }
+    }
+    members
 }
 
 /// Wait up to `grace` for the group to disappear.
@@ -593,6 +637,83 @@ mod tests {
         assert_eq!(StopRung::Interrupt.label(), "sigint");
         assert_eq!(StopRung::Hangup.label(), "sighup");
         assert_eq!(StopRung::Kill.label(), "sigkill");
+    }
+
+    #[test]
+    fn dead_state_letters_are_dead_in_every_os_spelling() {
+        // The demo row was macOS `?Es`: E = exiting, session leader. Linux
+        // reports `X`/`x` for dead and `Z` for zombie. Flag letters that
+        // follow the state (`Es`, `Z+`, `Xsl`) must not change the verdict.
+        for dead in ["Z", "Z+", "X", "Xsl", "x", "E", "Es", "?Es"] {
+            assert!(state_is_dead(dead), "{dead:?} is dead-but-unreaped");
+        }
+        for live in ["R", "R+", "S", "Ss", "?Ss", "D", "Dl", "T", "t", "I", ""] {
+            assert!(!state_is_dead(live), "{live:?} is still alive");
+        }
+    }
+
+    #[test]
+    fn a_synthetic_ps_table_classifies_an_exiting_macos_leader_as_dead() {
+        // The exact native-carrier-3 evidence: pgid 16146, the claude leader
+        // in state `?Es`, plus a zombie grandchild the same killpg sweep
+        // reached. Neither may be named a survivor.
+        let table = b"\
+   16146  16146 ?Es\n\
+   16146  16150 Z\n\
+    9999   9999 ?Ss\n";
+        let members = parse_ps_table(16146, table);
+        assert_eq!(members.len(), 2);
+        assert!(
+            members.iter().all(|member| member.zombie),
+            "the exiting leader and the zombie are both already dead: {members:?}"
+        );
+        assert!(
+            !members.iter().any(|member| member.pid == 9999),
+            "another group's leader must not be included"
+        );
+        // A live grandchild in another group never enters the table; verify a
+        // live row inside the group keeps it alive separately below.
+        assert!(
+            !members.iter().any(|member| !member.zombie),
+            "an all-dead table must read as gone even before waitpid"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_ps_table_keeps_a_live_member_visible() {
+        // One genuinely running grandchild keeps the group alive even when its
+        // leader is already exiting.
+        let table = b"\
+   16146  16146 ?Es\n\
+   16146  16151 Ss\n";
+        let members = parse_ps_table(16146, table);
+        assert!(
+            members
+                .iter()
+                .any(|member| !member.zombie && member.pid == 16151)
+        );
+    }
+
+    #[test]
+    fn proc_stat_dead_letters_are_classified_from_the_post_comm_tail() {
+        // `/proc/<pid>/stat` after the final `)`: state ppid pgrp …
+        assert_eq!(
+            parse_proc_stat_line(16146, 16146, "X 1 16146 16146 …").unwrap(),
+            GroupMember {
+                pid: 16146,
+                zombie: true
+            }
+        );
+        assert_eq!(
+            parse_proc_stat_line(16146, 16147, "Z 16146 16146 …").unwrap(),
+            GroupMember {
+                pid: 16147,
+                zombie: true
+            }
+        );
+        let live = parse_proc_stat_line(16146, 16148, "S 16146 16146 …").unwrap();
+        assert!(!live.zombie);
+        assert!(parse_proc_stat_line(9999, 16146, "E 1 16146 …").is_none());
     }
 
     /// Spawn `script` as its own process-group leader and wait until it has

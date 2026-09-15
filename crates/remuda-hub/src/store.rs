@@ -1338,7 +1338,8 @@ impl Store {
                     anchor: existing.anchor,
                     expires_at,
                     ..existing
-                });            }
+                });
+            }
             let staged: i64 = tx.query_row(
                 "SELECT COALESCE(SUM(byte_len), 0) FROM objects WHERE instance_id = ?1",
                 params![new.instance_id],
@@ -1355,8 +1356,8 @@ impl Store {
             // Derived, never caller-supplied: the blob name itself cannot
             // traverse. The original name is a separate column (D-027b).
             let stored_name = format!("{object_id}.{}", new.extension);
-            let kind = remuda_protocol::hubnode::AttachmentKind::from_media_type(&new.media_type)
-                .as_str();
+            let kind =
+                remuda_protocol::hubnode::AttachmentKind::from_media_type(&new.media_type).as_str();
             tx.execute(
                 "INSERT INTO objects
                     (id, instance_id, host_id, media_type, stored_name, original_name, kind,
@@ -3667,12 +3668,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // D-027b (2026-09-15): arbitrary files carry their sanitised original
     // filename and an image/file kind; pre-D-027b rows were all images.
     ensure_column(&conn, "objects", "original_name", "TEXT")?;
-    ensure_column(
-        &conn,
-        "objects",
-        "kind",
-        "TEXT NOT NULL DEFAULT 'image'",
-    )?;
+    ensure_column(&conn, "objects", "kind", "TEXT NOT NULL DEFAULT 'image'")?;
     ensure_column(&conn, "pair_codes", "code_prefix", "TEXT")?;
     ensure_column(
         &conn,

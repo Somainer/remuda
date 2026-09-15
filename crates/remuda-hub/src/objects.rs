@@ -100,16 +100,19 @@ fn accepted_file_media_type(raw: &str) -> Result<String, String> {
         return Ok("application/octet-stream".to_owned());
     }
     if essence.len() > MAX_MEDIA_TYPE_LEN {
-        return Err(format!("media type is longer than {MAX_MEDIA_TYPE_LEN} bytes"));
+        return Err(format!(
+            "media type is longer than {MAX_MEDIA_TYPE_LEN} bytes"
+        ));
     }
     let Some((main, sub)) = essence.split_once('/') else {
         return Err(format!("media type {essence} is not type/subunit"));
     };
     let valid_token = |part: &str| {
         !part.is_empty()
-            && part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '!' | '#' | '$' | '&' | '-' | '^' | '_' | '.' | '+' | '~'))
+            && part.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '!' | '#' | '$' | '&' | '-' | '^' | '_' | '.' | '+' | '~')
+            })
     };
     if !valid_token(main) || !valid_token(sub) {
         return Err(format!("media type {essence} contains invalid characters"));
@@ -202,7 +205,12 @@ async fn upload(
     // name that fails sanitisation (path separators, control characters,
     // oversize) is a 400 — a legitimate browser File name is always a bare
     // basename, so accepting a hostile value as null would hide a caller bug.
-    let original_name = match query.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+    let original_name = match query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
         None => None,
         Some(name) => Some(
             sanitize_attachment_name(name)
@@ -466,13 +474,25 @@ mod tests {
 
     #[test]
     fn sniff_recognises_the_image_allowlist_and_nothing_else() {
-        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest").unwrap().0, "image/png");
-        assert_eq!(sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().0, "image/jpeg");
+        assert_eq!(
+            sniff_image(b"\x89PNG\r\n\x1a\nrest").unwrap().0,
+            "image/png"
+        );
+        assert_eq!(
+            sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().0,
+            "image/jpeg"
+        );
         assert_eq!(sniff_image(b"GIF89a....").unwrap().0, "image/gif");
-        assert_eq!(sniff_image(b"RIFF\0\0\0\0WEBPVP8 ").unwrap().0, "image/webp");
+        assert_eq!(
+            sniff_image(b"RIFF\0\0\0\0WEBPVP8 ").unwrap().0,
+            "image/webp"
+        );
         assert!(sniff_image(b"%PDF-1.7").is_none());
         assert!(sniff_image(b"<svg xmlns=").is_none());
-        assert!(sniff_image(b"GIF").is_none(), "a truncated header is not a match");
+        assert!(
+            sniff_image(b"GIF").is_none(),
+            "a truncated header is not a match"
+        );
         assert!(sniff_image(b"RIFF\0\0\0\0WAVE").is_none());
     }
 
@@ -519,7 +539,10 @@ mod tests {
     #[test]
     fn malformed_or_hostile_file_types_are_rejected() {
         assert!(accepted_file_media_type("text").is_err());
-        assert!(accepted_file_media_type("text/html;").is_ok(), "parameters are dropped");
+        assert!(
+            accepted_file_media_type("text/html;").is_ok(),
+            "parameters are dropped"
+        );
         assert!(accepted_file_media_type("text/ht ml").is_err());
         assert!(accepted_file_media_type(&format!("text/{}", "a".repeat(260))).is_err());
     }

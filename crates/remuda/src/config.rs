@@ -557,8 +557,7 @@ impl Config {
             self.hub.host_lost_grace_ms = parse_env(&value, "REMUDA_HOST_LOST_GRACE_MS")?;
         }
         if let Some(value) = env_text(env, "REMUDA_ATTACHMENT_MAX_BYTES")? {
-            self.hub.attachment_max_bytes =
-                parse_env(&value, "REMUDA_ATTACHMENT_MAX_BYTES")?;
+            self.hub.attachment_max_bytes = parse_env(&value, "REMUDA_ATTACHMENT_MAX_BYTES")?;
         }
         if let Some(value) = env_text(env, "REMUDA_COOKIE_SECURE")? {
             self.hub.cookie_secure = match value.as_str() {

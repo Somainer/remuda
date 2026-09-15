@@ -20,8 +20,8 @@
 //! one driver.
 
 use crate::{DriverError, DriverResult};
-use remuda_protocol::hubnode::AttachmentKind;
 use remuda_protocol::ContentBlock;
+use remuda_protocol::hubnode::AttachmentKind;
 use std::path::PathBuf;
 
 /// One attachment a driver can deliver, resolved to a local file.
@@ -188,7 +188,10 @@ pub fn file_mention_lines(attachments: &[PromptAttachment]) -> Vec<String> {
                 .anchor
                 .map(|n| format!("[File #{n}] "))
                 .unwrap_or_default();
-            let size = attachment.byte_len.map(human_size).unwrap_or_else(|| "?".into());
+            let size = attachment
+                .byte_len
+                .map(human_size)
+                .unwrap_or_else(|| "?".into());
             format!(
                 "{anchor}{} ({}, {size}) saved at {}",
                 attachment.name,
@@ -468,22 +471,21 @@ mod tests {
         let file_at = mentioned.find(file_line).unwrap();
         let text_at = mentioned.find("what colour is the image?").unwrap();
         let footer_at = mentioned.find("请读取").unwrap();
-        assert!(file_at < text_at, "file line precedes user text: {mentioned}");
-        assert!(text_at < footer_at, "image footer follows user text: {mentioned}");
+        assert!(
+            file_at < text_at,
+            "file line precedes user text: {mentioned}"
+        );
+        assert!(
+            text_at < footer_at,
+            "image footer follows user text: {mentioned}"
+        );
     }
 
     /// Unanchored files keep the same line without a `[File #n]` prefix.
     #[test]
     fn unanchored_file_line_has_no_token() {
         let id = object_id();
-        let blocks = file_blocks(
-            &id,
-            "/data/notes.txt",
-            "notes.txt",
-            "text/plain",
-            42,
-            None,
-        );
+        let blocks = file_blocks(&id, "/data/notes.txt", "notes.txt", "text/plain", 42, None);
         let mentioned = text_with_path_mentions(&blocks).expect("text");
         let first = mentioned.lines().next().expect("first line");
         assert_eq!(
@@ -553,7 +555,14 @@ mod tests {
     #[test]
     fn a_file_alone_still_produces_a_prompt() {
         let id = object_id();
-        let blocks = file_blocks(&id, "/data/report.pdf", "report.pdf", "application/pdf", 10, None);
+        let blocks = file_blocks(
+            &id,
+            "/data/report.pdf",
+            "report.pdf",
+            "application/pdf",
+            10,
+            None,
+        );
         let mentioned = text_with_path_mentions(&blocks).expect("text");
         assert!(
             mentioned.contains("report.pdf (application/pdf, 10 B) saved at /data/report.pdf"),

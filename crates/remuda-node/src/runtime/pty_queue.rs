@@ -114,13 +114,12 @@ fn enqueue(
     attachment_refs: Vec<remuda_protocol::hubnode::AttachmentRef>,
     origin: remuda_protocol::InputOrigin,
 ) -> Result<PendingPrompt, NodeError> {
-    let ObservationPayload::Message(mut message) =
-        crate::driver::message_payload(
-            MessageRole::User,
-            MessagePhase::Input,
-            prompt.clone(),
-            Vec::new(),
-        )?
+    let ObservationPayload::Message(mut message) = crate::driver::message_payload(
+        MessageRole::User,
+        MessagePhase::Input,
+        prompt.clone(),
+        Vec::new(),
+    )?
     else {
         return Err(NodeError::InvalidRequest("expected user message".into()));
     };

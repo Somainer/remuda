@@ -17,10 +17,10 @@
 //! digest is verified, and nothing is ever executed.
 
 use crate::NodeError;
+use remuda_protocol::InstanceId;
 use remuda_protocol::hubnode::{
     AttachmentKind, AttachmentRef, extension_for_media_type, sanitize_attachment_name,
 };
-use remuda_protocol::InstanceId;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -244,7 +244,11 @@ pub async fn materialize(
             )));
         }
         let digest = format!("{:x}", Sha256::digest(&bytes));
-        if let Some(expected) = reference.digest.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(expected) = reference
+            .digest
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             if expected != digest {
                 return Err(NodeError::InvalidRequest(format!(
                     "attachment {} failed integrity check: digest {digest} != manifest {expected}",
@@ -253,8 +257,7 @@ pub async fn materialize(
             }
         }
         let name = landing_name(reference)?;
-        let file_name =
-            collision_free_name(&dir, &mut claimed, &name, &reference.object_id)?;
+        let file_name = collision_free_name(&dir, &mut claimed, &name, &reference.object_id)?;
         let path = dir.join(&file_name);
         write_private(&path, &bytes)?;
         claimed.insert(file_name);
@@ -278,11 +281,7 @@ pub async fn materialize(
 /// survived, fall back to the D-027 derived `<obj_id>.<ext>` so the name is
 /// still deterministic and path-safe.
 fn landing_name(reference: &AttachmentRef) -> Result<String, NodeError> {
-    if let Some(name) = reference
-        .name
-        .as_deref()
-        .and_then(sanitize_attachment_name)
-    {
+    if let Some(name) = reference.name.as_deref().and_then(sanitize_attachment_name) {
         return Ok(name);
     }
     let object_id = sanitize_id(&reference.object_id)?;
@@ -301,9 +300,8 @@ fn collision_free_name(
     name: &str,
     object_id: &str,
 ) -> Result<String, NodeError> {
-    let free = |candidate: &str| -> bool {
-        !claimed.contains(candidate) && !dir.join(candidate).exists()
-    };
+    let free =
+        |candidate: &str| -> bool { !claimed.contains(candidate) && !dir.join(candidate).exists() };
     if free(name) {
         return Ok(name.to_owned());
     }
@@ -352,7 +350,9 @@ fn split_name(name: &str) -> (&str, Option<&str>) {
 /// media block naming the Hub object followed by a `resource` block carrying
 /// the absolute `file://` URI.
 #[must_use]
-pub fn content_blocks(attachments: &[MaterializedAttachment]) -> Vec<remuda_protocol::ContentBlock> {
+pub fn content_blocks(
+    attachments: &[MaterializedAttachment],
+) -> Vec<remuda_protocol::ContentBlock> {
     use remuda_protocol::ContentBlock;
     let mut blocks = Vec::with_capacity(attachments.len() * 2);
     for attachment in attachments {
@@ -388,7 +388,8 @@ pub fn content_blocks(attachments: &[MaterializedAttachment]) -> Vec<remuda_prot
 }
 
 /// Object ids are opaque to us, so verify the shape before it becomes a path.
-fn sanitize_id(object_id: &str) -> Result<String, NodeError> {    let ok = !object_id.is_empty()
+fn sanitize_id(object_id: &str) -> Result<String, NodeError> {
+    let ok = !object_id.is_empty()
         && object_id.len() <= 128
         && object_id
             .chars()
@@ -550,9 +551,8 @@ mod tests {
         fn fetch(
             &self,
             _object_id: String,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<Vec<u8>, NodeError>> + Send + '_>,
-        > {
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, NodeError>> + Send + '_>>
+        {
             let bytes = self.bytes.clone();
             Box::pin(async move { Ok(bytes) })
         }
@@ -596,7 +596,11 @@ mod tests {
         let again = materialize(&source, &data_dir, &instance, &refs)
             .await
             .expect("materialize again");
-        assert!(again[0].path.ends_with("notes-1.txt"), "{:?}", again[0].path);
+        assert!(
+            again[0].path.ends_with("notes-1.txt"),
+            "{:?}",
+            again[0].path
+        );
 
         // A wrong digest fails the whole send.
         let bad = vec![AttachmentRef {
@@ -604,9 +608,11 @@ mod tests {
             digest: Some("0".repeat(64)),
             ..refs[0].clone()
         }];
-        assert!(materialize(&source, &data_dir, &instance, &bad)
-            .await
-            .is_err());
+        assert!(
+            materialize(&source, &data_dir, &instance, &bad)
+                .await
+                .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1583,10 +1583,7 @@ fn prompt_content(blocks: &[ContentBlock]) -> DriverResult<UserContent> {
     // File-reference lines precede the user text; when every attachment is an
     // image the text block is the prompt unchanged.
     let text = if has_files {
-        crate::attachment::with_file_lines(
-            &crate::attachment::text_of(blocks),
-            &attachments,
-        )
+        crate::attachment::with_file_lines(&crate::attachment::text_of(blocks), &attachments)
     } else {
         crate::attachment::text_of(blocks)
     };

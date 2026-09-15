@@ -570,9 +570,7 @@ impl Driver for GenericPtyDriver {
         // to a PDF or text file is readable with ordinary file tools.
         let image_count = attachments
             .iter()
-            .filter(|attachment| {
-                attachment.kind == remuda_protocol::hubnode::AttachmentKind::Image
-            })
+            .filter(|attachment| attachment.kind == remuda_protocol::hubnode::AttachmentKind::Image)
             .count();
         if image_count > 0 && live.preset_id.eq_ignore_ascii_case("grok") {
             note_attachments_unreadable(live, &self.seq, image_count).await;

@@ -354,7 +354,11 @@ async fn non_image_types_stage_as_files_but_fake_images_are_downgraded() -> Resu
     assert_eq!(status, 200, "{body}");
     let value: Value = serde_json::from_str(body.trim())?;
     assert_eq!(value["kind"], json!("file"), "{body}");
-    assert_eq!(value["mediaType"], json!("application/octet-stream"), "{body}");
+    assert_eq!(
+        value["mediaType"],
+        json!("application/octet-stream"),
+        "{body}"
+    );
     fixture.hub.shutdown().await;
     Ok(())
 }

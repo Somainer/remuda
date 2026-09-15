@@ -273,7 +273,11 @@ async fn arbitrary_files_land_with_their_name_and_collision_suffix() -> Result<(
     send(
         &fixture.node,
         &instance,
-        vec![file_attachment("obj_pdf", "application/pdf", "Q3 report.pdf")],
+        vec![file_attachment(
+            "obj_pdf",
+            "application/pdf",
+            "Q3 report.pdf",
+        )],
     )
     .await?;
 
@@ -291,7 +295,11 @@ async fn arbitrary_files_land_with_their_name_and_collision_suffix() -> Result<(
     send(
         &fixture.node,
         &instance,
-        vec![file_attachment("obj_pdf", "application/pdf", "Q3 report.pdf")],
+        vec![file_attachment(
+            "obj_pdf",
+            "application/pdf",
+            "Q3 report.pdf",
+        )],
     )
     .await?;
     let second = dir.join("Q3 report-1.pdf");

@@ -273,9 +273,7 @@ mod tests {
 
     #[test]
     fn the_inline_ceiling_is_below_the_staging_ceiling() {
-        assert!(
-            MAX_INLINE_ATTACHMENT_BYTES < crate::config::default_attachment_max_bytes() as i64
-        );
+        assert!(MAX_INLINE_ATTACHMENT_BYTES < crate::config::default_attachment_max_bytes() as i64);
         assert_eq!(MAX_INLINE_ATTACHMENT_BYTES, 3_670_016);
     }
 

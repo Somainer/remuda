@@ -957,10 +957,7 @@ fn landing_dir() -> &'static std::path::Path {
     use std::sync::OnceLock;
     static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "remuda-e2e-landed-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("remuda-e2e-landed-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("landing dir");
         dir
     })
@@ -970,9 +967,7 @@ fn landing_dir() -> &'static std::path::Path {
 /// separators or control characters.
 fn safe_name(raw: &str) -> String {
     let trimmed = raw.trim_matches(|c: char| c.is_whitespace() || c == '.');
-    if trimmed.is_empty()
-        || trimmed.contains(['/', '\\'])
-        || trimmed.chars().any(char::is_control)
+    if trimmed.is_empty() || trimmed.contains(['/', '\\']) || trimmed.chars().any(char::is_control)
     {
         "attachment.bin".to_owned()
     } else {

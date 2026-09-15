@@ -1,0 +1,131 @@
+/* Live status strip — status only, never message/tool content (design §2.4).
+   Sits at the top of the session dock. Flex-wrap keeps it one quiet row at
+   1440 px and a wrapped set of chips at 390 px; nothing here may introduce
+   horizontal page scroll. */
+
+.strip {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-width: 0;
+  padding: 2px 2px 0;
+  font-size: var(--text-aux);
+  line-height: 1.5;
+  color: var(--paper);
+  font-family: var(--font);
+}
+
+.phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-weight: 500;
+}
+
+.toolName {
+  color: var(--mute);
+  font-weight: 400;
+  /* A harness tool name is status metadata; clip rather than push the row. */
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.liveDot,
+.idleDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.liveDot {
+  background: var(--cold);
+  animation: livePulse 1.4s ease-in-out infinite;
+}
+
+.idleDot {
+  background: var(--mute);
+}
+
+@keyframes livePulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.elapsed,
+.elapsedStale {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.elapsed {
+  color: var(--paper);
+}
+
+/* The anchor channel cannot vouch for freshness: the reading stays on screen
+   (it is still "time since the harness spoke") but stops claiming it. */
+.elapsedStale {
+  color: var(--mute);
+  font-style: italic;
+}
+
+.chip {
+  flex: none;
+  color: var(--mute);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 6px;
+  font-size: var(--text-label);
+  line-height: 1.6;
+}
+
+.phrase {
+  color: var(--mute);
+  font-style: italic;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Decoration may grow long; it yields space before any other chip wraps. */
+  flex: 1 1 120px;
+}
+
+.warnStalled,
+.warnMissing {
+  flex: none;
+  border-radius: var(--radius);
+  padding: 0 6px;
+  font-size: var(--text-label);
+  line-height: 1.6;
+}
+
+.warnStalled {
+  color: var(--dust);
+  border: 1px solid var(--dust);
+}
+
+.warnMissing {
+  color: var(--danger-strong);
+  border: 1px solid var(--danger);
+}
+
+@media (max-width: 480px) {
+  .strip {
+    gap: 3px 8px;
+  }
+
+  .toolName {
+    max-width: 120px;
+  }
+}

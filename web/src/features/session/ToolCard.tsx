@@ -6,6 +6,7 @@ import { DiffBlock } from "../../components/DiffBlock";
 import { familyFor, splitMcpName } from "./toolRegistry";
 import { presentTool } from "./toolPresenters";
 import { WorkflowTimelineCard } from "./workflow/WorkflowTimelineCard";
+import { LiveToolElapsed } from "./live/LiveStatusStrip";
 import type {
   WorkflowMemberPayload,
   WorkflowPhasePayload,
@@ -52,7 +53,7 @@ function BashCard({ call, result, completeness }: { call: ToolCallPayload; resul
         <span className={css.toolTitle}>Bash</span>
         <span className={css.toolStatus}>
           {running ? <span className={css.runDot} /> : null}
-          {running ? "running · 无 exit，不画成功" : exit === undefined ? "无 exit" : `exit ${exit}`}
+          {running ? <LiveToolElapsed call={call} /> : exit === undefined ? "无 exit" : `exit ${exit}`}
         </span>
         {completeness !== "structured" ? <span className={css.stat}>不完整</span> : null}
         <span className={css.spacer} />

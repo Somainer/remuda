@@ -181,3 +181,95 @@ cargo clippy --workspace --all-targets -- -D warnings
   (`tests/fixtures/modern-claude-turn.bin`) classifies
   idle → working → blocked → working → idle through the real VT parser with
   zero occurrences of `"interrupt"`.
+
+---
+
+# Batch C — w-live-view: the browser renders the live layer (2026-09-16)
+
+The web batch (design §3.3, `wt/w-live-view/live-status-strip`): a status
+strip above the composer (phase · one local elapsed · tier chip · health
+notes), the ticking elapsed on the running Bash card, and projection-only
+supersession of streamed/transcript nodes. All derivation is pure
+(`web/src/features/session/live/{phase,channelHealth,useElapsed,supersede}.ts`).
+
+E2e method: `web/tests/e2e/ux-live-view.hub.spec.ts` runs the production
+native Node (`native_hub_e2e`) against `fake-harness --kind claude` through a
+real PTY with `REMUDA_PTY_HOOKS=1 REMUDA_PTY_EMULATOR=1`; ground truth is the
+harness `--events-out` JSONL. The scenario is one auto-approved Bash tool
+running 15 s — past the hook tier's 3 × 2 s silence budget — then streamed
+text and `Stop`.
+
+## 6 — The five acceptance assertions (design §4.4)
+
+Observed in the passing run (`playwright … ux-live-view.hub.spec.ts`, ~60 s):
+
+1. **submit → `prompt-accepted`**: the strip flipped after the CR, measured
+   in-browser against the write, within the 5 s e2e allowance (the
+   native→journal budget is 250 ms p99; uplink adds one RTT).
+2. **running tool ticks, no premature exit**: the Bash card showed
+   `running · 无 exit，不画成功 · m:ss`, the reading advanced at 1 Hz, and no
+   `exit N` appeared before the Final `tool_result`.
+3. **health warning when the hook tier goes silent**: ~6 s into the 15 s
+   tool `live-health-hook` read `stalled`, the elapsed flipped to
+   `data-stale="1"` (grey italic), the strip never showed `turn-ended`, and
+   the page's `data-activity` stayed `working`.
+4. **the strip never renders OSC/screen content**: the command line, the
+   `⎿` output row, and spinner glyphs stayed out of the strip; claude emits
+   no `phrase` today and none rendered.
+5. **no premature turn-ended / Final settles the card**: the strip reached
+   `turn-ended` only after the ground-truth `turn_end`, then the one
+   converged card showed `exit 0`, the ticker unmounted, and the stall note
+   cleared on the PostToolUse burst.
+
+The recorded phase sequence was
+`prompt-accepted → tool-started → (stall note while the tool runs) →
+tool-finished → text-streaming → turn-ended`.
+
+## 7 — Elapsed is derived, never transported
+
+`useElapsed` is the only clock in the web UI. The 20 s-tool unit fixture
+contains **one** `turn.live` observation; the test renders 20 distinct
+second readings (`0:00`…`0:20`) from it. The rAF loop ticks whole seconds,
+pauses while the tab is hidden (no frames presented), and greys when the
+anchoring tier's health is not `ok`.
+
+## 8 — Two wire-realities the projection had to cover
+
+Both were found via the e2e journal summary, not assumed:
+
+- **Phase tags ride the raw hook lifecycle, whose `topic` varies** —
+  `diagnostic` for Pre/PostToolUse, `hook` for MessageDisplay,
+  `permission` for blocking requests, `turn` only for UserPromptSubmit/Stop.
+  A projection filtering on `topic === "turn"` saw `prompt-accepted` and
+  nothing else. Identity is the `relatedIds.phase` tag alone.
+- **The promoted-terminal transcript mapper mints random node ids**, so on
+  that path the hook running card and the transcript tool node do *not*
+  converge by id (the derived-id path batch A built covers
+  `remuda-journal`, used by the print/file readers). The projection
+  converges them by a content fingerprint (`toolName` + canonical
+  `toolInput`); before Final the hook card keeps the row (it owns the live
+  anchor), after Final the transcript identity takes the same slot with the
+  hook's known exit code merged on. A prerequisite fix: the Hub journal
+  coercion dropped the real `source.channel` for a `stdout` stub, which made
+  every channel-derived projection (health, supersession) blind.
+
+## 9 — Themes, widths, and the gate
+
+Both themes at 390 px and 1440 px, captured while the tool is genuinely
+running (stall note + grey elapsed visible);
+`documentElement.scrollWidth - clientWidth <= 1` at every width:
+
+![strip 1440 night](live-view-c-strip-1440-night.png)
+![strip 390 night](live-view-c-strip-390-night.png)
+![strip 1440 ledger](live-view-c-strip-1440-ledger.png)
+![strip 390 ledger](live-view-c-strip-390-ledger.png)
+
+```
+pnpm typecheck                                   # clean
+pnpm lint                                        # clean
+pnpm test                                        # 106 files / 939 tests, incl. live/* 37
+PW_CHANNEL=chromium PW_TEST_CONNECT_WS_ENDPOINT=ws://127.0.0.1:3177/ \
+HUB_E2E_LISTEN=127.0.0.1:57780 HUB_E2E_WEB_PORT=57789 \
+  pnpm exec playwright test -c playwright.hub.config.ts tests/e2e/ux-live-view.hub.spec.ts
+# → 1 passed (~60 s)
+```

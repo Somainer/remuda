@@ -8,9 +8,10 @@ use std::{collections::VecDeque, time::Duration};
 struct PendingPrompt {
     command_id: CommandId,
     prompt: String,
-    /// Already on disk when the prompt was queued (D-027); a PTY agent reads
-    /// these by path once the prompt is finally typed.
-    attachments: Vec<crate::attachments::MaterializedAttachment>,
+    /// Hub refs staged at accept time (D-027). Bytes are pulled in this worker
+    /// when the prompt reaches the front of the queue, so a slow fetch never
+    /// delays the RPC ack — only the prompt it belongs to.
+    attachment_refs: Vec<remuda_protocol::hubnode::AttachmentRef>,
     origin: remuda_protocol::InputOrigin,
     message: Box<MessagePayload>,
 }
@@ -30,6 +31,7 @@ pub(super) async fn run(
     interactions: Arc<InteractionRuntime>,
     create: Option<(Command, String)>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
+    loader: super::AttachmentLoader,
     prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> Result<(), NodeError> {
     let capacity = receiver.max_capacity();
@@ -41,7 +43,7 @@ pub(super) async fn run(
                 &instance_id,
                 command.command_id.clone(),
                 prompt,
-                // The create prompt stages no attachments (D-027).
+                // A create-time prompt never carries attachments (D-027).
                 Vec::new(),
                 crate::origin::input_origin(command.origin),
                 prompts.as_ref(),
@@ -59,20 +61,20 @@ pub(super) async fn run(
                     interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance worker closed", prompts.as_ref())?;
                     return Err(NodeError::DriverUnavailable);
                 };
-                if let DriverRequest::Send { prompt, attachments, origin } = queued.request {
+                if let DriverRequest::Send { prompt, attachments: _, origin } = queued.request {
                     if pending.len() == capacity {
                         let command = store.get_command(&queued.command_id)?;
                         prompts.cancel(&queued.command_id);
                         reject_before_dispatch(store.as_ref(), &instance_id, command, "instance-queue-full")?;
                     } else {
-                        pending.push_back(enqueue(store.as_ref(), &instance_id, queued.command_id, prompt, attachments, origin, prompts.as_ref())?);
+                        pending.push_back(enqueue(store.as_ref(), &instance_id, queued.command_id, prompt, queued.attachment_refs, origin, prompts.as_ref())?);
                     }
                 } else {
                     let close_after = queued.close_after;
                     if matches!(queued.request, DriverRequest::Cancel | DriverRequest::Close) {
                         interrupt_pending(store.as_ref(), &instance_id, &mut pending, "queued input cancelled", prompts.as_ref())?;
                     }
-                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone(), Arc::clone(&prompts)).await?;
+                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone(), loader.clone(), Arc::clone(&prompts)).await?;
                     if close_after && store.get_instance(&instance_id)?.lifecycle == InstanceLifecycle::Exited {
                         // The Instance is exited, so nothing may still hold a
                         // pane in the operator's Herdr session. The driver's
@@ -99,7 +101,7 @@ pub(super) async fn run(
                     continue;
                 }
                 if let Some(prompt) = pending.front_mut()
-                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt, carrier.as_ref(), prompts.as_ref()).await?
+                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt, carrier.as_ref(), &loader, prompts.as_ref()).await?
                 {
                     pending.pop_front();
                 }
@@ -113,7 +115,7 @@ fn enqueue(
     instance_id: &InstanceId,
     command_id: CommandId,
     prompt: String,
-    attachments: Vec<crate::attachments::MaterializedAttachment>,
+    attachment_refs: Vec<remuda_protocol::hubnode::AttachmentRef>,
     origin: remuda_protocol::InputOrigin,
     prompts: &crate::prompt_correlation::PromptCorrelator,
 ) -> Result<PendingPrompt, NodeError> {
@@ -140,7 +142,7 @@ fn enqueue(
     Ok(PendingPrompt {
         command_id,
         prompt,
-        attachments,
+        attachment_refs,
         origin,
         message,
     })
@@ -184,8 +186,31 @@ async fn deliver(
     interactions: &InteractionRuntime,
     prompt: &mut PendingPrompt,
     carrier: Option<&crate::carrier_recovery::CarrierSupervisor>,
+    loader: &super::AttachmentLoader,
     prompts: &crate::prompt_correlation::PromptCorrelator,
 ) -> Result<bool, NodeError> {
+    // D-027: bytes are pulled only when the prompt reaches the front of the
+    // queue, so a slow Hub object store delays this prompt and nothing else.
+    let attachments = match loader
+        .resolve(instance_id, prompt.attachment_refs.clone())
+        .await
+    {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            update_message(store, instance_id, prompt, ContentStatus::Interrupted)?;
+            prompts.cancel(&prompt.command_id);
+            let command = store.get_command(&prompt.command_id)?;
+            if command.state != CommandState::Settled {
+                reject_before_dispatch(
+                    store,
+                    instance_id,
+                    command,
+                    &format!("attachment materialization failed: {error}"),
+                )?;
+            }
+            return Ok(true);
+        }
+    };
     // Cancelling a readiness probe cannot submit input. Never time out or replay send().
     let execution =
         match tokio::time::timeout(Duration::from_millis(100), driver.wait_control()).await {
@@ -205,7 +230,7 @@ async fn deliver(
                 driver
                     .execute(DriverRequest::Send {
                         prompt: prompt.prompt.clone(),
-                        attachments: prompt.attachments.clone(),
+                        attachments,
                         origin: prompt.origin,
                     })
                     .await

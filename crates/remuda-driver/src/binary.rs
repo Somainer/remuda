@@ -4,20 +4,67 @@ use crate::error::{DriverError, DriverResult};
 use remuda_protocol::Digest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static PIN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Read buffer for [`hash_file`]. A multi-megabyte agent binary (the pinned
+/// claude is ~207 MB) costs tens of thousands of syscalls through an 8 KiB
+/// buffer; 1 MiB is large enough to make the reads themselves negligible
+/// without holding a stack-sized buffer.
+const HASH_BUF: usize = 1024 * 1024;
 
 /// Re-probes of the original path before its bytes are copied elsewhere.
 const ETXTBSY_REPROBES: u32 = 6;
 
 /// Base delay between re-probes; the nth wait is `n` times this.
 const ETXTBSY_BACKOFF: Duration = Duration::from_millis(2);
+
+/// Identity of a file whose pin is cached.
+///
+/// `(path, len, mtime)` is the same triple build systems use to decide whether
+/// a file changed: a new binary version has a new length or mtime, so the
+/// expensive SHA-256 of a ~207 MB agent executable runs once per version
+/// instead of on every `instance.create`. A replace that preserves both is
+/// already detectable only by hashing, and is the accepted stale-cache edge.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PinCacheKey {
+    path: PathBuf,
+    len: u64,
+    mtime: SystemTime,
+}
+
+/// Process-wide pin cache. Pins are immutable facts about a file inode-state,
+/// safe to share across instances and Nodes in this process.
+static PIN_CACHE: Mutex<Option<HashMap<PinCacheKey, BinaryPin>>> = Mutex::new(None);
+
+fn pin_cache_get(key: &PinCacheKey) -> Option<BinaryPin> {
+    let guard = PIN_CACHE.lock().ok()?;
+    guard.as_ref()?.get(key).cloned()
+}
+
+fn pin_cache_put(key: PinCacheKey, pin: BinaryPin) {
+    if let Ok(mut guard) = PIN_CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        // Bound the cache: a long-lived Node pins every agent version it ever
+        // saw, and these entries hold nothing small — drop the oldest rather
+        // than grow without limit.
+        if cache.len() >= 64
+            && !cache.contains_key(&key)
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(key, pin);
+    }
+}
 
 /// Pinned native executable recorded in a [`crate::LaunchRecipe`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,20 +88,57 @@ pub struct BinaryPin {
 /// inode) makes the bytes get copied to a unique sibling path, and that copy is
 /// pinned instead of overwriting the busy inode.
 pub fn pin_binary(command: impl AsRef<Path>) -> DriverResult<BinaryPin> {
+    let span = tracing::info_span!(
+        "pin_binary",
+        command = %command.as_ref().display()
+    );
+    let _guard = span.enter();
     let original = resolve_binary(command)?;
-    let (path, version) = probe_version(&original)?;
+    // Canonicalize before the version probe so the cache key is the real file
+    // a symlink points at, not whichever alias was asked for.
+    let canonical = original.canonicalize().unwrap_or(original);
+    let cache_key = pin_cache_key(&canonical)?;
+    if let Some(pin) = pin_cache_get(&cache_key) {
+        tracing::debug!(
+            path = %pin.abs_path,
+            version = %pin.version,
+            digest = %String::from(pin.sha256.clone()),
+            "using cached native binary pin"
+        );
+        return Ok(pin);
+    }
+    let (path, version) = probe_version(&canonical)?;
     let path = path.canonicalize().unwrap_or(path);
-    let sha256 = hash_file(&path)?;
+    let sha256 = {
+        let _span = tracing::info_span!("hash_binary", path = %path.display()).entered();
+        hash_file(&path)?
+    };
     tracing::info!(
         path = %path.display(),
         version = %version,
         digest = %String::from(sha256.clone()),
         "pinned native binary"
     );
-    Ok(BinaryPin {
+    let pin = BinaryPin {
         abs_path: path.to_string_lossy().into_owned(),
         version,
         sha256,
+    };
+    // A persistent-ETXTBSY copy is a unique sibling path, not the binary the
+    // key describes; do not cache that pin under the original path.
+    if path == cache_key.path {
+        pin_cache_put(cache_key, pin.clone());
+    }
+    Ok(pin)
+}
+
+/// Build the cache key for a resolved binary: canonical path, length, mtime.
+fn pin_cache_key(path: &Path) -> DriverResult<PinCacheKey> {
+    let metadata = fs::metadata(path)?;
+    Ok(PinCacheKey {
+        path: path.to_path_buf(),
+        len: metadata.len(),
+        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
     })
 }
 
@@ -334,7 +418,7 @@ pub fn resolve_binary(command: impl AsRef<Path>) -> DriverResult<PathBuf> {
 pub fn hash_file(path: &Path) -> DriverResult<Digest> {
     let mut hasher = Sha256::new();
     let mut file = File::open(path)?;
-    let mut buf = [0_u8; 8192];
+    let mut buf = vec![0_u8; HASH_BUF];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -509,6 +593,32 @@ mod tests {
         assert!(first.abs_path.starts_with('/'));
         assert_eq!(first.version, "stub-9.9.9 (test)");
         assert!(String::from(first.sha256.clone()).starts_with("sha256:"));
+    }
+
+    /// A second pin of an unchanged file must be served from the
+    /// `(path, len, mtime)` cache — the 207 MB claude hash runs once per
+    /// binary version, not once per create.
+    #[test]
+    fn the_digest_cache_serves_a_second_pin_without_rehashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_stub(dir.path(), "stub-cache (test)");
+        let resolved = path.canonicalize().unwrap();
+        let first = pin_binary(&path).unwrap();
+        // The entry is directly observable under the canonical path's key.
+        let key = pin_cache_key(&resolved).unwrap();
+        let cached = pin_cache_get(&key).expect("the pin is cached");
+        assert_eq!(cached, first);
+        let second = pin_binary(&path).unwrap();
+        assert_eq!(first, second);
+        // A symlink alias resolves to the same canonical file, so it must hit
+        // the same entry rather than hash through the alias.
+        let alias = dir.path().join("alias-stub");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let via_alias = pin_binary(&alias).unwrap();
+        assert_eq!(via_alias, first);
+        // A different file's pin never aliases to this entry.
+        let other = write_stub(dir.path(), "stub-cache (different)");
+        assert_ne!(pin_binary(&other).unwrap().sha256, first.sha256);
     }
 
     fn write_stub(dir: &Path, version: &str) -> PathBuf {

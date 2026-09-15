@@ -11,6 +11,7 @@ description = "Feishu dispatcher adapter: lark-cli consume, inbound normalize, o
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 remuda-hub-client.workspace = true
 remuda-protocol.workspace = true
 rusqlite.workspace = true

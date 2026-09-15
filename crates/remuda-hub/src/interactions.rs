@@ -16,6 +16,14 @@ use std::time::Duration;
 
 const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Context for an accepted Bot-relayed answer (design §5.1 #1).
+struct BotRelay {
+    /// Acting owner Feishu `open_id`.
+    open_id: String,
+    /// Open card ticket that authorized the relay.
+    ticket_id: String,
+}
+
 /// REST routes for `/v1/interactions`.
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -40,6 +48,10 @@ pub struct AnswerBody {
     #[serde(default)]
     command_id: Option<String>,
     answer: InteractionAnswer,
+    /// Feishu `open_id` of the owner who acted. Required, and only consulted,
+    /// when the caller is a Bot device relaying a card click (design §5.1 #1).
+    #[serde(default)]
+    acting_open_id: Option<String>,
 }
 
 /// `GET /v1/interactions` — durable Hub index, merged with live Node RPC.
@@ -151,17 +163,60 @@ pub async fn answer_interaction(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
-    if crate::agent_scope::origin(&device) != remuda_protocol::InputOrigin::Human {
+    let origin = crate::agent_scope::origin(&device);
+    if origin == remuda_protocol::InputOrigin::Agent {
         return Err(HubError::Forbidden);
     }
     let interaction_id =
         InteractionId::try_from(id).map_err(|err| HubError::BadRequest(err.to_string()))?;
+    // D-005/D-011 stay in force for Bot callers (design §5.1 #1): the bot is
+    // only the owner's courier. A relay is accepted exactly when all hold:
+    //   1. the answer carries the acting owner's Feishu open_id,
+    //   2. that open_id is on this bot device's allowlist,
+    //   3. an open, unexpired card ticket binds this interaction to the bot.
+    // Agent-relayed approvals without these stay untrusted and get 403.
+    let bot_relay = if origin == remuda_protocol::InputOrigin::Bot {
+        let acting_open_id = body
+            .acting_open_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(HubError::Forbidden)?;
+        if !state
+            .store
+            .bot_owner_allowlist_contains(device.id.clone(), acting_open_id.to_string())
+            .await?
+        {
+            return Err(HubError::Forbidden);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let ticket = state
+            .store
+            .get_open_card_ticket_for_bot(
+                interaction_id.as_id().as_str().to_string(),
+                device.id.clone(),
+            )
+            .await?
+            .ok_or(HubError::Forbidden)?;
+        if ticket.expires_at_ms <= now_ms {
+            return Err(HubError::Forbidden);
+        }
+        Some(BotRelay {
+            open_id: acting_open_id.to_string(),
+            ticket_id: ticket.ticket_id,
+        })
+    } else {
+        None
+    };
     let command_id = match body.command_id {
         Some(raw) => {
             CommandId::try_from(raw).map_err(|err| HubError::BadRequest(err.to_string()))?
         }
         None => CommandId::new(),
     };
+    let device_id = device.id.clone();
     let by_device = Id::try_from(device.id).map_err(|err| HubError::Internal(err.to_string()))?;
     if let Some(result) = state
         .agent_approvals
@@ -173,6 +228,16 @@ pub async fn answer_interaction(
         )
         .await?
     {
+        if let Some(relay) = &bot_relay {
+            settle_bot_relay(
+                &state,
+                &device_id,
+                relay,
+                interaction_id.as_id().as_str(),
+                command_id.as_id().as_str(),
+            )
+            .await;
+        }
         return Ok(Json(result));
     }
     let stored = state
@@ -181,12 +246,17 @@ pub async fn answer_interaction(
         .await?;
     // Node owns first-answer-wins. Never commit an answer in the Hub before
     // the owner is reached, and let the Node reconcile same-command retries.
-    let params = json!({
+    let mut params = json!({
         "interactionId": interaction_id.as_id().as_str(),
         "commandId": command_id.as_id().as_str(),
         "byDevice": by_device.as_str(),
         "answer": body.answer,
     });
+    if let Some(relay) = &bot_relay {
+        // Informational only: the Node still authorizes against `byDevice`.
+        // The durable attribution of the human owner lives in the Hub audit row.
+        params["actingOpenId"] = json!(relay.open_id);
+    }
     let hosts = match stored {
         Some(row) => vec![row.host_id],
         None => state.nodes.host_ids().await,
@@ -210,6 +280,16 @@ pub async fn answer_interaction(
                         .store
                         .record_interaction_answer(interaction_id.as_id().to_string())
                         .await?;
+                    if let Some(relay) = &bot_relay {
+                        settle_bot_relay(
+                            &state,
+                            &device_id,
+                            relay,
+                            interaction_id.as_id().as_str(),
+                            command_id.as_id().as_str(),
+                        )
+                        .await;
+                    }
                     return Ok(Json(result));
                 }
                 Err(HubError::NotFound) => {}
@@ -221,6 +301,49 @@ pub async fn answer_interaction(
     }
 
     Err(HubError::NotFound)
+}
+
+/// Winning-relay side effects: the Hub owns the authoritative ticket row, so
+/// flip it to `answered` here (rather than trusting the dispatcher client),
+/// and write the audit row that names the acting owner. D-005/D-011: the bot
+/// never self-attests — the human `open_id` behind every relayed approval is
+/// auditable and names the acting owner, not the bot device alone.
+async fn settle_bot_relay(
+    state: &AppState,
+    device_id: &str,
+    relay: &BotRelay,
+    interaction_id: &str,
+    command_id: &str,
+) {
+    if let Err(err) = state
+        .store
+        .set_card_ticket_state(
+            relay.ticket_id.clone(),
+            device_id.to_string(),
+            "answered".into(),
+            None,
+        )
+        .await
+    {
+        tracing::error!(error = %err, interaction_id, "failed to settle card ticket state");
+    }
+    if let Err(err) = state
+        .store
+        .append_audit(
+            device_id.to_string(),
+            "interaction.bot-answer".into(),
+            Some(interaction_id.to_string()),
+            json!({
+                "actingOpenId": relay.open_id,
+                "ticketId": relay.ticket_id,
+                "commandId": command_id,
+                "relayedBy": "feishu",
+            }),
+        )
+        .await
+    {
+        tracing::error!(error = %err, interaction_id, "failed to audit bot-relayed answer");
+    }
 }
 
 fn rpc_result(frame: Value) -> Result<Value, HubError> {

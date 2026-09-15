@@ -13,6 +13,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use tokio::sync::mpsc;
 
@@ -217,6 +218,10 @@ pub trait DriverFactory: Send + Sync {
 pub struct FakeDriver {
     kind: DriverKind,
     panic_prompts: BTreeSet<String>,
+    /// Time `start()` takes before reporting the run handle. Lets the
+    /// fast-accept test prove the RPC ack lands while the driver is still
+    /// materializing.
+    start_delay: Duration,
     instance: Option<Instance>,
 }
 
@@ -226,6 +231,7 @@ impl FakeDriver {
         Self {
             kind,
             panic_prompts: BTreeSet::new(),
+            start_delay: Duration::ZERO,
             instance: None,
         }
     }
@@ -233,6 +239,12 @@ impl FakeDriver {
     /// Add a prompt that intentionally panics to test instance isolation.
     pub fn with_panic_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.panic_prompts.insert(prompt.into());
+        self
+    }
+
+    /// Delay `start()` by this long, simulating a slow binary pin / spawn.
+    pub fn with_start_delay(mut self, delay: Duration) -> Self {
+        self.start_delay = delay;
         self
     }
 }
@@ -246,6 +258,16 @@ impl Default for FakeDriver {
 impl Driver for FakeDriver {
     fn kind(&self) -> DriverKind {
         self.kind
+    }
+
+    fn start(&self) -> DriverStartFuture<'_> {
+        let delay = self.start_delay;
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(None)
+        })
     }
 
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
@@ -497,6 +519,7 @@ impl DriverFactory for FakeDriverFactory {
         Ok(Arc::new(FakeDriver {
             kind: DriverKind::ClaudePrint,
             panic_prompts: BTreeSet::new(),
+            start_delay: Duration::ZERO,
             instance: Some(launch.instance),
         }))
     }

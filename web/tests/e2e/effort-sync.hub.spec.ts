@@ -1,5 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * D-028 §9.1 live effort sync against the fake Node in
@@ -18,7 +21,7 @@ test.describe.configure({ mode: "serial" });
 
 const created: string[] = [];
 
-async function createSession(page: Page, prompt: string): Promise<string> {
+async function createSession(page: Page, prompt: string, kind = "claude"): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
@@ -28,6 +31,7 @@ async function createSession(page: Page, prompt: string): Promise<string> {
     .getAttribute("value");
   expect(hostId).toBeTruthy();
   await hostPicker.selectOption(hostId!);
+  await page.getByTestId(`new-session-kind-${kind}`).click();
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, {
     timeout: 20_000,
   });
@@ -42,6 +46,72 @@ async function createSession(page: Page, prompt: string): Promise<string> {
 test.beforeEach(async ({ page }) => {
   await login(page);
 });
+
+const codexTiers = [
+  ["low", "Low", "Fast responses with lighter reasoning"],
+  ["medium", "Medium", "Balances speed and reasoning depth for everyday tasks"],
+  ["high", "High", "Greater reasoning depth for complex problems"],
+  ["xhigh", "Extra high", "Extra high reasoning depth for complex problems"],
+  ["max", "Max", "For difficult problems when quality matters more than speed · higher usage"],
+  ["ultra", "Ultra", "For demanding work using multiple agents · highest usage"],
+] as const;
+
+const evidenceDir = process.env.REMUDA_EVIDENCE === "1"
+  ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence")
+  : path.resolve("test-results/evidence");
+
+for (const width of [390, 1440]) {
+  test(`Codex max and ultra round-trip with the six-tier picker at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const instanceId = await createSession(page, "Codex effort round trip", "codex");
+    await clearApprovals(page, instanceId);
+
+    for (const [name, look] of [["max", "top"], ["ultra", "ultracode"]] as const) {
+      await page.getByTestId("model-effort-chip").click();
+      await page.getByTestId("effort-open-list").click();
+      const request = page.waitForRequest((r) =>
+        r.method() === "POST" && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
+        && r.postDataJSON()?.operation === "instance.configure");
+      await page.getByTestId(`effort-tier-${name}`).click();
+      const payload = (await request).postDataJSON().payload;
+      expect(payload.effort.name).toBe(name);
+      expect(payload.effort.ultracode ?? false).toBe(false);
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-name", name);
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", look);
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ultracode", "0");
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-effective", name);
+      await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-source", "remuda");
+      await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-mismatch", "0");
+
+      // Reload from persisted Hub state: neither requested nor observed name
+      // may be downgraded to xhigh or turned into Claude's workflow flag.
+      await page.reload();
+      await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-effective", name);
+      await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-mismatch", "0");
+      await page.getByTestId("model-effort-chip").click();
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-name", name);
+      await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", look);
+      await expect(page.getByTestId("loading-snapshot")).toHaveCount(0);
+      await mkdir(evidenceDir, { recursive: true });
+      await page.screenshot({ path: path.join(evidenceDir, `effort-codex-tiers-1-${name}-${width}.png`), animations: "disabled" });
+      await page.keyboard.press("Escape");
+    }
+
+    await page.getByTestId("model-effort-chip").click();
+    await page.getByTestId("effort-open-list").click();
+    const rows = page.getByTestId("effort-list").locator('[data-testid^="effort-tier-"]');
+    await expect(rows).toHaveCount(6);
+    for (const [i, [name, label, description]] of codexTiers.entries()) {
+      await expect(rows.nth(i)).toHaveAttribute("data-testid", `effort-tier-${name}`);
+      await expect(rows.nth(i)).toHaveText(`${label}${description}`);
+      await expect(rows.nth(i)).toHaveAttribute("title", description);
+      await expect(rows.nth(i)).toBeVisible();
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+    await page.screenshot({ path: path.join(evidenceDir, `effort-codex-tiers-1-list-${width}.png`), animations: "disabled" });
+  });
+}
 
 // Clean up with `page.request`, which carries the login session cookie. The
 // standalone Playwright `request` fixture is unauthenticated: deleting with

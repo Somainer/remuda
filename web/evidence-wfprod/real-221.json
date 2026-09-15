@@ -1,0 +1,379 @@
+{
+ "liveRun": {
+  "description": {
+   "state": "known",
+   "value": "r-ux-w two-phase signals spike"
+  },
+  "engine": "claude-workflow",
+  "live": {
+   "agentLabel": {
+    "state": "known",
+    "value": "alpha:one"
+   },
+   "phaseTitle": {
+    "state": "known",
+    "value": "Alpha"
+   },
+   "summary": {
+    "evidenceEventIds": [],
+    "reason": "not-emitted",
+    "state": "unknown"
+   }
+  },
+  "name": {
+   "state": "known",
+   "value": "spike-wf-1"
+  },
+  "nativeRunId": {
+   "state": "known",
+   "value": "wf_c3422384-cb1"
+  },
+  "nativeTaskId": {
+   "state": "known",
+   "value": "wn1eumvco"
+  },
+  "resultRef": null,
+  "revision": "2",
+  "state": "running",
+  "title": {
+   "state": "known",
+   "value": "r-ux-w two-phase signals spike"
+  },
+  "toolCallId": "obj_859142b8-f8a7-7927-bdc8-f45f0fe21197",
+  "totals": {
+   "agentsDone": "0",
+   "agentsFailed": "0",
+   "agentsKilled": "0",
+   "agentsRunning": "1",
+   "agentsTotal": "4",
+   "calls": "1",
+   "elapsedMs": "82001361",
+   "tokens": "20895",
+   "totalKnown": true
+  },
+  "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+ },
+ "livePhases": [
+  {
+   "label": {
+    "state": "known",
+    "value": "Alpha"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Alpha"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6b24b1d7fe",
+   "revision": "2",
+   "state": "running",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  },
+  {
+   "label": {
+    "state": "known",
+    "value": "Beta"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Beta"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6c7ca10992",
+   "revision": "1",
+   "state": "queued",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  }
+ ],
+ "liveMembers": [
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "1",
+   "durationMs": "12220",
+   "label": {
+    "state": "known",
+    "value": "alpha:one"
+   },
+   "latestTool": {
+    "state": "known",
+    "value": "Bash"
+   },
+   "memberId": "obj_01a0a530-6ae8-759b-9a2b-b6941438724e",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "aae139d44933cefe2"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:fdc74efd0cb6889adc0bc2b8c033ad6ba01a8959d991fc92edfa0c8acfe8cbb1"
+   },
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6b24b1d7fe",
+   "resultRef": null,
+   "revision": "1",
+   "startedAt": "2026-09-14T14:23:27.511Z",
+   "state": "running",
+   "tokens": "20895",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  }
+ ],
+ "doneRun": {
+  "description": {
+   "state": "known",
+   "value": "r-ux-w two-phase signals spike"
+  },
+  "engine": "claude-workflow",
+  "live": {
+   "agentLabel": {
+    "evidenceEventIds": [],
+    "reason": "not-emitted",
+    "state": "unknown"
+   },
+   "phaseTitle": {
+    "evidenceEventIds": [],
+    "reason": "not-emitted",
+    "state": "unknown"
+   },
+   "summary": {
+    "state": "known",
+    "value": "Dynamic workflow \\\"r-ux-w two-phase signals spike\\\" completed"
+   }
+  },
+  "name": {
+   "state": "known",
+   "value": "spike-wf-1"
+  },
+  "nativeRunId": {
+   "state": "known",
+   "value": "wf_c3422384-cb1"
+  },
+  "nativeTaskId": {
+   "state": "known",
+   "value": "wn1eumvco"
+  },
+  "resultRef": null,
+  "revision": "10",
+  "state": "completed",
+  "title": {
+   "state": "known",
+   "value": "r-ux-w two-phase signals spike"
+  },
+  "toolCallId": "obj_859142b8-f8a7-7927-bdc8-f45f0fe21197",
+  "totals": {
+   "agentsDone": "4",
+   "agentsFailed": "0",
+   "agentsKilled": "0",
+   "agentsRunning": "0",
+   "agentsTotal": "4",
+   "calls": "3",
+   "elapsedMs": "21460",
+   "tokens": "83365",
+   "totalKnown": true
+  },
+  "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+ },
+ "donePhases": [
+  {
+   "label": {
+    "state": "known",
+    "value": "Alpha"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Alpha"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6b24b1d7fe",
+   "revision": "3",
+   "state": "completed",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  },
+  {
+   "label": {
+    "state": "known",
+    "value": "Beta"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Beta"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6c7ca10992",
+   "revision": "3",
+   "state": "completed",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  }
+ ],
+ "doneMembers": [
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "1",
+   "durationMs": "12220",
+   "endedAt": "2026-09-14T14:23:39.731Z",
+   "label": {
+    "state": "known",
+    "value": "alpha:one"
+   },
+   "latestTool": {
+    "state": "known",
+    "value": "Bash"
+   },
+   "memberId": "obj_01a0a530-6ae8-759b-9a2b-b6941438724e",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "aae139d44933cefe2"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:fdc74efd0cb6889adc0bc2b8c033ad6ba01a8959d991fc92edfa0c8acfe8cbb1"
+   },
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6b24b1d7fe",
+   "resultRef": null,
+   "revision": "2",
+   "startedAt": "2026-09-14T14:23:27.511Z",
+   "state": "completed",
+   "tokens": "20895",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  },
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "1",
+   "durationMs": "13228",
+   "endedAt": "2026-09-14T14:23:40.741Z",
+   "label": {
+    "state": "known",
+    "value": "alpha:two"
+   },
+   "latestTool": {
+    "state": "known",
+    "value": "Bash"
+   },
+   "memberId": "obj_01a0a530-6aea-7350-975c-b8e9f2c18674",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "a600b756a51671bdd"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:cf96cd0af8d9e5ea79c3c88fcd729f7627b7b8dca12474292bb0b6efc71ff7e1"
+   },
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6b24b1d7fe",
+   "resultRef": null,
+   "revision": "2",
+   "startedAt": "2026-09-14T14:23:27.513Z",
+   "state": "completed",
+   "tokens": "20896",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  },
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "0",
+   "durationMs": "5084",
+   "endedAt": "2026-09-14T14:23:45.905Z",
+   "label": {
+    "state": "known",
+    "value": "beta:one"
+   },
+   "memberId": "obj_01a0a530-6aec-70b8-8c3e-0ecbcdeb09fd",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "aa0c6a535232f3334"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:fa9298c4be08fb8630515f2d120309870e0a8e34c551a18c49f4ba6f18c153f3"
+   },
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6c7ca10992",
+   "resultRef": null,
+   "revision": "2",
+   "startedAt": "2026-09-14T14:23:40.821Z",
+   "state": "completed",
+   "tokens": "20737",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  },
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "1",
+   "durationMs": "8149",
+   "endedAt": "2026-09-14T14:23:48.971Z",
+   "label": {
+    "state": "known",
+    "value": "beta:two"
+   },
+   "latestTool": {
+    "state": "known",
+    "value": "Bash"
+   },
+   "memberId": "obj_01a0a530-6aed-72fa-8ed0-1a31046c616e",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "a03d5a31534ff70f8"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:61839973f9fd07c65376b3c6b1091ee50d549404fd74f3eb8efcbbee6688e802"
+   },
+   "phaseId": "obj_01a0a530-6a83-7431-a464-8a6c7ca10992",
+   "resultRef": null,
+   "revision": "2",
+   "startedAt": "2026-09-14T14:23:40.822Z",
+   "state": "completed",
+   "tokens": "20837",
+   "workflowId": "obj_01a0a530-6a83-7431-a464-8a6a724da9e0"
+  }
+ ]
+}

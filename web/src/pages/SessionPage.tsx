@@ -504,6 +504,9 @@ export function SessionPage({
                   objectId: item.objectId as string,
                   name: item.name,
                   previewUrl: item.previewUrl,
+                  kind: item.kind,
+                  mediaType: item.mediaType,
+                  size: item.size,
                 }));
               await hubStore.send(instance.id, text, attachments ?? [], previews, mode);
             } finally {

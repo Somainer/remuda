@@ -478,8 +478,9 @@ mod d028 {
             ("xhigh", EffortName::Xhigh, false),
             ("max", EffortName::Max, false),
             ("ultracode", EffortName::Xhigh, true),
-            // The old web/codex top tier `ultra` migrates to the current top.
-            ("ultra", EffortName::Xhigh, false),
+            // Real level names survive kind-less decoding; the driver rejects
+            // Codex-only ultra when the eventual launch kind is Claude/agy.
+            ("ultra", EffortName::Ultra, false),
             // Unrecognized spellings fall to the Claude default rather
             // than failing a launch over a stale UI string.
             ("whatever-the-ui-said", EffortName::High, false),
@@ -510,17 +511,19 @@ mod d028 {
         }
         // Per-harness migrations — the values the web/driver tables enforce.
         for (kind, legacy, expected) in [
-            // codex: the invented `ultra` is not a codex word → xhigh; the
-            // enum also parses minimal; unknown → the CLI default medium.
-            ("codex", "ultra", (EffortName::Xhigh, false)),
-            ("codex", "minimal", (EffortName::Minimal, false)),
+            // Codex's real top levels are preserved; old minimal inputs map
+            // to low, while unknown names keep the CLI default medium.
+            ("codex", "max", (EffortName::Max, false)),
+            ("codex", "ultra", (EffortName::Ultra, false)),
+            ("codex", "minimal", (EffortName::Low, false)),
             ("codex", "bogus", (EffortName::Medium, false)),
             // grok: quick/standard/max was an invented table; the verified
             // menu is low/medium/high/xhigh.
             ("grok", "quick", (EffortName::Low, false)),
             ("grok", "standard", (EffortName::Medium, false)),
             ("grok", "max", (EffortName::Xhigh, false)),
-            ("grok", "ultra", (EffortName::Xhigh, false)),
+            ("grok", "ultra", (EffortName::Ultra, false)),
+            ("agy", "ultra", (EffortName::Ultra, false)),
             ("grok", "bogus", (EffortName::Medium, false)),
         ] {
             assert_eq!(
@@ -539,6 +542,29 @@ mod d028 {
         assert_eq!(decoded.level_name(), "xhigh");
         assert_eq!(EffortSelection::DEFAULT.flag_value(), "high");
         assert!(serde_json::from_value::<EffortSelection>(json!({"index": 3})).is_err());
+    }
+
+    #[test]
+    fn codex_max_and_ultra_round_trip_as_requested_and_effective_levels() {
+        for (word, name) in [("max", EffortName::Max), ("ultra", EffortName::Ultra)] {
+            assert_eq!(round_trip::<EffortName>(json!(word)), name);
+            let selected = round_trip::<EffortSelection>(json!({
+                "name": word,
+                "ultracode": false,
+            }));
+            assert_eq!(selected.name, name);
+            assert_eq!(selected.level_name(), word);
+            assert_eq!(selected.flag_value(), word);
+            assert!(!selected.ultracode);
+
+            let effective = round_trip::<EffortEffective>(json!({
+                "name": word,
+                "source": "remuda",
+                "observedAt": "2026-09-15T00:00:00.000Z",
+            }));
+            assert_eq!(effective.name, name);
+            assert_eq!(effective.ultracode, None);
+        }
     }
 
     /// An InstanceSpec written before D-028 has no `effort`, and absent must

@@ -110,7 +110,7 @@ pub enum DriverEmission {
 impl DriverEmission {
     pub(crate) fn into_payload(self) -> Result<ObservationPayload, NodeError> {
         match self {
-            Self::Message { role, phase, text } => message_payload(role, phase, text),
+            Self::Message { role, phase, text } => message_payload(role, phase, text, Vec::new()),
             Self::NativeLifecycle {
                 name,
                 status,
@@ -529,8 +529,14 @@ pub(crate) fn message_payload(
     role: MessageRole,
     phase: MessagePhase,
     text: String,
+    attachment_blocks: Vec<ContentBlock>,
 ) -> Result<ObservationPayload, NodeError> {
     let node_id = Id::new("obj")?;
+    // The landed file/image blocks (with their absolute `file://` resource
+    // URIs) are journal metadata (D-027b); text stays last so a plain reader
+    // sees the prompt after the references.
+    let mut blocks = attachment_blocks;
+    blocks.push(ContentBlock::Text(Box::new(TextBlock { text })));
     Ok(ObservationPayload::Message(Box::new(MessagePayload {
         mutation: NodeMutation {
             node_id: node_id.clone(),
@@ -541,7 +547,7 @@ pub(crate) fn message_payload(
         message_id: node_id,
         role,
         phase,
-        blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
+        blocks,
         target_block: None,
         parent_tool_call_id: None,
         native_origin: unknown("fake-driver"),

@@ -17,12 +17,10 @@ use crate::types::{
     TurnStartResponse,
 };
 
-/// Verified `model_reasoning_effort` vocabulary for the pinned codex-cli
-/// (0.147.0 `ReasoningEffort::from_str` + the embedded model catalog's common
-/// set). The enum also parses `none`/`max`/`ultra`/custom strings, but those
-/// are model-gated or advanced-picker only; an unknown word must never reach
-/// the binary from this crate. See `docs/design/evidence/composer-slider-5.md`.
-pub const REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+/// Native effort ladder from the codex-cli 0.154.0 picker on the owner's Mac.
+/// `minimal` is accepted only as a legacy input alias for `low`.
+/// See `docs/design/evidence/effort-codex-tiers-1.md`.
+pub const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 
 /// Launch recipe for one app-server child. Always `--listen stdio://`.
 #[derive(Debug, Clone)]
@@ -84,10 +82,15 @@ impl SpawnSpec {
             args.extend(config_flag("model", model)?);
         }
         if let Some(effort) = &self.reasoning_effort {
-            if !REASONING_EFFORTS.contains(&effort.as_str()) {
+            let value = if effort == "minimal" {
+                "low"
+            } else {
+                effort.as_str()
+            };
+            if !REASONING_EFFORTS.contains(&value) {
                 return Err(WireError::InvalidReasoningEffort(effort.clone()));
             }
-            args.extend(config_flag("model_reasoning_effort", effort)?);
+            args.extend(config_flag("model_reasoning_effort", value)?);
         }
         if let Some(policy) = &self.approval_policy {
             args.extend(config_flag("approval_policy", policy)?);
@@ -357,7 +360,7 @@ mod tests {
 
     #[test]
     fn rejects_effort_outside_the_verified_vocabulary() {
-        for value in ["ultra", "max", "bogus", "HIGH"] {
+        for value in ["none", "ultracode", "bogus", "HIGH"] {
             let mut spec = SpawnSpec::new("/usr/bin/codex".into(), "/tmp".into()).expect("abs");
             spec.reasoning_effort = Some(value.into());
             let error = spec.argv().unwrap_err();
@@ -366,10 +369,32 @@ mod tests {
                 "{value}: {error:?}"
             );
         }
-        for value in REASONING_EFFORTS {
+    }
+
+    #[test]
+    fn six_native_efforts_pass_through_unchanged_and_minimal_maps_to_low() {
+        assert_eq!(
+            REASONING_EFFORTS,
+            &["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        for (input, expected) in REASONING_EFFORTS
+            .iter()
+            .map(|value| (*value, *value))
+            .chain([("minimal", "low")])
+        {
             let mut spec = SpawnSpec::new("/usr/bin/codex".into(), "/tmp".into()).expect("abs");
-            spec.reasoning_effort = Some((*value).into());
-            assert!(spec.argv().is_ok(), "{value}");
+            spec.reasoning_effort = Some(input.into());
+            assert_eq!(
+                spec.argv().expect(input),
+                vec![
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    "stdio://".to_owned(),
+                    "-c".to_owned(),
+                    format!("model_reasoning_effort=\"{expected}\""),
+                ],
+                "{input}"
+            );
         }
     }
 }

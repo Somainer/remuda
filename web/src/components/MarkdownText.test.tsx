@@ -178,3 +178,22 @@ describe("sanitising fence bodies", () => {
     expect(received[0]).toMatchObject({ lang: "ts", path: "src/app.ts" });
   });
 });
+
+describe("D-027b file-mention folding", () => {
+  it("renders a quoted [File #n] saved-at line as a collapsed row", () => {
+    const text =
+      "echo intro\n[File #1] report.pdf (application/pdf, 24.0 MB) saved at /data/report.pdf\nrest";
+    render(<MarkdownText text={text} />);
+    const row = screen.getByTestId("file-mention");
+    expect(row.getAttribute("data-index")).toBe("1");
+    expect(row.textContent).toContain("report.pdf");
+    expect(row.textContent).toContain("application/pdf");
+    expect((row as HTMLDetailsElement).open).toBe(false);
+  });
+
+  it("leaves ordinary markdown without a mention row", () => {
+    render(<MarkdownText text="hello **world**" />);
+    expect(screen.getByText("world")).toBeTruthy();
+    expect(screen.queryAllByTestId("file-mention")).toHaveLength(0);
+  });
+});

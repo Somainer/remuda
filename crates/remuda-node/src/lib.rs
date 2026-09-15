@@ -33,6 +33,9 @@ mod stdio;
 mod store;
 mod transport;
 mod tty;
+/// Hook-driven Workflow card producer. Public for the integration test and
+/// potential reuse; it has no Node state beyond the per-session fold itself.
+pub mod workflow_producer;
 mod workspace;
 mod workspace_access;
 mod workspace_scm;
@@ -73,7 +76,7 @@ pub use interactions::{InteractionRuntime, PendingInteraction};
 pub use inventory::{
     CLI_KINDS, CliAuth, CliEntry, CollectRequest, Collector, DEFAULT_TTL, HerdrReport,
     HostSnapshot, ProbeEnv, ResourceReport, claude_native_gateway_configured, collect,
-    collect_fresh,
+    collect_fresh, driver_capability_snapshot,
 };
 pub use model::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, InstanceCommandRequest,

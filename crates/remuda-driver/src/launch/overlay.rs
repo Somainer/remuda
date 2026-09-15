@@ -145,6 +145,7 @@ const fn remuda_signal_events() -> &'static [&'static str] {
         "Stop",
         "StopFailure",
         "SessionEnd",
+        "SubagentStart",
         "SubagentStop",
         "Notification",
         "PreToolUse",

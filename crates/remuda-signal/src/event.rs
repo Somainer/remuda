@@ -117,6 +117,8 @@ pub const REGISTERED_EVENTS: &[&str] = &[
     "Stop",
     "StopFailure",
     "SessionEnd",
+    "SubagentStart",
+    "SubagentStop",
     "Notification",
     "PreToolUse",
     "PostToolUse",

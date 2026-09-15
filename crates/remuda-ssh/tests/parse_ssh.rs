@@ -26,8 +26,7 @@ fn fixture_path(name: &str) -> PathBuf {
 
 #[test]
 fn parses_bolt_devbox_sg_g_output() {
-    let target =
-        SshTarget::from_g_output("devbox-sg", &fixture("ssh-G-devbox-sg.txt")).unwrap();
+    let target = SshTarget::from_g_output("devbox-sg", &fixture("ssh-G-devbox-sg.txt")).unwrap();
     assert_eq!(target.alias, "devbox-sg");
     assert_eq!(target.hostname, "10.199.x.x");
     assert_eq!(target.user, "devuser");

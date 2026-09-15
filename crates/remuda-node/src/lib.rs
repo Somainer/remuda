@@ -34,6 +34,7 @@ mod transport;
 mod tty;
 mod workspace;
 mod workspace_access;
+mod workspace_scm;
 mod worktree;
 
 pub use attachments::{

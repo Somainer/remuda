@@ -1342,7 +1342,12 @@ async fn execute_queued(
         queued
     };
     let mut command = store.get_command(&queued.command_id)?;
-    if let DriverRequest::Send { prompt, .. } = &queued.request {
+    if let DriverRequest::Send {
+        prompt,
+        attachments,
+        ..
+    } = &queued.request
+    {
         store.set_instance_state(
             instance_id,
             None,
@@ -1350,11 +1355,18 @@ async fn execute_queued(
                 value: Activity::Working,
             }),
         )?;
+        // D-027b: the journal user message carries the landed image/file
+        // blocks, so the absolute landed path is recorded as metadata.
         store.append_observation(
             instance_id,
             None,
             Completeness::Structured,
-            crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?,
+            crate::driver::message_payload(
+                MessageRole::User,
+                MessagePhase::Input,
+                prompt.clone(),
+                crate::attachments::content_blocks(attachments),
+            )?,
         )?;
         if let Err(error) = driver.wait_control().await {
             notify_carrier(carrier.as_ref(), &error);

@@ -1,4 +1,5 @@
-//! D-027: pull staged attachments from the Hub and materialize them on disk.
+//! D-027 / D-027b: pull staged attachments from the Hub and materialize them
+//! on disk.
 //!
 //! An `instance.send` carries attachment metadata only; the bytes stay on the
 //! Hub behind `GET /v1/objects/{id}` until this module fetches them. §8.1 of
@@ -8,38 +9,55 @@
 //!
 //! Materialization happens *before* dispatch and fails the whole send when it
 //! cannot complete. Degrading silently to a text-only prompt would leave the
-//! agent answering a question about an image it never received.
+//! agent answering a question about a file it never received.
+//!
+//! D-027b (2026-09-15) widened this from four image types to arbitrary files:
+//! files land under their sanitised *original* name (the Hub already
+//! sanitised it; we defend in depth), collisions get a numeric suffix, the
+//! digest is verified, and nothing is ever executed.
 
 use crate::NodeError;
+use remuda_protocol::hubnode::{
+    AttachmentKind, AttachmentRef, extension_for_media_type, sanitize_attachment_name,
+};
 use remuda_protocol::InstanceId;
-use remuda_protocol::hubnode::AttachmentRef;
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Per-attachment ceiling, mirroring the Hub's upload cap so a compromised or
-/// buggy Hub response cannot fill this disk.
-const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+/// Per-attachment ceiling, mirroring the Hub's default upload cap so a
+/// compromised or buggy Hub response cannot fill this disk. A Hub configured
+/// with a smaller `attachmentMaxBytes` never sends more; a larger configured
+/// cap must be matched here explicitly.
+pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Attachments accepted on one send, mirroring the Hub's per-message cap.
-const MAX_ATTACHMENTS: usize = 4;
+const MAX_ATTACHMENTS: usize = 8;
 /// Pull deadline. A send waits on this, so it stays short.
-const PULL_TIMEOUT: Duration = Duration::from_secs(30);
+const PULL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One attachment that now exists on this host's disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedAttachment {
     /// Hub object identity.
     pub object_id: String,
-    /// Media type as sniffed by the Hub.
+    /// Image vs. arbitrary file (D-027b).
+    pub kind: AttachmentKind,
+    /// Media type as accepted by the Hub.
     pub media_type: String,
+    /// Sanitised display name (original filename when one was uploaded).
+    pub name: String,
     /// Absolute path written under the instance's attachments directory.
     pub path: PathBuf,
     /// Byte length actually written.
     pub byte_len: u64,
-    /// 1-based `[Image #n]` anchor number from the send manifest, when the
-    /// client numbered its attachments.
+    /// Lowercase hex SHA-256 of the bytes as written (verified against the
+    /// manifest digest when the Hub carried one).
+    pub digest: String,
+    /// 1-based `[Image #n]` / `[File #n]` anchor number from the send
+    /// manifest, when the client numbered its attachments.
     pub index: Option<u32>,
 }
 
@@ -207,17 +225,10 @@ pub async fn materialize(
     create_private_dir(&dir)?;
 
     let mut out = Vec::with_capacity(refs.len());
+    // Names already claimed by this batch, so two attachments uploaded under
+    // the same filename in one send get distinct landed paths.
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
     for reference in refs {
-        let extension = extension_for(&reference.media_type).ok_or_else(|| {
-            NodeError::InvalidRequest(format!(
-                "attachment {} has unsupported media type {}",
-                reference.object_id, reference.media_type
-            ))
-        })?;
-        // The name is rebuilt from the id and the media type. Nothing the Hub
-        // or the caller sent is used as a path component.
-        let file_name = format!("{}.{extension}", sanitize_id(&reference.object_id)?);
-        let path = dir.join(&file_name);
         let bytes = source.fetch(reference.object_id.clone()).await?;
         if bytes.is_empty() {
             return Err(NodeError::InvalidRequest(format!(
@@ -232,21 +243,152 @@ pub async fn materialize(
                 bytes.len()
             )));
         }
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if let Some(expected) = reference.digest.as_deref().filter(|value| !value.is_empty()) {
+            if expected != digest {
+                return Err(NodeError::InvalidRequest(format!(
+                    "attachment {} failed integrity check: digest {digest} != manifest {expected}",
+                    reference.object_id
+                )));
+            }
+        }
+        let name = landing_name(reference)?;
+        let file_name =
+            collision_free_name(&dir, &mut claimed, &name, &reference.object_id)?;
+        let path = dir.join(&file_name);
         write_private(&path, &bytes)?;
+        claimed.insert(file_name);
         out.push(MaterializedAttachment {
             object_id: reference.object_id.clone(),
+            kind: reference.kind,
             media_type: reference.media_type.clone(),
+            name,
             byte_len: bytes.len() as u64,
             path,
+            digest,
             index: reference.index,
         });
     }
     Ok(out)
 }
 
+/// Choose the on-disk basename for one attachment (D-027b).
+///
+/// Prefer the sanitised original filename the manifest carries; when none
+/// survived, fall back to the D-027 derived `<obj_id>.<ext>` so the name is
+/// still deterministic and path-safe.
+fn landing_name(reference: &AttachmentRef) -> Result<String, NodeError> {
+    if let Some(name) = reference
+        .name
+        .as_deref()
+        .and_then(sanitize_attachment_name)
+    {
+        return Ok(name);
+    }
+    let object_id = sanitize_id(&reference.object_id)?;
+    Ok(format!(
+        "{object_id}.{}",
+        extension_for_media_type(&reference.media_type)
+    ))
+}
+
+/// Return `name` when it is free both on disk and within this batch, else a
+/// `stem-<n>.<ext>` variant. `object_id` is only used for the fallback when a
+/// name carries no extension.
+fn collision_free_name(
+    dir: &Path,
+    claimed: &mut BTreeSet<String>,
+    name: &str,
+    object_id: &str,
+) -> Result<String, NodeError> {
+    let free = |candidate: &str| -> bool {
+        !claimed.contains(candidate) && !dir.join(candidate).exists()
+    };
+    if free(name) {
+        return Ok(name.to_owned());
+    }
+    let (stem, ext) = split_name(name);
+    let stem = if stem.is_empty() {
+        sanitize_id(object_id)?
+    } else {
+        stem.to_owned()
+    };
+    for suffix in 1..u32::MAX {
+        let candidate = match ext {
+            Some(ext) => format!("{stem}-{suffix}.{ext}"),
+            None => format!("{stem}-{suffix}"),
+        };
+        if free(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(NodeError::InvalidRequest(format!(
+        "could not find a collision-free name for {name}"
+    )))
+}
+
+/// Split a filename into its last extension (no dot), for the `-<n>` suffix.
+fn split_name(name: &str) -> (&str, Option<&str>) {
+    // A leading dot is not an extension (".env" stays the stem); use the last
+    // dot so "archive.tar.gz" keeps stem "archive.tar" and ext "gz".
+    let dot = name
+        .char_indices()
+        .skip(1)
+        .filter(|(_, ch)| *ch == '.')
+        .last()
+        .map(|(index, _)| index);
+    match dot {
+        Some(index) => (&name[..index], Some(&name[index + 1..])),
+        None => (name, None),
+    }
+}
+
+/// Build the `image`/`file` + `resource` content blocks describing landed
+/// attachments (D-027b).
+///
+/// Used both for the driver-facing prompt and for the journal user-message
+/// record, so the absolute landed path survives in journal metadata even
+/// though it never travels in a command frame. Each attachment contributes a
+/// media block naming the Hub object followed by a `resource` block carrying
+/// the absolute `file://` URI.
+#[must_use]
+pub fn content_blocks(attachments: &[MaterializedAttachment]) -> Vec<remuda_protocol::ContentBlock> {
+    use remuda_protocol::ContentBlock;
+    let mut blocks = Vec::with_capacity(attachments.len() * 2);
+    for attachment in attachments {
+        let Ok(object_id) = remuda_protocol::Id::try_from(attachment.object_id.clone()) else {
+            tracing::warn!(
+                object_id = %attachment.object_id,
+                "attachment id is not a protocol Id; journal/driver block skipped"
+            );
+            continue;
+        };
+        let media = Box::new(remuda_protocol::MediaBlock {
+            object_id: object_id.clone(),
+            media_type: attachment.media_type.clone(),
+            name: Some(attachment.name.clone()),
+            anchor: attachment.index,
+            size: Some(attachment.byte_len),
+        });
+        blocks.push(match attachment.kind {
+            AttachmentKind::Image => ContentBlock::Image(media),
+            AttachmentKind::File => ContentBlock::File(media),
+        });
+        blocks.push(ContentBlock::Resource(Box::new(
+            remuda_protocol::ResourceBlock {
+                uri: format!("file://{}", attachment.path.display()),
+                media_type: remuda_protocol::Knowledge::Known {
+                    value: attachment.media_type.clone(),
+                },
+                object_id: Some(object_id),
+            },
+        )));
+    }
+    blocks
+}
+
 /// Object ids are opaque to us, so verify the shape before it becomes a path.
-fn sanitize_id(object_id: &str) -> Result<String, NodeError> {
-    let ok = !object_id.is_empty()
+fn sanitize_id(object_id: &str) -> Result<String, NodeError> {    let ok = !object_id.is_empty()
         && object_id.len() <= 128
         && object_id
             .chars()
@@ -257,17 +399,6 @@ fn sanitize_id(object_id: &str) -> Result<String, NodeError> {
         Err(NodeError::InvalidRequest(format!(
             "attachment id {object_id} is not a bare identifier"
         )))
-    }
-}
-
-/// Extension for an allowlisted media type; `None` rejects everything else.
-pub fn extension_for(media_type: &str) -> Option<&'static str> {
-    match media_type.split(';').next().unwrap_or_default().trim() {
-        "image/png" => Some("png"),
-        "image/jpeg" | "image/jpg" => Some("jpg"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        _ => None,
     }
 }
 
@@ -330,15 +461,6 @@ mod tests {
         assert!(http_base("wss://").is_err());
     }
 
-    #[test]
-    fn only_allowlisted_image_types_get_an_extension() {
-        assert_eq!(extension_for("image/png"), Some("png"));
-        assert_eq!(extension_for("image/jpeg"), Some("jpg"));
-        assert_eq!(extension_for("image/webp; charset=binary"), Some("webp"));
-        assert_eq!(extension_for("application/pdf"), None);
-        assert_eq!(extension_for("image/svg+xml"), None);
-    }
-
     /// A traversal-shaped id must never reach the filesystem, even though the
     /// Hub already mints ids itself.
     #[test]
@@ -347,5 +469,145 @@ mod tests {
         assert!(sanitize_id("../../etc/passwd").is_err());
         assert!(sanitize_id("obj/nested").is_err());
         assert!(sanitize_id("").is_err());
+    }
+
+    #[test]
+    fn extension_split_keeps_leading_dots_in_the_stem() {
+        assert_eq!(split_name("report.pdf"), ("report", Some("pdf")));
+        assert_eq!(split_name("archive.tar.gz"), ("archive.tar", Some("gz")));
+        assert_eq!(split_name("README"), ("README", None));
+        assert_eq!(split_name(".env"), (".env", None));
+    }
+
+    /// The landing name is the sanitised original; an unusable one falls back
+    /// to `<obj_id>.<ext>`.
+    #[test]
+    fn landing_names_prefer_the_original_and_fall_back_safely() {
+        let reference = AttachmentRef {
+            object_id: "obj_1".into(),
+            kind: AttachmentKind::File,
+            media_type: "application/pdf".into(),
+            name: Some("Q3 report.pdf".into()),
+            size: Some(10),
+            digest: None,
+            index: None,
+        };
+        assert_eq!(landing_name(&reference).unwrap(), "Q3 report.pdf");
+
+        let hostile = AttachmentRef {
+            name: Some("../escape.pdf".into()),
+            ..reference.clone()
+        };
+        assert_eq!(landing_name(&hostile).unwrap(), "obj_1.pdf");
+
+        let unnamed = AttachmentRef {
+            name: None,
+            ..reference.clone()
+        };
+        assert_eq!(landing_name(&unnamed).unwrap(), "obj_1.pdf");
+    }
+
+    /// Existing files — from an earlier send in the same instance directory —
+    /// force a numeric suffix, and two same-named files in one batch diverge.
+    #[test]
+    fn collision_suffixes_keep_every_landing_distinct() {
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-attach-collision-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        create_private_dir(&dir).unwrap();
+        std::fs::write(dir.join("report.txt"), b"old").unwrap();
+        let mut claimed = BTreeSet::new();
+
+        let first = collision_free_name(&dir, &mut claimed, "report.txt", "obj_1").unwrap();
+        assert_eq!(first, "report-1.txt");
+        claimed.insert(first);
+
+        let second = collision_free_name(&dir, &mut claimed, "report.txt", "obj_2").unwrap();
+        assert_eq!(second, "report-2.txt");
+        claimed.insert(second);
+
+        // An existing base name AND its first suffixed variant are skipped.
+        std::fs::write(dir.join("notes.md"), b"old").unwrap();
+        std::fs::write(dir.join("notes-1.md"), b"old").unwrap();
+        let notes = collision_free_name(&dir, &mut claimed, "notes.md", "obj_3").unwrap();
+        assert_eq!(notes, "notes-2.md");
+
+        // An extensionless name gets a bare suffix.
+        let bare = collision_free_name(&dir, &mut claimed, "LICENSE", "obj_4").unwrap();
+        assert_eq!(bare, "LICENSE");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Debug)]
+    struct FakeSource {
+        bytes: Vec<u8>,
+    }
+
+    impl ObjectSource for FakeSource {
+        fn fetch(
+            &self,
+            _object_id: String,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Vec<u8>, NodeError>> + Send + '_>,
+        > {
+            let bytes = self.bytes.clone();
+            Box::pin(async move { Ok(bytes) })
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_writes_named_files_and_rejects_digest_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-attach-mat-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let data_dir = dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let instance = InstanceId::new();
+        let source: Arc<dyn ObjectSource> = Arc::new(FakeSource {
+            bytes: b"hello file\n".to_vec(),
+        });
+
+        let digest = format!("{:x}", Sha256::digest(b"hello file\n"));
+        let refs = vec![AttachmentRef {
+            object_id: "obj_a".into(),
+            kind: AttachmentKind::File,
+            media_type: "text/plain".into(),
+            name: Some("notes.txt".into()),
+            size: Some(11),
+            digest: Some(digest.clone()),
+            index: Some(1),
+        }];
+        let landed = materialize(&source, &data_dir, &instance, &refs)
+            .await
+            .expect("materialize");
+        assert_eq!(landed.len(), 1);
+        assert_eq!(landed[0].name, "notes.txt");
+        assert!(landed[0].path.is_absolute());
+        assert!(landed[0].path.ends_with("notes.txt"));
+        assert_eq!(landed[0].digest, digest);
+        assert_eq!(std::fs::read(&landed[0].path).unwrap(), b"hello file\n");
+
+        // A second materialization of the same name must not overwrite.
+        let again = materialize(&source, &data_dir, &instance, &refs)
+            .await
+            .expect("materialize again");
+        assert!(again[0].path.ends_with("notes-1.txt"), "{:?}", again[0].path);
+
+        // A wrong digest fails the whole send.
+        let bad = vec![AttachmentRef {
+            object_id: "obj_b".into(),
+            digest: Some("0".repeat(64)),
+            ..refs[0].clone()
+        }];
+        assert!(materialize(&source, &data_dir, &instance, &bad)
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

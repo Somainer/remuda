@@ -66,9 +66,25 @@ impl ObjectSource for FakeObjects {
 fn attachment(object_id: &str, media_type: &str) -> AttachmentRef {
     AttachmentRef {
         object_id: object_id.to_owned(),
+        kind: remuda_protocol::hubnode::AttachmentKind::from_media_type(media_type),
         media_type: media_type.to_owned(),
-        name: Some(format!("{object_id}.png")),
+        // No original name: the landed name is derived `<obj_id>.<ext>`.
+        name: None,
         size: None,
+        digest: None,
+        index: None,
+    }
+}
+
+/// A named non-image attachment (D-027b).
+fn file_attachment(object_id: &str, media_type: &str, name: &str) -> AttachmentRef {
+    AttachmentRef {
+        object_id: object_id.to_owned(),
+        kind: remuda_protocol::hubnode::AttachmentKind::File,
+        media_type: media_type.to_owned(),
+        name: Some(name.to_owned()),
+        size: None,
+        digest: None,
         index: None,
     }
 }
@@ -244,28 +260,48 @@ async fn a_failed_pull_rejects_the_whole_send() -> Result<()> {
     Ok(())
 }
 
-/// Unsupported types never reach the disk, even if a Hub somehow offered one.
+/// D-027b: arbitrary files (a PDF here) land with their sanitised original
+/// filename, and a second send of the same name gets a numeric suffix rather
+/// than overwriting the first landing.
 #[tokio::test]
-async fn unsupported_media_types_are_refused_before_any_fetch() -> Result<()> {
+async fn arbitrary_files_land_with_their_name_and_collision_suffix() -> Result<()> {
     let fixture = fixture()?;
-    let objects = FakeObjects::with(&[("obj_doc", b"%PDF-1.7".to_vec())]);
+    let objects = FakeObjects::with(&[("obj_pdf", b"%PDF-1.7 fake".to_vec())]);
     fixture.node.set_object_source(objects.clone());
     let instance = create_instance(&fixture.node).await?;
 
-    let result = send(
+    send(
         &fixture.node,
         &instance,
-        vec![attachment("obj_doc", "application/pdf")],
+        vec![file_attachment("obj_pdf", "application/pdf", "Q3 report.pdf")],
     )
     .await?;
-    let command_id = result["command"]["commandId"].as_str().unwrap();
-    let message = rejection_message(&fixture.node, command_id).await?;
-    assert!(message.contains("unsupported media type"), "{message}");
-    assert_eq!(
-        objects.fetches.load(Ordering::SeqCst),
-        0,
-        "the type is checked before the bytes are pulled"
-    );
+
+    let dir = remuda_node::attachments_dir(&fixture.data_dir, &instance);
+    let first = dir.join("Q3 report.pdf");
+    for _ in 0..100 {
+        if first.is_file() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(first.is_file(), "missing {}", first.display());
+    assert_eq!(std::fs::read(&first)?, b"%PDF-1.7 fake");
+
+    send(
+        &fixture.node,
+        &instance,
+        vec![file_attachment("obj_pdf", "application/pdf", "Q3 report.pdf")],
+    )
+    .await?;
+    let second = dir.join("Q3 report-1.pdf");
+    for _ in 0..100 {
+        if second.is_file() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(second.is_file(), "missing {}", second.display());
     Ok(())
 }
 
@@ -294,7 +330,7 @@ async fn a_node_with_no_object_source_refuses_attachments_but_still_sends_text()
 #[tokio::test]
 async fn more_attachments_than_the_cap_are_refused() -> Result<()> {
     let fixture = fixture()?;
-    let entries: Vec<(String, Vec<u8>)> = (0..5)
+    let entries: Vec<(String, Vec<u8>)> = (0..9)
         .map(|index| (format!("obj_{index}"), png(32)))
         .collect();
     let borrowed: Vec<(&str, Vec<u8>)> = entries

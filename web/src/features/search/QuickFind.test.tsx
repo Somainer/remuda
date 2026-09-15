@@ -5,7 +5,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { Instance } from "../../types/instance";
 import type { Workspace } from "../../types/workspace";
 import { SPACES_PREFS_KEY, spaceStore } from "../spaces/store";
-import { QuickFind, QuickFindTrigger, closeQuickFind } from "./QuickFind";
+import { QuickFind, QuickFindTrigger, closeQuickFind } from "./QuickFind.tsx";
 
 // vi.mock factories are hoisted above imports, so every value the mock closes
 // over has to be hoisted with it. These are plain objects cast to the entity

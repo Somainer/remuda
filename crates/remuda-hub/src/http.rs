@@ -1389,11 +1389,17 @@ pub(crate) async fn forward_if_online(
         .as_object_mut()
         .ok_or_else(|| HubError::BadRequest("command payload must be an object".into()))?;
     object.insert("commandId".into(), json!(command.command_id));
-    if command.operation == "instance.create" {
+    if matches!(
+        command.operation.as_str(),
+        "instance.create" | "instance.resume"
+    ) {
         let instance_id = command.instance_id.clone().ok_or(HubError::NotFound)?;
         let token = crate::agent_scope::instance_token(state.store.clone(), instance_id).await?;
         // Credential travels only on the authenticated carrier, never in the
         // persisted command, returned HTTP body, or launch recipe.
+        // Resume launches a new child too: its re-resolved public provider
+        // overlay needs a fresh, host-scoped secret just like create. Reusing
+        // a parent's launch file would bypass rotation and scope checks.
         object.insert("agentCredential".into(), json!({"token":token}));
         params = crate::providers::with_launch_secret(state, &command.host_id, params).await?;
     }

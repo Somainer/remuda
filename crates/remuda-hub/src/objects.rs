@@ -68,27 +68,26 @@ async fn reject_oversize_upload(
     request: Request,
     next: Next,
 ) -> Response {
-    if method == Method::POST && uri.path() == "/v1/objects" {
-        if let Some(length) = headers
+    if method == Method::POST
+        && uri.path() == "/v1/objects"
+        && let Some(length) = headers
             .get(header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<usize>().ok())
-        {
-            if length > max_bytes {
-                let body = json!({
-                    "error": format!(
-                        "RESOURCE_LIMIT: attachment is {length} bytes; the limit is {max_bytes}"
-                    ),
-                    "code": "RESOURCE_LIMIT",
-                });
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    Json(body),
-                )
-                    .into_response();
-            }
-        }
+        && length > max_bytes
+    {
+        let body = json!({
+            "error": format!(
+                "RESOURCE_LIMIT: attachment is {length} bytes; the limit is {max_bytes}"
+            ),
+            "code": "RESOURCE_LIMIT",
+        });
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(body),
+        )
+            .into_response();
     }
     next.run(request).await
 }

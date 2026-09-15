@@ -11,6 +11,14 @@ import shutil
 import subprocess
 import sys
 import time
+sys.path.insert(0, str(Path.cwd() / "scripts/ci"))
+from affected import test_selection
+from gate_supervisor import (
+    install_parent_death_guard,
+    run_step,
+    step_timeout,
+    timeout_overrides,
+)
 
 parser = argparse.ArgumentParser(description="Run the ordered Remuda merge gate")
 selection = parser.add_mutually_exclusive_group()
@@ -30,8 +38,6 @@ if args.affected and not args.base:
 root = Path.cwd()
 os.environ.setdefault("CARGO_TARGET_DIR", str(root / "target-gate"))
 os.environ["CARGO_INCREMENTAL"] = "0"
-sys.path.insert(0, str(root / "scripts/ci"))
-from affected import test_selection
 
 crates, reason = [], "web only"
 if not args.web_only:
@@ -58,6 +64,7 @@ definitions = [
 # Test seam: an executable path, not a shell expression. It receives the step
 # name and still exercises ordering, retries, reports, cwd, and environment.
 override = os.environ.get("REMUDA_MERGE_GATE_COMMAND")
+overrides = timeout_overrides()
 plan = []
 for name, command, cwd, attempts in definitions:
     selected = (args.web or args.web_only or args.web_e2e) if cwd == "web" else not args.web_only
@@ -65,8 +72,10 @@ for name, command, cwd, attempts in definitions:
         selected = False
     if name == "web-hub-e2e":
         selected = args.web_e2e
+    budget = step_timeout(name, overrides)
     plan.append(dict(name=name, command=[override, name] if override else command,
                      cwd=cwd, maxAttempts=attempts,
+                     timeoutSeconds=(int(budget) if budget is not None else 0),
                      status="planned" if selected else "skipped",
                      durationMs=0, attempts=0, retried=False))
     if name == "cargo-test":
@@ -74,6 +83,18 @@ for name, command, cwd, attempts in definitions:
 if args.list:
     print(json.dumps(plan))
     sys.exit(0)
+
+# The step currently running, so a parent-death SIGTERM can kill its whole
+# process group instead of leaving cargo/pnpm grandchildren orphaned.
+active_pgid = None
+
+
+def mark_group(pgid):
+    global active_pgid
+    active_pgid = pgid
+
+
+install_parent_death_guard(lambda: active_pgid)
 
 failed = False
 if not args.web_only:
@@ -85,6 +106,7 @@ try:
             step["status"] = "skipped"
         else:
             started = time.monotonic()
+            terminal = None
             for attempt in range(1, step["maxAttempts"] + 1):
                 step["attempts"] = attempt
                 step["retried"] = attempt > 1
@@ -92,24 +114,43 @@ try:
                       file=sys.stderr, flush=True)
                 command = step["command"]
                 # The Hub e2e step shares one browser server across merge
-                # lanes; serialise it on an advisory lock (flock(1)).
+                # lanes; serialise it on an advisory lock (flock(1)). flock
+                # execs the command, so it stays inside the step process group.
                 if (step["name"] == "web-hub-e2e"
                         and os.environ.get("REMUDA_E2E_LOCK")
                         and shutil.which("flock")):
                     command = ["flock", os.environ["REMUDA_E2E_LOCK"], *command]
-                try:
-                    result = subprocess.run(command, cwd=root / step["cwd"],
-                                            stdin=subprocess.DEVNULL,
-                                            stdout=sys.stderr, stderr=sys.stderr)
-                    code = result.returncode
-                    error = f"exit status {code}"
-                except OSError as exc:
-                    code, error = 1, str(exc)
+                budget = step["timeoutSeconds"] or None
+                result = run_step(command, root / step["cwd"],
+                                  float(budget) if budget else None,
+                                  stdin=subprocess.DEVNULL,
+                                  stdout=sys.stderr, stderr=sys.stderr,
+                                  on_group=mark_group)
+                active_pgid = None
+                code, error = result.returncode, None
+                if result.reason == "timeout":
+                    terminal = result.reason
+                    error = f"{result.detail}; killed step process group"
+                    print(f"gate: {step['name']}: {error}", file=sys.stderr, flush=True)
+                    break
+                if result.reason == "child-lost":
+                    terminal = result.reason
+                    error = f"{result.detail}; killed remaining step process group"
+                    print(f"gate: {step['name']}: {error}", file=sys.stderr, flush=True)
+                    break
                 if code == 0:
                     step["status"] = "ok"
                     break
+                error = f"exit status {code}"
             else:
                 step["status"] = "failed"
+                step["error"] = error
+                failed = True
+            if terminal is not None:
+                # Timeouts and externally lost children are not the flaky-test
+                # class: do not burn another full budget on a retry.
+                step["status"] = "failed"
+                step["reason"] = terminal
                 step["error"] = error
                 failed = True
             step["durationMs"] = int((time.monotonic() - started) * 1000)

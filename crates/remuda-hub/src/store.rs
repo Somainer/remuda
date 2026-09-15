@@ -3499,6 +3499,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
     crate::workspaces::migrate(&conn)?;
     crate::projects::migrate(&conn)?;
+    crate::tasks::migrate(&conn)?;
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;

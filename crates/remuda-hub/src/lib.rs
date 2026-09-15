@@ -39,6 +39,7 @@ mod registry;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;
+mod tasks;
 mod transport;
 mod tty;
 mod web;
@@ -62,6 +63,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+pub use agent_scope::instance_token;
 pub use auth::{bootstrap_issued_at, rotate_bootstrap};
 pub use config::{
     DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
@@ -454,6 +456,7 @@ pub fn router(state: AppState) -> Router {
         .merge(ws::routes())
         .merge(placement::routes())
         .merge(projects::routes())
+        .merge(tasks::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())

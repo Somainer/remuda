@@ -625,6 +625,14 @@ export type DecisionOption = ({
 /** DeliveryState wire values; `protocol.md` §2.6. */
 export type DeliveryState = ("not-sent" | "intent-durable" | "written" | "confirmed" | "rejected" | "unknown");
 
+/** Result of reconciling a diff against a task's `owns[]`; design §4.3 (`scopeCheck.diffMustStayWithin: owns`) — the single highest-value new primitive (playbook), and the pure function the later merge gate calls. */
+export type DiffScopeCheck = ({
+  "checked": (number);
+  "violations"?: (((string))[]);
+  "within": (boolean);
+  [key: string]: unknown;
+});
+
 export type Digest = (string);
 
 /** DispatchState wire values; `protocol.md` §2.5. */
@@ -1895,6 +1903,21 @@ export type LiteralEnv = ({
   [key: string]: unknown;
 });
 
+/** The inherited owner-intent chain carried by every task; design §2.5. */
+export type Mandate = ({
+  "chain": ((MandateLink)[]);
+  [key: string]: unknown;
+});
+
+/** One edge of the inherited owner-intent chain.  Every delegation edge attaches the upstream's own words, so a depth-3 node still reads the owner's original instruction rather than a retelling. */
+export type MandateLink = ({
+  "depth": (number);
+  "intent": (string);
+  "taskId": TaskId;
+  "title": (string);
+  [key: string]: unknown;
+});
+
 /** MediaBlock; `protocol.md` §5.2. */
 export type MediaBlock = ({
   "anchor"?: (number | null);
@@ -2586,6 +2609,31 @@ export type PermissionMode = (ClaudePermission & ({
   "kind": "generic";
   [key: string]: unknown;
 }));
+
+/** One placement-ledger row; design §2.2 ⑥/§5.6.  `reasons` / `rejected` are both the audit trail and the future bot card body — the two never diverge because there is no second representation. */
+export type PlacementLedgerRow = ({
+  "branch"?: (string | null);
+  "createdAt": Timestamp;
+  "createdBy": (string);
+  "harness"?: (string | null);
+  "hostId"?: (HostId | (null));
+  "id": Id;
+  "instanceId"?: (InstanceId | (null));
+  "kind": (string);
+  "model"?: (string | null);
+  "projectId": ProjectId;
+  "reasons"?: (((string))[]);
+  "rejected"?: ((PlacementRejection)[]);
+  "taskId": TaskId;
+  [key: string]: unknown;
+});
+
+/** One rejected candidate and why; design §4.4/§5.6. */
+export type PlacementRejection = ({
+  "candidate": (string);
+  "reason": (string);
+  [key: string]: unknown;
+});
 
 /** PlanReviewAnswer; `protocol.md` §5.4. */
 export type PlanReviewAnswer = ({
@@ -3486,7 +3534,59 @@ export type SubscriptionParams = ({
   [key: string]: unknown;
 });
 
+/** One row of the task ledger; design §2.2/§8.1 row 4. */
+export type Task = ({
+  "blockedReason"?: (string | null);
+  "budget": TaskBudget;
+  "class": TaskClass;
+  "createdAt": Timestamp;
+  "deps"?: ((TaskDep)[]);
+  "id": TaskId;
+  "landedSha"?: (string | null);
+  "mandate": Mandate;
+  "owns"?: (((string))[]);
+  "parentTaskId"?: (TaskId | (null));
+  "placement"?: (TaskPlacementRef | (null));
+  "projectId": ProjectId;
+  "revision": U64;
+  "state": TaskState;
+  "title": (string);
+  "updatedAt": Timestamp;
+  [key: string]: unknown;
+});
+
+/** Estimated budget envelope; design §4.3. Amounts are estimates (§4.5). */
+export type TaskBudget = ({
+  "maxTurns"?: (number | null);
+  "maxUsd"?: (string | null);
+  "maxWallMins"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** TaskClass wire values; `protocol.md` §4.3. */
+export type TaskClass = ("research" | "implement" | "review" | "test" | "merge-gate" | "triage" | "docs");
+
+/** One dependency edge. Edges unlock only when the referenced task carries a landed sha (invariant I1, design §7 #8). */
+export type TaskDep = ({
+  "note"?: (string | null);
+  "taskId": TaskId;
+  [key: string]: unknown;
+});
+
 export type TaskId = (string);
+
+/** Where the task's worker is (or was) placed; updated from placement rows. */
+export type TaskPlacementRef = ({
+  "branch"?: (string | null);
+  "hostId"?: (HostId | (null));
+  "instanceId"?: (InstanceId | (null));
+  "model"?: (string | null);
+  "placementId"?: (Id | (null));
+  [key: string]: unknown;
+});
+
+/** TaskState wire values; `protocol.md` §2.2/5.3. */
+export type TaskState = ("pending" | "placed" | "running" | "stalled" | "done" | "failed" | "parked" | "deferred");
 
 /** TerminalEvidence; `protocol.md` §2.4. */
 export type TerminalEvidence = ({

@@ -43,9 +43,13 @@ test.beforeEach(async ({ page }) => {
   await login(page);
 });
 
-test.afterAll(async ({ request }) => {
+// Clean up with `page.request`, which carries the login session cookie. The
+// standalone Playwright `request` fixture is unauthenticated: deleting with
+// it 401s (previously swallowed by .catch), leaving the fake node's 8
+// placement slots occupied and failing later specs with PLACEMENT_UNSATISFIABLE.
+test.afterEach(async ({ page }) => {
   for (const id of created.splice(0)) {
-    await request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
   }
 });
 

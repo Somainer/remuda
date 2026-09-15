@@ -93,9 +93,67 @@ pub fn map_event(event: &HookEvent) -> Mapped {
         ("reason", "reason"),
         ("source", "source"),
         ("permissionMode", "permission_mode"),
+        // r-ux-w: which agent a sub-agent hook belongs to. Main-session hooks
+        // omit these; workflow sub-agents send `workflow-subagent`.
+        ("agentId", "agent_id"),
+        ("agentType", "agent_type"),
     ] {
         if let Some(value) = event.text(field) {
             related.insert(key.into(), value.to_owned());
+        }
+    }
+    // r-ux-w: SubagentStop carries the agent transcript path (model/usage/timing
+    // tail) and the background-task snapshot (id/status/name/description).
+    if let Some(path) = event.text("agent_transcript_path") {
+        related.insert("agentTranscriptPath".into(), path.to_owned());
+    }
+    if let Some(duration) = event
+        .payload
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
+    {
+        related.insert("durationMs".into(), duration.to_string());
+    }
+    // Structured launch handle on PostToolUse(Workflow): runId / taskId /
+    // run directory / script path. Verified on claude 2.1.221 (r-ux-w).
+    let response = event.payload.get("tool_response");
+    for (key, field) in [
+        ("runId", "runId"),
+        ("taskId", "taskId"),
+        ("workflowName", "workflowName"),
+        ("transcriptDir", "transcriptDir"),
+        ("scriptPath", "scriptPath"),
+        ("taskType", "taskType"),
+    ] {
+        if let Some(value) = response
+            .and_then(|v| v.get(field))
+            .and_then(serde_json::Value::as_str)
+        {
+            related.insert(key.into(), value.to_owned());
+        }
+    }
+    // Background tasks on SubagentStop / Stop: curate the workflow row's
+    // id+status+name when exactly one workflow task is present.
+    let workflow_tasks: Vec<&serde_json::Value> = event
+        .payload
+        .get("background_tasks")
+        .and_then(serde_json::Value::as_array)
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("workflow"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let [task] = workflow_tasks.as_slice() {
+        if let Some(value) = task.get("id").and_then(serde_json::Value::as_str) {
+            related.insert("backgroundTaskId".into(), value.to_owned());
+        }
+        if let Some(value) = task.get("status").and_then(serde_json::Value::as_str) {
+            related.insert("backgroundTaskStatus".into(), value.to_owned());
+        }
+        if let Some(value) = task.get("name").and_then(serde_json::Value::as_str) {
+            related.insert("backgroundTaskName".into(), value.to_owned());
         }
     }
     // MessageDisplay's delta is the payload P3 needs; index/final say where the

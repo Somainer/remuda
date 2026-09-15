@@ -133,7 +133,7 @@ pub struct NativeHome {
 /// by the driver, so it can never reach `claude --effort`.
 ///
 /// Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes
-/// legacy tier **names** through [`legacy_effort_for_kind`], so a stored row
+/// legacy tier **names** through [`normalize_legacy_effort`], so a stored row
 /// or an old client keeps working. Legacy normalization is **per harness**:
 ///
 /// | legacy `name` | harness | normalized |

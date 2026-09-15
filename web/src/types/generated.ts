@@ -669,7 +669,7 @@ export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-a
 /** EffortName wire values; `protocol.md` §4.1. */
 export type EffortName = ("minimal" | "low" | "medium" | "high" | "xhigh" | "max");
 
-/** Native effort selection; `protocol.md` §4.1 (D-028 §9.1).  Five Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only, and is never persisted as a level name.  [`EffortName`] additionally carries `minimal`, which Claude Code does not expose: the Codex/Grok vocabularies do. It is rejected at Claude launches by the driver, so it can never reach `claude --effort`.  Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes legacy tier **names** through [`legacy_effort_for_kind`], so a stored row or an old client keeps working. Legacy normalization is **per harness**:  | legacy `name` | harness | normalized | | --- | --- | --- | | `default` | any | `low` | | `think` | claude | `high` | | `think-hard` | claude | `xhigh` | | `ultra` | any | `xhigh` (the old invented web/codex top tier) | | `quick` / `standard` / `max` | grok | `low` / `medium` / `xhigh` | | `ultracode` | claude | `xhigh` + `ultracode: true` | | anything unrecognized | any | the harness default (`high` for claude, `medium` otherwise) |  Normalization is by **name**, never by index: the legacy tables had different lengths per harness, so index 3 meant `ultracode` for Claude and `ultra` for Codex. `index` on the wire is therefore ignored on read and not written back. */
+/** Native effort selection; `protocol.md` §4.1 (D-028 §9.1).  Five Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only, and is never persisted as a level name.  [`EffortName`] additionally carries `minimal`, which Claude Code does not expose: the Codex/Grok vocabularies do. It is rejected at Claude launches by the driver, so it can never reach `claude --effort`.  Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes legacy tier **names** through [`normalize_legacy_effort`], so a stored row or an old client keeps working. Legacy normalization is **per harness**:  | legacy `name` | harness | normalized | | --- | --- | --- | | `default` | any | `low` | | `think` | claude | `high` | | `think-hard` | claude | `xhigh` | | `ultra` | any | `xhigh` (the old invented web/codex top tier) | | `quick` / `standard` / `max` | grok | `low` / `medium` / `xhigh` | | `ultracode` | claude | `xhigh` + `ultracode: true` | | anything unrecognized | any | the harness default (`high` for claude, `medium` otherwise) |  Normalization is by **name**, never by index: the legacy tables had different lengths per harness, so index 3 meant `ultracode` for Claude and `ultra` for Codex. `index` on the wire is therefore ignored on read and not written back. */
 export type EffortSelection = ({
   "name": EffortName;
   "ultracode": (boolean);
@@ -924,6 +924,9 @@ export type GenericPermission = ({
 
 /** GenericPermissionMode wire values; `protocol.md` §4.1. */
 export type GenericPermissionMode = ("native");
+
+/** GrantVerb wire values; `protocol.md` §2.5. */
+export type GrantVerb = ("dispatch" | "land" | "spend" | "address-owner");
 
 /** GrokPermission; `protocol.md` §4.1. */
 export type GrokPermission = ({
@@ -1232,6 +1235,15 @@ export type InstanceResumeParams = ({
   "instanceId": InstanceId;
   "nativeRef": NativeRef;
   "providerProfileRevision": U64;
+  [key: string]: unknown;
+});
+
+/** Resource reach of one delegation node; design §2.5.  Scope narrows monotonically down the tree: a child scope must be a subset of its parent's. An *empty* dimension means "no narrowing on this dimension" for the dimension's parent view — a node with every dimension empty is the universe root (the human-seated top coordinator). */
+export type InstanceScope = ({
+  "hostIds"?: ((HostId)[]);
+  "projectIds"?: ((ProjectId)[]);
+  "supplyGrants"?: (((string))[]);
+  "workspaceIds"?: ((WorkspaceId)[]);
   [key: string]: unknown;
 });
 
@@ -2111,6 +2123,15 @@ export type MethodName = ("runtime.hello" | "runtime.heartbeat" | "host.report" 
 /** ModelEffective wire values; `protocol.md` §3.1. */
 export type ModelEffective = ("next-turn");
 
+/** Project speaks model roles, not concrete model ids; design §3.2. */
+export type ModelRoles = ({
+  "cheap"?: (string | null);
+  "frontier"?: (string | null);
+  "reviewer"?: (string | null);
+  "workhorse"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** ModelSwitchInput; `protocol.md` §3.1. */
 export type ModelSwitchInput = ({
   "effective": ModelEffective;
@@ -2620,6 +2641,138 @@ export type ProcessRef = ({
 export type ProfileRef = ({
   "id": Id;
   "revision": U64;
+  [key: string]: unknown;
+});
+
+/** Thin authoritative Hub Project entity; design §3.1–§3.2. */
+export type Project = ({
+  "branchPattern": (string);
+  "briefRef": (string);
+  "createdAt": Timestamp;
+  "defaultBaseBranch": (string);
+  "defaultEffort"?: (string | null);
+  "gate": ProjectGate;
+  "homeHost"?: (HostId | (null));
+  "hosts"?: ((ProjectHostQuota)[]);
+  "id": ProjectId;
+  "members"?: ((ProjectMember)[]);
+  "modelRoles": ModelRoles;
+  "name": (string);
+  "permissionPosture"?: (string | null);
+  "placement": ProjectPlacement;
+  "policy": ProjectPolicy;
+  "provider": ProjectProviderRef;
+  "repoRemote"?: (string | null);
+  "revision": U64;
+  "updatedAt": Timestamp;
+  [key: string]: unknown;
+});
+
+/** Configurable policy. Owner-tunable; the first four delegate-tree limits implement design §2.5 ⑤ (depth/fan-out are policy, not schema). */
+export type ProjectConfigurablePolicy = ({
+  "allowMultipleDispatchers": (boolean);
+  "completionLine": (string);
+  "coordinatorFanOut": (number);
+  "defaultPlacement": (string);
+  "maxConcurrentWorkers": (number);
+  "maxDelegationDepth": (number);
+  "maxFanOutPerTask": (number);
+  "nudgeThrottleMins": (number);
+  "stallThresholdMins": (number);
+  [key: string]: unknown;
+});
+
+/** Enforced policy switches. All default on; agents may never change them (D-031 — read-only for coordinators, change requires escalation). */
+export type ProjectEnforcedPolicy = ({
+  "allocatedPortBlocks": (boolean);
+  "casAncestorCheck": (boolean);
+  "gateBeforeLand": (boolean);
+  "noDeployScripts": (boolean);
+  "noOsSettingsChanges": (boolean);
+  "noTunnelTools": (boolean);
+  "oneWorktreePerWorker": (boolean);
+  "reclaimDiskOnRetire": (boolean);
+  "secretsNeverInBriefs": (boolean);
+  "workersNeverPush": (boolean);
+  [key: string]: unknown;
+});
+
+/** Gate configuration; design §3.2 (placeholder, consumed by r-mergequeue). */
+export type ProjectGate = ({
+  "affected": (boolean);
+  "command"?: (string | null);
+  "landSerialization"?: (string | null);
+  "lanes"?: ((ProjectGateLane)[]);
+  "mandatorySteps"?: (((string))[]);
+  "web"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** One gate lane; consumed later by r-mergequeue's `--onto/--lanes`.  Placeholder for batch 1: stored and returned verbatim, not yet enforced. */
+export type ProjectGateLane = ({
+  "hostId": HostId;
+  "id": (string);
+  "ports"?: (string | null);
+  "remote"?: (string | null);
+  "repoPath": (string);
+  "targetDir": (string);
+  [key: string]: unknown;
+});
+
+/** Project-side capacity view of one host with capacity; design §3.2. */
+export type ProjectHostQuota = ({
+  "diskBudgetGb"?: (number | null);
+  "hostId": HostId;
+  "latencyClass"?: (string | null);
+  "maxBuilding"?: (number | null);
+  "maxInstances"?: (number | null);
+  "portBlocks"?: (((string))[]);
+  "requires"?: (((string))[]);
+  [key: string]: unknown;
+});
+
+export type ProjectId = (string);
+
+/** Launch-relevant defaults folded into an instance create; design §3.2 / §6.  Fold priority is explicit (request body) > project > host > global, so every field here only fills a key the request did not name. */
+export type ProjectLaunchDefaults = ({
+  "agent"?: (string | null);
+  "delegation"?: (string | null);
+  "driver"?: (string | null);
+  "effort"?: (string | null);
+  "launchArgs"?: (((string))[]);
+  "model"?: (string | null);
+  "permissionPosture"?: (string | null);
+  "providerProfileId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** One `(hostId, workspaceId)` pair — the same key Space uses (D-024). */
+export type ProjectMember = ({
+  "hostId": HostId;
+  "role": (string);
+  "workspaceId": WorkspaceId;
+  [key: string]: unknown;
+});
+
+/** Project placement defaults. */
+export type ProjectPlacement = ({
+  "default": (string);
+  "hostIds"?: ((HostId)[]);
+  "labels"?: (((string))[]);
+  [key: string]: unknown;
+});
+
+/** Full project policy envelope; design §3.2. */
+export type ProjectPolicy = ({
+  "configurable": ProjectConfigurablePolicy;
+  "enforced": ProjectEnforcedPolicy;
+  [key: string]: unknown;
+});
+
+/** Provider reference (no secret — projects hold only a profileId; design §3.2). */
+export type ProjectProviderRef = ({
+  "delegation"?: (string | null);
+  "profileId"?: (string | null);
   [key: string]: unknown;
 });
 
@@ -3331,6 +3484,8 @@ export type SubscriptionParams = ({
   [key: string]: unknown;
 });
 
+export type TaskId = (string);
+
 /** TerminalEvidence; `protocol.md` §2.4. */
 export type TerminalEvidence = ({
   "eventIds": ((EventId)[]);
@@ -3590,10 +3745,22 @@ export type WaitReason = ("condition-met" | "timeout" | "unknown");
 /** WorkflowEngine wire values; `protocol.md` §5.3. */
 export type WorkflowEngine = ("claude-workflow");
 
+/** The card's live line under the header; additive r-ux-w, §5.3. */
+export type WorkflowLive = ({
+  "agentLabel": Knowledge2;
+  "phaseTitle": Knowledge2;
+  "summary": Knowledge2;
+  [key: string]: unknown;
+});
+
 /** WorkflowMemberPayload; `protocol.md` §5.3. */
 export type WorkflowMemberPayload = ({
   "attempt": Knowledge3;
+  "calls"?: (U64 | (null));
+  "durationMs"?: (U64 | (null));
+  "endedAt"?: (Timestamp | (null));
   "label": Knowledge2;
+  "latestTool"?: (Knowledge2 | (null));
   "memberId": Id;
   "modelRequested": Knowledge2;
   "modelResolved": Knowledge2;
@@ -3602,7 +3769,9 @@ export type WorkflowMemberPayload = ({
   "phaseId": (Id | (null));
   "resultRef": (Id | (null));
   "revision": U64;
+  "startedAt"?: (Timestamp | (null));
   "state": WorkflowState;
+  "tokens"?: (U64 | (null));
   "workflowId": Id;
   [key: string]: unknown;
 });
@@ -3621,20 +3790,39 @@ export type WorkflowPhasePayload = ({
 
 /** WorkflowRunPayload; `protocol.md` §5.3. */
 export type WorkflowRunPayload = ({
+  "description"?: (Knowledge2 | (null));
   "engine": WorkflowEngine;
+  "live"?: (WorkflowLive | (null));
+  "name"?: (Knowledge2 | (null));
   "nativeRunId": Knowledge2;
   "nativeTaskId": Knowledge2;
+  "note"?: (string | null);
   "resultRef": (Id | (null));
   "revision": U64;
   "state": WorkflowState;
   "title": Knowledge2;
   "toolCallId": (Id | (null));
+  "totals"?: (WorkflowTotals | (null));
   "workflowId": Id;
   [key: string]: unknown;
 });
 
 /** WorkflowState wire values; `protocol.md` §5.3. */
 export type WorkflowState = ("queued" | "running" | "completed" | "failed" | "cancelled" | "unknown");
+
+/** Aggregate counters shown on a Workflow card; additive r-ux-w, §5.3.  All values are a point-in-time snapshot: a running run's `tokens` / `elapsed_ms` keep moving until the terminal revision. */
+export type WorkflowTotals = ({
+  "agentsDone": U64;
+  "agentsFailed": U64;
+  "agentsKilled": U64;
+  "agentsRunning": U64;
+  "agentsTotal": U64;
+  "calls": U64;
+  "elapsedMs": U64;
+  "tokens": U64;
+  "totalKnown": (boolean);
+  [key: string]: unknown;
+});
 
 /** WorkflowWaitParams; `protocol.md` §7.2. */
 export type WorkflowWaitParams = ({

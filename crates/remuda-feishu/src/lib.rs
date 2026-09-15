@@ -34,7 +34,7 @@ pub use dispatcher::{
     SendRequest, SessionBinding, SessionStatus, SessionStore,
 };
 pub use error::Error;
-pub use hub_api::HubInstanceApi;
+pub use hub_api::{HubInstanceApi, HubTicketBackend, register_owner_allowlist};
 pub use inbound::{
     CallbackValue, CardAction, ChatType, Deduper, DropReason, ExplicitCommand, GateDecision,
     INBOUND_RETENTION, ImMessage, Inbound, InboundKind, InboundLog, InboundPolicy, Intent, Mention,
@@ -47,8 +47,8 @@ pub use outbound::{
 pub use runtime::{DispatcherRun, run_dispatcher};
 pub use tickets::{
     AnswerScope, CardTicket, DEFAULT_INTERACTION_TTL, MAX_INTERACTION_TTL, MIN_INTERACTION_TTL,
-    MappedAnswer, ShortcutMiss, ShortcutRef, TicketState, TicketStore, parse_form_value,
-    request_title, session_chat,
+    MappedAnswer, NoopTicketBackend, ShortcutMiss, ShortcutRef, StoredTicket, TicketBackend,
+    TicketState, TicketStore, parse_form_value, request_title, session_chat,
 };
 
 /// Event key for inbound IM (one consume process).

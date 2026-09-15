@@ -24,7 +24,8 @@ use crate::inbound::{
 };
 use crate::outbound::{LarkCli, OutboundBody};
 use crate::tickets::{
-    AnswerScope, MappedAnswer, ShortcutMiss, ShortcutRef, TicketStore, request_title,
+    AnswerScope, MappedAnswer, NoopTicketBackend, ShortcutMiss, ShortcutRef, TicketBackend,
+    TicketStore, request_title,
 };
 
 /// Minimum gap between static progress cards (tool-boundary updates only).
@@ -332,6 +333,9 @@ pub struct RespondRequest {
     pub process_generation: U64,
     /// Encoded answer (never logged).
     pub answer: InteractionAnswer,
+    /// Feishu `open_id` of the owner who clicked/typed. The Hub authorizes the
+    /// Bot relay against its allowlist using this (design §5.1 #1).
+    pub acting_open_id: String,
 }
 
 /// One follow/journal page.
@@ -589,17 +593,43 @@ impl<A: InstanceApi> Dispatcher<A> {
         policy: InboundPolicy,
         defaults: RouteDefaults,
     ) -> Result<Self, Error> {
+        Self::open_with_backend(
+            path,
+            api,
+            outbound,
+            policy,
+            defaults,
+            std::sync::Arc::new(NoopTicketBackend),
+        )
+    }
+
+    /// Like [`Self::open`] but with a durable ticket backend, and hydrate open
+    /// card bindings from it (design §5.1 #3).
+    pub fn open_with_backend(
+        path: impl Into<PathBuf>,
+        api: A,
+        outbound: LarkCli,
+        policy: InboundPolicy,
+        defaults: RouteDefaults,
+        ticket_backend: std::sync::Arc<dyn TicketBackend>,
+    ) -> Result<Self, Error> {
         let path = path.into();
         let log = InboundLog::open(inbound_log_path(&path))?;
         Ok(Self {
             api,
             outbound,
             sessions: SessionStore::open(path)?,
-            tickets: TicketStore::with_default_ttl(),
+            tickets: TicketStore::with_default_ttl_backend(ticket_backend),
             policy,
             log,
             defaults,
         })
+    }
+
+    /// Reload durable open ticket bindings after construction. Safe to call
+    /// repeatedly; in-memory bindings always win over stale persisted rows.
+    pub async fn hydrate_tickets(&mut self, now: SystemTime) -> Result<usize, Error> {
+        self.tickets.hydrate(now).await
     }
 
     /// Recorded outbound argv.
@@ -801,7 +831,7 @@ impl<A: InstanceApi> Dispatcher<A> {
         self.touch_inbound(&mut binding, inbound);
         self.sessions.put(&binding)?;
         // F9: a retired instance must not keep answerable cards behind it.
-        let dropped = self.tickets.expire_session(key);
+        let dropped = self.tickets.expire_session_synced(key).await?;
         if !dropped.is_empty() {
             info!(
                 session_key = key,
@@ -883,7 +913,7 @@ impl<A: InstanceApi> Dispatcher<A> {
         binding.status = SessionStatus::Stopped;
         self.touch_inbound(&mut binding, inbound);
         self.sessions.put(&binding)?;
-        let dropped = self.tickets.expire_session(key);
+        let dropped = self.tickets.expire_session_synced(key).await?;
         if !dropped.is_empty() {
             info!(
                 session_key = key,
@@ -918,9 +948,10 @@ impl<A: InstanceApi> Dispatcher<A> {
             tid: ticket.ticket_id.clone(),
             a: a.to_string(),
         };
-        let mapped =
-            self.tickets
-                .answer_callback(&callback, None, AnswerScope::Session(key), now)?;
+        let mapped = self
+            .tickets
+            .answer_callback_synced(&callback, None, AnswerScope::Session(key), now)
+            .await?;
         // Echo what was approved: the owner sees the tool, not just "ok".
         let verb = if a == "deny" {
             "Denied"
@@ -946,7 +977,7 @@ impl<A: InstanceApi> Dispatcher<A> {
         };
         // Card actions carry no thread identity, so they bind to the chat (F9).
         let scope = AnswerScope::Chat(&inbound.chat_id);
-        match self.tickets.answer_card(action, scope, now) {
+        match self.tickets.answer_card_synced(action, scope, now).await {
             Ok(mapped) => self.commit_answer(inbound, mapped).await,
             Err(Error::TicketExpired(tid)) => {
                 let card = crate::render_expired_card("Expired")?;
@@ -1001,7 +1032,14 @@ impl<A: InstanceApi> Dispatcher<A> {
                 request_version: mapped.ticket.request_version,
                 process_generation: mapped.ticket.process_generation,
                 answer: mapped.answer,
+                acting_open_id: inbound.actor_open_id.clone(),
             })
+            .await?;
+        // The Hub accepted the relay; only now flip the durable binding so a
+        // crash between click and accept lets the owner retry instead of
+        // stranding an open card.
+        self.tickets
+            .mark_answered_synced(&mapped.ticket.ticket_id)
             .await?;
         self.reply_card(
             inbound,
@@ -1066,7 +1104,10 @@ impl<A: InstanceApi> Dispatcher<A> {
                     ));
                 }
                 FollowEvent::Interaction(interaction) => {
-                    let (ticket, card) = self.tickets.issue(&interaction, session_key, now)?;
+                    let (ticket, card) = self
+                        .tickets
+                        .issue_synced(&interaction, session_key, instance_id.as_id().as_str(), now)
+                        .await?;
                     let receipt = self
                         .send_chat_card(
                             &binding,
@@ -1077,7 +1118,8 @@ impl<A: InstanceApi> Dispatcher<A> {
                     // Lets `/yes` bind by replying to the card itself (F8).
                     if let Some(message_id) = receipt.message_id.as_deref() {
                         self.tickets
-                            .set_card_message_id(&ticket.ticket_id, message_id);
+                            .set_card_message_id_synced(&ticket.ticket_id, message_id)
+                            .await?;
                     }
                     reports.push(report(
                         session_key,
@@ -1103,7 +1145,7 @@ impl<A: InstanceApi> Dispatcher<A> {
     }
 
     async fn expire_tickets(&mut self, now: SystemTime) -> Result<Vec<DispatchReport>, Error> {
-        let expired = self.tickets.expire_due(now)?;
+        let expired = self.tickets.expire_due_synced(now).await?;
         let mut reports = Vec::new();
         for (ticket, card) in expired {
             if let Some(binding) = self.sessions.get(&ticket.session_key)? {

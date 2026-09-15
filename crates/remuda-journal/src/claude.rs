@@ -29,10 +29,11 @@ use std::path::PathBuf;
 pub struct NativeIds {
     scope: String,
     messages: HashMap<String, (Id, u64)>,
-    tools: HashMap<String, Id>,
     thoughts: HashMap<String, Id>,
+    tools: HashMap<String, Id>,
     workflows: HashMap<String, Id>,
     members: HashMap<String, Id>,
+    phases: HashMap<String, Id>,
 }
 
 impl NativeIds {
@@ -45,6 +46,7 @@ impl NativeIds {
             thoughts: HashMap::new(),
             workflows: HashMap::new(),
             members: HashMap::new(),
+            phases: HashMap::new(),
         }
     }
 
@@ -81,7 +83,8 @@ impl NativeIds {
         Ok(id)
     }
 
-    pub(crate) fn workflow(&mut self, native: &str) -> Result<Id, Error> {
+    pub(crate) fn workflow(&mut self, native: impl AsRef<str>) -> Result<Id, Error> {
+        let native = native.as_ref();
         if let Some(id) = self.workflows.get(native) {
             return Ok(id.clone());
         }
@@ -90,12 +93,23 @@ impl NativeIds {
         Ok(id)
     }
 
-    pub(crate) fn member(&mut self, native: &str) -> Result<Id, Error> {
+    pub(crate) fn member(&mut self, native: impl AsRef<str>) -> Result<Id, Error> {
+        let native = native.as_ref();
         if let Some(id) = self.members.get(native) {
             return Ok(id.clone());
         }
         let id = Id::new("obj")?;
         self.members.insert(native.to_owned(), id.clone());
+        Ok(id)
+    }
+
+    pub(crate) fn phase(&mut self, native: impl AsRef<str>) -> Result<Id, Error> {
+        let native = native.as_ref();
+        if let Some(id) = self.phases.get(native) {
+            return Ok(id.clone());
+        }
+        let id = Id::new("obj")?;
+        self.phases.insert(native.to_owned(), id.clone());
         Ok(id)
     }
 }

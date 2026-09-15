@@ -54,13 +54,17 @@ async fn main() -> Result<()> {
     config.auth_ip_refill_per_sec = 1_000.0;
     config.auth_global_burst = 1_000_000.0;
     config.auth_global_refill_per_sec = 1_000.0;
-    // D-027b: let a hub-backed e2e shrink the per-file ceiling so a size-cap
-    // assertion does not have to move the full 25 MiB through the browser.
-    if let Ok(limit) = std::env::var("HUB_E2E_ATTACHMENT_MAX_BYTES") {
-        config.attachment_max_bytes = limit
+    // D-027b: the browser suite runs against a deliberately small per-file
+    // ceiling so the size-cap assertion uploads only ~100 KiB instead of
+    // pushing 26 MiB through a remote browser. Production defaults stay at
+    // 25 MiB (config::DEFAULT_ATTACHMENT_MAX_BYTES); this is an e2e fixture.
+    // Override with HUB_E2E_ATTACHMENT_MAX_BYTES when a spec needs more room.
+    config.attachment_max_bytes = match std::env::var("HUB_E2E_ATTACHMENT_MAX_BYTES") {
+        Ok(limit) => limit
             .parse()
-            .with_context(|| format!("HUB_E2E_ATTACHMENT_MAX_BYTES={limit}"))?;
-    }
+            .with_context(|| format!("HUB_E2E_ATTACHMENT_MAX_BYTES={limit}"))?,
+        Err(_) => 64 * 1024,
+    };
     // Local acceptance can attach the same fake engine to an isolated remuda
     // dev Hub/Node pair. CI still starts its own disposable real Hub here.
     let addr = config.listen;

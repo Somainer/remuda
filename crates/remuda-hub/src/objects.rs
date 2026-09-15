@@ -15,8 +15,9 @@ use crate::auth::{require_origin, verify_secret};
 use crate::store::{ObjectRecord, StoreError};
 use crate::{AppState, HubError};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,9 +27,9 @@ use remuda_protocol::hubnode::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Slack above the configured per-file ceiling, so an oversized upload fails
-/// with our `RESOURCE_LIMIT` message rather than an opaque 413 from the body
-/// layer.
+/// Slack above the configured per-file ceiling: a body without a declared
+/// length (chunked) is allowed one MiB past the cap into the buffering layer,
+/// where the app-layer check rejects it with our `RESOURCE_LIMIT` message.
 const BODY_LIMIT_SLACK: usize = 1024 * 1024;
 /// Total live staged bytes per instance. Sized for eight 25 MiB files (D-027b).
 pub const MAX_INSTANCE_BYTES: i64 = 256 * 1024 * 1024;
@@ -45,7 +46,51 @@ pub fn routes(max_object_bytes: usize) -> Router<AppState> {
     Router::new()
         .route("/v1/objects", post(upload))
         .route("/v1/objects/{id}", get(download))
+        // Reject on the declared Content-Length before the body streams: a
+        // browser pushing tens of MiB gets an immediate 413 instead of a
+        // stalled request. The app-layer check in `upload` remains as the
+        // backstop for lengthless/chunked bodies.
+        .layer(axum::middleware::from_fn_with_state(
+            max_object_bytes,
+            reject_oversize_upload,
+        ))
         .layer(DefaultBodyLimit::max(max_object_bytes + BODY_LIMIT_SLACK))
+}
+
+/// Return 413 with a `RESOURCE_LIMIT` body for a POST to `/v1/objects` whose
+/// declared `Content-Length` already exceeds the per-file cap, without
+/// reading or buffering the request body. Any other request passes through.
+async fn reject_oversize_upload(
+    State(max_bytes): State<usize>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    if method == Method::POST && uri.path() == "/v1/objects" {
+        if let Some(length) = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            if length > max_bytes {
+                let body = json!({
+                    "error": format!(
+                        "RESOURCE_LIMIT: attachment is {length} bytes; the limit is {max_bytes}"
+                    ),
+                    "code": "RESOURCE_LIMIT",
+                });
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(body),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
 }
 
 /// Allowed image media types, keyed by the extension used for the on-disk

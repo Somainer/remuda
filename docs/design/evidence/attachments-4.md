@@ -44,12 +44,12 @@ PW_TEST_CONNECT_WS_ENDPOINT=ws://127.0.0.1:3177/ \
 HUB_E2E_LISTEN=127.0.0.1:57980 HUB_E2E_WEB_PORT=57989 \
 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:57981 \
 VITE_E2E_UPSTREAM=http://127.0.0.1:57981 \
-HUB_E2E_ATTACHMENT_MAX_BYTES=2097152 \
 pnpm --dir web exec playwright test -c playwright.hub.config.ts ux-attach-files.hub.spec.ts
 ```
 
-`HUB_E2E_ATTACHMENT_MAX_BYTES` 只把例子 Hub 的上限调小，让 size-cap 用例不必
-推 26 MiB；生产默认仍为 25 MiB。
+e2e fixture Hub 默认把上限调到 64 KiB（2026-09-16），size-cap 用例只传约
+96 KiB；需要更大上限的用例可用 `HUB_E2E_ATTACHMENT_MAX_BYTES` 覆盖。
+生产默认仍为 25 MiB。
 
 ## 交付行为（clipboard-images.md §5.3.1 的实现）
 
@@ -94,6 +94,15 @@ nosniff），图片仍是缩略图：
 - 同目录重名（同批次或历史落盘）一律 `<stem>-<n>.<ext>` 数字后缀，
   已存在的 `-1` 也会被跳过；
 - 回拉后校验 sha256，与 manifest 不符即整条 send 失败；
+- **超限即时拒绝（产品修复，2026-09-16）**：Hub 在读取/缓冲 body
+  **之前**先按声明的 `Content-Length` 判定超限，直接回
+  `413` + `{"code":"RESOURCE_LIMIT"}`——浏览器（尤其经远端 Docker
+  Playwright 的上传）不必把几十 MiB 推完才看到失败；无
+  Content-Length 的 chunked body 仍由缓冲后的应用层检查兜底（400，
+  Rust 集成测试 `an_oversize_content_length_is_rejected_before_the_body`
+  与 chunked 分支分别覆盖）。e2e 的 Hub fixture 把上限调小到
+  **64 KiB**（生产默认仍为 25 MiB，可用 `HUB_E2E_ATTACHMENT_MAX_BYTES`
+  覆盖），size-cap 用例只传约 96 KiB 并断言 15 s 内 chip 即 failed；
 - 非图片 GET 固定 `Content-Disposition: attachment`（净化文件名）+
   `X-Content-Type-Options: nosniff`；声明 `image/*` 但嗅不出图片魔数的
   内容降级为 `application/octet-stream`，浏览器不会把它当图片/HTML 渲染；

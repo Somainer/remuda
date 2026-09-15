@@ -348,13 +348,15 @@ test("the per-file size cap surfaces as a failed chip with the Hub's RESOURCE_LI
 }) => {
   await login(page);
   await createAttachmentSession(page);
-  // The hub_e2e example honours HUB_E2E_ATTACHMENT_MAX_BYTES (default 25 MiB);
-  // pushing 26 MiB through the dev proxy is needlessly slow, so the suite runs
-  // with a smaller configured cap. Either way the file is 1 KiB over it and
-  // must fail at the Hub, not silently disappear.
-  const cap = Number(process.env.HUB_E2E_ATTACHMENT_MAX_BYTES ?? 25 * 1024 * 1024);
-  const bytes = new Uint8Array(cap + 1024);
+  // The hub_e2e example starts with a 64 KiB per-file cap (override with
+  // HUB_E2E_ATTACHMENT_MAX_BYTES), so this uploads only ~100 KiB: cheap even
+  // through a remote Docker browser. The Hub rejects on the declared
+  // Content-Length before the body streams, and the chip fails immediately
+  // with the RESOURCE_LIMIT message.
+  const cap = Number(process.env.HUB_E2E_ATTACHMENT_MAX_BYTES ?? 64 * 1024);
+  const bytes = new Uint8Array(cap + 32 * 1024);
   for (let i = 0; i < bytes.length; i += 4096) bytes[i] = (i / 4096) % 256;
+  const start = Date.now();
   await page.evaluate((payload) => {
     const file = new File([payload], "too-big.bin", { type: "application/octet-stream" });
     const data = new DataTransfer();
@@ -363,8 +365,10 @@ test("the per-file size cap surfaces as a failed chip with the Hub's RESOURCE_LI
     area?.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true }));
   }, bytes);
   const chip = page.locator("[data-testid='attachment-chip']").first();
-  await expect(chip).toHaveAttribute("data-state", "failed", { timeout: 60_000 });
+  await expect(chip).toHaveAttribute("data-state", "failed", { timeout: 15_000 });
   await expect(chip).toContainText(/RESOURCE_LIMIT|limit/i);
+  // An early Content-Length reject fails the chip in seconds, never minutes.
+  expect(Date.now() - start).toBeLessThan(15_000);
 });
 
 test("evidence: mixed file + image chips and the sent file row, 390/1440 both themes", async ({

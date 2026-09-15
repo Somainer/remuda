@@ -36,13 +36,30 @@ async fn raw(
     headers: &[(&str, &str)],
     body: Option<(&str, &[u8])>,
 ) -> Result<(u16, String, Vec<u8>)> {
+    raw_chunked(addr, method, path, headers, body, false).await
+}
+
+/// Like `raw`, but frames the body with `Transfer-Encoding: chunked` and no
+/// Content-Length, which is the path the app-layer size check exists for.
+async fn raw_chunked(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<(&str, &[u8])>,
+    chunked: bool,
+) -> Result<(u16, String, Vec<u8>)> {
     let mut stream = TcpStream::connect(addr).await?;
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
     if let Some((content_type, bytes)) = body {
         if !content_type.is_empty() {
             head.push_str(&format!("Content-Type: {content_type}\r\n"));
         }
-        head.push_str(&format!("Content-Length: {}\r\n", bytes.len()));
+        if chunked {
+            head.push_str("Transfer-Encoding: chunked\r\n");
+        } else {
+            head.push_str(&format!("Content-Length: {}\r\n", bytes.len()));
+        }
     }
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -50,7 +67,13 @@ async fn raw(
     head.push_str("\r\n");
     let mut request = head.into_bytes();
     if let Some((_, bytes)) = body {
-        request.extend_from_slice(bytes);
+        if chunked {
+            request.extend_from_slice(format!("{:X}\r\n", bytes.len()).as_bytes());
+            request.extend_from_slice(bytes);
+            request.extend_from_slice(b"\r\n0\r\n\r\n");
+        } else {
+            request.extend_from_slice(bytes);
+        }
     }
     stream.write_all(&request).await?;
     let mut buf = Vec::new();
@@ -367,18 +390,63 @@ async fn non_image_types_stage_as_files_but_fake_images_are_downgraded() -> Resu
 async fn upload_rejects_an_attachment_over_the_size_cap() -> Result<()> {
     let fixture = fixture().await?;
     let addr = fixture.hub.addr;
-    // D-027b default cap is 25 MiB; one byte over fails at the app layer with
-    // RESOURCE_LIMIT (and is still under the body-layer slack, so not a 413).
+    // D-027b default cap is 25 MiB. A declared Content-Length over it is
+    // rejected up front (413, covered by the test above); a lengthless
+    // chunked body reaches the buffered app-layer check and fails 400.
     let oversized = png_bytes(25 * 1024 * 1024 + 1);
-    let (status, body) = upload(
+    let (status, head, body) = raw_chunked(
         addr,
-        &fixture.cookie,
-        &fixture.instance_id,
-        "image/png",
-        &oversized,
+        "POST",
+        &format!("/v1/objects?instanceId={}", fixture.instance_id),
+        &[("Cookie", fixture.cookie.as_str())],
+        Some(("image/png", &oversized)),
+        true,
     )
     .await?;
-    assert_eq!(status, 400, "{body}");
+    assert_eq!(status, 400, "{head}");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("RESOURCE_LIMIT"), "{body}");
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+/// A declared Content-Length over the cap is rejected with 413 before the
+/// body is read: an oversized browser upload fails immediately instead of
+/// streaming the whole file into the buffer (D-027b follow-up).
+#[tokio::test]
+async fn an_oversize_content_length_is_rejected_before_the_body() -> Result<()> {
+    let fixture = fixture().await?;
+    let addr = fixture.hub.addr;
+    let mut stream = TcpStream::connect(addr).await?;
+    let head = format!(
+        "POST /v1/objects?instanceId={} HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Connection: close\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\n\
+         Cookie: {}\r\n\r\n",
+        fixture.instance_id,
+        25 * 1024 * 1024 + 1,
+        fixture.cookie
+    );
+    stream.write_all(head.as_bytes()).await?;
+    // Only a trickle of actual bytes; the reject happens before they matter.
+    stream.write_all(b"x").await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let split = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let head_text = String::from_utf8_lossy(&buf[..split]).to_string();
+    let status = head_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert_eq!(status, 413, "{head_text}");
+    let body = String::from_utf8_lossy(&buf[split + 4..]);
     assert!(body.contains("RESOURCE_LIMIT"), "{body}");
     fixture.hub.shutdown().await;
     Ok(())

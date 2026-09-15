@@ -1370,6 +1370,7 @@ mod tests {
             herdr: None,
             resources: None,
             max_instances: max,
+            default_tui: None,
             hostname: None,
             provider_binding: "auto".into(),
             default_launch_args: None,

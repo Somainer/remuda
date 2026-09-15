@@ -9,14 +9,22 @@
 //! shared-browser web e2e step serialises on an advisory `flock(1)` lock.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use nix::sys::signal::{Signal::SIGKILL, kill};
+use nix::sys::wait::{WaitPidFlag, waitpid};
+use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
+use super::lock::QUEUE_WORKER;
 use super::{MergeArgs, MergeReport, branch_ref, git, lane_target_dir, reports, resolve};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -58,6 +66,10 @@ pub(crate) struct VerificationRecord {
     pub(super) speculative: bool,
     /// true when this verification was the one used for landing.
     pub(super) reused: bool,
+    /// "lane died: …" when this attempt ended with the lane subprocess dead
+    /// rather than a gate verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
 }
 
 /// A gate verdict injected into the state machine.
@@ -75,6 +87,9 @@ pub(super) struct FinishedJob {
     merge: Option<String>,
     tree: Option<String>,
     verdict: Verdict,
+    /// Set when the lane ended without a verdict: killed by a signal,
+    /// exited without a report, or vanished while the monitor was wedged.
+    death: Option<String>,
 }
 
 /// What the coordinator should do next.
@@ -132,6 +147,7 @@ struct Attempt {
     tree: Option<String>,
     verdict: Verdict,
     speculative: bool,
+    death: Option<String>,
 }
 
 const MAX_REVERIFIES: u32 = 3;
@@ -154,8 +170,45 @@ impl Machine {
         self.tentative[idx] = Some(merge);
     }
 
-    fn has_in_flight(&self) -> bool {
-        !self.in_flight.is_empty()
+    fn debug_state(&self) -> String {
+        format!(
+            "main={} status={} inflight={:?} tentative={:?} last={:?}",
+            &self.main[..self.main.len().min(6)],
+            self.status
+                .iter()
+                .map(|s| match s {
+                    BranchStatus::Pending => 'P',
+                    BranchStatus::Landed => 'L',
+                    BranchStatus::Failed => 'F',
+                })
+                .collect::<String>(),
+            self.in_flight,
+            self.tentative,
+            self.attempts
+                .iter()
+                .map(|a| {
+                    a.last()
+                        .map(|t| {
+                            format!(
+                                "{}/{}:{}",
+                                &t.base[..t.base.len().min(6)],
+                                if t.verdict == Verdict::Passed {
+                                    "ok"
+                                } else {
+                                    "fail"
+                                },
+                                if t.speculative { "spec" } else { "real" }
+                            )
+                        })
+                        .unwrap_or_else(|| "-".into())
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Whether branch `idx` currently has a dispatched verification in flight.
+    fn is_active(&self, idx: usize) -> bool {
+        self.in_flight.contains(&idx)
     }
 
     fn finished(&mut self, job: FinishedJob) {
@@ -164,11 +217,12 @@ impl Machine {
         self.launched_speculative[job.idx] = false;
         self.attempts[job.idx].push(Attempt {
             lane: job.lane,
-            base: job.base,
+            base: job.base.clone(),
             merge: job.merge,
             tree: job.tree,
             verdict: job.verdict,
             speculative,
+            death: job.death,
         });
         if job.verdict == Verdict::Failed {
             // The constructed tentative merge is dead.
@@ -186,6 +240,26 @@ impl Machine {
     fn external_move(&mut self, idx: usize, current_main: String) {
         self.main = current_main;
         self.moves[idx] += 1;
+    }
+
+    /// Mark branches whose latest attempt failed on the current main as
+    /// Failed. This is the terminal-failure half of [`Machine::next_serial`]
+    /// run *before* scheduling: a verdict ingested one event earlier must be
+    /// visible to dispatch so a dependent branch can re-verify onto the real
+    /// main in the same iteration instead of waiting for a lane event that
+    /// will never come.
+    fn settle(&mut self) {
+        for idx in 0..self.status.len() {
+            if self.status[idx] != BranchStatus::Pending || self.in_flight.contains(&idx) {
+                continue;
+            }
+            if let Some(last) = self.attempts[idx].last()
+                && last.verdict == Verdict::Failed
+                && last.base == self.main
+            {
+                self.status[idx] = BranchStatus::Failed;
+            }
+        }
     }
 
     /// Pick verification work that can start now and fits free lanes.
@@ -335,6 +409,7 @@ impl Machine {
                         reused: self.status[idx] == BranchStatus::Landed
                             && a.verdict == Verdict::Passed
                             && a.merge == used_merge,
+                        reason: a.death.clone(),
                     })
                     .collect();
                 let (status, why) = match self.status[idx] {
@@ -343,7 +418,16 @@ impl Machine {
                     }
                     BranchStatus::Failed => (
                         "gate_failed".to_string(),
-                        "gate failed on the current main; branch not landed".into(),
+                        match self.attempts[idx]
+                            .iter()
+                            .rev()
+                            .find_map(|a| a.death.as_deref())
+                        {
+                            Some(death) => {
+                                format!("{death}; branch not landed")
+                            }
+                            None => "gate failed on the current main; branch not landed".into(),
+                        },
                     ),
                     BranchStatus::Pending => (
                         "skipped".to_string(),
@@ -388,9 +472,32 @@ fn landed_reason(attempts: &[Attempt]) -> String {
 // Subprocess driver
 // ---------------------------------------------------------------------------
 
+/// How long a lane may show no sign of life (no preparing sidecar and no
+/// final report) before the watchdog considers it dead. Overridable for
+/// tests; the production default is 3 hours — longer than any gate.
+const WATCHDOG_GRACE: Duration = Duration::from_secs(3 * 60 * 60);
+/// How long a wedged lane monitor thread gets to reap its child before the
+/// watchdog reaps the lane pid directly.
+const REAP_GRACE: Duration = Duration::from_secs(10);
+const WATCHDOG_TICK: Duration = Duration::from_millis(200);
+
 enum Event {
     Prepared { idx: usize, merge: String },
     Finished(FinishedJob),
+}
+
+/// A running lane and the watchdog's view of it.
+struct Lane {
+    idx: usize,
+    lane: usize,
+    base: String,
+    pid: u32,
+    started: Instant,
+    /// First moment the watchdog noticed the pid gone/zombie or killed it;
+    /// the monitor gets [`REAP_GRACE`] to report before the watchdog does.
+    noticed: Option<Instant>,
+    /// Set by whichever side (monitor or watchdog) claims the lane first.
+    claimed: Arc<AtomicBool>,
 }
 
 pub(crate) fn run_queue(args: MergeArgs) -> MergeReport {
@@ -413,13 +520,69 @@ struct QueueCtx {
     lock: PathBuf,
 }
 
-/// Remove leftover merge pins for every queued branch.
+/// Remove leftover merge pins and preparing sidecars for every queued branch.
 fn cleanup_queue_pins(ctx: &QueueCtx) {
     for reference in &ctx.references {
         if let Err(error) = reports::cleanup_pins(&ctx.repo, reference) {
             tracing::error!(%error, %reference, "could not remove merge pin");
         }
+        if let Err(error) = reports::cleanup_preparing(&ctx.repo, reference) {
+            tracing::error!(%error, %reference, "could not remove preparing sidecar");
+        }
     }
+}
+
+/// Reap scratch worktrees a SIGKILLed lane could not drop itself.
+///
+/// A lane killed by a signal never runs [`super::TemporaryWorktree`]'s
+/// destructor; its `remuda-mq-<pid>-…` scratch directory and git worktree
+/// registration would otherwise leak. Safety:
+/// * only `remuda-mq-<pid>-` prefixes are inspected (`pid` is the lane this
+///   queue spawned for that branch; the final sweep uses `lane_pids` — the
+///   exact set of pids THIS queue launched), never a blanket prefix sweep;
+/// * the worktree is removed only when git registers it against THIS repo;
+/// * scratch deletion goes through the containment-checked primitive.
+///
+/// Without the pid allowlist a queue on a shared host could delete another
+/// queue's live scratch root (they all use the same OS temp dir).
+fn cleanup_temp_worktrees(repo: &std::path::Path, lane_pids: &[u32]) {
+    let list = git(repo, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+    let mut registered_paths = std::collections::HashSet::new();
+    for line in list.lines().filter(|line| line.starts_with("worktree ")) {
+        registered_paths.insert(PathBuf::from(line.trim_start_matches("worktree ")));
+    }
+
+    let tmp = std::env::temp_dir();
+    let entries = match std::fs::read_dir(&tmp) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(super::scratch::SCRATCH_PREFIX) {
+            continue;
+        }
+        // Restrict to pids this queue actually spawned.
+        let owned = lane_pids
+            .iter()
+            .any(|pid| name.starts_with(&format!("{}{pid}-", super::scratch::SCRATCH_PREFIX)));
+        if !owned {
+            continue;
+        }
+        let root = entry.path();
+        let worktree = root.join("worktree");
+        if registered_paths.contains(&worktree) {
+            let _ = git(
+                repo,
+                &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+            );
+        }
+        // Containment-checked: root is its own exact scratch root.
+        let _ = super::scratch::remove_within(&root, &root);
+    }
+    let _ = git(repo, &["worktree", "prune"]);
 }
 
 fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
@@ -458,39 +621,61 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     let (tx, rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
     // Busy lane per branch: branch idx -> lane.
     let mut busy: BTreeMap<usize, usize> = BTreeMap::new();
+    // All live lanes keyed by branch idx. The watchdog reaps any lane whose
+    // monitor stops observing, so the channel can never go silent forever.
+    let mut active: BTreeMap<usize, Lane> = BTreeMap::new();
+    // Every lane pid this queue has launched; bounds post-kill scratch
+    // reaping so we can never touch another queue's directories.
+    let mut spawned_pids: Vec<u32> = Vec::new();
     let lanes = args.lanes;
-    let mut main_after = None;
     let mut pushed = false;
+    let watchdog_grace = watchdog_grace();
 
-    loop {
+    let main_after = loop {
+        machine.settle();
         for decision in machine.dispatch(lanes, &busy) {
             if let Decision::Verify {
                 idx, lane, base, ..
             } = decision
             {
                 busy.insert(idx, lane);
-                spawn_verify(args, &ctx, tx.clone(), idx, lane, base);
+                match spawn_verify(args, &ctx, tx.clone(), idx, lane, base.clone()) {
+                    Ok((pid, claimed)) => {
+                        if !spawned_pids.contains(&pid) {
+                            spawned_pids.push(pid);
+                        }
+                        active.insert(
+                            idx,
+                            Lane {
+                                idx,
+                                lane,
+                                base,
+                                pid,
+                                started: Instant::now(),
+                                noticed: None,
+                                claimed,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        busy.remove(&idx);
+                        machine.finished(failed_job(idx, lane, &base, &error.to_string()));
+                    }
+                }
             }
         }
 
         match machine.next_serial() {
             Decision::Done => {
-                main_after = Some(resolve(&ctx.repo, "refs/heads/main")?);
-                break;
+                drain_lanes(&rx, &mut active, &mut busy, &mut machine, watchdog_grace);
+                cleanup_temp_worktrees(&ctx.repo, &spawned_pids);
+                break resolve(&ctx.repo, "refs/heads/main")?;
             }
             Decision::StopBaseMoved { idx, current_main } => {
                 // Drain still-running speculative lanes so their child
                 // processes and temporary worktrees do not outlive the queue.
-                while machine.has_in_flight() {
-                    match rx.recv() {
-                        Ok(Event::Prepared { .. }) => {}
-                        Ok(Event::Finished(job)) => {
-                            busy.remove(&job.idx);
-                            machine.finished(job);
-                        }
-                        Err(_) => break,
-                    }
-                }
+                drain_lanes(&rx, &mut active, &mut busy, &mut machine, watchdog_grace);
+                cleanup_temp_worktrees(&ctx.repo, &spawned_pids);
                 cleanup_queue_pins(&ctx);
                 let mut outcomes = machine.records(&names);
                 outcomes[idx].status = "base_moved".into();
@@ -529,18 +714,63 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
                 }
                 continue;
             }
-            Decision::Verify { .. } | Decision::Wait => match rx.recv() {
-                Ok(Event::Prepared { idx, merge }) => machine.prepared(idx, merge),
-                Ok(Event::Finished(job)) => {
-                    busy.remove(&job.idx);
-                    machine.finished(job);
+            Decision::Verify { .. } | Decision::Wait => {
+                // Invariant: waiting requires at least one in-flight lane to
+                // wake us. If nothing is running and nothing was dispatched,
+                // the channel can never be signalled again — the 2026-09-15
+                // production hang. Fail loudly instead of parking forever.
+                ensure!(
+                    !active.is_empty(),
+                    "queue stalled: state machine is waiting with no verification in flight: {}",
+                    machine.debug_state()
+                );
+                // Wait for lane events, but never block on a channel whose
+                // sender side could go silent (a monitor thread wedged in a
+                // futex, like the 2026-09-15 production hang): the watchdog
+                // observes lane pids directly and synthesises a failure.
+                match wait_event(&rx, &mut active, watchdog_grace) {
+                    Some(Event::Finished(job)) => {
+                        if let Some(lane) = active.remove(&job.idx)
+                            && job.death.is_some()
+                        {
+                            // The lane never ran destructors; reap its
+                            // temporary worktree before it can block cleanup.
+                            cleanup_temp_worktrees(&ctx.repo, &[lane.pid]);
+                        } else {
+                            active.remove(&job.idx);
+                        }
+                        busy.remove(&job.idx);
+                        machine.finished(job);
+                    }
+                    Some(Event::Prepared { idx, merge }) => {
+                        machine.prepared(idx, merge);
+                    }
+                    None => {
+                        // Every sender is gone. A lane still tracked has a
+                        // dead monitor; turn each into a failed verification
+                        // so the loop can make progress instead of spinning.
+                        let indices: Vec<usize> = active.keys().copied().collect();
+                        for idx in indices {
+                            let lane = active.remove(&idx).expect("lane tracked");
+                            busy.remove(&idx);
+                            if machine.is_active(idx) {
+                                machine.finished(died_job(
+                                    lane.idx,
+                                    lane.lane,
+                                    &lane.base,
+                                    "lane monitor ended without a verdict".to_string(),
+                                ));
+                            }
+                        }
+                    }
                 }
-                Err(_) => break,
-            },
+            }
         }
-    }
+    };
 
     // Landed branches settle in order; failed branches remain unlanded.
+    // Reap any temporary worktree a signalled lane could not drop itself.
+    cleanup_temp_worktrees(&ctx.repo, &spawned_pids);
     cleanup_queue_pins(&ctx);
     let outcomes = machine.records(&names);
     let failed = outcomes
@@ -550,11 +780,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     if !failed && !args.no_push {
         if let Err(error) = git(
             &ctx.repo,
-            &[
-                "push",
-                "origin",
-                &format!("{}:refs/heads/main", main_after.clone().unwrap()),
-            ],
+            &["push", "origin", &format!("{}:refs/heads/main", main_after)],
         ) {
             // Local landings stand, exactly like the single-branch push step.
             push_error = Some(format!("{error:#}"));
@@ -567,7 +793,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
         report,
         lanes,
         main_before,
-        main_after,
+        Some(main_after),
         pushed,
         outcomes,
         exit,
@@ -645,6 +871,7 @@ fn land_child(ctx: &QueueCtx, idx: usize, base: &str, merge: &str) -> Result<Lan
         .arg("--json")
         .arg("--repo")
         .arg(&repo_str)
+        .env(QUEUE_WORKER, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -674,7 +901,7 @@ fn spawn_verify(
     idx: usize,
     lane: usize,
     base: String,
-) {
+) -> std::io::Result<(u32, Arc<AtomicBool>)> {
     let repo = ctx.repo.clone();
     let reference = ctx.references[idx].clone();
     let lock = ctx.lock.clone();
@@ -682,7 +909,7 @@ fn spawn_verify(
     let repo_str = repo.to_string_lossy().into_owned();
     let target_str = target.to_string_lossy().into_owned();
     let lock_str = lock.to_string_lossy().into_owned();
-    let exe = merge_binary().unwrap();
+    let exe = merge_binary().map_err(std::io::Error::other)?;
     let mut command = Command::new(&exe);
     command
         .current_dir(&repo)
@@ -702,7 +929,10 @@ fn spawn_verify(
         .arg("--e2e-port-base")
         .arg(args.e2e_port_base.to_string())
         .arg("--e2e-lock")
-        .arg(&lock_str);
+        .arg(&lock_str)
+        // The parent holds the repository lock for the whole queue; the lane
+        // locks only its own target directory.
+        .env(QUEUE_WORKER, "1");
     if args.web {
         command.arg("--web");
     }
@@ -715,20 +945,15 @@ fn spawn_verify(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        // Own process group so the watchdog can kill the lane and its gate
+        // without touching the queue parent or any sibling lane.
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    let claimed = Arc::new(AtomicBool::new(false));
+    let monitor_claimed = claimed.clone();
     thread::spawn(move || {
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = tx.send(Event::Finished(failed_job(
-                    idx,
-                    lane,
-                    &base,
-                    &error.to_string(),
-                )));
-                return;
-            }
-        };
         // Watch for the preparing sidecar so the next lane can speculate.
         let mut announced = false;
         loop {
@@ -743,51 +968,90 @@ fn spawn_verify(
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => thread::sleep(std::time::Duration::from_millis(25)),
+                // ECHILD: someone else reaped the lane. The watchdog owns
+                // the verdict in that case.
                 Err(_) => break,
             }
         }
-        let output = match child.wait_with_output() {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = tx.send(Event::Finished(failed_job(
-                    idx,
-                    lane,
-                    &base,
-                    &error.to_string(),
-                )));
-                return;
-            }
+        // try_wait already reaped in the normal path; wait_with_output then
+        // only drains the pipes and returns the cached status.
+        let output = child.wait_with_output();
+        // The watchdog may already have claimed a wedged/dead lane.
+        if monitor_claimed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let job = match output {
+            Ok(output) => classify_child(idx, lane, &base, &output.status, &output.stdout),
+            Err(error) => failed_job(idx, lane, &base, &error.to_string()),
         };
-        let value: serde_json::Value = match first_json(&output.stdout) {
-            Some(value) => value,
-            None => {
-                let _ = tx.send(Event::Finished(failed_job(
-                    idx,
-                    lane,
-                    &base,
-                    "child produced no JSON report",
-                )));
-                return;
-            }
-        };
-        let verdict = if value["exitCode"] == 0 {
-            Verdict::Passed
-        } else {
-            Verdict::Failed
-        };
-        let _ = tx.send(Event::Finished(FinishedJob {
+        let _ = tx.send(Event::Finished(job));
+    });
+    Ok((pid, claimed))
+}
+
+/// Turn a lane child's exit into a state-machine job. A gate verdict is a
+/// normal failure; a lane that was signalled, exited without a report, or
+/// claimed success without a merge commit is a *lane death* — recorded as
+/// "lane died: …", never silently lost.
+fn classify_child(
+    idx: usize,
+    lane: usize,
+    base: &str,
+    status: &std::process::ExitStatus,
+    stdout: &[u8],
+) -> FinishedJob {
+    if let Some(signal) = status.signal() {
+        return died_job(idx, lane, base, format!("killed by signal {signal}"));
+    }
+    let Some(value) = first_json(stdout) else {
+        return died_job(
             idx,
             lane,
             base,
-            merge: value["merged"].as_str().map(str::to_owned),
+            format!(
+                "exited {} without a verification report",
+                status.code().unwrap_or(-1)
+            ),
+        );
+    };
+    let code = value["exitCode"].as_i64();
+    if code == Some(0) {
+        // A passing verification always carries the constructed merge sha.
+        let Some(merged) = value["merged"].as_str().map(str::to_owned) else {
+            return died_job(
+                idx,
+                lane,
+                base,
+                "reported success without a merged commit".to_string(),
+            );
+        };
+        return FinishedJob {
+            idx,
+            lane,
+            base: base.to_owned(),
+            merge: Some(merged),
             tree: value["tree"].as_str().map(str::to_owned),
-            verdict,
-        }));
-    });
+            verdict: Verdict::Passed,
+            death: None,
+        };
+    }
+    // Nonzero with a well-formed report is a gate verdict: a failed gate,
+    // conflict (2), base move (2), or lock contention (3). A merge sha is
+    // present only when the failure came after the merge was constructed.
+    FinishedJob {
+        idx,
+        lane,
+        base: base.to_owned(),
+        merge: value["merged"].as_str().map(str::to_owned),
+        tree: value["tree"].as_str().map(str::to_owned),
+        verdict: Verdict::Failed,
+        death: None,
+    }
 }
 
-fn failed_job(idx: usize, lane: usize, base: &str, error: &str) -> FinishedJob {
-    eprintln!("queue: verification failed to start: {error}");
+fn died_job(idx: usize, lane: usize, base: &str, detail: String) -> FinishedJob {
+    let reason = format!("lane died: {detail}");
+    eprintln!("queue: {reason}");
     FinishedJob {
         idx,
         lane,
@@ -795,6 +1059,233 @@ fn failed_job(idx: usize, lane: usize, base: &str, error: &str) -> FinishedJob {
         merge: None,
         tree: None,
         verdict: Verdict::Failed,
+        death: Some(reason),
+    }
+}
+
+fn failed_job(idx: usize, lane: usize, base: &str, error: &str) -> FinishedJob {
+    died_job(
+        idx,
+        lane,
+        base,
+        format!("verification failed to start: {error}"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Lane watchdog
+// ---------------------------------------------------------------------------
+
+fn watchdog_grace() -> Duration {
+    match std::env::var("REMUDA_QUEUE_WATCHDOG_SECS") {
+        Ok(raw) => raw
+            .parse()
+            .map(Duration::from_secs)
+            .unwrap_or(WATCHDOG_GRACE),
+        Err(_) => WATCHDOG_GRACE,
+    }
+}
+
+fn reap_grace() -> Duration {
+    match std::env::var("REMUDA_QUEUE_REAP_GRACE_MS") {
+        Ok(raw) => raw.parse().map(Duration::from_millis).unwrap_or(REAP_GRACE),
+        Err(_) => REAP_GRACE,
+    }
+}
+
+/// True when the pid exists and is not a zombie: a zombie means the monitor
+/// thread alone can reap it, and if it has not reported it is wedged.
+fn pid_running(pid: u32) -> bool {
+    let raw = i32::try_from(pid).unwrap_or(0);
+    match kill(Pid::from_raw(raw), None) {
+        Ok(()) => {}
+        Err(nix::Error::ESRCH) => return false,
+        // EPERM: something exists with that pid.
+        Err(_) => return true,
+    }
+    proc_state(pid).map(|state| state != b'Z').unwrap_or(true)
+}
+
+/// Linux-only: the third field of `/proc/<pid>/stat` (process state).
+fn proc_state(pid: u32) -> Option<u8> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let comm_end = stat.rfind(')')?;
+    stat[comm_end + 2..].bytes().next()
+}
+
+/// Read a pid's parent from `/proc/<pid>/stat` (Linux). Comm may contain
+/// spaces/parens, so split after the last ')'.
+fn proc_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let comm_end = stat.rfind(')')?;
+    stat[comm_end + 2..].split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Every descendant of `root` by PPID walk. Gate steps start their own
+/// sessions, so a plain process-group kill would leave cargo/pnpm alive.
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(pid) = frontier.pop() {
+        for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(other) = name.parse::<u32>() else {
+                continue;
+            };
+            if proc_ppid(other) == Some(pid) {
+                found.push(other);
+                frontier.push(other);
+            }
+        }
+    }
+    found
+}
+
+fn kill_lane_group(pid: u32) {
+    let raw = i32::try_from(pid).unwrap_or(0);
+    // Steps spawned by the gate run in their own sessions; kill the whole
+    // descendant tree so no cargo/pnpm grandchild outlives the lane.
+    for descendant in descendant_pids(pid) {
+        if let Ok(raw_desc) = i32::try_from(descendant) {
+            match kill(Pid::from_raw(raw_desc), SIGKILL) {
+                Ok(()) | Err(nix::Error::ESRCH) | Err(nix::Error::EPERM) => {}
+                Err(_) => {}
+            }
+        }
+    }
+    // Negative pid addresses the whole process group the lane created.
+    match kill(Pid::from_raw(-raw), SIGKILL) {
+        Ok(()) | Err(nix::Error::ESRCH) | Err(nix::Error::EPERM) => {}
+        Err(_) => {
+            let _ = kill(Pid::from_raw(raw), SIGKILL);
+        }
+    }
+}
+
+/// Best-effort direct reap (only works if this thread is the parent, which
+/// it is not in normal operation; harmless ECHILD otherwise).
+fn reap_pid(pid: u32) {
+    let _ = waitpid(
+        Pid::from_raw(i32::try_from(pid).unwrap_or(0)),
+        Some(WaitPidFlag::WNOHANG),
+    );
+}
+
+/// Apply one lane event to the driver tables and state machine.
+fn apply_event(
+    event: Event,
+    active: &mut BTreeMap<usize, Lane>,
+    busy: &mut BTreeMap<usize, usize>,
+    machine: &mut Machine,
+) {
+    match event {
+        Event::Prepared { idx, merge } => machine.prepared(idx, merge),
+        Event::Finished(job) => {
+            if let Some(lane) = active.remove(&job.idx) {
+                lane.claimed.store(true, Ordering::Release);
+            }
+            if machine.is_active(job.idx) {
+                busy.remove(&job.idx);
+                machine.finished(job);
+            }
+        }
+    }
+}
+
+/// Wait for one lane event, synthesising failures for lanes the watchdog
+/// finds dead/zombie/overdue. Never blocks without a deadline.
+fn wait_event(
+    rx: &Receiver<Event>,
+    active: &mut BTreeMap<usize, Lane>,
+    grace: Duration,
+) -> Option<Event> {
+    loop {
+        match rx.recv_timeout(WATCHDOG_TICK) {
+            Ok(event) => return Some(event),
+            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        let now = Instant::now();
+        for lane in active.values_mut() {
+            let running = pid_running(lane.pid);
+            if (!running || now.duration_since(lane.started) > grace) && lane.noticed.is_none() {
+                eprintln!(
+                    "queue: lane {} (pid {}) {}; waiting {}s for its monitor",
+                    lane.lane,
+                    lane.pid,
+                    if running {
+                        "exceeded the watchdog deadline"
+                    } else {
+                        "is gone"
+                    },
+                    reap_grace().as_secs()
+                );
+                if running {
+                    kill_lane_group(lane.pid);
+                }
+                lane.noticed = Some(now);
+            }
+        }
+        let mut overdue = None;
+        for lane in active.values() {
+            if let Some(noticed) = lane.noticed
+                && now.duration_since(noticed) >= reap_grace()
+            {
+                overdue = Some(lane.idx);
+                break;
+            }
+        }
+        if let Some(idx) = overdue
+            && let Some(lane) = active.get(&idx)
+        {
+            reap_pid(lane.pid);
+            let detail =
+                "lane process was gone or killed past the grace period and its monitor never reported"
+                    .to_string();
+            lane.claimed.store(true, Ordering::Release);
+            return Some(Event::Finished(died_job(
+                lane.idx, lane.lane, &lane.base, detail,
+            )));
+        }
+    }
+}
+
+/// Stop every live lane (queue abort) and collect their verdicts.
+fn drain_lanes(
+    rx: &Receiver<Event>,
+    active: &mut BTreeMap<usize, Lane>,
+    busy: &mut BTreeMap<usize, usize>,
+    machine: &mut Machine,
+    grace: Duration,
+) {
+    let now = Instant::now();
+    for lane in active.values_mut() {
+        kill_lane_group(lane.pid);
+        // Start the reap grace immediately rather than after the next tick.
+        lane.noticed = Some(now);
+    }
+    while !active.is_empty() {
+        match wait_event(rx, active, grace) {
+            Some(event) => apply_event(event, active, busy, machine),
+            None => {
+                // Senders gone: any lane still tracked is unreachable.
+                let indices: Vec<usize> = active.keys().copied().collect();
+                for idx in indices {
+                    let lane = active.remove(&idx).expect("lane tracked");
+                    busy.remove(&idx);
+                    if machine.is_active(idx) {
+                        machine.finished(died_job(
+                            lane.idx,
+                            lane.lane,
+                            &lane.base,
+                            "monitor channel closed with the lane still running".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -821,6 +1312,7 @@ mod tests {
             merge: merge.map(str::to_owned),
             tree: merge.map(|_| "tree".into()),
             verdict,
+            death: None,
         });
     }
 

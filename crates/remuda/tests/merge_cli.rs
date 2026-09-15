@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 const GATE: &str = include_str!("../../../scripts/ci/gate.sh");
 const AFFECTED: &str = include_str!("../../../scripts/ci/affected.py");
+const GATE_SUPERVISOR: &str = include_str!("../../../scripts/ci/gate_supervisor.py");
 const STUB: &str = include_str!("fixtures/merge-gate-stub.py");
 
 fn git_command(repo: &Path) -> Command {
@@ -75,6 +76,7 @@ impl Repo {
         git(&root, &["config", "commit.gpgsign", "false"]);
         fs::write(root.join("scripts/ci/gate.sh"), GATE).unwrap();
         fs::write(root.join("scripts/ci/affected.py"), AFFECTED).unwrap();
+        fs::write(root.join("scripts/ci/gate_supervisor.py"), GATE_SUPERVISOR).unwrap();
         fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/core\", \"crates/app\", \"crates/other\"]\nresolver = \"3\"\n",
@@ -113,6 +115,7 @@ impl Repo {
             "shared file.txt",
             "scripts/ci/gate.sh",
             "scripts/ci/affected.py",
+            "scripts/ci/gate_supervisor.py",
             "web/.keep",
             "web/src/lib/api.generated.ts",
         ];
@@ -206,10 +209,13 @@ impl Repo {
             2,
             "{list}"
         );
-        let tmp = self.root.join("data/tmp");
-        if tmp.exists() {
-            assert_eq!(fs::read_dir(tmp).unwrap().count(), 0);
-        }
+        // Scratch worktrees now live under the OS temp dir's remuda-mq-*
+        // roots (removed by drop); nothing must be created inside the repo.
+        assert!(
+            !self.root.join("data").exists(),
+            "merge created scratch inside the repo: {:?}",
+            self.root.join("data")
+        );
     }
 }
 
@@ -364,8 +370,15 @@ fn merge_pushes_verified_no_ff_commit_and_preserves_worker_edits() {
             .iter()
             .all(|event| event["target"] == repo.root.join("target-gate").to_str().unwrap())
     );
+    // The gate worktree lives under an OS-temp remuda-mq-* scratch root,
+    // never inside the repository checkout.
+    let scratch_prefix = std::env::temp_dir().canonicalize().unwrap();
     assert!(trace.iter().all(|event| {
-        Path::new(event["cwd"].as_str().unwrap()).starts_with(repo.root.join("data/tmp"))
+        let cwd = Path::new(event["cwd"].as_str().unwrap());
+        cwd.starts_with(&scratch_prefix)
+            && cwd
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().starts_with("remuda-mq-"))
     }));
     assert_eq!(
         fs::read_to_string(repo.source.join("shared file.txt")).unwrap(),
@@ -627,7 +640,7 @@ fn staged_source_changes_are_refused_before_creating_a_worktree() {
         "staged.txt"
     );
     assert_eq!(repo.main(), repo.base);
-    assert!(!repo.root.join("data/tmp").exists());
+    assert!(!repo.root.join("data").exists());
     assert!(repo.trace().is_empty());
 }
 
@@ -656,7 +669,7 @@ fn rebase_and_merge_in_progress_are_refused_even_with_detached_head() {
                 .contains("rebase/merge in progress"),
             "{report}"
         );
-        assert!(!repo.root.join("data/tmp").exists());
+        assert!(!repo.root.join("data").exists());
         assert!(repo.trace().is_empty());
         git(&repo.source, &[operation, "--abort"]);
     }
@@ -689,7 +702,7 @@ fn dry_run_does_not_fetch_create_worktrees_or_run_gate_commands() {
     assert_eq!(report["merged"], Value::Null);
     assert_eq!(repo.main(), repo.base);
     assert!(!fetch_head.exists());
-    assert!(!repo.root.join("data/tmp").exists());
+    assert!(!repo.root.join("data").exists());
     assert!(repo.trace().is_empty());
 }
 
@@ -721,15 +734,37 @@ fn gate_cannot_publish_a_tree_it_mutated() {
 }
 
 #[test]
-fn cleanup_removes_git_registration_when_data_directory_is_a_symlink() {
+fn cleanup_removes_scratch_even_when_temp_dir_is_a_symlink() {
     let repo = Repo::new();
-    let data = repo.root.parent().unwrap().join("external data");
-    fs::create_dir(&data).unwrap();
-    std::os::unix::fs::symlink(&data, repo.root.join("data")).unwrap();
-    let (output, report) = repo.merge(&["--gate", "--no-push"], &[]);
+    // Point the merge at a temp root reached through a symlink: create_root
+    // canonicalises, and removal must delete the real directory, not leave
+    // an orphan behind the link.
+    let real_tmp = repo.root.parent().unwrap().join("external tmp");
+    fs::create_dir_all(&real_tmp).unwrap();
+    let link_tmp = repo.root.parent().unwrap().join("tmp-link");
+    std::os::unix::fs::symlink(&real_tmp, &link_tmp).unwrap();
+    let output = repo
+        .command()
+        .args(["merge", "topic", "--gate", "--no-push", "--json"])
+        .env("TMPDIR", &link_tmp)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_exit(&output, &report, 0);
     repo.assert_cleaned();
-    assert_eq!(fs::read_dir(data.join("tmp")).unwrap().count(), 0);
+    // No remuda-mq-* scratch root survives behind either path.
+    let leftovers = fs::read_dir(&real_tmp)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("remuda-mq-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+    assert!(!repo.root.join("data").exists());
 }
 
 #[test]

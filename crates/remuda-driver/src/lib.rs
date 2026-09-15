@@ -56,8 +56,8 @@ pub use capabilities::{
 };
 pub use claude_bg::{ClaudeBgDriver, ClaudeBgOptions, parse_backgrounded};
 pub use claude_onboarding::{
-    HostClaudeConfig, SeedOutcome, StartupDialog, has_login_material, seed_scoped_config,
-    startup_dialog,
+    HostClaudeConfig, SeedOutcome, StartupDialog, has_login_material, pre_trust_workspace,
+    seed_scoped_config, startup_dialog,
 };
 pub use claude_print::TranscriptMapper;
 pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};

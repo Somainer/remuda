@@ -92,6 +92,14 @@ const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// long enough for a normally-exiting child to be reaped.
 const EXIT_STATUS_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How long `close` keeps waiting for an exiting leader (macOS state `E`) to
+/// become reapable after the stop ladder has confirmed the group is dead.
+///
+/// The normal `E` → zombie transition takes milliseconds; this generous bound
+/// covers a loaded machine without stalling a close indefinitely on a process
+/// wedged in an uninterruptible kernel exit (which only init can outlast).
+const REAP_EXITING_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Native lifecycle name for a PTY process that ended (§5.5).
 pub const NATIVE_EXIT: &str = "native_exit";
 
@@ -162,6 +170,22 @@ pub struct ShellPtyOptions {
     /// the login shell it got before. [`Target::Agent`] launches the agent CLI
     /// directly from a materialized recipe.
     pub target: Target,
+    /// Pin the agent at `agent.native_home` via its harness config-dir env var
+    /// (`CLAUDE_CONFIG_DIR` for Claude, the recipe's home var otherwise).
+    ///
+    /// Set by the Node whenever it prepared a scoped native home. Unset when
+    /// the launch inherits the operator's default config — exporting a pin then
+    /// would point the CLI at an empty directory and it would report "not
+    /// logged in". This pin is also what makes the transcript poller look in
+    /// the same directory the harness writes its session files into.
+    pub pin_native_home: bool,
+    /// Whether the promotion supervisor may answer Claude's exact folder-trust
+    /// dialog with its documented key sequence (once per foreground agent).
+    ///
+    /// The Node grants this only for a cwd inside a registered workspace root
+    /// (the same gate the herdr carrier uses, D-022). Without it the dialog is
+    /// detected, reported as blocked, and left for a human.
+    pub auto_trust_workspace: bool,
     /// Recipe inputs for [`Target::Agent`]. Required for that target and
     /// ignored for a shell.
     ///
@@ -198,6 +222,8 @@ impl ShellPtyOptions {
             hooks: None,
             emulator: emulator_enabled(),
             target: Target::Shell,
+            pin_native_home: false,
+            auto_trust_workspace: false,
             agent: None,
         }
     }
@@ -945,6 +971,7 @@ impl ShellPtyDriver {
                 self.bindings.clone(),
                 hooks,
                 matches!(self.options.target, Target::Shell),
+                self.options.auto_trust_workspace,
                 Arc::clone(&self.interrupt_pid),
                 Arc::clone(&self.interrupt_screen_markers),
                 tx.clone(),
@@ -1140,29 +1167,55 @@ impl ShellPtyDriver {
         // false `stop-incomplete` against a process already in state E/Z.
         let mut child = state.child.lock().await;
         let mut reaped = false;
-        lifecycle::stop_group(
-            pgid,
-            move || {
-                drop(master.take());
-            },
-            &mut move || {
-                if reaped {
-                    return true;
+        let reaper = &mut || {
+            if reaped {
+                return true;
+            }
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    reaped = true;
+                    true
                 }
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::debug!(%error, "pty child reap failed");
+                    false
+                }
+            }
+        };
+        let outcome = lifecycle::stop_group(pgid, move || drop(master.take()), reaper).await?;
+        // The leader can be classified dead while the kernel has not made it
+        // reapable yet: on macOS a SIGKILLed session leader sits in `E`
+        // (exiting) before it becomes a zombie. `stop_group` correctly reports
+        // the group gone, but leaving it unreaped is how the demo's `?Es`
+        // process lingered as a child of the Node for minutes. Wait it out —
+        // bounded, because a process wedged in uninterruptible exit is a kernel
+        // problem no userspace wait can hurry.
+        if !reaped {
+            let deadline = tokio::time::Instant::now() + REAP_EXITING_GRACE;
+            loop {
                 match child.try_wait() {
-                    Ok(Some(_status)) => {
-                        reaped = true;
-                        true
+                    Ok(Some(_status)) => break,
+                    Ok(None) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(lifecycle::EXIT_REAP_POLL).await;
                     }
-                    Ok(None) => false,
+                    Ok(None) => {
+                        tracing::warn!(
+                            pgid,
+                            "the process group is dead but the leader has not become reapable \
+                             within {:?}; it is exiting in the kernel and is left for init",
+                            REAP_EXITING_GRACE
+                        );
+                        break;
+                    }
                     Err(error) => {
-                        tracing::debug!(%error, "pty child reap failed");
-                        false
+                        tracing::debug!(%error, "final pty child reap failed");
+                        break;
                     }
                 }
-            },
-        )
-        .await
+            }
+        }
+        Ok(outcome)
     }
 
     /// Shared body of [`Driver::resume`] and [`Driver::start_resumed`].
@@ -1265,7 +1318,10 @@ fn prepare_launch_blocking(
 ) -> DriverResult<(LaunchRecipe, Option<Arc<crate::launch::HookSession>>)> {
     let recipe = recipe_for_blocking(options, cwd, spec, None)?;
     let native_claude = options.target.agent_kind() == Some(AgentKind::Claude);
-    let base_settings = if native_claude && options.hooks.is_some() {
+    // The operator-supplied overlay (if any) is the base everything else merges
+    // into. Read it from the audited materialized file so the bytes here are
+    // exactly the ones the recipe recorded.
+    let mut base_settings = if native_claude {
         recipe
             .materialized_files
             .iter()
@@ -1275,13 +1331,102 @@ fn prepare_launch_blocking(
     } else {
         None
     };
-    let hooks = start_hooks_blocking(options, ctx, events, base_settings, seq, interrupt_pid)?;
-    let recipe = if native_claude && let Some(hooks) = &hooks {
-        recipe_for_blocking(options, cwd, spec, Some(&hooks.overlay.path))?
-    } else {
-        recipe
+    // A native launch that explicitly requested bypass permissions must not sit
+    // on Claude's "WARNING: … Yes, I accept" disclaimer — that screen parks
+    // before SessionStart exactly like the trust dialog does.
+    //
+    // The acceptance is written into the private **settings** overlay
+    // (`skipDangerousModePermissionPrompt`), not the global config key: on a
+    // migrated 2.1.x config (`migrationVersion` ≥ 14, verified on the installed
+    // 2.1.221) the global `bypassPermissionsModeAccepted` is ignored at the
+    // TUI gate while the settings key is honoured. This is also the key Claude
+    // itself writes into `settings.json` when a human accepts the disclaimer,
+    // and the herdr carrier's session overlay carries the same decision. The
+    // operator's real settings are never touched.
+    let bypass_requested = spec.is_some_and(spec_bypass_permissions);
+    if native_claude && bypass_requested {
+        let object = base_settings.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(object) = object.as_object_mut() {
+            object.insert(
+                "skipDangerousModePermissionPrompt".into(),
+                serde_json::json!(true),
+            );
+        } else {
+            return Err(DriverError::SettingsIsolationUnavailable(
+                "settings overlay is not a JSON object".into(),
+            ));
+        }
+    }
+    let hooks = start_hooks_blocking(
+        options,
+        ctx,
+        events,
+        base_settings.clone(),
+        seq,
+        interrupt_pid,
+    )?;
+    if let Some(hooks) = &hooks {
+        // The macOS retest failure showed only the emulator log; this line is
+        // the proof that the hook path actually stood up (D-028 §4.2).
+        tracing::info!(
+            path = %hooks.overlay.path.display(),
+            socket = %hooks.socket_path.display(),
+            bin = %hooks.bin_dir().display(),
+            "hooks overlay materialised"
+        );
+    }
+    // Which overlay the recipe argv must carry: the hook session's merged file
+    // when hooks are live, otherwise a bypass-only file we write ourselves.
+    // Neither exists when hooks are off and no setting needed injecting — then
+    // the first recipe already had the right argv (or no --settings at all).
+    let settings_overlay = match hooks.as_ref() {
+        Some(hooks) => Some(hooks.overlay.path.clone()),
+        None if native_claude && bypass_requested => Some(write_bypass_overlay(
+            options,
+            base_settings
+                .as_ref()
+                .expect("bypass implies a base object"),
+        )?),
+        None => None,
+    };
+    let recipe = match settings_overlay {
+        Some(path) => recipe_for_blocking(options, cwd, spec, Some(&path))?,
+        None => recipe,
     };
     Ok((recipe, hooks))
+}
+
+/// Write the bypass-acceptance overlay when no hook session owns one.
+fn write_bypass_overlay(
+    options: &ShellPtyOptions,
+    settings: &serde_json::Value,
+) -> DriverResult<PathBuf> {
+    let launch = options
+        .agent
+        .as_ref()
+        .map(|agent| agent.launch_dir.clone())
+        .ok_or_else(|| {
+            DriverError::InvalidLaunchSpec("bypass overlay needs an agent launch dir".into())
+        })?;
+    std::fs::create_dir_all(&launch)?;
+    let path = launch.join("settings.json");
+    let bytes = serde_json::to_vec_pretty(settings)?;
+    std::fs::write(&path, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(path)
+}
+
+/// Whether the launch spec explicitly asked for bypass permissions.
+fn spec_bypass_permissions(spec: &InstanceSpec) -> bool {
+    matches!(
+        spec.permission_mode,
+        remuda_protocol::PermissionMode::Claude(ref claude)
+            if claude.mode == remuda_protocol::ClaudePermissionMode::BypassPermissions
+    )
 }
 
 /// Free-function form of [`ShellPtyDriver::recipe_for`] usable off the async
@@ -1966,7 +2111,7 @@ fn build_command(
     // shell would pin the effort for the whole session and make the UI's
     // "effective" readout a lie. `child_env` denies it, and this loop honours
     // that; the assertion is that nothing below re-adds it.
-    for (key, value) in agent_env(&options.target, recipe) {
+    for (key, value) in agent_env(&options.target, recipe, options.pin_native_home) {
         if crate::child_env::is_denied(&key) {
             tracing::warn!(%key, "recipe env entry is on the deny list; not forwarding");
             continue;
@@ -1995,18 +2140,28 @@ fn build_command(
     Ok(cmd)
 }
 
-/// Literal env the recipe asks for: `CODEX_HOME` / `GROK_HOME` shadow dirs and
-/// provider overlay values (§5.1).
+/// Literal env the recipe asks for: `CLAUDE_CONFIG_DIR` / `CODEX_HOME` /
+/// `GROK_HOME` shadow dirs and provider overlay values (§5.1).
 ///
 /// Only [`EnvAllowlistSource::NativeHome`] and
 /// [`EnvAllowlistSource::ProviderOverlay`] entries carry a value inline.
 /// `Credential` entries name a secret the broker resolves and must never be
 /// read from here, and `HostEnv` entries are inherited, not set.
-fn agent_env(target: &Target, recipe: &LaunchRecipe) -> Vec<(String, String)> {
+///
+/// Claude's preset has no `home_env` (its config dir is not part of argv
+/// materialization), so without the explicit pin here a shell-pty agent child
+/// inherits the Node's own `CLAUDE_CONFIG_DIR`/`$HOME` and writes its
+/// transcript somewhere other than the registered home the promotion poller
+/// scans — the native-carrier-3 `transcript_unbound` defect.
+fn agent_env(
+    target: &Target,
+    recipe: &LaunchRecipe,
+    pin_native_home: bool,
+) -> Vec<(String, String)> {
     if target.agent_kind().is_none() {
         return Vec::new();
     }
-    recipe
+    let mut entries = recipe
         .env_allowlist
         .iter()
         .filter(|entry| {
@@ -2021,7 +2176,15 @@ fn agent_env(target: &Target, recipe: &LaunchRecipe) -> Vec<(String, String)> {
             "GROK_DISABLE_AUTOUPDATER" => Some((entry.name.clone(), "1".to_owned())),
             _ => None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if pin_native_home
+        && target.agent_kind() == Some(AgentKind::Claude)
+        && !recipe.native_home.is_empty()
+        && !entries.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+    {
+        entries.push(("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone()));
+    }
+    entries
 }
 
 fn read_pty(state: Arc<PtyState>, mut reader: Box<dyn Read + Send>) {
@@ -2446,6 +2609,134 @@ mod tests {
         assert!(
             !invalid_instance.exists(),
             "validate before creating hook artifacts"
+        );
+    }
+
+    /// native-carrier-3: a bypass launch must carry the disclaimer acceptance
+    /// in the merged overlay, the native home must be pinned for a Claude
+    /// agent, and without hooks the bypass-only overlay is still written.
+    #[tokio::test]
+    async fn a_bypass_native_launch_pins_its_home_and_suppresses_the_disclaimer() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = dir.path().join("instance");
+        let native_home = dir.path().join("native-home");
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.permission_mode =
+            remuda_protocol::PermissionMode::Claude(Box::new(remuda_protocol::ClaudePermission {
+                mode: remuda_protocol::ClaudePermissionMode::BypassPermissions,
+                interaction: remuda_protocol::ClaudeInteractionMode::NativeTty,
+            }));
+
+        let build = |hooks_on: bool| {
+            let mut options = ShellPtyOptions::agent(
+                dir.path().to_path_buf(),
+                AgentKind::Claude,
+                AgentLaunch {
+                    profile: Box::new(crate::profile::ProviderProfile {
+                        id: spec.provider_profile.id.clone(),
+                        kind: ProviderKind::Anthropic,
+                        base_url: String::new(),
+                        delegation: Delegation::None,
+                        secret_ref: None,
+                        models: vec!["sonnet".into()],
+                        health: crate::profile::ProviderHealth::Healthy,
+                    }),
+                    launch_dir: instance.join("launch"),
+                    native_home: native_home.clone(),
+                    binary: Some(PathBuf::from("/bin/sh")),
+                    origin: crate::materializer::LaunchOrigin::Human,
+                    settings_overlay: None,
+                },
+            );
+            options.pin_native_home = true;
+            if hooks_on {
+                options.hooks = Some(HookConfig {
+                    instance_dir: instance.clone(),
+                    relay_binary: PathBuf::from("/nonexistent/remuda"),
+                    tui: crate::launch::TuiMode::Default,
+                });
+            }
+            options
+        };
+
+        for hooks_on in [true, false] {
+            let options = build(hooks_on);
+            let ctx = promote_ctx(&options, &spec.cwd, Some(&spec)).unwrap();
+            let (events, _rx) = mpsc::channel(8);
+            let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let (recipe, hooks) = prepare_launch_blocking(
+                &options,
+                &spec.cwd,
+                Some(&spec),
+                &ctx,
+                &events,
+                &seq,
+                &interrupt_pid,
+            )
+            .unwrap();
+            // The settings file the recipe argv carries holds the acceptance.
+            let settings_path = recipe
+                .argv
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--settings").then(|| PathBuf::from(&pair[1])))
+                .unwrap_or_else(|| {
+                    panic!("bypass launch must carry --settings (hooks={hooks_on})")
+                });
+            let written: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+            assert_eq!(
+                written["skipDangerousModePermissionPrompt"],
+                serde_json::json!(true),
+                "hooks={hooks_on}"
+            );
+            if hooks_on {
+                let hooks = hooks.expect("hooks requested");
+                assert_eq!(settings_path, hooks.overlay.path);
+            } else {
+                assert!(hooks.is_none(), "the bypass overlay exists without hooks");
+            }
+            // The native home pin travels through the recipe env applied to
+            // the child command, not via inherited ambient env.
+            let pinned = agent_env(&options.target, &recipe, options.pin_native_home);
+            let pinned_home = native_home.to_string_lossy().into_owned();
+            assert!(
+                pinned
+                    .iter()
+                    .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == &pinned_home),
+                "hooks={hooks_on}: CLAUDE_CONFIG_DIR must pin the registered home"
+            );
+        }
+
+        // Without the pin the env stays silent — an inherited home must not be
+        // silently redirected at an empty directory.
+        let unpinned_options = {
+            let mut options = build(false);
+            options.pin_native_home = false;
+            options
+        };
+        let ctx = promote_ctx(&unpinned_options, &spec.cwd, Some(&spec)).unwrap();
+        let (events, _rx) = mpsc::channel(8);
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let (recipe, _) = prepare_launch_blocking(
+            &unpinned_options,
+            &spec.cwd,
+            Some(&spec),
+            &ctx,
+            &events,
+            &seq,
+            &interrupt_pid,
+        )
+        .unwrap();
+        assert!(
+            !agent_env(&unpinned_options.target, &recipe, false)
+                .iter()
+                .any(|(name, _)| name == "CLAUDE_CONFIG_DIR"),
+            "an unpinned launch must not invent a config-dir env"
         );
     }
 

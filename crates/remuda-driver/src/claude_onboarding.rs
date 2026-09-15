@@ -270,6 +270,69 @@ pub fn has_login_material(config_dir: &Path) -> bool {
     })
 }
 
+/// Pre-accept Claude's folder-trust dialog for exactly `cwd` in a scoped
+/// config directory.
+///
+/// This is the design-sanctioned, non-GUI answer to a trust dialog that would
+/// otherwise park the agent before its `SessionStart` hook fires: Claude's own
+/// global config records the decision per project under
+/// `projects.<cwd>.hasTrustDialogAccepted`, and writing that exact key is the
+/// same state a human accepting the dialog produces.
+///
+/// Deliberately scoped to an **isolated, Node-owned** config directory: the
+/// caller must never point this at the operator's real `~/.claude.json`, where
+/// editing trust decisions on their behalf is out of bounds — there the
+/// carrier answers the dialog with its documented key sequence instead. The
+/// path must be absolute for the same reason [`seed_scoped_config`] requires
+/// it: a relative entry could never match the absolute cwd Claude records.
+///
+/// Idempotent and additive: an existing project object keeps every other key;
+/// an existing truthy `hasTrustDialogAccepted` is left as written.
+pub fn pre_trust_workspace(config_dir: &Path, cwd: &Path) -> DriverResult<()> {
+    if !config_dir.is_absolute() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "claude config dir must be an absolute path".into(),
+        ));
+    }
+    if !cwd.is_absolute() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "a pre-trusted workspace cwd must be absolute".into(),
+        ));
+    }
+    let mut global = read_object(&config_dir.join(".claude.json")).unwrap_or_default();
+    let changed = {
+        let projects = global
+            .entry("projects")
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                DriverError::SettingsIsolationUnavailable(
+                    ".claude.json projects is not an object".into(),
+                )
+            })?;
+        let project = projects
+            .entry(cwd.to_string_lossy().into_owned())
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                DriverError::SettingsIsolationUnavailable(
+                    ".claude.json project entry is not an object".into(),
+                )
+            })?;
+        match project.get("hasTrustDialogAccepted") {
+            Some(Value::Bool(true)) => false,
+            _ => {
+                project.insert("hasTrustDialogAccepted".into(), Value::Bool(true));
+                true
+            }
+        }
+    };
+    if changed {
+        write_private_json(&config_dir.join(".claude.json"), &global)?;
+    }
+    Ok(())
+}
+
 /// A recognised Claude Code startup screen that is not the prompt composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupDialog {
@@ -334,6 +397,7 @@ pub fn startup_dialog(screen: &str) -> Option<StartupDialog> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn write(path: &Path, value: Value) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -436,6 +500,77 @@ mod tests {
     fn seeding_refuses_a_relative_config_dir() {
         assert!(matches!(
             seed_scoped_config(Path::new("relative/home"), None),
+            Err(DriverError::InvalidLaunchSpec(_))
+        ));
+    }
+
+    #[test]
+    fn pre_trust_writes_exactly_the_one_project_key_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("native-home");
+        let cwd = dir.path().join("workspace");
+        // First call creates the global config with just the trust decision.
+        pre_trust_workspace(&home, &cwd).unwrap();
+        let global = read_object(&home.join(".claude.json")).unwrap();
+        assert_eq!(
+            global["projects"][cwd.to_str().unwrap()]["hasTrustDialogAccepted"],
+            true
+        );
+        assert!(
+            !global["projects"][cwd.to_str().unwrap()]
+                .as_object()
+                .unwrap()
+                .contains_key("allowedTools"),
+            "pre-trust never invents other project keys"
+        );
+
+        // A second call after Claude added other keys preserves them.
+        let mut object = global.clone();
+        object["projects"][cwd.to_str().unwrap()]["lastCost"] = json!(12);
+        write_private_json(&home.join(".claude.json"), &object).unwrap();
+        pre_trust_workspace(&home, &cwd).unwrap();
+        let reread = read_object(&home.join(".claude.json")).unwrap();
+        assert_eq!(
+            reread["projects"][cwd.to_str().unwrap()]["lastCost"],
+            json!(12)
+        );
+        assert_eq!(
+            reread["projects"][cwd.to_str().unwrap()]["hasTrustDialogAccepted"],
+            true
+        );
+    }
+
+    #[test]
+    fn pre_trust_does_not_touch_other_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("native-home");
+        let existing_cwd = dir.path().join("elsewhere");
+        write(
+            &home.join(".claude.json"),
+            json!({
+                "projects": {
+                    existing_cwd.to_string_lossy(): {"hasTrustDialogAccepted": false}
+                }
+            }),
+        );
+        pre_trust_workspace(&home, &dir.path().join("workspace")).unwrap();
+        let global = read_object(&home.join(".claude.json")).unwrap();
+        assert_eq!(
+            global["projects"][existing_cwd.to_str().unwrap()]["hasTrustDialogAccepted"],
+            false,
+            "a pre-trust for one cwd must not rewrite another project's decision"
+        );
+    }
+
+    #[test]
+    fn pre_trust_requires_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            pre_trust_workspace(Path::new("relative/home"), dir.path()),
+            Err(DriverError::InvalidLaunchSpec(_))
+        ));
+        assert!(matches!(
+            pre_trust_workspace(&dir.path().join("home"), Path::new("relative/ws")),
             Err(DriverError::InvalidLaunchSpec(_))
         ));
     }

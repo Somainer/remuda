@@ -329,12 +329,39 @@ impl DriverFactory for NativeClaudeFactory {
                 // what makes §1.0's "the two paths produce one journal" a
                 // property of the design rather than a thing to maintain.
                 let agent_kind = agent_pty_kind(launch.request.kind);
+                // Registered-workspace containment, identical to the
+                // claude-pty gate. Auto-trust must never fire for a cwd outside
+                // a root the operator registered.
+                let auto_trust = self.config.auto_trust_registered_workspaces
+                    && cwd_is_registered(&launch.workspace_root, &launch.registered_workspace_root);
+                // An agent launched into a scoped (non-inherited) native home
+                // gets its first-run flags seeded and its exact cwd pre-trusted
+                // before the process starts, so it mounts the composer instead
+                // of parking on a wizard or the folder-trust dialog. An
+                // inherited operator home is never edited; there the poller
+                // answers the exact trust dialog on screen (once) instead.
+                if agent_kind.is_some() && !inherit_default_config {
+                    if self.config.seed_claude_onboarding {
+                        let outcome = remuda_driver::seed_scoped_config(
+                            &native_home,
+                            remuda_driver::HostClaudeConfig::from_env().as_ref(),
+                        )
+                        .map_err(map_driver_error)?;
+                        if !outcome.is_noop() {
+                            tracing::debug!("{}", outcome.summary());
+                        }
+                    }
+                    if auto_trust {
+                        remuda_driver::pre_trust_workspace(&native_home, &launch.workspace_root)
+                            .map_err(map_driver_error)?;
+                    }
+                }
                 let mut options = match agent_kind {
                     Some(kind) => {
                         let agent = remuda_driver::shell_pty::AgentLaunch {
                             profile: Box::new(profile),
                             launch_dir,
-                            native_home,
+                            native_home: native_home.clone(),
                             binary: match &binary {
                                 BinarySource::Path(path) => Some(path.clone()),
                                 // The preset names the binary; letting it
@@ -360,8 +387,22 @@ impl DriverFactory for NativeClaudeFactory {
                     // started. An agent target sets this itself, because for it
                     // promotion is not optional.
                     options.promote = self.config.promote_terminal_agents;
+                } else {
+                    // The poller must scan the same home the pinned CLI writes
+                    // its session/transcript files into. When the launch
+                    // inherits the operator home, leave the default
+                    // (`$HOME/.claude`) rather than the Node-wide override.
+                    options.claude_home = if inherit_default_config {
+                        None
+                    } else {
+                        Some(native_home.clone())
+                    };
+                    options.pin_native_home = !inherit_default_config;
+                    options.auto_trust_workspace = auto_trust;
                 }
-                options.claude_home = self.config.claude_native_home.clone();
+                if agent_kind.is_none() {
+                    options.claude_home = self.config.claude_native_home.clone();
+                }
                 // D-028 §4.2: the hook path only exists when the operator
                 // opted in. For a shell, promotion is its precondition — one
                 // nobody can start an agent in has nothing to hook. An agent

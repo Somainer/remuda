@@ -273,6 +273,11 @@ async fn fake_node(
                         "version": "2.1.268",
                         "absolutePath": "/usr/bin/claude",
                         "authState": "logged_in"
+                    }, {
+                        "kind": "codex",
+                        "version": "0.154.0-e2e-fake",
+                        "absolutePath": "/usr/bin/codex",
+                        "authState": "logged_in"
                     }]
                 },
                 // D-028 §5.1: the kind/driver matrix the web reads to default
@@ -330,6 +335,7 @@ async fn fake_node(
     let mut ttys: HashMap<String, TtyFake> = HashMap::new();
     // A failed Claude launch must not acquire a TTY through lazy attach.
     let mut claude_ptys = HashSet::new();
+    let mut instance_kinds: HashMap<String, String> = HashMap::new();
     while let Some(msg) = ws.next().await {
         let Ok(Message::Text(text)) = msg else {
             continue;
@@ -361,6 +367,9 @@ async fn fake_node(
             }
             "instance.create" | "instance.resume" => {
                 let spec = params.get("spec").unwrap_or(&params);
+                if let Some(kind) = spec.get("kind").and_then(Value::as_str) {
+                    instance_kinds.insert(instance_id.clone(), kind.to_owned());
+                }
                 if spec.get("driver").and_then(Value::as_str) == Some("claude-pty") {
                     claude_ptys.insert(instance_id.clone());
                     // Model the real driver's launch prerequisite, so this
@@ -599,8 +608,14 @@ async fn fake_node(
                     && let Some(requested) = effort.get("name").and_then(Value::as_str)
                 {
                     let observed = match requested {
-                        // The fake agent's environment caps at xhigh.
-                        "max" => "xhigh",
+                        // Keep the Claude mismatch fixture; Codex must echo
+                        // both max and ultra unchanged through the Hub.
+                        "max"
+                            if instance_kinds.get(&instance_id).map(String::as_str)
+                                == Some("claude") =>
+                        {
+                            "xhigh"
+                        }
                         other => other,
                     };
                     let observed_at = "2026-09-14T12:00:00.000Z";

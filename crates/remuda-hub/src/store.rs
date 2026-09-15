@@ -4799,6 +4799,9 @@ mod tests {
             ("claude", "ultra"),
             ("claude", "ultracode"),
             ("claude", "whatever"),
+            ("codex", "minimal"),
+            ("codex", "xhigh"),
+            ("codex", "max"),
             ("codex", "ultra"),
             ("codex", "bogus"),
             ("grok", "quick"),
@@ -4855,6 +4858,59 @@ mod tests {
                 Some(expected.ultracode),
                 "{kind}:{legacy} disagrees with remuda-protocol"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_top_efforts_round_trip_through_configure_and_reload() {
+        let (_dir, store, host) = store_with_host("enroll-codex-top-efforts").await;
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "codex".into(),
+                "generic-pty".into(),
+                Some("codex-top-efforts".into()),
+                json!({ "effortName": "minimal" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(instance.effort_name.as_deref(), Some("low"));
+
+        for (index, name) in [(4, "max"), (5, "ultra"), (4, "max")] {
+            let payload = json!({
+                "instanceId": instance.instance_id,
+                "effort": { "index": index, "name": name, "kind": "codex", "ultracode": false }
+            });
+            let (command, created) = store
+                .queue_command(
+                    None,
+                    Some(instance.instance_id.clone()),
+                    host.clone(),
+                    "instance.configure".into(),
+                    payload.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(created);
+            assert_eq!(command.payload["effort"]["name"], json!(name));
+            assert_eq!(command.payload["effort"]["index"], json!(index));
+            let patched = store
+                .patch_instance_configure(instance.instance_id.clone(), payload)
+                .await
+                .unwrap();
+            assert_eq!(patched.effort_name.as_deref(), Some(name));
+            assert_eq!(patched.effort_ultracode, Some(false));
+            let reloaded = store
+                .get_instance(instance.instance_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.effort_name.as_deref(), Some(name));
+            assert_eq!(reloaded.effort_ultracode, Some(false));
+            let listed = store.list_instances(None).await.unwrap();
+            assert_eq!(listed[0].effort_name.as_deref(), Some(name));
         }
     }
 
@@ -5731,9 +5787,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .map(str::to_string);
             let effort = spec.get("effort");
             // D-028 §9.1: normalize by NAME, never by index, using the shared
-            // per-harness normalizer (remuda-protocol): codex `ultra` and the
-            // invented grok quick/standard/max table migrate onto the verified
-            // vocabulary here, exactly as the driver and the web table do.
+            // per-harness normalizer (remuda-protocol). Codex `max` / `ultra`
+            // remain native levels; legacy Codex `minimal` and Grok aliases
+            // migrate exactly as the driver and the web table do.
             let legacy_name = effort
                 .and_then(|value| value.get("name"))
                 .and_then(Value::as_str)

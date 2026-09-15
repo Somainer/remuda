@@ -224,9 +224,9 @@ impl CreateInstanceRequest {
             // Accepts both the D-028 object and the legacy `effortName`
             // string the Hub has stored on specs since before it existed.
             // Normalization is per harness through the shared protocol
-            // helper: a grok `quick/standard/max` or codex `ultra` row must
-            // migrate onto the verified native vocabulary, not a Claude
-            // default.
+            // helper: Codex `max` / `ultra` remain native levels, while
+            // legacy Codex `minimal` and Grok aliases migrate onto that
+            // harness's vocabulary.
             let raw = spec
                 .get("effort")
                 .and_then(|value| value.get("name"))
@@ -361,5 +361,42 @@ impl InstanceCommandRequest {
                 .map(|n| n as u32);
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn codex_spec_efforts_preserve_max_and_ultra_and_migrate_minimal() {
+        for (input, expected) in [("max", "max"), ("ultra", "ultra"), ("minimal", "low")] {
+            for spec in [
+                json!({ "effortName": input }),
+                json!({ "effort": input }),
+                json!({ "effort": { "name": input, "ultracode": false } }),
+            ] {
+                let mut request: CreateInstanceRequest =
+                    serde_json::from_value(json!({ "kind": "codex" })).unwrap();
+                request.apply_spec_launch_fields(&spec);
+                let effort = request.effort.unwrap();
+                assert_eq!(effort.level_name(), expected, "{spec}");
+                assert!(!effort.ultracode, "{spec}");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_configure_retains_both_top_effort_names() {
+        for (index, name) in [(4, "max"), (5, "ultra")] {
+            let request: InstanceCommandRequest =
+                serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+            let request = request.with_configure(&json!({
+                "effort": { "name": name, "index": index, "kind": "codex" }
+            }));
+            assert_eq!(request.effort_name.as_deref(), Some(name));
+            assert_eq!(request.effort_index, Some(index));
+        }
     }
 }

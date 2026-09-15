@@ -8,7 +8,7 @@
 //!   `-c model_reasoning_effort="<v>"` overlay (codex parses no top-level
 //!   `--effort`), grok takes `--reasoning-effort <v>`. The closed
 //!   vocabularies and the legacy-name migration
-//!   (`ultra`/`quick`/`standard`/`max`…) live in remuda-protocol
+//!   (`minimal`/`quick`/`standard`/`max`…) live in remuda-protocol
 //!   (`normalize_legacy_effort`); this layer only validates a normalized
 //!   selection is launchable. Vocabulary evidence in
 //!   `docs/design/evidence/composer-slider-5.md`.
@@ -30,11 +30,10 @@ use tokio::sync::{Notify, oneshot};
 
 // ───────────────────────────── Launch vocabulary ─────────────────────────────
 
-/// The Codex `-c model_reasoning_effort=…` vocabulary (codex-cli 0.147.0
-/// `ReasoningEffort::from_str`): the five values every current model catalog
-/// shares. `none`/`max`/`ultra` exist in the enum but are model-gated or
-/// auto-review-only, so the driver never launches with them.
-pub const CODEX_REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+/// The six tiers in the codex-cli 0.154.0 picker on the owner's Mac.
+/// `minimal` remains an input alias for `low`, but is no longer offered.
+/// Evidence: `docs/design/evidence/effort-codex-tiers-1.md`.
+pub const CODEX_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 
 /// Grok's built-in effort menu (`EFFORT_LEVELS` / user guide `/effort`):
 /// xhigh · high · medium · low. The wire enum also parses `none`/`minimal`/
@@ -54,10 +53,17 @@ pub fn effort_argv(kind: AgentKind, effort: Option<EffortSelection>) -> DriverRe
     };
     match kind {
         AgentKind::Claude | AgentKind::Agy => {
-            // agy shares the Claude Code flag shape; `minimal` is not in it.
-            if matches!(effort.name, EffortName::Minimal) {
+            // agy shares the Claude Code level flag shape, but ultracode is
+            // a Claude-only workflow flag.
+            if kind == AgentKind::Agy && effort.ultracode {
+                return Err(DriverError::InvalidLaunchSpec(
+                    "ultracode is a Claude-only workflow flag; agy has no such effort".into(),
+                ));
+            }
+            if matches!(effort.name, EffortName::Minimal | EffortName::Ultra) {
                 return Err(DriverError::InvalidLaunchSpec(format!(
-                    "--effort minimal is not a Claude/agy level (one of {})",
+                    "--effort {} is not a Claude/agy level (one of {})",
+                    effort.level_name(),
                     CLAUDE_EFFORTS.join(" / ")
                 )));
             }
@@ -69,7 +75,7 @@ pub fn effort_argv(kind: AgentKind, effort: Option<EffortSelection>) -> DriverRe
                     "ultracode is a Claude-only workflow flag; codex has no such effort".into(),
                 ));
             }
-            let value = codex_reasoning_value(effort.name)?;
+            let value = codex_reasoning_value(effort.name);
             Ok(vec![
                 "-c".into(),
                 format!("model_reasoning_effort=\"{value}\""),
@@ -92,17 +98,14 @@ pub fn effort_argv(kind: AgentKind, effort: Option<EffortSelection>) -> DriverRe
 }
 
 /// Map a protocol level onto the Codex `model_reasoning_effort` vocabulary.
-fn codex_reasoning_value(name: EffortName) -> DriverResult<&'static str> {
+fn codex_reasoning_value(name: EffortName) -> &'static str {
     match name {
-        EffortName::Minimal => Ok("minimal"),
-        EffortName::Low => Ok("low"),
-        EffortName::Medium => Ok("medium"),
-        EffortName::High => Ok("high"),
-        EffortName::Xhigh => Ok("xhigh"),
-        EffortName::Max => Err(DriverError::InvalidLaunchSpec(format!(
-            "model_reasoning_effort=max is not advertised by the codex models (one of {})",
-            CODEX_REASONING_EFFORTS.join(" / ")
-        ))),
+        EffortName::Minimal | EffortName::Low => "low",
+        EffortName::Medium => "medium",
+        EffortName::High => "high",
+        EffortName::Xhigh => "xhigh",
+        EffortName::Max => "max",
+        EffortName::Ultra => "ultra",
     }
 }
 
@@ -113,10 +116,12 @@ fn grok_reasoning_value(name: EffortName) -> DriverResult<&'static str> {
         EffortName::Medium => Ok("medium"),
         EffortName::High => Ok("high"),
         EffortName::Xhigh => Ok("xhigh"),
-        EffortName::Minimal | EffortName::Max => Err(DriverError::InvalidLaunchSpec(format!(
-            "grok --reasoning-effort takes one of {} (the built-in /effort menu)",
-            GROK_REASONING_EFFORTS.join(" / ")
-        ))),
+        EffortName::Minimal | EffortName::Max | EffortName::Ultra => {
+            Err(DriverError::InvalidLaunchSpec(format!(
+                "grok --reasoning-effort takes one of {} (the built-in /effort menu)",
+                GROK_REASONING_EFFORTS.join(" / ")
+            )))
+        }
     }
 }
 
@@ -214,9 +219,10 @@ impl EffortRequest {
                 EffortName::High => "high",
                 EffortName::Xhigh => "xhigh",
                 EffortName::Max => "max",
-                // `minimal` is a Codex/Grok word, never an in-session Claude
-                // `/effort` level; EffortRequest::from_level never produces it.
+                // Neither the legacy `minimal` nor Codex `ultra` is a Claude
+                // `/effort` level; EffortRequest::from_level produces neither.
                 EffortName::Minimal => "minimal",
+                EffortName::Ultra => "ultra",
             }
         }
     }
@@ -646,23 +652,44 @@ mod argv_tests {
                 effort_argv(kind, Some(sel(EffortName::High, false))).unwrap(),
                 vec!["--effort".to_string(), "high".to_string()]
             );
-            assert_eq!(
-                effort_argv(kind, Some(sel(EffortName::Xhigh, true))).unwrap(),
-                vec!["--effort".to_string(), "ultracode".to_string()]
-            );
             assert!(effort_argv(kind, Some(sel(EffortName::Minimal, false))).is_err());
+        }
+        assert_eq!(
+            effort_argv(AgentKind::Claude, Some(sel(EffortName::Xhigh, true))).unwrap(),
+            vec!["--effort".to_string(), "ultracode".to_string()]
+        );
+        assert!(matches!(
+            effort_argv(AgentKind::Agy, Some(sel(EffortName::Xhigh, true))),
+            Err(DriverError::InvalidLaunchSpec(message))
+                if message == "ultracode is a Claude-only workflow flag; agy has no such effort"
+        ));
+    }
+
+    #[test]
+    fn ultra_is_rejected_by_other_harnesses_without_changing_the_error_shape() {
+        for kind in [AgentKind::Claude, AgentKind::Agy, AgentKind::Grok] {
+            assert!(matches!(
+                effort_argv(kind, Some(sel(EffortName::Ultra, false))),
+                Err(DriverError::InvalidLaunchSpec(_))
+            ));
         }
     }
 
     #[test]
     fn codex_maps_one_to_one_onto_the_config_overlay() {
-        for (name, value) in [
-            (EffortName::Minimal, "minimal"),
+        let tiers = [
             (EffortName::Low, "low"),
             (EffortName::Medium, "medium"),
             (EffortName::High, "high"),
             (EffortName::Xhigh, "xhigh"),
-        ] {
+            (EffortName::Max, "max"),
+            (EffortName::Ultra, "ultra"),
+        ];
+        assert_eq!(
+            CODEX_REASONING_EFFORTS,
+            tiers.map(|(_, value)| value).as_slice()
+        );
+        for (name, value) in tiers {
             assert_eq!(
                 effort_argv(AgentKind::Codex, Some(sel(name, false))).unwrap(),
                 vec![
@@ -671,9 +698,16 @@ mod argv_tests {
                 ]
             );
         }
-        // `max`/`ultra` are not in the offered set; never passed through.
-        assert!(effort_argv(AgentKind::Codex, Some(sel(EffortName::Max, false))).is_err());
+        // Old stored `minimal` selections remain launchable as `low`.
+        assert_eq!(
+            effort_argv(AgentKind::Codex, Some(sel(EffortName::Minimal, false))).unwrap(),
+            vec![
+                "-c".to_string(),
+                "model_reasoning_effort=\"low\"".to_string()
+            ]
+        );
         assert!(effort_argv(AgentKind::Codex, Some(sel(EffortName::Xhigh, true))).is_err());
+        assert!(effort_argv(AgentKind::Codex, Some(sel(EffortName::Ultra, true))).is_err());
     }
 
     #[test]
@@ -733,6 +767,7 @@ mod sync_tests {
         }
         assert!(EffortRequest::from_level("bogus").is_none());
         assert!(EffortRequest::from_level("auto").is_none());
+        assert!(EffortRequest::from_level("ultra").is_none());
     }
 
     #[tokio::test]

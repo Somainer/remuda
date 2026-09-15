@@ -3243,6 +3243,11 @@
           "const": "max",
           "description": "Wire value `max`.",
           "type": "string"
+        },
+        {
+          "const": "ultra",
+          "description": "Wire value `ultra`.",
+          "type": "string"
         }
       ]
     },
@@ -3278,11 +3283,11 @@
       "type": "object"
     },
     "EffortSelection": {
-      "description": "Native effort selection; `protocol.md` §4.1 (D-028 §9.1).\n\nFive Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is\n**not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only,\nand is never persisted as a level name.\n\n[`EffortName`] additionally carries `minimal`, which Claude Code does not\nexpose: the Codex/Grok vocabularies do. It is rejected at Claude launches\nby the driver, so it can never reach `claude --effort`.\n\nDeserialization accepts the pre-D-028 shape `{index, name}` and normalizes\nlegacy tier **names** through [`normalize_legacy_effort`], so a stored row\nor an old client keeps working. Legacy normalization is **per harness**:\n\n| legacy `name` | harness | normalized |\n| --- | --- | --- |\n| `default` | any | `low` |\n| `think` | claude | `high` |\n| `think-hard` | claude | `xhigh` |\n| `ultra` | any | `xhigh` (the old invented web/codex top tier) |\n| `quick` / `standard` / `max` | grok | `low` / `medium` / `xhigh` |\n| `ultracode` | claude | `xhigh` + `ultracode: true` |\n| anything unrecognized | any | the harness default (`high` for claude, `medium` otherwise) |\n\nNormalization is by **name**, never by index: the legacy tables had\ndifferent lengths per harness, so index 3 meant `ultracode` for Claude and\n`ultra` for Codex. `index` on the wire is therefore ignored on read and not\nwritten back.",
+      "description": "Native effort selection; `protocol.md` §4.1 (D-028 §9.1).\n\nSix Codex levels (`low..=ultra`), five Claude levels (`low..=max`), and an\northogonal Claude `ultracode` boolean. `ultracode` is `xhigh` plus dynamic\nworkflow, is session-only, and is never persisted as a level name. It is\nindependent of Codex's `ultra` level.\n\n[`EffortName`] additionally carries the legacy `minimal` input, which maps\nto `low` for Codex and is rejected at Claude, agy, and Grok launches.\n\nDeserialization accepts the pre-D-028 shape `{index, name}` and normalizes\nlegacy tier **names** through [`normalize_legacy_effort`], so a stored row\nor an old client keeps working. Legacy normalization is **per harness**:\n\n| legacy `name` | harness | normalized |\n| --- | --- | --- |\n| `default` | any | `low` |\n| `think` | claude | `high` |\n| `think-hard` | claude | `xhigh` |\n| `minimal` | codex | `low` |\n| `ultra` | codex | `ultra` (a real Codex level; rejected by other harnesses) |\n| `quick` / `standard` / `max` | grok | `low` / `medium` / `xhigh` |\n| `ultracode` | claude | `xhigh` + `ultracode: true` |\n| anything unrecognized | any | the harness default (`high` for claude, `medium` otherwise) |\n\nNormalization is by **name**, never by index: the legacy tables had\ndifferent lengths per harness, so index 3 meant `ultracode` for Claude and\n`ultra` for Codex. `index` on the wire is therefore ignored on read and not\nwritten back.",
       "properties": {
         "name": {
           "$ref": "#/$defs/EffortName",
-          "description": "Claude level (`low..=max`); `minimal` is Codex/Grok-only."
+          "description": "Native level: Codex `low..=ultra`, Claude `low..=max`, Grok `low..=xhigh`."
         },
         "ultracode": {
           "description": "Dynamic-workflow flag (`--effort ultracode`). Session-only.",

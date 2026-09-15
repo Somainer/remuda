@@ -1,5 +1,7 @@
 # Composer effort slider · pass 6 — the three-level look and the real Codex/Grok vocabularies
 
+> **Correction (2026-09-15):** The Codex picker conclusion and `ultra → xhigh` migration below were wrong. The owner transcribed codex-cli 0.154.0 on this Mac: Low, Medium, High, Extra high, Max, Ultra. Current implementation and local acceptance evidence: [effort-codex-tiers-1](./effort-codex-tiers-1.md). Earlier binary observations and screenshots are historical.
+
 Sixth pass, from two owner-reported defects after the six-stop slider
 ([composer-slider-4](./composer-slider-4.md), [composer-slider-5](./composer-slider-5.md)):
 
@@ -21,8 +23,8 @@ what the evidence shows.
 | look | stops | treatment |
 | --- | --- | --- |
 | `plain` | claude `low/medium/high`; every non-top stop of the other tables; agy | the cold brand fill, muted tick, plain thumb |
-| `top` | claude `xhigh` **and** `max`; the native top row of codex (`xhigh`) and grok (`xhigh`) | restrained static accent: cold→dust gradient, dust tick/title, one thin dust thumb ring. No glow, no spark field, no animation |
-| `ultracode` | the Claude `ultracode` stop **alone** | full amber ember: four drifting spark layers + breathing wash + brighter halo, its own `--ember-ultra` label colour and its own thumb state |
+| `top` | claude `xhigh` **and** `max`; codex `max` and grok `xhigh` | restrained static accent: cold→dust gradient, dust tick/title, one thin dust thumb ring. No glow, no spark field, no animation |
+| `ultracode` | the Claude `ultracode` stop and Codex `ultra` tier | full amber ember: four drifting spark layers + breathing wash + brighter halo, its own `--ember-ultra` label colour and its own thumb state |
 
 The distinction is asserted without screenshots through
 `data-effort-look="plain|top|ultracode"` on the slider root, the panel, the
@@ -108,22 +110,12 @@ host, all in throwaway `/tmp/remuda-r-effort2/` homes:
    crosses into Max or Ultra; those efforts require the explicit
    advanced-reasoning picker."*
 
-The slider therefore offers the common verified set, in CLI order,
-**minimal · low · medium · high · xhigh** with the real default **medium**:
-
-```ts
-// web/src/features/session/effort.ts
-const CODEX = [minimal, low, medium(默认档), high, xhigh];
-```
-
-`max`/`ultra` stay out: they are model-gated advanced tiers this client has no
-picker for, and `none` is the auto-review-only absence-of-reasoning.
-
-Migration (`normalizeHarnessName`, applied on the record read path exactly
-like `CLAUDE_LEGACY_NAMES`): `ultra → xhigh`; any other unknown word →
-`medium`. Values about to be persisted or sent pass through
-`nativeEffortWord()`, which throws the typed `UnknownEffortError` on anything
-that is not a current row — an unknown word is never forwarded to the CLI.
+The earlier conclusion to offer `minimal/low/medium/high/xhigh` was wrong.
+The corrected picker is **Low · Medium · High · Extra high · Max · Ultra**,
+with wire values `low/medium/high/xhigh/max/ultra` and default `medium`.
+`minimal` is accepted only as a compatibility alias for `low`; `max` and
+`ultra` pass unchanged. Unknown stored words fall back to `medium`.
+See the [current six-tier table and evidence](./effort-codex-tiers-1.md).
 
 ## 3 · Grok vocabulary — quick/standard/max was invented
 
@@ -151,12 +143,12 @@ in hand-written `spec.args`. The legacy stored words migrate by name:
 
 ## 4 · Wire mapping, 1:1, with typed rejection
 
-- `remuda-protocol`: `EffortName` gains `Minimal`;
-  `EffortSelection::from_legacy_name` migrates the old web/codex `ultra` to
-  `xhigh` (round-trip tests in `remuda-protocol/tests/wire.rs`).
+- `remuda-protocol`: `EffortName` carries legacy `Minimal` and real `Ultra`;
+  the harness-aware `normalize_legacy_effort` preserves Codex `ultra` and maps
+  legacy Codex `minimal` to `low` (round-trip tests in `remuda-protocol/tests/wire.rs`).
 - `remuda-driver/src/effort.rs` (new): one mapper per kind —
-  claude/agy `--effort <low..max|ultracode>`, codex
-  `-c model_reasoning_effort="<minimal|low|medium|high|xhigh>"`, grok
+  claude `--effort <low..max|ultracode>`, agy `--effort <low..max>`, codex
+  `-c model_reasoning_effort="<low|medium|high|xhigh|max|ultra>"`, grok
   `--reasoning-effort <low|medium|high|xhigh>` — returning
   `DriverError::InvalidLaunchSpec` on out-of-vocabulary values;
   `materialize_shell_pty_agent` calls it per kind, and
@@ -168,7 +160,7 @@ in hand-written `spec.args`. The legacy stored words migrate by name:
   `reasoning_effort` outside `REASONING_EFFORTS` with the typed
   `WireError::InvalidReasoningEffort` before spawn.
 - Web: `effortWireName` only emits current native words (plus the claude
-  `ultracode` sentinel), the Hub openapi enum gains `minimal`, and both
+  `ultracode` sentinel), the Hub openapi enum includes `ultra`, and both
   generated TS files were regenerated (`just gen-types`, `pnpm gen:api`).
 
 ## Tests

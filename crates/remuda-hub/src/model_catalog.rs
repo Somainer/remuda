@@ -17,7 +17,7 @@ use remuda_protocol::ModelClass;
 
 /// Bumped whenever a row is added or changed so placement ledgers stay
 /// attributable to the catalog revision they were solved against.
-pub const CATALOG_REVISION: u32 = 1;
+pub const CATALOG_REVISION: u32 = 2;
 
 /// ISO date (YYYY-MM-DD) of the last catalog refresh.
 pub const CATALOG_UPDATED: &str = "2026-09-15";
@@ -105,7 +105,7 @@ impl CapabilityProfile {
 }
 
 const CLAUDE_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const CODEX_LEVELS: &[&str] = &["low", "medium", "high", "ultra"];
+const CODEX_LEVELS: &[&str] = remuda_driver::effort::CODEX_REASONING_EFFORTS;
 
 const CLAUDE_SUPPORTS: ModelSupports = ModelSupports {
     tool_choice_any: true,
@@ -382,7 +382,18 @@ mod tests {
         // Opus input price is carried from the (provisional) driver card.
         assert_eq!(opus.input_price_per_mtok(), Some(15.0));
         assert!(opus.price_is_provisional());
-        assert_eq!(CATALOG_REVISION, 1);
+        assert_eq!(CATALOG_REVISION, 2);
+    }
+
+    #[test]
+    fn codex_capability_rows_offer_the_six_native_tiers() {
+        for model in ["gpt-5", "gpt-5-mini", "gpt-5-nano"] {
+            assert_eq!(
+                lookup(model).unwrap().effort_levels,
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+                "{model}"
+            );
+        }
     }
 
     #[test]

@@ -26,6 +26,8 @@ mod interactions;
 mod inventory;
 mod maintenance;
 mod model_catalog;
+/// Built-in model catalog revision (tests compare the served catalog against it).
+pub use model_catalog::CATALOG_REVISION;
 mod objects;
 mod passkeys;
 mod placement;

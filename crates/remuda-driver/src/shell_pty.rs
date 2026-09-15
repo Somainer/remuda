@@ -281,8 +281,8 @@ struct PtyState {
     /// two open, the slave never sees EOF, and on macOS the SIGKILLed leader
     /// parks in `E` (exiting) forever instead of becoming a reapable zombie —
     /// the `?Es` process the demo left behind on every delete. Closing the PTY
-    /// therefore means releasing all three, which is what
-    /// [`PtyState::release_pty`] does.
+    /// therefore means releasing all three; [`ShellPtyDriver::stop_tree`] drops
+    /// the two owned halves and the reader closes its own dup on EOF.
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     /// Signals the child independently of whoever holds `child`.
@@ -313,23 +313,6 @@ struct PtyState {
 }
 
 impl PtyState {
-    /// Close every file descriptor this process holds on the PTY master.
-    ///
-    /// `portable-pty` hands out three: the master box, a `take_writer` dup and
-    /// a `try_clone_reader` dup. The slave's hangup is only delivered once the
-    /// *last* of them is gone, so releasing one and calling the PTY closed is
-    /// the bug that left a SIGKILLed macOS leader parked in `E` forever —
-    /// `waitpid` cannot reap a process that is still wedged in exit, and the
-    /// kernel will not finish the exit while the terminal has a live endpoint.
-    ///
-    /// The reader thread owns the third dup and cannot be reached from here;
-    /// it closes it by returning, which it does as soon as this close makes
-    /// its blocking `read` report EOF.
-    async fn release_pty(&self) {
-        drop(self.writer.lock().await.take());
-        drop(self.master.lock().await.take());
-    }
-
     fn screen_evidence(&self) -> (u64, ScreenGrid) {
         // The reader holds this same lock while updating both the rendered
         // grid and marker count. Sampling them separately can consume a new
@@ -2813,6 +2796,19 @@ mod tests {
                     .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == &pinned_home),
                 "hooks={hooks_on}: CLAUDE_CONFIG_DIR must pin the registered home"
             );
+            // native-carrier-4: pinning the config dir moves Claude's OS
+            // credential namespace with it (the macOS keychain service is
+            // suffixed with a hash of CLAUDE_CONFIG_DIR), so the pin alone
+            // makes an authenticated operator look logged out. The empty
+            // securestorage override selects the default namespace, keeping
+            // the config scoped and the credential lookup where the human
+            // logged in.
+            assert!(
+                pinned.iter().any(|(name, value)| name
+                    == "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+                    && value.is_empty()),
+                "hooks={hooks_on}: a pinned home must keep the default credential namespace"
+            );
         }
 
         // Without the pin the env stays silent — an inherited home must not be
@@ -2836,11 +2832,75 @@ mod tests {
             &interrupt_pid,
         )
         .unwrap();
+        let unpinned = agent_env(&unpinned_options.target, &recipe, false);
         assert!(
-            !agent_env(&unpinned_options.target, &recipe, false)
+            !unpinned
                 .iter()
                 .any(|(name, _)| name == "CLAUDE_CONFIG_DIR"),
             "an unpinned launch must not invent a config-dir env"
+        );
+        // An inherited home already resolves to the default credential
+        // namespace, so overriding it there would be noise at best and, if the
+        // operator had set the variable themselves, a silent contradiction.
+        assert!(
+            !unpinned
+                .iter()
+                .any(|(name, _)| name == "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            "an unpinned launch must leave the credential namespace alone"
+        );
+    }
+
+    /// native-carrier-4: the screen read is the carrier's debugging tool, so
+    /// it has to work on a live PTY and be honest when there is nothing to
+    /// read. A driver that has not started must not answer with an empty grid,
+    /// which reads as a blank terminal.
+    #[tokio::test]
+    async fn a_live_pty_reads_its_screen_and_an_unstarted_one_says_it_has_none() {
+        use crate::driver::Driver as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+        options.emulator = true;
+        let driver = ShellPtyDriver::new(options);
+        assert!(
+            driver.screen_read().await.unwrap().is_none(),
+            "an unstarted driver has no screen, and must not pretend to a blank one"
+        );
+
+        let _events = driver.spawn().await.unwrap().into_events();
+        let state = driver.state().await.unwrap();
+        state
+            .emulator
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .feed(b"Quick safety check: Is this a project you created?\r\n");
+
+        let screen = driver
+            .screen_read()
+            .await
+            .unwrap()
+            .expect("a started PTY has a screen");
+        assert!(
+            screen.emulated,
+            "the emulator is on, so the grid must not be a raw-ring fallback"
+        );
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("Quick safety check")),
+            "the dialog parked on screen is exactly what this read exists to surface: {:?}",
+            screen.lines
+        );
+        assert!(screen.cols > 0 && screen.rows > 0);
+
+        driver.close().await.unwrap();
+        assert!(
+            driver.screen_read().await.unwrap().is_none(),
+            "a closed driver has no screen to read"
         );
     }
 
@@ -2905,7 +2965,7 @@ mod tests {
         let mut events = driver.spawn().await.unwrap().into_events();
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         *driver.state().await.unwrap().writer.lock().await =
-            Box::new(RecordingWriter(Arc::clone(&written)));
+            Some(Box::new(RecordingWriter(Arc::clone(&written))));
         Driver::cancel(&driver).await.unwrap();
         assert_eq!(written.lock().unwrap().as_slice(), b"\x03");
         written.lock().unwrap().clear();
@@ -3021,7 +3081,7 @@ mod tests {
         );
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         let state = driver.state().await.unwrap();
-        *state.writer.lock().await = Box::new(RecordingWriter(Arc::clone(&written)));
+        *state.writer.lock().await = Some(Box::new(RecordingWriter(Arc::clone(&written))));
         Driver::cancel(&driver).await.unwrap();
         assert_eq!(written.lock().unwrap().as_slice(), b"\x1b");
         assert_eq!(

@@ -679,6 +679,32 @@ mod tests {
         );
     }
 
+    /// macOS spells the demo's leader `?Es`, and none of those three
+    /// characters is the run state `E`: the first char is the run state (`?`
+    /// when the kernel state is not one of `IRSTUZ`), and `E`/`s` are *flags*
+    /// — "trying to exit" and "session leader" (ps(1)). The classifier reads
+    /// the row as dead either way, but only because it strips the `?` first,
+    /// so pin the real spellings against a future "simplification".
+    #[test]
+    fn macos_flag_letters_do_not_change_the_run_state_reading() {
+        // Real rows seen on the demo Mac during a forced delete.
+        for exiting in ["?Es", "?E", "Es"] {
+            assert!(
+                state_is_dead(exiting),
+                "{exiting:?}: a process trying to exit is dead-but-unreaped"
+            );
+        }
+        // `s` alone is just a session leader, and a sleeping session leader is
+        // the single most common row in the table — reading it as dead would
+        // report every healthy agent as gone.
+        for live in ["Ss", "Ss+", "?Ss", "S", "R+"] {
+            assert!(!state_is_dead(live), "{live:?} is a live process");
+        }
+        // `E` as a trailing flag on a *live* run state still means the process
+        // is on its way out and cannot be a survivor.
+        assert!(state_is_dead("?Es"), "the exact demo row");
+    }
+
     #[test]
     fn a_synthetic_ps_table_keeps_a_live_member_visible() {
         // One genuinely running grandchild keeps the group alive even when its
@@ -755,7 +781,11 @@ mod tests {
     /// Spawn `script` as its own process-group leader, leaving the [`Child`]
     /// in the caller's hands: the caller decides when to reap, which is the
     /// whole point of the zombie tests.
-    #[cfg(unix)]
+    // Only the Linux zombie test needs an unreaped child: it is the one
+    // platform where `/proc` lets the test observe the `Z` state directly.
+    // Keeping the cfg wider than the caller makes this dead code on macOS,
+    // which `-D warnings` rejects.
+    #[cfg(all(unix, target_os = "linux"))]
     async fn spawn_leader_unreaped(
         script: &str,
         ready: &std::path::Path,

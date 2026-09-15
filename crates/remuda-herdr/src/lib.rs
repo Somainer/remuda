@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+mod alt_screen;
 mod client;
 mod error;
 mod events;
@@ -15,6 +16,8 @@ mod rpc;
 mod server;
 mod terminal;
 mod types;
+
+pub use alt_screen::AltScreenScanner;
 
 pub use client::{Client, EventStream, default_api_socket, herdr_config_dir, session_sockets};
 pub use error::{Error, SERVER_UNAVAILABLE};

@@ -4,6 +4,7 @@
 //! [`Bytes`]. Control mode accepts stdin JSON `terminal.input` / `terminal.resize`.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use bytes::Bytes;
@@ -15,6 +16,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::alt_screen::AltScreenScanner;
 use crate::client::Client;
 use crate::error::Error;
 
@@ -81,6 +83,10 @@ pub struct TerminalFrame {
     pub full: bool,
     /// Raw ANSI bytes (base64 already decoded).
     pub bytes: Bytes,
+    /// Whether the DEC alternate screen was active after this frame's bytes,
+    /// tracked deterministically from the stream itself (`?1049/?1047/?47`,
+    /// RIS) so a carrier without a mode API still has a trustworthy reading.
+    pub alt_screen: bool,
 }
 
 /// Wire envelope from `herdr terminal session observe|control` stdout.
@@ -136,6 +142,9 @@ impl TerminalEnvelope {
             height: self.height,
             full: self.full,
             bytes: Bytes::from(raw),
+            // Single-frame parse has no cross-frame scanner; the live relay
+            // fills this in [`read_frames`].
+            alt_screen: false,
         })
     }
 }
@@ -175,6 +184,9 @@ pub struct TerminalObserver {
     stdin: Option<ChildStdin>,
     mode: TerminalMode,
     frames: mpsc::Receiver<Result<TerminalFrame, Error>>,
+    /// Alternate-screen state shared with the frame reader, so callers can
+    /// query the current value without consuming the next frame.
+    alt_screen: Arc<Mutex<AltScreenScanner>>,
 }
 
 impl TerminalObserver {
@@ -240,18 +252,33 @@ impl TerminalObserver {
         })?;
         let stdin = child.stdin.take();
         let (tx, rx) = mpsc::channel(32);
-        tokio::spawn(read_frames(stdout, tx));
+        let alt_screen = Arc::new(Mutex::new(AltScreenScanner::new()));
+        tokio::spawn(read_frames(stdout, tx, Arc::clone(&alt_screen)));
         Ok(Self {
             child,
             stdin,
             mode: open.mode,
             frames: rx,
+            alt_screen,
         })
     }
 
     /// Next decoded ANSI frame.
     pub async fn next_frame(&mut self) -> Option<Result<TerminalFrame, Error>> {
         self.frames.recv().await
+    }
+
+    /// Current DEC alternate-screen state, tracked from the relayed bytes.
+    ///
+    /// The reading starts when this observer attaches; a mid-session attach
+    /// learns the true mode either from herdr's full frame or from the next
+    /// mode switch in the stream.
+    #[must_use]
+    pub fn alt_screen(&self) -> bool {
+        self.alt_screen
+            .lock()
+            .map(|scanner| scanner.alt_screen())
+            .unwrap_or(false)
     }
 
     /// Stream of decoded ANSI [`Bytes`] (drops metadata).
@@ -311,6 +338,7 @@ impl Drop for TerminalObserver {
 async fn read_frames(
     stdout: tokio::process::ChildStdout,
     tx: mpsc::Sender<Result<TerminalFrame, Error>>,
+    alt_screen: Arc<Mutex<AltScreenScanner>>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -318,7 +346,13 @@ async fn read_frames(
             Ok(Some(line)) if line.trim().is_empty() => continue,
             Ok(Some(line)) => match serde_json::from_str::<TerminalEnvelope>(&line) {
                 Ok(envelope) => match envelope.into_frame() {
-                    Ok(frame) => {
+                    Ok(mut frame) => {
+                        // The byte stream is the source of truth: feed before
+                        // handing over so the frame carries the post-byte mode.
+                        if let Ok(mut scanner) = alt_screen.lock() {
+                            scanner.feed(&frame.bytes);
+                            frame.alt_screen = scanner.alt_screen();
+                        }
                         if tx.send(Ok(frame)).await.is_err() {
                             break;
                         }

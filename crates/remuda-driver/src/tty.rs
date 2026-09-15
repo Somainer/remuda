@@ -37,10 +37,11 @@ impl HerdrTty {
         Ok(Self { observer })
     }
 
-    /// Next ANSI payload (`full` is true for a screen reset / snapshot frame).
-    pub async fn next_output(&mut self) -> Option<DriverResult<(Vec<u8>, bool)>> {
+    /// Next ANSI payload (`full` is true for a screen reset / snapshot frame,
+    /// `alt_screen` is the byte-stream scanner's post-frame DEC mode reading).
+    pub async fn next_output(&mut self) -> Option<DriverResult<(Vec<u8>, bool, bool)>> {
         match self.observer.next_frame().await? {
-            Ok(frame) => Some(Ok((frame.bytes.to_vec(), frame.full))),
+            Ok(frame) => Some(Ok((frame.bytes.to_vec(), frame.full, frame.alt_screen))),
             Err(err) => Some(Err(map_term(err))),
         }
     }

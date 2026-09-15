@@ -168,6 +168,14 @@ pub trait Driver: Send + Sync {
         None
     }
 
+    /// Trustworthy DEC alternate-screen observation for the live pane, if
+    /// this driver tracks one. `Some(true)` = a full-screen TUI currently owns
+    /// the display; `Some(false)` = inline/primary. Carriers without a mode
+    /// observation return `None` rather than guessing.
+    async fn alt_screen(&self) -> Option<bool> {
+        None
+    }
+
     /// Request cancellation of the active Run.
     async fn cancel(&self) -> DriverResult<DriverAck>;
 

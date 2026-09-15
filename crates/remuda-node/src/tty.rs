@@ -6,7 +6,7 @@ use remuda_protocol::{BinaryChannel, Id, InstanceId, StreamUuid, U64, encode_bin
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 /// Number of bytes in the protocol v1 binary frame header.
@@ -156,7 +156,12 @@ fn data_encoding_base64(bytes: &[u8]) -> String {
 }
 
 enum Backend {
-    Herdr { ctl: mpsc::Sender<Ctl> },
+    /// `ctl` carries writes/resizes into the control task; `alt_screen` is
+    /// the byte-stream scanner's current DEC alt-screen reading.
+    Herdr {
+        ctl: mpsc::Sender<Ctl>,
+        alt_screen: Arc<AtomicBool>,
+    },
     Local(Arc<dyn LocalPty>),
 }
 
@@ -227,12 +232,18 @@ impl TtyRegistry {
         let session = match bridge {
             TtyBridge::Herdr { client, pane_id } => {
                 let (ctl_tx, ctl_rx) = mpsc::channel(64);
+                // A fresh pane starts on its primary screen; the pump's
+                // scanner promotes this the instant the stream says otherwise.
+                let alt_screen = Arc::new(AtomicBool::new(false));
                 let session = Arc::new(TtySession {
                     stream_id: stream_id.clone(),
                     stream_epoch,
                     offset: AtomicU64::new(0),
                     ring: Mutex::new(VecDeque::new()),
-                    backend: Backend::Herdr { ctl: ctl_tx },
+                    backend: Backend::Herdr {
+                        ctl: ctl_tx,
+                        alt_screen: Arc::clone(&alt_screen),
+                    },
                     cols: AtomicU16::new(cols),
                     rows: AtomicU16::new(rows),
                 });
@@ -244,6 +255,7 @@ impl TtyRegistry {
                     cols,
                     rows,
                     ctl_rx,
+                    alt_screen,
                 );
                 session
             }
@@ -298,6 +310,13 @@ impl TtyRegistry {
                 PtySnapshot::raw_ring(session.ring.lock().await.iter().copied().collect())
             }
         };
+        // Herdr carriers have no emulator-backed repaint, but the relay tracks
+        // DEC alt-screen deterministically from the byte stream, so its
+        // reading is trustworthy even when the snapshot is a raw ring slice.
+        let herdr_alt_screen = match &session.backend {
+            Backend::Herdr { alt_screen, .. } => Some(alt_screen.load(Ordering::SeqCst)),
+            Backend::Local(_) => None,
+        };
         let next_offset = session.offset.load(Ordering::SeqCst);
         // A repaint is synthesized, not a slice of the stream, so it occupies
         // no offset range of its own. Anchoring it at `next_offset` keeps the
@@ -322,7 +341,9 @@ impl TtyRegistry {
             next_offset,
             cols: session.cols.load(Ordering::SeqCst),
             rows: session.rows.load(Ordering::SeqCst),
-            alt_screen: (snapshot.source == SnapshotSource::Repaint).then_some(snapshot.alt_screen),
+            alt_screen: herdr_alt_screen.or_else(|| {
+                (snapshot.source == SnapshotSource::Repaint).then_some(snapshot.alt_screen)
+            }),
         })
     }
 
@@ -357,7 +378,7 @@ impl TtyRegistry {
             .cloned()
             .ok_or_else(|| NodeError::InvalidRequest("instance has no TTY bridge".into()))?;
         match &session.backend {
-            Backend::Herdr { ctl } => {
+            Backend::Herdr { ctl, .. } => {
                 ctl.send(Ctl::Write(bytes.to_vec()))
                     .await
                     .map_err(|_| NodeError::DriverUnavailable)?;
@@ -392,7 +413,7 @@ impl TtyRegistry {
             .cloned()
             .ok_or_else(|| NodeError::InvalidRequest("instance has no TTY bridge".into()))?;
         match &session.backend {
-            Backend::Herdr { ctl } => {
+            Backend::Herdr { ctl, .. } => {
                 ctl.send(Ctl::Resize { cols, rows })
                     .await
                     .map_err(|_| NodeError::DriverUnavailable)?;
@@ -423,6 +444,7 @@ fn spawn_herdr_pump(
     cols: u16,
     rows: u16,
     mut ctl_rx: mpsc::Receiver<Ctl>,
+    alt_screen_slot: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         let TtyBridge::Herdr { client, pane_id } = bridge else {
@@ -435,13 +457,27 @@ fn spawn_herdr_pump(
                 return;
             }
         };
+        // Byte-stream mode observation (D-028 §4.6 baseline): no herdr API
+        // needed — the relay scans the same bytes the web renders for
+        // DECSET/DECRST 1049/1047/47 and RIS. A flip is published before the
+        // bytes that caused it, so the badge/wheel policy update ahead of paint.
+        let mut last_mode = false;
         loop {
             tokio::select! {
                 frame = observer.next_output() => {
                     let Some(frame) = frame else { break; };
-                    let Ok((bytes, _full)) = frame else { break; };
+                    let Ok((bytes, _full, alt_screen)) = frame else { break; };
                     if bytes.is_empty() {
                         continue;
+                    }
+                    if alt_screen != last_mode {
+                        last_mode = alt_screen;
+                        alt_screen_slot.store(alt_screen, Ordering::SeqCst);
+                        let _ = events.send(TtyEvent::Mode {
+                            instance_id: instance_id.clone(),
+                            stream_id: session.stream_id.clone(),
+                            alt_screen,
+                        });
                     }
                     push_output(&session, &instance_id, &events, &bytes).await;
                 }

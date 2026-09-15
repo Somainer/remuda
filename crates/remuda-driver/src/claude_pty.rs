@@ -175,6 +175,8 @@ struct PtyLive {
     hook_task: Option<JoinHandle<()>>,
     transcript_task: Option<JoinHandle<()>>,
     tty_task: Option<JoinHandle<()>>,
+    /// Current alt-screen mode seen by the attach relay's byte scanner.
+    alt_screen: Arc<AtomicBool>,
     closed: bool,
 }
 
@@ -533,6 +535,7 @@ impl ClaudePtyDriver {
             hook_task: Some(hook_task),
             transcript_task: Some(transcript_task),
             tty_task: None,
+            alt_screen: Arc::new(AtomicBool::new(false)),
             closed: false,
         });
 
@@ -705,6 +708,7 @@ impl Driver for ClaudePtyDriver {
             live.events.clone(),
             ctx,
             Arc::clone(&self.seq),
+            Arc::clone(&live.alt_screen),
         ));
         let mut ack = DriverAck::transport_written();
         ack.native_ids.insert("paneId".into(), pane_id);
@@ -768,6 +772,15 @@ impl Driver for ClaudePtyDriver {
             client: live.client.clone(),
             pane_id: live.pane_id.clone(),
         })
+    }
+
+    async fn alt_screen(&self) -> Option<bool> {
+        // The attach relay scans the exact byte stream the follower renders
+        // (DECSET/DECRST 1049/1047/47, RIS); before any relay has attached the
+        // pane's mode has no trustworthy observation.
+        let inner = self.inner.lock().await;
+        let live = inner.as_ref()?;
+        (live.tty_task.is_some() && !live.closed).then(|| live.alt_screen.load(Ordering::SeqCst))
     }
 
     async fn cancel(&self) -> DriverResult<DriverAck> {
@@ -1088,12 +1101,16 @@ fn spawn_tty_pump(
     tx: mpsc::Sender<Observation>,
     ctx: ObsCtx,
     seq: Arc<AtomicU64>,
+    alt_screen_slot: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(frame) = observer.next_frame().await {
             let Ok(frame) = frame else {
                 break;
             };
+            // The relay scans the exact bytes followers render
+            // (?1049/?1047/?47, RIS) — no herdr mode API, no full emulator.
+            alt_screen_slot.store(frame.alt_screen, Ordering::SeqCst);
             let stream_id = match Id::new("tty") {
                 Ok(id) => id,
                 Err(_) => break,

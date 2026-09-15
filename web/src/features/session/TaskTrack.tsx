@@ -56,14 +56,23 @@ export function TaskTrack({ tasks }: { tasks: ToolNode[] }) {
       </div>
       <ul>
         {tasks.map((task) => {
+          // A foreground subagent has no result until it ends. A backgrounded
+          // launch returns immediately with a `partial` result ("agent started
+          // in background"); its completion folds a `final` result later.
+          const background = task.result?.stage === "partial";
           const running = !task.result || task.result.stage !== "final";
           const failed = task.result?.outcome === "failed" || task.result?.outcome === "denied";
+          const outcomeAttr = background ? "background" : (task.result?.outcome ?? "running");
           return (
-            <li key={task.id} data-testid="task-track-item" data-task-outcome={task.result?.outcome ?? "running"}>
+            <li key={task.id} data-testid="task-track-item" data-task-outcome={outcomeAttr}>
               <TaskPrompt text={taskPrompt(task)} />
               <span className={failed ? uiCss.taskFailed : undefined}>
                 {" · "}
-                {running ? "running" : (task.result?.outcome ?? "unknown")}
+                {background
+                  ? "running in background"
+                  : running
+                    ? "running"
+                    : (task.result?.outcome ?? "unknown")}
               </span>
             </li>
           );

@@ -3692,6 +3692,16 @@ export type TaskDep = ({
 
 export type TaskId = (string);
 
+/** One parsed `<task-notification>` body. */
+export type TaskNotification = ({
+  "result": (string | null);
+  "status": (string);
+  "summary": (string | null);
+  "task_id": (string);
+  "tool_use_id": (string | null);
+  [key: string]: unknown;
+});
+
 /** Explicit pin that disables automatic supply choice; §4.3. */
 export type TaskPin = ({
   "harness"?: (string | null);

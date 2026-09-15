@@ -11,3 +11,4 @@
 | `workflow/runs-221/wf_93a3b4ed-afb/**` | same project, run-level-failure spike | Real 2.1.221 one-agent run ending in a run-level `failed`. |
 | `workflow/scripts/spike-wf-1.js` | same project, `workflows/scripts/` | The spike script copy (name/description/phases + 4 `agent(literal,{label,phase})`). |
 | `workflow/scripts/spike-wf-runfail-wf_93a3b4ed-afb.js` | same project | Script copy for the run-failure spike. |
+| `claude-transcript-tasktrack.jsonl` | identical sanitized fixture to `crates/remuda-driver/tests/fixtures/claude-transcript-tasktrack.jsonl` (see its SOURCES entry), captured 2026-09-15/16 | Three Agent lifecycles (sync foreground, backgrounded launch + task-notification completion, killed). Used by `tests/tasktrack_fold.rs` for the file-transcript mapper (c-tasktrack). |

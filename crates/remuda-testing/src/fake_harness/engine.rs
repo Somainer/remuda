@@ -25,12 +25,12 @@ use serde_json::{Value, json};
 use crate::fake_harness::artifacts::{
     ArtifactKind, ArtifactPaths, ArtifactSet, CodexCounters, CommandOutcome, GrokTurnIds,
     SessionMeta, claude_assistant_block, claude_effort_slash_records, claude_queue_op,
-    claude_queued_attachment, claude_tool_result, claude_user_record, codex_assistant_message,
-    codex_command_item_completed, codex_function_call, codex_function_output, codex_session_index,
-    codex_session_meta, codex_task_complete, codex_task_started, codex_token_usage,
-    codex_turn_aborted, codex_user_item_completed, codex_user_message, grok_chunk_update,
-    grok_tool_call, grok_tool_update_completed, grok_tool_update_failed, grok_turn_completed,
-    grok_write_registry,
+    claude_queued_attachment, claude_task_notification_record, claude_tool_result,
+    claude_user_record, codex_assistant_message, codex_command_item_completed, codex_function_call,
+    codex_function_output, codex_session_index, codex_session_meta, codex_task_complete,
+    codex_task_started, codex_token_usage, codex_turn_aborted, codex_user_item_completed,
+    codex_user_message, grok_chunk_update, grok_tool_call, grok_tool_update_completed,
+    grok_tool_update_failed, grok_turn_completed, grok_write_registry,
 };
 use crate::fake_harness::clock::FakeClock;
 use crate::fake_harness::hooks::{
@@ -41,7 +41,9 @@ use crate::fake_harness::screen::{
     ApprovalView, Dialect, DialectVersion, ScreenMode, View, WorkingPhase, default_choices, enter,
     osc_transitions, repaint, teardown,
 };
-use crate::fake_harness::script::{ApprovalMode, Scenario, TurnSpec, UsageSpec};
+use crate::fake_harness::script::{
+    ApprovalMode, AsyncAgent, Scenario, ToolSpec, TurnSpec, UsageSpec,
+};
 
 /// Failures surfaced by the binary.
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +179,10 @@ struct Engine {
     codex_counters: CodexCounters,
     draft: String,
     claude_queue: Vec<QueuedPrompt>,
+    /// Backgrounded Agent completions to deliver after the launching turn's
+    /// Stop: `(agentId, notification text)`. Kept apart from `claude_queue`
+    /// because those are human prompts absorbed at the tool boundary.
+    async_completions: std::collections::VecDeque<(String, String)>,
     /// §9.1: current in-session effort level, stamped on assistant records;
     /// changed by a typed `/effort <word>`.
     effort: String,
@@ -378,6 +384,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         codex_counters: CodexCounters::new(),
         draft: String::new(),
         claude_queue: Vec::new(),
+        async_completions: std::collections::VecDeque::new(),
         effort: "high".into(),
         codex_queue: VecDeque::new(),
         grok_queue: VecDeque::new(),
@@ -1900,6 +1907,104 @@ impl Engine {
         Ok(())
     }
 
+    /// Emit the immediate `async_launched` result + PostToolUse for a
+    /// backgrounded Agent, and enqueue its later `<task-notification>` (plus a
+    /// `SubagentStop`) to be delivered after this turn ends.
+    fn finish_async_agent(
+        &mut self,
+        tool: &ToolSpec,
+        tool_id: &str,
+        agent: &AsyncAgent,
+    ) -> Result<(), RunError> {
+        let agent_id = agent
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "ag_fake_async_1".to_owned());
+        let status = agent.status.clone().unwrap_or_else(|| "completed".into());
+        let summary = agent
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("Agent {:?} finished", tool.name));
+        let result = agent.result.clone().unwrap_or_else(|| "DONE".into());
+
+        let sidecar = json!({
+            "isAsync": true,
+            "status": "async_launched",
+            "agentId": agent_id,
+            "description": tool.input_object().get("description").cloned().unwrap_or(Value::Null),
+            "outputFile": format!("/work/tasks/{agent_id}.output"),
+        });
+        let record = json!({
+            "parentUuid": uuid::Uuid::nil().to_string(),
+            "isSidechain": false,
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "tool_use_id": tool_id,
+                    "type": "tool_result",
+                    "content": "Async agent launched successfully.",
+                }],
+            },
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "timestamp": self.clock.rfc3339(),
+            "toolUseResult": sidecar,
+            "session_id": self.meta.session_id,
+            "sessionId": self.meta.session_id,
+            "userType": "external",
+            "entrypoint": "cli",
+            "version": self.meta.version,
+            "gitBranch": "HEAD"
+        });
+        self.artifacts.append(record)?;
+        self.event(
+            "tool_finish_hook",
+            json!({ "toolUseId": tool_id, "toolName": tool.name }),
+        );
+        // Build the notification text that will be delivered after this turn's
+        // Stop.
+        let notification_record = claude_task_notification_record(
+            &self.meta,
+            &self.clock,
+            tool_id,
+            &agent_id,
+            &status,
+            &summary,
+            &result,
+        );
+        let notification = notification_record["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // PostToolUse for a background launch carries the same async sidecar;
+        // this is what the live layer marks `Partial`.
+        self.fire_hook(
+            HookEvent::PostToolUse,
+            json!({
+                "tool_name": tool.name,
+                "toolName": tool.name,
+                "tool_use_id": tool_id,
+                "toolUseId": tool_id,
+                "tool_input": tool.input_object(),
+                "tool_response": {
+                    "isAsync": true,
+                    "status": "async_launched",
+                    "agentId": agent_id,
+                },
+                "duration_ms": tool.duration(),
+                "durationMs": tool.duration(),
+                "isBackgrounded": true,
+                "transcript_path": self.paths.main.to_string_lossy()
+            }),
+        );
+
+        // The completion notification is delivered after this turn's Stop,
+        // not absorbed at the tool boundary like a human queued prompt.
+        self.async_completions
+            .push_back((agent_id.clone(), notification));
+        Ok(())
+    }
+
     fn finish_tool(&mut self, idx: usize, denied: Option<&str>) -> Result<(), RunError> {
         let tool = self.turn.as_ref().unwrap().spec.tools[idx].clone();
         let tool_id = self.turn.as_ref().unwrap().tool_ids[idx].clone();
@@ -1917,36 +2022,40 @@ impl Engine {
             match self.dialect {
                 Dialect::Claude => {
                     let source = uuid_like();
-                    let record = claude_tool_result(
-                        &self.meta,
-                        &self.clock,
-                        &tool_id,
-                        &source,
-                        &result,
-                        tool.is_error(),
-                    );
-                    self.artifacts.append(record)?;
-                    // Timing anchor immediately before the PostToolUse relay.
-                    self.event(
-                        "tool_finish_hook",
-                        json!({ "toolUseId": tool_id, "toolName": tool.name }),
-                    );
-                    self.fire_hook(
-                        HookEvent::PostToolUse,
-                        json!({
-                            "tool_name": tool.name,
-                            "toolName": tool.name,
-                            "tool_use_id": tool_id,
-                            "toolUseId": tool_id,
-                            "tool_input": tool.input_object(),
-                            "tool_response": { "stdout": output, "exit_code": exit_code },
-                            "toolResult": { "stdout": output, "exit_code": exit_code },
-                            "duration_ms": tool.duration(),
-                            "durationMs": tool.duration(),
-                            "isBackgrounded": false,
-                            "transcript_path": self.paths.main.to_string_lossy()
-                        }),
-                    );
+                    if let Some(agent) = &tool.async_agent {
+                        self.finish_async_agent(&tool, &tool_id, agent)?;
+                    } else {
+                        let record = claude_tool_result(
+                            &self.meta,
+                            &self.clock,
+                            &tool_id,
+                            &source,
+                            &result,
+                            tool.is_error(),
+                        );
+                        self.artifacts.append(record)?;
+                        // Timing anchor immediately before the PostToolUse relay.
+                        self.event(
+                            "tool_finish_hook",
+                            json!({ "toolUseId": tool_id, "toolName": tool.name }),
+                        );
+                        self.fire_hook(
+                            HookEvent::PostToolUse,
+                            json!({
+                                "tool_name": tool.name,
+                                "toolName": tool.name,
+                                "tool_use_id": tool_id,
+                                "toolUseId": tool_id,
+                                "tool_input": tool.input_object(),
+                                "tool_response": { "stdout": output, "exit_code": exit_code },
+                                "toolResult": { "stdout": output, "exit_code": exit_code },
+                                "duration_ms": tool.duration(),
+                                "durationMs": tool.duration(),
+                                "isBackgrounded": false,
+                                "transcript_path": self.paths.main.to_string_lossy()
+                            }),
+                        );
+                    }
                 }
                 Dialect::Codex => {
                     let turn_id = self
@@ -2153,6 +2262,42 @@ impl Engine {
         Ok(())
     }
 
+    /// Write the injected completion record (and queued-command attachment)
+    /// when a backgrounded Agent lands. The transcript tailer folds the
+    /// notification's `<tool-use-id>` onto the launch node.
+    fn deliver_async_completion(&mut self, queued: &QueuedPrompt) -> Result<(), RunError> {
+        let extract = |tag: &str| -> Option<String> {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            let start = queued.text.find(&open).map(|at| at + open.len())?;
+            let end = start + queued.text[start..].find(&close)?;
+            Some(queued.text[start..end].trim().to_owned())
+        };
+        let tool_use_id = extract("tool-use-id").unwrap_or_else(|| "toolu_fake_async".into());
+        let agent_id = extract("task-id").unwrap_or_else(|| "ag_fake_async".into());
+        let status = extract("status").unwrap_or_else(|| "completed".into());
+        let summary = extract("summary").unwrap_or_else(|| "Agent finished".into());
+        let result = extract("result").unwrap_or_else(|| "DONE".into());
+        let record = claude_task_notification_record(
+            &self.meta,
+            &self.clock,
+            &tool_use_id,
+            &agent_id,
+            &status,
+            &summary,
+            &result,
+        );
+        self.artifacts.append(record)?;
+        // The queued-command attachment mirrors a real delivered notification.
+        let enqueued_at = queued.enqueued_at.clone();
+        self.artifacts.append(claude_queued_attachment(
+            &self.meta,
+            &enqueued_at,
+            &queued.text,
+        ))?;
+        Ok(())
+    }
+
     fn end_turn_and_maybe_continue(&mut self, outcome: Option<&str>) -> Result<(), RunError> {
         self.event(
             "turn_end",
@@ -2164,6 +2309,35 @@ impl Engine {
         self.view.notice = None;
         self.view.steering.clear();
         self.turn = None;
+
+        // Claude: a backgrounded Agent completes after the launching turn's
+        // Stop. Write its enqueue/dequeue ledger, the injected notification
+        // user record (which folds the task row Final) and the delivery
+        // attachment, then idle — no new human turn.
+        if self.dialect == Dialect::Claude
+            && let Some((_agent_id, notification)) = self.async_completions.pop_front()
+        {
+            self.artifacts.append(claude_queue_op(
+                &self.meta,
+                &self.clock,
+                "enqueue",
+                Some(&notification),
+                None,
+            ))?;
+            self.artifacts.append(claude_queue_op(
+                &self.meta,
+                &self.clock,
+                "remove",
+                None,
+                None,
+            ))?;
+            self.deliver_async_completion(&QueuedPrompt {
+                text: notification,
+                enqueued_at: self.clock.rfc3339(),
+            })?;
+            self.view.queued.clear();
+            return Ok(());
+        }
 
         // Claude: items still queued after the final tool boundary dequeue
         // after Stop and run as a new turn; the queue otherwise survives only

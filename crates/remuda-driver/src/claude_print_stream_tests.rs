@@ -302,6 +302,9 @@ fn tool_json_deltas_reconcile_snapshot_and_result_without_reopening_call() {
         })
         .collect();
     assert_eq!(results.len(), 1);
+    // A tool_result is its own node (joined to the call via `tool_call_id`)
+    // and opens exactly once — the live stream and transcript replay share
+    // this sequence (promotion parity, D-025/D-028).
     assert_eq!(results[0].tool_call_id, calls[0].tool_call_id);
     assert_ne!(results[0].mutation.node_id, calls[0].mutation.node_id);
     assert_eq!(results[0].mutation.operation, MutationOperation::Open);

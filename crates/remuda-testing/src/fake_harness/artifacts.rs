@@ -491,6 +491,48 @@ pub fn claude_tool_result(
     })
 }
 
+/// A claude `user` record carrying an injected `<task-notification>` — the
+/// shape Claude writes when a backgrounded Agent finishes (2.1.221/2.1.272,
+/// c-tasktrack). `promptSource: "system"` and `origin.kind:
+/// "task-notification"` make it hook context, not the human; the
+/// `<tool-use-id>` joins the completion back to the launch tool call.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn claude_task_notification_record(
+    meta: &SessionMeta,
+    clock: &FakeClock,
+    tool_use_id: &str,
+    task_id: &str,
+    status: &str,
+    summary: &str,
+    result: &str,
+) -> Value {
+    let body = format!(
+        "<task-notification>\n<task-id>{task_id}</task-id>\n\
+<tool-use-id>{tool_use_id}</tool-use-id>\n\
+<output-file>/work/tasks/{task_id}.output</output-file>\n\
+<status>{status}</status>\n<summary>{summary}</summary>\n\
+<result>{result}</result>\n</task-notification>"
+    );
+    json!({
+        "parentUuid": Uuid::nil().to_string(),
+        "isSidechain": false,
+        "promptId": Uuid::new_v4().to_string(),
+        "type": "user",
+        "message": { "role": "user", "content": body },
+        "uuid": Uuid::new_v4().to_string(),
+        "timestamp": clock.rfc3339(),
+        "origin": { "kind": "task-notification" },
+        "promptSource": "system",
+        "session_id": meta.session_id,
+        "sessionId": meta.session_id,
+        "userType": "external",
+        "entrypoint": "cli",
+        "version": meta.version,
+        "gitBranch": "HEAD"
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Codex rollout records
 // ---------------------------------------------------------------------------

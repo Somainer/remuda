@@ -384,6 +384,7 @@ pub fn schema_document() -> Value {
         TaskPlacementRef,
         TaskSpec,
         TaskState,
+        TaskNotification,
         TerminalEvidence,
         TextBlock,
         ThoughtPayload,

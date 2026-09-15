@@ -1,0 +1,47 @@
+{
+  "turns": [
+    {
+      "match_prefix": "FGAGENT",
+      "text": "foreground agent done",
+      "tools": [
+        {
+          "name": "Agent",
+          "input": {
+            "subagent_type": "general-purpose",
+            "description": "foreground integration",
+            "prompt": "echo foreground-done then reply DONE"
+          },
+          "approval": "auto",
+          "duration_ms": 50,
+          "result": "foreground subagent report"
+        }
+      ],
+      "stop_reason": "end_turn"
+    },
+    {
+      "match_prefix": "BGAGENT",
+      "text": "LAUNCHED",
+      "tools": [
+        {
+          "name": "Agent",
+          "input": {
+            "subagent_type": "general-purpose",
+            "description": "background integration",
+            "run_in_background": true,
+            "prompt": "echo background-done then reply DONE"
+          },
+          "approval": "auto",
+          "duration_ms": 50,
+          "async_agent": {
+            "agent_id": "ag_fake_bg_integration",
+            "status": "completed",
+            "summary": "Agent \"background integration\" finished",
+            "result": "background subagent report"
+          }
+        }
+      ],
+      "stop_reason": "end_turn"
+    }
+  ],
+  "quit_after_turns": 3
+}

@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 mod runtime_wss;
+mod uplink;
 
 #[cfg(unix)]
 type RuntimeController = crate::daemon::DaemonWssFence;

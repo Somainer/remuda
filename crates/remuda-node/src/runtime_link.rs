@@ -152,6 +152,11 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
             crate::transport::hubnode::dispatch_method(node, method, params).await
         }
         method if crate::worktree::is_worktree_method(method) => node.worktree_rpc(method, &params),
+        // Read-only SCM RPCs must be explicit; the catch-all below would
+        // otherwise answer `{"ok":true}` and fake a successful read.
+        method if crate::workspace_scm::is_scm_method(method) => {
+            crate::workspace_scm::handle_rpc(node, method, &params)
+        }
         _ => Ok(json!({ "ok": true })),
     }
 }

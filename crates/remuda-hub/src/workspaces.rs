@@ -3,7 +3,7 @@
 use crate::auth::require_origin;
 use crate::store::{Store, StoreError};
 use crate::{AppState, HubError};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -12,10 +12,109 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/v1/hosts/{id}/workspaces",
-        get(list).post(register).delete(unregister),
+    Router::new()
+        .route(
+            "/v1/hosts/{id}/workspaces",
+            get(list).post(register).delete(unregister),
+        )
+        // G2: read-only, operator-only proxies to the Node's real-time git
+        // working-tree computation (files-view-contract §4). Nothing is
+        // cached: offline hosts get 409/422 and no stale content is served.
+        .route(
+            "/v1/hosts/{id}/workspaces/{workspaceId}/changes",
+            get(changes_status),
+        )
+        .route(
+            "/v1/hosts/{id}/workspaces/{workspaceId}/changes/diff",
+            get(changes_diff),
+        )
+        .route(
+            "/v1/hosts/{id}/workspaces/{workspaceId}/changes/file",
+            get(changes_file),
+        )
+}
+
+#[derive(Deserialize)]
+struct ChangesPath {
+    id: String,
+    #[serde(rename = "workspaceId")]
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    path: String,
+    #[serde(default)]
+    staged: bool,
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+/// `GET /v1/hosts/{hostId}/workspaces/{workspaceId}/changes` — current status.
+async fn changes_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<ChangesPath>,
+) -> Result<Json<Value>, HubError> {
+    proxy_scm(&state, &headers, &path, "workspace.scm.status", json!({})).await
+}
+
+/// `GET …/changes/diff?path=…&staged=…` — one entry's unified diff.
+async fn changes_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<ChangesPath>,
+    Query(query): Query<DiffQuery>,
+) -> Result<Json<Value>, HubError> {
+    proxy_scm(
+        &state,
+        &headers,
+        &path,
+        "workspace.scm.diff",
+        json!({"paths": [query.path], "staged": query.staged}),
     )
+    .await
+}
+
+/// `GET …/changes/file?path=…` — restricted current bytes for an entry.
+async fn changes_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<ChangesPath>,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<Value>, HubError> {
+    proxy_scm(
+        &state,
+        &headers,
+        &path,
+        "workspace.scm.file",
+        json!({"path": query.path}),
+    )
+    .await
+}
+
+/// Common proxy: operator gate, host existence, online gate (409), then the
+/// Node call (`call_node` maps `Ok(None)` to 422 PLACEMENT_UNSATISFIABLE).
+async fn proxy_scm(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &ChangesPath,
+    method: &str,
+    mut node_params: Value,
+) -> Result<Json<Value>, HubError> {
+    crate::agent_scope::require_operator(state, headers).await?;
+    require_host(state, &path.id).await?;
+    if state.nodes.kind_of(&path.id).await.is_none() {
+        return Err(HubError::HostOffline {
+            host_id: path.id.clone(),
+        });
+    }
+    node_params["workspaceId"] = json!(path.workspace_id);
+    let body = crate::http::call_node(state, &path.id, method, node_params).await?;
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]

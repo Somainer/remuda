@@ -495,6 +495,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/{id}/workspaces/{workspaceId}/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Current read-only git working-tree status of one registered workspace */
+        get: operations["workspaceChanges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/hosts/{id}/workspaces/{workspaceId}/changes/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Unified diff for one workspace change entry (Node proxy, never cached) */
+        get: operations["workspaceChangesDiff"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/hosts/{id}/workspaces/{workspaceId}/changes/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Restricted current bytes for an untracked/new workspace file (Node proxy, never cached) */
+        get: operations["workspaceChangesFile"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances": {
         parameters: {
             query?: never;
@@ -721,6 +772,67 @@ export interface paths {
         put?: never;
         post: operations["placementResolve"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List projects inside the caller's scope (agents require the dispatch grant) */
+        get: operations["projectList"];
+        put?: never;
+        /** Create the authoritative Project entity (human/bot operators only) */
+        post: operations["projectCreate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        /** Get one project inside the caller's scope */
+        get: operations["projectGet"];
+        put?: never;
+        post?: never;
+        /** Delete a project (human/bot operators only) */
+        delete: operations["projectDelete"];
+        options?: never;
+        head?: never;
+        /** Update project settings; D-031 enforced policy is immutable */
+        patch: operations["projectSet"];
+        trace?: never;
+    };
+    "/v1/projects/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Add a (hostId, workspaceId) member — the Space key (D-024) */
+        post: operations["projectMemberAdd"];
+        /** Remove a (hostId, workspaceId) member */
+        delete: operations["projectMemberRemove"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1092,6 +1204,7 @@ export interface components {
             delegation?: string;
             driver?: string;
             effort?: components["schemas"]["EffortSelection"];
+            grants?: ("dispatch" | "land" | "spend" | "address-owner")[];
             hostId?: string;
             kind?: string;
             maxBudgetUsd?: string | number;
@@ -1101,9 +1214,18 @@ export interface components {
             placement?: {
                 [key: string]: unknown;
             };
+            /** @description Single-project scope shortcut. */
+            projectId?: string;
             prompt?: string;
             providerProfileId?: string;
+            /**
+             * @description Preset name applied at create and stored for display; enforcement reads scope+grants, never this field (design §2.5).
+             * @enum {string}
+             */
+            role?: "worker" | "project-coordinator" | "top-coordinator";
+            scope?: components["schemas"]["InstanceScope"];
             settingsOverlayPath?: string;
+            taskId?: string;
             title?: string;
             /** @description Requested renderer. Omission inherits the host default, then fullscreen. */
             tui?: components["schemas"]["TuiMode"];
@@ -1204,6 +1326,14 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description Delegation-tree resource reach (design §2.5). Empty dimensions mean 'not narrowed'; child scope must be a subset of the parent. */
+        InstanceScope: {
+            hostIds?: string[];
+            projectIds?: string[];
+            /** @description Provider profile ids this node may spend (structured grants land with co-supply). */
+            supplyGrants?: string[];
+            workspaceIds?: string[];
+        };
         InteractionAnswerRequest: {
             answer: {
                 [key: string]: unknown;
@@ -1299,6 +1429,154 @@ export interface components {
             };
         } & {
             [key: string]: unknown;
+        };
+        /** @description Thin authoritative Hub Project entity; design §3.2. */
+        Project: {
+            branchPattern?: string;
+            briefRef?: string;
+            /** Format: date-time */
+            createdAt: string;
+            defaultBaseBranch?: string;
+            defaultEffort?: string;
+            gate?: components["schemas"]["ProjectGate"];
+            homeHost?: string;
+            hosts?: components["schemas"]["ProjectHostQuota"][];
+            id: string;
+            members?: components["schemas"]["ProjectMember"][];
+            modelRoles?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @enum {string} */
+            permissionPosture?: "ask" | "accept-edits" | "bypass";
+            placement?: components["schemas"]["ProjectPlacement"];
+            policy?: components["schemas"]["ProjectPolicy"];
+            provider?: components["schemas"]["ProjectProviderRef"];
+            repoRemote?: string;
+            revision: string;
+            /** Format: date-time */
+            updatedAt: string;
+        };
+        ProjectConfigurablePolicy: {
+            /** @description Relax the one-active-dispatch-holder-per-project rule. */
+            allowMultipleDispatchers?: boolean;
+            completionLine?: string;
+            /** @description Active children one node may delegate (Hub default 8). */
+            coordinatorFanOut?: number;
+            defaultPlacement?: string;
+            maxConcurrentWorkers?: number;
+            /** @description Delegation-tree depth limit (Hub default 3); design §2.5. */
+            maxDelegationDepth?: number;
+            maxFanOutPerTask?: number;
+            nudgeThrottleMins?: number;
+            stallThresholdMins?: number;
+        };
+        ProjectCreate: {
+            branchPattern?: string;
+            defaultBaseBranch?: string;
+            defaultEffort?: string;
+            gate?: components["schemas"]["ProjectGate"];
+            homeHost?: string;
+            members?: components["schemas"]["ProjectMember"][];
+            name: string;
+            /** @enum {string} */
+            permissionPosture?: "ask" | "accept-edits" | "bypass";
+            placement?: components["schemas"]["ProjectPlacement"];
+            policy?: components["schemas"]["ProjectPolicy"];
+            provider?: components["schemas"]["ProjectProviderRef"];
+            repoRemote?: string;
+        };
+        ProjectDeleted: {
+            deleted?: boolean;
+            project?: components["schemas"]["Project"];
+        };
+        /** @description D-031 enforced switches. All default true; read-only for coordinator agents after creation. */
+        ProjectEnforcedPolicy: {
+            allocatedPortBlocks?: boolean;
+            casAncestorCheck?: boolean;
+            gateBeforeLand?: boolean;
+            noDeployScripts?: boolean;
+            noOsSettingsChanges?: boolean;
+            noTunnelTools?: boolean;
+            oneWorktreePerWorker?: boolean;
+            reclaimDiskOnRetire?: boolean;
+            secretsNeverInBriefs?: boolean;
+            workersNeverPush?: boolean;
+        };
+        ProjectGate: {
+            affected?: boolean;
+            command?: string;
+            /** @enum {string} */
+            landSerialization?: "global-cas";
+            lanes?: components["schemas"]["ProjectGateLane"][];
+            mandatorySteps?: string[];
+            /** @enum {string} */
+            web?: "auto" | "always" | "never";
+        };
+        ProjectGateLane: {
+            hostId: string;
+            id: string;
+            ports?: string;
+            remote?: string;
+            repoPath: string;
+            targetDir: string;
+        };
+        ProjectHostQuota: {
+            diskBudgetGb?: number;
+            hostId: string;
+            /** @enum {string} */
+            latencyClass?: "local" | "remote";
+            maxBuilding?: number;
+            maxInstances?: number;
+            portBlocks?: string[];
+            /** @description Hard host-label requirements normalized key=value. */
+            requires?: string[];
+        };
+        ProjectMember: {
+            hostId: string;
+            /** @description Display-only member role (primary/build/…). */
+            role?: string;
+            workspaceId: string;
+        };
+        ProjectMemberPath: {
+            hostId: string;
+            role?: string;
+            workspaceId: string;
+        };
+        ProjectPage: {
+            items: components["schemas"]["Project"][];
+            nextCursor?: string | null;
+        };
+        /** @description remuda project set. Enforced policy (D-031) is immutable after creation; only policy.configurable is applied. */
+        ProjectPatch: {
+            branchPattern?: string;
+            defaultBaseBranch?: string;
+            defaultEffort?: string | null;
+            gate?: components["schemas"]["ProjectGate"];
+            homeHost?: string | null;
+            name?: string;
+            /** @enum {string|null} */
+            permissionPosture?: "ask" | "accept-edits" | "bypass" | null;
+            placement?: components["schemas"]["ProjectPlacement"];
+            policy?: components["schemas"]["ProjectPolicy"];
+            provider?: components["schemas"]["ProjectProviderRef"];
+            repoRemote?: string | null;
+        };
+        ProjectPlacement: {
+            /** @enum {string} */
+            default?: "auto" | "local" | "remote";
+            hostIds?: string[];
+            labels?: string[];
+        };
+        ProjectPolicy: {
+            configurable?: components["schemas"]["ProjectConfigurablePolicy"];
+            enforced?: components["schemas"]["ProjectEnforcedPolicy"];
+        };
+        /** @description Project never holds a secret, only a profileId and delegation shape. */
+        ProjectProviderRef: {
+            /** @enum {string} */
+            delegation?: "gateway" | "direct" | "none";
+            profileId?: string;
         };
         ProviderCreate: {
             authToken: string;
@@ -2379,6 +2657,97 @@ export interface operations {
             409: components["responses"]["Error"];
         };
     };
+    workspaceChanges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                workspaceId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Real-time workspace status entries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    workspaceChangesDiff: {
+        parameters: {
+            query: {
+                /** @description Workspace-relative entry path from the status response */
+                path: string;
+                staged?: boolean;
+            };
+            header?: never;
+            path: {
+                id: string;
+                workspaceId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Per-entry unified diff with truncation markers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    workspaceChangesFile: {
+        parameters: {
+            query: {
+                /** @description Workspace-relative entry path from the status response */
+                path: string;
+            };
+            header?: never;
+            path: {
+                id: string;
+                workspaceId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Restricted file content with sha256 digest */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
     instanceList: {
         parameters: {
             query?: {
@@ -2818,6 +3187,201 @@ export interface operations {
                 };
             };
             422: components["responses"]["Error"];
+        };
+    };
+    projectList: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project page, scoped to the caller's delegation scope. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    projectCreate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectCreate"];
+            };
+        };
+        responses: {
+            /** @description Project document */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    projectGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project document */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    projectDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDeleted"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    projectSet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectPatch"];
+            };
+        };
+        responses: {
+            /** @description Project document */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    projectMemberAdd: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectMemberPath"];
+            };
+        };
+        responses: {
+            /** @description Project document */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    projectMemberRemove: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectMemberPath"];
+            };
+        };
+        responses: {
+            /** @description Project document */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Project"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     providerList: {

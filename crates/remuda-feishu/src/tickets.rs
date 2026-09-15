@@ -1,12 +1,14 @@
 //! Interaction ↔ card tickets. Runtime deadline 10–15 min (default 12), first writer wins.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use remuda_protocol::{
     ApprovalAnswer, DecisionEffect, Interaction, InteractionAnswer, InteractionId,
     InteractionRequest, QuestionField, QuestionFieldAnswer, QuestionInput, U64,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cards::{render_expired_card, render_interaction_card, render_recorded_card};
@@ -117,17 +119,33 @@ pub struct MappedAnswer {
     pub replacement_card: Value,
 }
 
-/// In-memory ticket map. Hub persistence is out of scope for this prototype.
-#[derive(Debug, Clone)]
+/// In-memory ticket map with a write-through durable [`TicketBackend`].
+#[derive(Clone)]
 pub struct TicketStore {
     ttl: Duration,
     tickets: BTreeMap<String, CardTicket>,
     by_interaction: BTreeMap<String, String>,
+    backend: Arc<dyn TicketBackend>,
+}
+
+impl std::fmt::Debug for TicketStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TicketStore")
+            .field("ttl", &self.ttl)
+            .field("tickets", &self.tickets)
+            .field("by_interaction", &self.by_interaction)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TicketStore {
     /// `ttl` must be in 10–15 minutes.
     pub fn new(ttl: Duration) -> Result<Self, Error> {
+        Self::with_backend(ttl, Arc::new(NoopTicketBackend))
+    }
+
+    /// Like [`Self::new`] but with a write-through backend.
+    pub fn with_backend(ttl: Duration, backend: Arc<dyn TicketBackend>) -> Result<Self, Error> {
         if ttl < MIN_INTERACTION_TTL || ttl > MAX_INTERACTION_TTL {
             return Err(Error::InvalidTtl(ttl));
         }
@@ -135,6 +153,7 @@ impl TicketStore {
             ttl,
             tickets: BTreeMap::new(),
             by_interaction: BTreeMap::new(),
+            backend,
         })
     }
 
@@ -145,6 +164,18 @@ impl TicketStore {
             ttl: DEFAULT_INTERACTION_TTL,
             tickets: BTreeMap::new(),
             by_interaction: BTreeMap::new(),
+            backend: Arc::new(NoopTicketBackend),
+        }
+    }
+
+    /// 12 minute default with a write-through backend.
+    #[must_use]
+    pub fn with_default_ttl_backend(backend: Arc<dyn TicketBackend>) -> Self {
+        Self {
+            ttl: DEFAULT_INTERACTION_TTL,
+            tickets: BTreeMap::new(),
+            by_interaction: BTreeMap::new(),
+            backend,
         }
     }
 
@@ -371,6 +402,265 @@ impl TicketStore {
             Some(v) => Some(parse_form_value(Some(v))?),
         };
         self.answer_callback(&callback, parsed.as_ref(), scope, now)
+    }
+
+    // ----- Durable wrappers (write-through to the TicketBackend) -----------
+
+    /// Load every still-open ticket after a dispatcher restart. Local rows
+    /// never overwrite a fresher binding for the same interaction.
+    pub async fn hydrate(&mut self, now: SystemTime) -> Result<usize, Error> {
+        let stored = self.backend.load_open(now).await?;
+        let mut loaded = 0;
+        for row in stored {
+            if self.by_interaction.contains_key(&row.interaction_id) {
+                continue;
+            }
+            let ticket = row.into_ticket(TicketState::Open)?;
+            if ticket.expires_at <= now {
+                continue;
+            }
+            self.by_interaction.insert(
+                ticket.interaction_id.as_id().as_str().to_string(),
+                ticket.ticket_id.clone(),
+            );
+            self.tickets.insert(ticket.ticket_id.clone(), ticket);
+            loaded += 1;
+        }
+        Ok(loaded)
+    }
+
+    /// [`Self::issue`] plus write-through persistence. `instance_id` is the
+    /// session's live instance, recorded in the durable binding.
+    ///
+    /// When the interaction is re-issued with a new request version, the local
+    /// map expires the previous ticket; the durable row must be expired too or
+    /// the Hub's one-open-ticket-per-interaction index rejects the new row.
+    pub async fn issue_synced(
+        &mut self,
+        interaction: &Interaction,
+        session_key: &str,
+        instance_id: &str,
+        now: SystemTime,
+    ) -> Result<(CardTicket, Value), Error> {
+        let iid = interaction.meta.id.as_id().as_str().to_string();
+        let previous = self.by_interaction.get(&iid).cloned();
+        let (ticket, card) = self.issue(interaction, session_key, now)?;
+        if let Some(old_tid) = previous.filter(|tid| tid != &ticket.ticket_id) {
+            self.backend
+                .set_ticket_state(&old_tid, TicketState::Expired, None)
+                .await?;
+        }
+        self.backend
+            .put_ticket(&ticket.to_stored(instance_id)?)
+            .await?;
+        Ok((ticket, card))
+    }
+
+    /// [`Self::answer_card`] against the local first-writer-wins map.
+    ///
+    /// The durable row is deliberately left `open` until the caller confirms
+    /// the Hub accepted the relay ([`Self::mark_answered_synced`]): flipping
+    /// it earlier would make the Hub's own open-binding check refuse the very
+    /// answer in flight.
+    pub async fn answer_card_synced(
+        &mut self,
+        action: &CardAction,
+        scope: AnswerScope<'_>,
+        now: SystemTime,
+    ) -> Result<MappedAnswer, Error> {
+        self.answer_card(action, scope, now)
+    }
+
+    /// [`Self::answer_callback`] against the local map; durable state flips on
+    /// [`Self::mark_answered_synced`], same reasoning as
+    /// [`Self::answer_card_synced`].
+    pub async fn answer_callback_synced(
+        &mut self,
+        callback: &CallbackValue,
+        form: Option<&Value>,
+        scope: AnswerScope<'_>,
+        now: SystemTime,
+    ) -> Result<MappedAnswer, Error> {
+        self.answer_callback(callback, form, scope, now)
+    }
+
+    /// Flip the durable row to answered after the Hub accepted the relay.
+    pub async fn mark_answered_synced(&self, ticket_id: &str) -> Result<(), Error> {
+        self.backend
+            .set_ticket_state(ticket_id, TicketState::Answered, None)
+            .await
+    }
+
+    /// [`Self::expire_due`] plus write-through of each expired state.
+    pub async fn expire_due_synced(
+        &mut self,
+        now: SystemTime,
+    ) -> Result<Vec<(CardTicket, Value)>, Error> {
+        let expired = self.expire_due(now)?;
+        for (ticket, _) in &expired {
+            self.backend
+                .set_ticket_state(&ticket.ticket_id, TicketState::Expired, None)
+                .await?;
+        }
+        Ok(expired)
+    }
+
+    /// [`Self::expire_session`] backed by the durable store, so a second
+    /// dispatcher process cannot answer a retired instance's pending card.
+    pub async fn expire_session_synced(&mut self, session_key: &str) -> Result<Vec<String>, Error> {
+        let local = self.expire_session(session_key);
+        let durable = self.backend.expire_session(session_key).await?;
+        for id in &durable {
+            if let Some(ticket) = self.tickets.get_mut(id)
+                && ticket.state == TicketState::Open
+            {
+                ticket.state = TicketState::Expired;
+            }
+        }
+        Ok(if local.is_empty() { durable } else { local })
+    }
+
+    /// [`Self::set_card_message_id`] plus write-through.
+    pub async fn set_card_message_id_synced(
+        &mut self,
+        ticket_id: &str,
+        message_id: &str,
+    ) -> Result<(), Error> {
+        self.set_card_message_id(ticket_id, message_id);
+        self.backend
+            .set_ticket_state(ticket_id, TicketState::Open, Some(message_id))
+            .await
+    }
+}
+
+/// Persisted snapshot of a ticket (design §5.1 #3): everything a restarted
+/// dispatcher needs to re-hydrate the card binding without replaying journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredTicket {
+    /// Short id placed in the card callback.
+    pub ticket_id: String,
+    /// Instance whose journal produced the Interaction.
+    pub instance_id: String,
+    /// Protocol Interaction id.
+    pub interaction_id: String,
+    /// CAS fields.
+    pub request_version: String,
+    /// CAS fields.
+    pub process_generation: String,
+    /// Tagged `InteractionRequest` JSON (so answers can be re-encoded).
+    pub request_json: String,
+    /// Session the card was sent to.
+    pub session_key: String,
+    /// Posted card message id, once known.
+    #[serde(default)]
+    pub card_message_id: Option<String>,
+    /// Issue time, unix epoch milliseconds.
+    pub created_at_ms: i64,
+    /// Runtime deadline, unix epoch milliseconds.
+    pub expires_at_ms: i64,
+}
+
+impl CardTicket {
+    /// Serialize for the durable ticket store.
+    pub fn to_stored(&self, instance_id: &str) -> Result<StoredTicket, Error> {
+        Ok(StoredTicket {
+            ticket_id: self.ticket_id.clone(),
+            instance_id: instance_id.to_string(),
+            interaction_id: self.interaction_id.as_id().as_str().to_string(),
+            request_version: self.request_version.0.to_string(),
+            process_generation: self.process_generation.0.to_string(),
+            request_json: serde_json::to_string(&self.request)?,
+            session_key: self.session_key.clone(),
+            card_message_id: self.card_message_id.clone(),
+            created_at_ms: unix_ms(self.created_at)?,
+            expires_at_ms: unix_ms(self.expires_at)?,
+        })
+    }
+}
+
+impl StoredTicket {
+    /// Reconstruct a ticket after a dispatcher restart.
+    pub fn into_ticket(self, state: TicketState) -> Result<CardTicket, Error> {
+        Ok(CardTicket {
+            ticket_id: self.ticket_id,
+            interaction_id: self.interaction_id.parse().map_err(
+                |err: remuda_protocol::WireValueError| {
+                    Error::SessionStore(format!("stored interaction id: {err}"))
+                },
+            )?,
+            request_version: U64(self.request_version.parse().unwrap_or(0)),
+            process_generation: U64(self.process_generation.parse().unwrap_or(0)),
+            request: serde_json::from_str(&self.request_json)?,
+            session_key: self.session_key,
+            card_message_id: self.card_message_id,
+            created_at: system_time_ms(self.created_at_ms),
+            expires_at: system_time_ms(self.expires_at_ms),
+            state,
+        })
+    }
+}
+
+fn unix_ms(now: SystemTime) -> Result<i64, Error> {
+    now.duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .map_err(|_| Error::SessionStore("ticket time before unix epoch".into()))
+}
+
+fn system_time_ms(ms: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(u64::try_from(ms.max(0)).unwrap_or(0))
+}
+
+/// Durable home for ticket bindings. The in-process [`TicketStore`] is the
+/// write-through cache; this backs it so a dispatcher restart keeps open cards.
+#[async_trait::async_trait]
+pub trait TicketBackend: Send + Sync {
+    /// Upsert a ticket snapshot.
+    async fn put_ticket(&self, ticket: &StoredTicket) -> Result<(), Error>;
+    /// Update ticket state, optionally attaching the posted card message id.
+    async fn set_ticket_state(
+        &self,
+        ticket_id: &str,
+        state: TicketState,
+        card_message_id: Option<&str>,
+    ) -> Result<(), Error>;
+    /// Expire every open ticket for a session; returns the affected ticket ids.
+    async fn expire_session(&self, session_key: &str) -> Result<Vec<String>, Error>;
+    /// All unexpired open tickets at `now`, for restart hydration.
+    async fn load_open(&self, now: SystemTime) -> Result<Vec<StoredTicket>, Error>;
+}
+
+/// No persistence (unit tests exercising the synchronous mapping rules).
+#[derive(Debug, Default, Clone)]
+pub struct NoopTicketBackend;
+
+#[async_trait::async_trait]
+impl TicketBackend for NoopTicketBackend {
+    async fn put_ticket(&self, _ticket: &StoredTicket) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn set_ticket_state(
+        &self,
+        _ticket_id: &str,
+        _state: TicketState,
+        _card_message_id: Option<&str>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn expire_session(&self, _session_key: &str) -> Result<Vec<String>, Error> {
+        Ok(Vec::new())
+    }
+    async fn load_open(&self, _now: SystemTime) -> Result<Vec<StoredTicket>, Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// Wire name for a ticket state.
+pub fn state_wire(state: TicketState) -> &'static str {
+    match state {
+        TicketState::Open => "open",
+        TicketState::Answered => "answered",
+        TicketState::Expired => "expired",
     }
 }
 

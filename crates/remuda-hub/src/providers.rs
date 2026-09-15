@@ -430,6 +430,18 @@ pub async fn resolve_and_attach(
     host: &HostRecord,
     spec: &mut Value,
 ) -> Result<(), HubError> {
+    resolve_and_attach_with_project(state, host, spec, None).await
+}
+
+/// Waterfall with a project layer (explicit > project > host > global; design
+/// §6). `project` is the stored `Project.provider` reference, which never
+/// contains a secret — only a profile id and a delegation shape.
+pub async fn resolve_and_attach_with_project(
+    state: &AppState,
+    host: &HostRecord,
+    spec: &mut Value,
+    project: Option<&remuda_protocol::ProjectProviderRef>,
+) -> Result<(), HubError> {
     strip_provider_secrets(spec);
     let kind = spec.get("kind").and_then(Value::as_str).unwrap_or("claude");
     if kind != "claude" {
@@ -438,11 +450,19 @@ pub async fn resolve_and_attach(
     let profiles = state.store.list_providers(None).await?;
     let delegation = spec.get("delegation").and_then(Value::as_str);
     let provider_profile_id = spec.get("providerProfileId").and_then(Value::as_str);
+    let project_profile_id = project
+        .and_then(|provider| provider.profile_id.as_deref())
+        .filter(|id| provider_resolve::is_real_profile_id(id));
+    let project_delegation = project
+        .and_then(|provider| provider.delegation.as_deref())
+        .filter(|value| !value.is_empty());
     let resolved = provider_resolve::resolve(ResolveInput {
         host,
         profiles: &profiles,
         delegation,
         provider_profile_id,
+        project_profile_id,
+        project_delegation,
     })?;
     provider_resolve::apply_to_spec(spec, &resolved);
     Ok(())

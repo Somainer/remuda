@@ -83,3 +83,34 @@ The Playwright configuration keeps the union of existing patterns plus `.hub.spe
 | `gen:api`, secret scan and whitespace check | **VERIFIED**: generated API unchanged; scans passed after fixture cleanup |
 
 Hub runs again used only the fake Node/fake harness on ports 58580/58589, with fresh native fixture executables. No additional real-Claude probe was needed for this settings integration.
+
+
+## Coordinator merge follow-up: projects, resume overlay and live harness
+
+Merged main `e2c919e` into the renderer branch. The HTTP create body retains both the renderer option and the new project/delegation fields. Resume retains the renderer while forwarding the current provider overlay and host-scoped secret; both native-provider absence assertions and the gateway token-rotation regression remain in the merged tests. The fake harness initializes the modern dialect before resolving the requested renderer, preserving modern OSC updates, layered settings/hooks and replacement-process `/tui` behavior.
+
+The Hub OpenAPI document is a hand-maintained source in this repository (`tests/openapi.rs` and `web/scripts/gen-api.mjs`), not a Rust-generated artifact. It was rebuilt with a structural three-way JSON merge, preserving every incoming main value and adding only the five renderer schema entries. `pnpm --dir web gen:api` regenerated the API client, and `cargo run --locked -p remuda-protocol --example gen_types` regenerated both protocol artifacts from the merged Rust types.
+
+The incoming Files view exposed another macOS import collision: `FilesView.tsx` and `filesView.ts`. Renaming only the helper to `filesViewModel.ts` and updating its two imports restores unambiguous module resolution. The component and all helper behavior are unchanged. The Playwright Hub configuration remains exactly as on incoming main; both owned specs use the `.hub.spec.ts` convention.
+
+
+The first combined Rust run and a focused rerun both timed out in `claude_artifacts_parse_with_the_transcript_mapper`, before any approval event; only `session_start` was captured. That test immediately sent input using fixed delays while the child was starting. Waiting for its existing SessionStart event before the first body/Enter pair made the focused regression pass. This is a fixture startup synchronization fix. The hypothesis that the early bytes were combined as one paste follows the reader/parser implementation; no raw input-read trace was captured, so that exact batching is not claimed as an observed fact.
+
+
+The first Hub run passed the host-defaults spec but stopped the promoted fixture at instance creation. A diagnostic rerun captured `PLACEMENT_UNSATISFIABLE`: the new placement guard rejected the disposable native Node's initial CPU report of 100% against its 90% ceiling. The inventory implementation samples load average at startup and reuses that report in heartbeats. This machine-load result says nothing about renderer switching, because no instance was launched.
+
+The promoted spec now uses a dedicated `remuda-node` example, `native_hub_e2e`, with the public native runtime and WSS APIs. Only its synthetic resource report is fixed for deterministic placement; the production guard is unchanged. The example keeps its workspace, home, token and data inside the disposable fixture, restricts inventory to the fake executable directory, and explicitly supplies the real Remuda hook-relay helper. The native runtime still performs PTY dispatch, hook binding and renderer observation against fake-harness. Its resource values are fixture inputs, not a measurement of this Mac.
+
+
+| Final merge gate | Result |
+|---|---|
+| `cargo test --locked -p remuda-hub -p remuda-testing` | **VERIFIED**: final complete rerun passed 266 tests across 33 suites; zero failures or ignored cases; all 24 fake-harness integration cases passed |
+| `pnpm --dir web typecheck`, `lint`, `build` | **VERIFIED**: passed; lint reports existing warnings |
+| `pnpm --dir web test --maxWorkers=4` | **VERIFIED**: 90 files, 766 tests passed |
+| `cargo clippy --locked -p remuda-node --example native_hub_e2e -- -D warnings` and `cargo fmt --all -- --check` | **VERIFIED**: passed |
+| Owned `promoted-claude.hub.spec.ts` and `settings-tui.hub.spec.ts` | **VERIFIED**: both passed in the final combined run; 43.2 seconds, zero skips or retries |
+| Protocol generator `--check` and `pnpm --dir web gen:api` | **VERIFIED**: protocol schema/types match the merged source; regenerated API client is diff-clean |
+
+The final Hub run used only the isolated Hub/native fixture/fake-harness at `127.0.0.1:59080`, web port `59089` and synthetic upstream port `59081`, with `HUB_E2E_EXTERNAL=0` and `REMUDA_EVIDENCE=0`. It verified both observed renderer states, replacement PIDs with stable session binding, post-switch continuation, explicit host-default saving, persistence and rejected-save rollback. The tests left no tracked-file changes or new committed-evidence screenshots. The owned native fixture directories and short worktree scratch directory were removed before delivery.
+
+`./scripts/ci/secret-scan.sh` and the whitespace check against incoming main passed after cleanup.

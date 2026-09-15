@@ -123,7 +123,12 @@ async fn a_pty_whose_process_exits_cleanly_stops_being_ready() {
     let settled = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let instance = node.get_instance(&id).expect("instance");
-            if instance.lifecycle != InstanceLifecycle::Ready {
+            // A fast-accepted create starts at `preparing`; wait for a real
+            // terminal state rather than racing the preparing → ready ramp.
+            if matches!(
+                instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            ) {
                 return instance;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -170,7 +175,10 @@ async fn a_pty_that_dies_badly_is_failed_rather_than_exited() {
     let settled = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let instance = node.get_instance(&id).expect("instance");
-            if instance.lifecycle != InstanceLifecycle::Ready {
+            if matches!(
+                instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            ) {
                 return instance;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -264,7 +272,21 @@ async fn a_node_restart_ends_native_pty_sessions_and_says_why() {
             "while :; do sleep 0.1; done".into(),
         ];
         let created = node.create_instance(request).await.expect("create");
-        assert_eq!(created.instance.lifecycle, InstanceLifecycle::Ready);
+        // The create is durably accepted at `preparing`; wait for the worker to
+        // materialize the PTY and reach `ready` before killing the Node.
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if node
+                    .get_instance(&created.instance.meta.id)
+                    .is_ok_and(|instance| instance.lifecycle == InstanceLifecycle::Ready)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        ready.expect("the instance reaches ready after materialization");
         let ids = (
             created.instance.meta.id.clone(),
             created.instance.journal_id.clone(),

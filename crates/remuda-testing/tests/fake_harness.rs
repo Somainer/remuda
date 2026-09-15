@@ -39,6 +39,9 @@ fn claude_artifacts_parse_with_the_transcript_mapper() {
     let mut h = HarnessBuilder::new("claude")
         .scenario("approval.json")
         .spawn();
+    // Do not send body + Enter while a cold process is still starting. If
+    // both queue before its reader starts, Claude treats them as one paste.
+    h.wait_event("session_start", |_| true, WAIT);
     h.submit("RUN_TOOL");
     // Native approval dialog: single approval.
     h.wait_event("approval_prompt", |_| true, WAIT);

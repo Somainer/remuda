@@ -511,13 +511,23 @@ fn materialize_shell_pty_agent(
     let mut files = Vec::new();
     let mut env_allowlist = Vec::new();
 
-    // The overlay slot. The signal worker's hook/settings overlay lands here;
-    // until it does, a caller-supplied path is honoured and nothing is
-    // invented — an absent overlay means no `--settings` flag, not an empty
-    // file that would shadow the user's own settings.
-    let overlay = match request.settings_overlay_path.as_ref() {
+    // The overlay slot. A caller-supplied path is honoured. The native PTY
+    // agent launch never traverses the PATH shim that injects the generated
+    // overlay, so the hook session's `<launch_dir>/settings.json` (hook
+    // commands + TUI flags, written when `REMUDA_PTY_HOOKS=1`) is picked up
+    // here explicitly. Nothing is invented when the file is absent: hooks off
+    // means no `--settings` flag, not an empty file shadowing user settings.
+    let overlay_path = request
+        .settings_overlay_path
+        .as_deref()
+        .map(validate_settings_overlay)
+        .transpose()?
+        .or_else(|| {
+            let generated = request.launch_dir.join("settings.json");
+            generated.is_file().then_some(generated)
+        });
+    let overlay = match overlay_path {
         Some(path) => {
-            let path = validate_settings_overlay(path)?;
             let bytes = fs::read(&path)?;
             let digest = crate::binary::hash_bytes(&bytes)?;
             files.push(MaterializedFile {
@@ -525,7 +535,7 @@ fn materialize_shell_pty_agent(
                 role: FileRole::Settings,
                 mode: "0600".into(),
                 content_digest: digest,
-                lifetime: FileLifetime::NativeStore,
+                lifetime: FileLifetime::Launch,
             });
             Some(path)
         }

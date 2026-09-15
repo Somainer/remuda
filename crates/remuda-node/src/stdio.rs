@@ -378,7 +378,8 @@ async fn handle_stdio_frame(
         }
         _ if crate::workspace::is_workspace_method(request.method.as_str())
             || request.method == "host.doctor"
-            || crate::worktree::is_worktree_method(request.method.as_str()) =>
+            || crate::worktree::is_worktree_method(request.method.as_str())
+            || crate::workspace_scm::is_scm_method(request.method.as_str()) =>
         {
             let result =
                 hubnode_codec::dispatch_method(node, request.method.as_str(), params).await;

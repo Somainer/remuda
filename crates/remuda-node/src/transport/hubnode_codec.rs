@@ -189,6 +189,9 @@ pub async fn dispatch_method(
     if crate::worktree::is_worktree_method(method) {
         return node.worktree_rpc(method, &params);
     }
+    if crate::workspace_scm::is_scm_method(method) {
+        return crate::workspace_scm::handle_rpc(node, method, &params);
+    }
     if method == "instance.purge" {
         // Hub-driven session deletion: remove this Node's own rows and data
         // directory for a stopped Instance. Idempotent.

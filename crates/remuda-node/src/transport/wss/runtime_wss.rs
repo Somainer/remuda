@@ -139,7 +139,11 @@ async fn dispatch_hub(
                 credential.hub = Some(runtime.hub_url.clone());
             }
             let created = runtime.node.create_instance(request).await?;
-            catch_up(runtime, &created.instance.meta.id).await?;
+            // The durable accept is the reply. Journal mirroring continues
+            // through the per-instance pump the accept started; awaiting it
+            // here would put a Hub round-trip on the accept's critical path —
+            // exactly the serialization a loaded link tripped over.
+            ensure_pump(runtime, &created.instance.meta.id);
             Ok(serde_json::to_value(&created)?)
         }
         // D-026: resume takes the same path as create, with the session to
@@ -172,12 +176,12 @@ async fn dispatch_hub(
                 credential.hub = Some(runtime.hub_url.clone());
             }
             let created = runtime.node.create_instance(request).await?;
-            catch_up(runtime, &created.instance.meta.id).await?;
+            ensure_pump(runtime, &created.instance.meta.id);
             Ok(serde_json::to_value(&created)?)
         }
         Some(HubNodeMethod::InstanceSend) => {
             let (instance_id, result) = send_from_params(&runtime.node, params).await?;
-            catch_up(runtime, &instance_id).await?;
+            ensure_pump(runtime, &instance_id);
             Ok(result)
         }
         Some(HubNodeMethod::InstanceConfigure) => {
@@ -191,22 +195,22 @@ async fn dispatch_hub(
                 .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
             let result =
                 crate::transport::hubnode::dispatch_method(&runtime.node, method, params).await?;
-            catch_up(runtime, &instance_id).await?;
+            ensure_pump(runtime, &instance_id);
             Ok(result)
         }
         Some(HubNodeMethod::InstanceCancel) => {
             let (instance_id, result) = cancel_from_params(&runtime.node, params).await?;
-            catch_up(runtime, &instance_id).await?;
+            ensure_pump(runtime, &instance_id);
             Ok(result)
         }
         Some(HubNodeMethod::InstanceRespond | HubNodeMethod::InteractionRespond) => {
             let (instance_id, result) = respond_from_params(&runtime.node, params).await?;
-            catch_up(runtime, &instance_id).await?;
+            ensure_pump(runtime, &instance_id);
             Ok(result)
         }
         Some(HubNodeMethod::TtyWrite | HubNodeMethod::InstanceKeys) => {
             let (instance_id, result) = keys_from_params(&runtime.node, params).await?;
-            catch_up(runtime, &instance_id).await?;
+            ensure_pump(runtime, &instance_id);
             Ok(result)
         }
         Some(HubNodeMethod::TtyResize | HubNodeMethod::TtyAttach) => {
@@ -227,7 +231,7 @@ async fn dispatch_hub(
         }
         _ if method == "instance.close" => {
             let (instance_id, result) = close_from_params(&runtime.node, params).await?;
-            catch_up(runtime, &instance_id).await?;
+            ensure_pump(runtime, &instance_id);
             Ok(result)
         }
         _ if crate::worktree::is_worktree_method(method) => {
@@ -696,24 +700,35 @@ fn ensure_pump(runtime: &RuntimeLink, instance_id: &InstanceId) {
     });
 }
 
+/// Maximum unacknowledged `journal.append` frames per instance.
+///
+/// Bounds memory and Hub-side queue depth while removing the per-event RTT
+/// serialization. 16 matches the daemon NDJSON uplink's in-flight budget.
+const UPLINK_WINDOW: usize = 16;
+
 async fn flush_journal(runtime: &RuntimeLink, instance_id: &InstanceId) -> Result<(), NodeError> {
     let instance = runtime.node.get_instance(instance_id)?;
+    // Replay is also pipelined: fill the window directly from durable rows.
+    let mut window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
     loop {
-        let after = current_watermark(&runtime.watermarks, instance_id.as_id().as_str());
-        let after_seq = (after > 0).then_some(U64(u64::try_from(after).unwrap_or(0)));
-        let page = runtime
-            .node
-            .read_journal(&instance.journal_id, after_seq, 256)?;
-        if page.events.is_empty() {
-            break;
+        if window.is_empty() {
+            let after = current_watermark(&runtime.watermarks, instance_id.as_id().as_str());
+            let after_seq = (after > 0).then_some(U64(u64::try_from(after).unwrap_or(0)));
+            let page = runtime
+                .node
+                .read_journal(&instance.journal_id, after_seq, 256)?;
+            if page.events.is_empty() {
+                break;
+            }
+            for event in &page.events {
+                submit_forward(runtime, instance_id, event, &mut window)?;
+                if !window.has_capacity() {
+                    break;
+                }
+            }
         }
-        for event in page.events {
-            forward_event(runtime, instance_id, &event).await?;
-        }
-        if current_watermark(&runtime.watermarks, instance_id.as_id().as_str())
-            >= i64::try_from(page.durable_seq.0).unwrap_or(i64::MAX)
-        {
-            break;
+        while let Some(result) = window.next().await {
+            acknowledge(runtime, instance_id, result)?;
         }
     }
     Ok(())
@@ -727,37 +742,64 @@ async fn pump_live(
 ) {
     let mut retry = tokio::time::interval(std::time::Duration::from_millis(250));
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
     loop {
-        let event = tokio::select! {
+        // Events are submitted whenever there is window capacity; ACKs drain
+        // in order whenever they are ready. The two are independent, so a
+        // burst of six fills the wire immediately instead of queueing behind
+        // six sequential RTTs.
+        let can_send = window.has_capacity();
+        tokio::select! {
             biased;
-            _ = runtime.journal.tx.closed() => break,
-            _ = retry.tick(), if needs_replay => {
-                needs_replay = flush_journal(runtime, &instance_id).await.is_err();
-                continue;
-            }
-            event = rx.recv(), if !needs_replay => event,
-        };
-        match event {
-            Ok(event) => {
-                if let Err(error) = forward_event(runtime, &instance_id, &event).await {
+            // Collect in-order ACKs whenever any are outstanding; this frees
+            // window capacity and advances the confirmed watermark.
+            ack = window.next(), if !window.is_empty() => {
+                let Some(ack) = ack else { break };
+                if let Err(error) = acknowledge(runtime, &instance_id, ack) {
                     tracing::debug!(%error, "journal pump forward failed");
-                    // The last event may have no later broadcast to wake us.
-                    // Retry only durable journal rows from the confirmed ACK.
+                    window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
                     needs_replay = true;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                needs_replay = true;
+            event = rx.recv(), if can_send && !needs_replay => {
+                match event {
+                    Ok(event) => {
+                        if let Err(error) = submit_forward(runtime, &instance_id, &event, &mut window)
+                        {
+                            tracing::debug!(%error, "journal pump forward failed");
+                            window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
+                            needs_replay = true;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => needs_replay = true,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            _ = retry.tick(), if needs_replay => {
+                needs_replay = flush_journal(runtime, &instance_id).await.is_err();
+                // Rows appended by live observations during replay are either
+                // already in the window or behind the new watermark; resume
+                // the broadcast.
+            }
+            _ = runtime.journal.tx.closed() => break,
         }
+    }
+    // Drain in-flight appends on shutdown so confirmed rows are not replayed
+    // needlessly on the next connection (best effort).
+    while let Some(ack) = window.next().await {
+        let _ = acknowledge(runtime, &instance_id, ack);
     }
 }
 
-async fn forward_event(
+/// One submitted append plus its identity, resolved in submission order.
+type UplinkResult = Result<(Option<String>, i64, i64), NodeError>;
+
+/// Submit one event into the pipeline without awaiting its ACK.
+fn submit_forward(
     runtime: &RuntimeLink,
     instance_id: &InstanceId,
     event: &JournalEvent,
+    window: &mut super::uplink::UplinkWindow<UplinkResult>,
 ) -> Result<(), NodeError> {
     let seq = i64::try_from(event.position().1.0).unwrap_or(0);
     let key = instance_id.as_id().as_str();
@@ -765,33 +807,42 @@ async fn forward_event(
         return Ok(());
     }
     let value = serde_json::to_value(event)?;
-    let result = runtime.journal.append_seq(key.to_owned(), seq, value).await;
-    match result {
-        Ok(ack) => {
-            let acked = ack
-                .get("durableSeq")
-                .or_else(|| ack.get("seq"))
-                .and_then(super::value_i64)
-                .unwrap_or(seq);
-            record_watermark(
-                &runtime.watermarks,
-                key,
-                Some(event.position().0.to_string()),
-                acked,
-            );
-            Ok(())
+    let runtime = runtime.clone_link();
+    let key = key.to_owned();
+    let instance = runtime.node.get_instance(instance_id)?;
+    let journal_id = instance.journal_id.as_str().to_owned();
+    window.push(Box::pin(async move {
+        let result = runtime.journal.append_seq(key.clone(), seq, value).await;
+        match result {
+            Ok(ack) => {
+                let acked = ack
+                    .get("durableSeq")
+                    .or_else(|| ack.get("seq"))
+                    .and_then(super::value_i64)
+                    .unwrap_or(seq);
+                Ok((Some(journal_id), seq, acked))
+            }
+            Err(error) if super::already_durable(&error, seq) => Ok((Some(journal_id), seq, seq)),
+            Err(error) => Err(error),
         }
-        Err(error) if super::already_durable(&error, seq) => {
-            record_watermark(
-                &runtime.watermarks,
-                key,
-                Some(event.position().0.to_string()),
-                seq,
-            );
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    }));
+    Ok(())
+}
+
+/// Advance the watermark for an append resolved in journal order.
+fn acknowledge(
+    runtime: &RuntimeLink,
+    instance_id: &InstanceId,
+    result: UplinkResult,
+) -> Result<(), NodeError> {
+    let (journal_id, seq, acked) = result?;
+    record_watermark(
+        &runtime.watermarks,
+        instance_id.as_id().as_str(),
+        journal_id,
+        acked.max(seq),
+    );
+    Ok(())
 }
 
 pub(crate) fn record_watermark(

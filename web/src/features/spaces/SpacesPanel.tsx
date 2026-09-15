@@ -8,7 +8,7 @@ import { projectStatus } from "../../lib/status";
 import { newSessionPath, spaceSessions, spaceStore, type Space, type SpacePrefs } from "./store";
 import type { Instance } from "../../types/instance";
 import { LaunchedByMark } from "../session/LaunchedBy";
-import { QuickFind, QuickFindTrigger } from "../search/QuickFind";
+import { QuickFind, QuickFindTrigger } from "../search/QuickFind.tsx";
 import css from "./spaces.module.css";
 import qfCss from "../search/quickfind.module.css";
 

@@ -692,6 +692,17 @@ pub(super) fn spawn(
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
         let mut hydrator: Option<Hydrator> = None;
+        // Raise-only + blocked latch across the whole promoted session
+        // (design §2.4 rule 6, §10 anchor ④). The stateless screen read feeds
+        // it; its verdict is what we both journal and expose via the status
+        // slot. Reset on every demotion below.
+        let mut screen_latch = remuda_screen::ScreenLatch::new();
+        // Sticky hook-tier health for this promoted epoch. A transient
+        // `ps` miss (found == None) or a hook relay child taking the sampled
+        // row must not read as "no hook tier" and release the raise: the
+        // SessionStart/turn binding, once observed for this foreground pid,
+        // stays live until that pid demotes or a hook confirms the turn end.
+        let mut hook_ever_live = false;
         let mut last_status: Option<ScreenStatus> = None;
         // Last announced binding state, deduping lifecycle emission:
         // None = nothing announced yet this epoch.
@@ -735,8 +746,11 @@ pub(super) fn spawn(
                     return;
                 }
             }
-            // Epoch boundaries reset tail, hydrated state, and the picker.
+            // Epoch boundaries reset tail, hydrated state, the picker, and the
+            // screen raise/blocked latch — a new foreground starts unraised.
             if saw_demote {
+                screen_latch = remuda_screen::ScreenLatch::new();
+                hook_ever_live = false;
                 interrupt_pid.store(0, Ordering::SeqCst);
                 if let Some(payload) = bindings.invalidate_picker()
                     && emit(
@@ -834,15 +848,12 @@ pub(super) fn spawn(
             }
 
             // Screen-derived readiness, on the same evidence class claude-pty
-            // takes from herdr. Only transitions are journaled.
+            // takes from herdr. Only latch transitions are journaled.
             //
             // The grid is the emulator's when `REMUDA_PTY_EMULATOR=1`, and the
             // ANSI-stripped ring tail otherwise — the same input the matchers
             // read before D-028, so the default path is unchanged (§13 P0).
             let (interruption_count, grid) = state.screen_evidence();
-            let status = promote
-                .kind
-                .and_then(|_| remuda_screen::screen_status(&grid));
             // Esc can end a Claude turn without a Stop hook. A newly rendered
             // native interruption marker settles the pending request, while an
             // old marker already present when cancel was sent cannot do so.
@@ -886,23 +897,54 @@ pub(super) fn spawn(
                     return;
                 }
             }
+            // Rule 6 (design §2.4): the screen/OSC tier may raise busy and
+            // latch blocked, but it never lowers busy while a hook tier is
+            // live for this foreground process. The HookSession's
+            // `turn_active(pid)` is the §2.6 decision: `Some(true)` holds
+            // busy, `Some(false)`/`None` differ only by whether this run ever
+            // materialised a hook tier. That "ever materialised" bit is
+            // sticky per epoch so a transient process-table miss cannot lower
+            // the guard.
+            let turn_state = match (found.as_ref(), hooks.as_ref()) {
+                (Some(found), Some(hooks)) if found.pid > 0 => hooks.turn_active(found.pid),
+                _ => None,
+            };
+            match turn_state {
+                Some(true) => hook_ever_live = true,
+                Some(false) if hook_ever_live => {
+                    // A hook-confirmed turn end: the screen idle edge is now
+                    // allowed. Clear the epoch stickiness for the next turn —
+                    // the next UserPromptSubmit sets it again.
+                    hook_ever_live = false;
+                }
+                _ => {}
+            }
+            let hook_health = match turn_state {
+                Some(true) => remuda_screen::HookHealth::Healthy,
+                Some(false) => remuda_screen::HookHealth::NeverMaterialised,
+                None if hook_ever_live => remuda_screen::HookHealth::Healthy,
+                None => remuda_screen::HookHealth::NeverMaterialised,
+            };
+            let status = screen_latch.update(&grid, hook_health);
             if let Ok(mut slot) = status_slot.lock() {
                 *slot = status;
             }
-            if status != last_status {
-                last_status = status;
-                if let Some(status) = status
-                    && emit(
-                        &events,
-                        &seq,
-                        &ctx,
-                        SourceChannel::Pty,
-                        // A screen read is not proof; say so in the envelope.
-                        Completeness::ScreenDerived,
-                        agent_status(status),
-                    )
-                    .await
-                    .is_err()
+            // Journal only on an actual latch transition.
+            if let Some(status) = status
+                && last_status != Some(status)
+            {
+                last_status = Some(status);
+                if emit(
+                    &events,
+                    &seq,
+                    &ctx,
+                    SourceChannel::Pty,
+                    // A screen read is not proof; say so in the envelope.
+                    Completeness::ScreenDerived,
+                    agent_status(status),
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }

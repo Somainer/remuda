@@ -838,6 +838,9 @@ async fn dispatch_rpc(
         "worktree.list" => node.worktree_rpc(method, &params),
         "host.doctor" => node.doctor().await,
         "worktree.create" => node.create_worktree(&params),
+        method if crate::workspace_scm::is_scm_method(method) => {
+            crate::workspace_scm::handle_rpc(node, method, &params)
+        }
         "instance.list" => {
             let mut page = node.list_instances()?;
             if let Some(raw_workspace) = params.get("workspaceId").and_then(Value::as_str) {

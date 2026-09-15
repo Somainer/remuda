@@ -480,20 +480,47 @@ async fn fake_node(
                 }
                 // D-027: echo the attachment metadata the Hub resolved, so the
                 // e2e can prove staging reached the Node without a real agent.
-                let attachments = params
+                // 2026-09-15: also echo the [Image #n] manifest (index +
+                // objectId + mediaType in token order) on one line each.
+                let sent: Vec<(Option<i64>, String, String)> = params
                     .get("attachments")
                     .and_then(Value::as_array)
                     .map(|list| {
                         list.iter()
-                            .filter_map(|item| item.get("mediaType").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
+                            .map(|item| {
+                                (
+                                    item.get("index").and_then(Value::as_i64),
+                                    item.get("objectId")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    item.get("mediaType")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                )
+                            })
+                            .collect()
                     })
                     .unwrap_or_default();
-                let reply = if attachments.is_empty() {
+                let types = sent
+                    .iter()
+                    .map(|(_, _, media_type)| media_type.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut reply = if sent.is_empty() {
                     format!("echo: {prompt}")
                 } else {
-                    format!("echo: {prompt} [attachments: {}]", attachments.join(","))
+                    format!("echo: {prompt} [attachments: {types}]")
                 };
+                for (index, object_id, media_type) in &sent {
+                    reply.push_str(&format!(
+                        " [attachment-refs: #{} {} {}]",
+                        index.unwrap_or(0),
+                        object_id,
+                        media_type
+                    ));
+                }
                 if prompt.starts_with("stream ") {
                     // D-028 §7: reply as an open/append chain so the web e2e
                     // sees text arrive mid-turn, the way `MessageDisplay`

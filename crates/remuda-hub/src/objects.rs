@@ -234,7 +234,18 @@ pub async fn validate_send_attachments(
 
     let now = crate::config::now_rfc3339();
     let mut resolved = Vec::with_capacity(entries.len());
-    for entry in entries {
+    // (objectId, anchor) persisted so remuda_attachments_list reports the
+    // same token numbers the prompt carries.
+    let mut anchor_tags: Vec<(String, i64)> = Vec::new();
+    for (position, entry) in entries.into_iter().enumerate() {
+        // Older clients omit `index`; the 1-based array position then stands
+        // in (the manifest is ordered by token appearance).
+        let index = entry
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|n| n as i64)
+            .filter(|n| *n >= 1)
+            .unwrap_or(position as i64 + 1);
         let object_id = entry
             .get("objectId")
             .and_then(Value::as_str)
@@ -257,13 +268,16 @@ pub async fn validate_send_attachments(
         if object.instance_id != instance.instance_id {
             return Err(HubError::Forbidden);
         }
+        anchor_tags.push((object.object_id.clone(), index));
         resolved.push(json!({
             "objectId": object.object_id,
             "mediaType": object.media_type,
             "name": object.stored_name,
             "size": object.byte_len,
+            "index": index,
         }));
     }
+    state.store.tag_object_anchors(anchor_tags).await?;
     payload["attachments"] = json!(resolved);
     Ok(())
 }

@@ -950,6 +950,8 @@ export interface components {
             /** @description Lowercase hex SHA-256 of the stored bytes. */
             digest: string;
             expiresAt: string;
+            /** @description 1-based number matching the prompt's `[Image #n]` token, assigned by the send manifest that consumed the object; null while the object is only staged. `remuda_attachments_list` is ordered by this number. */
+            index?: number | null;
             /** @description Session this attachment is staged for; also the read-authorization key. */
             instanceId: string;
             mediaType: string;

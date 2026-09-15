@@ -26,6 +26,8 @@ pub struct PromptAttachment {
     pub media_type: String,
     /// Absolute path on this host.
     pub path: PathBuf,
+    /// 1-based `[Image #n]` anchor from the prompt manifest, when numbered.
+    pub anchor: Option<u32>,
 }
 
 impl PromptAttachment {
@@ -41,6 +43,11 @@ impl PromptAttachment {
     /// Path as a string for a prompt mention.
     pub fn display_path(&self) -> String {
         self.path.display().to_string()
+    }
+
+    /// `#1` / `#2` marker matching the prompt's `[Image #n]`, or "" unanchored.
+    fn number_label(&self) -> String {
+        self.anchor.map(|n| format!("#{n}")).unwrap_or_default()
     }
 }
 
@@ -70,6 +77,7 @@ pub fn attachments_of(blocks: &[ContentBlock]) -> Vec<PromptAttachment> {
             object_id,
             media_type: media.media_type.clone(),
             path,
+            anchor: media.anchor,
         });
     }
     found
@@ -127,7 +135,13 @@ pub fn text_with_path_mentions(blocks: &[ContentBlock]) -> DriverResult<String> 
     Ok(append_path_mentions(&text, &attachments))
 }
 
-/// Append one `附件: <path>` line per attachment, under a read instruction.
+/// Append one attachment block per image under a read instruction.
+///
+/// Numbered prompts (2026-09-15) keep the prompt's `[Image #n]` numbering
+/// visible on every line and name the Hub objectId, so an agent with the
+/// Remuda MCP tools can call `remuda_attachments_list` to map the number onto
+/// `remuda_attachment`; the absolute path stays on the same line as the
+/// fallback for a harness whose MCP server is not injected.
 #[must_use]
 pub fn append_path_mentions(text: &str, attachments: &[PromptAttachment]) -> String {
     if attachments.is_empty() {
@@ -140,15 +154,39 @@ pub fn append_path_mentions(text: &str, attachments: &[PromptAttachment]) -> Str
     if !out.is_empty() {
         out.push('\n');
     }
-    out.push_str(if attachments.len() == 1 {
-        "请读取下面这个本地图片文件（附件）：\n"
+    let numbered = attachments
+        .iter()
+        .any(|attachment| attachment.anchor.is_some());
+    if numbered {
+        out.push_str(&format!(
+            "图片按正文中的 [Image #n] 编号（共 {} 张）。可用 MCP 工具 remuda_attachments_list \
+             把编号解析成 objectId 后调用 remuda_attachment 读取；也可以直接读取下面的本地路径：\n",
+            attachments.len()
+        ));
     } else {
-        "请读取下面这些本地图片文件（附件）：\n"
-    });
+        out.push_str(if attachments.len() == 1 {
+            "请读取下面这个本地图片文件（附件）：\n"
+        } else {
+            "请读取下面这些本地图片文件（附件）：\n"
+        });
+    }
     for attachment in attachments {
-        out.push_str("附件: ");
-        out.push_str(&attachment.display_path());
-        out.push('\n');
+        if numbered {
+            // 附件 #2: obj_0199… (image/jpeg) /data/.../obj_0199….jpg
+            out.push_str("附件 ");
+            out.push_str(&attachment.number_label());
+            out.push_str(": ");
+            out.push_str(&attachment.object_id);
+            out.push_str(" (");
+            out.push_str(&attachment.media_type);
+            out.push_str(") ");
+            out.push_str(&attachment.display_path());
+            out.push('\n');
+        } else {
+            out.push_str("附件: ");
+            out.push_str(&attachment.display_path());
+            out.push('\n');
+        }
     }
     out
 }
@@ -165,6 +203,7 @@ mod tests {
                 object_id: id.clone(),
                 media_type: "image/png".into(),
                 name: Some("shot.png".into()),
+                anchor: None,
             })),
             ContentBlock::Resource(Box::new(ResourceBlock {
                 uri: format!("file://{path}"),
@@ -252,6 +291,68 @@ mod tests {
             mentioned.contains("附件: /data/attachments/shot.png"),
             "{mentioned}"
         );
+    }
+
+    /// Numbered sends keep the prompt's [Image #n] numbering on each line and
+    /// name the objectId, so the MCP path and the fallback path agree.
+    #[test]
+    fn numbered_mentions_pair_the_token_number_with_object_and_path() {
+        let id_1 = remuda_protocol::Id::new("obj").expect("id");
+        let id_2 = remuda_protocol::Id::new("obj").expect("id");
+        let blocks = vec![
+            ContentBlock::Image(Box::new(MediaBlock {
+                object_id: id_1.clone(),
+                media_type: "image/png".into(),
+                name: Some("a.png".into()),
+                anchor: Some(1),
+            })),
+            ContentBlock::Resource(Box::new(ResourceBlock {
+                uri: "file:///data/a.png".into(),
+                media_type: Knowledge::Known {
+                    value: "image/png".into(),
+                },
+                object_id: Some(id_1),
+            })),
+            ContentBlock::Image(Box::new(MediaBlock {
+                object_id: id_2.clone(),
+                media_type: "image/jpeg".into(),
+                name: Some("b.jpg".into()),
+                anchor: Some(2),
+            })),
+            ContentBlock::Resource(Box::new(ResourceBlock {
+                uri: "file:///data/b.jpg".into(),
+                media_type: Knowledge::Known {
+                    value: "image/jpeg".into(),
+                },
+                object_id: Some(id_2),
+            })),
+            ContentBlock::Text(Box::new(TextBlock {
+                text: "compare [Image #1] with [Image #2]".into(),
+            })),
+        ];
+        let mentioned = text_with_path_mentions(&blocks).expect("text");
+        assert!(
+            mentioned.contains("compare [Image #1] with [Image #2]"),
+            "{mentioned}"
+        );
+        let line_1 = mentioned
+            .lines()
+            .find(|line| line.contains("附件 #1:"))
+            .expect("#1 line");
+        let line_2 = mentioned
+            .lines()
+            .find(|line| line.contains("附件 #2:"))
+            .expect("#2 line");
+        assert!(
+            line_1.contains("(image/png)") && line_1.ends_with("/data/a.png"),
+            "{line_1}"
+        );
+        assert!(
+            line_2.contains("(image/jpeg)") && line_2.ends_with("/data/b.jpg"),
+            "{line_2}"
+        );
+        // #1 must precede #2 even though the driver iterates block order.
+        assert!(mentioned.find("附件 #1:").unwrap() < mentioned.find("附件 #2:").unwrap());
     }
 
     /// An attachment with no accompanying text still produces a usable prompt

@@ -146,6 +146,13 @@
           },
           "size": {
             "type": "integer"
+          },
+          "index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "1-based number matching the prompt's `[Image #n]` token, assigned by the send manifest that consumed the object; null while the object is only staged. `remuda_attachments_list` is ordered by this number."
           }
         },
         "required": [

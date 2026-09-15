@@ -100,7 +100,7 @@ impl PendingDecisions {
     /// unanswered approval to fail closed rather than becoming an allow or
     /// hanging the agent indefinitely.
     ///
-    /// Registering a second waiter under a live key replaces the first, and
+    /// Registering a second waiter under a live key displaces the first, and
     /// the first is told to deny: two hooks cannot both be the answer to one
     /// interaction, and leaving the loser parked would hang it until its own
     /// deadline.
@@ -109,12 +109,36 @@ impl PendingDecisions {
         key: DecisionKey,
         timeout: std::time::Duration,
     ) -> (HookDecision, Outcome) {
+        let rx = self.park(key.clone());
+        self.await_parked(key, rx, timeout).await
+    }
+
+    /// Register the waiter for `key` and return the receiver its decision
+    /// arrives on. Pair with [`await_parked`](Self::await_parked).
+    ///
+    /// Split from [`wait`](Self::wait) so a caller can publish the interaction
+    /// card *after* the waiter exists: an answer the instant the card appears
+    /// must find a registered hook, never be dropped as `Abandoned` and then
+    /// time out as a deny. A displaced previous waiter is dropped (denied),
+    /// exactly as in [`wait`](Self::wait).
+    pub fn park(&self, key: DecisionKey) -> oneshot::Receiver<HookDecision> {
         let (tx, rx) = oneshot::channel();
         if let Ok(mut table) = self.inner.lock() {
             // Dropped, not sent on: a displaced waiter was not decided by
             // anyone, and sending it a deny would make it report `Answered`.
-            drop(table.insert(key.clone(), tx));
+            drop(table.insert(key, tx));
         }
+        rx
+    }
+
+    /// Wait on a receiver handed out by [`park`](Self::park), enforcing the
+    /// same fail-closed timeout and table cleanup as [`wait`](Self::wait).
+    pub async fn await_parked(
+        &self,
+        key: DecisionKey,
+        rx: oneshot::Receiver<HookDecision>,
+        timeout: std::time::Duration,
+    ) -> (HookDecision, Outcome) {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(decision)) => (decision, Outcome::Answered),
             // The sender was dropped: the table was cleared out from under us

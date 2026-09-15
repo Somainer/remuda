@@ -78,10 +78,12 @@ pub struct SignalBus {
 
 /// The context kept for one parked blocking hook, so an answer arriving later
 /// can be turned back into the decision the harness reads.
-#[derive(Clone)]
 struct ParkedHook {
     /// Suggestions the harness offered; an allow-always answer echoes one.
     suggestions: Vec<crate::PermissionSuggestion>,
+    /// Receiver for the decision, registered before the card was emitted on
+    /// the delivery path; `None` for a direct fold that never blocks.
+    decision_rx: Option<tokio::sync::oneshot::Receiver<crate::decision::HookDecision>>,
 }
 
 /// A blocking hook whose card is open and whose process may await a decision.
@@ -165,13 +167,15 @@ impl SignalBus {
         answer: &remuda_protocol::InteractionAnswer,
     ) -> crate::Outcome {
         let key = crate::pending::DecisionKey::new(id.as_id().as_str());
-        let parked = self
+        // Only the suggestions are needed to build the decision; the parked
+        // receiver is owned by the delivery wait and must stay put.
+        let suggestions = self
             .parked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-            .cloned();
-        let Some(parked) = parked else {
+            .map(|parked| parked.suggestions.clone());
+        let Some(suggestions) = suggestions else {
             // No parked context: the hook already ended. Still report
             // honestly rather than claiming a delivery we cannot prove.
             return self.pending.resolve(
@@ -181,7 +185,7 @@ impl SignalBus {
                 },
             );
         };
-        let Some(decision) = parked.to_decision(answer) else {
+        let Some(decision) = ParkedHook::to_decision(&suggestions, answer) else {
             tracing::warn!(?answer, "a hook answer did not match its interaction kind");
             return self.pending.resolve(
                 &key,
@@ -299,12 +303,12 @@ impl SignalBus {
     /// Handle one authenticated event: fold and journal it.
     ///
     /// This never waits on a human. A blocking event's interaction card is
-    /// emitted and its hook parked, but the decision is awaited only by the
-    /// socket delivery path ([`SignalBus::deliver`]), so direct fold callers —
-    /// and the live observation pipeline — return immediately.
+    /// emitted, but no hook is parked in the decision table — direct fold
+    /// callers never answer through it — so the observation fold and the live
+    /// pipeline return immediately regardless of event kind.
     pub async fn handle(&self, envelope: HookEnvelope) -> HookReply {
         let event = HookEvent::from_envelope(envelope);
-        self.fold_event(event).await;
+        self.fold_event(event, false).await;
         HookReply::empty()
     }
 
@@ -316,7 +320,7 @@ impl SignalBus {
     /// observation fold or any other event.
     pub async fn deliver(&self, envelope: HookEnvelope) -> HookReply {
         let event = HookEvent::from_envelope(envelope);
-        match self.fold_event(event).await {
+        match self.fold_event(event, true).await {
             Some(pending) => self.await_decision(pending).await,
             None => HookReply::empty(),
         }
@@ -326,7 +330,12 @@ impl SignalBus {
     /// derived observations, and — for a blocking event — open the card and
     /// park the hook. Returns the parked handle (if any) for the caller to
     /// optionally await.
-    async fn fold_event(&self, event: HookEvent) -> Option<PendingDecision> {
+    ///
+    /// `register_waiter` must be true exactly on the socket delivery path:
+    /// when set, the decision waiter is registered **before** the card is
+    /// emitted, so an answer that arrives the instant the card is visible can
+    /// only find a live hook and can never be lost as a late abandon.
+    async fn fold_event(&self, event: HookEvent, register_waiter: bool) -> Option<PendingDecision> {
         let mapped = map_event(&event);
         if mapped.kind == MappedKind::SessionStarted
             && let Some(session_id) = mapped.session_id.clone()
@@ -442,7 +451,7 @@ impl SignalBus {
         // the same pass. The fold does not await the decision — it hands the
         // handle back so the socket delivery task can.
         if crate::event::is_blocking(&event.name) {
-            return self.open_and_park(&event).await;
+            return self.open_and_park(&event, register_waiter).await;
         }
         None
     }
@@ -453,7 +462,11 @@ impl SignalBus {
     /// the fold so the card and the phase observations are one ordered batch,
     /// but *without* blocking on the human — that split is what lets the live
     /// layer drain observations whether or not a decision ever arrives.
-    async fn open_and_park(&self, event: &HookEvent) -> Option<PendingDecision> {
+    async fn open_and_park(
+        &self,
+        event: &HookEvent,
+        register_waiter: bool,
+    ) -> Option<PendingDecision> {
         let Some((interaction, key)) = self.open_interaction(event) else {
             tracing::debug!(
                 event = %event.name,
@@ -461,19 +474,44 @@ impl SignalBus {
             );
             return None;
         };
-        if !self.emit_interaction(interaction).await {
-            // Nobody can see a card that never reached the journal. Answering
-            // it is impossible, so the relay must not park for the full TTL.
-            tracing::debug!(event = %event.name, "interaction not journaled; not parking a hook");
-            return None;
-        }
         let suggestions = crate::decision::PermissionRequestEvent::from_event(event)
             .map(|request| request.suggestions)
             .unwrap_or_default();
+        // Register BOTH the decision waiter and the parked record BEFORE the
+        // card becomes visible. A device that answers the instant it receives
+        // the card must find a parked hook in both tables: the oneshot so its
+        // decision reaches the wait, and the parked record so resolve_answer
+        // can map its answer into the harness decision. Registering either
+        // only after the emit reopened a window where an allow was dropped as
+        // abandoned / "after the request closed" and the hook then denied on
+        // its deadline (the hook_approval_e2e flakes).
+        let decision_rx = register_waiter.then(|| self.pending.park(key.clone()));
         self.parked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), ParkedHook { suggestions });
+            .insert(
+                key.clone(),
+                ParkedHook {
+                    suggestions,
+                    decision_rx,
+                },
+            );
+        if !self.emit_interaction(interaction).await {
+            // Nobody can see a card that never reached the journal. Answering
+            // it is impossible, so the relay must not park for the full TTL.
+            // Retire the just-registered waiter and parked record: dropping
+            // the sender reads as fail-closed TimedOut, never an answered
+            // deny, and avoids leaving a dead entry for the instance lifetime.
+            tracing::debug!(event = %event.name, "interaction not journaled; not parking a hook");
+            self.parked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            if register_waiter {
+                self.pending.retire(&key, crate::RetireReason::Deadline);
+            }
+            return None;
+        }
         Some(PendingDecision {
             key,
             event: event.name.clone(),
@@ -486,10 +524,28 @@ impl SignalBus {
     /// This is the only place the bus awaits a human, and it runs on the socket
     /// delivery task, never on the observation fold.
     async fn await_decision(&self, pending: PendingDecision) -> HookReply {
-        let (decision, outcome) = self
-            .pending
-            .wait(pending.key.clone(), self.blocking_wait)
-            .await;
+        // The receiver was registered before the card was emitted in
+        // open_and_park; take it from the parked record so the wait starts
+        // without any window in which an answer could miss the hook.
+        let rx = self
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&pending.key)
+            .and_then(|parked| parked.decision_rx.take());
+        let (decision, outcome) = match rx {
+            Some(rx) => {
+                self.pending
+                    .await_parked(pending.key.clone(), rx, self.blocking_wait)
+                    .await
+            }
+            // Direct fold callers (handle) never register a waiter; nothing
+            // can answer through this path, so fail closed without parking.
+            None => (
+                crate::decision::HookDecision::timed_out(),
+                crate::pending::Outcome::TimedOut,
+            ),
+        };
         self.parked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -694,7 +750,7 @@ impl ParkedHook {
     /// hook actually opened; the caller then denies rather than sending the
     /// harness something it cannot interpret.
     fn to_decision(
-        &self,
+        suggestions: &[crate::PermissionSuggestion],
         answer: &remuda_protocol::InteractionAnswer,
     ) -> Option<crate::HookDecision> {
         use remuda_protocol::InteractionAnswer;
@@ -716,7 +772,7 @@ impl ParkedHook {
                     // Echo the exact suggestion the button was built from. An
                     // out-of-range index means the answer named a grant that
                     // was never offered, which is the deny case, not an allow.
-                    let suggestion = self.suggestions.get(index)?.value.clone();
+                    let suggestion = suggestions.get(index)?.value.clone();
                     Some(crate::HookDecision::Allow {
                         updated_input: None,
                         updated_permissions: vec![suggestion],
@@ -1124,9 +1180,58 @@ mod tests {
         );
     }
 
+    /// The exact hook_approval_e2e race: a device answers the moment the card
+    /// reaches its journal — with no await between observing the card and
+    /// resolving it. The waiter must already be registered when the card is
+    /// emitted, so the allow lands even under a 1 ms blocking budget: it can
+    /// never be dropped as abandoned and then denied on the deadline.
+    #[tokio::test]
+    async fn an_allow_landing_with_the_card_never_loses_to_the_deadline() {
+        let (bus, mut rx) = fast_blocking_one_ms();
+        let pending = bus.pending();
+        let handle = tokio::spawn(async move {
+            bus.deliver(envelope("PermissionRequest", permission_request()))
+                .await
+        });
+        // The card is the first blocking observation. `recv` returning means
+        // `events.send` just completed inside the fold; resolve before
+        // yielding again, i.e. before the delivery task can register a waiter
+        // that was previously created only *after* the emit.
+        let key = next_decision_key(&mut rx).await;
+        let outcome = pending.resolve(
+            &key,
+            crate::HookDecision::Allow {
+                updated_input: None,
+                updated_permissions: Vec::new(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            crate::Outcome::Answered,
+            "the hook must be parked before its card becomes visible"
+        );
+        let reply = handle.await.expect("handler");
+        assert_eq!(
+            reply.to_hook_json()["hookSpecificOutput"]["decision"]["behavior"],
+            "allow",
+            "an allow that arrives with the card must not time out as deny"
+        );
+    }
+
+    /// A bus whose blocking window is deliberately 1 ms: only a waiter that is
+    /// registered before the card is emitted can still receive an immediate
+    /// answer inside it.
+    fn fast_blocking_one_ms() -> (SignalBus, mpsc::Receiver<Observation>) {
+        let (tx, rx) = mpsc::channel(128);
+        (
+            SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0)))
+                .with_blocking_wait(std::time::Duration::from_millis(1)),
+            rx,
+        )
+    }
+
     #[tokio::test]
     async fn an_unanswered_request_denies_rather_than_allowing() {
-        // §4.4 fail-closed, through the real bus wait.
         let (bus, mut rx) = fast_bus();
         let handle = tokio::spawn(async move {
             bus.deliver(envelope("PermissionRequest", permission_request()))

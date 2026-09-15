@@ -1,4 +1,6 @@
 import type { Attachment } from "../../lib/attachments";
+import type { DraftCodeQuote } from "../../lib/codeAnchors";
+import { quotePreview } from "../../lib/codeAnchors";
 import css from "./AttachmentChips.module.css";
 
 /**
@@ -109,6 +111,69 @@ export function SentAttachments({
           ) : null}
         </span>
       ))}
+    </div>
+  );
+}
+
+/**
+ * Draft chips for quoted code blocks (workbench-code-2). Same visual language
+ * as the image chips: numbered badge, title row, a one-line preview, and the
+ * × that strips the `[Code #n]` token. A quote whose token was edited out is
+ * dashed + "未引用（仍会发送）", exactly like image chips.
+ */
+export function CodeQuoteChips({
+  quotes,
+  unreferenced,
+  onRemove,
+}: {
+  quotes: readonly DraftCodeQuote[];
+  /** localIds whose `[Code #n]` token no longer appears in the draft text. */
+  unreferenced?: ReadonlySet<string>;
+  onRemove: (index: number) => void;
+}) {
+  if (quotes.length === 0) return null;
+  return (
+    <div className={css.row} data-testid="code-quote-chips">
+      {quotes.map((quote, position) => {
+        const index = position + 1;
+        const orphan = unreferenced?.has(quote.localId) === true;
+        const heading = quote.path || (quote.lang ? `${quote.lang} block` : "code block");
+        return (
+          <div
+            key={quote.localId}
+            className={css.chip}
+            data-unreferenced={orphan ? "1" : "0"}
+            data-index={index}
+            data-testid="code-quote-chip"
+          >
+            <span className={css.thumbWrap}>
+              <span className={css.codeGlyph} aria-hidden>
+                {"</>"}
+              </span>
+              <span className={css.indexBadge} data-testid="code-quote-index" aria-hidden>
+                {index}
+              </span>
+            </span>
+            <span className={css.meta}>
+              <span className={css.name} title={heading}>
+                {heading}
+              </span>
+              <span className={css.status} title={quotePreview(quote)}>
+                {orphan ? "未引用（仍会发送）" : quotePreview(quote)}
+              </span>
+            </span>
+            <button
+              type="button"
+              className={css.remove}
+              aria-label={`移除引用（代码 ${index}）`}
+              data-testid="code-quote-remove"
+              onClick={() => onRemove(index)}
+            >
+              ×
+            </button>
+          </div>
+        );
+      })}
     </div>
   );
 }

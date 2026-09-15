@@ -98,6 +98,10 @@ pub enum ModelClass {
     Frontier,
 }
 
+fn default_task_class() -> crate::TaskClass {
+    crate::TaskClass::Implement
+}
+
 impl ModelClass {
     /// Parse a class wire name, accepting the plural/alias spellings seen in
     /// briefs (`frontier` / `workhorse` / `cheap`).
@@ -299,35 +303,6 @@ fn i64_is_zero(value: &i64) -> bool {
 
 // ── TaskSpec (§4.3) ────────────────────────────────────────────────────────
 
-/// Dispatch task classes; §4.3.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
-)]
-pub enum TaskClass {
-    /// Open-ended investigation / spike.
-    #[serde(rename = "research")]
-    Research,
-    /// Product code change.
-    #[default]
-    #[serde(rename = "implement")]
-    Implement,
-    /// Diff review.
-    #[serde(rename = "review")]
-    Review,
-    /// Test work.
-    #[serde(rename = "test")]
-    Test,
-    /// Gate / merge execution.
-    #[serde(rename = "merge-gate")]
-    MergeGate,
-    /// Triage of failures.
-    #[serde(rename = "triage")]
-    Triage,
-    /// Documentation.
-    #[serde(rename = "docs")]
-    Docs,
-}
-
 /// Generic low/normal/high sensitivity knob.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
@@ -358,22 +333,6 @@ pub struct ContextNeed {
     /// `file` | `crate` | `workspace` | `repo` blast radius hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_scope: Option<String>,
-}
-
-/// Hard task budget; §4.3. Money is an estimate (§4.5) — the stop band is
-/// estimate×1.15, applied by the coordinator loop rather than this type.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskBudget {
-    /// Estimated USD cap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_usd: Option<f64>,
-    /// Turn cap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<u64>,
-    /// Wall-clock cap in minutes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_wall_mins: Option<u64>,
 }
 
 /// Explicit pin that disables automatic supply choice; §4.3.
@@ -408,8 +367,8 @@ pub struct TaskSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<TaskId>,
     /// Task class; defaults to `implement`.
-    #[serde(default)]
-    pub class: TaskClass,
+    #[serde(default = "default_task_class")]
+    pub class: crate::TaskClass,
     /// Minimum model class; admission never goes below this silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_class: Option<ModelClass>,
@@ -430,7 +389,7 @@ pub struct TaskSpec {
     pub requires: Vec<String>,
     /// Budget caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<TaskBudget>,
+    pub budget: Option<crate::TaskBudget>,
     /// Explicit harness/model/supply pin; disables auto-selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<TaskPin>,

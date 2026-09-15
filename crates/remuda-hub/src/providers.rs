@@ -169,12 +169,16 @@ async fn create_provider(
     let base_url = validate_base_url(&body.base_url, &kind)?;
     let headers_map = sanitize_headers(body.headers)?;
     // Secret-less profiles are legal: a native login (§4.1) has no token to
-    // store, and a supply declaration may precede the token entry.
+    // store, and a supply declaration may precede the token entry. A gateway
+    // profile still requires its token.
     let token = body
         .auth_token
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    if kind == "gateway" && token.is_none() {
+        return Err(HubError::BadRequest("authToken is required on create".into()));
+    }
     let default_gateway = body.default_gateway && kind == "gateway";
     let scope = validate_scope(&state, body.scope.as_deref()).await?;
     let models = provider_models::from_value(&body.models);

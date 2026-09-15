@@ -15,7 +15,7 @@ remuda merge wt/reviewer/work --gate --json      # verify, then advance main
    merge/rebase (including a detached rebase HEAD). Unstaged and untracked
    worker files do not participate in the merge.
 2. Pins local main's SHA and the committed source SHA, then merges `--no-ff`
-   in a detached worktree under `<repo>/data/tmp` — your checkouts are never
+   in a detached worktree under an OS-temp `remuda-mq-*` scratch root (never under the checkout) — your checkouts are never
    touched.
 3. Runs `scripts/ci/gate.sh`, the single definition of gate order: secret
    scan → `cargo fmt --all --check` → `cargo check --workspace --all-targets

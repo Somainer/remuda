@@ -776,3 +776,63 @@
     width: calc(100% - 28px);
   }
 }
+
+/*
+ * Hold-⌘/Ctrl session-switch badges (r-ux-keys).
+ *
+ * The badge is always laid out on the first nine rows of the Space ordering
+ * (so revealing it never moves a single pixel) but hidden until the modifier
+ * is held; it fades in fast (≤80 ms) and the screen reader learns the
+ * shortcut permanently from the row link's aria-keyshortcuts instead.
+ */
+.keyBadge {
+  margin-left: auto;
+  flex: none;
+  align-self: center;
+  height: 20px;
+  min-width: 38px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--mute);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 80ms ease;
+}
+
+.keyBadge[data-held="1"] {
+  opacity: 1;
+  visibility: visible;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .keyBadge {
+    transition: none;
+  }
+}
+
+/* Discreet, permanent reminder that the hold gesture exists. Touch/phone
+   widths never show it: there is no held-modifier flow there. */
+.switchHint {
+  flex: none;
+  margin-top: auto;
+  padding: 10px 20px 12px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  text-align: right;
+}
+
+@media (max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
+  .keyBadge,
+  .switchHint {
+    display: none;
+  }
+}

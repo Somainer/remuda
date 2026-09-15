@@ -15,11 +15,13 @@ pub mod journal_diff;
 pub mod mcp;
 pub mod merge;
 pub mod node;
+mod own;
 mod profile;
 mod project;
 pub(crate) mod registry;
 pub mod ssh;
 pub mod table;
+mod task;
 pub mod version;
 pub mod worktree;
 
@@ -51,6 +53,8 @@ commands! {
     Instance(instance::Args),
     Journal(journal_diff::Args),
     Project(project::ProjectArgs),
+    Task(task::TaskArgs),
+    Own(own::OwnArgs),
     Profile(profile::ProfileArgs),
     Fleet(fleet::Args),
     Worktree(worktree::Args),

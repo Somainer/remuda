@@ -263,6 +263,9 @@ pub struct ObjectRecord {
     pub byte_len: i64,
     /// RFC3339 expiry; a row at or past it reads as absent.
     pub expires_at: String,
+    /// 1-based `[Image #n]` anchor from the send that consumed this object;
+    /// unset until a send manifest names it (2026-09-15).
+    pub anchor: Option<i64>,
 }
 
 /// Arguments for [`Store::insert_object`].
@@ -1314,6 +1317,7 @@ impl Store {
                 )?;
                 tx.commit()?;
                 return Ok(ObjectRecord {
+                    anchor: existing.anchor,
                     expires_at,
                     ..existing
                 });
@@ -1362,6 +1366,7 @@ impl Store {
                 digest: new.digest,
                 byte_len,
                 expires_at,
+                anchor: None,
             })
         })
         .await
@@ -1370,6 +1375,22 @@ impl Store {
     /// Attachment metadata without its bytes.
     pub async fn get_object(&self, id: String) -> Result<Option<ObjectRecord>, StoreError> {
         self.run(move |conn| load_object(conn, &id)).await
+    }
+
+    /// Record the 1-based `[Image #n]` anchor a send assigned to each object
+    /// (2026-09-15). Drives the order `remuda_attachments_list` reports to the
+    /// in-session agent. Runs in the same HTTP call that validated the send.
+    pub async fn tag_object_anchors(&self, entries: Vec<(String, i64)>) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            for (object_id, anchor) in &entries {
+                conn.execute(
+                    "UPDATE objects SET anchor = ?1 WHERE id = ?2",
+                    params![anchor, object_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Staged bytes, or `None` when the row is gone.
@@ -3405,7 +3426,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             bytes BLOB NOT NULL,
             created_by TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
+            expires_at TEXT NOT NULL,
+            anchor INTEGER
         );
         CREATE UNIQUE INDEX IF NOT EXISTS objects_instance_digest
             ON objects(instance_id, digest);
@@ -3602,6 +3624,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
+    // 2026-09-15: [Image #n] anchor assigned by the send manifest.
+    ensure_column(&conn, "objects", "anchor", "INTEGER")?;
     ensure_column(&conn, "pair_codes", "code_prefix", "TEXT")?;
     ensure_column(
         &conn,
@@ -3614,6 +3638,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
     crate::workspaces::migrate(&conn)?;
     crate::projects::migrate(&conn)?;
+    crate::tasks::migrate(&conn)?;
     crate::supply::migrate(&conn)?;
     crate::usage_store::migrate(&conn)?;
     migrate_provider_models(&conn)?;
@@ -5319,11 +5344,12 @@ fn object_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
         digest: row.get(5)?,
         byte_len: row.get(6)?,
         expires_at: row.get(7)?,
+        anchor: row.get(8)?,
     })
 }
 
 const OBJECT_COLUMNS: &str =
-    "id, instance_id, host_id, media_type, stored_name, digest, byte_len, expires_at";
+    "id, instance_id, host_id, media_type, stored_name, digest, byte_len, expires_at, anchor";
 
 fn load_object(conn: &Connection, id: &str) -> Result<Option<ObjectRecord>, StoreError> {
     conn.query_row(

@@ -675,6 +675,7 @@ fn prompt_input(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .map(str::to_owned),
+            anchor: attachment.index,
         })));
         blocks.push(ContentBlock::Resource(Box::new(
             remuda_protocol::ResourceBlock {
@@ -1319,6 +1320,7 @@ mod tests {
             media_type: "image/png".into(),
             path: PathBuf::from("/tmp/remuda-node-test/attachments/shot.png"),
             byte_len: 64,
+            index: Some(1),
         };
         let DriverInput::Prompt(prompt) = prompt_input(
             "what colour?".into(),
@@ -1333,6 +1335,11 @@ mod tests {
                 assert_eq!(media.object_id.to_string(), attachment.object_id);
                 assert_eq!(media.media_type, "image/png");
                 assert_eq!(media.name.as_deref(), Some("shot.png"));
+                assert_eq!(
+                    media.anchor,
+                    Some(1),
+                    "the [Image #1] number rides the image block"
+                );
             }
             other => panic!("expected an image block, got {other:?}"),
         }

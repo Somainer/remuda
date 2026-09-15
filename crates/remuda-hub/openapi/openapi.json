@@ -146,6 +146,13 @@
           },
           "size": {
             "type": "integer"
+          },
+          "index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "1-based number matching the prompt's `[Image #n]` token, assigned by the send manifest that consumed the object; null while the object is only staged. `remuda_attachments_list` is ordered by this number."
           }
         },
         "required": [
@@ -1424,6 +1431,179 @@
         ],
         "type": "object"
       },
+      "Mandate": {
+        "description": "Root-first chain of upstream intents carried by every task.",
+        "properties": {
+          "chain": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MandateLink"
+            }
+          }
+        },
+        "required": [
+          "chain"
+        ],
+        "type": "object"
+      },
+      "MandateLink": {
+        "description": "One edge of the inherited owner-intent chain; design \u00a72.5.",
+        "properties": {
+          "depth": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "intent": {
+            "type": "string"
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "depth",
+          "taskId",
+          "title",
+          "intent"
+        ],
+        "type": "object"
+      },
+      "OwnCheckRequest": {
+        "description": "remuda own check: explicit paths or a pasted diff/stat/name-only listing.",
+        "properties": {
+          "diff": {
+            "type": "string"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId"
+        ],
+        "type": "object"
+      },
+      "OwnCheckResult": {
+        "description": "within=false means changed paths cross the task's owns[] boundary (\u00a74.3/\u00a77 #3).",
+        "properties": {
+          "checked": {
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/TaskState"
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          },
+          "violations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "within": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "taskId",
+          "within",
+          "checked",
+          "violations"
+        ],
+        "type": "object"
+      },
+      "OwnClaim": {
+        "description": "Claim/release body; empty paths on DELETE releases all of the task's claims.",
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "OwnClaimResult": {
+        "properties": {
+          "owns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "owns"
+        ],
+        "type": "object"
+      },
+      "OwnMap": {
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OwnMapEntry"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "OwnMapEntry": {
+        "description": "One aggregated active-claim row in the ownership map.",
+        "properties": {
+          "claimedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "claimedBy": {
+            "type": "string"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "projectId": {
+            "pattern": "^prj_",
+            "type": "string"
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "taskId",
+          "paths",
+          "claimedBy",
+          "claimedAt"
+        ],
+        "type": "object"
+      },
       "PairCode": {
         "properties": {
           "code": {
@@ -1586,6 +1766,169 @@
         },
         "required": [
           "name"
+        ],
+        "type": "object"
+      },
+      "PlacementAppend": {
+        "description": "Append a placement ledger row; drives the legal task-state transition.",
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "harness": {
+            "type": "string"
+          },
+          "hostId": {
+            "pattern": "^hst_",
+            "type": "string"
+          },
+          "instanceId": {
+            "pattern": "^ins_",
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "dispatch",
+              "switch-model",
+              "park",
+              "unplace"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rejected": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlacementRejection"
+            }
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "PlacementAppendResult": {
+        "properties": {
+          "placement": {
+            "$ref": "#/components/schemas/PlacementLedgerRow"
+          },
+          "task": {
+            "$ref": "#/components/schemas/Task"
+          }
+        },
+        "required": [
+          "placement",
+          "task"
+        ],
+        "type": "object"
+      },
+      "PlacementLedgerRow": {
+        "description": "Placement ledger row; reasons[]/rejected[] are audit trail and bot card (\u00a75.6).",
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "createdBy": {
+            "type": "string"
+          },
+          "harness": {
+            "type": "string"
+          },
+          "hostId": {
+            "pattern": "^hst_",
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^plc_",
+            "type": "string"
+          },
+          "instanceId": {
+            "pattern": "^ins_",
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "projectId": {
+            "pattern": "^prj_",
+            "type": "string"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rejected": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlacementRejection"
+            }
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "taskId",
+          "projectId",
+          "kind",
+          "createdBy",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "PlacementPage": {
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlacementLedgerRow"
+            }
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "PlacementRejection": {
+        "description": "Rejected candidate and why.",
+        "properties": {
+          "candidate": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate",
+          "reason"
         ],
         "type": "object"
       },
@@ -2603,6 +2946,300 @@
         "required": [
           "target",
           "label"
+        ],
+        "type": "object"
+      },
+      "Task": {
+        "description": "One row of the task ledger; design \u00a72.2/\u00a72.5/\u00a78.1 row 4.",
+        "properties": {
+          "blockedReason": {
+            "type": "string"
+          },
+          "budget": {
+            "$ref": "#/components/schemas/TaskBudget"
+          },
+          "class": {
+            "$ref": "#/components/schemas/TaskClass"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "deps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskDep"
+            }
+          },
+          "id": {
+            "pattern": "^tsk_",
+            "type": "string"
+          },
+          "landedSha": {
+            "type": "string"
+          },
+          "mandate": {
+            "$ref": "#/components/schemas/Mandate"
+          },
+          "owns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "parentTaskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          },
+          "placement": {
+            "$ref": "#/components/schemas/TaskPlacementRef"
+          },
+          "projectId": {
+            "pattern": "^prj_",
+            "type": "string"
+          },
+          "revision": {
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/TaskState"
+          },
+          "title": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "createdAt",
+          "updatedAt",
+          "projectId",
+          "title",
+          "mandate",
+          "class",
+          "state"
+        ],
+        "type": "object"
+      },
+      "TaskBudget": {
+        "description": "Estimated budget envelope; amounts are estimates (\u00a74.5).",
+        "properties": {
+          "maxTurns": {
+            "type": "integer"
+          },
+          "maxUsd": {
+            "type": "string"
+          },
+          "maxWallMins": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "TaskClass": {
+        "type": "string",
+        "enum": [
+          "research",
+          "implement",
+          "review",
+          "test",
+          "merge-gate",
+          "triage",
+          "docs"
+        ],
+        "description": "Task class; design \u00a74.3."
+      },
+      "TaskCreate": {
+        "description": "remuda task add",
+        "properties": {
+          "budget": {
+            "$ref": "#/components/schemas/TaskBudget"
+          },
+          "class": {
+            "$ref": "#/components/schemas/TaskClass"
+          },
+          "deps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskDepInput"
+            }
+          },
+          "intent": {
+            "type": "string"
+          },
+          "owns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "projectId": {
+            "pattern": "^prj_",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "title",
+          "intent"
+        ],
+        "type": "object"
+      },
+      "TaskDep": {
+        "description": "Dependency edge; unlocks only from the referenced task's landed sha (\u00a77 #8).",
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId"
+        ],
+        "type": "object"
+      },
+      "TaskDepInput": {
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId"
+        ],
+        "type": "object"
+      },
+      "TaskLand": {
+        "description": "Record the landed sha from gate/land; the only dep-unlock signal (\u00a77 #8).",
+        "properties": {
+          "sha": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sha"
+        ],
+        "type": "object"
+      },
+      "TaskPage": {
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Task"
+            }
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "TaskPlacementRef": {
+        "description": "Current worker slot for a placed task.",
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "hostId": {
+            "pattern": "^hst_",
+            "type": "string"
+          },
+          "instanceId": {
+            "pattern": "^ins_",
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "placementId": {
+            "pattern": "^plc_",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "TaskSplit": {
+        "description": "remuda task split; parent and mandate chain come from the path id",
+        "properties": {
+          "budget": {
+            "$ref": "#/components/schemas/TaskBudget"
+          },
+          "class": {
+            "$ref": "#/components/schemas/TaskClass"
+          },
+          "deps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskDepInput"
+            }
+          },
+          "intent": {
+            "type": "string"
+          },
+          "owns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "intent"
+        ],
+        "type": "object"
+      },
+      "TaskState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "placed",
+          "running",
+          "stalled",
+          "done",
+          "failed",
+          "parked",
+          "deferred"
+        ],
+        "description": "Task ledger state; design \u00a75.3. Legal transitions are enforced Hub-side."
+      },
+      "TaskStateSet": {
+        "description": "remuda task set-state; illegal transitions are refused (409).",
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/TaskState"
+          }
+        },
+        "required": [
+          "state"
         ],
         "type": "object"
       },
@@ -3711,196 +4348,6 @@
         ]
       }
     },
-
-      "/v1/hosts/{id}/workspaces/{workspaceId}/changes": {
-        "get": {
-          "tags": [
-            "workspaces"
-          ],
-          "operationId": "workspaceChanges",
-          "summary": "Current read-only git working-tree status of one registered workspace",
-          "parameters": [
-            {
-              "name": "id",
-              "in": "path",
-              "required": true,
-              "schema": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "workspaceId",
-              "in": "path",
-              "required": true,
-              "schema": {
-                "type": "string"
-              }
-            }
-          ],
-          "responses": {
-            "200": {
-              "description": "Real-time workspace status entries",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object"
-                  }
-                }
-              }
-            },
-            "401": {
-              "$ref": "#/components/responses/Error"
-            },
-            "403": {
-              "$ref": "#/components/responses/Error"
-            },
-            "404": {
-              "$ref": "#/components/responses/Error"
-            },
-            "409": {
-              "$ref": "#/components/responses/Error"
-            },
-            "422": {
-              "$ref": "#/components/responses/Error"
-            }
-          }
-        }
-      },
-      "/v1/hosts/{id}/workspaces/{workspaceId}/changes/diff": {
-        "get": {
-          "tags": [
-            "workspaces"
-          ],
-          "operationId": "workspaceChangesDiff",
-          "summary": "Unified diff for one workspace change entry (Node proxy, never cached)",
-          "parameters": [
-            {
-              "name": "id",
-              "in": "path",
-              "required": true,
-              "schema": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "workspaceId",
-              "in": "path",
-              "required": true,
-              "schema": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "path",
-              "in": "query",
-              "required": true,
-              "description": "Workspace-relative entry path from the status response",
-              "schema": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "staged",
-              "in": "query",
-              "required": false,
-              "schema": {
-                "type": "boolean",
-                "default": false
-              }
-            }
-          ],
-          "responses": {
-            "200": {
-              "description": "Per-entry unified diff with truncation markers",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object"
-                  }
-                }
-              }
-            },
-            "401": {
-              "$ref": "#/components/responses/Error"
-            },
-            "403": {
-              "$ref": "#/components/responses/Error"
-            },
-            "404": {
-              "$ref": "#/components/responses/Error"
-            },
-            "409": {
-              "$ref": "#/components/responses/Error"
-            },
-            "422": {
-              "$ref": "#/components/responses/Error"
-            }
-          }
-        }
-      },
-      "/v1/hosts/{id}/workspaces/{workspaceId}/changes/file": {
-        "get": {
-          "tags": [
-            "workspaces"
-          ],
-          "operationId": "workspaceChangesFile",
-          "summary": "Restricted current bytes for an untracked/new workspace file (Node proxy, never cached)",
-          "parameters": [
-            {
-              "name": "id",
-              "in": "path",
-              "required": true,
-              "schema": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "workspaceId",
-              "in": "path",
-              "required": true,
-              "schema": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "path",
-              "in": "query",
-              "required": true,
-              "description": "Workspace-relative entry path from the status response",
-              "schema": {
-                "type": "string"
-              }
-            }
-          ],
-          "responses": {
-            "200": {
-              "description": "Restricted file content with sha256 digest",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object"
-                  }
-                }
-              }
-            },
-            "401": {
-              "$ref": "#/components/responses/Error"
-            },
-            "403": {
-              "$ref": "#/components/responses/Error"
-            },
-            "404": {
-              "$ref": "#/components/responses/Error"
-            },
-            "409": {
-              "$ref": "#/components/responses/Error"
-            },
-            "422": {
-              "$ref": "#/components/responses/Error"
-            }
-          }
-        }
-      },
     "/v1/hosts/{id}/doctor": {
       "get": {
         "description": "Requires device authentication. Runs the Node inventory, data/identity, disk and listener checks without returning credentials. Login states are local-marker heuristics. RPC callers cannot choose filesystem paths.",
@@ -4144,6 +4591,195 @@
         "tags": [
           "hosts"
         ]
+      }
+    },
+    "/v1/hosts/{id}/workspaces/{workspaceId}/changes": {
+      "get": {
+        "tags": [
+          "workspaces"
+        ],
+        "operationId": "workspaceChanges",
+        "summary": "Current read-only git working-tree status of one registered workspace",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workspaceId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Real-time workspace status entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/hosts/{id}/workspaces/{workspaceId}/changes/diff": {
+      "get": {
+        "tags": [
+          "workspaces"
+        ],
+        "operationId": "workspaceChangesDiff",
+        "summary": "Unified diff for one workspace change entry (Node proxy, never cached)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workspaceId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "Workspace-relative entry path from the status response",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "staged",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-entry unified diff with truncation markers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/hosts/{id}/workspaces/{workspaceId}/changes/file": {
+      "get": {
+        "tags": [
+          "workspaces"
+        ],
+        "operationId": "workspaceChangesFile",
+        "summary": "Restricted current bytes for an untracked/new workspace file (Node proxy, never cached)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "workspaceId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "Workspace-relative entry path from the status response",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restricted file content with sha256 digest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
       }
     },
     "/v1/instances": {
@@ -4447,20 +5083,6 @@
         ]
       }
     },
-    "/v1/instances/{id}/usage": {
-      "get": {
-        "operationId": "instanceUsage",
-        "summary": "Journaled usage totals for one instance (estimates; coordinator design section 4.5)",
-        "tags": ["supply"],
-        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
-        "responses": {
-          "200": { "description": "Per-instance usage aggregate", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-          "401": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
-        }
-      }
-    },
     "/v1/instances/{id}/resume": {
       "post": {
         "description": "Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window.",
@@ -4521,6 +5143,42 @@
         "tags": [
           "instances"
         ]
+      }
+    },
+    "/v1/instances/{id}/usage": {
+      "get": {
+        "operationId": "instanceUsage",
+        "summary": "Journaled usage totals for one instance (estimates; coordinator design section 4.5)",
+        "tags": [
+          "supply"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
       }
     },
     "/v1/interactions": {
@@ -4786,6 +5444,87 @@
         "summary": "Read staged attachment bytes",
         "tags": [
           "objects"
+        ]
+      }
+    },
+    "/v1/own": {
+      "get": {
+        "operationId": "ownList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnMap"
+                }
+              }
+            },
+            "description": "Ownership map"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the active ownership map (agents see their scope only)",
+        "tags": [
+          "own"
+        ],
+        "parameters": [
+          {
+            "description": "prj_\u2026 project id",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/own/check": {
+      "post": {
+        "operationId": "ownCheck",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnCheckResult"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Check changed paths against a task's owns[] (the merge-gate scope check)",
+        "tags": [
+          "own"
         ]
       }
     },
@@ -5320,30 +6059,84 @@
       "get": {
         "operationId": "providerSupplyGet",
         "summary": "Read declared plus observed supply envelope for one profile",
-        "tags": ["supply"],
-        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "tags": [
+          "supply"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
         "responses": {
-          "200": { "description": "Supply envelope", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-          "401": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "put": {
         "operationId": "providerSupplyDeclare",
         "summary": "Replace the user-declared supply envelope; observed cooldowns are preserved",
-        "tags": ["supply"],
-        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "tags": [
+          "supply"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
         "requestBody": {
           "required": true,
-          "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true, "description": "Declared SupplyProfile: priority, reserve, concurrency.max, windows[], credits, spendControl" } } }
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Declared SupplyProfile: priority, reserve, concurrency.max, windows[], credits, spendControl"
+              }
+            }
+          }
         },
         "responses": {
-          "200": { "description": "Updated supply envelope", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -5351,18 +6144,49 @@
       "post": {
         "operationId": "providerSupplyEvent",
         "summary": "Report observed supply evidence (textual 429/529 or structured rate-limit windows); 529 cools nothing",
-        "tags": ["supply"],
-        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "tags": [
+          "supply"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
         "requestBody": {
           "required": true,
-          "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
         },
         "responses": {
-          "200": { "description": "Supply envelope after the event", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -5402,16 +6226,43 @@
       "get": {
         "operationId": "providerUsage",
         "summary": "Per-model usage aggregation and budget band (estimate x 1.15); coordinator design section 4.5",
-        "tags": ["supply"],
+        "tags": [
+          "supply"
+        ],
         "parameters": [
-          { "$ref": "#/components/parameters/IdPath" },
-          { "in": "query", "name": "budgetMaxUsd", "required": false, "schema": { "type": "number" } }
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "in": "query",
+            "name": "budgetMaxUsd",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "Per-model usage aggregates", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-          "401": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -5419,11 +6270,27 @@
       "get": {
         "operationId": "supplyCatalog",
         "summary": "Built-in model capability table (family, class, context window, effort levels, feature support); revisioned",
-        "tags": ["supply"],
+        "tags": [
+          "supply"
+        ],
         "responses": {
-          "200": { "description": "Capability catalog", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-          "401": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -5431,32 +6298,564 @@
       "post": {
         "operationId": "supplyResolve",
         "summary": "Dry-run admission for a TaskSpec: ranked supply list, rejected reasons, deferredUntil; never spawns",
-        "tags": ["supply"],
+        "tags": [
+          "supply"
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["taskSpec"],
+                "required": [
+                  "taskSpec"
+                ],
                 "additionalProperties": true,
                 "properties": {
-                  "taskSpec": { "type": "object", "additionalProperties": true },
-                  "placement": { "type": "object", "additionalProperties": true },
-                  "hostId": { "type": "string" }
+                  "taskSpec": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "placement": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "hostId": {
+                    "type": "string"
+                  }
                 }
               }
             }
           }
         },
         "responses": {
-          "200": { "description": "Supply decision", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" },
-          "422": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
         }
+      }
+    },
+    "/v1/tasks": {
+      "get": {
+        "operationId": "taskList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskPage"
+                }
+              }
+            },
+            "description": "Task page"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List tasks in the caller's project scope",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "prj_\u2026 project id",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ledger state filter",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TaskState"
+            }
+          }
+        ]
+      },
+      "post": {
+        "operationId": "taskAdd",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Add a root task (requires the dispatch grant)",
+        "tags": [
+          "tasks"
+        ]
+      }
+    },
+    "/v1/tasks/{id}": {
+      "get": {
+        "operationId": "taskGet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Task"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get one task with its mandate chain",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "patch": {
+        "operationId": "taskSetState",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskStateSet"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Task"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Move a task along the state machine (illegal jumps \u2192 409)",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/tasks/{id}/land": {
+      "post": {
+        "operationId": "taskLand",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskLand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Task"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Record the landed sha; the only thing dependency edges unlock from (\u00a77 #8)",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/tasks/{id}/own": {
+      "post": {
+        "operationId": "ownClaim",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnClaimResult"
+                }
+              }
+            },
+            "description": "Claimed"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Claim path globs; conflicting active claims \u2192 409",
+        "tags": [
+          "own"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "operationId": "ownRelease",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnClaimResult"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Release claimed globs (empty list releases all)",
+        "tags": [
+          "own"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/tasks/{id}/placements": {
+      "get": {
+        "operationId": "placementList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlacementPage"
+                }
+              }
+            },
+            "description": "Placement rows"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List placement ledger rows for a task",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "post": {
+        "operationId": "placementAdd",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlacementAppend"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlacementAppendResult"
+                }
+              }
+            },
+            "description": "Row and task"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Append a placement ledger row (reasons[]/rejected[] = card + audit)",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/tasks/{id}/split": {
+      "post": {
+        "operationId": "taskSplit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskSplit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Child task"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Split a child task; the mandate chain is inherited and extended",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_\u2026 id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
       }
     },
     "/v1/worktrees": {

@@ -4447,6 +4447,20 @@
         ]
       }
     },
+    "/v1/instances/{id}/usage": {
+      "get": {
+        "operationId": "instanceUsage",
+        "summary": "Journaled usage totals for one instance (estimates; coordinator design section 4.5)",
+        "tags": ["supply"],
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": { "description": "Per-instance usage aggregate", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/instances/{id}/resume": {
       "post": {
         "description": "Creates a new Instance on the same host and workspace whose driver launches `claude --resume <nativeSessionId>` with the parent's provider, permission and model settings. The exited instance keeps its history and stays exited. Human/Bot only; Agent callers get 403. Idempotent per (instance, mode) inside a short window.",
@@ -5302,6 +5316,56 @@
         ]
       }
     },
+    "/v1/providers/{id}/supply": {
+      "get": {
+        "operationId": "providerSupplyGet",
+        "summary": "Read declared plus observed supply envelope for one profile",
+        "tags": ["supply"],
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "responses": {
+          "200": { "description": "Supply envelope", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "put": {
+        "operationId": "providerSupplyDeclare",
+        "summary": "Replace the user-declared supply envelope; observed cooldowns are preserved",
+        "tags": ["supply"],
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true, "description": "Declared SupplyProfile: priority, reserve, concurrency.max, windows[], credits, spendControl" } } }
+        },
+        "responses": {
+          "200": { "description": "Updated supply envelope", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/providers/{id}/supply/events": {
+      "post": {
+        "operationId": "providerSupplyEvent",
+        "summary": "Report observed supply evidence (textual 429/529 or structured rate-limit windows); 529 cools nothing",
+        "tags": ["supply"],
+        "parameters": [{ "$ref": "#/components/parameters/IdPath" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } }
+        },
+        "responses": {
+          "200": { "description": "Supply envelope after the event", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/providers/{id}/test": {
       "post": {
         "operationId": "providerTest",
@@ -5332,6 +5396,67 @@
         "tags": [
           "providers"
         ]
+      }
+    },
+    "/v1/providers/{id}/usage": {
+      "get": {
+        "operationId": "providerUsage",
+        "summary": "Per-model usage aggregation and budget band (estimate x 1.15); coordinator design section 4.5",
+        "tags": ["supply"],
+        "parameters": [
+          { "$ref": "#/components/parameters/IdPath" },
+          { "in": "query", "name": "budgetMaxUsd", "required": false, "schema": { "type": "number" } }
+        ],
+        "responses": {
+          "200": { "description": "Per-model usage aggregates", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/supply/catalog": {
+      "get": {
+        "operationId": "supplyCatalog",
+        "summary": "Built-in model capability table (family, class, context window, effort levels, feature support); revisioned",
+        "tags": ["supply"],
+        "responses": {
+          "200": { "description": "Capability catalog", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/supply/resolve": {
+      "post": {
+        "operationId": "supplyResolve",
+        "summary": "Dry-run admission for a TaskSpec: ranked supply list, rejected reasons, deferredUntil; never spawns",
+        "tags": ["supply"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["taskSpec"],
+                "additionalProperties": true,
+                "properties": {
+                  "taskSpec": { "type": "object", "additionalProperties": true },
+                  "placement": { "type": "object", "additionalProperties": true },
+                  "hostId": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Supply decision", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
       }
     },
     "/v1/worktrees": {

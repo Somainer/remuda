@@ -1675,6 +1675,7 @@ mod tests {
                 media_type: "image/png".into(),
                 name: Some("shot.png".into()),
                 anchor: None,
+                size: None,
             })),
             ContentBlock::Resource(Box::new(ResourceBlock {
                 uri: "file:///data/instances/ins_1/attachments/obj_1.png".into(),

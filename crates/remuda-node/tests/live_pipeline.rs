@@ -404,6 +404,36 @@ fn is_hook(row: &Row, name: &str) -> bool {
     row.channel.as_deref() == Some("hook") && row.name.as_deref() == Some(name)
 }
 
+/// The native-carrier-3 acceptance: one PONG-shaped turn through the native
+/// shell-pty carrier must populate the same four channels the herdr carrier
+/// produced in the macOS reference run — runtime lifecycle, the hook bus, the
+/// terminal/screen tier (`pty`, herdr's counterpart), and the transcript.
+async fn assert_all_four_native_channels(run: &LiveRun) {
+    let rows = run.journal().await;
+    let mut present = std::collections::BTreeSet::new();
+    for row in &rows {
+        if let Some(channel) = row.channel.as_deref() {
+            present.insert(channel.to_owned());
+        }
+    }
+    for channel in ["runtime", "hook", "pty", "transcript"] {
+        assert!(
+            present.contains(channel),
+            "the hooked native shell-pty turn never wrote a {channel} event; got {present:?}"
+        );
+    }
+    // The hook channel is the one the macOS retest lost entirely.
+    assert!(
+        rows.iter().any(|row| is_hook(row, "SessionStart")),
+        "SessionStart must bind the session through the hook socket"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.kind == "message" && row.channel.as_deref() == Some("hook")),
+        "MessageDisplay must derive a streaming message on the hook channel"
+    );
+}
+
 fn is_screen(row: &Row, label: &str) -> bool {
     row.channel.as_deref() == Some("pty")
         && row.name.as_deref() == Some("agent_status")
@@ -432,6 +462,7 @@ async fn budgets_and_rule_six_over_a_real_pty() {
         assert_quiet_tool_window(&run).await;
         assert_relative_burst(&run).await;
         assert_no_screen_idle_before_stop(&run).await;
+        assert_all_four_native_channels(&run).await;
         assert_eq!(
             run.activity().await,
             Knowledge::Known {

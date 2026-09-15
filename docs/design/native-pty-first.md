@@ -168,7 +168,7 @@ New Session = 在一个 Remuda 自持 PTY 里**预填 launch command 并回车**
 
 | kind | 基础 argv 与环境 | yolo argv（仅 Human/Bot 且显式 bypass） | overlay | session id 来源 |
 |---|---|---|---|---|
-| claude | `claude` + `--settings <overlay>` + `--setting-sources user,project,local` + `--effort <v>` | `--dangerously-skip-permissions` | settings overlay：hooks、`tui`、`showStatusInTerminalTab`、`terminalProgressBarEnabled` | `SessionStart` hook → `session-meta.json` |
+| claude | `claude` + `--settings <overlay>` + `--effort <v>` | `--dangerously-skip-permissions` | settings overlay：hooks、`tui`、`showStatusInTerminalTab`、`terminalProgressBarEnabled` | `SessionStart` hook → `session-meta.json` |
 | codex | `codex`，`CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` | 影子 `config.toml`（`hooks = true`、`notify`）+ `hooks.json` | `SessionStart` hook；否则 `session_index.jsonl` 最新 `updated_at` |
 | grok | `grok`，`GROK_HOME` 指向影子目录 | `--always-approve` | 影子 `hooks/*.json`（须自辨 harness，见 §3.1） | `active_sessions.json` 按 PTY 子进程 pid 匹配 |
 | agy | `agy` | `--yolo` | `config/hooks.json`（namespace 键） | `PreInvocation.conversationId` |
@@ -352,16 +352,22 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 
 ### 9.2 tui / 终端状态信号
 
-在同一份 per-session settings overlay 里**钉死**三个键：
+启动时在同一份 per-session settings overlay 里钉住三个键：
 
 | 键 | 值 | 为什么必须钉 |
 |---|---|---|
-| `tui` | `"fullscreen"` / `"default"` | **两个方向都要显式写**，否则宿主 `~/.claude/settings.json` 会经 `--setting-sources` 的 user 层漏进来，渲染器跨机器不确定 |
-| `showStatusInTerminalTab` | `true` | 关掉就没有 OSC 标题 → 丢掉一整层 idle/working 信号 |
-| `terminalProgressBarEnabled` | `true` | 关掉就没有 `OSC 9;4` 进度 → 同上 |
+| `tui` | `"fullscreen"` / `"default"` | 两个方向都显式写，确保启动选择覆盖 user/project/local；前台 SessionStart 绑定后仅释放这个键 |
+| `showStatusInTerminalTab` | `true` | 保留 OSC 标题信号，renderer relaunch 后仍钉住 |
+| `terminalProgressBarEnabled` | `true` | 保留 `OSC 9;4` 进度信号，renderer relaunch 后仍钉住 |
 
-- **保留 `--setting-sources`**。它是确定性保证；代价只是会话内 `/tui` 被拒（该 flag 会触发 fork-restricted 检查）——而渲染器已经在启动时由 Remuda 决定，切换方式是「改 launch overlay + 重开实例」，不是让用户敲 `/tui`。`--settings` 本身不触发该限制。
-- **不得假设 fullscreen 生效**：崩溃闩、screen reader、嵌套复用器都会静默降级。**从字节流里探测 `ESC[?1049h`** 判定实际模式，并经 `TtyAttach` 的 `altScreen` 上报给 web（§4.6）。
+- **§9.2 follow-up 修正**：不再自动追加 `--setting-sources user,project,local`。这三个来源原本就会加载；确定性来自 `--settings` 的优先级，不需要该 flag。显式 `--settings <relay>` 也必须先经 shim 合并 overlay。优先级是 managed > `--settings` > local > project > user；hooks 在各层合并。
+- **允许会话内 `/tui X`**：只在通过认证的 SessionStart 与检测到的前台 PID 匹配后，Node 的驱动监督器原子重写本实例的 base/private merged overlay，删除 `tui`，保留 hooks 和另外两个终端键。每次新实例启动仍重新钉住两个方向。Claude 会写用户偏好并携带原 argv relaunch；仅去掉 flag、继续钉 `tui` 会静默覆盖用户切换。
+- **启动选择**：可选 `InstanceSpec.tui`，session 值替换 host `defaultTui`，均未设置时为 fullscreen。适用于启用 hook overlay 的 native PTY；旧 print/herdr 路径没有本轮的绑定后释放机制。New Session 高级区使用「全屏渲染（推荐）」/「行内渲染」，提示「启动时使用此渲染方式，会话内可用 /tui 切换」。
+- **身份跟随**：新 PID 的 relaunch 走 replacement-process promotion；同 PID、新 native session ID 的 exec relaunch 以认证 SessionStart + cwd 内 transcript 更新绑定、重建 tail。不能把新 SessionStart 误当作旧 transcript 的继续。
+- **不得假设 fullscreen 生效**：崩溃闩、screen reader、嵌套复用器都可能降级。终端模拟器从 `ESC[?1049h`/`ESC[?1049l` 维护实际状态，经 attach `altScreen` 和 live `tty.mode` 上报。raw-ring fallback 无法判断时为 unknown。UI 根据观测显示，requested fullscreen 但尚未见 alt screen 时只给轻量提示。
+- **原生优先级仍生效**：`/tui` 写 user 设置；如果 project/local/managed 仍设了 `tui`，它们会继续覆盖该用户偏好。Remuda 不改这些设置，实际模式以 `altScreen` 为准。
+
+2.1.270 bundle predicate、实际 `/tui` 对照与测试边界见 [native-pty-9b](./evidence/native-pty-9b.md)。
 
 ---
 
@@ -591,7 +597,7 @@ reason = "…"                     # 必填，且不得为空白
 | 3 | 工作中 composer：steer / 排队 / 打断，逐 harness 键位，能力诚实 | §6（键位表 + native/emulated 映射 + composer 三态 + `unknown` 诚实上报） | P4 | **已实测三家**（claude / codex / grok，证据见 §6 末列）；agy 仍 **[U]** |
 | 4 | 结构化视图实时流式（文本/思考/工具增量） | §7（`MessageDisplay` 行级 + ACP chunk + mapper 重组修复） | P3 | 设计已定 |
 | 5 | effort：5 档 + ultracode；`--effort` + `/effort`；显示 effective vs requested | §9.1 | P2 | 部分 **[U]**（PTY 内 `/effort` 未实测） |
-| 6 | 滚动 + 全屏 TUI：真字节修 scrollback；overlay 钉 `tui`；保留 `--setting-sources` | §4.6 + §9.2 | P0 / P2 | 设计已定 |
+| 6 | 滚动 + 全屏 TUI：真字节修 scrollback；overlay 启动钉 `tui`、绑定后释放；保留正常 settings sources | §4.6 + §9.2 | P0 / P2 | 设计已定 |
 | 7 | 识别手敲启动的 agent（D-025 promotion），给同样的结构化视图 | §1.0 规则 2 + §4.2 launch shim + P1 验收 | P1 | 设计已定 |
 
 ---

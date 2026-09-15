@@ -1,5 +1,12 @@
 /** New-session permission and provider/delegation (decisions.md D-011 / D-012). */
 
+export const TUI_OPTIONS = [
+  { id: "fullscreen", label: "全屏渲染（推荐）" },
+  { id: "default", label: "行内渲染" },
+] as const;
+
+export const TUI_LAUNCH_HINT = "启动时使用此渲染方式，会话内可用 /tui 切换";
+
 export const PERMISSION_OPTIONS = [
   { id: "manual", label: "询问" },
   { id: "acceptEdits", label: "可改文件" },

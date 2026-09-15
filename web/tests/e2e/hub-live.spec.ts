@@ -81,11 +81,17 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   const host = await page.getByTestId("new-session-host").locator("option").filter({ hasText: "e2e-fake-node" }).getAttribute("value");
   await page.getByTestId("new-session-host").selectOption(host!);
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0);
+  await page.getByTestId("new-session-advanced").click();
+  await page.getByTestId("new-session-tui").selectOption("default");
   await page.getByTestId("new-session-prompt").fill("hello from web hub");
   await expect(page.getByTestId("new-session-start")).toBeEnabled();
   await page.getByTestId("new-session-start").click();
   await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
   const sessionPath = new URL(page.url()).pathname;
+  const createdId = sessionPath.split("/")[2];
+  const stored = await (await page.request.get(`/v1/instances/${createdId}`)).json();
+  expect(stored.tui).toBe("default");
+
   await expect(page.getByTestId("session-page")).toBeVisible();
   await expect(page.getByTestId("message").filter({ hasText: /^You/ })).toContainText("hello from web hub", {
     timeout: 20_000,

@@ -65,6 +65,15 @@ pub enum TtyEvent {
         /// ANSI / PTY bytes.
         payload: Vec<u8>,
     },
+    /// Actual mode observed by the local terminal emulator.
+    Mode {
+        /// Instance that owns the stream.
+        instance_id: InstanceId,
+        /// Stream identity.
+        stream_id: Id,
+        /// Whether DEC alternate screen is currently active.
+        alt_screen: bool,
+    },
 }
 
 /// Result of [`TtyRegistry::attach`].
@@ -86,9 +95,8 @@ pub struct TtyAttach {
     pub rows: u16,
     /// `?1049` was active when the snapshot was taken, so the client is looking
     /// at a full-screen TUI and must not hijack the wheel for local scrollback
-    /// (D-028 §4.6). False whenever the snapshot came from the raw ring, which
-    /// cannot know the mode — the client then keeps its existing behaviour.
-    pub alt_screen: bool,
+    /// (D-028 §4.6). None on raw-ring fallback: that path cannot know the mode.
+    pub alt_screen: Option<bool>,
 }
 
 impl TtyAttach {
@@ -210,6 +218,12 @@ impl TtyRegistry {
         let stream_epoch = Id::new("epoch")?;
         let cols = cols.max(1);
         let rows = rows.max(1);
+        // Announce ownership before spawning a pump that can immediately emit
+        // bytes or a mode edge; Hub rejects unbound stream notifications.
+        let _ = self.events.send(TtyEvent::Open {
+            instance_id: instance_id.clone(),
+            stream_id: stream_id.clone(),
+        });
         let session = match bridge {
             TtyBridge::Herdr { client, pane_id } => {
                 let (ctl_tx, ctl_rx) = mpsc::channel(64);
@@ -259,10 +273,6 @@ impl TtyRegistry {
             .write()
             .await
             .insert(instance_id.clone(), Arc::clone(&session));
-        let _ = self.events.send(TtyEvent::Open {
-            instance_id,
-            stream_id: stream_id.clone(),
-        });
         Ok(stream_id)
     }
 
@@ -312,7 +322,7 @@ impl TtyRegistry {
             next_offset,
             cols: session.cols.load(Ordering::SeqCst),
             rows: session.rows.load(Ordering::SeqCst),
-            alt_screen: snapshot.alt_screen,
+            alt_screen: (snapshot.source == SnapshotSource::Repaint).then_some(snapshot.alt_screen),
         })
     }
 
@@ -462,9 +472,21 @@ fn spawn_local_pump(
     mut rx: broadcast::Receiver<Vec<u8>>,
 ) {
     tokio::spawn(async move {
+        let mut last_mode = None;
         loop {
             match rx.recv().await {
                 Ok(bytes) if !bytes.is_empty() => {
+                    if let Backend::Local(local) = &session.backend
+                        && let Some(alt_screen) = local.alt_screen()
+                        && last_mode != Some(alt_screen)
+                    {
+                        last_mode = Some(alt_screen);
+                        let _ = events.send(TtyEvent::Mode {
+                            instance_id: instance_id.clone(),
+                            stream_id: session.stream_id.clone(),
+                            alt_screen,
+                        });
+                    }
                     push_output(&session, &instance_id, &events, &bytes).await;
                 }
                 Ok(_) => {}

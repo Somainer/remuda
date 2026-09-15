@@ -126,7 +126,8 @@ commits and any staged-change or rebase/merge blocker. This is a local queue
 inspection: it does not fetch, move refs, or alter existing worktrees.
 
 For `--gate`, fetch and preflight run before creating a detached temporary
-worktree under the selected repository's `data/tmp`. A caller checkout whose
+worktree under an OS-temp `remuda-mq-<pid>-<n>` scratch root (never under
+the checkout; removal is containment-checked against that exact root). A caller checkout whose
 HEAD does not contain local main is rejected with a “checkout is behind main”
 message. A local main behind or diverged from fetched `origin/main` is also
 rejected; the coordinator must update it before retrying.

@@ -192,6 +192,7 @@ struct Engine {
     stopping: Arc<AtomicBool>,
     events_file: Option<std::fs::File>,
     should_exit: bool,
+    relaunch_tui: Option<String>,
     dirty: bool,
     last_second: u64,
     /// Last OSC 0 title emitted, so live edges only resend changes.
@@ -306,8 +307,12 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         Dialect::Codex => HookKind::Codex,
         Dialect::Grok => HookKind::Grok,
     };
-    let hooks = HookTable::load(hook_kind, opts.settings.as_deref(), Some(&home))
-        .map_err(RunError::Args)?;
+    let hooks = if dialect == Dialect::Claude {
+        HookTable::load_claude(&home, &cwd, opts.settings.as_deref())
+    } else {
+        HookTable::load(hook_kind, opts.settings.as_deref(), Some(&home))
+    }
+    .map_err(RunError::Args)?;
 
     let artifact_kind = match dialect {
         Dialect::Claude => ArtifactKind::Claude,
@@ -332,6 +337,20 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     let mut view = View::new(dialect, model.clone(), dir_name);
     view.alt_screen = !opts.no_alt_screen;
     view.dialect_version = dialect_version;
+    if dialect == Dialect::Claude {
+        let settings = crate::fake_harness::settings::merged_claude_settings(
+            &home,
+            &cwd,
+            opts.settings.as_deref(),
+        )
+        .map_err(RunError::Args)?;
+        let latch = std::env::var("CLAUDE_CODE_TUI_JUST_SWITCHED").ok();
+        let tui = settings
+            .get("tui")
+            .and_then(Value::as_str)
+            .or(latch.as_deref());
+        view.alt_screen &= tui != Some("default");
+    }
     if dialect == Dialect::Codex && !resuming {
         view.transcript
             .push(format!(">_ OpenAI Codex (v{})", dialect.version()));
@@ -371,6 +390,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         stopping,
         events_file,
         should_exit: false,
+        relaunch_tui: None,
         dirty: true,
         last_second: 0,
         osc_title: initial_title,
@@ -403,6 +423,14 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         session_start["transcript_path"] = json!(engine.paths.main.to_string_lossy());
     }
     engine.fire_hook(HookEvent::SessionStart, session_start);
+    engine.event(
+        "session_start",
+        json!({
+            "pid": std::process::id(), "session_id": engine.meta.session_id,
+            "alt_screen": engine.view.alt_screen,
+            "tui_latch": std::env::var("CLAUDE_CODE_TUI_JUST_SWITCHED").ok(),
+        }),
+    );
     if opts.trust_dialog {
         engine.view.mode = ScreenMode::Trust;
     }
@@ -418,7 +446,39 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     engine.shutdown_artifacts()?;
     engine.fire_hook(HookEvent::SessionEnd, json!({ "reason": "shutdown" }));
     let _ = write_stdout(&teardown(&engine.view));
+    if let Some(tui) = engine.relaunch_tui {
+        return relaunch_claude(&tui, &engine.meta.session_id);
+    }
     result
+}
+
+/// Replace this process with a waiting shell and a new harness PID, retaining
+/// the PTY process group. Exec also removes the old blocking stdin reader.
+/// This models /tui's replacement-process boundary without a live model.
+fn relaunch_claude(tui: &str, session_id: &str) -> Result<i32, RunError> {
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !args.iter().any(|arg| arg == "--resume") {
+        args.extend(["--resume".into(), session_id.into()]);
+    }
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "exec 3<&0; \"$@\" <&3 & child=$!; wait \"$child\"",
+            "fake-tui-relaunch",
+        ])
+        .arg(std::env::current_exe()?)
+        .args(args)
+        .env("CLAUDE_CODE_TUI_JUST_SWITCHED", tui);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(command.status()?.code().unwrap_or(1))
+    }
 }
 
 fn default_home(dialect: Dialect) -> Option<PathBuf> {
@@ -1208,6 +1268,35 @@ impl Engine {
     fn submit_prompt(&mut self) {
         let prompt = std::mem::take(&mut self.draft);
         if prompt.is_empty() {
+            return;
+        }
+        if self.dialect == Dialect::Claude
+            && let Some(tui) = prompt.trim().strip_prefix("/tui ")
+            && matches!(tui, "fullscreen" | "default")
+        {
+            let path = self.home.join("settings.json");
+            let result = (|| -> Result<(), RunError> {
+                let mut settings = if path.exists() {
+                    serde_json::from_slice::<Value>(&std::fs::read(&path)?)
+                        .map_err(|error| RunError::Args(error.to_string()))?
+                } else {
+                    json!({})
+                };
+                settings["tui"] = json!(tui);
+                std::fs::write(path, settings.to_string())?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    self.event(
+                        "tui_relaunch",
+                        json!({"tui": tui, "pid": std::process::id()}),
+                    );
+                    self.relaunch_tui = Some(tui.into());
+                    self.should_exit = true;
+                }
+                Err(error) => self.view.notice = Some(error.to_string()),
+            }
             return;
         }
         let exit = match self.dialect {

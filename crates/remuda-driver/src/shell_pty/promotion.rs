@@ -215,6 +215,33 @@ impl BindingHandle {
         }
     }
 
+    /// An authenticated fresh SessionStart can describe an exec-style renderer
+    /// relaunch: the PID is unchanged but its native session/transcript changed.
+    /// This is explicit identity evidence, never an mtime-based rebind.
+    fn rebind_authenticated_start(&self, found: &Detected, report: &SessionStartReport) -> bool {
+        let Ok(mut slot) = self.inner.lock() else {
+            return false;
+        };
+        let Some(candidate) = report.bind(found.pid) else {
+            return false;
+        };
+        let Some(previous) = &slot.binding else {
+            return false;
+        };
+        if previous.session_id == candidate.session_id
+            || !transcript_belongs_to_cwd(&slot.claude_home, &slot.cwd, &candidate.path)
+        {
+            return false;
+        }
+        slot.epoch = slot.epoch.saturating_add(1);
+        slot.binding = Some(candidate);
+        slot.degraded = false;
+        slot.degraded_reason.clear();
+        slot.cwd_checked = false;
+        slot.hooks.clear();
+        true
+    }
+
     /// Current locked binding, if any.
     fn binding(&self) -> Option<TranscriptBinding> {
         self.inner.lock().ok().and_then(|slot| slot.binding.clone())
@@ -681,6 +708,7 @@ pub(super) fn spawn(
         // None = nothing announced yet this epoch.
         let mut announced: Option<String> = None;
         let mut bypass_announced = false;
+        let mut tui_released = false;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -753,16 +781,38 @@ pub(super) fn spawn(
             // binding. Without this bridge only Claude's separate pid file
             // could hydrate, leaving a spurious manual picker over a hooked
             // session. begin_epoch must happen first so it cannot erase it.
-            if let Some(binding) = hooks.as_ref().and_then(|hooks| hooks.binding())
+            if let Some(hooks) = hooks.as_ref()
+                && let Some(binding) = hooks.binding()
                 && found.as_ref().is_some_and(|found| found.pid == binding.pid)
-                && let Some(path) = binding.transcript_path
             {
-                bindings.ingest_session_start(SessionStartReport {
-                    session_id: binding.session_id,
-                    transcript_path: path.into(),
-                    cwd: None,
-                    ppid: Some(i64::from(binding.pid)),
-                });
+                // Only an authenticated SessionStart for the observed
+                // foreground agent can release the deterministic start pin.
+                // A /tui relaunch keeps the same --settings argv, so its file
+                // must stop overriding the user's new renderer preference.
+                if !tui_released {
+                    match hooks.release_tui_pin() {
+                        Ok(()) => tui_released = true,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not release launch renderer pin")
+                        }
+                    }
+                }
+                if let Some(path) = binding.transcript_path {
+                    let report = SessionStartReport {
+                        session_id: binding.session_id,
+                        transcript_path: path.into(),
+                        cwd: None,
+                        ppid: Some(i64::from(binding.pid)),
+                    };
+                    if bindings.rebind_authenticated_start(
+                        found.as_ref().expect("matched foreground"),
+                        &report,
+                    ) {
+                        hydrator = None;
+                        announced = None;
+                    }
+                    bindings.ingest_session_start(report);
+                }
             }
 
             if !bypass_announced
@@ -1789,6 +1839,37 @@ mod tests {
         slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
         let second = bindings.resolve(&found).expect("second poll still bound");
         assert_eq!(second.session_id, CORRECT, "must never switch files");
+    }
+
+    #[test]
+    fn authenticated_renderer_relaunch_can_replace_session_at_the_same_pid() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, tmp.path());
+        slug_session(tmp.path(), &cwd, CORRECT, "{}\n");
+        slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
+        let found = detected_claude(4242, Some(CORRECT));
+        assert_eq!(bindings.resolve(&found).unwrap().session_id, CORRECT);
+        let mut report = SessionStartReport {
+            session_id: LATE_STARTER.into(),
+            transcript_path: crate::claude_transcript::project_dir(tmp.path(), &cwd)
+                .join(format!("{LATE_STARTER}.jsonl")),
+            cwd: None,
+            ppid: Some(7777),
+        };
+        assert!(!bindings.rebind_authenticated_start(&found, &report));
+        assert_eq!(bindings.binding().unwrap().session_id, CORRECT);
+        report.ppid = Some(4242);
+        assert!(bindings.rebind_authenticated_start(&found, &report));
+        assert_eq!(bindings.resolve(&found).unwrap().session_id, LATE_STARTER);
+        assert!(!bindings.rebind_authenticated_start(&found, &report));
+        report.session_id = BUSY_OTHER.into();
+        report.transcript_path = tmp.path().join("other.jsonl");
+        std::fs::write(&report.transcript_path, "{}\n").unwrap();
+        assert!(!bindings.rebind_authenticated_start(&found, &report));
+        assert_eq!(bindings.binding().unwrap().session_id, LATE_STARTER);
     }
 
     #[test]

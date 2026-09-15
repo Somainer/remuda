@@ -13,7 +13,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use remuda_protocol::hubnode::{
-    self, HubNodeMethod, JournalAppendParams, NodeHelloParams, TtyFrameParams,
+    self, HubNodeMethod, JournalAppendParams, NodeHelloParams, TtyFrameParams, TtyModeParams,
 };
 use remuda_protocol::{
     ConnectionLease, HeartbeatResult, HelloResult, PROTOCOL_VERSION, TransportLimits, U64,
@@ -84,6 +84,12 @@ impl TtyRelay {
                 // rather than growing it without bound.
                 streams.clear();
             }
+            // An instance has one active terminal stream. Retire its old
+            // identity so delayed mode notices cannot overwrite the state of
+            // a replacement stream after reopen or recovery.
+            streams.retain(|uuid, owner| {
+                uuid == stream_uuid || owner.host_id != host_id || owner.instance_id != instance_id
+            });
             streams.insert(
                 stream_uuid.to_owned(),
                 StreamOwner {
@@ -538,6 +544,31 @@ pub(crate) async fn handle_node_method(
                 "watermark": { "durableSeq": appended.durable_seq.to_string() },
             })))
         }
+        "tty.mode" => {
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            let mode: TtyModeParams = serde_json::from_value(params)
+                .map_err(|error| HubError::BadRequest(format!("tty.mode: {error}")))?;
+            let instance_id = mode.instance_id.as_str();
+            let stream_id = mode.stream_id.as_str();
+            let uuid = stream_uuid_of(stream_id)
+                .ok_or_else(|| HubError::BadRequest("tty.mode has invalid streamId".into()))?;
+            let instance = state
+                .store
+                .get_instance(instance_id.to_owned())
+                .await?
+                .ok_or(HubError::NotFound)?;
+            if instance.host_id != *host_id
+                || state.tty.instance_for_host(&uuid, host_id).as_deref() != Some(instance_id)
+            {
+                return Err(HubError::Forbidden);
+            }
+            state.bus.publish(FollowEvent::json(
+                instance_id,
+                0,
+                json!({ "type": "tty.mode", "params": mode }),
+            ));
+            Ok(Some(json!({ "ok": true })))
+        }
         "tty.frame" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             let typed: Option<TtyFrameParams> = serde_json::from_value(params.clone()).ok();
@@ -988,6 +1019,9 @@ async fn follow_session(
                             {
                                 continue;
                             }
+                            if !want_tty && event.event["type"] == "tty.mode" {
+                                continue;
+                            }
                             let send = if want_tty && let Some(binary) = event.binary {
                                 FollowMsg::Binary(binary)
                             } else if event.binary.is_some() {
@@ -1091,24 +1125,20 @@ async fn send_tty_snapshot(
                     state.tty.bind(&uuid, host_id, instance_id);
                 }
                 cached_stream_id = stream_id;
-                // D-028 §4.6: tell the follower whether the snapshot it is
-                // about to receive is a full-screen TUI, so it can leave the
-                // wheel to the application instead of guessing from DECSET
-                // bytes it may never have seen. Sent before the snapshot so the
-                // client has the mode in hand while it paints. Absent when the
-                // Node does not report it — the client then keeps its own
-                // behaviour rather than assuming either way.
-                if let Some(alt_screen) = result.get("altScreen").and_then(Value::as_bool) {
-                    let notice = json!({
-                        "type": "tty.mode",
-                        "instanceId": instance_id,
-                        "altScreen": alt_screen,
-                    });
-                    out_tx
-                        .send(FollowMsg::Text(notice.to_string()))
-                        .await
-                        .map_err(|_| ())?;
-                }
+                // Every fresh attach supplies an authoritative mode boundary.
+                // Null means this snapshot has no emulator-backed observation
+                // (or an older Node omitted it); it clears a prior true/false
+                // rather than making stale mode evidence look current.
+                let notice = json!({
+                    "type": "tty.mode",
+                    "instanceId": instance_id,
+                    "streamId": cached_stream_id,
+                    "altScreen": result.get("altScreen").and_then(Value::as_bool),
+                });
+                out_tx
+                    .send(FollowMsg::Text(notice.to_string()))
+                    .await
+                    .map_err(|_| ())?;
                 if let Some(b64) = result.get("snapshotBase64").and_then(Value::as_str)
                     && let Ok(bytes) = decode_b64(b64)
                     && !bytes.is_empty()
@@ -1425,6 +1455,24 @@ async fn snapshot_json(state: &AppState, instance_id: &str) -> Result<Value, Hub
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_terminal_stream_retires_stale_mode_source() {
+        let relay = TtyRelay::default();
+        relay.bind("old-stream", "host-a", "instance-a");
+        relay.bind("other-stream", "host-a", "instance-b");
+        relay.bind("new-stream", "host-a", "instance-a");
+        assert_eq!(relay.instance_for_host("old-stream", "host-a"), None);
+        assert_eq!(relay.instance_for_host("new-stream", "host-b"), None);
+        assert_eq!(
+            relay.instance_for_host("new-stream", "host-a").as_deref(),
+            Some("instance-a")
+        );
+        assert_eq!(
+            relay.instance_for_host("other-stream", "host-a").as_deref(),
+            Some("instance-b")
+        );
+    }
 
     #[tokio::test]
     async fn follow_bus_reports_lag_when_capacity_exceeded() {

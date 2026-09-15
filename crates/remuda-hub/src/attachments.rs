@@ -181,6 +181,9 @@ fn view(object: &ObjectRecord) -> Value {
         "size": object.byte_len,
         "digest": object.digest,
         "expiresAt": object.expires_at,
+        // 1-based [Image #n] anchor; absent for objects never consumed by a
+        // numbered send (listed oldest-first in that case).
+        "index": object.anchor,
     })
 }
 
@@ -194,10 +197,10 @@ async fn live_objects(
         .run(move |conn| {
             let mut statement = conn.prepare(
                 "SELECT id, instance_id, host_id, media_type, stored_name, digest, byte_len,
-                        expires_at
+                        expires_at, anchor
                  FROM objects
                  WHERE instance_id = ?1 AND expires_at > ?2
-                 ORDER BY created_at, id",
+                 ORDER BY COALESCE(anchor, 9223372036854775807), created_at, id",
             )?;
             let rows = statement
                 .query_map(params![instance_id, now], |row| {
@@ -210,6 +213,7 @@ async fn live_objects(
                         digest: row.get(5)?,
                         byte_len: row.get(6)?,
                         expires_at: row.get(7)?,
+                        anchor: row.get(8)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -265,5 +269,57 @@ mod tests {
     fn the_inline_ceiling_is_below_the_staging_ceiling() {
         assert!(MAX_INLINE_ATTACHMENT_BYTES < crate::objects::MAX_OBJECT_BYTES as i64);
         assert_eq!(MAX_INLINE_ATTACHMENT_BYTES, 3_670_016);
+    }
+
+    /// A send manifest tags each object with its `[Image #n]` number; the
+    /// listing the in-session agent sees must come back in that order so the
+    /// model resolves tokens by position.
+    #[tokio::test]
+    async fn listing_orders_by_send_manifest_anchor() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = crate::store::Store::open(dir.path()).expect("store");
+        let instance = "ins_anchors".to_owned();
+        let stage = |n: u8, digest: &str| crate::store::NewObject {
+            instance_id: instance.clone(),
+            host_id: "hst_1".into(),
+            media_type: "image/png".into(),
+            extension: "png".into(),
+            digest: digest.to_owned(),
+            bytes: vec![0x89, b'P', b'N', b'G', n],
+            device_id: "dev_1".into(),
+            ttl_seconds: 3600,
+            instance_budget: 64 * 1024 * 1024,
+        };
+        let first = store
+            .insert_object(stage(1, &"a".repeat(64)))
+            .await
+            .expect("a");
+        let second = store
+            .insert_object(stage(2, &"b".repeat(64)))
+            .await
+            .expect("b");
+        // Uploaded oldest-first: first then second. The send references #2
+        // first in the prompt, so tag them against token order.
+        store
+            .tag_object_anchors(vec![
+                (second.object_id.clone(), 1),
+                (first.object_id.clone(), 2),
+            ])
+            .await
+            .expect("tag");
+
+        let objects = live_objects(&store, instance, crate::config::now_rfc3339())
+            .await
+            .expect("list");
+        let ordered: Vec<(String, Option<i64>)> = objects
+            .iter()
+            .map(|object| (object.object_id.clone(), object.anchor))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![(second.object_id, Some(1)), (first.object_id, Some(2))],
+            "the manifest's token order wins over upload order"
+        );
+        store.close().await;
     }
 }

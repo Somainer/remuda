@@ -142,7 +142,8 @@ normal checkout; override with `--e2e-lock`, ports with `--e2e-port-base`).
 Landing stays serial: main only ever advances to a merge whose exact tree
 passed a gate. Exit 0 all landed, 1 at least one gate failed (landed
 branches stay landed; send only the failures back), 2 an unresolved base
-move — re-read `currentMain` / the `queue` summary and retry. Single
+move — re-read `currentMain` / the `queue` summary and retry, 3 either a CAS
+loss (`cas_lost`) or another merge/queue already running (`locked`). Single
 verification or landing split across ssh calls:
 
 ```sh
@@ -151,9 +152,46 @@ remuda merge wt/a --land  --onto <base> --no-push --json # CAS main, no gate
 ```
 
 `--land` exits 2 `base_moved` (and prints the new main) when main is no
-longer the verified base. Reports live in
+longer the verified base, `--gate` exits 3 `locked` when another merge or
+queue is already running on the same repository (or would reuse the same
+gate target directory). That guard catches two coordinators scripting the
+same checkout before either fails mysteriously deep in a gate (`local main
+is behind`, `webServer exited early`, …): the report is
+`another remuda merge is running on this repo (pid N, since T)` and the
+second invocation never touches refs or worktrees. Pass `--wait` to block
+behind the holder instead of exiting. The queue parent holds the repository
+lock itself; its lane children share it and each take their own per-lane
+target-directory lock (`<target-dir>/.remuda-merge.lock`), so two lanes can
+never share a build directory while two independent queues still cannot
+overlap. Reports (single verification and queue lanes alike) live in
 `<git-common-dir>/remuda/merge-reports/<branch-slug>/<base>.json`.
 
+### Gate step timeouts and lane-death handling
+
+Every gate step has a wall-clock deadline enforced by the gate driver:
+`cargo-*` steps 30 minutes, `web-*` steps 20 minutes, the Hub e2e step 30
+minutes (its real worst case), scans and any other step 30 minutes. Each
+step runs in its own process group; the driver polls the child every
+200 ms. If the deadline passes, or the direct child disappears without
+`waitpid` returning (an external kill leaving the driver stuck in `wait4`,
+as happened on 2026-09-15), the driver kills the whole step group (SIGTERM,
+a 3 s grace, then SIGKILL), records the step as `failed` with
+`reason: "timeout"` / `"child-lost"` in `gate.jsonl`, and exits nonzero
+without retrying — a killed or timed-out build is not the flaky-test class.
+Budgets override via `REMUDA_GATE_STEP_TIMEOUTS='{"cargo-test": 3600}'`
+(seconds per step name; `0` disables that step's timeout).
+
+A queue treats a *dead lane* exactly like a failed verification on the
+current main: a lane killed by a signal, exiting without a JSON report, or
+whose monitor goes silent while its pid is gone/zombie records the branch
+as `gate_failed` with `reason: "lane died: …"` on the verification and in
+the branch's `why`; already-verified reports are kept, following branches
+re-verify onto the real main as for any failure, and the queue never blocks
+on a channel no lane can signal. A watchdog (3 h default,
+`REMUDA_QUEUE_WATCHDOG_SECS`) observes lane pids directly, kills the lane's
+process tree after a short reap grace (`REMUDA_QUEUE_REAP_GRACE_MS`), and
+synthesises the failed-verdict itself; a state machine caught waiting with
+zero in-flight lanes aborts with an error instead of parking.
 
 If a gate fails, the branch goes back to its agent with the failing output —
 don't fix a worker's crate inside the merge. Independent branches merge in

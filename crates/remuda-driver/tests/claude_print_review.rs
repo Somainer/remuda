@@ -292,7 +292,7 @@ async fn resume_reapplies_settings_and_model() {
             .windows(2)
             .any(|w| w[0] == "--model" && w[1] == "haiku")
     );
-    assert!(first_argv.windows(2).any(|w| w[0] == "--setting-sources"));
+    assert!(!first_argv.iter().any(|arg| arg == "--setting-sources"));
     assert!(first_argv.windows(2).any(|w| w[0] == "--settings"));
     let session = handle
         .ack()
@@ -335,7 +335,7 @@ async fn resume_reapplies_settings_and_model() {
             .any(|w| w[0] == "--model" && w[1] == "haiku")
     );
     assert!(argv.windows(2).any(|w| w[0] == "--settings"));
-    assert!(argv.windows(2).any(|w| w[0] == "--setting-sources"));
+    assert!(!argv.iter().any(|arg| arg == "--setting-sources"));
     assert!(
         !argv
             .iter()

@@ -2198,6 +2198,7 @@ mod attachment_tests {
                 object_id: id.clone(),
                 media_type: "image/png".into(),
                 name: Some("shot.png".into()),
+                anchor: None,
             })),
             ContentBlock::Resource(Box::new(ResourceBlock {
                 uri: format!("file://{}", path.display()),

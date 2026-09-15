@@ -54,6 +54,9 @@ struct PatchHostBody {
     /// Per-host default claude executable. `null` or `""` clears it.
     #[serde(default, deserialize_with = "double_option")]
     claude_binary_path: Option<Option<String>>,
+    /// Per-host renderer preference. `null` clears it to fullscreen.
+    #[serde(default, deserialize_with = "double_option")]
+    default_tui: Option<Option<remuda_protocol::TuiMode>>,
 }
 
 /// Deserialize a present-but-null field as `Some(None)`.
@@ -89,6 +92,7 @@ pub(crate) fn host_view(host: &HostRecord) -> Value {
         "providerBinding": host.provider_binding,
         "defaultLaunchArgs": host.default_launch_args,
         "claudeBinaryPath": host.claude_binary_path,
+        "defaultTui": host.default_tui,
         "workspaces": host.workspaces,
         "workspaceRevision": host.workspace_revision,
     })
@@ -152,6 +156,7 @@ async fn patch_host(
             crate::store::HostLaunchDefaultsPatch {
                 default_launch_args: body.default_launch_args,
                 claude_binary_path: body.claude_binary_path,
+                default_tui: body.default_tui,
             },
         )
         .await

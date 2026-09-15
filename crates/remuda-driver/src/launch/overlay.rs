@@ -14,11 +14,12 @@
 //!    where both hooks fire.
 //! 2. **Never touch the user's own config.** The only file written is under
 //!    `<instance dir>/launch/`. `~/.claude/settings.json` is read by the
-//!    harness through `--setting-sources` and never by us.
+//!    harness through its normal configuration layers and never by us.
 //! 3. **Pin both directions.** `tui` is written whether it is `fullscreen` or
 //!    `default`; §9.2 is explicit that leaving it unset lets the host's own
 //!    settings leak in through the user layer and makes the renderer
-//!    non-deterministic across machines.
+//!    non-deterministic across machines. After authenticated SessionStart,
+//!    only this renderer pin is released so `/tui` can relaunch normally.
 
 use crate::binary::hash_bytes;
 use crate::error::{DriverError, DriverResult};
@@ -26,7 +27,7 @@ use remuda_protocol::AgentKind;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-/// Renderer pinned for the session (§9.2).
+/// Renderer pinned until the session binds (§9.2 follow-up).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiMode {
     /// Alt-screen TUI.
@@ -72,6 +73,63 @@ pub struct HookOverlay {
     pub events: Vec<String>,
 }
 
+const TUI_RELEASED_MARKER: &str = "tui-released";
+
+impl HookOverlay {
+    /// Release the launch-time renderer preference after authenticated binding.
+    ///
+    /// Claude's `/tui` rewrites its user preference and relaunches the same argv.
+    /// Remove only `tui` from our base and private merged overlays so that argv
+    /// no longer overrides the new preference. Hooks and OSC status keys stay
+    /// pinned. The launch digest continues to identify the original bytes.
+    pub fn release_tui_pin(&self) -> DriverResult<()> {
+        let launch = self.path.parent().ok_or_else(|| {
+            DriverError::SettingsIsolationUnavailable("overlay has no launch directory".into())
+        })?;
+        // Mark first: an explicit-settings merge concurrent with this rewrite
+        // must also release tui, even if it read the old base overlay already.
+        write_private(&launch.join(TUI_RELEASED_MARKER), b"released\n", 0o600)?;
+        for entry in std::fs::read_dir(launch)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Only Remuda-generated overlays. Never follow symlinks or rewrite
+            // a caller's settings file merely because it is in this directory.
+            let generated = name
+                .strip_prefix("settings-run_")
+                .and_then(|name| name.strip_suffix(".json"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+            if entry.path() != self.path && !generated {
+                continue;
+            }
+            release_tui_in_file(&entry.path(), launch)?;
+        }
+        Ok(())
+    }
+}
+
+fn release_tui_in_file(path: &Path, launch: &Path) -> DriverResult<()> {
+    let mut settings: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let object = settings.as_object_mut().ok_or_else(|| {
+        DriverError::SettingsIsolationUnavailable("settings overlay is not an object".into())
+    })?;
+    if object.remove("tui").is_some() {
+        let temporary = launch.join(format!(
+            ".settings-{}.tmp",
+            remuda_protocol::RunId::new().as_id()
+        ));
+        write_private(&temporary, &serde_json::to_vec_pretty(&settings)?, 0o600)?;
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
 /// Hook events registered against the relay.
 ///
 /// `PermissionRequest` and `Elicitation` are registered **observe-only** in
@@ -102,6 +160,10 @@ const fn remuda_signal_events() -> &'static [&'static str] {
 pub fn materialize_overlay(options: &OverlayOptions) -> DriverResult<HookOverlay> {
     std::fs::create_dir_all(&options.launch_dir)?;
     set_mode(&options.launch_dir, 0o700)?;
+    let marker = options.launch_dir.join(TUI_RELEASED_MARKER);
+    if marker.exists() {
+        std::fs::remove_file(marker)?;
+    }
     let mut settings = options.base.clone().unwrap_or_else(|| json!({}));
     if !settings.is_object() {
         return Err(DriverError::SettingsIsolationUnavailable(
@@ -195,12 +257,11 @@ fn pin_terminal_keys(settings: &mut Value, tui: TuiMode) -> DriverResult<()> {
     Ok(())
 }
 
-/// Ensure `--settings <overlay>` and a non-empty `--setting-sources` are on
-/// `argv`, replacing an existing `--settings` value rather than adding a second.
+/// Ensure `--settings <overlay>` is on `argv`, replacing an existing value.
 ///
-/// `--setting-sources` stays (§9.2): it is what makes the resolved
-/// configuration deterministic. Its only cost is that in-session `/tui` is
-/// refused, and the renderer is already decided at launch.
+/// Normal settings sources stay enabled without an argv override. The CLI
+/// overlay has higher precedence already; adding `--setting-sources` only
+/// disables Claude's in-session renderer relaunch.
 pub fn ensure_overlay_argv(argv: &mut Vec<String>, overlay: &Path) -> DriverResult<()> {
     let path = overlay.to_string_lossy().into_owned();
     if let Some(index) = argv.iter().position(|token| token == "--settings") {
@@ -217,14 +278,6 @@ pub fn ensure_overlay_argv(argv: &mut Vec<String>, overlay: &Path) -> DriverResu
         argv.push("--settings".into());
         argv.push(path);
     }
-    if argv
-        .iter()
-        .any(|token| token == "--setting-sources" || token.starts_with("--setting-sources="))
-    {
-        return Ok(());
-    }
-    argv.push("--setting-sources".into());
-    argv.push("user,project,local".into());
     Ok(())
 }
 
@@ -315,25 +368,31 @@ pub fn merge_explicit_settings(overlay: &Path, argv: &mut Vec<String>) -> Driver
         let launch = overlay.parent().ok_or_else(|| {
             DriverError::SettingsIsolationUnavailable("overlay has no launch directory".into())
         })?;
-        // One immutable overlay per invocation: a nested launch cannot replace
-        // the file an already running Claude might reread.
+        if launch.join(TUI_RELEASED_MARKER).is_file() {
+            settings
+                .as_object_mut()
+                .expect("validated object")
+                .remove("tui");
+        }
+        // One overlay per invocation: a nested launch cannot replace the file
+        // an already running Claude might reread. The SessionStart binding may
+        // later release only its launch-time renderer pin.
         destination = launch.join(format!(
             "settings-{}.json",
             remuda_protocol::RunId::new().as_id()
         ));
         write_private(&destination, &serde_json::to_vec_pretty(&settings)?, 0o600)?;
+        // Release marks before scanning. If this file appeared after that scan,
+        // the post-write check strips its pin; if release starts after this
+        // check, its scan will find the file that already exists.
+        if launch.join(TUI_RELEASED_MARKER).is_file() {
+            release_tui_in_file(&destination, launch)?;
+        }
     }
     let mut injected = vec![
         "--settings".into(),
         destination.to_string_lossy().into_owned(),
     ];
-    if !remaining
-        .iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--setting-sources" || arg.starts_with("--setting-sources="))
-    {
-        injected.extend(["--setting-sources".into(), "user,project,local".into()]);
-    }
     injected.extend(remaining);
     *argv = injected;
     Ok(())
@@ -550,6 +609,79 @@ mod tests {
     }
 
     #[test]
+    fn binding_releases_only_tui_in_base_and_private_explicit_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = materialize_overlay(&options(dir.path())).unwrap();
+        let mut argv = vec![
+            "--settings".into(),
+            json!({"tui":"default","env":{"KEEP":"yes"}}).to_string(),
+        ];
+        merge_explicit_settings(&overlay.path, &mut argv).unwrap();
+        let merged_path = PathBuf::from(&argv[1]);
+        let unrelated = overlay
+            .path
+            .parent()
+            .unwrap()
+            .join("settings-operator.json");
+        std::fs::write(&unrelated, r#"{"tui":"default"}"#).unwrap();
+        let original = read(&overlay);
+        overlay.release_tui_pin().unwrap();
+        overlay.release_tui_pin().unwrap();
+        for path in [&overlay.path, &merged_path] {
+            let released: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(released.get("tui").is_none(), "{}", path.display());
+            assert_eq!(released["hooks"], original["hooks"]);
+            assert_eq!(released["showStatusInTerminalTab"], true);
+            assert_eq!(released["terminalProgressBarEnabled"], true);
+        }
+        assert_eq!(
+            std::fs::read_to_string(unrelated).unwrap(),
+            r#"{"tui":"default"}"#
+        );
+        // Claude carries the private --settings argv into its renderer relaunch.
+        // Passing it through the shim again must not reintroduce a tui pin.
+        merge_explicit_settings(&overlay.path, &mut argv).unwrap();
+        let relaunched: Value = serde_json::from_slice(&std::fs::read(&argv[1]).unwrap()).unwrap();
+        assert!(relaunched.get("tui").is_none());
+        assert_eq!(relaunched["env"]["KEEP"], "yes");
+        let mut concurrent = vec!["--settings".into(), json!({"tui":"fullscreen"}).to_string()];
+        merge_explicit_settings(&overlay.path, &mut concurrent).unwrap();
+        let concurrent: Value =
+            serde_json::from_slice(&std::fs::read(&concurrent[1]).unwrap()).unwrap();
+        assert!(concurrent.get("tui").is_none());
+
+        let fresh = materialize_overlay(&options(dir.path())).unwrap();
+        assert_eq!(read(&fresh)["tui"], "fullscreen");
+        assert!(
+            !fresh
+                .path
+                .parent()
+                .unwrap()
+                .join(TUI_RELEASED_MARKER)
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn releasing_tui_does_not_follow_a_settings_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = materialize_overlay(&options(dir.path())).unwrap();
+        let user = dir.path().join("user.json");
+        std::fs::write(&user, r#"{"tui":"default"}"#).unwrap();
+        let alias = overlay.path.parent().unwrap().join(format!(
+            "settings-{}.json",
+            remuda_protocol::RunId::new().as_id()
+        ));
+        std::os::unix::fs::symlink(&user, alias).unwrap();
+        overlay.release_tui_pin().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(user).unwrap(),
+            r#"{"tui":"default"}"#
+        );
+    }
+
+    #[test]
     fn a_user_who_disabled_the_osc_signals_has_them_re_enabled_for_the_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = options(dir.path());
@@ -630,14 +762,10 @@ mod tests {
     }
 
     #[test]
-    fn overlay_argv_keeps_setting_sources_and_never_leaves_it_empty() {
+    fn overlay_argv_leaves_normal_sources_implicit_and_preserves_an_explicit_choice() {
         let mut argv = vec!["claude".to_owned()];
         ensure_overlay_argv(&mut argv, Path::new("/new.json")).unwrap();
-        let index = argv
-            .iter()
-            .position(|token| token == "--setting-sources")
-            .expect("setting sources must be present");
-        assert_eq!(argv[index + 1], "user,project,local");
+        assert!(!argv.iter().any(|token| token == "--setting-sources"));
 
         // A caller's own choice is respected, not doubled.
         let mut argv = vec![

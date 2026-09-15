@@ -173,6 +173,8 @@ pub struct HostLaunchDefaultsPatch {
     pub default_launch_args: Option<Option<Vec<String>>>,
     /// Per-host default claude executable. `Some(None)` clears it.
     pub claude_binary_path: Option<Option<String>>,
+    /// Per-host renderer preference. `Some(None)` restores fullscreen.
+    pub default_tui: Option<Option<remuda_protocol::TuiMode>>,
 }
 
 /// Host index row (Hub projection).
@@ -227,6 +229,9 @@ pub struct HostRecord {
     /// Per-host default claude executable. Stored as given; the Node validates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_binary_path: Option<String>,
+    /// Per-host requested renderer; absent means fullscreen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tui: Option<remuda_protocol::TuiMode>,
     /// Last acknowledged Node workspace registry.
     #[serde(default)]
     pub workspaces: Vec<Value>,
@@ -263,6 +268,9 @@ pub struct ObjectRecord {
     pub byte_len: i64,
     /// RFC3339 expiry; a row at or past it reads as absent.
     pub expires_at: String,
+    /// 1-based `[Image #n]` anchor from the send that consumed this object;
+    /// unset until a send manifest names it (2026-09-15).
+    pub anchor: Option<i64>,
 }
 
 /// Arguments for [`Store::insert_object`].
@@ -332,6 +340,9 @@ pub struct InstanceRecord {
     /// Current model id from create / `instance.configure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Requested launch renderer; actual mode comes from the tty snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui: Option<remuda_protocol::TuiMode>,
     /// Native effort tier name.
     ///
     /// Normalized to a D-028 §9.1 level (`low` … `max`) on read, so a row
@@ -719,6 +730,7 @@ impl InstanceRecord {
             "workspaceId": self.workspace_id,
             "cwd": self.cwd,
             "model": self.model,
+            "tui": self.tui,
             "delegation": self.delegation,
             "providerProfileId": self.provider_profile_id,
         });
@@ -1310,6 +1322,7 @@ impl Store {
                 )?;
                 tx.commit()?;
                 return Ok(ObjectRecord {
+                    anchor: existing.anchor,
                     expires_at,
                     ..existing
                 });
@@ -1358,6 +1371,7 @@ impl Store {
                 digest: new.digest,
                 byte_len,
                 expires_at,
+                anchor: None,
             })
         })
         .await
@@ -1366,6 +1380,22 @@ impl Store {
     /// Attachment metadata without its bytes.
     pub async fn get_object(&self, id: String) -> Result<Option<ObjectRecord>, StoreError> {
         self.run(move |conn| load_object(conn, &id)).await
+    }
+
+    /// Record the 1-based `[Image #n]` anchor a send assigned to each object
+    /// (2026-09-15). Drives the order `remuda_attachments_list` reports to the
+    /// in-session agent. Runs in the same HTTP call that validated the send.
+    pub async fn tag_object_anchors(&self, entries: Vec<(String, i64)>) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            for (object_id, anchor) in &entries {
+                conn.execute(
+                    "UPDATE objects SET anchor = ?1 WHERE id = ?2",
+                    params![anchor, object_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Staged bytes, or `None` when the row is gone.
@@ -2704,6 +2734,7 @@ impl Store {
         let HostLaunchDefaultsPatch {
             default_launch_args,
             claude_binary_path,
+            default_tui,
         } = launch_defaults;
         self.run(move |conn| {
             if load_host(conn, &host_id)?.is_none() {
@@ -2754,6 +2785,16 @@ impl Store {
                 conn.execute(
                     "UPDATE hosts SET claude_binary_path = ?1 WHERE id = ?2",
                     params![path, host_id],
+                )?;
+            }
+            if let Some(tui) = default_tui {
+                let encoded = tui
+                    .map(|tui| serde_json::to_string(&tui))
+                    .transpose()
+                    .map_err(|error| StoreError::Id(error.to_string()))?;
+                conn.execute(
+                    "UPDATE hosts SET default_tui = ?1 WHERE id = ?2",
+                    params![encoded, host_id],
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
@@ -3273,7 +3314,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             bytes BLOB NOT NULL,
             created_by TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
+            expires_at TEXT NOT NULL,
+            anchor INTEGER
         );
         CREATE UNIQUE INDEX IF NOT EXISTS objects_instance_digest
             ON objects(instance_id, digest);
@@ -3433,6 +3475,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // default", which is different from "an empty arg list".
     ensure_column(&conn, "hosts", "default_launch_args", "TEXT")?;
     ensure_column(&conn, "hosts", "claude_binary_path", "TEXT")?;
+    ensure_column(&conn, "hosts", "default_tui", "TEXT")?;
     ensure_column(
         &conn,
         "provider_profiles",
@@ -3463,6 +3506,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
+    // 2026-09-15: [Image #n] anchor assigned by the send manifest.
+    ensure_column(&conn, "objects", "anchor", "INTEGER")?;
     ensure_column(&conn, "pair_codes", "code_prefix", "TEXT")?;
     ensure_column(
         &conn,
@@ -3475,6 +3520,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
     crate::workspaces::migrate(&conn)?;
     crate::projects::migrate(&conn)?;
+    crate::tasks::migrate(&conn)?;
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;
@@ -5178,11 +5224,12 @@ fn object_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
         digest: row.get(5)?,
         byte_len: row.get(6)?,
         expires_at: row.get(7)?,
+        anchor: row.get(8)?,
     })
 }
 
 const OBJECT_COLUMNS: &str =
-    "id, instance_id, host_id, media_type, stored_name, digest, byte_len, expires_at";
+    "id, instance_id, host_id, media_type, stored_name, digest, byte_len, expires_at, anchor";
 
 fn load_object(conn: &Connection, id: &str) -> Result<Option<ObjectRecord>, StoreError> {
     conn.query_row(
@@ -5229,7 +5276,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
                     labels_json, herdr_json, resources_json,
                     COALESCE(max_instances_override, max_instances), hostname, provider_binding,
-                    default_launch_args, claude_binary_path
+                    default_launch_args, claude_binary_path, default_tui
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -5252,6 +5299,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                         .unwrap_or_else(|| "auto".into()),
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
                 ))
             },
         )
@@ -5273,6 +5321,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         provider_binding,
         default_launch_args,
         claude_binary_path,
+        default_tui,
     )) = row
     else {
         return Ok(None);
@@ -5332,6 +5381,9 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             .as_deref()
             .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
         claude_binary_path: claude_binary_path.filter(|value| !value.trim().is_empty()),
+        default_tui: default_tui
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
         workspaces,
         workspace_revision: workspace_revision.max(0) as u64,
     }))
@@ -5460,6 +5512,9 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_source,
                 provider_source_hint,
                 model,
+                tui: spec
+                    .get("tui")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok()),
                 effort_name,
                 effort_ultracode,
                 effort_index,

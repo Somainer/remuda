@@ -188,6 +188,12 @@ impl HookSession {
         self.bus.retire_all();
     }
 
+    /// Release only the renderer pin after an authenticated SessionStart binds.
+    /// Callers must first verify that the binding belongs to the launched agent.
+    pub fn release_tui_pin(&self) -> DriverResult<()> {
+        self.overlay.release_tui_pin()
+    }
+
     /// Hook-derived turn state for the exact foreground agent, when observed.
     #[must_use]
     pub fn turn_active(&self, pid: i32) -> Option<bool> {

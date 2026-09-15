@@ -271,11 +271,7 @@ fn inject_hook_writes_launch_dir_not_native_home_and_keeps_sources() {
         "must not write user global hooks"
     );
     assert!(has_token(&injected.argv, "--settings"));
-    assert!(has_flag_value(
-        &injected.argv,
-        "--setting-sources",
-        "user,project,local"
-    ));
+    assert!(!has_token(&injected.argv, "--setting-sources"));
     let overlay: serde_json::Value =
         serde_json::from_slice(&fs::read(launch.join("settings.json")).unwrap()).unwrap();
     assert!(
@@ -396,16 +392,12 @@ fn bot_origin_rejects_bypass_and_dont_ask() {
 }
 
 #[test]
-fn ensure_sources_rejects_empty_and_fills_default() {
-    let mut argv = vec!["--model".into(), "haiku".into()];
-    review::ensure_sources(&mut argv).unwrap();
-    assert!(has_flag_value(
-        &argv,
-        "--setting-sources",
-        "user,project,local"
-    ));
-    let mut empty = vec!["--setting-sources".into(), "".into()];
-    assert!(review::ensure_sources(&mut empty).is_err());
+fn ensure_sources_rejects_empty_and_leaves_normal_sources_implicit() {
+    let argv = vec!["--model".into(), "haiku".into()];
+    review::ensure_sources(&argv).unwrap();
+    assert!(!has_token(&argv, "--setting-sources"));
+    let empty = vec!["--setting-sources".into(), "".into()];
+    assert!(review::ensure_sources(&empty).is_err());
 }
 
 #[tokio::test]
@@ -455,11 +447,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
     let first = handle.recipe().argv.clone();
     assert!(has_flag_value(&first, "--model", "opus-review"));
     assert!(has_token(&first, "--settings"));
-    assert!(has_flag_value(
-        &first,
-        "--setting-sources",
-        "user,project,local"
-    ));
+    assert!(!has_token(&first, "--setting-sources"));
     assert!(has_token(&first, "--dangerously-skip-permissions"));
     assert!(!has_token(&first, "--allow-dangerously-skip-permissions"));
     assert!(!has_token(&first, "--bare"));
@@ -498,11 +486,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
     assert!(has_flag_value(argv, "--resume", &session));
     assert!(has_flag_value(argv, "--model", "opus-review"));
     assert!(has_token(argv, "--settings"));
-    assert!(has_flag_value(
-        argv,
-        "--setting-sources",
-        "user,project,local"
-    ));
+    assert!(!has_token(argv, "--setting-sources"));
     assert!(has_token(argv, "--dangerously-skip-permissions"));
     assert!(has_flag_value(argv, "--max-budget-usd", "0.3"));
     assert!(!has_token(argv, "--bare"));
@@ -545,11 +529,7 @@ async fn bg_resume_keeps_settings_attach_after_stop_does_not_wake() {
     assert!(!has_token(&prepared, "--bare"));
     assert!(has_token(&prepared, "--settings"));
     assert!(has_flag_value(&prepared, "--model", "opus-review"));
-    assert!(has_flag_value(
-        &prepared,
-        "--setting-sources",
-        "user,project,local"
-    ));
+    assert!(!has_token(&prepared, "--setting-sources"));
     assert!(launch.join("session-start.sh").is_file());
 
     let ack = driver

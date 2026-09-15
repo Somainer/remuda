@@ -66,6 +66,10 @@ pub const METHOD_INSTANCE_KEYS: &str = "instance.keys";
 pub const METHOD_TTY_RESIZE: &str = "tty.resize";
 /// Attach (or refresh) a TTY stream; Hub→Node. Snapshot bytes may be in the result.
 pub const METHOD_TTY_ATTACH: &str = "tty.attach";
+/// Read the current screen as text; Hub→Node. Read-only and side-effect free:
+/// unlike [`METHOD_TTY_ATTACH`] it opens no stream and moves no offset, so it
+/// is safe to call against a session a human is watching.
+pub const METHOD_TTY_SCREEN: &str = "tty.screen";
 /// HTTP Authorization scheme for `GET /v1/node`.
 pub const WS_AUTHORIZATION_SCHEME: &str = "Bearer";
 /// `params.scheme` on [`METHOD_NODE_AUTH`].
@@ -172,6 +176,8 @@ pub enum HubNodeMethod {
     TtyResize,
     /// [`METHOD_TTY_ATTACH`].
     TtyAttach,
+    /// [`METHOD_TTY_SCREEN`].
+    TtyScreen,
 }
 
 /// An explicitly sequenced phase of a workspace mutation.
@@ -851,6 +857,7 @@ impl HubNodeMethod {
             Self::InstanceKeys => METHOD_INSTANCE_KEYS,
             Self::TtyResize => METHOD_TTY_RESIZE,
             Self::TtyAttach => METHOD_TTY_ATTACH,
+            Self::TtyScreen => METHOD_TTY_SCREEN,
         }
     }
 
@@ -882,6 +889,7 @@ impl HubNodeMethod {
             METHOD_INSTANCE_KEYS => Self::InstanceKeys,
             METHOD_TTY_RESIZE => Self::TtyResize,
             METHOD_TTY_ATTACH => Self::TtyAttach,
+            METHOD_TTY_SCREEN => Self::TtyScreen,
             _ => return None,
         })
     }
@@ -913,6 +921,7 @@ impl HubNodeMethod {
                 | Self::InstanceKeys
                 | Self::TtyResize
                 | Self::TtyAttach
+                | Self::TtyScreen
         )
     }
 }

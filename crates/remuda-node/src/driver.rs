@@ -203,6 +203,20 @@ pub trait Driver: Send + Sync {
     {
         Box::pin(async { None })
     }
+
+    /// Current screen as text, for a carrier that keeps one.
+    ///
+    /// `None` means this driver has no screen to read, which the Node reports
+    /// as `supported: false` rather than as an empty terminal.
+    fn screen_read(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Creates one stateful driver object for each Instance.
@@ -504,6 +518,22 @@ impl Driver for NativeShellAdapter {
         Box::pin(async move {
             use remuda_driver::Driver as _;
             self.inner.tty_bridge().await
+        })
+    }
+
+    fn screen_read(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_,
+        >,
+    > {
+        Box::pin(async move {
+            use remuda_driver::Driver as _;
+            self.inner
+                .screen_read()
+                .await
+                .map_err(|error| DriverError::Failed(error.to_string()))
         })
     }
 }

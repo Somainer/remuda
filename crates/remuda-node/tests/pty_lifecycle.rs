@@ -256,6 +256,75 @@ async fn closing_a_pty_leaves_no_process_behind() {
     );
 }
 
+/// native-carrier-4: a purge that arrives behind a forced delete must stop the
+/// instance, not refuse it.
+///
+/// The Hub only purges behind a delete it has already decided to perform, and
+/// it drops its own row regardless of the answer. So refusing here never kept
+/// a session alive — it orphaned the process: the Hub logged "node rejected
+/// instance.purge" and the Node was left holding a running agent nobody could
+/// reach. On macOS that happened on *every* forced delete, because the
+/// shell-pty stop ladder outlasts the purge's own grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purging_a_live_pty_stops_it_instead_of_orphaning_it() {
+    let data = tempfile::tempdir().expect("data dir");
+    let node = compose(&native_config(data.path())).expect("compose");
+    let marker = data.path().join("child.pid");
+    let mut request = create_req(AgentKind::Terminal, DriverKind::ShellPty);
+    request.args = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "echo $$ > {}; while :; do sleep 0.1; done",
+            marker.display()
+        ),
+    ];
+    let created = node.create_instance(request).await.expect("create");
+    let id = created.instance.meta.id.clone();
+
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the shell starts");
+
+    // No `instance.close` first: this is the forced-delete path, where the
+    // purge is what has to cope with a still-live instance.
+    let purged = node.purge_instance(&id).await.expect("purge must succeed");
+    assert_eq!(purged["purged"], serde_json::json!(true));
+
+    let gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !remuda_driver::shell_pty::lifecycle::group_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "the purge returned while its process was still running"
+    );
+    // The Node-owned directory goes with it; leaving it behind is the leak the
+    // old rejection path produced on every forced delete.
+    assert!(
+        !data
+            .path()
+            .join("instances")
+            .join(id.as_id().as_str())
+            .exists(),
+        "the instance directory outlived the purge"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_restart_ends_native_pty_sessions_and_says_why() {
     // §8 plan A. An in-process PTY dies with the Node, and the requirement is

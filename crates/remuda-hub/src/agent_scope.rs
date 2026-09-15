@@ -143,7 +143,13 @@ pub async fn require_instance_read(
 
 fn read_target(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/v1/instances/")?;
-    let id = rest.strip_suffix("/journal").unwrap_or(rest);
+    // Every per-instance *read* suffix must be listed: an unlisted one falls
+    // through to the `contains('/')` guard and is refused, which is the safe
+    // direction but silently breaks the endpoint for agent callers.
+    let id = rest
+        .strip_suffix("/journal")
+        .or_else(|| rest.strip_suffix("/screen"))
+        .unwrap_or(rest);
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 

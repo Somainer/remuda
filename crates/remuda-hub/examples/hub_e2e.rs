@@ -54,6 +54,13 @@ async fn main() -> Result<()> {
     config.auth_ip_refill_per_sec = 1_000.0;
     config.auth_global_burst = 1_000_000.0;
     config.auth_global_refill_per_sec = 1_000.0;
+    // D-027b: let a hub-backed e2e shrink the per-file ceiling so a size-cap
+    // assertion does not have to move the full 25 MiB through the browser.
+    if let Ok(limit) = std::env::var("HUB_E2E_ATTACHMENT_MAX_BYTES") {
+        config.attachment_max_bytes = limit
+            .parse()
+            .with_context(|| format!("HUB_E2E_ATTACHMENT_MAX_BYTES={limit}"))?;
+    }
     // Local acceptance can attach the same fake engine to an isolated remuda
     // dev Hub/Node pair. CI still starts its own disposable real Hub here.
     let addr = config.listen;
@@ -320,6 +327,12 @@ async fn fake_node(
         value["result"]["nodeToken"].as_str().is_some(),
         "enroll hello {value}"
     );
+    // The enroll token is single-use; object pulls need the durable host token
+    // the hello exchanges it for (the real Node does exactly this).
+    let durable_token: String = value["result"]["nodeToken"]
+        .as_str()
+        .unwrap_or(&enroll)
+        .to_owned();
     let _ = ready.send(());
     let mut append_n = 0u64;
     // Minimal PTY harness for the QuickFind xterm e2e. It exists only while
@@ -511,7 +524,11 @@ async fn fake_node(
                 // e2e can prove staging reached the Node without a real agent.
                 // 2026-09-15: also echo the [Image #n] manifest (index +
                 // objectId + mediaType in token order) on one line each.
-                let sent: Vec<(Option<i64>, String, String)> = params
+                // D-027b: the fake Node also pulls each object like the real
+                // one (Bearer host token), lands it under a sanitised name
+                // with a collision suffix, and records the exact
+                // `[File #n] … saved at …` expansion line the harness receives.
+                let sent: Vec<(Option<i64>, String, String, String, String, i64)> = params
                     .get("attachments")
                     .and_then(Value::as_array)
                     .map(|list| {
@@ -523,10 +540,19 @@ async fn fake_node(
                                         .and_then(Value::as_str)
                                         .unwrap_or("")
                                         .to_owned(),
+                                    item.get("kind")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("image")
+                                        .to_owned(),
                                     item.get("mediaType")
                                         .and_then(Value::as_str)
                                         .unwrap_or("")
                                         .to_owned(),
+                                    item.get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    item.get("size").and_then(Value::as_i64).unwrap_or(0),
                                 )
                             })
                             .collect()
@@ -534,7 +560,7 @@ async fn fake_node(
                     .unwrap_or_default();
                 let types = sent
                     .iter()
-                    .map(|(_, _, media_type)| media_type.as_str())
+                    .map(|(_, _, _, media_type, _, _)| media_type.as_str())
                     .collect::<Vec<_>>()
                     .join(",");
                 let mut reply = if sent.is_empty() {
@@ -542,13 +568,37 @@ async fn fake_node(
                 } else {
                     format!("echo: {prompt} [attachments: {types}]")
                 };
-                for (index, object_id, media_type) in &sent {
+                for (index, object_id, _kind, media_type, _name, _size) in &sent {
                     reply.push_str(&format!(
                         " [attachment-refs: #{} {} {}]",
                         index.unwrap_or(0),
                         object_id,
                         media_type
                     ));
+                }
+                // D-027b: pull + land + expand, exactly like remuda-node.
+                // One line per file, matching the driver's prompt expansion,
+                // so the web transcript can fold each line like an anchor.
+                let mut file_lines: Vec<String> = Vec::new();
+                for (index, object_id, kind, media_type, name, size) in &sent {
+                    if kind != "file" {
+                        continue;
+                    }
+                    let landed = land_attachment(addr, &durable_token, object_id, name)
+                        .await
+                        .unwrap_or_else(|error| format!("<pull failed: {error}>"));
+                    file_lines.push(format!(
+                        "[File #{}] {} ({}, {}) saved at {}",
+                        index.unwrap_or(0),
+                        name,
+                        media_type,
+                        human_size(*size as u64),
+                        landed
+                    ));
+                }
+                if !file_lines.is_empty() {
+                    reply.push('\n');
+                    reply.push_str(&file_lines.join("\n"));
                 }
                 if prompt.starts_with("stream ") {
                     // D-028 §7: reply as an open/append chain so the web e2e
@@ -898,6 +948,85 @@ async fn append_instance_state(
     ))
     .await?;
     Ok(seq)
+}
+
+/// Directory the fake Node lands pulled attachments in (D-027b). Lives for
+/// the process so a second send of the same filename observes the collision
+/// suffix, exactly like `remuda-node::attachments`.
+fn landing_dir() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-e2e-landed-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("landing dir");
+        dir
+    })
+}
+
+/// Defensive sanitisation mirroring `sanitize_attachment_name`: no path
+/// separators or control characters.
+fn safe_name(raw: &str) -> String {
+    let trimmed = raw.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    if trimmed.is_empty()
+        || trimmed.contains(['/', '\\'])
+        || trimmed.chars().any(char::is_control)
+    {
+        "attachment.bin".to_owned()
+    } else {
+        trimmed.chars().take(255).collect()
+    }
+}
+
+/// Pull one object with the host token and land it under a collision-free
+/// sanitised name. Returns the absolute landed path.
+async fn land_attachment(
+    addr: SocketAddr,
+    token: &str,
+    object_id: &str,
+    name: &str,
+) -> Result<String> {
+    let bytes = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/objects/{object_id}"))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let dir = landing_dir();
+    let wanted = safe_name(name);
+    let (stem, ext) = match wanted.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_owned(), Some(ext.to_owned())),
+        _ => (wanted.clone(), None),
+    };
+    let mut candidate = wanted.clone();
+    let mut suffix = 1u32;
+    while dir.join(&candidate).exists() {
+        candidate = match &ext {
+            Some(ext) => format!("{stem}-{suffix}.{ext}"),
+            None => format!("{stem}-{suffix}"),
+        };
+        suffix += 1;
+    }
+    let path = dir.join(&candidate);
+    std::fs::write(&path, bytes)?;
+    Ok(path.display().to_string())
+}
+
+/// Compact human size, matching the web chip and the driver expansion.
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    }
 }
 
 async fn append_journal(

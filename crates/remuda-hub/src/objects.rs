@@ -1,14 +1,15 @@
-//! D-027: attachment staging for image passthrough.
+//! D-027 / D-027b: attachment staging — images and arbitrary files.
 //!
-//! A browser uploads image bytes here, gets back an `obj_…` id, and puts only
-//! that id on the `instance.send` command. The Node then pulls the bytes back
-//! over HTTP and materializes them next to the instance. Bytes never travel in
-//! a command frame: those are capped at 1 MiB and the prompt at 64 KiB.
+//! A browser uploads bytes here, gets back an `obj_…` id, and puts only that
+//! id on the `instance.send` command. The Node then pulls the bytes back over
+//! HTTP and materializes them next to the instance. Bytes never travel in a
+//! command frame: those are capped at 1 MiB and the prompt at 64 KiB.
 //!
-//! Deliberately narrow for the MVP — no `DELETE`, no thumbnails, no
-//! server-side re-render. EXIF is stripped in the browser by re-encoding
-//! through a canvas, so the Hub never decodes an image and never links an
-//! image library.
+//! Images (PNG, JPEG, GIF, WebP) are magic-byte sniffed as in the D-027 MVP.
+//! Every other file is accepted with its declared `Content-Type` (D-027b,
+//! 2026-09-15): bytes are never executed, GET serves non-images with an
+//! `attachment` disposition plus `nosniff`, and the original filename is
+//! sanitised before it is echoed anywhere.
 
 use crate::auth::{require_origin, verify_secret};
 use crate::store::{ObjectRecord, StoreError};
@@ -19,35 +20,39 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use remuda_protocol::hubnode::{
+    AttachmentKind, extension_for_media_type, sanitize_attachment_name,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Largest single attachment. The body limit below is deliberately a little
-/// larger so an oversized upload fails with our `RESOURCE_LIMIT` message
-/// rather than an opaque 413 from the body layer.
-pub const MAX_OBJECT_BYTES: usize = 5 * 1024 * 1024;
-/// Request body ceiling for the objects routes only.
-const BODY_LIMIT: usize = 6 * 1024 * 1024;
-/// Total live staged bytes per instance.
-pub const MAX_INSTANCE_BYTES: i64 = 64 * 1024 * 1024;
+/// Slack above the configured per-file ceiling, so an oversized upload fails
+/// with our `RESOURCE_LIMIT` message rather than an opaque 413 from the body
+/// layer.
+const BODY_LIMIT_SLACK: usize = 1024 * 1024;
+/// Total live staged bytes per instance. Sized for eight 25 MiB files (D-027b).
+pub const MAX_INSTANCE_BYTES: i64 = 256 * 1024 * 1024;
 /// Attachments per `instance.send`. Enforced where the command is built; kept
 /// here so both ends quote the same number.
-pub const MAX_ATTACHMENTS_PER_SEND: usize = 4;
+pub const MAX_ATTACHMENTS_PER_SEND: usize = 8;
 /// Staging lifetime. Must exceed a typical Node offline window, because a
 /// command queued for an offline Node is only pulled once it reconnects.
 pub const OBJECT_TTL_SECONDS: i64 = 24 * 60 * 60;
+/// Longest accepted declared MIME string.
+const MAX_MEDIA_TYPE_LEN: usize = 255;
 
-pub fn routes() -> Router<AppState> {
+pub fn routes(max_object_bytes: usize) -> Router<AppState> {
     Router::new()
         .route("/v1/objects", post(upload))
         .route("/v1/objects/{id}", get(download))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(DefaultBodyLimit::max(max_object_bytes + BODY_LIMIT_SLACK))
 }
 
-/// Allowed media types, keyed by the extension used for the on-disk name.
+/// Allowed image media types, keyed by the extension used for the on-disk
+/// internal name.
 ///
 /// The sniffed type wins: a caller's `Content-Type` only has to agree with it.
-fn sniff(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Some(("image/png", "png"));
     }
@@ -65,12 +70,7 @@ fn sniff(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
 
 /// `image/jpeg` and `image/jpg` name the same format; everything else must match.
 fn declared_matches(declared: &str, sniffed: &str) -> bool {
-    let declared = declared
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
+    let declared = media_type_essence(declared);
     if declared.is_empty() || declared == "application/octet-stream" {
         // No useful claim; the sniff stands on its own.
         return true;
@@ -81,16 +81,56 @@ fn declared_matches(declared: &str, sniffed: &str) -> bool {
     declared == sniffed
 }
 
+/// Lowercased MIME essence (`Image/PNG; charset=…` -> `image/png`).
+fn media_type_essence(raw: &str) -> String {
+    raw.split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Validate a declared media type for a non-image upload: essence only,
+/// well-formed tokens, length-capped. We never trust parameters and never
+/// store them. `application/octet-stream` (and an empty claim) stand for an
+/// unknown binary.
+fn accepted_file_media_type(raw: &str) -> Result<String, String> {
+    let essence = media_type_essence(raw);
+    if essence.is_empty() || essence == "application/octet-stream" {
+        return Ok("application/octet-stream".to_owned());
+    }
+    if essence.len() > MAX_MEDIA_TYPE_LEN {
+        return Err(format!("media type is longer than {MAX_MEDIA_TYPE_LEN} bytes"));
+    }
+    let Some((main, sub)) = essence.split_once('/') else {
+        return Err(format!("media type {essence} is not type/subunit"));
+    };
+    let valid_token = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '!' | '#' | '$' | '&' | '-' | '^' | '_' | '.' | '+' | '~'))
+    };
+    if !valid_token(main) || !valid_token(sub) {
+        return Err(format!("media type {essence} contains invalid characters"));
+    }
+    Ok(essence)
+}
+
 /// Query for [`upload`].
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadQuery {
     /// Instance to stage this attachment for.
     instance_id: String,
+    /// Original filename, sanitised server-side (D-027b). Optional: without
+    /// it the object gets a derived `<obj_id>.<ext>` name.
+    #[serde(default)]
+    name: Option<String>,
 }
 
-/// `POST /v1/objects?instanceId=ins_…` — stage one image for a later
-/// `instance.send`.
+/// `POST /v1/objects?instanceId=ins_…[&name=report.pdf]` — stage one
+/// attachment for a later `instance.send`.
 ///
 /// Raw body plus `Content-Type`; no multipart, so no new dependency.
 ///
@@ -124,37 +164,61 @@ async fn upload(
     if body.is_empty() {
         return Err(HubError::BadRequest("attachment body is empty".into()));
     }
-    if body.len() > MAX_OBJECT_BYTES {
+    let max_bytes = state.config.attachment_max_bytes;
+    if body.len() > max_bytes {
         return Err(HubError::BadRequest(format!(
-            "RESOURCE_LIMIT: attachment is {} bytes; the limit is {MAX_OBJECT_BYTES}",
+            "RESOURCE_LIMIT: attachment is {} bytes; the limit is {max_bytes}",
             body.len()
         )));
     }
-    let Some((media_type, extension)) = sniff(&body) else {
-        return Err(HubError::BadRequest(
-            "attachment must be a PNG, JPEG, GIF or WebP image".into(),
-        ));
-    };
     let declared = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if !declared_matches(declared, media_type) {
-        return Err(HubError::BadRequest(format!(
-            "Content-Type {declared} disagrees with the sniffed type {media_type}"
-        )));
-    }
+    // Images keep the D-027 magic-byte contract; everything else is accepted
+    // with a validated declared type and never sniffed into a privileged type.
+    let (media_type, extension) = if let Some((media_type, extension)) = sniff_image(&body) {
+        if !declared_matches(declared, media_type) {
+            return Err(HubError::BadRequest(format!(
+                "Content-Type {declared} disagrees with the sniffed type {media_type}"
+            )));
+        }
+        (media_type.to_owned(), extension.to_owned())
+    } else {
+        let media_type = accepted_file_media_type(declared).map_err(HubError::BadRequest)?;
+        // A file that merely *claims* image/* but carries no image magic is
+        // not an image: delivering it as one would hand a browser a renderer.
+        let media_type = if media_type.starts_with("image/") {
+            "application/octet-stream".to_owned()
+        } else {
+            media_type
+        };
+        let extension = extension_for_media_type(&media_type).to_owned();
+        (media_type, extension)
+    };
+
+    // The original name is user metadata: sanitise, do not trust. An absent
+    // or blank name falls back to the derived `<obj_id>.<ext>`; a non-empty
+    // name that fails sanitisation (path separators, control characters,
+    // oversize) is a 400 — a legitimate browser File name is always a bare
+    // basename, so accepting a hostile value as null would hide a caller bug.
+    let original_name = match query.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        None => None,
+        Some(name) => Some(
+            sanitize_attachment_name(name)
+                .ok_or_else(|| HubError::BadRequest(format!("invalid attachment name {name}")))?,
+        ),
+    };
 
     let digest = crate::config::sha256_hex(&body);
-    // The stored name is derived, never caller-supplied: a fixed
-    // `<obj_id>.<ext>` removes path traversal structurally (D-027).
     let record = state
         .store
         .insert_object(crate::store::NewObject {
             instance_id: instance_id.clone(),
             host_id: instance.host_id.clone(),
-            media_type: media_type.to_owned(),
-            extension: extension.to_owned(),
+            media_type: media_type.clone(),
+            extension,
+            original_name: original_name.clone(),
             digest,
             bytes: body.to_vec(),
             device_id: device.id.clone(),
@@ -168,20 +232,33 @@ async fn upload(
         object_id = %record.object_id,
         digest = %record.digest,
         bytes = record.byte_len,
+        kind = %record.kind,
         media_type = %record.media_type,
+        original_name = ?record.original_name,
         instance_id = %record.instance_id,
         device_id = %device.id,
         "attachment.uploaded"
     );
     Ok(Json(json!({
         "objectId": record.object_id,
+        "kind": record.kind,
         "mediaType": record.media_type,
         "size": record.byte_len,
         "digest": record.digest,
-        "name": record.stored_name,
+        "name": record.original_name,
+        "storedName": record.stored_name,
         "instanceId": record.instance_id,
         "expiresAt": record.expires_at,
     })))
+}
+
+/// Name a send manifest entry should carry: the sanitised original name when
+/// one exists, otherwise the derived internal name.
+fn manifest_name(object: &ObjectRecord) -> String {
+    object
+        .original_name
+        .clone()
+        .unwrap_or_else(|| object.stored_name.clone())
 }
 
 /// Normalize and check the `attachments` array on an `instance.send` payload.
@@ -190,11 +267,11 @@ async fn upload(
 /// HTTP boundary, where the caller can still act on it, rather than on the
 /// Node after the command has been accepted. Each referenced object must
 /// exist, be unexpired, and already be bound to this very instance — a
-/// caller cannot attach another session's image by quoting its id.
+/// caller cannot attach another session's file by quoting its id.
 ///
-/// The metadata written back is the Hub's own, not the caller's: media type
-/// and name come from the stored row, so the Node materializes what was
-/// actually sniffed at upload time.
+/// The metadata written back is the Hub's own, not the caller's: media type,
+/// kind, digest, size and name come from the stored row, so the Node
+/// materializes what was actually accepted at upload time.
 pub async fn validate_send_attachments(
     state: &AppState,
     device: &crate::store::Device,
@@ -271,9 +348,11 @@ pub async fn validate_send_attachments(
         anchor_tags.push((object.object_id.clone(), index));
         resolved.push(json!({
             "objectId": object.object_id,
+            "kind": object.kind,
             "mediaType": object.media_type,
-            "name": object.stored_name,
+            "name": manifest_name(&object),
             "size": object.byte_len,
+            "digest": object.digest,
             "index": index,
         }));
     }
@@ -288,6 +367,11 @@ pub async fn validate_send_attachments(
 /// the operator device that can already see the instance, and the Node
 /// hosting it. A host credential therefore cannot read another host's
 /// attachments.
+///
+/// Images are served inline so the composer's thumbnails and download links
+/// both work; non-images always carry `attachment` disposition with the
+/// sanitised filename, plus `nosniff`, so the browser never renders one as
+/// HTML or script (D-027b).
 async fn download(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -310,14 +394,20 @@ async fn download(
         .read_object_bytes(id)
         .await?
         .ok_or(HubError::NotFound)?;
+    let disposition = match AttachmentKind::from_media_type(&object.media_type) {
+        AttachmentKind::Image => "inline".to_owned(),
+        AttachmentKind::File => {
+            // Filename is already sanitised; strip quotes/backslashes defensively
+            // so the header value itself cannot break.
+            let file_name = manifest_name(&object).replace(['"', '\\', '\r', '\n'], "_");
+            format!("attachment; filename=\"{file_name}\"")
+        }
+    };
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, object.media_type.clone()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}\"", object.stored_name),
-            ),
+            (header::CONTENT_DISPOSITION, disposition),
             (
                 header::HeaderName::from_static("x-content-type-options"),
                 "nosniff".to_owned(),
@@ -375,19 +465,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sniff_recognises_the_allowlist_and_nothing_else() {
-        assert_eq!(sniff(b"\x89PNG\r\n\x1a\nrest").unwrap().0, "image/png");
-        assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().0, "image/jpeg");
-        assert_eq!(sniff(b"GIF89a....").unwrap().0, "image/gif");
-        assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 ").unwrap().0, "image/webp");
-        assert!(sniff(b"%PDF-1.7").is_none());
-        assert!(sniff(b"<svg xmlns=").is_none());
-        assert!(sniff(b"GIF").is_none(), "a truncated header is not a match");
-        assert!(sniff(b"RIFF\0\0\0\0WAVE").is_none());
+    fn sniff_recognises_the_image_allowlist_and_nothing_else() {
+        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest").unwrap().0, "image/png");
+        assert_eq!(sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().0, "image/jpeg");
+        assert_eq!(sniff_image(b"GIF89a....").unwrap().0, "image/gif");
+        assert_eq!(sniff_image(b"RIFF\0\0\0\0WEBPVP8 ").unwrap().0, "image/webp");
+        assert!(sniff_image(b"%PDF-1.7").is_none());
+        assert!(sniff_image(b"<svg xmlns=").is_none());
+        assert!(sniff_image(b"GIF").is_none(), "a truncated header is not a match");
+        assert!(sniff_image(b"RIFF\0\0\0\0WAVE").is_none());
     }
 
     #[test]
-    fn declared_type_must_agree_with_the_sniffed_one() {
+    fn declared_type_must_agree_with_the_sniffed_image() {
         assert!(declared_matches("image/png", "image/png"));
         assert!(declared_matches("image/png; charset=binary", "image/png"));
         assert!(declared_matches("IMAGE/PNG", "image/png"));
@@ -396,5 +486,53 @@ mod tests {
         assert!(declared_matches("application/octet-stream", "image/gif"));
         assert!(!declared_matches("image/png", "image/gif"));
         assert!(!declared_matches("text/html", "image/png"));
+    }
+
+    #[test]
+    fn arbitrary_file_types_are_accepted_as_essence() {
+        assert_eq!(
+            accepted_file_media_type("application/pdf").unwrap(),
+            "application/pdf"
+        );
+        assert_eq!(
+            accepted_file_media_type("text/plain; charset=utf-8").unwrap(),
+            "text/plain"
+        );
+        assert_eq!(
+            accepted_file_media_type("Application/JSON").unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            accepted_file_media_type("").unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            accepted_file_media_type("application/octet-stream").unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            accepted_file_media_type("video/mp4; codecs=avc1").unwrap(),
+            "video/mp4"
+        );
+    }
+
+    #[test]
+    fn malformed_or_hostile_file_types_are_rejected() {
+        assert!(accepted_file_media_type("text").is_err());
+        assert!(accepted_file_media_type("text/html;").is_ok(), "parameters are dropped");
+        assert!(accepted_file_media_type("text/ht ml").is_err());
+        assert!(accepted_file_media_type(&format!("text/{}", "a".repeat(260))).is_err());
+    }
+
+    #[test]
+    fn filenames_are_sanitised_for_the_manifest() {
+        assert_eq!(
+            sanitize_attachment_name("Q3 report.pdf").as_deref(),
+            Some("Q3 report.pdf")
+        );
+        assert_eq!(sanitize_attachment_name("../../etc/passwd"), None);
+        assert_eq!(sanitize_attachment_name("a\\b.pdf"), None);
+        assert_eq!(sanitize_attachment_name("evil\0.pdf"), None);
+        assert_eq!(sanitize_attachment_name("  "), None);
     }
 }

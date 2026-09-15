@@ -264,11 +264,17 @@ async fn upload_sniffs_the_type_and_returns_a_derived_name() -> Result<()> {
     let object_id = value["objectId"].as_str().context("objectId")?;
     assert!(object_id.starts_with("obj_"), "{object_id}");
     assert_eq!(value["mediaType"], json!("image/png"));
+    assert_eq!(value["kind"], json!("image"));
     assert_eq!(value["size"], json!(512));
     assert_eq!(
-        value["name"],
+        value["storedName"],
         json!(format!("{object_id}.png")),
-        "the stored name is derived from the id, never from the caller"
+        "the internal blob name is derived from the id"
+    );
+    assert_eq!(
+        value["name"],
+        Value::Null,
+        "without an original name the manifest name falls back later"
     );
     assert_eq!(value["instanceId"], json!(fixture.instance_id));
     assert!(value["expiresAt"].as_str().is_some_and(|v| !v.is_empty()));
@@ -307,17 +313,21 @@ async fn upload_rejects_a_content_type_that_contradicts_the_bytes() -> Result<()
     Ok(())
 }
 
+/// D-027b: non-image types are now accepted (as kind=file); only hostile
+/// claims are refused — a non-image body declaring image/* is downgraded to
+/// octet-stream rather than stored as a renderable image.
 #[tokio::test]
-async fn upload_rejects_types_outside_the_image_allowlist() -> Result<()> {
+async fn non_image_types_stage_as_files_but_fake_images_are_downgraded() -> Result<()> {
     let fixture = fixture().await?;
     let addr = fixture.hub.addr;
-    for (content_type, bytes) in [
-        ("application/pdf", b"%PDF-1.7 fake".to_vec()),
+    for (content_type, bytes, expect_type, expect_kind) in [
         (
-            "image/svg+xml",
-            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec(),
+            "application/pdf",
+            b"%PDF-1.7 fake".to_vec(),
+            "application/pdf",
+            "file",
         ),
-        ("text/plain", b"just text".to_vec()),
+        ("text/plain", b"just text".to_vec(), "text/plain", "file"),
     ] {
         let (status, body) = upload(
             addr,
@@ -327,9 +337,24 @@ async fn upload_rejects_types_outside_the_image_allowlist() -> Result<()> {
             &bytes,
         )
         .await?;
-        assert_eq!(status, 400, "{content_type} {body}");
-        assert!(body.contains("PNG, JPEG, GIF or WebP"), "{body}");
+        assert_eq!(status, 200, "{content_type} {body}");
+        let value: Value = serde_json::from_str(body.trim())?;
+        assert_eq!(value["mediaType"], json!(expect_type));
+        assert_eq!(value["kind"], json!(expect_kind));
     }
+    // SVG has no image magic in the sniffer: it must not become an image.
+    let (status, body) = upload(
+        addr,
+        &fixture.cookie,
+        &fixture.instance_id,
+        "image/svg+xml",
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let value: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(value["kind"], json!("file"), "{body}");
+    assert_eq!(value["mediaType"], json!("application/octet-stream"), "{body}");
     fixture.hub.shutdown().await;
     Ok(())
 }
@@ -338,7 +363,9 @@ async fn upload_rejects_types_outside_the_image_allowlist() -> Result<()> {
 async fn upload_rejects_an_attachment_over_the_size_cap() -> Result<()> {
     let fixture = fixture().await?;
     let addr = fixture.hub.addr;
-    let oversized = png_bytes(5 * 1024 * 1024 + 1);
+    // D-027b default cap is 25 MiB; one byte over fails at the app layer with
+    // RESOURCE_LIMIT (and is still under the body-layer slack, so not a 413).
+    let oversized = png_bytes(25 * 1024 * 1024 + 1);
     let (status, body) = upload(
         addr,
         &fixture.cookie,
@@ -508,7 +535,9 @@ async fn the_owning_node_can_read_bytes_and_another_host_cannot() -> Result<()> 
     let lower = head.to_ascii_lowercase();
     assert!(lower.contains("content-type: image/png"), "{head}");
     assert!(lower.contains("x-content-type-options: nosniff"), "{head}");
-    assert!(lower.contains("content-disposition: attachment"), "{head}");
+    // D-027b: images are served inline; a non-image file would carry
+    // `content-disposition: attachment`.
+    assert!(lower.contains("content-disposition: inline"), "{head}");
 
     // A second Node on the same Hub hosts nothing here and must be refused.
     let other_enroll = enroll_token(addr, &fixture.cookie).await?;
@@ -607,8 +636,10 @@ async fn send_accepts_only_attachments_bound_to_that_instance() -> Result<()> {
     assert_eq!(
         attachment["name"],
         json!(format!("{object_id}.png")),
-        "a caller-supplied name must never survive into the command"
+        "without an original name the manifest carries the derived name"
     );
+    assert_eq!(attachment["kind"], json!("image"));
+    assert!(attachment["digest"].as_str().is_some_and(|d| d.len() == 64));
     assert_eq!(attachment["size"], json!(321));
 
     // An unknown id is refused.
@@ -663,7 +694,8 @@ async fn send_refuses_more_attachments_than_the_per_message_cap() -> Result<()> 
     let fixture = fixture().await?;
     let addr = fixture.hub.addr;
     let mut ids = Vec::new();
-    for index in 0..5u8 {
+    // D-027b cap is 8 per send; 9 distinct objects must be refused.
+    for index in 0..9u8 {
         let mut bytes = png_bytes(64);
         bytes.push(index);
         let (status, body) = upload(

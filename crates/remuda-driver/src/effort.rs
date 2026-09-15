@@ -704,11 +704,13 @@ mod argv_tests {
             ensure_no_effort_in_extras(AgentKind::Codex, &["--reasoning-effort=high".into()])
                 .is_err()
         );
-        assert!(ensure_no_effort_in_extras(
-            AgentKind::Grok,
-            &["--reasoning-effort".into(), "high".into()]
-        )
-        .is_err());
+        assert!(
+            ensure_no_effort_in_extras(
+                AgentKind::Grok,
+                &["--reasoning-effort".into(), "high".into()]
+            )
+            .is_err()
+        );
     }
 }
 

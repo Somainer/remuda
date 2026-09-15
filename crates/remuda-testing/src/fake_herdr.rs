@@ -374,6 +374,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(herdr_frames_path);
+    let mut frames_explicit = std::env::var_os("FAKE_HERDR_FRAMES").is_some();
     let mut cols: u16 = 80;
     let mut rows: u16 = 24;
     let mut unavailable_calls: usize = std::env::var("FAKE_HERDR_UNAVAILABLE_CALLS")
@@ -412,6 +413,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
                     args.get(i)
                         .ok_or_else(|| FakeHerdrError::Args("missing --frames".into()))?,
                 );
+                frames_explicit = true;
             }
             "--cols" => {
                 i += 1;
@@ -451,6 +453,14 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         i += 1;
     }
     if positional.first().map(String::as_str) == Some("terminal") {
+        // Test fixtures may park a frame script next to the API socket
+        // (`<socket>.frames`): the relay subprocess is spawned with only
+        // HERDR_SOCKET_PATH, so this lets a test script its output without
+        // process-global env vars or a shared CLI flag.
+        let neighbor = frames_neighbor(&socket);
+        if !frames_explicit && neighbor.is_file() {
+            frames = neighbor;
+        }
         return Ok(Cli::Observe { frames, cols, rows });
     }
     // `serve` is the fake's own spelling; `server` is what herdr's CLI uses and
@@ -474,6 +484,16 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
     )))
 }
 
+/// Per-socket frame script path: `<socket>.frames` next to the API socket.
+fn frames_neighbor(socket: &Path) -> PathBuf {
+    let mut name = socket
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".frames");
+    socket.with_file_name(name)
+}
+
 fn print_help() {
     eprintln!(
         "fake-herdr — Herdr JSON-RPC test double\n\n\
@@ -483,13 +503,35 @@ fn print_help() {
 }
 
 /// Replay bundled or recorded `terminal.frame` JSONL to stdout.
+///
+/// Comment lines are skipped on the wire; a `# sleep-ms <N>` directive parks
+/// for `N` milliseconds before continuing, so a test can script a mode switch
+/// (e.g. the pane entering the alt screen) at a deterministic moment.
 pub fn write_observe_frames(frames: &Path, cols: u16, rows: u16) -> Result<(), FakeHerdrError> {
     let body = std::fs::read_to_string(frames)?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for line in body.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("# sleep-ms")
+            .or_else(|| trimmed.strip_prefix("#sleep-ms"))
+            .map(str::trim_start)
+        {
+            let millis: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if millis > 0 {
+                std::thread::sleep(Duration::from_millis(millis));
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') {
             continue;
         }
         let mut value: Value = serde_json::from_str(trimmed)?;

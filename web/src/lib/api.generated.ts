@@ -1265,9 +1265,9 @@ export interface components {
             name: string;
             token: string;
         };
-        /** @description Native effort selection (D-028 §9.1): the harness-native level plus an orthogonal ultracode boolean (Claude only). Claude takes low | medium | high | xhigh | max; Codex and Grok add minimal on the low end. Legacy tier names (default / think / think-hard / ultra / ultracode) are accepted and normalized by NAME — never by index, because the old per-harness tables differed in length. */
+        /** @description Native effort selection (D-028 §9.1): the harness-native level plus an orthogonal ultracode boolean (Claude only). Claude takes low | medium | high | xhigh | max; Codex takes low | medium | high | xhigh | max | ultra. Codex accepts legacy minimal as low; ultra is a real Codex level, independent of the Claude-only ultracode flag. Legacy tier names (default / think / think-hard / ultracode) are accepted and normalized by NAME — never by index, because the old per-harness tables differed in length. */
         EffortSelection: {
-            /** @description minimal | low | medium | high | xhigh | max (minimal is Codex/Grok-only), or a legacy tier name to be normalized. */
+            /** @description low | medium | high | xhigh | max | ultra (ultra is Codex-only), or a legacy tier name to be normalized; Codex minimal maps to low. */
             name: string;
             /** @description Dynamic workflow. Equivalent to xhigh plus dynamic workflow; session-only, never persisted as a level. */
             ultracode?: boolean;
@@ -1518,7 +1518,7 @@ export interface components {
             /** @description D-028 §9.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown. */
             effortEffective?: ({
                 /** @enum {string} */
-                name: "low" | "medium" | "high" | "xhigh" | "max";
+                name: "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
                 observedAt: string;
                 /** @enum {string} */
                 source: "launch" | "slash" | "remuda" | "unknown";
@@ -1530,10 +1530,10 @@ export interface components {
             /** @description Legacy per-harness table index. Preserved for older clients; never used to derive the tier, because the old tables differed in length per harness. */
             effortIndex?: number | null;
             /**
-             * @description Normalized D-028 §9.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default→low, think→high, think-hard/ultra→xhigh, ultracode→xhigh with effortUltracode true). `minimal` is Codex/Grok-only and never emitted for a Claude launch.
+             * @description Normalized D-028 §9.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default→low, think→high, think-hard→xhigh, ultracode→xhigh with effortUltracode true). Codex minimal maps to low; Codex max and ultra persist unchanged. Ultra is rejected by Claude, agy and Grok.
              * @enum {string|null}
              */
-            effortName?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+            effortName?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
             /** @description Dynamic-workflow flag (`--effort ultracode`). Session-only; it is xhigh plus dynamic workflow, not a sixth level. */
             effortUltracode?: boolean | null;
             hostId: string;

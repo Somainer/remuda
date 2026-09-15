@@ -1147,8 +1147,8 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
     argv.push("--model".into());
     argv.push(model.to_string());
     // §9.1: launch-time effort. `--effort ultracode` is the flag spelling for
-    // the boolean; it is not a sixth level name. `minimal` is a Codex/Grok
-    // spelling that claude does not parse — refuse rather than launch-crash.
+    // the boolean; it is distinct from the Codex `ultra` level. Claude parses
+    // neither `minimal` nor `ultra` — refuse rather than launch-crash.
     if let Some(effort) = effort {
         argv.extend(crate::effort::effort_argv(AgentKind::Claude, Some(effort))?);
     }

@@ -41,8 +41,8 @@ fn name_wire(name: EffortName) -> &'static str {
         EffortName::High => "high",
         EffortName::Xhigh => "xhigh",
         EffortName::Max => "max",
-        // Claude assistant records never report the Codex/Grok-only `minimal`
-        // word; it only exists on launch argv for those harnesses.
+        EffortName::Ultra => "ultra",
+        // Claude assistant records never report the legacy `minimal` word.
         EffortName::Minimal => "minimal",
     }
 }
@@ -239,6 +239,7 @@ mod tests {
     fn auto_and_garbage_are_not_levels() {
         assert!(EffortTracker::parse_level("auto").is_none());
         assert!(EffortTracker::parse_level("bogus").is_none());
+        assert!(EffortTracker::parse_level("ultra").is_none());
         assert_eq!(EffortTracker::parse_level("XHigh"), Some(EffortName::Xhigh));
     }
 

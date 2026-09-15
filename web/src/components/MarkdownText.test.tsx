@@ -5,6 +5,7 @@ import { clipboardIo } from "../lib/clipboard";
 import { highlightCode } from "../lib/highlight";
 import { notify } from "../lib/notify";
 import { MarkdownText } from "./MarkdownText";
+import { listenForCodeQuotes } from "../lib/codeQuoteBus";
 
 vi.mock("../lib/notify", () => ({ notify: vi.fn() }));
 
@@ -158,5 +159,22 @@ describe("sanitising fence bodies", () => {
     expect(screen.queryByTestId("code-toolbar")).toBeNull();
     expect(screen.queryByTestId("code-block")).toBeNull();
     expect(screen.getByText("rm -rf").tagName).toBe("CODE");
+  });
+
+  it("passes the fence language plus meta (e.g. a file path) through to CodeBlock", async () => {
+    const received: unknown[] = [];
+    const stop = listenForCodeQuotes((quote) => received.push(quote));
+    try {
+      render(<MarkdownText text={"```ts src/app.ts\nconst x = 1;\n```"} />);
+      await screen.findByTestId("code-comment");
+      fireEvent.click(screen.getByTestId("code-comment"));
+      await waitFor(() => expect(received).toHaveLength(1));
+    } finally {
+      stop();
+    }
+    // Language label resolves to its display name; the path survives
+    // sanitize into the quote payload the composer expands.
+    expect(screen.getByTestId("code-lang")).toHaveTextContent("TypeScript");
+    expect(received[0]).toMatchObject({ lang: "ts", path: "src/app.ts" });
   });
 });

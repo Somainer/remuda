@@ -1,5 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { readDraft, writeDraft } from "../../lib/drafts";
+import {
+  insertAnchors,
+  referencedIndices,
+  removeAndRenumber,
+} from "../../lib/imageAnchors";
 import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
 import type { PromptMode } from "../../types/generated";
@@ -90,6 +95,11 @@ export function Composer({
   const [interrupted, setInterrupted] = useState(false);
   const rootRef = useRef<HTMLFormElement>(null);
   const images = useAttachments(instanceId);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Synchronous mirror so rapid pastes and the drop handler see the text the
+  // previous insert just produced rather than a stale React closure.
+  const textRef = useRef(text);
+  textRef.current = text;
   const barRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const phaseRef = useRef(phase);
@@ -148,6 +158,45 @@ export function Composer({
     return true;
   };
 
+  /**
+   * Insert `[Image #n]` tokens for freshly staged files at the textarea caret
+   * (mid-word inserts get surrounding spaces — see imageAnchors). The caret is
+   * restored after the controlled value commits.
+   */
+  const insertForImages = (indices: number[]) => {
+    if (indices.length === 0) return;
+    const area = inputRef.current;
+    const caret = area && area.selectionStart != null ? area.selectionStart : textRef.current.length;
+    const result = insertAnchors(textRef.current, caret, indices);
+    textRef.current = result.text;
+    setText(result.text);
+    writeDraft(instanceId, result.text);
+    requestAnimationFrame(() => {
+      const next = inputRef.current;
+      if (!next) return;
+      next.focus();
+      next.setSelectionRange(result.caret, result.caret);
+    });
+  };
+
+  /** Chip × : unstage the image, pull its token(s) out, renumber the rest. */
+  const removeAttachment = (localId: string) => {
+    const index = images.remove(localId);
+    if (index === null) return;
+    const next = removeAndRenumber(textRef.current, index);
+    textRef.current = next;
+    setText(next);
+    writeDraft(instanceId, next);
+  };
+
+  /** Chips whose [Image #n] token was edited out of the draft; still sent. */
+  const unreferenced = new Set(
+    images.attachments
+      .map((attachment, position) => ({ attachment, index: position + 1 }))
+      .filter(({ index }) => !referencedIndices(textRef.current).has(index))
+      .map(({ attachment }) => attachment.localId),
+  );
+
   const clearBox = () => {
     writeDraft(instanceId, "");
     setText("");
@@ -164,7 +213,7 @@ export function Composer({
   const submitPrimary = async () => {
     if (!canSubmit()) return;
     const value = text.trim();
-    const refs = images.refs();
+    const refs = images.refs(value);
     const staged = images.attachments;
     const action = controls.primary;
     if (action.kind === "queue") {
@@ -184,7 +233,7 @@ export function Composer({
   const submitQueue = () => {
     if (!controls.queue.available || !canSubmit()) return;
     const value = text.trim();
-    const refs = images.refs();
+    const refs = images.refs(value);
     const staged = images.attachments;
     if (controls.queue.holder === "native") {
       setHeld((cur) => [
@@ -212,7 +261,7 @@ export function Composer({
     );
     if (!confirmed) return;
     const value = text.trim();
-    const refs = images.refs();
+    const refs = images.refs(value);
     const staged = images.attachments;
     await doInterrupt();
     clearBox();
@@ -334,7 +383,8 @@ export function Composer({
       ) : null}
       <AttachmentChips
         attachments={images.attachments}
-        onRemove={images.remove}
+        unreferenced={unreferenced}
+        onRemove={removeAttachment}
         onRetry={images.retry}
       />
       {images.notice ? (
@@ -353,23 +403,29 @@ export function Composer({
           );
           if (dropped.length === 0) return;
           event.preventDefault();
-          images.add(dropped);
+          insertForImages(images.add(dropped));
         }}
       >
         <textarea
+          ref={inputRef}
           className={css.input}
           data-testid="composer-input"
           value={text}
           disabled={disabled}
           placeholder="输入提示词…  Enter 主操作 · Shift+Enter 换行 · 工作中 Esc 打断 · IME 组字期间不送"
           onChange={(e) => {
+            textRef.current = e.target.value;
             setText(e.target.value);
             writeDraft(instanceId, e.target.value);
           }}
           onPaste={(event) => {
             // Only swallow the paste when an image was actually taken:
             // otherwise plain-text pasting and the iOS caret both break.
-            if (images.onPaste(event.clipboardData)) event.preventDefault();
+            const indices = images.onPaste(event.clipboardData);
+            if (indices.length > 0) {
+              event.preventDefault();
+              insertForImages(indices);
+            }
           }}
           onKeyDown={onKeyDown}
         />
@@ -379,8 +435,8 @@ export function Composer({
           className={css.chip}
           disabled={disabled}
           mobile={mobile}
-          onFiles={images.add}
-          onPasteClick={() => void images.pasteFromClipboard()}
+          onFiles={(files) => insertForImages(images.add(files))}
+          onPasteClick={async () => insertForImages(await images.pasteFromClipboard())}
         />
         {caps.harness ? (
           <span className={css.chip} data-testid="harness-chip" data-readonly="1">

@@ -581,20 +581,14 @@ async fn fake_node(
                             "raw": observed
                         }
                     });
-                    let seq = append_n + 1;
-                    ws.send(Message::Text(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": format!("j{seq}"),
-                            "method": "journal.append",
-                            "params": {"instanceId": instance_id, "event": event}
-                        })
-                        .to_string()
-                        .into(),
-                    ))
+                    append_n = append_event(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "effort",
+                        event["payload"].clone(),
+                    )
                     .await?;
-                    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
-                    append_n = seq;
                 }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }

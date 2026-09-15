@@ -33,6 +33,7 @@ use crate::claude_transcript::{
 };
 use crate::error::{DriverError, DriverResult};
 use crate::promote::{Detected, ProcessTable, ScreenStatus, detect, foreground_pgid};
+use crate::tty::{LocalPty as _, logical_keys_to_bytes};
 use remuda_protocol::{
     AgentKind, Completeness, DeadlineSource, DeliveryState, EffortSelection, EntityLifecycle,
     EntityMeta, EventId, HostId, Id, InstanceId, Interaction, InteractionAnswer,
@@ -685,6 +686,10 @@ pub(super) fn spawn(
     bindings: BindingHandle,
     hooks: Option<Arc<crate::launch::HookSession>>,
     expect_shim: bool,
+    // Answer Claude's exact folder-trust dialog with its documented key
+    // sequence, once per promoted epoch. Granted by the Node only when the cwd
+    // is inside a registered workspace root (D-022).
+    auto_trust_workspace: bool,
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<Mutex<InterruptBaseline>>,
     events: mpsc::Sender<Observation>,
@@ -712,6 +717,10 @@ pub(super) fn spawn(
         let mut announced: Option<String> = None;
         let mut bypass_announced = false;
         let mut tui_released = false;
+        // One trust-dialog answer per promoted epoch (D-022). Reset on
+        // promotion: a relaunched agent that hits the dialog again must not be
+        // blocked by an answer spent on the previous foreground pid.
+        let mut trust_attempted = false;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -778,6 +787,7 @@ pub(super) fn spawn(
                 hydrator = None;
                 announced = None;
                 bypass_announced = false;
+                trust_attempted = false;
             }
 
             // The socket's SessionStart is also channel A for transcript
@@ -857,6 +867,58 @@ pub(super) fn spawn(
             // ANSI-stripped ring tail otherwise — the same input the matchers
             // read before D-028, so the default path is unchanged (§13 P0).
             let (interruption_count, grid) = state.screen_evidence();
+            // Pre-launch config seeding is the first line of defence against
+            // the folder-trust dialog, but an inherited operator home or an
+            // ancestor project entry with `hasTrustDialogAccepted: false` can
+            // still put it on screen. When the Node granted auto-trust for this
+            // registered workspace, answer the EXACT dialog once with its own
+            // key sequence (D-022, same gate and same narrow matcher the herdr
+            // carrier uses) — never by touching the operator's real config.
+            if auto_trust_workspace
+                && !trust_attempted
+                && found
+                    .as_ref()
+                    .is_some_and(|found| found.kind == AgentKind::Claude)
+                && let Some(keys) = remuda_screen::trust_dialog_keys(&grid)
+            {
+                trust_attempted = true;
+                let result = state.write_bytes(&logical_keys_to_bytes(&keys)).await;
+                let success = result.is_ok();
+                tracing::info!(
+                    ?keys,
+                    success,
+                    "folder-trust dialog observed on the native carrier; answering once (registered workspace)"
+                );
+                let (_, payload) = native(
+                    LifecycleTopic::Diagnostic,
+                    "trust-dialog",
+                    Knowledge::NotApplicable,
+                    if success {
+                        "trust-dialog auto-accepted (registered workspace)"
+                    } else {
+                        "trust-dialog automatic answer delivery failed; not replayed"
+                    },
+                    BTreeMap::new(),
+                    if success {
+                        Severity::Info
+                    } else {
+                        Severity::Warning
+                    },
+                );
+                if emit(
+                    &events,
+                    &seq,
+                    &ctx,
+                    SourceChannel::Runtime,
+                    Completeness::Structured,
+                    payload,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
             // Esc can end a Claude turn without a Stop hook. A newly rendered
             // native interruption marker settles the pending request, while an
             // old marker already present when cancel was sent cannot do so.

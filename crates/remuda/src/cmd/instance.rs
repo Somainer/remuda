@@ -526,6 +526,20 @@ pub(crate) async fn wait(
     }
 }
 
+/// Ask the Hub for the live screen of a PTY-carried session.
+///
+/// `Ok(None)` means "this session has no readable screen" — an offline host, a
+/// driver without a terminal, or a route an older Hub does not serve. Callers
+/// fall back to the journal and *say* they did, rather than printing an empty
+/// grid that looks like a blank terminal.
+async fn live_screen(client: &HubClient, instance_id: &str) -> Option<Value> {
+    let body = client
+        .get(&format!("/v1/instances/{instance_id}/screen"))
+        .await
+        .ok()?;
+    (body.get("supported").and_then(Value::as_bool) == Some(true)).then_some(body)
+}
+
 pub(crate) async fn read(
     client: &HubClient,
     instance_id: &str,
@@ -533,6 +547,41 @@ pub(crate) async fn read(
     lines: usize,
     source: &str,
 ) -> Result<Value> {
+    // D-028 §4.6: a `shell-pty` (or any PTY) session holds a real emulator
+    // grid, and that is what `--source screen` should mean. Only when no live
+    // screen exists does this fall back to scraping screen-shaped events out
+    // of the journal, which is all this command could ever do before.
+    if source.trim().eq_ignore_ascii_case("screen")
+        && let Some(screen) = live_screen(client, instance_id).await
+    {
+        let grid: Vec<String> = screen
+            .get("lines")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| row.as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let truncated = grid.len() > lines;
+        let printed = if truncated {
+            grid[grid.len() - lines..].to_vec()
+        } else {
+            grid
+        };
+        return Ok(json!({
+            "instanceId": instance_id,
+            "source": "screen",
+            "screenSource": screen.get("source").cloned().unwrap_or(Value::Null),
+            "cols": screen.get("cols").cloned().unwrap_or(Value::Null),
+            "rows": screen.get("rows").cloned().unwrap_or(Value::Null),
+            "cursor": screen.get("cursor").cloned().unwrap_or(Value::Null),
+            "altScreen": screen.get("altScreen").cloned().unwrap_or(Value::Null),
+            "lines": printed,
+            "truncated": truncated,
+            "completeness": if truncated { "truncated" } else { "complete" },
+        }));
+    }
     let journal = client.get_journal(instance_id, after_seq).await?;
     let all_events = journal
         .get("events")
@@ -574,7 +623,8 @@ pub(crate) async fn read(
         "truncated": truncated,
         "completeness": if truncated { "truncated" } else { "complete" },
         "asOfSeq": journal.get("durableSeq").cloned().unwrap_or(json!("0")),
-        "driverHint": "screen/keys require a tty-attach driver such as generic-pty",
+        "driverHint": "no live screen for this session; \
+                       showing journal events (a PTY carrier serves GET /v1/instances/<id>/screen)",
     }))
 }
 

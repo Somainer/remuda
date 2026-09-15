@@ -29,6 +29,33 @@ pub struct CallContext {
     pub run_generation: Option<U64>,
 }
 
+/// A read-only look at what a PTY-carried session currently shows.
+///
+/// The debugging tool the native carrier was missing: when an agent parks on a
+/// dialog before its first hook fires, the journal is empty and the screen is
+/// the only evidence of *why*. Unlike an attach this opens no stream and moves
+/// no offset, so reading it cannot disturb a session someone is watching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenRead {
+    /// Visible rows, top to bottom, with trailing blank rows trimmed.
+    pub lines: Vec<String>,
+    /// Terminal width in columns.
+    pub cols: u16,
+    /// Terminal height in rows.
+    pub rows: u16,
+    /// Zero-based `(row, col)` cursor position.
+    pub cursor: (u16, u16),
+    /// Whether a full-screen TUI (DEC `?1049`) owns the display.
+    pub alt_screen: bool,
+    /// `true` when a real terminal emulator produced this grid, `false` when it
+    /// is an ANSI-stripped slice of the raw byte ring. A ring slice is a much
+    /// weaker witness — it cannot resolve cursor moves or redraws — so callers
+    /// must be able to tell the two apart rather than trusting every read
+    /// equally.
+    pub emulated: bool,
+}
+
 /// Dispatch acknowledgement; `protocol.md` §3.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,6 +201,15 @@ pub trait Driver: Send + Sync {
     /// observation return `None` rather than guessing.
     async fn alt_screen(&self) -> Option<bool> {
         None
+    }
+
+    /// Current screen as text, for a carrier that keeps one.
+    ///
+    /// `None` means "this driver has no screen to read" — the honest answer for
+    /// a non-PTY carrier — and callers must report that rather than presenting
+    /// an empty grid as a blank terminal.
+    async fn screen_read(&self) -> DriverResult<Option<ScreenRead>> {
+        Ok(None)
     }
 
     /// Request cancellation of the active Run.

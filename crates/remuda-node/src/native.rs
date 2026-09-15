@@ -602,6 +602,14 @@ impl Driver for NativeAdapter {
         Box::pin(async move { self.native.tty_bridge().await })
     }
 
+    fn screen_read(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_>,
+    > {
+        Box::pin(async move { self.native.screen_read().await.map_err(map_driver_error) })
+    }
+
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
         Box::pin(async move {
             match request {

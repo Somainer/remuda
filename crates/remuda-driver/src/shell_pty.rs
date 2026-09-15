@@ -1809,6 +1809,30 @@ impl Driver for ShellPtyDriver {
         Some(TtyBridge::Local(state))
     }
 
+    /// The emulator grid this PTY is showing right now (D-028 §4.6).
+    ///
+    /// Reading is deliberately passive — no attach, no offset movement, no
+    /// keystroke — because the case it exists for is an agent parked on a
+    /// dialog *before* its first hook fires, where touching the session could
+    /// change the very thing being diagnosed.
+    async fn screen_read(&self) -> DriverResult<Option<crate::driver::ScreenRead>> {
+        let Some(state) = self.inner.lock().await.clone() else {
+            // Not started, or already closed: there is no screen. Say so
+            // rather than returning an empty grid, which reads as a blank
+            // terminal and would be indistinguishable from a cleared one.
+            return Ok(None);
+        };
+        let grid = state.screen_grid();
+        Ok(Some(crate::driver::ScreenRead {
+            cols: state.cols.load(Ordering::SeqCst),
+            rows: state.rows.load(Ordering::SeqCst),
+            cursor: grid.cursor,
+            alt_screen: grid.modes.alt_screen,
+            emulated: grid.emulated,
+            lines: grid.lines,
+        }))
+    }
+
     /// Interrupt the current turn — **not** stop the process (§5.3).
     ///
     /// For a plain shell `Ctrl+C` genuinely is the interrupt, and that is what

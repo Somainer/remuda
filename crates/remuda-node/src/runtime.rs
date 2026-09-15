@@ -328,6 +328,62 @@ impl DevNode {
         }))
     }
 
+    /// Current screen of a PTY-carried Instance, as text.
+    ///
+    /// The `shell-pty` carrier's missing debugging tool: when an agent parks on
+    /// a dialog before its first hook fires the journal is empty, and the
+    /// screen is the only evidence of why. Read-only — no attach, no offset
+    /// movement, no keystroke — so it cannot disturb the session it inspects.
+    ///
+    /// A driver with no screen (`claude-print`, the fakes) answers
+    /// `supported: false` rather than an empty grid: a blank terminal and
+    /// "this carrier has no terminal" are different facts.
+    pub async fn screen_read(&self, instance_id: &InstanceId) -> Result<Value, NodeError> {
+        // Resolve the instance first so an unknown id is a 404-shaped error
+        // rather than "no live driver".
+        let instance = self.inner.store.get_instance(instance_id)?;
+        let driver = self
+            .inner
+            .instance_drivers
+            .read()
+            .await
+            .get(instance_id)
+            .cloned();
+        let Some(driver) = driver else {
+            return Ok(serde_json::json!({
+                "instanceId": instance_id,
+                "supported": false,
+                "reason": "no live driver for this instance",
+                "lifecycle": instance.lifecycle,
+            }));
+        };
+        let screen = driver
+            .screen_read()
+            .await
+            .map_err(|error| NodeError::Driver(error.to_string()))?;
+        match screen {
+            Some(screen) => Ok(serde_json::json!({
+                "instanceId": instance_id,
+                "supported": true,
+                "lifecycle": instance.lifecycle,
+                "driver": driver.kind(),
+                "cols": screen.cols,
+                "rows": screen.rows,
+                "cursor": {"row": screen.cursor.0, "col": screen.cursor.1},
+                "altScreen": screen.alt_screen,
+                "source": if screen.emulated { "emulator" } else { "raw-ring" },
+                "lines": screen.lines,
+            })),
+            None => Ok(serde_json::json!({
+                "instanceId": instance_id,
+                "supported": false,
+                "reason": "this driver carries no readable screen",
+                "lifecycle": instance.lifecycle,
+                "driver": driver.kind(),
+            })),
+        }
+    }
+
     /// Catalog of git worktrees under the first registered workspace root.
     pub fn list_worktrees(&self) -> Result<Value, NodeError> {
         self.worktree_rpc("worktree.list", &serde_json::json!({}))

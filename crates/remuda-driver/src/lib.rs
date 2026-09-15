@@ -66,7 +66,7 @@ pub use claude_transcript::{
     bind_by_pid_file, bind_by_session_id, bind_manual, cwd_matches, encode_project_dir,
     list_candidates, project_dir, recorded_cwd, transcript_belongs_to_cwd,
 };
-pub use driver::{CallContext, Driver, DriverAck, RunHandle};
+pub use driver::{CallContext, Driver, DriverAck, RunHandle, ScreenRead};
 pub use error::{DriverError, DriverResult};
 /// Validate `InstanceSpec.args` against the per-driver launch allowlist.
 ///

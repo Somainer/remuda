@@ -5137,6 +5137,42 @@
         ]
       }
     },
+    "/v1/instances/{id}/screen": {
+      "get": {
+        "description": "Read-only: opens no stream and moves no offset, so it is safe against a session someone is watching. Answers supported=false when the driver carries no screen.",
+        "operationId": "instanceScreen",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Current screen text for a PTY-carried instance"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
     "/v1/instances/{id}/mcp-token": {
       "post": {
         "description": "Requires Human origin. The returned credential always has Agent origin and cannot be rebound to another instance.",

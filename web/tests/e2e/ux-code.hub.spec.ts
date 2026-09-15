@@ -235,10 +235,16 @@ test.describe("390px", () => {
     await expect(first.getByTestId("code-toolbar")).toHaveCSS("opacity", "1");
 
     for (const name of ["换行", "复制"]) {
-      const box = await first.getByRole("button", { name }).boundingBox();
-      expect(box, `${name} button must have a box`).toBeTruthy();
-      expect(box!.width).toBeGreaterThanOrEqual(44);
-      expect(box!.height).toBeGreaterThanOrEqual(44);
+      // The transcript re-renders while live observations arrive; poll the box
+      // instead of sampling it once (a mid-render sample returns null).
+      const button = first.getByRole("button", { name });
+      await expect(button, `${name} button must be visible`).toBeVisible();
+      await expect
+        .poll(async () => (await button.boundingBox())?.width ?? 0, { message: `${name} button width` })
+        .toBeGreaterThanOrEqual(44);
+      await expect
+        .poll(async () => (await button.boundingBox())?.height ?? 0, { message: `${name} button height` })
+        .toBeGreaterThanOrEqual(44);
     }
 
     const noPageOverflow = await page.evaluate(() => ({

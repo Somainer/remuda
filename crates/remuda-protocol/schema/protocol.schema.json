@@ -2665,6 +2665,34 @@
         }
       ]
     },
+    "ContextNeed": {
+      "description": "Context-size requirements of a task; §4.3.",
+      "properties": {
+        "expectedInputTokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Planner's expected input token volume."
+        },
+        "needsLongContext": {
+          "description": "Task explicitly needs a long-context model.",
+          "type": "boolean"
+        },
+        "repoScope": {
+          "description": "`file` | `crate` | `workspace` | `repo` blast radius hint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ConversationNode": {
       "description": "ConversationNode; `protocol.md` §7.3.",
       "oneOf": [
@@ -9817,6 +9845,26 @@
         }
       ]
     },
+    "ModelClass": {
+      "description": "Model capability class used by `TaskSpec.minClass` and the catalog; §4.2.",
+      "oneOf": [
+        {
+          "const": "cheap",
+          "description": "Cheapest tier; never auto-selected above `minClass`.",
+          "type": "string"
+        },
+        {
+          "const": "workhorse",
+          "description": "Default worker tier.",
+          "type": "string"
+        },
+        {
+          "const": "frontier",
+          "description": "Strongest tier; review/design-heavy work.",
+          "type": "string"
+        }
+      ]
+    },
     "ModelEffective": {
       "description": "ModelEffective wire values; `protocol.md` §3.1.",
       "oneOf": [
@@ -11415,6 +11463,23 @@
         "nativeEventId",
         "nativeRequestId",
         "sourceCursor"
+      ],
+      "type": "object"
+    },
+    "ObservedRateLimits": {
+      "description": "One observed Codex `account/rateLimits/updated` frame, normalized; §4.2.\n\nThe Node does not relay these frames yet (r-p6); the REST\n`…/supply/events` path accepts this shape so the loop is wired end to end.",
+      "properties": {
+        "windows": {
+          "default": [],
+          "description": "Account/window snapshots exactly as Codex reports them.",
+          "items": {
+            "$ref": "#/$defs/RateLimitWindow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "windows"
       ],
       "type": "object"
     },
@@ -13223,6 +13288,94 @@
       "required": [
         "title",
         "fields"
+      ],
+      "type": "object"
+    },
+    "RateLimitWindow": {
+      "description": "One rate-limit window — the Codex `RateLimitWindow` vocabulary (§4.2).\n\n`appliesTo` is the field that makes fallback correct: `[\"*\"]` is an\naccount/session/weekly bucket a model switch cannot escape; `[\"<family>\"]`\nis a family bucket a sibling family can dodge (§4.6).",
+      "properties": {
+        "appliesTo": {
+          "default": [
+            "*"
+          ],
+          "description": "Families this window covers; `[\"*\"]` = account-level.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "backoffAttempts": {
+          "description": "Consecutive limit hits without a reset; drives the backoff ladder.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cooldownUntil": {
+          "description": "Runtime: park admissions on this window until this epoch second.\nKnown `resetsAt` wins; otherwise exponential backoff sets it (§4.4 ⑦).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable window id (`primary`, `weekly`, `model`, …).",
+          "type": "string"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared request/token budget when the user knows one."
+        },
+        "observedAt": {
+          "description": "Unix-epoch seconds of the last observed fill.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "resetsAt": {
+          "description": "Unix-epoch **seconds** at which the window resets; null = unknown.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/WindowSource",
+          "default": "declared",
+          "description": "Declared vs observed vs inferred."
+        },
+        "usedPercent": {
+          "description": "Fill percentage 0..=100 from the latest evidence.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "windowDurationMins": {
+          "description": "Window length in minutes (Codex `windowDurationMins`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "appliesTo",
+        "source"
       ],
       "type": "object"
     },
@@ -15190,6 +15343,26 @@
         }
       ]
     },
+    "Sensitivity": {
+      "description": "Generic low/normal/high sensitivity knob.",
+      "oneOf": [
+        {
+          "const": "low",
+          "description": "Prefer the cheap/remote side.",
+          "type": "string"
+        },
+        {
+          "const": "normal",
+          "description": "Default neutrality.",
+          "type": "string"
+        },
+        {
+          "const": "high",
+          "description": "Cost: prefer cheap. Latency: prefer local/warm.",
+          "type": "string"
+        }
+      ]
+    },
     "SettingsFormat": {
       "description": "SettingsFormat wire values; `protocol.md` §4.1.",
       "oneOf": [
@@ -15575,6 +15748,34 @@
         }
       ]
     },
+    "SpendControl": {
+      "description": "Spend-control panel numbers (billing-site data, never inferred); §4.2.",
+      "properties": {
+        "limit": {
+          "description": "Declared period limit, decimal string in the account currency.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remainingPercent": {
+          "description": "Remaining percentage 0..=100 as reported by the billing page.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "used": {
+          "description": "Spent so far, decimal string.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "StateConfidence": {
       "description": "StateConfidence wire values; `protocol.md` §2.4.",
       "oneOf": [
@@ -15650,6 +15851,189 @@
         "subscriptionId"
       ],
       "type": "object"
+    },
+    "SupplyConcurrency": {
+      "description": "Account-level concurrency ceiling; §4.4 step 2 — the primitive that was\nentirely missing while only host `maxInstances` existed.",
+      "properties": {
+        "max": {
+          "description": "Max simultaneous in-flight uses across every host; null = undeclared.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SupplyCredits": {
+      "description": "Subscription/credits presence; §4.2.",
+      "properties": {
+        "hasCredits": {
+          "description": "Account has a credit balance; null = unknown.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "unlimited": {
+          "description": "Balance is unlimited.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "SupplyProfile": {
+      "description": "Declared supply plus observed state for one provider profile; §4.2.\n\nEvery field is optional/defaulted so a user can declare as little as\n\"workhorse: X, scarce: Y\" and grow from there. Observed runtime fields\n(`state`, `cooldownUntil`, `lastError`, window cooldowns) are written by\nthe Hub feedback loop, never by the user.",
+      "properties": {
+        "concurrency": {
+          "$ref": "#/$defs/SupplyConcurrency",
+          "default": {},
+          "description": "Account-level in-flight ceiling."
+        },
+        "cooldownUntil": {
+          "description": "Account-level cooldown epoch seconds (exponential backoff fallback).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "credits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SupplyCredits"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Credits information."
+        },
+        "dailyUsd": {
+          "description": "Optional declared aggregate limits.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "lastError": {
+          "description": "Last classified supply error (429 text, structured frame, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ordinaryUsageAllowed": {
+          "description": "Whether ordinary use is allowed; null = unknown. Per the Codex contract\nthis is NEVER inferred from percentages or reset times.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "priority": {
+          "description": "User preference order: larger wins (changed often — that is the point).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "reserve": {
+          "$ref": "#/$defs/SupplyReserve",
+          "default": "none",
+          "description": "Reserve this supply for coordinator seats."
+        },
+        "resetWindowMins": {
+          "description": "Declared primary reset window length in minutes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "spendControl": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpendControl"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Billing spend-control panel."
+        },
+        "state": {
+          "$ref": "#/$defs/SupplyState",
+          "default": "available",
+          "description": "Observed runtime state."
+        },
+        "weeklyUsd": {
+          "description": "Optional declared weekly limit.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "windows": {
+          "description": "Rate-limit windows (declared + observed merged).",
+          "items": {
+            "$ref": "#/$defs/RateLimitWindow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "reserve",
+        "concurrency",
+        "state"
+      ],
+      "type": "object"
+    },
+    "SupplyReserve": {
+      "description": "Who may spend a supply; §4.2 (`reserve`).",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Ordinary worker tasks may use it.",
+          "type": "string"
+        },
+        {
+          "const": "coordinator-only",
+          "description": "Only coordinator seats may spend it (e.g. Fable leading a loop).",
+          "type": "string"
+        }
+      ]
+    },
+    "SupplyState": {
+      "description": "Account-level supply state; §4.2.",
+      "oneOf": [
+        {
+          "const": "available",
+          "description": "Usable on the last evidence.",
+          "type": "string"
+        },
+        {
+          "const": "degraded",
+          "description": "A family-scoped window is cooling; sibling families stay usable.",
+          "type": "string"
+        },
+        {
+          "const": "cooling",
+          "description": "An account-scoped window is cooling until `cooldownUntil`/reset.",
+          "type": "string"
+        },
+        {
+          "const": "exhausted",
+          "description": "Declared/explicitly observed as fully spent.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Gateway-style supply with no windows the Hub can read; used only when\nexplicitly prioritised or once every windowed supply is exhausted\n(design §8.3 open question 4).",
+          "type": "string"
+        }
+      ]
     },
     "Task": {
       "description": "One row of the task ledger; design §2.2/§8.1 row 4.",
@@ -15776,9 +16160,10 @@
           ]
         },
         "maxUsd": {
-          "description": "Estimated USD cap; serialised as a string to stay exact on the wire.",
+          "description": "Estimated USD cap (money is an estimate, §4.5).",
+          "format": "double",
           "type": [
-            "string",
+            "number",
             "null"
           ]
         },
@@ -15857,6 +16242,33 @@
       "pattern": "^(tsk)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "TaskPin": {
+      "description": "Explicit pin that disables automatic supply choice; §4.3.",
+      "properties": {
+        "harness": {
+          "description": "Pinned harness (`claude` / `codex` / …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Pinned model id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supplyId": {
+          "description": "Pinned supply (provider profile id).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "TaskPlacementRef": {
       "description": "Where the task's worker is (or was) placed; updated from placement rows.",
       "properties": {
@@ -15908,6 +16320,122 @@
           "description": "Latest placement-ledger row describing this slot."
         }
       },
+      "type": "object"
+    },
+    "TaskSpec": {
+      "description": "What a coordinator submits at dispatch/instance-create; §4.3.\n\nCarried additively on the instance create body as `taskSpec`. Only\n`class`/sensitivities are LLM assignments; the rest is planner bookkeeping.",
+      "properties": {
+        "allowDowngrade": {
+          "description": "Opt into picking a weaker class when nothing satisfies `minClass`.\nDefault false: unsatisfied admission is `deferred`, never downgraded.",
+          "type": "boolean"
+        },
+        "budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskBudget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Budget caps."
+        },
+        "class": {
+          "$ref": "#/$defs/TaskClass",
+          "default": "implement",
+          "description": "Task class; defaults to `implement`."
+        },
+        "contextNeed": {
+          "$ref": "#/$defs/ContextNeed",
+          "default": {},
+          "description": "Context requirements."
+        },
+        "costSensitivity": {
+          "$ref": "#/$defs/Sensitivity",
+          "default": "normal",
+          "description": "Cost sensitivity; `high` folds price into the rank."
+        },
+        "effort": {
+          "description": "Requested effort tier name (validated against catalog levels).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "latencySensitivity": {
+          "$ref": "#/$defs/Sensitivity",
+          "default": "normal",
+          "description": "Latency sensitivity; `high` favours warm/local supply."
+        },
+        "minClass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Minimum model class; admission never goes below this silently."
+        },
+        "parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Parent task in the delegation tree."
+        },
+        "pin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskPin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit harness/model/supply pin; disables auto-selection."
+        },
+        "projectId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Owning project (`prj_…`)."
+        },
+        "requires": {
+          "description": "Hard host-label requirements (`toolchain=rust`, …).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "taskId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bound task (`tsk_…`); batch 4's ledger owns the row."
+        }
+      },
+      "required": [
+        "class",
+        "contextNeed",
+        "costSensitivity",
+        "latencySensitivity"
+      ],
       "type": "object"
     },
     "TaskState": {
@@ -17104,6 +17632,26 @@
         {
           "const": "unknown",
           "description": "Wire value `unknown`.",
+          "type": "string"
+        }
+      ]
+    },
+    "WindowSource": {
+      "description": "Where a window's numbers came from; §4.1.\n\nObserved frames update `observed` fields but never erase a `declared`\nlimit; `inferred` is filled by Hub-side usage aggregation (§4.5).",
+      "oneOf": [
+        {
+          "const": "declared",
+          "description": "User-declared via `remuda profile declare` / REST.",
+          "type": "string"
+        },
+        {
+          "const": "observed",
+          "description": "Harness frame, probe, or screen text (429 / Codex rateLimits).",
+          "type": "string"
+        },
+        {
+          "const": "inferred",
+          "description": "Hub usage aggregation inferred fill level.",
           "type": "string"
         }
       ]

@@ -33,6 +33,16 @@ wire_enum!(TaskClass, "4.3", {
     Docs => "docs",
 });
 
+impl Default for TaskClass {
+    // TaskClass is a wire_enum! (no per-variant Default attribute), so the
+    // default is an explicit impl rather than a derive: §4.3 makes
+    // `implement` the implicit dispatch class.
+    #[allow(clippy::derivable_impls)]
+    fn default() -> Self {
+        TaskClass::Implement
+    }
+}
+
 impl TaskState {
     /// Legal ledger transitions; design §5.3 vocabulary plus §7 risk 8.
     ///
@@ -143,12 +153,12 @@ pub struct TaskDep {
 }
 
 /// Estimated budget envelope; design §4.3. Amounts are estimates (§4.5).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskBudget {
-    /// Estimated USD cap; serialised as a string to stay exact on the wire.
+    /// Estimated USD cap (money is an estimate, §4.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_usd: Option<String>,
+    pub max_usd: Option<f64>,
     /// Turn cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<i64>,
@@ -179,7 +189,7 @@ pub struct TaskPlacementRef {
 }
 
 /// One row of the task ledger; design §2.2/§8.1 row 4.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
     /// `meta`.

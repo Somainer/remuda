@@ -529,6 +529,8 @@ pub(crate) async fn handle_node_method(
                 if !appended.replayed {
                     publish_journal(&state.bus, &appended.record);
                     crate::alerts::observe(state, &appended.record);
+                    crate::usage_store::observe_journal(state, &appended.record).await;
+                    crate::supply::observe_journal_text(state, &appended.record).await;
                 }
                 seq = Some(appended.record.seq.saturating_add(1));
                 last = Some(appended);

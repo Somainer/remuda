@@ -38,7 +38,7 @@ struct DepBody {
 #[serde(rename_all = "camelCase")]
 struct BudgetBody {
     #[serde(default)]
-    max_usd: Option<String>,
+    max_usd: Option<f64>,
     #[serde(default)]
     max_turns: Option<i64>,
     #[serde(default)]

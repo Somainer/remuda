@@ -109,6 +109,12 @@ pub struct CreateInstanceBody {
     /// Bound task (`tsk_…`).
     #[serde(default, rename = "taskId")]
     task_id: Option<String>,
+    /// Dispatch task spec; §4.3. When present the Hub runs the §4.4 supply
+    /// admission (capability → windows/concurrency → rank) before host
+    /// resolution; unsatisfied admission is a 429 SUPPLY_DEFERRED, never a
+    /// silent downgrade.
+    #[serde(default, rename = "taskSpec")]
+    task_spec: Option<remuda_protocol::TaskSpec>,
 }
 
 fn default_kind() -> String {
@@ -852,7 +858,70 @@ pub async fn create_instance(
     )?;
     let project_provider = project.as_ref().map(|project| project.provider.clone());
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
-    let hosts = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
+    let mut hosts = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
+
+    // ── §4.4 model-supply admission (coordinator dispatch only) ──────────
+    // A plain New Session request (no taskSpec) keeps the legacy provider
+    // waterfall untouched. A dispatch with a task spec is admitted: the
+    // chosen (profile, model) becomes an explicit launch request, and no
+    // admissible candidate is an explicit deferred 429 carrying the ranked
+    // decision (never a downgrade below minClass).
+    let mut supply_decision: Option<serde_json::Value> = None;
+    if let Some(task_spec) = body.task_spec.as_ref() {
+        let coordinator = match device.instance_id.as_deref() {
+            None => true,
+            Some(instance_id) => {
+                let caller_instance = state
+                    .store
+                    .get_instance(instance_id.into())
+                    .await?
+                    .ok_or(HubError::Forbidden)?;
+                caller_instance
+                    .grants
+                    .iter()
+                    .any(|verb| verb == "dispatch" || verb == "spend")
+            }
+        };
+        let decision = crate::supply::solve_state(&state, task_spec, &hosts, coordinator).await?;
+        if decision.deferred {
+            return Err(HubError::SupplyDeferred {
+                decision: decision.to_json(),
+            });
+        }
+        let chosen_supply = decision
+            .chosen
+            .as_ref()
+            .expect("non-deferred supply decision has a choice");
+        let chosen_profile = state
+            .store
+            .get_provider(chosen_supply.profile_id.clone())
+            .await?
+            .ok_or(HubError::BadRequest(
+                "supply decision named a profile that vanished".into(),
+            ))?;
+        if let Some(obj) = spec.as_object_mut() {
+            obj.insert("model".into(), json!(chosen_supply.model_id));
+            obj.insert("providerProfileId".into(), json!(chosen_supply.profile_id));
+            if obj.get("delegation").is_none_or(Value::is_null) {
+                obj.insert(
+                    "delegation".into(),
+                    json!(if chosen_profile.kind == "native" {
+                        "none"
+                    } else if chosen_profile.kind == "direct" {
+                        "direct"
+                    } else {
+                        "gateway"
+                    }),
+                );
+            }
+        }
+        // Try the supply solver's host (least-loaded allowed host) first.
+        if let Some(preferred) = &chosen_supply.host_id {
+            hosts.sort_by_key(|host| if &host.host_id == preferred { 0 } else { 1 });
+        }
+        supply_decision = Some(decision.to_json());
+    }
+
     let mut reasons = Vec::new();
     let mut provider_reasons = Vec::new();
     let mut chosen = None;
@@ -931,6 +1000,32 @@ pub async fn create_instance(
         },
     )
     .await?;
+    // §5.6 placement ledger: the same reasons[]/rejected[] JSON that goes to
+    // the bot card and the audit trail.
+    if let Some(decision) = supply_decision {
+        let profile_id = decision
+            .pointer("/chosen/profileId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let model_id = decision
+            .pointer("/chosen/modelId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Err(error) = state
+            .store
+            .insert_placement_ledger(
+                Some(instance.instance_id.clone()),
+                placement_project_id,
+                profile_id,
+                model_id,
+                Some(host.host_id.clone()),
+                decision,
+            )
+            .await
+        {
+            tracing::warn!(%error, "placement ledger write failed");
+        }
+    }
     Ok(Json(
         json!({ "instance": instance, "command": command, "hostId": host.host_id }),
     ))

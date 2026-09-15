@@ -32,6 +32,15 @@ pub fn routes() -> Router<AppState> {
                 .delete(delete_provider),
         )
         .route("/v1/providers/{id}/test", post(test_provider))
+        .route(
+            "/v1/providers/{id}/supply",
+            get(get_supply).put(declare_supply),
+        )
+        .route(
+            "/v1/providers/{id}/supply/events",
+            post(report_supply_event),
+        )
+        .route("/v1/providers/{id}/usage", get(provider_usage))
 }
 
 #[derive(Deserialize)]
@@ -54,6 +63,9 @@ struct CreateBody {
     default_gateway: bool,
     #[serde(default)]
     scope: Option<String>,
+    /// Declared supply envelope (coordinator §4.2); optional.
+    #[serde(default)]
+    supply: Option<remuda_protocol::SupplyProfile>,
 }
 
 fn default_kind() -> String {
@@ -81,6 +93,9 @@ struct PatchBody {
     default_gateway: Option<bool>,
     #[serde(default)]
     scope: Option<String>,
+    /// Replace the declared supply envelope (observations merged, not wiped).
+    #[serde(default)]
+    supply: Option<remuda_protocol::SupplyProfile>,
 }
 
 /// `POST /v1/providers/discover` body: probe a gateway before it is saved.
@@ -153,23 +168,35 @@ async fn create_provider(
     let name = validate_name(&body.name)?;
     let base_url = validate_base_url(&body.base_url, &kind)?;
     let headers_map = sanitize_headers(body.headers)?;
+    // Secret-less profiles are legal: a native login (§4.1) has no token to
+    // store, and a supply declaration may precede the token entry. A gateway
+    // profile still requires its token.
     let token = body
         .auth_token
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| HubError::BadRequest("authToken is required on create".into()))?;
+        .filter(|s| !s.is_empty());
+    if kind == "gateway" && token.is_none() {
+        return Err(HubError::BadRequest(
+            "authToken is required on create".into(),
+        ));
+    }
     let default_gateway = body.default_gateway && kind == "gateway";
     let scope = validate_scope(&state, body.scope.as_deref()).await?;
     let models = provider_models::from_value(&body.models);
     let default_model = resolve_default_model(body.default_model.as_deref(), &models)?;
-    let (fingerprint, last4) = fingerprint_secret(token.as_bytes());
+    let (fingerprint, last4) = token
+        .map(|token| fingerprint_secret(token.as_bytes()))
+        .unzip();
     let id = crate::config::new_id("pvp").map_err(|err| HubError::Internal(err.to_string()))?;
-    let secret_name = vault_name(&id);
-    state
-        .secrets
-        .put(&secret_name, token.as_bytes())
-        .map_err(|err| HubError::Internal(format!("secret store: {err}")))?;
+    let secret_name = token.map(|_| vault_name(&id));
+    if let (Some(token), Some(secret_name)) = (token, secret_name.as_ref()) {
+        state
+            .secrets
+            .put(secret_name, token.as_bytes())
+            .map_err(|err| HubError::Internal(format!("secret store: {err}")))?;
+    }
+    let supply = body.supply.unwrap_or_default();
     let profile = match state
         .store
         .insert_provider(
@@ -182,15 +209,18 @@ async fn create_provider(
             headers_map,
             default_gateway,
             scope,
-            Some(secret_name.clone()),
-            Some(last4),
-            Some(fingerprint),
+            secret_name.clone(),
+            last4,
+            fingerprint,
+            supply,
         )
         .await
     {
         Ok(profile) => profile,
         Err(err) => {
-            let _ = state.secrets.delete(&secret_name);
+            if let Some(secret_name) = &secret_name {
+                let _ = state.secrets.delete(secret_name);
+            }
             return Err(map_store(err));
         }
     };
@@ -277,6 +307,7 @@ async fn patch_provider(
             secret_name,
             secret_last4,
             secret_fingerprint,
+            body.supply,
         )
         .await
         .map_err(map_store)?;
@@ -599,8 +630,11 @@ fn normalize_kind(kind: &str) -> Result<String, HubError> {
     match kind.trim() {
         "gateway" => Ok("gateway".into()),
         "direct" => Ok("direct".into()),
+        // A secret-less native-login account row: its only job is to declare
+        // supply for a host CLI login the Hub holds no token for (§4.1).
+        "native" => Ok("native".into()),
         other => Err(HubError::BadRequest(format!(
-            "kind must be gateway or direct, not {other}"
+            "kind must be gateway, direct, or native, not {other}"
         ))),
     }
 }
@@ -617,7 +651,7 @@ fn validate_name(name: &str) -> Result<String, HubError> {
 
 fn validate_base_url(raw: &str, kind: &str) -> Result<String, HubError> {
     let raw = raw.trim();
-    if kind == "direct" && raw.is_empty() {
+    if kind == "direct" || kind == "native" {
         return Ok(String::new());
     }
     if raw.is_empty() {
@@ -860,4 +894,277 @@ fn sanitize_probe_error(err: &reqwest::Error, token: Option<&str>) -> String {
         text = text.replace(token, "[redacted]");
     }
     text
+}
+
+// ── declared supply + observed events (coordinator §4.2, §4.5) ─────────────
+
+/// `GET /v1/providers/:id/supply` — declared + observed supply envelope.
+async fn get_supply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    crate::agent_scope::require_operator(&state, &headers).await?;
+    let profile = state
+        .store
+        .get_provider(id)
+        .await?
+        .ok_or(HubError::NotFound)?;
+    Ok(Json(json!({
+        "id": profile.id,
+        "name": profile.name,
+        "supply": profile.supply,
+        "catalogRevision": crate::model_catalog::CATALOG_REVISION,
+        "catalogUpdated": crate::model_catalog::CATALOG_UPDATED,
+    })))
+}
+
+/// `PUT /v1/providers/:id/supply` — replace the user-declared envelope while
+/// preserving observed runtime fields (cooldowns, lastError) and merged
+/// window observations.
+async fn declare_supply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(declared): Json<remuda_protocol::SupplyProfile>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    require_device(&state.store, &headers).await?;
+    let existing = state
+        .store
+        .get_provider(id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let merged = merge_declared_supply(existing.supply, declared);
+    let profile = state
+        .store
+        .update_provider_supply(id, merged.clone())
+        .await
+        .map_err(map_store)?;
+    let _ = state
+        .store
+        .append_audit(
+            "operator".into(),
+            "supply.declare".into(),
+            Some(profile.id.clone()),
+            json!({"priority": merged.priority,
+                   "concurrencyMax": merged.concurrency.max,
+                   "windows": merged.windows.len()}),
+        )
+        .await;
+    Ok(Json(json!({ "id": profile.id, "supply": profile.supply })))
+}
+
+/// Preserve runtime-managed fields when an operator re-declares.
+fn merge_declared_supply(
+    current: remuda_protocol::SupplyProfile,
+    mut declared: remuda_protocol::SupplyProfile,
+) -> remuda_protocol::SupplyProfile {
+    // Declared windows keep runtime cooldown/usedPercent state when the
+    // declaration still names them by id (observed fields are never cleared).
+    for window in &mut declared.windows {
+        if let Some(existing) = current.windows.iter().find(|w| w.id == window.id) {
+            if window.cooldown_until.is_none() {
+                window.cooldown_until = existing.cooldown_until;
+            }
+            if window.used_percent.is_none() {
+                window.used_percent = existing.used_percent;
+            }
+            if window.observed_at.is_none() {
+                window.observed_at = existing.observed_at;
+            }
+            window.backoff_attempts = existing.backoff_attempts;
+        }
+    }
+    // Operator never manages runtime state directly; carry the observed
+    // windows that the new declaration dropped.
+    for existing in current.windows {
+        if !declared.windows.iter().any(|w| w.id == existing.id)
+            && existing.cooldown_until.is_some()
+        {
+            declared.windows.push(existing);
+        }
+    }
+    declared.state = current.state;
+    declared.cooldown_until = current.cooldown_until;
+    declared.last_error = current.last_error;
+    declared
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SupplyEventBody {
+    /// `textual` (429/529 line + optional httpStatus) or `structured`
+    /// (Codex `account/rateLimits/updated` shape).
+    #[serde(rename = "type")]
+    event_type: String,
+    /// Raw screen/journal text for textual events.
+    #[serde(default)]
+    text: String,
+    /// HTTP status when the text came from a probe/response.
+    #[serde(default)]
+    http_status: Option<u16>,
+    /// Model/family this event concerns (defaults to the profile's workhorse).
+    #[serde(default)]
+    model: Option<String>,
+    /// Structured window frames.
+    #[serde(default)]
+    windows: Vec<remuda_protocol::RateLimitWindow>,
+}
+
+/// `POST /v1/providers/:id/supply/events` — report observed supply evidence
+/// (probe results, synthetic tests, future Node relay). A 429 cools, a 529
+/// records but cools nothing.
+async fn report_supply_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<SupplyEventBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    require_device(&state.store, &headers).await?;
+    let profile = state
+        .store
+        .get_provider(id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let mut supply = profile.supply.clone();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let (action, cooled) = match body.event_type.as_str() {
+        "textual" => {
+            let model_id = body
+                .model
+                .or_else(|| profile.default_model.clone())
+                .unwrap_or_default();
+            let family = crate::supply::family_of(&profile, &model_id);
+            let signal = crate::supply::observe_textual_event(
+                &mut supply.windows,
+                &family,
+                body.http_status,
+                &body.text,
+                now,
+            );
+            match signal {
+                Some(crate::supply::RateSignal::RateLimited) => ("supply.cooldown", vec![family]),
+                Some(crate::supply::RateSignal::FleetOverloaded) => {
+                    supply.last_error =
+                        Some("upstream fleet overload (529); windows not cooled".to_string());
+                    ("supply.overload-observed", Vec::new())
+                }
+                None => {
+                    return Err(HubError::BadRequest(
+                        "text did not match a 429/rate-limit or 529/overload signal".into(),
+                    ));
+                }
+            }
+        }
+        "structured" => {
+            if body.windows.is_empty() {
+                return Err(HubError::BadRequest(
+                    "structured event requires windows[]".into(),
+                ));
+            }
+            let observed = remuda_protocol::ObservedRateLimits {
+                windows: body.windows,
+            };
+            crate::supply::apply_structured_windows(&mut supply.windows, &observed, now);
+            ("supply.rate-limits-observed", Vec::new())
+        }
+        other => {
+            return Err(HubError::BadRequest(format!(
+                "event type must be textual or structured, not {other}"
+            )));
+        }
+    };
+    supply.state = crate::supply::refresh_state(&mut supply.windows, None, now);
+    supply.cooldown_until = supply
+        .windows
+        .iter()
+        .filter(|w| w.is_account_level())
+        .filter_map(|w| w.cooldown_until)
+        .max();
+    if action == "supply.cooldown" {
+        supply.last_error = Some(format!("429 observed for families {cooled:?}"));
+    }
+    let saved = state
+        .store
+        .update_provider_supply(id, supply.clone())
+        .await
+        .map_err(map_store)?;
+    let _ = state
+        .store
+        .append_audit(
+            "operator".into(),
+            action.into(),
+            Some(saved.id.clone()),
+            json!({"cooledFamilies": cooled, "state": format!("{:?}", supply.state)}),
+        )
+        .await;
+    Ok(Json(json!({ "id": saved.id, "supply": saved.supply })))
+}
+
+/// `GET /v1/providers/:id/usage?budgetMaxUsd=…` — Hub-side usage aggregation
+/// (§4.5): per-model token/cost totals from journaled `usage` events plus the
+/// estimate×1.15 budget band. Money is always an estimate.
+async fn provider_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<Value>, HubError> {
+    crate::agent_scope::require_operator(&state, &headers).await?;
+    let profile = state
+        .store
+        .get_provider(id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let models: Vec<Value> = {
+        let store = state.store.clone();
+        let ids: Vec<String> = profile.models.iter().map(|m| m.id.clone()).collect();
+        let mut out = Vec::new();
+        for model in ids {
+            let id_for = id.clone();
+            let model_for = model.clone();
+            let agg = store
+                .run(move |conn| {
+                    crate::usage_store::aggregate_supply(conn, &id_for, &model_for)
+                        .map_err(crate::store::StoreError::from)
+                })
+                .await
+                .map_err(map_store)?;
+            if agg.events == 0 {
+                continue;
+            }
+            let budget_max = query.budget_max_usd;
+            out.push(json!({
+                "model": model,
+                "events": agg.events,
+                "totalTokens": agg.total_tokens,
+                "inputTokens": agg.input_tokens,
+                "outputTokens": agg.output_tokens,
+                "estimatedUsd": agg.cost_usd,
+                "budgetStatus": match agg.budget_status(budget_max) {
+                    crate::usage_store::BudgetStatus::Ok => "ok",
+                    crate::usage_store::BudgetStatus::Warn => "warn",
+                    crate::usage_store::BudgetStatus::Stop => "stop",
+                },
+                "estimated": true,
+            }));
+        }
+        out
+    };
+    Ok(Json(json!({
+        "id": profile.id,
+        "models": models,
+        "budgetStopFactor": crate::usage_store::BUDGET_STOP_FACTOR,
+        "note": "costs are estimates (估算); hard cap band is estimate x 1.15",
+    })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UsageQuery {
+    /// Optional estimated USD budget to grade the band against.
+    #[serde(default)]
+    budget_max_usd: Option<f64>,
 }

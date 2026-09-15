@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as store from "../lib/store";
 import { readDeviceSettings } from "../features/settings";
 import { SettingsPage } from "./SettingsPage";
+import { api } from "../lib/api";
+import { mockDb } from "../lib/mock";
 
 const pushMock = vi.hoisted(() => ({
   readPushStatus: vi.fn(),
@@ -51,10 +53,10 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("grouping and anchors", () => {
-  it("renders the three anchored groups with in-page navigation", () => {
+  it("renders the anchored groups with in-page navigation", () => {
     renderSettings(["/settings"]);
     expect(screen.getByTestId("settings-nav")).toBeInTheDocument();
-    for (const id of ["appearance", "notifications", "connection"]) {
+    for (const id of ["appearance", "notifications", "connection", "host-defaults"]) {
       const link = screen.getByTestId(`settings-nav-${id}`);
       expect(link).toHaveAttribute("href", `/settings#${id}`);
       expect(screen.getByTestId(`settings-group-${id}`)).toBeInTheDocument();
@@ -253,5 +255,77 @@ describe("kept sections", () => {
     const providers = screen.getByRole("link", { name: "Provider" });
     expect(providers).toHaveAttribute("href", "/providers");
     expect(screen.getByRole("link", { name: "主机" })).toHaveAttribute("href", "/hosts");
+  });
+});
+
+
+describe("host renderer defaults use grouped explicit saves", () => {
+  const host = { ...mockDb.hosts[0], defaultTui: "default" as const };
+  const field = `settings-host-tui-${host.id}`;
+  const group = `settings-host-defaults-${host.id}`;
+
+  function setupHost() {
+    vi.mocked(store.useHub).mockReturnValue({ ...baseHub, hosts: [host] });
+    vi.spyOn(store.hubStore, "refreshHosts").mockResolvedValue(undefined);
+    renderSettings(["/settings#host-defaults"]);
+  }
+
+  it("focuses the host group and saves the single renderer field only after explicit Save", async () => {
+    const patch = vi.spyOn(api, "hostPatch").mockResolvedValue({ ...host, defaultTui: "fullscreen" });
+    setupHost();
+    expect(screen.getByTestId("settings-nav-host-defaults")).toHaveAttribute("aria-current", "true");
+    expect(document.activeElement).toBe(screen.getByTestId("settings-group-host-defaults"));
+    expect(screen.getAllByTestId(field)).toHaveLength(1);
+    expect(screen.queryByTestId("settings-host-tui")).not.toBeInTheDocument();
+    expect(screen.getByTestId(`${group}-save`)).toBeDisabled();
+    fireEvent.change(screen.getByTestId(field), { target: { value: "fullscreen" } });
+    expect(patch).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId(`${group}-save`));
+    expect(screen.getByTestId(`${group}-status`)).toHaveTextContent("保存中");
+    expect(screen.getByTestId(field)).toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId(`${group}-status`)).toHaveTextContent("已保存"));
+    expect(patch).toHaveBeenCalledExactlyOnceWith(host.id, { defaultTui: "fullscreen" });
+    expect(screen.getByTestId(`${group}-save`)).toBeDisabled();
+  });
+
+  it("rolls a rejected change back to the latest server-confirmed renderer", async () => {
+    const patch = vi.spyOn(api, "hostPatch")
+      .mockResolvedValueOnce({ ...host, defaultTui: "fullscreen" })
+      .mockRejectedValueOnce(new Error("主机拒绝保存"));
+    setupHost();
+    fireEvent.change(screen.getByTestId(field), { target: { value: "fullscreen" } });
+    fireEvent.click(screen.getByTestId(`${group}-save`));
+    await waitFor(() => expect(screen.getByTestId(`${group}-status`)).toHaveTextContent("已保存"));
+    fireEvent.change(screen.getByTestId(field), { target: { value: "default" } });
+    fireEvent.click(screen.getByTestId(`${group}-save`));
+    await waitFor(() => expect(screen.getByTestId(`${group}-status`)).toHaveTextContent("失败：主机拒绝保存"));
+    expect(screen.getByTestId(field)).toHaveValue("fullscreen");
+    expect(patch).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId(`${group}-save`)).toBeDisabled();
+  });
+
+  it("reset discards only the host renderer draft without making a request", () => {
+    const patch = vi.spyOn(api, "hostPatch");
+    setupHost();
+    fireEvent.change(screen.getByTestId("settings-device-name"), { target: { value: "unsaved-device" } });
+    fireEvent.change(screen.getByTestId(field), { target: { value: "fullscreen" } });
+    fireEvent.click(screen.getByTestId(`${group}-reset`));
+    expect(screen.getByTestId(field)).toHaveValue("default");
+    expect(screen.getByTestId("settings-device-name")).toHaveValue("unsaved-device");
+    expect(screen.getByTestId(`${group}-save`)).toBeDisabled();
+    expect(patch).not.toHaveBeenCalled();
+  });
+
+  it("keeps a confirmed save and unrelated drafts when the follow-up refresh fails", async () => {
+    vi.spyOn(api, "hostPatch").mockResolvedValue({ ...host, defaultTui: "fullscreen" });
+    setupHost();
+    vi.mocked(store.hubStore.refreshHosts).mockRejectedValue(new Error("refresh unavailable"));
+    fireEvent.change(screen.getByTestId("settings-device-name"), { target: { value: "unsaved-device" } });
+    fireEvent.change(screen.getByTestId(field), { target: { value: "fullscreen" } });
+    fireEvent.click(screen.getByTestId(`${group}-save`));
+    await waitFor(() => expect(screen.getByTestId(`${group}-status`)).toHaveTextContent("已保存"));
+    expect(screen.getByTestId(field)).toHaveValue("fullscreen");
+    expect(screen.getByTestId("settings-device-name")).toHaveValue("unsaved-device");
+    expect(screen.getByTestId("settings-identity-save")).toBeEnabled();
   });
 });

@@ -1251,7 +1251,7 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
 
     let host_path = format!("/v1/hosts/{}", host_id.as_id().as_str());
 
-    // PATCH stores both defaults and the view reports them back.
+    // PATCH stores launch defaults and the view reports them back.
     let (status, _, patched) = http(
         hub.addr,
         "PATCH",
@@ -1260,7 +1260,8 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
         Some(
             &json!({
                 "defaultLaunchArgs": ["--effort", "high"],
-                "claudeBinaryPath": "/opt/claude/bin/claude"
+                "claudeBinaryPath": "/opt/claude/bin/claude",
+                "defaultTui": "default"
             })
             .to_string(),
         ),
@@ -1270,6 +1271,15 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
     let patched: Value = serde_json::from_str(patched.trim())?;
     assert_eq!(patched["defaultLaunchArgs"], json!(["--effort", "high"]));
     assert_eq!(patched["claudeBinaryPath"], json!("/opt/claude/bin/claude"));
+
+    assert_eq!(patched["defaultTui"], json!("default"));
+    let (status, _, loaded) =
+        http(hub.addr, "GET", &host_path, &[("Cookie", &cookie)], None).await?;
+    assert_eq!(status, 200, "{loaded}");
+    assert_eq!(
+        serde_json::from_str::<Value>(loaded.trim())?["defaultTui"],
+        json!("default")
+    );
 
     // A flag the allowlist refuses is a 400 on the PATCH, not a surprise at
     // the next launch.
@@ -1283,7 +1293,7 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
     .await?;
     assert_eq!(status, 400, "{rejected}");
 
-    // A create that omits both inherits the host defaults.
+    // A create that omits launch preferences inherits the host defaults.
     let create = |extra: Value| {
         let mut body = json!({
             "hostId": host_id.as_id().as_str(),
@@ -1309,6 +1319,11 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
     .await?;
     assert_eq!(status, 200, "{body}");
 
+    assert_eq!(
+        serde_json::from_str::<Value>(body.trim())?["instance"]["tui"],
+        json!("default")
+    );
+
     // A session value REPLACES the host default rather than concatenating:
     // two arg lists merged would repeat a flag, which the allowlist refuses.
     let (status, _, body) = http(
@@ -1318,7 +1333,8 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
         &[("Cookie", &cookie)],
         Some(&create(json!({
             "args": ["--effort", "low"],
-            "binaryPath": "/opt/claude-2.2/bin/claude"
+            "binaryPath": "/opt/claude-2.2/bin/claude",
+            "tui": "fullscreen"
         }))),
     )
     .await?;
@@ -1333,6 +1349,8 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
     assert_eq!(specs.len(), 2, "two creates were forwarded: {frames:?}");
     assert_eq!(specs[0]["args"], json!(["--effort", "high"]));
     assert_eq!(specs[0]["binaryPath"], json!("/opt/claude/bin/claude"));
+    assert_eq!(specs[0]["tui"], json!("default"));
+    assert_eq!(specs[1]["tui"], json!("fullscreen"));
     assert_eq!(specs[1]["args"], json!(["--effort", "low"]));
     assert_eq!(
         specs[1]["binaryPath"],
@@ -1357,13 +1375,37 @@ async fn host_launch_defaults_round_trip_and_a_session_replaces_them() -> Result
         "PATCH",
         &host_path,
         &[("Cookie", &cookie)],
-        Some(&json!({ "defaultLaunchArgs": null, "claudeBinaryPath": null }).to_string()),
+        Some(
+            &json!({ "defaultLaunchArgs": null, "claudeBinaryPath": null, "defaultTui": null })
+                .to_string(),
+        ),
     )
     .await?;
     assert_eq!(status, 200, "{cleared}");
     let cleared: Value = serde_json::from_str(cleared.trim())?;
     assert!(cleared["defaultLaunchArgs"].is_null(), "{cleared}");
     assert!(cleared["claudeBinaryPath"].is_null(), "{cleared}");
+    assert!(cleared["defaultTui"].is_null(), "{cleared}");
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create(json!({}))),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(body.trim())?["instance"]["tui"],
+        json!("fullscreen")
+    );
+    let frames = seen.lock().expect("lock");
+    let last = frames
+        .iter()
+        .rev()
+        .find(|frame| frame["method"] == json!("instance.create"))
+        .expect("third create");
+    assert_eq!(last["params"]["spec"]["tui"], json!("fullscreen"));
     Ok(())
 }
 
@@ -2183,6 +2225,25 @@ async fn tty_binary_frames_are_scoped_to_the_registering_socket() -> Result<()> 
     let resnapshot = recv_json(&mut follow).await?;
     assert_eq!(resnapshot["type"], json!("snapshot"));
 
+    let attach = recv_json(&mut node_a).await?;
+    assert_eq!(attach["method"], json!("tty.attach"));
+    node_a
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": attach["id"],
+                "result": { "streamId": stream_id.as_str(), "snapshotBase64": "" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    let unknown_mode = recv_json(&mut follow).await?;
+    assert_eq!(unknown_mode["type"], json!("tty.mode"));
+    assert_eq!(unknown_mode["altScreen"], Value::Null);
+    assert_eq!(unknown_mode["streamId"], json!(stream_id.as_str()));
+
     // Host B replays A's stream UUID on its own socket.
     let host_b = HostId::new();
     let enroll_b = enroll_token(hub.addr, &cookie).await?;
@@ -2190,6 +2251,13 @@ async fn tty_binary_frames_are_scoped_to_the_registering_socket() -> Result<()> 
     let uuid = StreamUuid::from_prefixed_id(stream_id.as_str()).expect("stream uuid");
     let forged = encode_binary_frame(BinaryChannel::TtyOutput, uuid, 0, b"forged")?;
     node_b.send(Message::Binary(forged.into())).await?;
+
+    node_b.send(Message::Text(json!({
+        "jsonrpc": "2.0", "id": "forged-mode", "method": "tty.mode",
+        "params": { "instanceId": instance_a.as_id().as_str(), "streamId": stream_id.as_str(), "altScreen": true }
+    }).to_string().into())).await?;
+    let refused = recv_json(&mut node_b).await?;
+    assert!(refused.get("error").is_some(), "{refused}");
 
     // Nothing must reach A's follower from B.
     let leaked = tokio::time::timeout(Duration::from_millis(400), follow.next()).await;
@@ -2212,6 +2280,28 @@ async fn tty_binary_frames_are_scoped_to_the_registering_socket() -> Result<()> 
         }
         other => anyhow::bail!("unexpected follow frame {other:?}"),
     }
+    // Renderer observations use the same host/instance/stream binding.
+    for alt_screen in [false, true] {
+        node_a.send(Message::Text(json!({
+            "jsonrpc": "2.0", "id": "mode", "method": "tty.mode",
+            "params": { "instanceId": instance_a.as_id().as_str(), "streamId": stream_id.as_str(), "altScreen": alt_screen }
+        }).to_string().into())).await?;
+        let ack = recv_json(&mut node_a).await?;
+        assert_eq!(ack["result"]["ok"], json!(true), "{ack}");
+        let observed = recv_json(&mut follow).await?;
+        assert_eq!(observed["event"]["type"], json!("tty.mode"));
+        assert_eq!(observed["event"]["params"]["altScreen"], json!(alt_screen));
+        assert_eq!(
+            observed["event"]["params"]["streamId"],
+            json!(stream_id.as_str())
+        );
+    }
+    let unknown_stream = remuda_protocol::Id::new("tty")?;
+    node_a.send(Message::Text(json!({
+        "jsonrpc": "2.0", "id": "unbound-mode", "method": "tty.mode",
+        "params": { "instanceId": instance_a.as_id().as_str(), "streamId": unknown_stream.as_str(), "altScreen": true }
+    }).to_string().into())).await?;
+    assert!(recv_json(&mut node_a).await?.get("error").is_some());
     Ok(())
 }
 

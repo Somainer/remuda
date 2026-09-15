@@ -96,6 +96,7 @@ fn public_wire_types_are_registered_for_generation() {
         "JournalAppendParams",
         "JournalSeqWatermark",
         "TtyFrameParams",
+        "TtyModeParams",
         "TtyWriteParams",
         "TtyResizeParams",
         "TtyAttachParams",

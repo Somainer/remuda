@@ -1,15 +1,19 @@
 import { useState } from "react";
+import type { TuiMode } from "../../types/instance";
+import { TUI_OPTIONS } from "../../lib/sessionOptions";
 import ui from "../../styles/ui.module.css";
 import css from "./hosts.module.css";
 
 export type LaunchDefaultsPatch = {
   defaultLaunchArgs?: string[] | null;
+  defaultTui?: TuiMode | null;
   claudeBinaryPath?: string | null;
 };
 
 type Props = {
   args: string[] | undefined;
   binaryPath: string | undefined;
+  tui?: TuiMode;
   /** Probed `claude` path from HostCli, shown as the placeholder. */
   probedBinaryPath?: string;
   disabled?: boolean;
@@ -29,23 +33,26 @@ export function parseLaunchArgs(raw: string): string[] {
  * path and, for args, get rejected by the allowlist for a flag the operator
  * was still typing.
  */
-export function HostLaunchDefaults({ args, binaryPath, probedBinaryPath, disabled, onSave }: Props) {
+export function HostLaunchDefaults({ args, binaryPath, tui, probedBinaryPath, disabled, onSave }: Props) {
   const savedArgs = (args ?? []).join(" ");
   const savedBinary = binaryPath ?? "";
+  const savedTui = tui ?? "fullscreen";
   const [argsDraft, setArgsDraft] = useState(savedArgs);
   const [binaryDraft, setBinaryDraft] = useState(savedBinary);
+  const [tuiDraft, setTuiDraft] = useState(savedTui);
   // Re-sync when the host row changes underneath (another tab, a refetch)
   // without an effect: comparing against the last-seen saved value during
   // render avoids the extra render pass an effect would cause.
-  const [seen, setSeen] = useState({ args: savedArgs, binary: savedBinary });
-  if (seen.args !== savedArgs || seen.binary !== savedBinary) {
-    setSeen({ args: savedArgs, binary: savedBinary });
+  const [seen, setSeen] = useState({ args: savedArgs, binary: savedBinary, tui: savedTui });
+  if (seen.args !== savedArgs || seen.binary !== savedBinary || seen.tui !== savedTui) {
+    setSeen({ args: savedArgs, binary: savedBinary, tui: savedTui });
     setArgsDraft(savedArgs);
     setBinaryDraft(savedBinary);
+    setTuiDraft(savedTui);
   }
 
   const tokens = parseLaunchArgs(argsDraft);
-  const dirty = argsDraft.trim() !== savedArgs.trim() || binaryDraft.trim() !== savedBinary.trim();
+  const dirty = argsDraft.trim() !== savedArgs.trim() || binaryDraft.trim() !== savedBinary.trim() || tuiDraft !== savedTui;
 
   return (
     <div className={ui.field} data-testid="host-launch-defaults">
@@ -73,6 +80,18 @@ export function HostLaunchDefaults({ args, binaryPath, probedBinaryPath, disable
         value={binaryDraft}
         onChange={(e) => setBinaryDraft(e.target.value)}
       />
+      <label className={ui.field}>
+        Claude 默认终端渲染
+        <select
+          className={ui.input}
+          data-testid="host-default-tui"
+          value={tuiDraft}
+          disabled={disabled}
+          onChange={(e) => setTuiDraft(e.target.value as TuiMode)}
+        >
+          {TUI_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+        </select>
+      </label>
       <p className={css.hint}>
         新建会话留空时套用；会话自己填了就整组替换，不是拼接。可执行文件由 Node 校验，Hub 只存字符串。
       </p>
@@ -87,6 +106,7 @@ export function HostLaunchDefaults({ args, binaryPath, probedBinaryPath, disable
           onSave({
             defaultLaunchArgs: tokens.length ? tokens : null,
             claudeBinaryPath: binaryDraft.trim() || null,
+            ...(tuiDraft !== savedTui ? { defaultTui: tuiDraft } : {}),
           })
         }
       >

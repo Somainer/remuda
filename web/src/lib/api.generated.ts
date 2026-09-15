@@ -1256,6 +1256,11 @@ export interface components {
             claudeBinaryPath?: string | null;
             /** @description Per-host default extra CLI args. Null clears the default. */
             defaultLaunchArgs?: string[] | null;
+            /**
+             * @description Per-host requested renderer. Null restores the fullscreen default.
+             * @enum {string|null}
+             */
+            defaultTui?: "fullscreen" | "default" | null;
             labels?: string[];
             maxInstances?: number;
             name?: string;
@@ -1271,6 +1276,11 @@ export interface components {
             cli?: components["schemas"]["HostCli"][];
             /** @description Per-host default extra CLI args, used when a create omits args. */
             defaultLaunchArgs?: string[] | null;
+            /**
+             * @description Per-host requested renderer. Null restores the fullscreen default.
+             * @enum {string|null}
+             */
+            defaultTui?: "fullscreen" | "default" | null;
             herdr?: {
                 [key: string]: unknown;
             } | null;
@@ -1359,6 +1369,8 @@ export interface components {
             settingsOverlayPath?: string;
             taskId?: string;
             title?: string;
+            /** @description Requested renderer. Omission inherits the host default, then fullscreen. */
+            tui?: components["schemas"]["TuiMode"];
             workspaceId?: string;
             /** @description Worktree name created by remuda worktree create. */
             worktree?: string;
@@ -1449,6 +1461,8 @@ export interface components {
              */
             readonly signalTier?: "hook" | "file" | "osc" | "screen" | "none" | null;
             title?: string | null;
+            /** @description Requested launch renderer. Actual mode is reported by tty snapshot altScreen. */
+            readonly tui?: components["schemas"]["TuiMode"];
             updatedAt?: string;
             workspaceId?: string | null;
         } & {
@@ -2023,6 +2037,8 @@ export interface components {
             reason?: string;
             state: components["schemas"]["TaskState"];
         };
+        /** @enum {string} */
+        TuiMode: "fullscreen" | "default";
         WorktreeCreate: {
             /** @description Start-point (default main). */
             base?: string;

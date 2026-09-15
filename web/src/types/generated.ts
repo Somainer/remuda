@@ -1302,6 +1302,7 @@ export type InstanceSpec = ({
   "requiredCapabilities": ((CapabilityName)[]);
   "schemaVersion": SchemaVersion;
   "settingsOverlay": SettingsOverlay;
+  "tui"?: (TuiMode | (null));
   "workspaceId": WorkspaceId;
   "worktree"?: (WorktreeSpec | (null));
   [key: string]: unknown;
@@ -3805,6 +3806,9 @@ export type TtyWriterLease = ({
   "leaseId": Id;
   [key: string]: unknown;
 });
+
+/** Claude renderer requested at launch (D-028 §9.2).  This is intent only; the terminal snapshot's `altScreen` reports the observed screen state after Claude applies platform and accessibility rules. */
+export type TuiMode = ("fullscreen" | "default");
 
 export type U64 = (string);
 

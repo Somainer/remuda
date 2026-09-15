@@ -89,6 +89,9 @@ pub struct CreateInstanceBody {
     /// Native effort selection persisted on the instance spec.
     #[serde(default)]
     effort: Option<Value>,
+    /// Requested Claude renderer; omission inherits the host launch default.
+    #[serde(default)]
+    tui: Option<remuda_protocol::TuiMode>,
     /// Delegation preset name (`worker` / `project-coordinator` /
     /// `top-coordinator`); display only, expanded into grants at create.
     #[serde(default)]
@@ -583,6 +586,12 @@ fn merge_host_launch_defaults(
     host: &crate::store::HostRecord,
     body: &CreateInstanceBody,
 ) {
+    // Recompute from the request for each placement candidate. A default
+    // copied from a previous rejected host must not leak to the next host.
+    spec.insert(
+        "tui".into(),
+        json!(body.tui.or(host.default_tui).unwrap_or_default()),
+    );
     if body.args.is_empty()
         && let Some(args) = host.default_launch_args.as_ref().filter(|a| !a.is_empty())
     {

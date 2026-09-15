@@ -684,6 +684,18 @@
           "providerBinding": {
             "description": "auto | native | profile:<id>",
             "type": "string"
+          },
+          "defaultTui": {
+            "description": "Per-host requested renderer. Null restores the fullscreen default.",
+            "enum": [
+              "fullscreen",
+              "default",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -829,6 +841,18 @@
               "$ref": "#/components/schemas/HostWorkspace"
             },
             "type": "array"
+          },
+          "defaultTui": {
+            "description": "Per-host requested renderer. Null restores the fullscreen default.",
+            "enum": [
+              "fullscreen",
+              "default",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1002,6 +1026,10 @@
           "worktree": {
             "description": "Worktree name created by remuda worktree create.",
             "type": "string"
+          },
+          "tui": {
+            "$ref": "#/components/schemas/TuiMode",
+            "description": "Requested renderer. Omission inherits the host default, then fullscreen."
           }
         },
         "type": "object"
@@ -1301,6 +1329,11 @@
               "string",
               "null"
             ]
+          },
+          "tui": {
+            "$ref": "#/components/schemas/TuiMode",
+            "description": "Requested launch renderer. Actual mode is reported by tty snapshot altScreen.",
+            "readOnly": true
           }
         },
         "required": [
@@ -3320,6 +3353,13 @@
           "path"
         ],
         "type": "object"
+      },
+      "TuiMode": {
+        "enum": [
+          "fullscreen",
+          "default"
+        ],
+        "type": "string"
       }
     }
   },

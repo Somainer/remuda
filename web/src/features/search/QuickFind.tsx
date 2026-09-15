@@ -8,7 +8,7 @@ import { hubStore, useHub } from "../../lib/store";
 import { useWorkbenchViewport } from "../../lib/viewport";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { buildSpaces, spaceStore, useSpacesPrefs } from "../spaces/store";
-import { rankQuickFind, type QuickFindHit } from "./quickFind";
+import { rankQuickFind, type QuickFindHit } from "./quickFindSearch";
 import css from "./quickfind.module.css";
 
 /**

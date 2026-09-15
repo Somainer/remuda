@@ -109,6 +109,11 @@ pub trait LocalPty: Send + Sync {
     fn screen_snapshot(&self) -> PtySnapshot {
         PtySnapshot::raw_ring(self.snapshot())
     }
+    /// Current emulator mode without synthesizing a repaint for every chunk.
+    /// None means this carrier has no trustworthy mode observation.
+    fn alt_screen(&self) -> Option<bool> {
+        None
+    }
     /// Write raw bytes (keyboard and mouse sequences).
     async fn write_bytes(&self, bytes: &[u8]) -> DriverResult<()>;
     /// Resize the PTY.

@@ -1136,6 +1136,14 @@ fn default_claude_home() -> PathBuf {
 
 #[async_trait]
 impl LocalPty for PtyState {
+    fn alt_screen(&self) -> Option<bool> {
+        self.emulator
+            .as_ref()?
+            .lock()
+            .ok()
+            .map(|emulator| emulator.alt_screen())
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
         self.output.subscribe()
     }

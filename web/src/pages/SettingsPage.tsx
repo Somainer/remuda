@@ -16,6 +16,10 @@ import { readPushStatus, subscribePush, unsubscribePush, type PushStatus } from 
 import { defaultPasskeyName, passkeyErrorText } from "../lib/passkeys";
 import { hubStore, useHub } from "../lib/store";
 import { LoginPage } from "./LoginPage";
+import { api } from "../lib/api";
+import { TUI_OPTIONS } from "../lib/sessionOptions";
+import type { Host, TuiMode } from "../types/instance";
+import { hostRegistry } from "../features/hosts/registry";
 
 /* ------------------------------------------------------------------ */
 /* Groups — exploration §5 P1-3: 外观与输入 / 通知 / 连接与登录.        */
@@ -27,12 +31,13 @@ const GROUPS = [
   { id: "appearance", label: "外观与输入" },
   { id: "notifications", label: "通知" },
   { id: "connection", label: "连接与登录" },
+  { id: "host-defaults", label: "主机默认值" },
 ] as const;
 
 type GroupId = (typeof GROUPS)[number]["id"];
 
 function isGroupId(value: string | null | undefined): value is GroupId {
-  return value === "appearance" || value === "notifications" || value === "connection";
+  return value === "appearance" || value === "notifications" || value === "connection" || value === "host-defaults";
 }
 
 /* ------------------------------------------------------------------ */
@@ -263,6 +268,48 @@ function SaveBar({
         重置
       </button>
       <SaveStatus testId={`${testId}-status`} phase={phase} message={message} />
+    </div>
+  );
+}
+
+/** Host preferences share the grouped explicit-save and rollback contract. */
+function HostDefaultsField({ host }: { host: Host }) {
+  const [confirmedTui, setConfirmedTui] = useState<TuiMode>(host.defaultTui ?? "fullscreen");
+  const defaults = useGroupDraft({ defaultTui: confirmedTui });
+  const testId = `settings-host-defaults-${host.id}`;
+
+  const save = () => defaults.save(async ({ defaultTui }) => {
+    const saved = await api.hostPatch(host.id, { defaultTui });
+    const confirmed = saved.defaultTui ?? "fullscreen";
+    setConfirmedTui(confirmed);
+    hostRegistry.patch(host.id, { defaultTui: saved.defaultTui });
+    // The PATCH response confirms persistence. A failed follow-up refresh
+    // must not relabel an accepted write as a rejected field value.
+    await hubStore.refreshHosts().catch(() => undefined);
+  });
+
+  return (
+    <div className={css.section} data-testid={testId}>
+      <label className={css.field}>
+        {host.label} · Claude 默认终端渲染
+        <select
+          className={css.input}
+          data-testid={`settings-host-tui-${host.id}`}
+          value={defaults.draft.defaultTui}
+          disabled={defaults.phase === "saving"}
+          onChange={(event) => defaults.patch({ defaultTui: event.target.value as TuiMode })}
+        >
+          {TUI_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+        </select>
+      </label>
+      <SaveBar
+        testId={testId}
+        dirty={defaults.dirty}
+        phase={defaults.phase}
+        message={defaults.message}
+        onSave={() => void save()}
+        onReset={defaults.reset}
+      />
     </div>
   );
 }
@@ -808,6 +855,18 @@ export function SettingsPage() {
                 </Link>
               ))}
             </div>
+          </section>
+
+          <section
+            id="host-defaults"
+            className={css.group}
+            data-testid="settings-group-host-defaults"
+            tabIndex={-1}
+            aria-labelledby="host-defaults-title"
+          >
+            <GroupHeading id="host-defaults" label="主机默认值" hint="保存在 Hub，供该主机的新会话使用；新建会话中的选择优先。" />
+            {hub.hosts.map((host) => <HostDefaultsField key={host.id} host={host} />)}
+            {!hub.hosts.length ? <p className={css.hint}>添加主机后可设置。</p> : null}
           </section>
         </div>
       </div>

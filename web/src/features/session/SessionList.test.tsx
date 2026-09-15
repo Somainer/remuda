@@ -43,6 +43,7 @@ vi.mock("../../lib/store", () => ({
     summaryOf: () => "",
     hostName: (id: string) => hostNames[id] ?? id,
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
+    effortEffectiveOf: () => null,
     refreshScreens: vi.fn(),
     broadcast: vi.fn(),
     send: vi.fn(),

@@ -5,6 +5,7 @@ import { clipboardIo } from "../lib/clipboard";
 import { highlightCode } from "../lib/highlight";
 import { notify } from "../lib/notify";
 import { MarkdownText } from "./MarkdownText";
+import { listenForCodeQuotes } from "../lib/codeQuoteBus";
 
 vi.mock("../lib/notify", () => ({ notify: vi.fn() }));
 
@@ -109,12 +110,12 @@ describe("syntax highlighting", () => {
         ].join("\n")}
       />,
     );
+    // Grammars load lazily per language: wait until every block has token spans, not just the first.
     await waitFor(() => {
-      expect(document.querySelectorAll(".hljs-keyword, .hljs-title, .hljs-attr, .hljs-built_in").length).toBeGreaterThan(0);
+      const codes = screen.getAllByTestId("code-code");
+      expect(codes.length).toBe(5);
+      for (const code of codes) expect(code.querySelectorAll("[class*='hljs']").length).toBeGreaterThan(0);
     });
-    const codes = screen.getAllByTestId("code-code");
-    expect(codes.length).toBe(5);
-    for (const code of codes) expect(code.querySelectorAll("[class*='hljs']").length).toBeGreaterThan(0);
   });
 
   it("renders unknown fences plain, keeping the raw info label", async () => {
@@ -158,5 +159,22 @@ describe("sanitising fence bodies", () => {
     expect(screen.queryByTestId("code-toolbar")).toBeNull();
     expect(screen.queryByTestId("code-block")).toBeNull();
     expect(screen.getByText("rm -rf").tagName).toBe("CODE");
+  });
+
+  it("passes the fence language plus meta (e.g. a file path) through to CodeBlock", async () => {
+    const received: unknown[] = [];
+    const stop = listenForCodeQuotes((quote) => received.push(quote));
+    try {
+      render(<MarkdownText text={"```ts src/app.ts\nconst x = 1;\n```"} />);
+      await screen.findByTestId("code-comment");
+      fireEvent.click(screen.getByTestId("code-comment"));
+      await waitFor(() => expect(received).toHaveLength(1));
+    } finally {
+      stop();
+    }
+    // Language label resolves to its display name; the path survives
+    // sanitize into the quote payload the composer expands.
+    expect(screen.getByTestId("code-lang")).toHaveTextContent("TypeScript");
+    expect(received[0]).toMatchObject({ lang: "ts", path: "src/app.ts" });
   });
 });

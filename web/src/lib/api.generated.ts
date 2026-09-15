@@ -654,6 +654,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Journaled usage totals for one instance (estimates; coordinator design section 4.5) */
+        get: operations["instanceUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/interactions": {
         parameters: {
             query?: never;
@@ -924,6 +941,41 @@ export interface paths {
         patch: operations["providerPatch"];
         trace?: never;
     };
+    "/v1/providers/{id}/supply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read declared plus observed supply envelope for one profile */
+        get: operations["providerSupplyGet"];
+        /** Replace the user-declared supply envelope; observed cooldowns are preserved */
+        put: operations["providerSupplyDeclare"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}/supply/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Report observed supply evidence (textual 429/529 or structured rate-limit windows); 529 cools nothing */
+        post: operations["providerSupplyEvent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/providers/{id}/test": {
         parameters: {
             query?: never;
@@ -935,6 +987,57 @@ export interface paths {
         put?: never;
         /** Probe models list / reachability against the gateway */
         post: operations["providerTest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Per-model usage aggregation and budget band (estimate x 1.15); coordinator design section 4.5 */
+        get: operations["providerUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/supply/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Built-in model capability table (family, class, context window, effort levels, feature support); revisioned */
+        get: operations["supplyCatalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/supply/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Dry-run admission for a TaskSpec: ranked supply list, rejected reasons, deferredUntil; never spawns */
+        post: operations["supplyResolve"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1256,6 +1359,11 @@ export interface components {
             claudeBinaryPath?: string | null;
             /** @description Per-host default extra CLI args. Null clears the default. */
             defaultLaunchArgs?: string[] | null;
+            /**
+             * @description Per-host requested renderer. Null restores the fullscreen default.
+             * @enum {string|null}
+             */
+            defaultTui?: "fullscreen" | "default" | null;
             labels?: string[];
             maxInstances?: number;
             name?: string;
@@ -1271,6 +1379,11 @@ export interface components {
             cli?: components["schemas"]["HostCli"][];
             /** @description Per-host default extra CLI args, used when a create omits args. */
             defaultLaunchArgs?: string[] | null;
+            /**
+             * @description Per-host requested renderer. Null restores the fullscreen default.
+             * @enum {string|null}
+             */
+            defaultTui?: "fullscreen" | "default" | null;
             herdr?: {
                 [key: string]: unknown;
             } | null;
@@ -1359,6 +1472,8 @@ export interface components {
             settingsOverlayPath?: string;
             taskId?: string;
             title?: string;
+            /** @description Requested renderer. Omission inherits the host default, then fullscreen. */
+            tui?: components["schemas"]["TuiMode"];
             workspaceId?: string;
             /** @description Worktree name created by remuda worktree create. */
             worktree?: string;
@@ -1400,6 +1515,18 @@ export interface components {
             delegation?: string | null;
             driver: string;
             durableSeq: string;
+            /** @description D-028 §9.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown. */
+            effortEffective?: ({
+                /** @enum {string} */
+                name: "low" | "medium" | "high" | "xhigh" | "max";
+                observedAt: string;
+                /** @enum {string} */
+                source: "launch" | "slash" | "remuda" | "unknown";
+                /** @description Observed dynamic-workflow flag; null unless positively observed (the native transcript spells ultracode as xhigh and omits the boolean). */
+                ultracode?: boolean | null;
+            } & {
+                [key: string]: unknown;
+            }) | null;
             /** @description Legacy per-harness table index. Preserved for older clients; never used to derive the tier, because the old tables differed in length per harness. */
             effortIndex?: number | null;
             /**
@@ -1449,6 +1576,8 @@ export interface components {
              */
             readonly signalTier?: "hook" | "file" | "osc" | "screen" | "none" | null;
             title?: string | null;
+            /** @description Requested launch renderer. Actual mode is reported by tty snapshot altScreen. */
+            readonly tui?: components["schemas"]["TuiMode"];
             updatedAt?: string;
             workspaceId?: string | null;
         } & {
@@ -2023,6 +2152,8 @@ export interface components {
             reason?: string;
             state: components["schemas"]["TaskState"];
         };
+        /** @enum {string} */
+        TuiMode: "fullscreen" | "default";
         WorktreeCreate: {
             /** @description Start-point (default main). */
             base?: string;
@@ -3301,6 +3432,33 @@ export interface operations {
             };
         };
     };
+    instanceUsage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
     interactionList: {
         parameters: {
             query?: {
@@ -3892,6 +4050,101 @@ export interface operations {
             404: components["responses"]["Error"];
         };
     };
+    providerSupplyGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    providerSupplyDeclare: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    providerSupplyEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
     providerTest: {
         parameters: {
             query?: never;
@@ -3914,6 +4167,100 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    providerUsage: {
+        parameters: {
+            query?: {
+                budgetMaxUsd?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    supplyCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    supplyResolve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    hostId?: string;
+                    placement?: {
+                        [key: string]: unknown;
+                    };
+                    taskSpec: {
+                        [key: string]: unknown;
+                    };
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     taskList: {

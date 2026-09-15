@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { hostname } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.
 const target = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target");
 const remuda = process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda");
 const harness = process.env.HUB_E2E_FAKE_HARNESS_BIN ?? path.join(target, "debug/fake-harness");
+const nativeNode = process.env.HUB_E2E_NATIVE_NODE_BIN ?? path.join(target, "debug/examples/native_hub_e2e");
 
 // A standalone Hub gate only builds its fake Hub example. Always refresh the
 // default native executables so a clean or stale Cargo target tests this tree.
@@ -20,16 +21,17 @@ test.beforeAll(async ({}, testInfo) => {
   const args = ["build", "--locked"];
   if (!process.env.HUB_E2E_REMUDA_BIN) args.push("-p", "remuda", "--bin", "remuda");
   if (!process.env.HUB_E2E_FAKE_HARNESS_BIN) args.push("-p", "remuda-testing", "--bin", "fake-harness");
+  if (!process.env.HUB_E2E_NATIVE_NODE_BIN) args.push("-p", "remuda-node", "--example", "native_hub_e2e");
   if (args.length > 2) {
     await promisify(execFile)("cargo", args, {
       cwd: root, env: process.env, timeout: 570_000, maxBuffer: 8 * 1024 * 1024,
     });
   }
-  await Promise.all([access(remuda), access(harness)]);
+  await Promise.all([access(remuda), access(harness), access(nativeNode)]);
 });
 
-type NativeEvent = { event: string; by?: string; outcome?: string };
-type JournalEvent = { source?: { channel?: string }; kind?: string; payload?: { nativeName?: string } };
+type NativeEvent = { event: string; by?: string; outcome?: string; pid?: number; session_id?: string; alt_screen?: boolean; tui_latch?: string };
+type JournalEvent = { source?: { channel?: string }; kind?: string; payload?: { nativeName?: string; relatedIds?: Record<string, string> } };
 type JournalRow = { seq?: string; observedAt?: string; event: JournalEvent };
 
 function quote(value: string): string {
@@ -79,13 +81,27 @@ async function stopNode(node: ChildProcess) {
 /**
  * This spec attaches a disposable production Node to the suite's Hub. The
  * existing fake WebSocket Node cannot prove hook relay, PTY keys, or native
- * interrupt settlement. Setup builds remuda and fake-harness in CARGO_TARGET_DIR;
- * the two HUB_E2E_*_BIN overrides opt into explicit prebuilt executables.
+ * interrupt settlement. The example runs the production native runtime with
+ * synthetic host resources, so unrelated machine load cannot block placement.
+ * Setup builds all three executables in CARGO_TARGET_DIR; HUB_E2E_*_BIN
+ * overrides opt into explicit prebuilt executables.
  */
 test("promoted Claude: hooks drive activity and 打断 sends a native Esc without closing", async ({ page }, testInfo) => {
   test.setTimeout(180_000);
-  // Keep Unix socket paths below sockaddr_un's macOS limit.
-  const dir = await realpath(await mkdtemp("/tmp/hge-"));
+  // Keep fixture writes inside this worktree. macOS's existing volfs alias
+  // addresses the same directory by inode without adding an external symlink,
+  // keeping the hook socket pathname below sockaddr_un's length limit.
+  const scratch = path.join(root, "target", "hub-e2e");
+  await mkdir(scratch, { recursive: true });
+  const dir = await realpath(await mkdtemp(path.join(scratch, "hge-")));
+  const dataDir = path.join(dir, "data");
+  await mkdir(dataDir);
+  const dataStat = await stat(dataDir);
+  // Linux's existing procfs alias needs the runner's directory handle kept
+  // open through cleanup; PTY children need not inherit that descriptor.
+  const dataHandle = process.platform === "linux" ? await open(dataDir, "r") : undefined;
+  const dataPath = process.platform === "darwin" ? `/.vol/${dataStat.dev}/${dataStat.ino}`
+    : dataHandle ? `/proc/${process.pid}/fd/${dataHandle.fd}` : dataDir;
   const bin = path.join(dir, "bin");
   const workspace = path.join(dir, "workspace");
   const claudeHome = path.join(dir, "claude-home");
@@ -124,6 +140,10 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     });
   });
   try {
+    // volfs supports filesystem access but not realpath; identity is the
+    // device/inode pair. The alias must address our own worktree directory.
+    const aliasStat = await stat(dataPath);
+    expect([aliasStat.dev, aliasStat.ino]).toEqual([dataStat.dev, dataStat.ino]);
     await Promise.all([mkdir(bin), mkdir(workspace), mkdir(claudeHome)]);
     // The detector sees the real foreground executable named claude. This is
     // still fake-harness --kind claude, with its production-shaped TUI/hooks.
@@ -151,12 +171,13 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     const hub = new URL(process.env.VITE_HUB_URL ?? `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`);
     hub.protocol = hub.protocol === "https:" ? "wss:" : "ws:";
     hub.pathname = "/v1/node";
-    node = spawn(remuda, ["node", "--hub-url", hub.toString(), "--host-token-file", tokenFile,
-      "--workspace", workspace, "--workspace-root", workspace,
-      "--label", "test=promoted-hooks", "--no-herdr-orphan-sweep"], {
+    node = spawn(nativeNode, [], {
       cwd: dir,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, REMUDA_DATA_DIR: path.join(dir, "data"),
+      env: { ...process.env, REMUDA_DATA_DIR: dataPath,
+        HUB_E2E_NODE_HUB_URL: hub.toString(), HUB_E2E_NODE_TOKEN_FILE: tokenFile,
+        HUB_E2E_NODE_WORKSPACE: workspace, HUB_E2E_NODE_DATA_DIR: dataPath,
+        HUB_E2E_REMUDA_BIN: remuda,
         REMUDA_PTY_EMULATOR: "1", REMUDA_PTY_HOOKS: "1", REMUDA_SHIM: "on",
         REMUDA_CLAUDE_BIN: path.join(bin, "claude"), REMUDA_CLAUDE_CONFIG_DIR: claudeHome,
         CLAUDE_CONFIG_DIR: claudeHome, SHELL: shell, PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
@@ -180,10 +201,10 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     const created = await page.request.post("/v1/instances", {
       headers: { Origin: new URL(page.url()).origin },
       data: { hostId, workspaceId: workspaces.workspaces[0].workspaceId, cwd: workspace,
-        kind: "terminal", driver: "shell-pty", name: "promoted-hook-e2e" },
+        kind: "terminal", driver: "shell-pty", name: "promoted-hook-e2e", tui: "default" },
     });
-    expect(created.ok()).toBe(true);
     const result = await created.json();
+    expect(created.ok(), `instance create ${created.status()}: ${JSON.stringify(result)}`).toBe(true);
     instanceId = result.instance.instanceId ?? result.instance.id;
     expect(instanceId).toBeTruthy();
     const id = instanceId!;
@@ -227,6 +248,7 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     expect(await (await page.request.get(`/v1/instances/${id}`)).json()).toMatchObject({
       driver: "shell-pty", kind: "claude", mode: "promoted", launchedBy: "user", signalTier: "hook",
     });
+    await expect(page.getByTestId("tty-alt-screen")).toHaveAttribute("data-alt-screen", "false");
     await page.getByTestId("view-switch-structured").click();
 
     let turn = 0;
@@ -276,6 +298,37 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
     await expect.poll(async () => (await nativeEvents(eventsFile)).filter((event) => event.event === "turn_end").length,
       { timeout: 10_000 }).toBe(2);
     await assertActivity("idle", "after-interrupt-end");
+
+    // /tui replaces the native process while carrying the same --settings
+    // argv. Node must have released only tui and follow the replacement PID.
+    await page.getByTestId("view-switch-tty").click();
+    const starts = () => nativeEvents(eventsFile).then((rows) => rows.filter((event) => event.event === "session_start"));
+    const initial = (await starts())[0];
+    expect(initial.alt_screen).toBe(false);
+    for (const [index, mode] of ["fullscreen", "default"].entries()) {
+      await submit(`/tui ${mode}`);
+      await expect.poll(async () => (await starts()).length, { timeout: 15_000 }).toBe(index + 2);
+      const current = (await starts())[index + 1];
+      expect(current.pid).not.toBe((await starts())[index].pid);
+      expect(current.session_id).toBe(initial.session_id);
+      expect(current.tui_latch).toBe(mode);
+      expect(current.alt_screen).toBe(mode === "fullscreen");
+      await expect(page.getByTestId("tty-alt-screen")).toHaveAttribute("data-alt-screen", String(mode === "fullscreen"));
+      await expect.poll(async () => (await journal(page, id))
+        .filter((event) => event.source?.channel === "hook" && event.payload?.nativeName === "SessionStart").length,
+      { timeout: 15_000 }).toBe(index + 2);
+      await expect.poll(async () => (await journal(page, id))
+        .filter((event) => event.payload?.nativeName === "agent_promoted")
+        .map((event) => event.payload?.relatedIds?.pid), { timeout: 15_000 }).toContain(String(current.pid));
+      await expect(session).toHaveAttribute("data-mode", "promoted");
+      await expect(session).toHaveAttribute("data-lifecycle", "running");
+      await page.screenshot({ path: testInfo.outputPath(`tui-${mode}.png`), animations: "disabled" });
+    }
+    await submit("AFTER_TUI_SWITCH");
+    await expect.poll(async () => (await nativeEvents(eventsFile)).filter((event) => event.event === "turn_end").length,
+      { timeout: 15_000 }).toBe(3);
+    await assertActivity("idle", "after-tui-switch");
+
   } finally {
     if (instanceId) {
       try {
@@ -303,6 +356,7 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
       .replaceAll(dir, "$TEST_DIR").replaceAll(process.env.HOME || "__unused__", "$HOME")
       .replaceAll(hostname(), "test-host"));
     await testInfo.attach("native-node.log", { path: logPath, contentType: "text/plain" });
+    await dataHandle?.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

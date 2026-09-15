@@ -124,3 +124,18 @@
   left: 4px;
   top: 4px;
 }
+
+/* Quoted-code chip glyph (workbench-code-2): stands in for a thumbnail. */
+.codeGlyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--paper) 8%, transparent);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  flex: none;
+}

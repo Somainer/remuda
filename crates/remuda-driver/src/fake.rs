@@ -88,8 +88,6 @@ impl FakeDriver {
                 "stream-json".into(),
                 "--output-format".into(),
                 "stream-json".into(),
-                "--setting-sources".into(),
-                "user,project,local".into(),
             ],
             env_allowlist: vec![EnvAllowlistEntry {
                 name: "CLAUDE_CONFIG_DIR".into(),
@@ -127,8 +125,6 @@ impl FakeDriver {
                     "stream-json".into(),
                     "--output-format".into(),
                     "stream-json".into(),
-                    "--setting-sources".into(),
-                    "user,project,local".into(),
                 ],
                 settings_digest: None,
                 prohibited_options_checked: BoolLiteral,

@@ -41,12 +41,12 @@ export type TtyHandlers = {
   /**
    * The attached session is (or is no longer) showing a full-screen TUI.
    *
-   * Reported by the Node on attach (D-028 §4.6) rather than sniffed from the
-   * byte stream, because attaching mid-session never sees the `?1049h` that
-   * put the terminal there. Not called at all when the Node does not report
-   * it, so the caller keeps whatever default it had.
+   * Reported by the Node on attach and on mode changes (D-028 §4.6), rather
+   * than sniffed from the byte stream: attaching mid-session never sees the `?1049h` that
+   * put the terminal there. A fresh snapshot without mode evidence reports
+   * undefined so a previous renderer observation cannot remain current.
    */
-  onAltScreen?: (altScreen: boolean) => void;
+  onAltScreen?: (altScreen: boolean | undefined) => void;
 };
 
 export type TtySession = {
@@ -231,6 +231,30 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     if (inputQueue.length) flushInput();
   };
 
+  const reportMode = (event: Record<string, unknown>, attached = false) => {
+    const params = event.params && typeof event.params === "object"
+      ? event.params as Record<string, unknown>
+      : event;
+    if (typeof params.instanceId === "string" && params.instanceId !== instance.id) return;
+    const mode = params.altScreen;
+    if (typeof mode !== "boolean" && !(attached && mode === null)) return;
+    const sid = extractStreamId(event);
+    if (attached) {
+      // The direct notice accompanies a fresh Hub attach. It may replace the
+      // stream after recovery; subsequent nested live events cannot do that.
+      if (sid && sid !== streamId) {
+        if (!streamIdToUuidBytes(sid)) return;
+        if (streamId) {
+          resetNext = true;
+          replayNext = true;
+          handlers.onSnapshot?.();
+        }
+        setStream(sid);
+      }
+    } else if (!sid || !streamId || sid !== streamId) return;
+    handlers.onAltScreen?.(typeof mode === "boolean" ? mode : undefined);
+  };
+
   const handleJson = (raw: string) => {
     let msg: Record<string, unknown>;
     try {
@@ -240,7 +264,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     }
     const type = typeof msg.type === "string" ? msg.type : "";
     if (type === "tty.mode") {
-      if (typeof msg.altScreen === "boolean") handlers.onAltScreen?.(msg.altScreen);
+      reportMode(msg, true);
       return;
     }
     if (type === "snapshot" || type === "tty.snapshot") {
@@ -248,6 +272,9 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
       resetNext = true;
       replayNext = true;
       handlers.onSnapshot?.();
+      handlers.onAltScreen?.(undefined);
+      streamId = "";
+      streamUuid = null;
       const sid = extractStreamId(msg);
       if (sid) setStream(sid);
       const b64 = extractBase64(msg);
@@ -271,6 +298,10 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
         : typeof event.method === "string"
           ? event.method
           : "";
+    if (eventType === "tty.mode") {
+      reportMode(event);
+      return;
+    }
     if (eventType === "tty.frame" || type === "tty.frame") {
       const sid = extractStreamId(event) ?? extractStreamId(msg);
       if (sid) {
@@ -334,6 +365,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
       sendResize(lastCols, lastRows);
     });
     ws.addEventListener("message", (ev) => {
+      if (closed || socket !== ws) return;
       if (typeof ev.data === "string") {
         handleJson(ev.data);
         return;

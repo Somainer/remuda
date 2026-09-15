@@ -1,15 +1,19 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
 import { readDraft, writeDraft } from "../../lib/drafts";
+import { expandCodeQuotes } from "../../lib/codeAnchors";
 import {
-  insertAnchors,
+  insertAnchorFor,
+  insertAnchorsFor,
   referencedIndices,
+  referencedIndicesFor,
   removeAndRenumber,
+  removeAndRenumberFor,
 } from "../../lib/imageAnchors";
 import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
 import type { PromptMode } from "../../types/generated";
 import type { CapabilitySnapshot } from "../../types/nativeRef";
-import { AttachButtons, AttachmentChips } from "./AttachmentChips";
+import { AttachButtons, AttachmentChips, CodeQuoteChips } from "./AttachmentChips";
 import { EffortSlider } from "./EffortSlider";
 import {
   defaultEffortIndex,
@@ -25,7 +29,14 @@ import {
   type EffortSelection,
 } from "./effort";
 import { composerState, type Phase } from "../composer/state";
+import {
+  effectiveLabel,
+  effortMismatch,
+  isEffortUnknown,
+  type EffortEffectiveView,
+} from "./effortEffective";
 import { useAttachments } from "./useAttachments";
+import { useCodeQuotes } from "./useCodeQuotes";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
 import css from "./session.module.css";
 
@@ -54,6 +65,7 @@ export function Composer({
   models,
   effort,
   onEffort,
+  effortEffective,
   onModel,
   contextLabel,
   effortDisabled,
@@ -79,6 +91,8 @@ export function Composer({
   models?: string[];
   effort?: EffortSelection;
   onEffort?: (next: EffortSelection) => void;
+  /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
+  effortEffective?: EffortEffectiveView | null;
   onModel?: (model: string) => void;
   contextLabel?: string | null;
   /** True when the session cannot take instance.configure (exited / observed-only). */
@@ -95,6 +109,7 @@ export function Composer({
   const [interrupted, setInterrupted] = useState(false);
   const rootRef = useRef<HTMLFormElement>(null);
   const images = useAttachments(instanceId);
+  const codeQuotes = useCodeQuotes((index) => insertCodeTokenRef.current?.(index));
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Synchronous mirror so rapid pastes and the drop handler see the text the
   // previous insert just produced rather than a stale React closure.
@@ -152,22 +167,22 @@ export function Composer({
   }, [interrupted]);
 
   const canSubmit = () => {
-    const value = text.trim();
+    const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     if ((!value && images.attachments.length === 0) || disabled || sending) return false;
     if (images.uploading) return false;
     return true;
   };
 
   /**
-   * Insert `[Image #n]` tokens for freshly staged files at the textarea caret
-   * (mid-word inserts get surrounding spaces — see imageAnchors). The caret is
-   * restored after the controlled value commits.
+   * Insert a `[Image #n]` / `[Code #n]` token at the textarea caret
+   * (mid-word inserts get surrounding spaces — see imageAnchors). Focus moves
+   * to the composer after insert; on touch-sized layouts the composer is
+   * scrolled into view so the chip/token is visible above the keyboard.
    */
-  const insertForImages = (indices: number[]) => {
-    if (indices.length === 0) return;
+  const insertTokenAtCaret = (kind: "Image" | "Code", index: number) => {
     const area = inputRef.current;
     const caret = area && area.selectionStart != null ? area.selectionStart : textRef.current.length;
-    const result = insertAnchors(textRef.current, caret, indices);
+    const result = insertAnchorFor(kind, textRef.current, caret, index);
     textRef.current = result.text;
     setText(result.text);
     writeDraft(instanceId, result.text);
@@ -176,14 +191,52 @@ export function Composer({
       if (!next) return;
       next.focus();
       next.setSelectionRange(result.caret, result.caret);
+      if (mobile) next.scrollIntoView({ block: "center", behavior: "smooth" });
     });
   };
+
+  /**
+   * Insert `[Image #n]` tokens for freshly staged files at the textarea caret.
+   * Multi-file paste chains the caret so tokens land in file order.
+   */
+  const insertForImages = (indices: number[]) => {
+    if (indices.length === 0) return;
+    const area = inputRef.current;
+    const caret = area && area.selectionStart != null ? area.selectionStart : textRef.current.length;
+    const result = insertAnchorsFor("Image", textRef.current, caret, indices);
+    textRef.current = result.text;
+    setText(result.text);
+    writeDraft(instanceId, result.text);
+    requestAnimationFrame(() => {
+      const next = inputRef.current;
+      if (!next) return;
+      next.focus();
+      next.setSelectionRange(result.caret, result.caret);
+      if (mobile) next.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+  };
+
+  /** 评论 on a code block: the quote is registered, then its token goes in. */
+  const insertCodeToken = (index: number) => insertTokenAtCaret("Code", index);
+  // The quote bus fires synchronously on click; the hook above reaches the
+  // inserter through this ref (kept current every render).
+  const insertCodeTokenRef = useRef(insertCodeToken);
+  insertCodeTokenRef.current = insertCodeToken;
 
   /** Chip × : unstage the image, pull its token(s) out, renumber the rest. */
   const removeAttachment = (localId: string) => {
     const index = images.remove(localId);
     if (index === null) return;
     const next = removeAndRenumber(textRef.current, index);
+    textRef.current = next;
+    setText(next);
+    writeDraft(instanceId, next);
+  };
+
+  /** Quote chip × : drop the quote and strip/renumber its [Code #n] token. */
+  const removeCodeQuote = (index: number) => {
+    codeQuotes.remove(index);
+    const next = removeAndRenumberFor("Code", textRef.current, index);
     textRef.current = next;
     setText(next);
     writeDraft(instanceId, next);
@@ -197,10 +250,19 @@ export function Composer({
       .map(({ attachment }) => attachment.localId),
   );
 
+  /** Quote chips whose [Code #n] token was edited out; still sent. */
+  const unreferencedCode = new Set(
+    codeQuotes.quotes
+      .map((quote, position) => ({ quote, index: position + 1 }))
+      .filter(({ index }) => !referencedIndicesFor("Code", textRef.current).has(index))
+      .map(({ quote }) => quote.localId),
+  );
+
   const clearBox = () => {
     writeDraft(instanceId, "");
     setText("");
     images.handOff();
+    codeQuotes.clear();
   };
 
   const doInterrupt = async () => {
@@ -212,7 +274,7 @@ export function Composer({
   /** Submit the PRIMARY control: send/steer goes out, queue holds a chip. */
   const submitPrimary = async () => {
     if (!canSubmit()) return;
-    const value = text.trim();
+    const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     const refs = images.refs(value);
     const staged = images.attachments;
     const action = controls.primary;
@@ -232,7 +294,7 @@ export function Composer({
   /** Explicit secondary queue control: native Tab sends now; otherwise hold. */
   const submitQueue = () => {
     if (!controls.queue.available || !canSubmit()) return;
-    const value = text.trim();
+    const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     const refs = images.refs(value);
     const staged = images.attachments;
     if (controls.queue.holder === "native") {
@@ -260,7 +322,7 @@ export function Composer({
         : "打断当前 turn 并立即发送？",
     );
     if (!confirmed) return;
-    const value = text.trim();
+    const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     const refs = images.refs(value);
     const staged = images.attachments;
     await doInterrupt();
@@ -330,6 +392,19 @@ export function Composer({
   // data-attr carries the wire name so an ultracode selection round-trips.
   const effortChipLabel = effortStopName(harness, currentEffort.name, ultraOn);
   const effortWire = effortWireName(currentEffort);
+  // §9.1: the chip text is the EFFECTIVE level read back from the transcript,
+  // not the requested selection. `?` until the first assistant record; a
+  // requested/effective divergence renders explicitly, it is never hidden.
+  const effectiveUnknown = isEffortUnknown(effortEffective);
+  const effectiveWord = effectiveLabel(effortEffective);
+  const mismatch = caps.effort
+    ? effortMismatch(effortWire, ultraOn, effortEffective)
+    : null;
+  const effortChipTitle = effectiveUnknown
+    ? "实际档位：等待会话回读（？）"
+    : mismatch
+      ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
+      : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
   const primaryLabel = sending
     ? "发送中"
     : controls.primary.kind === "steer"
@@ -387,6 +462,7 @@ export function Composer({
         onRemove={removeAttachment}
         onRetry={images.retry}
       />
+      <CodeQuoteChips quotes={codeQuotes.quotes} unreferenced={unreferencedCode} onRemove={removeCodeQuote} />
       {images.notice ? (
         <div className={css.attachNotice} data-testid="attachment-notice">
           {images.notice}
@@ -450,9 +526,13 @@ export function Composer({
             className={`${css.chip} ${ember ? css.ember : ""}`}
             data-testid="model-effort-chip"
             data-ember={ember ? "1" : "0"}
+            data-effort-effective={effectiveUnknown ? "unknown" : effectiveWord}
+            data-effort-source={effortEffective?.source ?? "unknown"}
+            data-effort-mismatch={mismatch ? "1" : "0"}
             aria-expanded={menu === "effort"}
             aria-haspopup="dialog"
-            aria-label={`Select effort, ${effortChipLabel}`}
+            aria-label={`Select effort, ${effortChipLabel}; effective ${effectiveUnknown ? "unknown" : effectiveWord}`}
+            title={effortChipTitle}
             onClick={() => toggle("effort")}
           >
             {ember ? (
@@ -462,7 +542,14 @@ export function Composer({
                 <span className={`${css.emberSpark} ${css.emberSpark3}`} />
             </>
             ) : null}
-            <span className={css.chipModel}>{effortChipLabel}</span>
+            <span className={css.chipModel} data-testid="model-effort-chip-label">
+              {effectiveUnknown ? "?" : effectiveWord}
+            </span>
+            {mismatch ? (
+              <span className={css.chipEffortMismatch} data-testid="model-effort-mismatch">
+                请求 {mismatch.requested} → 实际 {mismatch.effective}
+              </span>
+            ) : null}
             <span className={css.chipCaret}>▾</span>
           </button>
         ) : null}

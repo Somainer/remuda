@@ -36,8 +36,8 @@ use crate::tty::{LocalPty, PtySnapshot, TTY_SNAPSHOT_MAX, TtyBridge, logical_key
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use remuda_protocol::{
-    AgentKind, ApprovalAuthority, BoolLiteral, DriverInput, DriverKind, HostId, Id, InputDelivery,
-    InstanceId, InstanceSpec, RunId, U64,
+    AgentKind, ApprovalAuthority, BoolLiteral, Completeness, DriverInput, DriverKind, HostId, Id,
+    InputDelivery, InstanceId, InstanceSpec, RunId, SourceChannel, U64,
 };
 use remuda_screen::{Emulator, ModeSet, ScreenGrid};
 use std::collections::VecDeque;
@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, Ordering};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+pub mod answer;
 pub mod keys;
 pub mod launch;
 pub mod lifecycle;
@@ -353,6 +354,17 @@ impl PtyState {
     }
 }
 
+/// How long the screen fallback waits for the dialog to clear before it
+/// refuses to call the decision applied (§14 risk 1).
+///
+/// Generous enough for a TUI repaint on a loaded machine, short enough that a
+/// caller is not left hanging: the answer "we could not confirm it" is useful
+/// promptly, and the operator can look at the terminal.
+const FALLBACK_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Gap between repaint checks while confirming.
+const FALLBACK_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A PTY running a login shell or an agent CLI, with promotion (D-025).
 pub struct ShellPtyDriver {
     options: ShellPtyOptions,
@@ -381,6 +393,21 @@ pub struct ShellPtyDriver {
     /// Set once the exit waiter has concluded, so `close` on an already-dead
     /// process reports the real cause rather than "the ladder found nothing".
     exited: Arc<std::sync::Mutex<Option<ExitEvidence>>>,
+    /// §9.1 switch coordination; recreated per run, adopted from the resumed
+    /// driver on D-026 resume so an in-flight switch keeps its rendezvous.
+    effort_bridge: Mutex<Arc<crate::effort::EffortBridge>>,
+    effort_queue: Mutex<Arc<crate::effort::EffortQueue>>,
+    effort_worker: Mutex<Option<JoinHandle<()>>>,
+    /// Event sender for the current run, retained so an effort switch can
+    /// journal `queued`/`degraded` without going through the worker.
+    events_tx: Mutex<Option<mpsc::Sender<remuda_protocol::Observation>>>,
+    /// Identity the current run's effort lifecycle observations are stamped
+    /// with; `None` before `start`.
+    promote_ctx: Mutex<Option<promotion::PromoteCtx>>,
+    /// One screen-key fallback per interaction, for decisions the hook path
+    /// proved it did not apply (§14 risk 1). Lives on the driver because the
+    /// budget has to outlive the call that spends it.
+    fallbacks: crate::hook_answer::FallbackLedger,
     /// Foreground Claude whose cancel key awaits native turn-end evidence.
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
@@ -407,10 +434,16 @@ impl ShellPtyDriver {
             poller: Mutex::new(None),
             waiter: Mutex::new(None),
             table,
+            fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
             adapters: Mutex::new(None),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
+            effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
+            effort_queue: Mutex::new(Arc::new(crate::effort::EffortQueue::new())),
+            effort_worker: Mutex::new(None),
+            events_tx: Mutex::new(None),
+            promote_ctx: Mutex::new(None),
             interrupt_pid: Arc::new(AtomicI32::new(0)),
             interrupt_screen_markers: Arc::new(std::sync::Mutex::new(
                 promotion::InterruptBaseline::default(),
@@ -469,6 +502,108 @@ impl ShellPtyDriver {
     #[must_use]
     pub fn screen_status(&self) -> Option<ScreenStatus> {
         self.status.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Answer an ignored hook decision on the agent's own dialog, once (§14 risk 1).
+    ///
+    /// Reached only when the hook path *proved* it did not take the decision.
+    /// Everything here is deliberately conservative, because a stray keystroke
+    /// in an agent TUI answers whatever question happens to be showing:
+    ///
+    /// - **One attempt ever**, claimed before the write. A lost ACK must not
+    ///   become a replayed Enter (D-022).
+    /// - **No guessing.** A screen that is truncated, ambiguous, or offers no
+    ///   matching choice gets nothing pressed, and the caller is told so.
+    /// - **No unconfirmed success.** After writing, the dialog has to be
+    ///   observed to clear. If it does not, this reports `not-dispatched`
+    ///   rather than a success the user would read as "approved".
+    async fn fallback_to_screen(
+        &self,
+        id: &remuda_protocol::InteractionId,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> DriverResult<DriverAck> {
+        let Some(state) = self.inner.lock().await.clone() else {
+            // No PTY at all: there is no dialog to answer, and nothing to
+            // report but the truth.
+            return Ok(DriverAck::not_dispatched());
+        };
+        let keys = match answer::keys_for(&state.screen_grid(), answer) {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::warn!(
+                    interaction = %id.as_id().as_str(),
+                    %error,
+                    "the hook did not apply the decision and the screen cannot be answered safely"
+                );
+                return Ok(DriverAck::not_dispatched());
+            }
+        };
+        // Claim before writing: when a write's outcome is unknown we must
+        // assume it landed rather than send it twice (D-022).
+        if !self.fallbacks.claim(id) {
+            tracing::warn!(
+                interaction = %id.as_id().as_str(),
+                "the screen fallback for this interaction was already spent; not replaying"
+            );
+            return Ok(DriverAck::not_dispatched());
+        }
+        tracing::info!(
+            interaction = %id.as_id().as_str(),
+            ?keys,
+            "hook decision was not applied; answering on screen once"
+        );
+        state.write_bytes(&logical_keys_to_bytes(&keys)).await?;
+        if self
+            .dialog_cleared_within(&state, FALLBACK_CONFIRM_WINDOW)
+            .await
+        {
+            return Ok(DriverAck::transport_written());
+        }
+        // The keys went out and the prompt is still there. Saying "written"
+        // here is what §14 risk 1 forbids: the user would read it as approved.
+        tracing::warn!(
+            interaction = %id.as_id().as_str(),
+            "the approval dialog did not clear after the fallback; not reporting it as applied"
+        );
+        Ok(DriverAck::not_dispatched())
+    }
+
+    /// Poll until the approval dialog leaves the screen, or `budget` elapses.
+    ///
+    /// This is the "confirmed by screen change" half of the honesty rule: a
+    /// keypress has no receipt, so the only evidence that it was taken is the
+    /// prompt going away.
+    async fn dialog_cleared_within(
+        &self,
+        state: &Arc<PtyState>,
+        budget: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if answer::dialog_cleared(&state.screen_grid()) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(FALLBACK_CONFIRM_POLL).await;
+        }
+    }
+
+    /// Whether an on-screen approval left the screen after the hook accepted
+    /// the decision.
+    ///
+    /// `false` when there is no PTY or no confirmation window, so a caller that
+    /// cannot see the screen never *invents* a failure — but a live PTY that
+    /// still shows the dialog after a hook `Answered` is the confined case, and
+    /// that `false` is what arms the one fallback.
+    async fn approval_cleared_on_screen(&self) -> bool {
+        let Some(state) = self.inner.lock().await.clone() else {
+            // No PTY: there is nothing to verify, and nothing to fall back to.
+            return true;
+        };
+        self.dialog_cleared_within(&state, FALLBACK_CONFIRM_WINDOW)
+            .await
     }
 
     /// The native session a hook reported, if `SessionStart` has fired.
@@ -597,6 +732,64 @@ impl ShellPtyDriver {
             .ok_or(DriverError::ControlUnavailable)
     }
 
+    /// §9.1: queue `/effort <level>` for the composer, ready-ladder gated, and
+    /// wait for transcript read-back while the composer is idle.
+    async fn switch_effort(&self, level: &str) -> DriverResult<DriverAck> {
+        let Some(request) = crate::effort::EffortRequest::from_level(level) else {
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "claude /effort does not accept {level:?} in-session; \
+                 valid: low, medium, high, xhigh, max, ultracode"
+            )));
+        };
+        let state = self.state().await?;
+        if state.closed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        let queue = self.effort_queue.lock().await.clone();
+        let bridge = self.effort_bridge.lock().await.clone();
+        let events = self
+            .events_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let ctx = self
+            .promote_ctx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(ShellEffortIo {
+            state,
+            events,
+            seq: Arc::clone(&self.seq),
+            ctx,
+        });
+        let ready = io.is_idle().await;
+        if ready {
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait =
+                std::time::Duration::from_millis(crate::effort::EFFORT_READBACK_TIMEOUT_MS + 5_000);
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // Bounded window elapsed without a terminal outcome; the worker
+                // keeps running and journals applied/degraded. Never claim
+                // applied here.
+            }
+        } else {
+            // The agent is working (or the screen is not provably idle). Hold
+            // for the next idle and let the worker journal the terminal state.
+            io.journal(
+                crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
+                remuda_protocol::Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+        let _ = bridge;
+        Ok(DriverAck::transport_written())
+    }
+
     /// Spawn the PTY without an [`InstanceSpec`] (Node fake registry / tests).
     pub async fn spawn(&self) -> DriverResult<RunHandle> {
         let cwd = self.options.cwd.to_string_lossy().into_owned();
@@ -699,6 +892,40 @@ impl ShellPtyDriver {
             .map_err(DriverError::Io)?;
         *self.inner.lock().await = Some(Arc::clone(&state));
         *self.hooks.lock().await = hooks.clone();
+        *self.events_tx.lock().await = Some(tx.clone());
+        *self.promote_ctx.lock().await = Some(hook_ctx.clone());
+        // §9.1: a fresh run starts with fresh switch coordination; D-026 resume
+        // adopts the previous bridge afterwards when a switch was in flight.
+        let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
+        if let Some(effort) = spec.and_then(|spec| spec.effort) {
+            effort_bridge.note_launch_request(crate::effort::EffortRequest {
+                name: effort.name,
+                ultracode: effort.ultracode,
+            });
+        }
+        let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(ShellEffortIo {
+            state: Arc::clone(&state),
+            events: tx.clone(),
+            seq: Arc::clone(&self.seq),
+            ctx: hook_ctx.clone(),
+        });
+        // A fresh run needs a fresh queue: stop the previous worker and close
+        // its queue before swapping.
+        if let Some(worker) = self.effort_worker.lock().await.take() {
+            worker.abort();
+        }
+        let effort_queue = {
+            let mut slot = self.effort_queue.lock().await;
+            slot.close();
+            *slot = Arc::new(crate::effort::EffortQueue::new());
+            Arc::clone(&slot)
+        };
+        *self.effort_worker.lock().await = Some(crate::effort::spawn_worker(
+            Arc::clone(&effort_bridge),
+            Arc::clone(&effort_queue),
+            effort_io,
+        ));
+        *self.effort_bridge.lock().await = Arc::clone(&effort_bridge);
         // D-028 P6: file-tail signal adapters for the codex/grok structured
         // channels. They read the shadow home the hook session materialized
         // (which is the same path the child receives via CODEX_HOME /
@@ -722,6 +949,8 @@ impl ShellPtyDriver {
                 Arc::clone(&self.interrupt_screen_markers),
                 tx.clone(),
                 Arc::clone(&self.seq),
+                Some(Arc::clone(&effort_bridge)),
+                spec.and_then(|spec| spec.effort),
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -987,6 +1216,28 @@ impl ShellPtyDriver {
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
         *self.poller.lock().await = resumed.poller.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
+        // §9.1: adopt the resumed run's switch coordination. Its worker and
+        // mapper share a bridge, and its event sender is the live one. When a
+        // switch was mid-flight at resume, adopt the resumed bridge so the
+        // read-back rendezvous survives; otherwise start the run with ours.
+        self.effort_queue.lock().await.close();
+        if let Some(worker) = self.effort_worker.lock().await.take() {
+            worker.abort();
+        }
+        *self.effort_queue.lock().await = {
+            let mut slot = resumed.effort_queue.lock().await;
+            std::mem::replace(&mut *slot, Arc::new(crate::effort::EffortQueue::new()))
+        };
+        *self.effort_worker.lock().await = resumed.effort_worker.lock().await.take();
+        *self.events_tx.lock().await = resumed.events_tx.lock().await.take();
+        let adopt_bridge = resumed.effort_bridge.lock().await.has_pending();
+        if adopt_bridge {
+            let resumed_bridge = {
+                let mut slot = resumed.effort_bridge.lock().await;
+                std::mem::replace(&mut *slot, Arc::new(crate::effort::EffortBridge::new()))
+            };
+            *self.effort_bridge.lock().await = resumed_bridge;
+        }
         if let (Ok(mut ours), Ok(theirs)) = (self.recipe.lock(), resumed.recipe.lock()) {
             ours.clone_from(&theirs);
         }
@@ -1136,6 +1387,14 @@ fn default_claude_home() -> PathBuf {
 
 #[async_trait]
 impl LocalPty for PtyState {
+    fn alt_screen(&self) -> Option<bool> {
+        self.emulator
+            .as_ref()?
+            .lock()
+            .ok()
+            .map(|emulator| emulator.alt_screen())
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
         self.output.subscribe()
     }
@@ -1327,6 +1586,15 @@ impl Driver for ShellPtyDriver {
     }
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
+        // §9.1: for an agent session, an effort switch is `/effort <level>`
+        // typed through the composer and read back through the transcript.
+        if self.session_kind() == Some(AgentKind::Claude)
+            && let DriverInput::ModelSwitch(switch) = &input
+            && let Some(level) = switch.effort.as_deref()
+            && !level.is_empty()
+        {
+            return self.switch_effort(level).await;
+        }
         let text = match input {
             DriverInput::Prompt(prompt) => {
                 let mut text = prompt
@@ -1459,11 +1727,68 @@ impl Driver for ShellPtyDriver {
         Ok(DriverAck::transport_written())
     }
 
+    /// Answer an interaction, by whichever carrier opened it (§4.4).
+    ///
+    /// Three carriers land here and they are answered differently:
+    ///
+    /// 1. **Hook** — a `PermissionRequest` / `Elicitation` whose agent is
+    ///    parked on the socket. The decision goes to that process; no keys are
+    ///    pressed. Only this path can be *confirmed*.
+    /// 2. **Hook, ignored** — the decision was real but nothing received it
+    ///    (§14 risk 1). One screen-key attempt follows, and only one.
+    /// 3. **Transcript picker** — Remuda's own question, which binds the epoch.
+    ///
+    /// The return value never claims more than happened: a fallback that could
+    /// not find a matching choice on screen reports `not-dispatched` rather
+    /// than a success the user would read as "approved".
     async fn respond_interaction(
         &self,
         id: remuda_protocol::InteractionId,
         answer: remuda_protocol::InteractionAnswer,
     ) -> DriverResult<DriverAck> {
+        // Route by what the answer *is*, not by whether a hook is still parked.
+        // An abandoned hook is no longer in the table, and the whole point of
+        // §14 risk 1 is that that case still needs answering — routing on
+        // `is_parked` would send it to the transcript picker, which would
+        // reject it as the wrong answer kind and lose the decision entirely.
+        // The picker is the only thing that asks a Question here; approvals
+        // and elicitations can only have come from a hook.
+        let hook_carried = matches!(
+            &answer,
+            remuda_protocol::InteractionAnswer::Approval(_)
+                | remuda_protocol::InteractionAnswer::Elicitation(_)
+        );
+        if hook_carried {
+            let outcome = match self.hooks.lock().await.clone() {
+                Some(hooks) => hooks.resolve_answer(&id, &answer),
+                // Hooks are off for this instance, so nothing was ever parked
+                // and the agent's own dialog is the only place to answer.
+                None => remuda_signal::Outcome::Abandoned,
+            };
+            if crate::hook_answer::needs_fallback(outcome) {
+                // The hook stopped listening before the human decided, or the
+                // wait expired. The dialog may still be on screen, so spend
+                // the single fallback attempt on it (§14 risk 1).
+                return self.fallback_to_screen(&id, &answer).await;
+            }
+            // Outcome::Answered means the reply reached the process — but a
+            // confined (or otherwise restricted) session can accept the reply
+            // and still keep its own dialog up. §14 risk 1: never report
+            // applied unless confirmed, so for an approval verify the prompt
+            // actually left the screen, and fall back exactly once if it did
+            // not.
+            if matches!(&answer, remuda_protocol::InteractionAnswer::Approval(_))
+                && !self.approval_cleared_on_screen().await
+            {
+                tracing::warn!(
+                    interaction = %id.as_id().as_str(),
+                    "the hook accepted the decision but the approval dialog is still up; answering on screen once"
+                );
+                return self.fallback_to_screen(&id, &answer).await;
+            }
+            tracing::debug!(interaction = %id.as_id().as_str(), "hook decision delivered");
+            return Ok(DriverAck::transport_written());
+        }
         // The only structured question a shell-pty asks is the manual
         // transcript picker; its answer deterministically binds the epoch.
         self.bindings
@@ -1488,6 +1813,12 @@ impl Driver for ShellPtyDriver {
     /// not, that is journaled as `stop-incomplete`; §5.3 step 4 forbids
     /// reporting `exited` over a process tree that is still there.
     async fn close(&self) -> DriverResult<DriverAck> {
+        // §9.1: stop the effort switch before the PTY it types into goes away.
+        self.effort_queue.lock().await.close();
+        if let Some(worker) = self.effort_worker.lock().await.take() {
+            worker.abort();
+        }
+        self.events_tx.lock().await.take();
         if let Some(poller) = self.poller.lock().await.take() {
             poller.abort();
         }
@@ -1496,6 +1827,12 @@ impl Driver for ShellPtyDriver {
         }
         if let Ok(mut slot) = self.status.lock() {
             *slot = None;
+        }
+        // Release any hook parked on an approval before the socket goes away.
+        // Otherwise each one holds its agent's turn open until its own
+        // deadline, minutes after the session has stopped.
+        if let Some(hooks) = self.hooks.lock().await.as_ref() {
+            hooks.retire_parked();
         }
         // Unbinds the socket and removes the socket file. The overlay and shims
         // stay for `instance.purge` to remove with the rest of the instance
@@ -1934,6 +2271,66 @@ fn argv_redacted(args: &[String], shell: &Path) -> Vec<String> {
 /// around any embedded single quote.
 fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// §9.1 [`crate::effort::EffortSwitchIo`] backed by the local native PTY.
+struct ShellEffortIo {
+    state: Arc<PtyState>,
+    events: mpsc::Sender<remuda_protocol::Observation>,
+    seq: Arc<AtomicU64>,
+    ctx: promotion::PromoteCtx,
+}
+
+#[async_trait]
+impl crate::effort::EffortSwitchIo for ShellEffortIo {
+    async fn is_idle(&self) -> bool {
+        let rung = send::ready_rung(
+            true,
+            false,
+            self.state.modes(),
+            self_state_idle_helper(&self.state),
+        );
+        matches!(
+            rung,
+            Some(send::ReadyEvidence::Quiescence) | Some(send::ReadyEvidence::Glyph)
+        )
+    }
+
+    async fn type_body(&self, body: &str) -> crate::DriverResult<()> {
+        self.state.write_bytes(body.as_bytes()).await
+    }
+
+    async fn press_enter(&self) -> crate::DriverResult<()> {
+        // Enter is its own write, exactly as `send::encode` requires for an
+        // agent composer.
+        self.state.write_bytes(b"\r").await
+    }
+
+    async fn screen_text(&self) -> crate::DriverResult<String> {
+        Ok(self.state.screen_grid().text())
+    }
+
+    async fn journal(&self, status: String, severity: remuda_protocol::Severity) {
+        let payload = promotion::effort_lifecycle(&status, severity);
+        if promotion::emit_payload(
+            &self.events,
+            &self.seq,
+            &self.ctx,
+            SourceChannel::Runtime,
+            Completeness::Structured,
+            payload,
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!("effort lifecycle dropped: event channel closed");
+        }
+    }
+}
+
+/// Read the emulator/screen idle signal without a `&ShellPtyDriver`.
+fn self_state_idle_helper(state: &PtyState) -> bool {
+    remuda_screen::screen_status(&state.screen_grid()) == Some(ScreenStatus::Idle)
 }
 
 #[cfg(test)]

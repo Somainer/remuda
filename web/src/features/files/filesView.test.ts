@@ -15,7 +15,7 @@ import {
   type ScmEntry,
   type ScmFile,
   type ScmStatus,
-} from "./filesView";
+} from "./filesViewModel";
 
 const limits = { maxEntries: 5000, maxDiffBytes: 262144, maxFileBytes: 1048576 };
 

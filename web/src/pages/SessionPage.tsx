@@ -473,6 +473,7 @@ export function SessionPage({
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
           effort={hubStore.effortOf(instance.id, instance.kind)}
+          effortEffective={hubStore.effortEffectiveOf(instance.id)}
           contextLabel={(() => {
             const pct = contextPercent(usage, instance.kind);
             return pct == null ? null : `${pct}%`;

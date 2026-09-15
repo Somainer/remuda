@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod merge;
 pub mod node;
 mod own;
+mod profile;
 mod project;
 pub(crate) mod registry;
 pub mod ssh;
@@ -54,6 +55,7 @@ commands! {
     Project(project::ProjectArgs),
     Task(task::TaskArgs),
     Own(own::OwnArgs),
+    Profile(profile::ProfileArgs),
     Fleet(fleet::Args),
     Worktree(worktree::Args),
     Merge(merge::MergeArgs),

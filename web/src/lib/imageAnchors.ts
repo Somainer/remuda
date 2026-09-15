@@ -9,11 +9,23 @@
  * All functions are pure (no DOM, no React state), so caret arithmetic and
  * IME/CJK text can be unit-tested directly. The composer is responsible for
  * reading the textarea caret and restoring it after an insert.
+ *
+ * The same machinery is parameterised by `AnchorKind` so `[Code #n]` quote
+ * anchors (2026-09-15, workbench-code-2) reuse the exact token shape instead
+ * of inventing a second syntax.
  */
+
+/** Token families: `[Image #n]` and `[Code #n]` share the same shape. */
+export type AnchorKind = "Image" | "Code";
 
 /** The literal token for position `index` (1-based). */
 export function anchorToken(index: number): string {
   return `[Image #${index}]`;
+}
+
+/** Generic token literal for either family. */
+export function anchorTokenFor(kind: AnchorKind, index: number): string {
+  return `[${kind} #${index}]`;
 }
 
 /**
@@ -22,19 +34,51 @@ export function anchorToken(index: number): string {
  */
 export const IMAGE_ANCHOR_RE = /\[Image #(\d+)\]/g;
 
+/** Same contract for code quote anchors. */
+export const CODE_ANCHOR_RE = /\[Code #(\d+)\]/g;
+
+/** Matches either family; capture group 1 is the family word, 2 the number. */
+export const ANY_ANCHOR_RE = /\[(Image|Code) #(\d+)\]/g;
+
+export function anchorRegex(kind: AnchorKind): RegExp {
+  return kind === "Image" ? /\[Image #(\d+)\]/g : /\[Code #(\d+)\]/g;
+}
+
 /** One parsed token: its 1-based index and its half-open byte-ish offset. */
 export type AnchorSpan = { index: number; start: number; end: number };
+
+/** Same, tagged with its family (used by the combined AnchorText renderer). */
+export type TypedAnchorSpan = AnchorSpan & { kind: AnchorKind };
 
 /**
  * Every token in `text`, left to right. Duplicates are kept: a chip whose
  * token appears twice stays referenced, and chip removal rewrites both.
  */
 export function findAnchors(text: string): AnchorSpan[] {
+  return findAnchorsFor("Image", text);
+}
+
+/** Family-parameterised token scan. */
+export function findAnchorsFor(kind: AnchorKind, text: string): AnchorSpan[] {
   const found: AnchorSpan[] = [];
-  // String#replaceAll with a global regex is fine here; run a fresh regex so
-  // the function is re-entrant (a module-level global would carry lastIndex).
-  text.replace(IMAGE_ANCHOR_RE, (match, digits: string, offset: number) => {
+  const re = anchorRegex(kind);
+  text.replace(re, (match, digits: string, offset: number) => {
     found.push({ index: Number(digits), start: offset, end: offset + match.length });
+    return match;
+  });
+  return found;
+}
+
+/** Every token of either family, left to right. */
+export function findAllAnchors(text: string): TypedAnchorSpan[] {
+  const found: TypedAnchorSpan[] = [];
+  text.replace(ANY_ANCHOR_RE, (match, family: string, digits: string, offset: number) => {
+    found.push({
+      kind: family as AnchorKind,
+      index: Number(digits),
+      start: offset,
+      end: offset + match.length,
+    });
     return match;
   });
   return found;
@@ -43,6 +87,11 @@ export function findAnchors(text: string): AnchorSpan[] {
 /** Distinct token indices present in the text, ascending. */
 export function referencedIndices(text: string): Set<number> {
   return new Set(findAnchors(text).map((span) => span.index));
+}
+
+/** Same for a chosen family. */
+export function referencedIndicesFor(kind: AnchorKind, text: string): Set<number> {
+  return new Set(findAnchorsFor(kind, text).map((span) => span.index));
 }
 
 /** Result of inserting one or more tokens: the new text and where the caret should sit. */
@@ -57,6 +106,16 @@ const isWhitespace = (ch: string | undefined): boolean => ch === undefined || /\
  * token (before any trailing space this added), so typing continues naturally.
  */
 export function insertAnchor(text: string, caret: number, index: number): InsertResult {
+  return insertAnchorFor("Image", text, caret, index);
+}
+
+/** Family-parameterised insert. */
+export function insertAnchorFor(
+  kind: AnchorKind,
+  text: string,
+  caret: number,
+  index: number,
+): InsertResult {
   const at = Math.max(0, Math.min(caret, text.length));
   // String#at wraps negatives to the *end* of the string; at caret 0 there
   // is simply no preceding character.
@@ -64,7 +123,7 @@ export function insertAnchor(text: string, caret: number, index: number): Insert
   const after = text.at(at);
   const lead = isWhitespace(before) ? "" : " ";
   const tail = isWhitespace(after) ? "" : " ";
-  const token = anchorToken(index);
+  const token = anchorTokenFor(kind, index);
   const inserted = lead + token + tail;
   return {
     text: text.slice(0, at) + inserted + text.slice(at),
@@ -77,10 +136,20 @@ export function insertAnchor(text: string, caret: number, index: number): Insert
  * arrive in attachment order, each separated from the last.
  */
 export function insertAnchors(text: string, caret: number, indices: number[]): InsertResult {
+  return insertAnchorsFor("Image", text, caret, indices);
+}
+
+/** Family-parameterised multi-insert. */
+export function insertAnchorsFor(
+  kind: AnchorKind,
+  text: string,
+  caret: number,
+  indices: number[],
+): InsertResult {
   let next = text;
   let at = caret;
   for (const index of indices) {
-    const result = insertAnchor(next, at, index);
+    const result = insertAnchorFor(kind, next, at, index);
     next = result.text;
     at = result.caret;
   }
@@ -99,7 +168,16 @@ export function renumberAnchors(
   text: string,
   rename: (index: number) => number | null,
 ): string {
-  const spans = findAnchors(text);
+  return renumberAnchorsFor("Image", text, rename);
+}
+
+/** Family-parameterised renumber/delete. */
+export function renumberAnchorsFor(
+  kind: AnchorKind,
+  text: string,
+  rename: (index: number) => number | null,
+): string {
+  const spans = findAnchorsFor(kind, text);
   // `at` without the end-wrap footgun: a negative offset is out of bounds.
   const charAt = (offset: number): string | undefined =>
     offset >= 0 && offset < text.length ? text[offset] : undefined;
@@ -130,9 +208,9 @@ export function renumberAnchors(
   for (const del of deletions) {
     out = out.slice(0, del.start) + del.replacement + out.slice(del.end);
   }
-  return out.replace(IMAGE_ANCHOR_RE, (match, digits: string) => {
+  return out.replace(anchorRegex(kind), (match, digits: string) => {
     const next = rename(Number(digits));
-    return next === null ? match : anchorToken(next);
+    return next === null ? match : anchorTokenFor(kind, next);
   });
 }
 
@@ -142,4 +220,11 @@ export function renumberAnchors(
  */
 export function removeAndRenumber(text: string, removed: number): string {
   return renumberAnchors(text, (index) => (index === removed ? null : index > removed ? index - 1 : index));
+}
+
+/** Family-parameterised chip removal. */
+export function removeAndRenumberFor(kind: AnchorKind, text: string, removed: number): string {
+  return renumberAnchorsFor(kind, text, (index) =>
+    index === removed ? null : index > removed ? index - 1 : index,
+  );
 }

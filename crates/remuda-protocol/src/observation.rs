@@ -890,6 +890,27 @@ pub struct OpaquePayload {
     pub summary: Option<String>,
 }
 
+/// EffortPayload; `protocol.md` §5.1 (D-028 §9.1).
+///
+/// Emitted whenever an assistant transcript record's `effort` /
+/// `perTurnEffort` is observed. Unchanged values are deduped by the emitting
+/// driver, so the Hub only sees edges. The UI renders from this observation —
+/// never from the requested selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EffortPayload {
+    /// The level Remuda asked for (launch argv or an in-session switch), when
+    /// known on the observing side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<EffortSelection>,
+    /// The level actually observed in the assistant transcript record.
+    pub effective: EffortEffective,
+    /// Native spelling read off the record (`effort` / `perTurnEffort`), kept
+    /// for diagnostics (`auto`, an unknown future name normalizes into `name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+}
+
 /// ObservationPayload; `protocol.md` §5.1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", content = "payload")]
@@ -933,6 +954,9 @@ pub enum ObservationPayload {
     /// `artifact` payload; §5.1.
     #[serde(rename = "artifact")]
     Artifact(Box<ArtifactPayload>),
+    /// `effort` payload; §5.1 / D-028 §9.1.
+    #[serde(rename = "effort")]
+    Effort(Box<EffortPayload>),
     /// `raw_tty` payload; §5.1.
     #[serde(rename = "raw_tty")]
     RawTty(Box<RawTtyPayload>),
@@ -958,6 +982,7 @@ impl ObservationPayload {
             Self::Lifecycle(..) => ObservationKind::Lifecycle,
             Self::Usage(..) => ObservationKind::Usage,
             Self::Artifact(..) => ObservationKind::Artifact,
+            Self::Effort(..) => ObservationKind::Effort,
             Self::RawTty(..) => ObservationKind::RawTty,
             Self::Opaque(..) => ObservationKind::Opaque,
         }

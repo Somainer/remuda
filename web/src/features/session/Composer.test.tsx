@@ -45,13 +45,14 @@ describe("Composer shortcuts", () => {
         kind="claude"
         model="opus"
         effort={effortAt("claude", 2)}
+        effortEffective={{ name: "high", ultracode: null, source: "launch", observedAt: "2026-09-14T00:00:00Z" }}
         contextLabel="74%"
         onEffort={onEffort}
         onPermission={vi.fn()}
       />,
     );
     expect(screen.getByTestId("harness-chip")).toHaveTextContent(/Claude/);
-    expect(screen.getByTestId("model-effort-chip")).toHaveTextContent("high");
+    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("high");
     expect(screen.getByTestId("model-effort-chip")).not.toHaveTextContent("opus");
     expect(screen.getByTestId("context-chip")).toHaveTextContent("74%");
     expect(screen.getByTestId("permission-chip")).toHaveTextContent(/询问/);
@@ -168,6 +169,7 @@ describe("Composer shortcuts", () => {
         kind="claude"
         model="opus"
         effort={effortAt("claude", 3, true)}
+        effortEffective={{ name: "xhigh", ultracode: true, source: "remuda", observedAt: "2026-09-14T00:00:00Z" }}
         onEffort={onEffort}
       />,
     );
@@ -178,8 +180,9 @@ describe("Composer shortcuts", () => {
     expect(slider).toHaveAttribute("data-ember", "1");
     // The stop is a normal slider stop: the track stays enabled...
     expect(slider).toHaveAttribute("aria-disabled", "false");
-    // ...and the chip reads "ultracode", not the underlying tier name.
-    expect(screen.getByTestId("model-effort-chip")).toHaveTextContent("ultracode");
+    // §9.1: the chip reads the EFFECTIVE transcript level ("xhigh", the level
+    // ultracode runs at); the requested "ultracode" shows in the open slider.
+    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("xhigh");
     expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
     // One arrow left returns to max — no locked track.
     await user.keyboard("{ArrowLeft}");

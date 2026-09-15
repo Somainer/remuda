@@ -16,7 +16,7 @@ import {
   type EntryDetailState,
   type FilesViewModel,
   type ScmEntry,
-} from "./filesView";
+} from "./filesViewModel";
 import css from "./files.module.css";
 
 interface FilesViewProps {

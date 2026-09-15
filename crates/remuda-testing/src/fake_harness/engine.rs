@@ -24,12 +24,13 @@ use serde_json::{Value, json};
 
 use crate::fake_harness::artifacts::{
     ArtifactKind, ArtifactPaths, ArtifactSet, CodexCounters, CommandOutcome, GrokTurnIds,
-    SessionMeta, claude_assistant_block, claude_queue_op, claude_queued_attachment,
-    claude_tool_result, claude_user_record, codex_assistant_message, codex_command_item_completed,
-    codex_function_call, codex_function_output, codex_session_index, codex_session_meta,
-    codex_task_complete, codex_task_started, codex_token_usage, codex_turn_aborted,
-    codex_user_item_completed, codex_user_message, grok_chunk_update, grok_tool_call,
-    grok_tool_update_completed, grok_tool_update_failed, grok_turn_completed, grok_write_registry,
+    SessionMeta, claude_assistant_block, claude_effort_slash_records, claude_queue_op,
+    claude_queued_attachment, claude_tool_result, claude_user_record, codex_assistant_message,
+    codex_command_item_completed, codex_function_call, codex_function_output, codex_session_index,
+    codex_session_meta, codex_task_complete, codex_task_started, codex_token_usage,
+    codex_turn_aborted, codex_user_item_completed, codex_user_message, grok_chunk_update,
+    grok_tool_call, grok_tool_update_completed, grok_tool_update_failed, grok_turn_completed,
+    grok_write_registry,
 };
 use crate::fake_harness::clock::FakeClock;
 use crate::fake_harness::hooks::{
@@ -176,6 +177,9 @@ struct Engine {
     codex_counters: CodexCounters,
     draft: String,
     claude_queue: Vec<QueuedPrompt>,
+    /// §9.1: current in-session effort level, stamped on assistant records;
+    /// changed by a typed `/effort <word>`.
+    effort: String,
     codex_queue: VecDeque<String>,
     grok_queue: VecDeque<String>,
     consumed: BTreeMap<usize, ()>,
@@ -192,6 +196,7 @@ struct Engine {
     stopping: Arc<AtomicBool>,
     events_file: Option<std::fs::File>,
     should_exit: bool,
+    relaunch_tui: Option<String>,
     dirty: bool,
     last_second: u64,
     /// Last OSC 0 title emitted, so live edges only resend changes.
@@ -306,8 +311,12 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         Dialect::Codex => HookKind::Codex,
         Dialect::Grok => HookKind::Grok,
     };
-    let hooks = HookTable::load(hook_kind, opts.settings.as_deref(), Some(&home))
-        .map_err(RunError::Args)?;
+    let hooks = if dialect == Dialect::Claude {
+        HookTable::load_claude(&home, &cwd, opts.settings.as_deref())
+    } else {
+        HookTable::load(hook_kind, opts.settings.as_deref(), Some(&home))
+    }
+    .map_err(RunError::Args)?;
 
     let artifact_kind = match dialect {
         Dialect::Claude => ArtifactKind::Claude,
@@ -332,6 +341,20 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     let mut view = View::new(dialect, model.clone(), dir_name);
     view.alt_screen = !opts.no_alt_screen;
     view.dialect_version = dialect_version;
+    if dialect == Dialect::Claude {
+        let settings = crate::fake_harness::settings::merged_claude_settings(
+            &home,
+            &cwd,
+            opts.settings.as_deref(),
+        )
+        .map_err(RunError::Args)?;
+        let latch = std::env::var("CLAUDE_CODE_TUI_JUST_SWITCHED").ok();
+        let tui = settings
+            .get("tui")
+            .and_then(Value::as_str)
+            .or(latch.as_deref());
+        view.alt_screen &= tui != Some("default");
+    }
     if dialect == Dialect::Codex && !resuming {
         view.transcript
             .push(format!(">_ OpenAI Codex (v{})", dialect.version()));
@@ -355,6 +378,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         codex_counters: CodexCounters::new(),
         draft: String::new(),
         claude_queue: Vec::new(),
+        effort: "high".into(),
         codex_queue: VecDeque::new(),
         grok_queue: VecDeque::new(),
         consumed: BTreeMap::new(),
@@ -371,6 +395,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         stopping,
         events_file,
         should_exit: false,
+        relaunch_tui: None,
         dirty: true,
         last_second: 0,
         osc_title: initial_title,
@@ -403,6 +428,14 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         session_start["transcript_path"] = json!(engine.paths.main.to_string_lossy());
     }
     engine.fire_hook(HookEvent::SessionStart, session_start);
+    engine.event(
+        "session_start",
+        json!({
+            "pid": std::process::id(), "session_id": engine.meta.session_id,
+            "alt_screen": engine.view.alt_screen,
+            "tui_latch": std::env::var("CLAUDE_CODE_TUI_JUST_SWITCHED").ok(),
+        }),
+    );
     if opts.trust_dialog {
         engine.view.mode = ScreenMode::Trust;
     }
@@ -418,7 +451,39 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
     engine.shutdown_artifacts()?;
     engine.fire_hook(HookEvent::SessionEnd, json!({ "reason": "shutdown" }));
     let _ = write_stdout(&teardown(&engine.view));
+    if let Some(tui) = engine.relaunch_tui {
+        return relaunch_claude(&tui, &engine.meta.session_id);
+    }
     result
+}
+
+/// Replace this process with a waiting shell and a new harness PID, retaining
+/// the PTY process group. Exec also removes the old blocking stdin reader.
+/// This models /tui's replacement-process boundary without a live model.
+fn relaunch_claude(tui: &str, session_id: &str) -> Result<i32, RunError> {
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !args.iter().any(|arg| arg == "--resume") {
+        args.extend(["--resume".into(), session_id.into()]);
+    }
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "exec 3<&0; \"$@\" <&3 & child=$!; wait \"$child\"",
+            "fake-tui-relaunch",
+        ])
+        .arg(std::env::current_exe()?)
+        .args(args)
+        .env("CLAUDE_CODE_TUI_JUST_SWITCHED", tui);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(command.status()?.code().unwrap_or(1))
+    }
 }
 
 fn default_home(dialect: Dialect) -> Option<PathBuf> {
@@ -1210,6 +1275,35 @@ impl Engine {
         if prompt.is_empty() {
             return;
         }
+        if self.dialect == Dialect::Claude
+            && let Some(tui) = prompt.trim().strip_prefix("/tui ")
+            && matches!(tui, "fullscreen" | "default")
+        {
+            let path = self.home.join("settings.json");
+            let result = (|| -> Result<(), RunError> {
+                let mut settings = if path.exists() {
+                    serde_json::from_slice::<Value>(&std::fs::read(&path)?)
+                        .map_err(|error| RunError::Args(error.to_string()))?
+                } else {
+                    json!({})
+                };
+                settings["tui"] = json!(tui);
+                std::fs::write(path, settings.to_string())?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    self.event(
+                        "tui_relaunch",
+                        json!({"tui": tui, "pid": std::process::id()}),
+                    );
+                    self.relaunch_tui = Some(tui.into());
+                    self.should_exit = true;
+                }
+                Err(error) => self.view.notice = Some(error.to_string()),
+            }
+            return;
+        }
         let exit = match self.dialect {
             Dialect::Claude => prompt.trim() == "/exit",
             Dialect::Codex => prompt.trim() == "/quit",
@@ -1218,6 +1312,46 @@ impl Engine {
         if exit {
             self.event("exit_command", json!({ "command": prompt }));
             self.should_exit = true;
+            return;
+        }
+        // §9.1: a typed `/effort <word>` changes the level stamped on every
+        // subsequent assistant record and is journaled as the same two user
+        // records a real claude writes (command markup + local stdout), so the
+        // driver's read-back path runs unchanged.
+        if self.dialect == Dialect::Claude
+            && let Some(word) = prompt
+                .trim()
+                .strip_prefix("/effort")
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+        {
+            let word = word
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let valid = matches!(
+                word.as_str(),
+                "low" | "medium" | "high" | "xhigh" | "max" | "ultracode" | "auto"
+            );
+            let stdout = if valid {
+                // `ultracode` runs at xhigh + workflow; the assistant record
+                // level is therefore xhigh.
+                let stamped = if word == "ultracode" { "xhigh" } else { &word };
+                self.effort = stamped.to_string();
+                format!("Set effort level to {word} (in-session)")
+            } else {
+                format!(
+                    "Invalid argument: {word}. Valid options are: low, medium, high, xhigh, max, \
+                     ultracode, auto"
+                )
+            };
+            self.event("effort_command", json!({ "word": word, "accepted": valid }));
+            for record in claude_effort_slash_records(&self.meta, &self.clock, &word, &stdout) {
+                if let Err(error) = self.artifacts.append(record) {
+                    tracing::warn!(%error, "failed to append effort slash record");
+                }
+            }
             return;
         }
         self.fire_prompt_hook(&prompt);
@@ -1541,6 +1675,7 @@ impl Engine {
                     block,
                     "tool_use",
                     &self.usage_spec(),
+                    Some(&self.effort),
                 );
                 self.artifacts.append(record)?;
                 self.turn.as_mut().unwrap().claude_seq += 1;
@@ -1958,6 +2093,7 @@ impl Engine {
                     json!({ "type": "text", "text": text }),
                     stop_reason,
                     &usage,
+                    Some(&self.effort),
                 );
                 self.artifacts.append(record)?;
             }

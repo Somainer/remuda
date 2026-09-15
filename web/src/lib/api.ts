@@ -1,5 +1,5 @@
 import type { Command, CommandResult, Page } from "../types/command";
-import type { Host, HostCli, Instance } from "../types/instance";
+import type { Host, HostCli, Instance, TuiMode } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { EventsBatch, Observation, Snapshot } from "../types/observation";
 import { known, unknownKnowledge, type Id, type U64 } from "../types/wire";
@@ -203,6 +203,7 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
     providerBinding: typeof h.providerBinding === "string" && h.providerBinding ? h.providerBinding : "auto",
     defaultLaunchArgs: Array.isArray(h.defaultLaunchArgs) ? h.defaultLaunchArgs : undefined,
     claudeBinaryPath: h.claudeBinaryPath ?? undefined,
+    defaultTui: h.defaultTui ?? undefined,
   };
 }
 
@@ -219,8 +220,17 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     providerSource?: string | null;
     providerSourceHint?: string | null;
     model?: string | null;
+    tui?: TuiMode | null;
     effortName?: string | null;
     effortIndex?: number | null;
+    effortEffective?:
+      | {
+          name?: string;
+          ultracode?: boolean | null;
+          source?: string;
+          observedAt?: string;
+        }
+      | null;
     mode?: string | null;
     promotedAt?: string | null;
     launchedBy?: string | null;
@@ -292,8 +302,26 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     providerSourceHint:
       typeof rec.providerSourceHint === "string" ? rec.providerSourceHint : extra.providerSourceHint ?? null,
     model: typeof extra.model === "string" ? extra.model : null,
+    tui: extra.tui === "fullscreen" || extra.tui === "default" ? extra.tui : null,
     effortName: typeof extra.effortName === "string" ? extra.effortName : null,
     effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
+    effortEffective:
+      extra.effortEffective && typeof extra.effortEffective.name === "string"
+        ? {
+            name: extra.effortEffective.name,
+            ultracode:
+              typeof extra.effortEffective.ultracode === "boolean"
+                ? extra.effortEffective.ultracode
+                : null,
+            source:
+              extra.effortEffective.source === "launch" ||
+              extra.effortEffective.source === "slash" ||
+              extra.effortEffective.source === "remuda"
+                ? extra.effortEffective.source
+                : "unknown",
+            observedAt: extra.effortEffective.observedAt ?? "",
+          }
+        : null,
     mode: extra.mode === "promoted" || extra.mode === "native" ? extra.mode : null,
     promotedAt: typeof extra.promotedAt === "string" ? extra.promotedAt : null,
   };
@@ -363,6 +391,8 @@ export type InstanceCreateSpec = {
   args?: string[];
   /** Host-absolute claude executable. Validated and pinned by the Node, not the Hub. */
   binaryPath?: string;
+  /** Initial Claude renderer, replacing the host default when present. */
+  tui?: TuiMode;
   name?: string;
   /** Composer/New Session effort. Stored in UI state; Hub ignores unknown create fields. */
   effortIndex?: number;
@@ -501,7 +531,7 @@ export type HubApi = {
   hostRemove(hostId: Id): Promise<void>;
   hostList(): Promise<Page<Host>>;
   hostGet(hostId: Id): Promise<Host>;
-  hostPatch(hostId: Id, body: { name?: string; labels?: string[]; maxInstances?: number; providerBinding?: string; defaultLaunchArgs?: string[] | null; claudeBinaryPath?: string | null }): Promise<Host>;
+  hostPatch(hostId: Id, body: { name?: string; labels?: string[]; maxInstances?: number; providerBinding?: string; defaultLaunchArgs?: string[] | null; defaultTui?: TuiMode | null; claudeBinaryPath?: string | null }): Promise<Host>;
   workspaceList(hostId?: Id): Promise<Page<Workspace>>;
   workspaceRegister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceId?: string; workspaceRevision?: number }>;
   workspaceUnregister(hostId: Id, path: string): Promise<Page<Workspace> & { workspaceRevision?: number }>;
@@ -717,6 +747,7 @@ function createMockApi(): HubApi {
       instance.delegation = spec.delegation ?? "none";
       instance.providerProfileId = spec.providerProfileId;
       instance.model = spec.model;
+      instance.tui = spec.tui ?? mockDb.hosts.find((h) => h.id === spec.hostId)?.defaultTui ?? "fullscreen";
       if (spec.effortName != null) {
         instance.effortName = spec.effortName;
         instance.effortIndex = spec.effortIndex ?? 0;
@@ -832,6 +863,9 @@ function createMockApi(): HubApi {
       // `null` clears; `undefined` means the PATCH did not mention the field.
       if (body.defaultLaunchArgs !== undefined) {
         found.defaultLaunchArgs = body.defaultLaunchArgs ?? undefined;
+      }
+      if (body.defaultTui !== undefined) {
+        found.defaultTui = body.defaultTui ?? undefined;
       }
       if (body.claudeBinaryPath !== undefined) {
         found.claudeBinaryPath = body.claudeBinaryPath || undefined;
@@ -1161,6 +1195,7 @@ function createLiveApi(): HubApi {
         // host default with "no args", which is a different request.
         args: spec.args?.length ? spec.args : undefined,
         binaryPath: spec.binaryPath || undefined,
+        tui: spec.tui,
       };
       const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
         method: "POST",

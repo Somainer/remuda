@@ -173,6 +173,8 @@ pub struct HostLaunchDefaultsPatch {
     pub default_launch_args: Option<Option<Vec<String>>>,
     /// Per-host default claude executable. `Some(None)` clears it.
     pub claude_binary_path: Option<Option<String>>,
+    /// Per-host renderer preference. `Some(None)` restores fullscreen.
+    pub default_tui: Option<Option<remuda_protocol::TuiMode>>,
 }
 
 /// Host index row (Hub projection).
@@ -227,6 +229,9 @@ pub struct HostRecord {
     /// Per-host default claude executable. Stored as given; the Node validates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_binary_path: Option<String>,
+    /// Per-host requested renderer; absent means fullscreen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tui: Option<remuda_protocol::TuiMode>,
     /// Last acknowledged Node workspace registry.
     #[serde(default)]
     pub workspaces: Vec<Value>,
@@ -335,6 +340,9 @@ pub struct InstanceRecord {
     /// Current model id from create / `instance.configure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Requested launch renderer; actual mode comes from the tty snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui: Option<remuda_protocol::TuiMode>,
     /// Native effort tier name.
     ///
     /// Normalized to a D-028 §9.1 level (`low` … `max`) on read, so a row
@@ -365,6 +373,13 @@ pub struct InstanceRecord {
         rename = "effortIndex"
     )]
     pub effort_index: Option<u32>,
+    /// §9.1 effective effort read back from assistant transcript records.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortEffective"
+    )]
+    pub effort_effective: Option<Value>,
     /// Native session id reported by the driver, resumable with `--resume` (D-026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
@@ -722,6 +737,7 @@ impl InstanceRecord {
             "workspaceId": self.workspace_id,
             "cwd": self.cwd,
             "model": self.model,
+            "tui": self.tui,
             "delegation": self.delegation,
             "providerProfileId": self.provider_profile_id,
         });
@@ -912,6 +928,9 @@ pub struct ProviderRecord {
     /// Last `/test` message (no secrets).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_test_message: Option<String>,
+    /// Declared supply + observed window state (coordinator §4.2).
+    #[serde(default)]
+    pub supply: remuda_protocol::SupplyProfile,
     /// Create-time.
     pub created_at: String,
     /// Update-time.
@@ -946,6 +965,7 @@ impl ProviderRecord {
                 "checkedAt": self.last_test_at,
                 "message": self.last_test_message,
             })),
+            "supply": self.supply,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         })
@@ -2725,6 +2745,7 @@ impl Store {
         let HostLaunchDefaultsPatch {
             default_launch_args,
             claude_binary_path,
+            default_tui,
         } = launch_defaults;
         self.run(move |conn| {
             if load_host(conn, &host_id)?.is_none() {
@@ -2775,6 +2796,16 @@ impl Store {
                 conn.execute(
                     "UPDATE hosts SET claude_binary_path = ?1 WHERE id = ?2",
                     params![path, host_id],
+                )?;
+            }
+            if let Some(tui) = default_tui {
+                let encoded = tui
+                    .map(|tui| serde_json::to_string(&tui))
+                    .transpose()
+                    .map_err(|error| StoreError::Id(error.to_string()))?;
+                conn.execute(
+                    "UPDATE hosts SET default_tui = ?1 WHERE id = ?2",
+                    params![encoded, host_id],
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
@@ -2941,7 +2972,8 @@ impl Store {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                             is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
+                            supply_json
                      FROM provider_profiles
                      WHERE scope = 'universal' OR scope = '' OR scope = ?1
                      ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
@@ -2953,7 +2985,8 @@ impl Store {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                             is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
+                            supply_json
                      FROM provider_profiles
                      ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
                 )?;
@@ -3009,6 +3042,7 @@ impl Store {
         secret_name: Option<String>,
         secret_last4: Option<String>,
         secret_fingerprint: Option<String>,
+        supply: remuda_protocol::SupplyProfile,
     ) -> Result<ProviderRecord, StoreError> {
         self.run(move |conn| {
             let now = now_rfc3339();
@@ -3022,8 +3056,8 @@ impl Store {
                 "INSERT INTO provider_profiles
                  (id, name, kind, base_url, models_json, default_model, headers_json,
                   is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                  created_at, updated_at, scope)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13)",
+                  created_at, updated_at, scope, supply_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13, ?14)",
                 params![
                     id,
                     name,
@@ -3038,6 +3072,7 @@ impl Store {
                     secret_fingerprint,
                     now,
                     scope,
+                    serde_json::to_string(&supply)?,
                 ],
             )?;
             load_provider(conn, &id)?
@@ -3062,6 +3097,7 @@ impl Store {
         secret_name: Option<Option<String>>,
         secret_last4: Option<Option<String>>,
         secret_fingerprint: Option<Option<String>>,
+        supply: Option<remuda_protocol::SupplyProfile>,
     ) -> Result<ProviderRecord, StoreError> {
         self.run(move |conn| {
             let existing = load_provider(conn, &id)?
@@ -3140,6 +3176,12 @@ impl Store {
                     params![secret_fingerprint, id],
                 )?;
             }
+            if let Some(supply) = supply {
+                conn.execute(
+                    "UPDATE provider_profiles SET supply_json = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&supply)?, id],
+                )?;
+            }
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE provider_profiles SET revision = revision + 1, updated_at = ?1 WHERE id = ?2",
@@ -3173,6 +3215,117 @@ impl Store {
         .await
     }
 
+    /// Replace a profile's declared/observed supply envelope; §4.2.
+    ///
+    /// Used by `PATCH …/supply` (user declaration) and by the feedback loop
+    /// (429 / structured rate-limit frames). Bumps revision like other
+    /// profile metadata edits.
+    pub async fn update_provider_supply(
+        &self,
+        id: String,
+        supply: remuda_protocol::SupplyProfile,
+    ) -> Result<ProviderRecord, StoreError> {
+        self.run(move |conn| {
+            if load_provider(conn, &id)?.is_none() {
+                return Err(StoreError::Id("unknown provider".into()));
+            }
+            let encoded = serde_json::to_string(&supply)?;
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE provider_profiles SET supply_json = ?1, revision = revision + 1, updated_at = ?2
+                 WHERE id = ?3",
+                params![encoded, now, id],
+            )?;
+            load_provider(conn, &id)?.ok_or_else(|| StoreError::Id("unknown provider".into()))
+        })
+        .await
+    }
+
+    /// Read every live instance (same lifecycle set as host counts) for
+    /// supply concurrency accounting.
+    pub async fn list_live_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM instances
+                 WHERE lifecycle IN
+                    ('preparing', 'starting', 'ready', 'running', 'closing', 'reconciling')",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            ids.into_iter()
+                .map(|id| {
+                    load_instance(conn, &id)?
+                        .ok_or_else(|| StoreError::Id("instance missing during live list".into()))
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Append one placement decision to the audit ledger; §5.6.
+    pub async fn insert_placement_ledger(
+        &self,
+        instance_id: Option<String>,
+        project_id: Option<String>,
+        profile_id: Option<String>,
+        model_id: Option<String>,
+        host_id: Option<String>,
+        decision: Value,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            let encoded = serde_json::to_string(&decision)?;
+            conn.execute(
+                "INSERT INTO placement_ledger
+                    (instance_id, project_id, profile_id, model_id, host_id, decision_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![instance_id, project_id, profile_id, model_id, host_id, encoded, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Recent placement ledger rows (newest first); tests/support/CLI read.
+    pub async fn list_placement_ledger(&self, limit: i64) -> Result<Vec<Value>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT instance_id, project_id, profile_id, model_id, host_id, decision_json, created_at
+                 FROM placement_ledger ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                let decision_json: String = row.get(5)?;
+                let mut decision: Value =
+                    serde_json::from_str(&decision_json).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = decision.as_object_mut() {
+                    if let Ok(v) = row.get::<_, Option<String>>(0) {
+                        obj.insert("instanceId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(1) {
+                        obj.insert("projectId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(2) {
+                        obj.insert("profileId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(3) {
+                        obj.insert("modelId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(4) {
+                        obj.insert("hostId".into(), json!(v));
+                    }
+                    let created_at: String = row.get(6)?;
+                    obj.insert("placedAt".into(), json!(created_at));
+                }
+                Ok(decision)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
     /// Delete a profile row. Caller deletes the vault entry.
     pub async fn delete_provider(&self, id: String) -> Result<Option<ProviderRecord>, StoreError> {
         self.run(move |conn| {
@@ -3190,7 +3343,8 @@ fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderRecord>, 
     conn.query_row(
         "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                 is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
+                supply_json
          FROM provider_profiles WHERE id = ?1",
         params![id],
         load_provider_row,
@@ -3210,6 +3364,10 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         .get::<_, Option<String>>(17)?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "universal".into());
+    let supply_json: String = row
+        .get::<_, Option<String>>(18)?
+        .unwrap_or_else(|| "{}".into());
+    let supply = serde_json::from_str(&supply_json).unwrap_or_default();
     Ok(ProviderRecord {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -3230,6 +3388,7 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         created_at: row.get(15)?,
         updated_at: row.get(16)?,
         scope,
+        supply,
     })
 }
 
@@ -3455,11 +3614,19 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // default", which is different from "an empty arg list".
     ensure_column(&conn, "hosts", "default_launch_args", "TEXT")?;
     ensure_column(&conn, "hosts", "claude_binary_path", "TEXT")?;
+    ensure_column(&conn, "hosts", "default_tui", "TEXT")?;
     ensure_column(
         &conn,
         "provider_profiles",
         "scope",
         "TEXT NOT NULL DEFAULT 'universal'",
+    )?;
+    // Declared supply + observed window state (coordinator batch 3, §4.2).
+    ensure_column(
+        &conn,
+        "provider_profiles",
+        "supply_json",
+        "TEXT NOT NULL DEFAULT '{}'",
     )?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "instances", "mode", "TEXT")?;
@@ -3500,6 +3667,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::workspaces::migrate(&conn)?;
     crate::projects::migrate(&conn)?;
     crate::tasks::migrate(&conn)?;
+    crate::supply::migrate(&conn)?;
+    crate::usage_store::migrate(&conn)?;
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;
@@ -3532,6 +3701,28 @@ fn migrate_provider_models(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// §9.1: persist the transcript-observed effective effort onto the spec.
+fn apply_effective_effort_projection(
+    conn: &Connection,
+    instance_id: &str,
+    effective: &Value,
+) -> Result<(), StoreError> {
+    let spec_raw: String = conn.query_row(
+        "SELECT spec_json FROM instances WHERE id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let mut spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+    if let Some(object) = spec.as_object_mut() {
+        object.insert("effortEffective".into(), effective.clone());
+        conn.execute(
+            "UPDATE instances SET spec_json = ?1 WHERE id = ?2",
+            params![Value::Object(object.clone()).to_string(), instance_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_instance_projection(
     conn: &Connection,
     instance_id: &str,
@@ -3542,6 +3733,11 @@ fn apply_instance_projection(
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
     let payload = event.get("payload").cloned().unwrap_or(Value::Null);
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind == "effort"
+        && let Some(effective) = payload.get("effective")
+    {
+        apply_effective_effort_projection(conn, instance_id, effective)?;
+    }
     let mut lifecycle: Option<&str> = None;
     let mut last_error: Option<String> = None;
     if kind == "lifecycle"
@@ -5103,6 +5299,48 @@ mod tests {
             .expect("enroll");
         assert!(matches!(outcome, HostAuthOutcome::Authenticated { .. }));
     }
+    /// §9.1: an `effort` journal event persists the transcript-read-back level
+    /// as `effortEffective`, and never overwrites the requested `effort`.
+    #[tokio::test]
+    async fn effort_observation_projects_effective_without_touching_requested() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+        let instance = seed_instance(&store, &host).await;
+        store
+            .patch_instance_configure(
+                instance.instance_id.clone(),
+                json!({"effort": {"name": "max", "index": 4}}),
+            )
+            .await
+            .expect("configure");
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"effort","payload":{
+                    "requested":{"name":"max","ultracode":false},
+                    "effective":{"name":"xhigh","ultracode":null,
+                        "source":"slash","observedAt":"2026-09-14T12:00:00.000Z"},
+                    "raw":"xhigh"}}),
+            )
+            .await
+            .expect("effort event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.effort_name.as_deref(), Some("max"));
+        let effective = row.effort_effective.expect("effortEffective stored");
+        assert_eq!(effective.get("name").and_then(Value::as_str), Some("xhigh"));
+        assert_eq!(
+            effective.get("source").and_then(Value::as_str),
+            Some("slash")
+        );
+    }
 }
 
 fn touch_host_online(
@@ -5255,7 +5493,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
                     labels_json, herdr_json, resources_json,
                     COALESCE(max_instances_override, max_instances), hostname, provider_binding,
-                    default_launch_args, claude_binary_path
+                    default_launch_args, claude_binary_path, default_tui
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -5278,6 +5516,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                         .unwrap_or_else(|| "auto".into()),
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
                 ))
             },
         )
@@ -5299,6 +5538,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         provider_binding,
         default_launch_args,
         claude_binary_path,
+        default_tui,
     )) = row
     else {
         return Ok(None);
@@ -5358,6 +5598,9 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             .as_deref()
             .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
         claude_binary_path: claude_binary_path.filter(|value| !value.trim().is_empty()),
+        default_tui: default_tui
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
         workspaces,
         workspace_revision: workspace_revision.max(0) as u64,
     }))
@@ -5439,6 +5682,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                         .and_then(Value::as_u64)
                         .map(|n| n as u32)
                 });
+            let effort_effective = spec.get("effortEffective").cloned();
             let mode: Option<String> = row.get(15)?;
             let promoted_at: Option<String> = row.get(16)?;
             let stored: Option<String> = row.get(17)?;
@@ -5486,9 +5730,13 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_source,
                 provider_source_hint,
                 model,
+                tui: spec
+                    .get("tui")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok()),
                 effort_name,
                 effort_ultracode,
                 effort_index,
+                effort_effective,
                 native_session_id: spec
                     .get("nativeSessionId")
                     .and_then(Value::as_str)

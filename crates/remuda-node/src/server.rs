@@ -336,6 +336,17 @@ async fn tty_socket(
         }
     };
     let stream_id = attached.stream_id.clone();
+    if let Some(alt_screen) = attached.alt_screen {
+        let notice = json!({"type": "tty.mode", "instanceId": instance_id,
+            "streamId": stream_id, "altScreen": alt_screen});
+        if socket
+            .send(Message::Text(notice.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     if !attached.snapshot.is_empty() {
         match encode_tty_frame(&stream_id, attached.available_from, &attached.snapshot) {
             Ok(frame) => {
@@ -371,6 +382,15 @@ async fn tty_socket(
             }
             event = events.recv() => {
                 match event {
+                    Ok(crate::TtyEvent::Mode { instance_id: id, stream_id: sid, alt_screen })
+                        if id == instance_id =>
+                    {
+                        let notice = json!({"type": "tty.mode", "instanceId": id,
+                            "streamId": sid, "altScreen": alt_screen});
+                        if socket.send(Message::Text(notice.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
                     Ok(crate::TtyEvent::Bytes { instance_id: id, stream_id: sid, offset, payload })
                         if id == instance_id =>
                     {

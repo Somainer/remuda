@@ -3,7 +3,7 @@
 //! The fake honors the configuration surface Remuda's P1/P5 tests use, not the
 //! real binaries' full loader:
 //!
-//! - **claude** — one `--settings <file>` JSON overlay in the documented shape
+//! - **claude** — isolated user/project/local/CLI settings layers in the shape
 //!   `{"hooks": {"EventName": [{"hooks": [{"type":"command","command":"…",
 //!   "timeout": N}]}]}}`.
 //! - **codex** — `$CODEX_HOME/hooks.json` with the same shape. The real 0.154
@@ -160,11 +160,26 @@ impl HookTable {
         Ok(table)
     }
 
+    /// Load Claude fixture hooks from the same layers as renderer settings.
+    /// Managed settings use an isolated fixture file, never system config.
+    pub fn load_claude(home: &Path, cwd: &Path, overlay: Option<&Path>) -> Result<Self, String> {
+        let settings = super::settings::merged_claude_settings(home, cwd, overlay)?;
+        let mut table = Self::default();
+        if settings.get("hooks").is_some() {
+            table.merge_document(&settings, overlay.unwrap_or(home))?;
+        }
+        Ok(table)
+    }
+
     fn merge_file(&mut self, path: &Path) -> Result<(), String> {
         let text =
             std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
         let doc: Value =
             serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+        self.merge_document(&doc, path)
+    }
+
+    fn merge_document(&mut self, doc: &Value, path: &Path) -> Result<(), String> {
         let Some(events) = doc.get("hooks").and_then(Value::as_object) else {
             return Err(format!(
                 "{}: missing top-level \"hooks\" object",

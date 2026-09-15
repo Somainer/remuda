@@ -96,10 +96,14 @@ fn public_wire_types_are_registered_for_generation() {
         "JournalAppendParams",
         "JournalSeqWatermark",
         "TtyFrameParams",
+        "TtyModeParams",
         "TtyWriteParams",
         "TtyResizeParams",
         "TtyAttachParams",
         "TtyBinaryEnvelopeSpec",
+        // §9.1: pure transcript-mapper state shared between the driver and the
+        // journal tailer; it is never serialized on the wire.
+        "EffortTracker",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

@@ -758,11 +758,51 @@ fn resolve_claude_overlay(
     match try_write_generated_gateway_overlay(profile, launch_dir, &request.model) {
         Ok(path) => Ok(Some(path)),
         Err(_) => user
-            .ok_or_else(|| {
-                DriverError::Failed("gateway delegation requires a settings overlay".into())
-            })
+            .ok_or_else(|| missing_gateway_overlay_error(request, profile))
             .map(Some),
     }
+}
+
+fn missing_gateway_overlay_error(
+    request: &crate::CreateInstanceRequest,
+    profile: &ProviderProfile,
+) -> DriverError {
+    let mut delivered_missing = Vec::new();
+    if request.provider_overlay.is_none() {
+        delivered_missing.push("request.provider_overlay");
+    }
+    if request
+        .provider_auth_token
+        .as_deref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        delivered_missing.push("request.provider_auth_token");
+    }
+    let mut generated_missing = Vec::new();
+    if profile.base_url.trim().is_empty() {
+        generated_missing.push("profile.base_url");
+    }
+    if profile
+        .secret_ref
+        .as_ref()
+        .and_then(|secret_ref| secret_ref.env_name())
+        .is_none()
+    {
+        generated_missing.push("profile.secret_ref with env: scheme");
+    }
+    let generated = if generated_missing.is_empty() {
+        "generation failed (env credential unavailable or settings could not be written)".into()
+    } else {
+        format!("missing {}", generated_missing.join(", "))
+    };
+    // Report field names only: credentials, local paths and profile values must
+    // never be copied into a remotely visible launch error.
+    DriverError::Failed(format!(
+        "gateway delegation requires a settings overlay: delivered source missing {}; \
+         generated source unavailable ({generated}); \
+         user source missing request.settings_overlay_path",
+        delivered_missing.join(", "),
+    ))
 }
 
 fn refuse_host_scoped_overlay(
@@ -1556,6 +1596,124 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("settings overlay"), "{error}");
+        for missing in [
+            "request.provider_overlay",
+            "request.provider_auth_token",
+            "profile.base_url",
+            "profile.secret_ref with env: scheme",
+            "request.settings_overlay_path",
+        ] {
+            assert!(error.to_string().contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn gateway_resume_materializes_delivered_overlay_like_create() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = HostId::new();
+        let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-pty",
+            "hostId": host,
+            "model": "haiku",
+            "delegation": "gateway",
+            "providerProfileId": "pvp_example",
+            "providerOverlay": {
+                "kind": "gateway",
+                "baseUrl": "https://gateway.example/v1",
+                "model": "haiku",
+                "scope": format!("host:{}", host.as_id().as_str())
+            },
+            "providerAuthToken": "fake-resume-provider-token"
+        }))
+        .expect("request");
+        let profile = ProviderProfile {
+            id: Id::new("pvp").expect("profile id"),
+            kind: ProviderKind::Anthropic,
+            base_url: String::new(),
+            delegation: Delegation::Gateway,
+            secret_ref: None,
+            models: vec!["haiku".into()],
+            health: ProviderHealth::Healthy,
+        };
+        let resolve = |request: &crate::CreateInstanceRequest, launch_dir: &Path| {
+            resolve_claude_overlay(
+                request,
+                launch_dir,
+                DriverKind::ClaudePty,
+                Delegation::Gateway,
+                &profile,
+            )
+        };
+        let create_path = resolve(&request, &dir.path().join("create"))
+            .expect("create overlay")
+            .expect("create path");
+        let create_bytes = std::fs::read(&create_path).expect("create contents");
+        // A resumed instance owns a new launch directory; it must not depend on
+        // the old instance retaining its credential-bearing settings file.
+        std::fs::remove_dir_all(create_path.parent().expect("create directory"))
+            .expect("remove old launch directory");
+        let mut resumed = request.clone();
+        resumed.resume_session_id = Some("00000000-0000-4000-8000-000000000001".into());
+        resumed.resumed_from = Some(InstanceId::new());
+        let resume_path = resolve(&resumed, &dir.path().join("resume"))
+            .expect("resume overlay")
+            .expect("resume path");
+        assert_eq!(std::fs::read(&resume_path).unwrap(), create_bytes);
+        let settings: serde_json::Value = serde_json::from_slice(&create_bytes).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+            "fake-resume-provider-token"
+        );
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.example/v1"
+        );
+        assert_eq!(settings["model"], "haiku");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&resume_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+            );
+        }
+
+        for (overlay, token, missing) in [
+            (
+                None,
+                resumed.provider_auth_token.clone(),
+                "request.provider_overlay",
+            ),
+            (
+                resumed.provider_overlay.clone(),
+                None,
+                "request.provider_auth_token",
+            ),
+        ] {
+            let mut incomplete = resumed.clone();
+            incomplete.provider_overlay = overlay;
+            incomplete.provider_auth_token = token;
+            let launch_dir = dir.path().join("incomplete");
+            let error = resolve(&incomplete, &launch_dir).expect_err("delivery is required");
+            assert!(error.to_string().contains(missing), "{error}");
+            assert!(
+                !launch_dir.exists(),
+                "incomplete delivery must not write settings"
+            );
+        }
+        resumed.host_id = Some(HostId::new());
+        let wrong_host_dir = dir.path().join("wrong-host");
+        let error = resolve(&resumed, &wrong_host_dir).expect_err("host scope remains enforced");
+        assert!(
+            error.to_string().contains("host-scoped provider"),
+            "{error}"
+        );
+        assert!(!wrong_host_dir.exists());
     }
 
     #[test]

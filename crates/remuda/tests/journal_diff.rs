@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Repo-relative path to a parity fixture.
 fn fixture(name: &str) -> PathBuf {
@@ -203,6 +203,88 @@ fn the_human_diff_is_plain_text_unless_color_is_requested() {
         "whitelisted lines are amber"
     );
     assert!(colored.contains("\u{1b}[32m"), "the ok verdict is green");
+}
+
+#[test]
+fn a_hook_derived_turn_edge_is_excused_by_the_turn_live_rule_but_not_other_lifecycles() {
+    // The live layer journals UserPromptSubmit/Stop on the `turn` topic;
+    // `claude print` emits neither. The whitelist rule must excuse exactly
+    // that unmatched turn lifecycle, and the gate must still block an
+    // unmatched lifecycle on another topic.
+    let dir = tempfile::tempdir().unwrap();
+    let baseline = json!({
+        "instanceId": "ins_x",
+        "observations": [{
+            "kind": "lifecycle",
+            "payload": {
+                "type": "native",
+                "topic": "turn",
+                "nativeName": "turn-completed",
+                "status": {"state": "known", "value": "end_turn"},
+                "severity": "info",
+                "affectsCompletion": true
+            }
+        }]
+    });
+    // PTY side additionally carries the hook-derived turn START edge.
+    let with_start = json!({
+        "instanceId": "ins_x",
+        "observations": [
+            {
+                "kind": "lifecycle",
+                "payload": {
+                    "type": "native",
+                    "topic": "turn",
+                    "nativeName": "UserPromptSubmit",
+                    "status": {"state": "known", "value": "working"},
+                    "severity": "info",
+                    "affectsCompletion": false,
+                    "relatedIds": {"phase": "prompt-accepted", "tier": "hook"}
+                }
+            },
+            baseline["observations"][0].clone()
+        ]
+    });
+    let base = dir.path().join("base.json");
+    let pty = dir.path().join("pty.json");
+    std::fs::write(&base, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    std::fs::write(&pty, serde_json::to_vec(&with_start).unwrap()).unwrap();
+
+    let report = json(&[base.to_str().unwrap(), pty.to_str().unwrap()]);
+    assert_eq!(report["equal"], true, "{report}");
+    let whitelisted = report["whitelisted"].as_array().unwrap();
+    assert!(
+        whitelisted
+            .iter()
+            .any(|d| d["kind"] == "lifecycle" && d["topic"] == "turn"),
+        "the turn.live unmatched edge must be whitelisted: {whitelisted:?}"
+    );
+
+    // An unmatched lifecycle on a different topic still blocks.
+    let stray = json!({
+        "instanceId": "ins_x",
+        "observations": [
+            {
+                "kind": "lifecycle",
+                "payload": {
+                    "type": "native",
+                    "topic": "configuration",
+                    "nativeName": "settings-changed",
+                    "status": {"state": "known", "value": "idle"},
+                    "severity": "info",
+                    "affectsCompletion": false
+                }
+            },
+            baseline["observations"][0].clone()
+        ]
+    });
+    let stray_path = dir.path().join("stray.json");
+    std::fs::write(&stray_path, serde_json::to_vec(&stray).unwrap()).unwrap();
+    let report = json(&[base.to_str().unwrap(), stray_path.to_str().unwrap()]);
+    assert_eq!(
+        report["equal"], false,
+        "an unmatched non-turn lifecycle must not be excused"
+    );
 }
 
 #[test]

@@ -27,6 +27,16 @@ export type ToolNode = {
   result: ToolResultPayload | null;
   completeness: Observation["completeness"];
   diffState: DiffState;
+  /**
+   * r-ux-w: workflow timeline data mounted on this tool row when the
+   * `workflow.run` observation named this tool call. Batch W owns
+   * WorkflowTimelineCard; this hook is the only seam into the E-owned file.
+   */
+  workflow?: {
+    run: WorkflowRunPayload;
+    phases: WorkflowPhasePayload[];
+    members: WorkflowMemberPayload[];
+  };
 };
 
 export type TranscriptNode =
@@ -215,6 +225,23 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     if (!nodes.some((n) => n.type === "tool" && n.call.toolCallId === node.call.toolCallId)) nodes.push(node);
   };
 
+  // r-ux-w seam: mount a workflow's timeline card onto its Workflow tool row
+  // when the run observation names the tool call. Returns true when mounted.
+  const mountWorkflow = (
+    current: { run: WorkflowRunPayload; phases: WorkflowPhasePayload[]; members: WorkflowMemberPayload[] },
+  ): boolean => {
+    const toolCallId = current.run.toolCallId;
+    if (!toolCallId) return false;
+    const tool = tools.get(toolCallId);
+    if (!tool) return false;
+    // Attach the accumulator object itself: run revisions replace `current.run`
+    // and arrays mutate in place, so the mounted card stays live.
+    tool.workflow = current;
+    const standalone = nodes.find((n) => n.type === "workflow" && n.id === current.run.workflowId);
+    if (standalone) nodes.splice(nodes.indexOf(standalone), 1);
+    return true;
+  };
+
   for (const ev of events) {
     if (ev.kind === "message") {
       const node = messages.get(ev);
@@ -283,34 +310,46 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       }
       continue;
     }
-    if (ev.kind === "workflow.run") {
-      const run = ev.payload;
-      const current = workflows.get(run.workflowId) ?? {
-        type: "workflow" as const,
-        id: run.workflowId,
-        run,
-        phases: [] as WorkflowPhasePayload[],
-        members: [] as WorkflowMemberPayload[],
-      };
-      current.run = run;
-      workflows.set(run.workflowId, current);
-      if (!nodes.includes(current)) {
+    if (ev.kind === "workflow.run" || ev.kind === "workflow.phase" || ev.kind === "workflow.member") {
+      // Keep the per-workflow accumulator (mutated in place so a card already
+      // mounted on a tool row stays live), then either mount it on the
+      // Workflow tool row (r-ux-w decision 1) or keep a standalone node when
+      // the producer gave no tool call id to attach it to.
+      const wfId = ev.payload.workflowId;
+      const current =
+        workflows.get(wfId) ??
+        (() => {
+          const created = {
+            type: "workflow" as const,
+            id: wfId,
+            run: null as unknown as WorkflowRunPayload,
+            phases: [] as WorkflowPhasePayload[],
+            members: [] as WorkflowMemberPayload[],
+          };
+          workflows.set(wfId, created);
+          return created;
+        })();
+      if (ev.kind === "workflow.run") {
+        current.run = ev.payload;
+      } else if (ev.kind === "workflow.phase") {
+        const phase = ev.payload;
+        const at = current.phases.findIndex((p) => p.phaseId === phase.phaseId);
+        if (at >= 0) current.phases[at] = phase;
+        else current.phases.push(phase);
+      } else {
+        const member = ev.payload;
+        const at = current.members.findIndex((m) => m.memberId === member.memberId);
+        if (at >= 0) current.members[at] = member;
+        else current.members.push(member);
+      }
+      if (!current.run) continue;
+      const mounted = mountWorkflow(current);
+      const standaloneAt = nodes.findIndex((n) => n.type === "workflow" && n.id === wfId);
+      if (mounted) {
+        if (standaloneAt >= 0) nodes.splice(standaloneAt, 1);
+      } else if (standaloneAt < 0) {
         nodes.push(current);
         anchor(current, ev);
-      }
-      continue;
-    }
-    if (ev.kind === "workflow.phase") {
-      const phase = ev.payload;
-      const current = workflows.get(phase.workflowId);
-      if (current) current.phases = current.phases.filter((p) => p.phaseId !== phase.phaseId).concat(phase);
-      continue;
-    }
-    if (ev.kind === "workflow.member") {
-      const member = ev.payload;
-      const current = workflows.get(member.workflowId);
-      if (current) {
-        current.members = current.members.filter((m) => m.memberId !== member.memberId).concat(member);
       }
       continue;
     }

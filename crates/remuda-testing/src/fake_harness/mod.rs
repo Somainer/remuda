@@ -24,6 +24,7 @@ pub use engine::{Options, RunError, run};
 pub use hooks::{HookContext, HookEvent, HookKind, HookTable, decision_behavior, parse_decision};
 pub use input::{Input, Parser as InputParser};
 pub use screen::{
-    ApprovalView, Dialect, ScreenMode, View, WorkingPhase, enter, render_grid, repaint, teardown,
+    ApprovalView, Dialect, DialectVersion, ScreenMode, View, WorkingPhase, enter, render_grid,
+    repaint, teardown,
 };
 pub use script::{ApprovalMode, Scenario, ToolSpec, TurnSpec, UsageSpec};

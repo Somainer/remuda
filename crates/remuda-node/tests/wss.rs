@@ -1111,6 +1111,209 @@ fn journal_has_command_state(journal: &Value, command_id: &str, state: &str) -> 
     })
 }
 
+/// The Node→Hub uplink must pipeline `journal.append` frames: a batch of N
+/// events arrives within ~1 round trip, not N round trips. Before the
+/// bounded-in-flight window the pump awaited one ACK per event, which on the
+/// loaded demo host cost ~0.39 s median *per event* (2.4 s of a 2.8 s,
+/// six-event batch — remuda-pipeline §2 hop 7).
+///
+/// A fake Hub adds a fixed independent per-frame delay to every append ACK.
+/// We drive a real runtime Node whose shared FakeDriver emits one journal
+/// event per `instance.send`, and measure from batch submission to the fake
+/// Hub receiving the last frame. The assertion is relative: a batch of six
+/// must not take more than ~one single-event RTT (with slack), so it fails
+/// loudly if per-ACK serialization ever returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn journal_uplink_pipelines_a_batch_within_one_rtt() {
+    use futures::{SinkExt, StreamExt};
+    use remuda_node::{DevNode, DevServerConfig, DriverRegistry, MemoryStore};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    const ACK_DELAY: Duration = Duration::from_millis(120);
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake hub");
+    let addr = listener.local_addr().expect("local addr");
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let arrivals = Arc::new(tokio::sync::Mutex::new(
+        Vec::<(i64, tokio::time::Instant)>::new(),
+    ));
+    let arrivals_task = arrivals.clone();
+    let server_ready = Arc::new(Notify::new());
+    let server_ready_task = server_ready.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept node");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake");
+        server_ready_task.notify_one();
+        let (mut sink, mut stream) = ws.split();
+        let writer = tokio::spawn(async move {
+            while let Some(frame) = out_rx.recv().await {
+                if sink
+                    .send(WsMsg::Text(frame.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        while let Some(Ok(WsMsg::Text(text))) = stream.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            match method {
+                "node.hello" | "runtime.hello" => {
+                    let _ = out_tx.send(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "nodeToken": "host-token", "hostId": "hst_fake" }
+                    }));
+                }
+                "node.heartbeat" => {
+                    let _ = out_tx.send(json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}));
+                }
+                "journal.append" => {
+                    let seq = frame["params"]["seq"]
+                        .as_i64()
+                        .or_else(|| frame["params"]["seq"].as_str().and_then(|s| s.parse().ok()))
+                        .unwrap_or(0);
+                    arrivals_task
+                        .lock()
+                        .await
+                        .push((seq, tokio::time::Instant::now()));
+                    // Independent per-frame RTT — never wait on another frame.
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(ACK_DELAY).await;
+                        let _ = out_tx.send(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": { "seq": seq.to_string(), "durableSeq": seq.to_string(), "replayed": false }
+                        }));
+                    });
+                }
+                _ => {}
+            }
+        }
+        let _ = writer.await;
+    });
+
+    let mut config = DevServerConfig::loopback(0);
+    config.workspace_roots = Some(remuda_testing::test_workspace_roots!());
+    let registry = DriverRegistry::default();
+    registry
+        .register(Arc::new(remuda_node::FakeDriver::new(
+            remuda_protocol::DriverKind::ClaudePrint,
+        )))
+        .expect("register fake");
+    let node =
+        DevNode::with_parts(&config, Arc::new(MemoryStore::new(128)), registry).expect("node");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+
+    let created = node
+        .create_instance(
+            serde_json::from_value(json!({
+                "kind": "claude", "driver": "claude-print", "prompt": ""
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("create");
+    let iid = created.instance.meta.id.clone();
+
+    let mut ws_config = WssConfig::loopback(addr, "unused-enroll-token", host_id);
+    ws_config.backoff = Backoff {
+        initial: Duration::from_millis(5),
+        max: Duration::from_millis(20),
+        jitter_ppt: 0,
+    };
+    ws_config.heartbeat_interval = Duration::from_secs(60);
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(ws_config, node.clone()))
+        .await
+        .expect("connect")
+        .expect("runtime link");
+    server_ready.notified().await;
+    // hello triggers replay + pump start; let it drain the initial journal.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let send = |prompt: &'static str| {
+        let node = node.clone();
+        let iid = iid.clone();
+        async move {
+            node.submit_command(
+                &iid,
+                serde_json::from_value(json!({
+                    "origin": "human", "operation": "send", "prompt": prompt
+                }))
+                .expect("request"),
+            )
+            .await
+            .expect("submit");
+        }
+    };
+
+    // Each send causes the FakeDriver's `execute` to journal an emission. We
+    // measure from submission until the fake Hub observes a journal.append
+    // frame, counting frames beyond the initial create replay.
+    async fn wait_frames(
+        arrivals: &Arc<tokio::sync::Mutex<Vec<(i64, tokio::time::Instant)>>>,
+        n: usize,
+    ) {
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                if arrivals.lock().await.len() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("frames delivered");
+    }
+
+    // Let the initial (create) replay settle and record the baseline count.
+    tokio::time::sleep(ACK_DELAY + Duration::from_millis(200)).await;
+    let mut base = arrivals.lock().await.len();
+    eprintln!("baseline uplink frames: {base}");
+
+    // Single event ≈ one RTT.
+    let t_single = tokio::time::Instant::now();
+    send("probe-single").await;
+    wait_frames(&arrivals, base + 1).await;
+    let single = arrivals.lock().await[base].1 - t_single;
+    base += 1;
+    tokio::time::sleep(ACK_DELAY + Duration::from_millis(100)).await;
+
+    // Batch six; measure to the last frame received.
+    let t_batch = tokio::time::Instant::now();
+    for n in 0..6 {
+        send(Box::leak(format!("probe-batch-{n}").into_boxed_str())).await;
+    }
+    wait_frames(&arrivals, base + 6).await;
+    let batch = arrivals.lock().await[base + 5].1 - t_batch;
+
+    eprintln!(
+        "single={single:.0?} batch6={batch:.0?} ratio={:.2}",
+        batch.as_secs_f64() / single.as_secs_f64()
+    );
+    // A serial uplink would spend ~6 RTT; pipelined must be ~1 RTT. Generous
+    // slack so the relative assertion survives host load.
+    assert!(
+        batch < single * 2 + Duration::from_millis(150),
+        "six-event batch took {batch:.0?} but one RTT is {single:.0?}; \
+         the uplink is serializing on per-event ACKs again"
+    );
+
+    let _ = link.shutdown().await;
+    server.abort();
+}
+
 fn collect_follow_seqs(frame: &Value, seqs: &mut Vec<String>) {
     if frame.get("type").and_then(Value::as_str) == Some("event")
         && let Some(seq) = frame.get("seq")
@@ -1215,7 +1418,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","prompt":"human-origin"})),
+        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","grants":["dispatch"],"prompt":"human-origin"})),
         None,
     )
     .await;
@@ -1358,8 +1561,21 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
             assert_eq!(status, 403, "{route}: {body}");
         }
     }
+    // §2.5: this agent holds dispatch, so it may list instances — but only
+    // its own subtree. The fleet-wide GET is no longer refused for it; the
+    // sibling instance above must not appear.
+    let (status, fleet) = request(hub.addr, agent, "/v1/instances", None, None).await;
+    assert_eq!(status, 200, "{fleet}");
+    let visible: Vec<&str> = fleet["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["instanceId"].as_str().unwrap())
+        .collect();
+    assert!(visible.contains(&parent_id));
+    assert!(visible.contains(&child_id));
+    assert!(!visible.contains(&sibling_id));
     for route in [
-        "/v1/instances",
         "/v1/hosts",
         "/v1/devices",
         "/v1/providers",

@@ -32,6 +32,12 @@ pub enum StoreError {
     /// Protocol ID.
     #[error("id: {0}")]
     Id(String),
+    /// A uniqueness or delegation-tree invariant was violated (§2.5).
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// A delegation scope or grant would escape the parent's authority (§2.5).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     /// A passkey with the same credential id is already registered.
     #[error("duplicate credential")]
     DuplicateCredential,
@@ -415,10 +421,300 @@ pub struct InstanceRecord {
         rename = "launchedBy"
     )]
     pub launched_by: Option<String>,
+    /// Delegation preset name applied at create (`worker` /
+    /// `project-coordinator` / `top-coordinator`); design §2.5.
+    ///
+    /// Display only: enforcement reads [`InstanceRecord::scope`] and
+    /// [`InstanceRecord::grants`], never this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Resource reach; narrows monotonically down the delegation tree.
+    #[serde(default)]
+    pub scope: remuda_protocol::InstanceScope,
+    /// Convenience projection of `scope.projectIds` when it has one entry.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "projectId")]
+    pub project_id: Option<String>,
+    /// Granted verb wire names (`dispatch` / `land` / `spend` /
+    /// `address-owner`); empty = leaf worker; §2.5.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<String>,
+    /// Task this node works (`tsk_…`).
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "taskId")]
+    pub task_id: Option<String>,
+}
+
+/// Delegation-tree state attached at instance create; design §2.5.
+#[derive(Debug, Clone)]
+pub struct InstanceDelegation {
+    /// Preset name stored for display (`worker` / `project-coordinator` /
+    /// `top-coordinator`); never read by enforcement.
+    pub role: Option<String>,
+    /// Resource reach.
+    pub scope: remuda_protocol::InstanceScope,
+    /// Granted verb wire names, canonical (sorted, de-duplicated).
+    pub grants: Vec<String>,
+    /// Bound task (`tsk_…`).
+    pub task_id: Option<String>,
+    /// Whether the writer validates the §2.5 tree invariants for this insert.
+    ///
+    /// `true` for every `/v1/instances` create (delegation); `false` for
+    /// non-delegating insert paths (fleet fan-out, D-026 resume, SSH host
+    /// creates), which the operator already authorized directly.
+    pub enforce_tree: bool,
+}
+
+impl Default for InstanceDelegation {
+    /// Human-launched sessions before §2.5 read as leaf workers: a display
+    /// preset, universe reach, and no verbs. Scope alone never grants an
+    /// action — the grant set is what the agent-route checks read. This
+    /// default bypasses tree validation because its non-create call sites
+    /// (fleet/resume/SSH) are already operator-authorized.
+    fn default() -> Self {
+        Self {
+            role: Some(remuda_protocol::ROLE_WORKER.into()),
+            scope: remuda_protocol::InstanceScope::default(),
+            grants: Vec::new(),
+            task_id: None,
+            enforce_tree: false,
+        }
+    }
+}
+
+/// Lifecycles that still occupy coordinator seats (design §2.5 uniqueness).
+const ACTIVE_HOLDER_SQL: &str = "lifecycle NOT IN ('exited', 'failed', 'closed')";
+
+/// Enforce the two §2.5 seat rules inside the writer thread.
+///
+/// 1. at most one active `address-owner` holder per Hub;
+/// 2. at most one active `dispatch` holder per scoped project, unless that
+///    project's policy explicitly relaxes it.
+fn enforce_grant_uniqueness(
+    conn: &Connection,
+    delegation: &InstanceDelegation,
+) -> Result<(), StoreError> {
+    if !delegation.grants.contains(&"address-owner".to_string())
+        && !delegation.grants.contains(&"dispatch".to_string())
+    {
+        return Ok(());
+    }
+    if delegation.grants.contains(&"address-owner".to_string()) {
+        let exists: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                 AND grants_json LIKE '%\"address-owner\"%' LIMIT 1"
+                ),
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            return Err(StoreError::Conflict(
+                "an active instance already holds the address-owner grant (one per Hub)".into(),
+            ));
+        }
+    }
+    if delegation.grants.contains(&"dispatch".to_string()) {
+        for project in &delegation.scope.project_ids {
+            let project = project.as_id().to_string();
+            if project_allows_multiple_dispatchers(conn, &project)? {
+                continue;
+            }
+            let exists: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM instances WHERE {ACTIVE_HOLDER_SQL}
+                     AND grants_json LIKE '%\"dispatch\"%'
+                     AND scope_json LIKE ?1 LIMIT 1"
+                    ),
+                    params![format!("%{project}%")],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                return Err(StoreError::Conflict(format!(
+                    "an active instance already holds dispatch for project {project}; \
+                     set policy.configurable.allowMultipleDispatchers to relax"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read `allowMultipleDispatchers` off a stored project doc; missing = strict.
+fn project_allows_multiple_dispatchers(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<bool, StoreError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT doc_json FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    let doc: Value = serde_json::from_str(&raw)?;
+    Ok(doc
+        .pointer("/policy/configurable/allowMultipleDispatchers")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
+/// Delegation depth/fan-out limits resolved from the child's project policy,
+/// falling back to the Hub defaults (design §2.5 ⑤: limits are policy, not
+/// schema).
+pub(crate) struct DelegationLimits {
+    /// Max edges between a human-seated node and the deepest descendant.
+    pub max_depth: u32,
+    /// Max active children one node may delegate.
+    pub fan_out: u32,
+}
+
+pub(crate) fn delegation_limits_for(
+    conn: &Connection,
+    scope: &remuda_protocol::InstanceScope,
+) -> Result<DelegationLimits, StoreError> {
+    let mut limits = DelegationLimits {
+        max_depth: remuda_protocol::DEFAULT_MAX_DELEGATION_DEPTH,
+        fan_out: remuda_protocol::DEFAULT_COORDINATOR_FAN_OUT,
+    };
+    if let Some(project) = scope.single_project_id()
+        && let Some((depth, fan)) = project_limits(conn, project.as_id().as_str())?
+    {
+        limits.max_depth = depth;
+        limits.fan_out = fan;
+    }
+    Ok(limits)
+}
+
+fn project_limits(conn: &Connection, project_id: &str) -> Result<Option<(u32, u32)>, StoreError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT doc_json FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let doc: Value = serde_json::from_str(&raw)?;
+    let depth = doc
+        .pointer("/policy/configurable/maxDelegationDepth")
+        .and_then(Value::as_i64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(remuda_protocol::DEFAULT_MAX_DELEGATION_DEPTH);
+    let fan = doc
+        .pointer("/policy/configurable/coordinatorFanOut")
+        .and_then(Value::as_i64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(remuda_protocol::DEFAULT_COORDINATOR_FAN_OUT);
+    Ok(Some((depth, fan)))
+}
+
+/// Validate every §2.5 invariant for creating a child under `parent_id`.
+///
+/// * an agent parent must hold `dispatch`;
+/// * child scope ⊆ parent scope;
+/// * every child grant is held by the parent;
+/// * the ancestor walk must terminate (DAG);
+/// * depth stays within the (project) policy limit;
+/// * a parent's active children stay within its fan-out limit.
+///
+/// `parent_id == None` is a human-seated root node: no narrower parent, depth
+/// counted from 1.
+pub(crate) fn validate_child_delegation(
+    conn: &Connection,
+    parent_id: Option<&str>,
+    scope: &remuda_protocol::InstanceScope,
+    grants: &[String],
+) -> Result<(), StoreError> {
+    let child_depth = if let Some(pid) = parent_id {
+        let parent = load_instance(conn, pid)?
+            .ok_or_else(|| StoreError::Id("unknown parent instance".into()))?;
+        if !parent.grants.iter().any(|grant| grant == "dispatch") {
+            return Err(StoreError::Forbidden(
+                "delegating a child requires the dispatch grant".into(),
+            ));
+        }
+        if !scope.is_subset_of(&parent.scope) {
+            return Err(StoreError::Forbidden(
+                "child scope must be a subset of the parent instance scope".into(),
+            ));
+        }
+        for grant in grants {
+            if !parent.grants.contains(grant) {
+                return Err(StoreError::Forbidden(format!(
+                    "grant {grant} is not held by the parent instance"
+                )));
+            }
+        }
+        node_depth(conn, pid)? + 1
+    } else {
+        1
+    };
+    let limits = delegation_limits_for(conn, scope)?;
+    if child_depth > limits.max_depth {
+        return Err(StoreError::Conflict(format!(
+            "delegation depth {child_depth} exceeds the policy limit {}",
+            limits.max_depth
+        )));
+    }
+    if let Some(pid) = parent_id {
+        let active_children: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM instances
+             WHERE spec_json LIKE ?1
+               AND lifecycle NOT IN ('exited', 'failed', 'closed')",
+            params![format!("%\"parentInstanceId\":\"{pid}\"%")],
+            |row| row.get(0),
+        )?;
+        if u32::try_from(active_children).unwrap_or(0) >= limits.fan_out {
+            return Err(StoreError::Conflict(format!(
+                "parent {pid} already has {active_children} active children; fan-out limit is {}",
+                limits.fan_out
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Edges between `id` and its human-seated root; a directly-seated node is 1.
+fn node_depth(conn: &Connection, start: &str) -> Result<u32, StoreError> {
+    let mut current = start.to_string();
+    let mut depth = 1u32;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(StoreError::Conflict(
+                "delegation cycle detected in the instance ancestor chain".into(),
+            ));
+        }
+        let Some(instance) = load_instance(conn, &current)? else {
+            break;
+        };
+        match instance.parent_instance_id {
+            Some(parent) => {
+                depth += 1;
+                current = parent;
+            }
+            None => break,
+        }
+        if depth > 1000 {
+            return Err(StoreError::Conflict(
+                "delegation chain longer than 1000 edges; rejecting as a cycle".into(),
+            ));
+        }
+    }
+    Ok(depth)
 }
 
 impl InstanceRecord {
-    /// Launch spec a resumed child inherits from this instance (D-026).
     ///
     /// Everything that decides *how* the native process runs is kept, so the
     /// continued conversation talks to the same provider under the same
@@ -1764,6 +2060,30 @@ impl Store {
         title: Option<String>,
         spec: Value,
     ) -> Result<InstanceRecord, StoreError> {
+        self.insert_instance_delegated(
+            host_id,
+            workspace_id,
+            kind,
+            driver,
+            title,
+            spec,
+            InstanceDelegation::default(),
+        )
+        .await
+    }
+
+    /// Insert with explicit delegation-tree state; design §2.5.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_instance_delegated(
+        &self,
+        host_id: String,
+        workspace_id: Option<String>,
+        kind: String,
+        driver: String,
+        title: Option<String>,
+        spec: Value,
+        delegation: InstanceDelegation,
+    ) -> Result<InstanceRecord, StoreError> {
         self.run(move |conn| {
             let host =
                 load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
@@ -1783,6 +2103,19 @@ impl Store {
                     "SSH host is not online; retry after reconnect".into(),
                 ));
             }
+            let parent_id = spec
+                .get("parentInstanceId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if delegation.enforce_tree {
+                validate_child_delegation(
+                    conn,
+                    parent_id.as_deref(),
+                    &delegation.scope,
+                    &delegation.grants,
+                )?;
+            }
+            enforce_grant_uniqueness(conn, &delegation)?;
             let instance_id = new_id("ins").map_err(|e| StoreError::Id(e.to_string()))?;
             let journal_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
             let now = now_rfc3339();
@@ -1791,12 +2124,16 @@ impl Store {
             } else {
                 "disconnected"
             };
+            let scope_json = serde_json::to_string(&delegation.scope)?;
+            let grants_json = serde_json::to_string(&delegation.grants)?;
             conn.execute(
                 "INSERT INTO instances
                     (id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
-                     title, journal_id, durable_seq, spec_json, created_at, updated_at)
+                     title, journal_id, durable_seq, spec_json, created_at, updated_at,
+                     role, scope_json, grants_json, task_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'requested', 'unknown', ?6,
-                         ?7, ?8, 0, ?9, ?10, ?10)",
+                         ?7, ?8, 0, ?9, ?10, ?10,
+                         ?11, ?12, ?13, ?14)",
                 params![
                     instance_id,
                     host_id,
@@ -1807,7 +2144,11 @@ impl Store {
                     title,
                     journal_id,
                     spec.to_string(),
-                    now
+                    now,
+                    delegation.role,
+                    scope_json,
+                    grants_json,
+                    delegation.task_id,
                 ],
             )?;
             load_instance(conn, &instance_id)?
@@ -2085,6 +2426,24 @@ impl Store {
                 params![now, command_id],
             )?;
             Ok(true)
+        })
+        .await
+    }
+
+    /// The RPC accept deadline elapsed: the request is on the wire and the
+    /// Node is still executing it (protocol §2.5: a timeout returns `unknown`,
+    /// the command is never resent). Record that convergence is now delegated
+    /// to the mirrored journal — `unknown → reconciling` — from which the
+    /// journaled accept wins and flips resolution back to `clear`.
+    pub async fn mark_reconciling(&self, command_id: String) -> Result<CommandRecord, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE commands SET resolution = 'reconciling', updated_at = ?1
+                 WHERE id = ?2 AND state = 'queued' AND resolution = 'unknown'",
+                params![now, command_id],
+            )?;
+            load_command(conn, &command_id)?.ok_or_else(|| StoreError::Id("unknown command".into()))
         })
         .await
     }
@@ -3096,6 +3455,16 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "instances", "launched_by", "TEXT")?;
     // Operator ceiling survives Node hello/heartbeat inventory and Hub restarts.
     ensure_column(&conn, "hosts", "max_instances_override", "INTEGER")?;
+    // Delegation-tree columns; design §2.5 (additive, same migration shape).
+    ensure_column(&conn, "instances", "role", "TEXT")?;
+    ensure_column(&conn, "instances", "scope_json", "TEXT")?;
+    ensure_column(
+        &conn,
+        "instances",
+        "grants_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(&conn, "instances", "task_id", "TEXT")?;
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
@@ -3112,7 +3481,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
     crate::workspaces::migrate(&conn)?;
+    crate::projects::migrate(&conn)?;
     migrate_provider_models(&conn)?;
+    crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;
     Ok(conn)
 }
@@ -3789,6 +4160,103 @@ mod tests {
             .expect("instance query")
             .expect("instance row");
         assert_eq!(online.connectivity, "connected");
+    }
+
+    /// A create RPC whose accept reply was lost past the Hub deadline is
+    /// `queued + unknown`; the timeout arm marks it `reconciling`, and the
+    /// Node's mirrored journal — not a resent RPC — wins: the journaled
+    /// `accepted` flips the row to `accepted + clear`. The command is never
+    /// resent (protocol §2.5).
+    #[tokio::test]
+    async fn a_lost_accept_reconciling_row_is_converged_by_the_journal_not_a_resend() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host_id = new_id("hst").expect("host id");
+        let token = enroll_token(&store, "enroll-reconcile").await;
+        let _ = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: token,
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("slow-node".into()),
+                    node_version: Some("test".into()),
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .expect("host enroll");
+        let instance = store
+            .insert_instance(
+                host_id.clone(),
+                None,
+                "claude".into(),
+                "shell-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .expect("instance");
+        let (command, _) = store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host_id.clone(),
+                "instance.create".into(),
+                json!({"instanceId": instance.instance_id}),
+                None,
+            )
+            .await
+            .expect("command");
+        store
+            .mark_forward_intent(command.command_id.clone())
+            .await
+            .expect("forward once");
+        // The RPC accept deadline elapsed: unknown, not resent.
+        let unknown = store
+            .get_command(command.command_id.clone())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(unknown.state, "queued");
+        assert_eq!(unknown.resolution, "unknown");
+
+        let reconciling = store
+            .mark_reconciling(command.command_id.clone())
+            .await
+            .expect("reconciling");
+        assert_eq!(reconciling.state, "queued");
+        assert_eq!(reconciling.resolution, "reconciling");
+
+        // The Node journaled its durable accept after the reply was lost.
+        store
+            .append_journal(
+                host_id.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity",
+                        "entityType": "command",
+                        "entityId": command.command_id,
+                        "state": "accepted",
+                        "entity": {
+                            "commandId": command.command_id,
+                            "state": "accepted"
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("journaled accept");
+        let converged = store
+            .get_command(command.command_id.clone())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(converged.state, "accepted");
+        assert_eq!(converged.resolution, "clear");
     }
 
     /// D-018: an enrolled host re-announces with its own stored node token,
@@ -4949,7 +5417,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
     conn.query_row(
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
-                mode, promoted_at, launched_by
+                mode, promoted_at, launched_by,
+                role, scope_json, grants_json, task_id
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -5036,6 +5505,17 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 }
                 .to_string()
             }));
+            let role: Option<String> = row.get(18)?;
+            let scope_raw: Option<String> = row.get(19)?;
+            let scope: remuda_protocol::InstanceScope = scope_raw
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            let project_id = scope.single_project_id().map(|id| id.as_id().to_string());
+            let grants_raw: Option<String> = row.get(20)?;
+            let grants: Vec<String> = grants_raw
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            let task_id: Option<String> = row.get(21)?;
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 parent_instance_id: spec
@@ -5088,6 +5568,11 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 mode,
                 promoted_at,
                 launched_by,
+                role,
+                scope,
+                project_id,
+                grants,
+                task_id,
             })
         },
     )

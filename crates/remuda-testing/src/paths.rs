@@ -60,6 +60,21 @@ pub fn hook_session_fixture() -> &'static str {
     include_str!("../fixtures/hooks/claude-hook-session.jsonl")
 }
 
+/// Hook stream recorded from `claude` 2.1.221 around a real background
+/// Workflow run (r-ux-w, see
+/// `docs/design/evidence/workflow-progress-signals-1.md`).
+///
+/// Unlike the 2.1.270 session fixture, this captures what an older pinned
+/// build emits for workflows: the `PostToolUse(Workflow)` structured
+/// `tool_response` (runId/transcriptDir/scriptPath), `SubagentStart` /
+/// `SubagentStop` with `agent_type:"workflow-subagent"`, and sub-agent
+/// `PreToolUse` / `PostToolUse` / `PostToolBatch` carrying `agent_id`. Labels
+/// and phases are absent everywhere in this build — exactly the fields the
+/// timeline card must degrade without.
+pub fn hook_workflow_fixture() -> &'static str {
+    include_str!("../fixtures/hooks/claude-workflow-221.jsonl")
+}
+
 /// A recorded session whose assistant text arrives as **several**
 /// `MessageDisplay` chunks (D-028 §7, P3).
 ///

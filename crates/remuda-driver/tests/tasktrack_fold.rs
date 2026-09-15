@@ -12,8 +12,8 @@
 
 use remuda_driver::{DriverKind, TranscriptMapper};
 use remuda_protocol::{
-    ContentBlock, HostId, Id, InstanceId, ObservationPayload, ResultStage, RunId, ToolCategory,
-    ToolOutcome,
+    ContentBlock, HostId, Id, InstanceId, MutationOperation, ObservationPayload, ResultStage,
+    RunId, ToolCategory, ToolOutcome,
 };
 use std::path::Path;
 
@@ -61,16 +61,26 @@ fn result_text(result: &remuda_protocol::ToolResultPayload) -> String {
         .join("")
 }
 
+fn derived_result(instance: &InstanceId, native_tool_id: &str) -> Id {
+    // The result occupies its own node keyed `tool-result:{native}`.
+    Id::derive(
+        "obj",
+        instance.as_id().as_str(),
+        &format!("tool-result:{native_tool_id}"),
+    )
+    .expect("derive result id")
+}
+
 fn results_for<'a>(
     instance: &InstanceId,
     observations: &'a [remuda_protocol::Observation],
     native_tool_id: &str,
 ) -> Vec<&'a remuda_protocol::ToolResultPayload> {
-    let target = derived(instance, native_tool_id);
+    let target = derived_result(instance, native_tool_id);
     observations
         .iter()
         .filter_map(|obs| match &obs.body {
-            ObservationPayload::ToolResult(result) if result.tool_call_id == target => {
+            ObservationPayload::ToolResult(result) if result.mutation.node_id == target => {
                 Some(result.as_ref())
             }
             _ => None,
@@ -120,10 +130,14 @@ fn a_background_launch_is_partial_then_final_on_its_notification() {
         completion.mutation.revision.0,
         launch.mutation.revision.0
     );
-    // Both results target the very node the call opened.
+    // The result is its own node (open→replace) but joins the call via
+    // `tool_call_id`, matching the live stream's mutation sequence.
     let call = call_for(&instance, &observations, "toolu_recorded_task_bg").unwrap();
+    assert_ne!(call.tool_call_id, launch.mutation.node_id);
     assert_eq!(call.tool_call_id, launch.tool_call_id);
     assert_eq!(call.tool_call_id, completion.tool_call_id);
+    assert_eq!(launch.mutation.operation, MutationOperation::Open);
+    assert_eq!(completion.mutation.operation, MutationOperation::Replace);
 }
 
 #[test]

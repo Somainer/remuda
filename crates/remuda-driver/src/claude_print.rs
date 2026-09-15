@@ -155,13 +155,15 @@ struct NativeIds {
     tools: HashMap<String, Id>,
     workflows: HashMap<String, Id>,
     phases: HashMap<String, Id>,
-    /// Per-native-tool result revision. The tool call occupies revisions
-    /// 1 (open) and 2 (block close); the first ToolResult is revision 3 and a
-    /// background completion is revision 4. Monotonic revisions are what let
-    /// the hook relay and this transcript tailer overwrite one another's
-    /// same-node payloads instead of being rejected as stale (and what let a
-    /// later final replace the launch's `Partial` result).
-    tool_result_rev: HashMap<String, u64>,
+    /// One result node per native tool id, keyed `tool-result:{native}`. A
+    /// tool result is its own node — joined to the call via `tool_call_id`,
+    /// not a mutation of the call node — so a transcript replay emits the same
+    /// open→(replace) sequence the live stream does (promotion parity,
+    /// D-025/D-028). The first record opens it at revision 1; a background
+    /// subagent's later `<task-notification>` replaces it at revision 5, which
+    /// outranks the hook relay's SubagentStop (revision 4) because the
+    /// notification carries the authoritative status (killed/failed).
+    tool_results: HashMap<String, (Id, u64)>,
     /// Instance id scope for [`Id::derive`], set when the mapper knows it.
     scope: Option<String>,
 }
@@ -193,15 +195,34 @@ impl NativeIds {
         Ok(id)
     }
 
-    /// Next ToolResult revision for the first result on a native tool id. The
-    /// call owns revisions 1–2; the first result — a normal Final, or the
-    /// background launch's Partial — sits at revision 3. The hook SubagentStop
-    /// completion is revision 4 and the transcript `<task-notification>` is a
-    /// fixed revision 5 (it carries the authoritative terminal status).
-    fn tool_result_revision(&mut self, native: &str) -> U64 {
-        let rev = self.tool_result_rev.entry(native.to_owned()).or_insert(2);
-        *rev += 1;
-        U64(*rev)
+    /// The result node for a native tool id and its opening mutation: a fresh
+    /// node opened at revision 1 on first use. The call is joined via
+    /// `tool_call_id`, never mutated.
+    fn tool_result_open(&mut self, native: &str) -> DriverResult<(Id, U64, MutationOperation)> {
+        if let Some((id, rev)) = self.tool_results.get_mut(native) {
+            *rev += 1;
+            return Ok((id.clone(), U64(*rev), MutationOperation::Replace));
+        }
+        let id = match &self.scope {
+            Some(scope) => Id::derive("obj", scope, &format!("tool-result:{native}"))?,
+            None => Id::derive("obj", "stdout-tool-result", native)?,
+        };
+        self.tool_results.insert(native.to_owned(), (id.clone(), 1));
+        Ok((id, U64(1), MutationOperation::Open))
+    }
+
+    /// The result node id for a native tool id (creating an unopened entry so
+    /// a completion can replace a launch result even if observed first).
+    fn tool_result_id(&mut self, native: &str) -> DriverResult<Id> {
+        if let Some((id, _)) = self.tool_results.get(native) {
+            return Ok(id.clone());
+        }
+        let id = match &self.scope {
+            Some(scope) => Id::derive("obj", scope, &format!("tool-result:{native}"))?,
+            None => Id::derive("obj", "stdout-tool-result", native)?,
+        };
+        self.tool_results.insert(native.to_owned(), (id.clone(), 1));
+        Ok(id)
     }
 
     /// Build id tables whose tool ids derive deterministically from the instance
@@ -960,7 +981,13 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                             .get("tool_use_id")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        let id = mapper.ids.tool(tool_use_id)?;
+                        // The result occupies its own node (opened here), joined
+                        // to the call via `tool_call_id` — same sequence as the
+                        // live stream, so promoting a terminal from this
+                        // transcript is indistinguishable from streaming it.
+                        let call_id = mapper.ids.tool(tool_use_id)?;
+                        let (result_id, revision, operation) =
+                            mapper.ids.tool_result_open(tool_use_id)?;
                         let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
                         let text = match block.get("content") {
                             Some(Value::String(s)) => s.clone(),
@@ -973,22 +1000,21 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                         // later as an injected `<task-notification>` user
                         // record. Mark the launch `Partial` so the task row
                         // stays running (and the web shows "running in
-                        // background"); the notification closes it for real.
+                        // background"); the notification replaces it for real.
                         let async_launch = remuda_protocol::tool_result_is_async_launch(
                             msg.tool_use_result.as_ref(),
                         );
-                        let revision = mapper.ids.tool_result_revision(tool_use_id);
                         out.push(mapper.observation(
                             Completeness::Structured,
                             NativeRequestKey::None,
                             ObservationPayload::ToolResult(Box::new(ToolResultPayload {
                                 mutation: NodeMutation {
-                                    node_id: id.clone(),
+                                    node_id: result_id,
                                     revision,
-                                    operation: MutationOperation::Close,
-                                    base_revision: Some(U64(revision.0 - 1)),
+                                    operation,
+                                    base_revision: (revision.0 > 1).then_some(U64(revision.0 - 1)),
                                 },
-                                tool_call_id: id,
+                                tool_call_id: call_id,
                                 stage: if async_launch && !is_error {
                                     ResultStage::Partial
                                 } else {
@@ -1043,10 +1069,12 @@ fn task_notification_results(mapper: &mut Mapper, text: &str) -> DriverResult<Ve
     let Some(native_tool_id) = note.tool_use_id.clone().filter(|id| !id.is_empty()) else {
         return Ok(Vec::new());
     };
-    let id = mapper.ids.tool(&native_tool_id)?;
-    // Fixed revision 5: call 1–2, launch result 3, hook SubagentStop 4, and
-    // this authoritative notification (it carries the real status, including
-    // killed/failed) 5 — so it always outranks a same-node SubagentStop.
+    let call_id = mapper.ids.tool(&native_tool_id)?;
+    let result_id = mapper.ids.tool_result_id(&native_tool_id)?;
+    // Fixed revision 5 on the result node: launch Partial opens at 1, the hook
+    // SubagentStop replaces at 4, and this authoritative notification (it
+    // carries the real status, including killed/failed) replaces at 5 — so it
+    // always wins.
     let revision = U64(5);
     let outcome = note.outcome();
     let status = note.status.clone();
@@ -1062,12 +1090,12 @@ fn task_notification_results(mapper: &mut Mapper, text: &str) -> DriverResult<Ve
         NativeRequestKey::None,
         ObservationPayload::ToolResult(Box::new(ToolResultPayload {
             mutation: NodeMutation {
-                node_id: id.clone(),
+                node_id: result_id,
                 revision,
-                operation: MutationOperation::Close,
+                operation: MutationOperation::Replace,
                 base_revision: Some(U64(4)),
             },
-            tool_call_id: id,
+            tool_call_id: call_id,
             stage: ResultStage::Final,
             outcome,
             blocks: if body.is_empty() {

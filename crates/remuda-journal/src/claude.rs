@@ -32,6 +32,12 @@ pub struct NativeIds {
     messages: HashMap<String, (Id, u64)>,
     thoughts: HashMap<String, Id>,
     tools: HashMap<String, Id>,
+    /// One result node per native tool id. A tool result is its own node
+    /// (joined to the call via `tool_call_id`), not a mutation of the call
+    /// node, so this file replay produces the same open→replace sequence as
+    /// the live stream (promotion parity, D-025/D-028). First record opens at
+    /// revision 1; a background subagent's task-notification replaces it at 5.
+    tool_results: HashMap<String, Id>,
     workflows: HashMap<String, Id>,
     members: HashMap<String, Id>,
     phases: HashMap<String, Id>,
@@ -46,6 +52,7 @@ impl NativeIds {
             scope: scope.into(),
             messages: HashMap::new(),
             tools: HashMap::new(),
+            tool_results: HashMap::new(),
             thoughts: HashMap::new(),
             workflows: HashMap::new(),
             members: HashMap::new(),
@@ -86,6 +93,17 @@ impl NativeIds {
         }
         let id = self.derived(native)?;
         self.tools.insert(native.to_owned(), id.clone());
+        Ok(id)
+    }
+
+    /// The result node for a native tool id — its own deterministic node
+    /// derived from `tool-result:{native}`, created on first use.
+    pub(crate) fn tool_result(&mut self, native: &str) -> Result<Id, Error> {
+        if let Some(id) = self.tool_results.get(native) {
+            return Ok(id.clone());
+        }
+        let id = self.derived(&format!("tool-result:{native}"))?;
+        self.tool_results.insert(native.to_owned(), id.clone());
         Ok(id)
     }
 
@@ -1089,7 +1107,10 @@ fn tool_result(
         .get("tool_use_id")
         .and_then(Value::as_str)
         .unwrap_or("tool");
+    // Result occupies its own node (opened here), joined to the call via
+    // `tool_call_id` — same mutation sequence as the live stream.
     let tool_call_id = ids.tool(native_id)?;
+    let result_node = ids.tool_result(native_id)?;
     let is_error = block
         .get("is_error")
         .and_then(Value::as_bool)
@@ -1100,12 +1121,9 @@ fn tool_result(
     let sidecar = value.get("toolUseResult");
     let async_launch = remuda_protocol::tool_result_is_async_launch(sidecar) && !is_error;
     let text = tool_result_text(block);
-    // Shared node-revision convention across channels: call open is revision 1;
-    // a normal result closes at revision 2, an async-launch Partial at 3. A
-    // task-notification completion is revision 5 (see below), leaving 4 for the
-    // hook SubagentStop. Globally comparable revisions let the web assembler
-    // pick the latest same-node result regardless of which channel produced it.
-    let revision = if async_launch { U64(3) } else { U64(2) };
+    // The result node is opened at revision 1, whether Final (normal result)
+    // or Partial (background launch); a later task-notification replaces it at
+    // revision 5 and the hook SubagentStop at revision 4.
     envelope(
         ctx,
         cursor,
@@ -1115,10 +1133,10 @@ fn tool_result(
         Some(native_id),
         ObservationPayload::ToolResult(Box::new(ToolResultPayload {
             mutation: NodeMutation {
-                node_id: tool_call_id.clone(),
-                revision,
-                operation: MutationOperation::Close,
-                base_revision: Some(U64(revision.0 - 1)),
+                node_id: result_node,
+                revision: U64(1),
+                operation: MutationOperation::Open,
+                base_revision: None,
             },
             tool_call_id,
             stage: if async_launch {
@@ -1160,8 +1178,10 @@ fn task_notification_results(
         return Ok(Vec::new());
     };
     let tool_call_id = ids.tool(&native_id)?;
-    // Revision 5: outranks the launch Partial (3) and the hook SubagentStop
-    // (4), since the notification carries the authoritative terminal status.
+    let result_node = ids.tool_result(&native_id)?;
+    // Revision 5 on the result node: outranks the launch Partial (open at 1)
+    // and the hook SubagentStop (4), since the notification carries the
+    // authoritative terminal status (killed/failed).
     let revision = U64(5);
     let outcome = note.outcome();
     let body = note
@@ -1183,9 +1203,9 @@ fn task_notification_results(
         Some(&native_id),
         ObservationPayload::ToolResult(Box::new(ToolResultPayload {
             mutation: NodeMutation {
-                node_id: tool_call_id.clone(),
+                node_id: result_node,
                 revision,
-                operation: MutationOperation::Close,
+                operation: MutationOperation::Replace,
                 base_revision: Some(U64(4)),
             },
             tool_call_id,

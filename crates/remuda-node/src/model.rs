@@ -138,6 +138,12 @@ pub struct CreateInstanceRequest {
     /// Requested renderer; absent on older requests means fullscreen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<remuda_protocol::TuiMode>,
+    /// Per-instance environment applied to the herdr tab/process on top of
+    /// the Node-wide `extra_env` (M1 batch 5a: product-assigned
+    /// `CARGO_TARGET_DIR` / build-jobs cap / port block). Filtered through the
+    /// same deny list as the Node-wide env before launch.
+    #[serde(default, rename = "extraEnv")]
+    pub extra_env: std::collections::BTreeMap<String, String>,
 }
 
 impl CreateInstanceRequest {
@@ -246,6 +252,17 @@ impl CreateInstanceRequest {
                 }
                 selection
             });
+        }
+        // Per-worker env from a `worker.provision` dispatch. Only non-empty
+        // string values are copied; the deny list runs at launch time.
+        if let Some(extra) = spec.get("extraEnv").and_then(serde_json::Value::as_object) {
+            for (key, value) in extra {
+                if let Some(text) = value.as_str().filter(|text| !text.is_empty())
+                    && !self.extra_env.contains_key(key)
+                {
+                    self.extra_env.insert(key.clone(), text.to_owned());
+                }
+            }
         }
     }
 }

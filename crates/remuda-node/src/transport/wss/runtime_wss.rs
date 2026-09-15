@@ -237,6 +237,9 @@ async fn dispatch_hub(
         _ if crate::worktree::is_worktree_method(method) => {
             runtime.node.worktree_rpc(method, &params)
         }
+        // M1 batch 5a worker lifecycle RPCs over the outbound Hub link.
+        Some(HubNodeMethod::WorkerProvision) => runtime.node.provision_worker(&params).await,
+        Some(HubNodeMethod::WorkerRemove) => runtime.node.remove_worker(&params).await,
         _ => Ok(json!({ "ok": true })),
     }
 }
@@ -370,6 +373,7 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         // Filled by apply_spec_launch_fields from the Hub spec.
         effort: None,
         tui: None,
+        extra_env: std::collections::BTreeMap::new(),
     };
     request.apply_spec_launch_fields(spec);
     Ok(request)

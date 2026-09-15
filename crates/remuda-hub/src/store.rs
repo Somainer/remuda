@@ -3701,6 +3701,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::projects::migrate(&conn)?;
     crate::tasks::migrate(&conn)?;
     crate::supply::migrate(&conn)?;
+    crate::workers::migrate(&conn)?;
     crate::usage_store::migrate(&conn)?;
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;

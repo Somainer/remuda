@@ -16,8 +16,8 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use remuda_protocol::{
-    EntityMeta, GrantVerb, Project, ProjectGate, ProjectMember, ProjectPlacement, ProjectPolicy,
-    ProjectProviderRef, U64,
+    EntityMeta, GrantVerb, Project, ProjectGate, ProjectHostQuota, ProjectMember, ProjectPlacement,
+    ProjectPolicy, ProjectProviderRef, U64,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -71,6 +71,11 @@ struct CreateProjectBody {
     /// Seed members (`{hostId, workspaceId, role?}`); both hosts must be known.
     #[serde(default)]
     members: Vec<MemberBody>,
+    /// Per-host capacity quotas (`{hostId, maxInstances, maxBuilding,
+    /// diskBudgetGb, portBlocks, requires, latencyClass}`); the hosts must be
+    /// known. Read by placement §3.4, hostcap and worker port allocation.
+    #[serde(default)]
+    hosts: Vec<ProjectHostQuota>,
     #[serde(default)]
     provider: Option<ProjectProviderRef>,
     #[serde(default)]
@@ -120,6 +125,9 @@ struct PatchProjectBody {
     placement: Option<ProjectPlacement>,
     #[serde(default)]
     gate: Option<ProjectGate>,
+    /// Full replacement of per-host capacity quotas.
+    #[serde(default)]
+    hosts: Option<Vec<ProjectHostQuota>>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +175,7 @@ async fn create_project(
         require_known_host(&state, host).await?;
     }
     let members = resolve_members(&state, &body.members).await?;
+    let hosts = resolve_hosts(&state, body.hosts).await?;
     let now = crate::config::now_rfc3339();
     let id = remuda_protocol::ProjectId::new();
     let mut project = Project {
@@ -188,7 +197,7 @@ async fn create_project(
             .branch_pattern
             .unwrap_or_else(|| "wt/{worker}/{topic}".into()),
         members,
-        hosts: Vec::new(),
+        hosts,
         placement: body.placement.unwrap_or_default(),
         provider: body.provider.unwrap_or_default(),
         model_roles: Default::default(),
@@ -255,6 +264,11 @@ async fn set_project(
     if let Some(host) = body.home_host.as_ref().and_then(Option::as_ref) {
         require_known_host(&state, host).await?;
     }
+    let hosts = if body.hosts.is_some() {
+        Some(resolve_hosts(&state, body.hosts.unwrap_or_default()).await?)
+    } else {
+        None
+    };
     let updated = state
         .store
         .patch_project(id.clone(), move |project| {
@@ -300,6 +314,9 @@ async fn set_project(
             }
             if let Some(gate) = body.gate {
                 project.gate = gate;
+            }
+            if let Some(hosts) = hosts {
+                project.hosts = hosts;
             }
             Ok(())
         })
@@ -439,6 +456,31 @@ async fn require_known_host(state: &AppState, host_id: &str) -> Result<(), HubEr
             "unknown host {host_id}; enroll it and register a workspace first"
         ))),
     }
+}
+
+/// Validate per-host capacity quotas: every host must be enrolled.
+async fn resolve_hosts(
+    state: &AppState,
+    hosts: Vec<ProjectHostQuota>,
+) -> Result<Vec<ProjectHostQuota>, HubError> {
+    for quota in &hosts {
+        require_known_host(state, quota.host_id.as_id().as_str()).await?;
+        for block in &quota.port_blocks {
+            let parts: Vec<&str> = block.split('-').collect();
+            if parts.len() != 2
+                || parts
+                    .iter()
+                    .any(|part| part.parse::<i64>().is_err() || part.starts_with('-'))
+                || parts[0].parse::<i64>().unwrap_or(-1) > parts[1].parse::<i64>().unwrap_or(-1)
+            {
+                return Err(HubError::BadRequest(format!(
+                    "host {} declares a bad port block {block}; want START-END",
+                    quota.host_id.as_id()
+                )));
+            }
+        }
+    }
+    Ok(hosts)
 }
 
 /// Validate member `(hostId, workspaceId)` pairs: the host must be known and

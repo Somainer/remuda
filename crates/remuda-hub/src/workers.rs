@@ -1,0 +1,1253 @@
+//! Worker roster + the `dispatch` / `retire` / `hostcap` server-side verbs;
+//! M1 batch 5a (coordinator-hierarchy.md §1.1 goal 6, §2.2④, §2.4, §3.4).
+//!
+//! Dispatch productises the coordinator's spawn scripts: the Hub assigns name,
+//! branch, worktree, target dir and port block, provisions through the Node,
+//! admits supply via co-supply, launches through the existing instance-create
+//! path, and delivers the brief as an object attachment — never inline.
+//! Retire closes the herdr carrier and reclaims worktree + target dir through
+//! the Node. Cross-layer state lives in the roster, not in a shell script.
+
+use crate::AppState;
+use crate::agent_scope::{caller, caller_project_scope, require_grant};
+use crate::auth::require_origin;
+use crate::error::HubError;
+use crate::http::map_store;
+use crate::store::{HostRecord, InstanceDelegation, Store, StoreError};
+use axum::Json;
+use axum::Router;
+use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
+use axum::routing::{get, post};
+use remuda_protocol::{
+    EntityMeta, InstanceScope, ProjectId, TaskSpec, U64, WorkerRoster, WorkerRosterId, WorkerState,
+    slugify, validate_worker_branch, validate_worker_name,
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+/// Default size (ports) of one allocated worker port block.
+const PORT_BLOCK_SIZE: i64 = 10;
+/// Default allocatable range when a project declares no `portBlocks`. Sits
+/// below the gate lanes (58970+) and the hub-e2e fixed ports.
+const DEFAULT_PORT_RANGE: (i64, i64) = (58600, 58959);
+/// Build-jobs cap exported into every worker's tab env (the shared-host cap
+/// the coordinator scripts hand-roll as `CARGO_BUILD_JOBS=8`).
+const WORKER_BUILD_JOBS: i64 = 8;
+
+pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS worker_roster (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            state_kind TEXT NOT NULL,
+            doc_json TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS worker_roster_project ON worker_roster(project_id);
+         CREATE INDEX IF NOT EXISTS worker_roster_host ON worker_roster(host_id);
+         CREATE INDEX IF NOT EXISTS worker_roster_active_name
+             ON worker_roster(project_id, name) WHERE state_kind != 'retired';",
+    )?;
+    Ok(())
+}
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/workers", get(list_workers))
+        .route("/v1/workers/dispatch", post(dispatch_worker))
+        .route("/v1/workers/{id}", get(get_worker))
+        .route("/v1/workers/{id}/retire", post(retire_worker))
+        .route("/v1/workers/{id}/state", post(set_worker_state))
+        .route("/v1/workers/{id}/brief", post(send_worker_brief))
+        .route("/v1/hosts/{id}/hostcap", get(host_capacity))
+}
+
+// ── request bodies ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DispatchBody {
+    project_id: ProjectId,
+    /// Brief text (utf8). The CLI reads the brief file and posts the bytes;
+    /// the Hub stores it as an object attachment, never as inline prompt text.
+    brief: String,
+    /// Original brief file name (sanitised for the attachment name).
+    #[serde(default)]
+    brief_name: Option<String>,
+    /// Optional bound task.
+    #[serde(default)]
+    task_id: Option<String>,
+    /// `claude` (default) / `codex` / `grok`.
+    #[serde(default)]
+    harness: Option<String>,
+    /// Explicit model id; pins supply admission.
+    #[serde(default)]
+    model: Option<String>,
+    /// Explicit worker name (one safe segment).
+    #[serde(default)]
+    name: Option<String>,
+    /// Explicit host (`hst_…`).
+    #[serde(default)]
+    host_id: Option<String>,
+    /// `local` / `remote` tendency; resolved against project member hosts.
+    #[serde(default)]
+    placement: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListWorkersQuery {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetireBody {
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StateBody {
+    state: String,
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BriefBody {
+    content: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+// ── list / get ─────────────────────────────────────────────────────────────
+
+async fn list_workers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListWorkersQuery>,
+) -> Result<Json<Value>, HubError> {
+    let device = caller(&state, &headers).await?;
+    require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    let mut items = state
+        .store
+        .list_workers(query.project.clone())
+        .await
+        .map_err(map_store)?;
+    items.retain(|worker| {
+        scope.allows_project(worker.project_id.as_id().as_str())
+            && query
+                .state
+                .as_deref()
+                .is_none_or(|wanted| worker.state.kind() == wanted)
+    });
+    Ok(Json(json!({ "items": items, "nextCursor": null })))
+}
+
+async fn get_worker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    let device = caller(&state, &headers).await?;
+    require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    let worker = resolve_worker(&state, &id, &scope).await?;
+    Ok(Json(json!(worker)))
+}
+
+/// Resolve a roster row by `wkr_…` id or active worker name within the
+/// caller's project scope.
+async fn resolve_worker(
+    state: &AppState,
+    id_or_name: &str,
+    scope: &InstanceScope,
+) -> Result<WorkerRoster, HubError> {
+    let worker = if id_or_name.starts_with("wkr_") {
+        state
+            .store
+            .get_worker(id_or_name.to_string())
+            .await
+            .map_err(map_store)?
+            .ok_or(HubError::NotFound)?
+    } else {
+        let mut matches = state
+            .store
+            .find_active_workers_named(id_or_name.to_string())
+            .await
+            .map_err(map_store)?;
+        matches.retain(|worker| scope.allows_project(worker.project_id.as_id().as_str()));
+        match matches.len() {
+            0 => return Err(HubError::NotFound),
+            1 => matches.remove(0),
+            _ => {
+                return Err(HubError::Conflict(format!(
+                    "worker name {id_or_name} matches multiple projects; use its wkr_ id"
+                )));
+            }
+        }
+    };
+    if !scope.allows_project(worker.project_id.as_id().as_str()) {
+        return Err(HubError::Forbidden);
+    }
+    Ok(worker)
+}
+
+// ── dispatch ───────────────────────────────────────────────────────────────
+
+async fn dispatch_worker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DispatchBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = caller(&state, &headers).await?;
+    require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    if !scope.allows_project(body.project_id.as_id().as_str()) {
+        return Err(HubError::Forbidden);
+    }
+    if body.brief.trim().is_empty() {
+        return Err(HubError::BadRequest("brief is required".into()));
+    }
+    let harness = match body.harness.as_deref().unwrap_or("claude") {
+        "claude" | "codex" | "grok" => body.harness.as_deref().unwrap_or("claude").to_string(),
+        other => {
+            return Err(HubError::BadRequest(format!(
+                "harness must be claude, codex or grok (got {other})"
+            )));
+        }
+    };
+
+    let project = state
+        .store
+        .get_project(body.project_id.as_id().to_string())
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+
+    // ── host selection (§3.4) ──────────────────────────────────────────────
+    let host = select_dispatch_host(
+        &state,
+        &project,
+        body.host_id.as_deref(),
+        body.placement.as_deref(),
+    )
+    .await?;
+    let workspace_id = project
+        .members
+        .iter()
+        .find(|member| member.host_id.as_id().as_str() == host.host_id)
+        .map(|member| member.workspace_id.clone())
+        .ok_or_else(|| {
+            HubError::BadRequest(format!(
+                "project has no registered workspace on host {}; add a member first",
+                host.host_id
+            ))
+        })?;
+
+    // ── supply admission (co-supply §4.4) ──────────────────────────────────
+    let task = match body.task_id.as_deref() {
+        Some(id) => Some(
+            state
+                .store
+                .get_task(id.to_string())
+                .await
+                .map_err(map_store)?
+                .ok_or(HubError::NotFound)?,
+        ),
+        None => None,
+    };
+    let mut model = body.model.clone();
+    let mut provider_profile_id: Option<String> = None;
+    let mut delegation: Option<String> = None;
+    let mut supply_decision: Option<Value> = None;
+    let profiles = state.store.list_providers(None).await.map_err(map_store)?;
+    let supply_declared = !profiles.is_empty() || project.provider.profile_id.is_some();
+    if supply_declared {
+        let task_spec = build_task_spec(&project, task.as_ref(), &harness, body.model.as_deref());
+        let decision =
+            crate::supply::solve_state(&state, &task_spec, std::slice::from_ref(&host), true)
+                .await?;
+        if decision.deferred {
+            return Err(HubError::SupplyDeferred {
+                decision: decision.to_json(),
+            });
+        }
+        // A pinned (explicit --model) choice bypasses the rank filters, so the
+        // parked-model refusal is enforced separately: never launch a model
+        // whose observed window is cooling (the 429 park reason).
+        if let Some(wanted) = &model
+            && let Some(park) = crate::supply::model_park_reason(&profiles, wanted, Value::Null)
+        {
+            return Err(HubError::SupplyDeferred {
+                decision: json!({
+                    "deferred": true,
+                    "reasons": [park],
+                    "chosen": null,
+                    "ranked": [],
+                    "rejected": [],
+                }),
+            });
+        }
+        let chosen = decision
+            .chosen
+            .as_ref()
+            .expect("non-deferred supply decision has a choice");
+        model = Some(chosen.model_id.clone());
+        provider_profile_id = Some(chosen.profile_id.clone());
+        let profile = state
+            .store
+            .get_provider(chosen.profile_id.clone())
+            .await
+            .map_err(map_store)?
+            .ok_or_else(|| {
+                HubError::BadRequest("admission named a profile that vanished".into())
+            })?;
+        delegation = Some(match profile.kind.as_str() {
+            "native" => "none".to_string(),
+            "direct" => "direct".to_string(),
+            _ => "gateway".to_string(),
+        });
+        supply_decision = Some(decision.to_json());
+    } else if model.is_none() {
+        model = project.model_roles.workhorse.clone();
+    }
+
+    // ── product-assigned name / branch / port block (§2.4) ─────────────────
+    let slug_source = task
+        .as_ref()
+        .map(|task| task.title.clone())
+        .or_else(|| body.brief_name.clone())
+        .unwrap_or_else(|| "work".into());
+    let name = match body.name.as_deref() {
+        Some(name) => {
+            validate_worker_name(name).map_err(HubError::BadRequest)?;
+            name.to_string()
+        }
+        None => allocate_worker_name(&state, &project, &slug_source).await?,
+    };
+    let slug = unique_slug(&state, &project, &name, &slugify(&slug_source)).await?;
+    let branch = format!("wt/{name}/{slug}");
+    validate_worker_branch(&branch).map_err(HubError::BadRequest)?;
+    if let Some(existing) = state
+        .store
+        .find_active_workers_named(name.clone())
+        .await
+        .map_err(map_store)?
+        .into_iter()
+        .find(|worker| worker.project_id == project.meta.id)
+    {
+        return Err(HubError::Conflict(format!(
+            "worker {name} is already active in this project as {}",
+            existing.meta.id.as_id()
+        )));
+    }
+    let port_block = allocate_port_block(&state, &project, &host.host_id).await?;
+
+    // ── provision through the Node (worktree + target dir) ─────────────────
+    let provision = crate::http::call_node(
+        &state,
+        &host.host_id,
+        "worker.provision",
+        json!({
+            "name": name,
+            "branch": branch,
+            "workspaceId": workspace_id.as_id(),
+            "startPoint": format!("origin/{}", project.default_base_branch),
+        }),
+    )
+    .await?;
+    let worktree_path = provision
+        .get("worktreePath")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HubError::Internal("worker.provision returned no worktreePath".into()))?
+        .to_string();
+    let target_dir = provision
+        .get("targetDir")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // ── launch env: per-worker target dir, build cap, port block ───────────
+    let mut extra_env = serde_json::Map::new();
+    if let Some(target) = &target_dir {
+        extra_env.insert("CARGO_TARGET_DIR".into(), json!(target));
+    }
+    extra_env.insert("CARGO_INCREMENTAL".into(), json!("0"));
+    extra_env.insert("CARGO_BUILD_JOBS".into(), json!(WORKER_BUILD_JOBS));
+    if let Some(block) = &port_block
+        && let Some((first, _last)) = parse_block(block)
+    {
+        extra_env.insert("HUB_E2E_LISTEN".into(), json!(first.to_string()));
+        extra_env.insert(
+            "HUB_E2E_WEB_PORT".into(),
+            json!((first + PORT_BLOCK_SIZE - 1).to_string()),
+        );
+    }
+
+    let driver = driver_for(&harness, &host);
+    let mut spec = json!({
+        "kind": harness,
+        "driver": driver,
+        "model": model,
+        "providerProfileId": provider_profile_id,
+        "delegation": delegation,
+        "permissionMode": "bypassPermissions",
+        "workspaceId": workspace_id.as_id(),
+        "hostId": host.host_id,
+        "cwd": worktree_path,
+        "name": name,
+        "title": name,
+        "prompt": null,
+        "extraEnv": Value::Object(extra_env),
+        "projectId": project.meta.id.as_id(),
+    });
+    if let Some(task) = &task {
+        spec["taskId"] = json!(task.meta.id.as_id());
+    }
+    crate::agent_scope::prepare_create(
+        &state,
+        &headers,
+        &device,
+        &host.host_id,
+        &driver,
+        &mut spec,
+    )
+    .await?;
+    // Fold host launch defaults (binary path); dispatch already set tui/args.
+    if let Some(obj) = spec.as_object_mut()
+        && let Some(path) = host
+            .claude_binary_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        && obj.get("binaryPath").is_none_or(Value::is_null)
+    {
+        obj.insert("binaryPath".into(), json!(path));
+    }
+    // The project provider layer folds into the waterfall like it does on the
+    // normal create path (explicit > project > host > global).
+    crate::providers::resolve_and_attach_with_project(
+        &state,
+        &host,
+        &mut spec,
+        Some(&project.provider),
+    )
+    .await?;
+
+    let delegation_tree = InstanceDelegation {
+        role: Some("worker".into()),
+        scope: InstanceScope {
+            project_ids: vec![project.meta.id.clone()],
+            ..Default::default()
+        },
+        grants: Vec::new(),
+        task_id: task.as_ref().map(|task| task.meta.id.as_id().to_string()),
+        enforce_tree: true,
+    };
+    let (instance, command) = crate::placement::spawn_on_host(
+        &state,
+        &host,
+        crate::placement::SpawnRequest {
+            kind: harness.clone(),
+            driver,
+            workspace_id: Some(workspace_id.as_id().to_string()),
+            title: Some(name.clone()),
+            prompt: None,
+            spec: spec.clone(),
+            operation: "instance.create",
+            idempotency_key: None,
+            delegation: delegation_tree,
+        },
+    )
+    .await?;
+
+    // ── deliver the brief as an object attachment, then prompt ────────────
+    let brief_name = body
+        .brief_name
+        .as_deref()
+        .map(sanitize_brief_name)
+        .transpose()
+        .map_err(|bad| HubError::BadRequest(format!("invalid brief name {bad}")))?
+        .unwrap_or_else(|| "brief.md".into());
+    let (object_id, send_payload) = stage_brief(
+        &state,
+        &instance.instance_id,
+        &host.host_id,
+        &device.id,
+        &body.brief,
+        &brief_name,
+    )
+    .await?;
+    let (send_command, _) = state
+        .store
+        .queue_command(
+            None,
+            Some(instance.instance_id.clone()),
+            host.host_id.clone(),
+            "instance.send".into(),
+            send_payload,
+            None,
+        )
+        .await
+        .map_err(map_store)?;
+    let live = state.nodes.kind_of(&host.host_id).await.is_some();
+    let _send = crate::http::forward_if_online(&state, send_command, live).await?;
+
+    // ── roster row ─────────────────────────────────────────────────────────
+    let now = crate::config::now_rfc3339();
+    let worker = WorkerRoster {
+        meta: EntityMeta {
+            id: WorkerRosterId::new(),
+            revision: U64(1),
+            created_at: remuda_protocol::Timestamp::try_from(now.clone())
+                .map_err(|err| HubError::Internal(err.to_string()))?,
+            updated_at: remuda_protocol::Timestamp::try_from(now)
+                .map_err(|err| HubError::Internal(err.to_string()))?,
+        },
+        project_id: project.meta.id.clone(),
+        name,
+        instance_id: Some(instance.instance_id.parse().map_err(
+            |err: remuda_protocol::WireValueError| HubError::BadRequest(err.to_string()),
+        )?),
+        host_id: host
+            .host_id
+            .parse()
+            .map_err(|err: remuda_protocol::WireValueError| {
+                HubError::BadRequest(err.to_string())
+            })?,
+        workspace_id,
+        harness,
+        model,
+        provider_profile_id,
+        branch,
+        worktree_path,
+        port_block,
+        target_dir,
+        brief_object_id: Some(object_id),
+        task_id: task.as_ref().map(|task| task.meta.id.clone()),
+        state: WorkerState::Working,
+        supply_decision,
+        reclaimed_bytes: None,
+    };
+    let row = state
+        .store
+        .insert_worker(worker, device.id.clone())
+        .await
+        .map_err(map_store)?;
+    let _ = command;
+    state
+        .store
+        .append_audit(
+            device.id,
+            "worker.dispatch".into(),
+            Some(row.meta.id.as_id().to_string()),
+            json!({ "project": row.project_id.as_id(), "host": row.host_id.as_id() }),
+        )
+        .await
+        .map_err(map_store)?;
+    Ok(Json(json!({
+        "worker": row,
+        "instanceId": instance.instance_id,
+    })))
+}
+
+/// Select the dispatch host per §3.4: explicit host, else project members
+/// filtered/ordered by the local/remote tendency, then least-loaded.
+async fn select_dispatch_host(
+    state: &AppState,
+    project: &remuda_protocol::Project,
+    explicit: Option<&str>,
+    tendency: Option<&str>,
+) -> Result<HostRecord, HubError> {
+    let placement = if let Some(host) = explicit {
+        crate::placement::Placement::Host {
+            host_id: host.to_string(),
+        }
+    } else {
+        crate::placement::Placement::Project {
+            project_id: project.meta.id.as_id().to_string(),
+        }
+    };
+    let spec = crate::placement::PlaceSpec {
+        driver: "claude-pty".into(),
+        delegation: None,
+    };
+    let mut hosts = crate::placement::pick_hosts(state, &placement, &spec).await?;
+    if explicit.is_none()
+        && let Some(wanted) = tendency
+    {
+        let home = project.home_host.as_ref();
+        let classified = hosts
+            .into_iter()
+            .filter(|host| matches_tendency(project, host, wanted, home))
+            .collect::<Vec<_>>();
+        if classified.is_empty() {
+            return Err(HubError::Unsatisfiable {
+                reasons: vec![format!(
+                    "no {wanted} member host satisfies capacity; retry on the other placement or --host"
+                )],
+            });
+        }
+        hosts = classified;
+    }
+    hosts
+        .into_iter()
+        .next()
+        .ok_or_else(|| HubError::Unsatisfiable {
+            reasons: vec!["placement returned no host".into()],
+        })
+}
+
+fn matches_tendency(
+    project: &remuda_protocol::Project,
+    host: &HostRecord,
+    tendency: &str,
+    home: Option<&remuda_protocol::HostId>,
+) -> bool {
+    let latency = project
+        .hosts
+        .iter()
+        .find(|quota| quota.host_id.as_id().as_str() == host.host_id)
+        .and_then(|quota| quota.latency_class.as_deref());
+    match tendency {
+        "local" => {
+            latency == Some("local") || home.is_some_and(|id| id.as_id().as_str() == host.host_id)
+        }
+        "remote" => latency == Some("remote"),
+        _ => true,
+    }
+}
+
+fn driver_for(harness: &str, host: &HostRecord) -> String {
+    match harness {
+        "claude" => {
+            // Pty drivers require an advertised herdr; fall back to print.
+            let has_herdr = host.herdr.as_ref().is_some_and(|value| !value.is_null());
+            if has_herdr {
+                "claude-pty".to_string()
+            } else {
+                "claude-print".to_string()
+            }
+        }
+        "codex" | "grok" => "generic-pty".to_string(),
+        _ => "claude-pty".to_string(),
+    }
+}
+
+fn build_task_spec(
+    project: &remuda_protocol::Project,
+    task: Option<&remuda_protocol::Task>,
+    harness: &str,
+    model: Option<&str>,
+) -> TaskSpec {
+    let class = task.map(|task| task.class).unwrap_or_default();
+    TaskSpec {
+        task_id: task.map(|task| task.meta.id.clone()),
+        project_id: Some(project.meta.id.clone()),
+        parent: task.and_then(|task| task.parent_task_id.clone()),
+        class,
+        effort: project.default_effort.clone(),
+        pin: model.map(|wanted| remuda_protocol::TaskPin {
+            harness: Some(harness.to_string()),
+            model: Some(wanted.to_string()),
+            supply_id: None,
+        }),
+        requires: project
+            .hosts
+            .iter()
+            .flat_map(|quota| quota.requires.clone())
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Allocate a worker name when the caller did not pass one: `w<4-hex>` from a
+/// fresh id, guaranteed to collide only astronomically / verified below.
+async fn allocate_worker_name(
+    state: &AppState,
+    project: &remuda_protocol::Project,
+    _slug_source: &str,
+) -> Result<String, HubError> {
+    for _ in 0..10 {
+        let candidate = format!("w{}", &WorkerRosterId::new().as_id().to_string()[4..8]);
+        validate_worker_name(&candidate).map_err(HubError::BadRequest)?;
+        let taken = state
+            .store
+            .find_active_workers_named(candidate.clone())
+            .await
+            .map_err(map_store)?
+            .iter()
+            .any(|worker| worker.project_id == project.meta.id);
+        if !taken {
+            return Ok(candidate);
+        }
+    }
+    Err(HubError::Internal(
+        "could not allocate a unique worker name".into(),
+    ))
+}
+
+/// Append `-2`, `-3`, … to the slug until the branch is free in the project.
+async fn unique_slug(
+    state: &AppState,
+    project: &remuda_protocol::Project,
+    name: &str,
+    base: &str,
+) -> Result<String, HubError> {
+    let active = state
+        .store
+        .list_workers(Some(project.meta.id.as_id().to_string()))
+        .await
+        .map_err(map_store)?;
+    let slug = slugify(base);
+    let mut n = 1;
+    loop {
+        let candidate = if n == 1 {
+            slug.clone()
+        } else {
+            let mut candidate = format!("{slug}-{n}");
+            candidate.truncate(48);
+            candidate
+        };
+        let branch = format!("wt/{name}/{candidate}");
+        if !active
+            .iter()
+            .filter(|worker| worker.state.is_active())
+            .any(|worker| worker.branch == branch)
+        {
+            return Ok(candidate);
+        }
+        n += 1;
+        if n > 1000 {
+            return Err(HubError::Internal("could not allocate unique slug".into()));
+        }
+    }
+}
+
+/// Allocate the next free port block for this host from the project's
+/// declared ranges (or the built-in default), scanning active roster rows so
+/// two workers never share a block.
+async fn allocate_port_block(
+    state: &AppState,
+    project: &remuda_protocol::Project,
+    host_id: &str,
+) -> Result<Option<String>, HubError> {
+    let ranges: Vec<(i64, i64)> = project
+        .hosts
+        .iter()
+        .filter(|quota| quota.host_id.as_id().as_str() == host_id)
+        .flat_map(|quota| quota.port_blocks.iter())
+        .filter_map(|block| parse_block(block))
+        .collect();
+    let project_has_host = project
+        .hosts
+        .iter()
+        .any(|quota| quota.host_id.as_id().as_str() == host_id);
+    let ranges = if ranges.is_empty() {
+        // A declared project host with no portBlocks simply gets no allocated
+        // block (only e2e test workers need one). The built-in range is a
+        // fallback for projects that never declared a hosts entry.
+        if project_has_host {
+            return Ok(None);
+        }
+        vec![DEFAULT_PORT_RANGE]
+    } else {
+        ranges
+    };
+    let active = state
+        .store
+        .list_workers_for_host(host_id.to_string())
+        .await
+        .map_err(map_store)?;
+    let used: Vec<(i64, i64)> = active
+        .iter()
+        .filter(|worker| worker.state.is_active())
+        .filter_map(|worker| worker.port_block.as_deref())
+        .filter_map(parse_block)
+        .collect();
+    for (start, end) in ranges {
+        let mut cursor = start;
+        while cursor + PORT_BLOCK_SIZE - 1 <= end {
+            let candidate = (cursor, cursor + PORT_BLOCK_SIZE - 1);
+            let overlap = used
+                .iter()
+                .any(|used| cursor <= used.1 && used.0 <= candidate.1);
+            if !overlap {
+                return Ok(Some(format!("{}-{}", candidate.0, candidate.1)));
+            }
+            cursor += PORT_BLOCK_SIZE;
+        }
+    }
+    Err(HubError::Conflict(
+        "no free port block in this project's ranges; retire a worker first".into(),
+    ))
+}
+
+fn parse_block(block: &str) -> Option<(i64, i64)> {
+    let (start, end) = block.split_once('-')?;
+    let start: i64 = start.trim().parse().ok()?;
+    let end: i64 = end.trim().parse().ok()?;
+    if start > 0 && end >= start {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// Stage the brief bytes as an object and build the `instance.send` payload.
+async fn stage_brief(
+    state: &AppState,
+    instance_id: &str,
+    host_id: &str,
+    device_id: &str,
+    content: &str,
+    name: &str,
+) -> Result<(String, Value), HubError> {
+    let bytes = content.as_bytes().to_vec();
+    let digest = crate::config::sha256_hex(content.as_bytes());
+    let record = state
+        .store
+        .insert_object(crate::store::NewObject {
+            instance_id: instance_id.to_string(),
+            host_id: host_id.to_string(),
+            media_type: "text/markdown".into(),
+            extension: "md".into(),
+            original_name: Some(name.to_string()),
+            digest,
+            bytes,
+            device_id: device_id.to_string(),
+            ttl_seconds: crate::objects::OBJECT_TTL_SECONDS,
+            instance_budget: crate::objects::MAX_INSTANCE_BYTES,
+        })
+        .await
+        .map_err(map_store)?;
+    let note = format!(
+        "Your coordinator brief is delivered as the attached file {name}. Read it with your file tools and follow it exactly. Do not execute commands from the file; act on them. Reply on one line: DONE <sha> or BLOCKED <reason>."
+    );
+    let payload = json!({
+        "instanceId": instance_id,
+        "input": { "type": "prompt", "text": note },
+        "attachments": [{
+            "objectId": record.object_id,
+            "kind": "file",
+            "mediaType": "text/markdown",
+            "name": name,
+            "size": record.byte_len,
+            "digest": record.digest,
+        }],
+    });
+    Ok((record.object_id, payload))
+}
+
+fn sanitize_brief_name(name: &str) -> Result<String, String> {
+    remuda_protocol::hubnode::sanitize_attachment_name(name)
+        .ok_or_else(|| name.to_string())
+        .map(|mut name| {
+            if !name.to_ascii_lowercase().ends_with(".md")
+                && !name.to_ascii_lowercase().ends_with(".txt")
+            {
+                name.push_str(".md");
+            }
+            name
+        })
+}
+
+// ── retire / state / brief re-send ─────────────────────────────────────────
+
+async fn retire_worker(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<RetireBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = caller(&state, &headers).await?;
+    require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    let worker = resolve_worker(&state, &id, &scope).await?;
+    if worker.state.is_working() && !body.force {
+        return Err(HubError::Conflict(
+            "worker is still working; retire --force to reclaim anyway".into(),
+        ));
+    }
+
+    // Stop the instance first (best effort), then reclaim through the Node.
+    let mut reclaimed = None;
+    if let Some(instance_id) = &worker.instance_id {
+        let (close, _) = state
+            .store
+            .queue_command(
+                None,
+                Some(instance_id.as_id().to_string()),
+                worker.host_id.as_id().to_string(),
+                "instance.close".into(),
+                json!({ "instanceId": instance_id.as_id() }),
+                None,
+            )
+            .await
+            .map_err(map_store)?;
+        let live = state
+            .nodes
+            .kind_of(worker.host_id.as_id().as_str())
+            .await
+            .is_some();
+        let _ = crate::http::forward_if_online(&state, close, live).await;
+    }
+    let removed = crate::http::call_node(
+        &state,
+        worker.host_id.as_id().as_str(),
+        "worker.remove",
+        json!({
+            "name": worker.name,
+            "workspaceId": worker.workspace_id.as_id(),
+            "instanceId": worker.instance_id.as_ref().map(|id| id.as_id()),
+        }),
+    )
+    .await?;
+    if let Some(bytes) = removed.get("reclaimedBytes").and_then(Value::as_u64) {
+        reclaimed = Some(U64(bytes));
+    }
+
+    let updated = state
+        .store
+        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
+            row.state = WorkerState::Retired;
+            row.reclaimed_bytes = reclaimed;
+            Ok(())
+        })
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    state
+        .store
+        .append_audit(
+            device.id,
+            "worker.retire".into(),
+            Some(updated.meta.id.as_id().to_string()),
+            json!({ "force": body.force, "reclaimedBytes": reclaimed }),
+        )
+        .await
+        .map_err(map_store)?;
+    Ok(Json(json!({ "worker": updated, "node": removed })))
+}
+
+async fn set_worker_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<StateBody>,
+) -> Result<Json<Value>, HubError> {
+    let device = caller(&state, &headers).await?;
+    require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    let worker = resolve_worker(&state, &id, &scope).await?;
+    let next = WorkerState::from_update(&body.state, body.sha.as_deref(), body.reason.as_deref())
+        .map_err(HubError::BadRequest)?;
+    // A retired worker stays retired (retire is terminal).
+    if matches!(worker.state, WorkerState::Retired) {
+        return Err(HubError::Conflict("worker is retired".into()));
+    }
+    let updated = state
+        .store
+        .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
+            row.state = next;
+            Ok(())
+        })
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    Ok(Json(json!(updated)))
+}
+
+async fn send_worker_brief(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<BriefBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = caller(&state, &headers).await?;
+    require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    let worker = resolve_worker(&state, &id, &scope).await?;
+    if !worker.state.is_active() {
+        return Err(HubError::Conflict("worker is retired".into()));
+    }
+    let instance_id = worker
+        .instance_id
+        .as_ref()
+        .ok_or_else(|| HubError::Conflict("worker never launched an instance".into()))?;
+    let name = body
+        .name
+        .as_deref()
+        .map(sanitize_brief_name)
+        .transpose()
+        .map_err(|bad| HubError::BadRequest(format!("invalid brief name {bad}")))?
+        .unwrap_or_else(|| "brief.md".into());
+    let (object_id, payload) = stage_brief(
+        &state,
+        instance_id.as_id().as_str(),
+        worker.host_id.as_id().as_str(),
+        &device.id,
+        &body.content,
+        &name,
+    )
+    .await?;
+    let (command, _) = state
+        .store
+        .queue_command(
+            None,
+            Some(instance_id.as_id().to_string()),
+            worker.host_id.as_id().to_string(),
+            "instance.send".into(),
+            payload,
+            None,
+        )
+        .await
+        .map_err(map_store)?;
+    let live = state
+        .nodes
+        .kind_of(worker.host_id.as_id().as_str())
+        .await
+        .is_some();
+    let command = crate::http::forward_if_online(&state, command, live).await?;
+    let updated = state
+        .store
+        .mutate_worker(worker.meta.id.as_id().to_string(), {
+            let object_id = object_id.clone();
+            move |row| {
+                row.brief_object_id = Some(object_id);
+                Ok(())
+            }
+        })
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    Ok(Json(json!({ "worker": updated, "command": command })))
+}
+
+// ── hostcap ────────────────────────────────────────────────────────────────
+
+async fn host_capacity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(host_id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    let device = caller(&state, &headers).await?;
+    require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    if !scope.allows_host(&host_id) && !scope.is_universe() {
+        return Err(HubError::Forbidden);
+    }
+    let stored = state
+        .store
+        .get_host(host_id.clone())
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    let online = state.nodes.kind_of(&host_id).await.is_some();
+    let host = Store::with_live_link(stored, online);
+    let running = state
+        .store
+        .running_count(host_id.clone())
+        .await
+        .map_err(map_store)?;
+    let active = state
+        .store
+        .list_workers_for_host(host_id.clone())
+        .await
+        .map_err(map_store)?
+        .into_iter()
+        .filter(|worker| worker.state.is_active())
+        .collect::<Vec<_>>();
+    let resources = host.resources.clone().unwrap_or(json!({}));
+    let max = host.max_instances;
+    let port_blocks = active
+        .iter()
+        .filter_map(|worker| {
+            worker.port_block.as_ref().map(|block| {
+                json!({
+                    "block": block,
+                    "worker": worker.name,
+                    "state": worker.state.kind(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "hostId": host_id,
+        "online": online,
+        "cores": resources.get("cpuCount").cloned().unwrap_or(json!(null)),
+        "loadPct": resources.get("cpuPct").cloned().unwrap_or(json!(null)),
+        "loadAvg1": resources.get("loadAvg1").cloned().unwrap_or(json!(null)),
+        "memPct": resources.get("memPct").cloned().unwrap_or(json!(null)),
+        "diskFreeGb": resources.get("diskFreeGb").cloned().unwrap_or(json!(null)),
+        "maxInstances": max,
+        "running": running,
+        "freeSlots": (max - running).max(0),
+        "activeWorkers": active.len(),
+        "portBlocksInUse": port_blocks,
+    })))
+}
+
+// ── Store CRUD ─────────────────────────────────────────────────────────────
+
+impl Store {
+    pub async fn insert_worker(
+        &self,
+        worker: WorkerRoster,
+        created_by: String,
+    ) -> Result<WorkerRoster, StoreError> {
+        self.run(move |conn| {
+            let id = worker.meta.id.as_id().to_string();
+            let now = crate::config::now_rfc3339();
+            let doc = serde_json::to_string(&worker)?;
+            conn.execute(
+                "INSERT INTO worker_roster
+                    (id, project_id, name, host_id, state_kind, doc_json, revision,
+                     created_by, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?8)",
+                params![
+                    id,
+                    worker.project_id.as_id().to_string(),
+                    worker.name,
+                    worker.host_id.as_id().to_string(),
+                    worker.state.kind(),
+                    doc,
+                    created_by,
+                    now,
+                ],
+            )?;
+            load_worker(conn, &id)?.ok_or_else(|| StoreError::Id("worker insert missing".into()))
+        })
+        .await
+    }
+
+    pub async fn list_workers(
+        &self,
+        project_id: Option<String>,
+    ) -> Result<Vec<WorkerRoster>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = if project_id.is_some() {
+                conn.prepare(
+                    "SELECT id FROM worker_roster WHERE project_id = ?1 ORDER BY created_at",
+                )?
+            } else {
+                conn.prepare("SELECT id FROM worker_roster ORDER BY created_at")?
+            };
+            let ids: Vec<String> = stmt
+                .query_map(params![project_id], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            ids.into_iter()
+                .map(|id| {
+                    load_worker(conn, &id)?.ok_or_else(|| StoreError::Id("worker vanished".into()))
+                })
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn get_worker(&self, id: String) -> Result<Option<WorkerRoster>, StoreError> {
+        self.run(move |conn| load_worker(conn, &id)).await
+    }
+
+    pub async fn find_active_workers_named(
+        &self,
+        name: String,
+    ) -> Result<Vec<WorkerRoster>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM worker_roster WHERE name = ?1 AND state_kind != 'retired'",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(params![name], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            ids.into_iter()
+                .map(|id| {
+                    load_worker(conn, &id)?.ok_or_else(|| StoreError::Id("worker vanished".into()))
+                })
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn list_workers_for_host(
+        &self,
+        host_id: String,
+    ) -> Result<Vec<WorkerRoster>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT id FROM worker_roster WHERE host_id = ?1")?;
+            let ids: Vec<String> = stmt
+                .query_map(params![host_id], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            ids.into_iter()
+                .map(|id| {
+                    load_worker(conn, &id)?.ok_or_else(|| StoreError::Id("worker vanished".into()))
+                })
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn mutate_worker<F>(
+        &self,
+        id: String,
+        mutate: F,
+    ) -> Result<Option<WorkerRoster>, StoreError>
+    where
+        F: FnOnce(&mut WorkerRoster) -> Result<(), StoreError> + Send + 'static,
+    {
+        self.run(move |conn| {
+            let Some(mut worker) = load_worker(conn, &id)? else {
+                return Ok(None);
+            };
+            mutate(&mut worker)?;
+            let now = crate::config::now_rfc3339();
+            worker.meta.revision = U64(worker.meta.revision.0 + 1);
+            worker.meta.updated_at = remuda_protocol::Timestamp::try_from(now.clone())
+                .map_err(|err| StoreError::Id(err.to_string()))?;
+            let doc = serde_json::to_string(&worker)?;
+            conn.execute(
+                "UPDATE worker_roster
+                    SET doc_json = ?1, state_kind = ?2, revision = revision + 1, updated_at = ?3
+                 WHERE id = ?4",
+                params![doc, worker.state.kind(), now, id],
+            )?;
+            load_worker(conn, &id)
+        })
+        .await
+    }
+}
+
+fn load_worker(conn: &Connection, id: &str) -> Result<Option<WorkerRoster>, StoreError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT doc_json FROM worker_roster WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|raw| serde_json::from_str(&raw))
+        .transpose()
+        .map_err(StoreError::from)
+}

@@ -836,6 +836,8 @@ async fn dispatch_rpc(
             serde_json::to_value(workspace).map_err(NodeError::from)
         }
         "worktree.list" => node.worktree_rpc(method, &params),
+        "worker.provision" => node.provision_worker(&params).await,
+        "worker.remove" => node.remove_worker(&params).await,
         "host.doctor" => node.doctor().await,
         "worktree.create" => node.create_worktree(&params),
         method if crate::workspace_scm::is_scm_method(method) => {

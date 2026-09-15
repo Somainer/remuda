@@ -102,7 +102,9 @@ async fn main() -> Result<()> {
         cpu_count: 1,
         mem_bytes: None,
         cpu_pct: Some(0),
+        load_avg1: Some(0.0),
         mem_pct: Some(0),
+        disk_free_gb: None,
     };
 
     let mut native = NativeDriverConfig::new(data_dir.clone())

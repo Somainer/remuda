@@ -99,9 +99,16 @@ pub struct ResourceReport {
     /// Load average relative to CPU count, 0–100.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_pct: Option<u8>,
+    /// Raw 1-minute load average (not normalized by CPU count).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_avg1: Option<f64>,
     /// Used / total memory, 0–100.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_pct: Option<u8>,
+    /// Free scratch disk in GiB (`df` of the temp dir); read by
+    /// placement §3.4 and `remuda hostcap`. Best-effort like the other fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_free_gb: Option<f64>,
 }
 
 /// Labels, concurrency, and Herdr socket supplied by Node config.
@@ -734,12 +741,33 @@ fn detect_resources() -> ResourceReport {
         _ => None,
     };
     let cpu_pct = loadavg().map(|load| percent(load, f64::from(cpu_count)));
+    let load_avg1 = loadavg();
+    let disk_free_gb = disk_free_gib();
     ResourceReport {
         cpu_count,
         mem_bytes,
         cpu_pct,
+        load_avg1,
         mem_pct,
+        disk_free_gb,
     }
+}
+
+/// Free scratch disk in GiB via `df -Pk <dir>` (the same source the
+/// coordinator watcher polls); `None` on platforms/runs where `df` is absent.
+/// Scratch lives under the OS temp dir (`/tmp` on Linux), which is what the
+/// project `diskBudgetGb` budgets (design §3.2).
+fn disk_free_gib() -> Option<f64> {
+    let target = std::env::temp_dir();
+    let output = Command::new("df").arg("-Pk").arg(&target).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    // `df -Pk`: second data line, 4th column = available 1K-blocks.
+    let line = text.lines().nth(1)?;
+    let avail_kib: f64 = line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kib / (1024.0 * 1024.0))
 }
 
 fn percent(num: f64, den: f64) -> u8 {

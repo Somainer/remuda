@@ -268,7 +268,10 @@ impl DriverFactory for NativeClaudeFactory {
         let native: Arc<dyn NativeDriver> = match self.kind {
             DriverKind::ClaudePrint => {
                 let mut options = ClaudePrintOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&merge_launch_env(
+                    &self.config.extra_env,
+                    &launch.request.extra_env,
+                ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin;
                 options.handshake_timeout = self.config.print_handshake_timeout;
@@ -278,7 +281,10 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ClaudePty => {
                 let mut options = ClaudePtyOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&merge_launch_env(
+                    &self.config.extra_env,
+                    &launch.request.extra_env,
+                ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
@@ -300,7 +306,10 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::ClaudeBg => {
                 let mut options = ClaudeBgOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&merge_launch_env(
+                    &self.config.extra_env,
+                    &launch.request.extra_env,
+                ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
@@ -312,7 +321,10 @@ impl DriverFactory for NativeClaudeFactory {
             }
             DriverKind::GenericPty => {
                 let mut options = GenericPtyOptions::new(profile, launch_dir, native_home, binary);
-                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&merge_launch_env(
+                    &self.config.extra_env,
+                    &launch.request.extra_env,
+                ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 options.origin = launch.request.origin.into();
                 options.session_name = self.config.herdr_session.clone();
@@ -376,7 +388,10 @@ impl DriverFactory for NativeClaudeFactory {
                     }
                     None => ShellPtyOptions::login(launch.workspace_root.clone()),
                 };
-                options.extra_env = crate::origin::instance_env(&self.config.extra_env);
+                options.extra_env = crate::origin::instance_env(&merge_launch_env(
+                    &self.config.extra_env,
+                    &launch.request.extra_env,
+                ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
                 if agent_kind.is_none() {
                     // An agent's argv comes from its recipe (§5.1 step 3), not
@@ -1044,6 +1059,20 @@ fn resolve_binary_source(
         .unwrap_or_else(|| BinarySource::Command("claude".to_owned()))
 }
 
+/// Merge Node-wide launch env with a dispatched worker's per-instance env
+/// (M1 batch 5a). Worker values win; both maps still pass through
+/// [`crate::origin::instance_env`]'s deny list before reaching a process.
+fn merge_launch_env(
+    node_env: &BTreeMap<String, String>,
+    worker_env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = node_env.clone();
+    for (key, value) in worker_env {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
 fn instance_spec(
     launch: &DriverLaunch,
     config: &NativeDriverConfig,
@@ -1316,6 +1345,7 @@ mod tests {
                 resumed_from: None,
                 effort: None,
                 tui: None,
+                extra_env: std::collections::BTreeMap::new(),
             };
             let driver = registry
                 .build(
@@ -1536,6 +1566,7 @@ mod tests {
             resumed_from: None,
             effort: None,
             tui: None,
+            extra_env: std::collections::BTreeMap::new(),
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -1586,6 +1617,7 @@ mod tests {
             resumed_from: None,
             effort: None,
             tui: None,
+            extra_env: std::collections::BTreeMap::new(),
         };
         registry
             .build(
@@ -1639,6 +1671,7 @@ mod tests {
             resumed_from: None,
             effort: None,
             tui: None,
+            extra_env: std::collections::BTreeMap::new(),
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -1818,6 +1851,7 @@ mod tests {
             resumed_from: None,
             effort: None,
             tui: None,
+            extra_env: std::collections::BTreeMap::new(),
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,

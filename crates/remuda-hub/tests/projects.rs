@@ -43,10 +43,7 @@ async fn enroll_node(
     let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
     let labels_obj: Value = labels
         .iter()
-        .map(|label| {
-            let (key, value) = label.split_once('=').unwrap_or((label, ""));
-            json!({ "key": key, "value": value })
-        })
+        .map(|label| json!(*label))
         .collect::<Vec<_>>()
         .into();
     let ws_rows: Vec<Value> = workspaces

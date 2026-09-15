@@ -5178,7 +5178,7 @@
       ]
     },
     "Id": {
-      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
     "InputAccounting": {
@@ -17876,6 +17876,361 @@
           "const": "inferred",
           "description": "Hub usage aggregation inferred fill level.",
           "type": "string"
+        }
+      ]
+    },
+    "WorkerProvisionParams": {
+      "description": "`worker.provision` params: create the product-assigned worktree and the\nper-worker cargo target directory on the Node.\n\nThe Node owns the filesystem layout: the request names the worker and the\nbranch, but never absolute paths (security-review-2 M4, same rule as\n`worktree.create`). The Node creates the worktree under its managed\n`<repo>/../remuda-wt/<name>` root and the target dir under\n`<repo>/../remuda-target/<name>`.",
+      "properties": {
+        "branch": {
+          "description": "Full branch to create (`wt/<name>/<slug>`); must not exist yet.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Worker name; one safe path segment, also the worktree directory.",
+          "type": "string"
+        },
+        "startPoint": {
+          "description": "Start point to branch and check out from (default `origin/main`). The\nNode fetches it first, so the worktree always starts at remote main.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Registered workspace whose repository root holds the checkout."
+        }
+      },
+      "required": [
+        "name",
+        "branch"
+      ],
+      "type": "object"
+    },
+    "WorkerProvisionResult": {
+      "description": "Result of `worker.provision`.",
+      "properties": {
+        "branch": {
+          "description": "Branch created.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "startPoint": {
+          "description": "Start point actually used.",
+          "type": "string"
+        },
+        "targetDir": {
+          "description": "Absolute per-worker cargo target dir (node-assigned).",
+          "type": "string"
+        },
+        "worktreePath": {
+          "description": "Absolute worktree path (node-assigned).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "branch",
+        "startPoint",
+        "worktreePath",
+        "targetDir"
+      ],
+      "type": "object"
+    },
+    "WorkerRemoveParams": {
+      "description": "`worker.remove` params: reclaim one worker's filesystem resources.\n\nPaths are never taken from the wire: the Node recomputes both locations from\nthe managed roots and the `name`, then containment-checks before deleting.",
+      "properties": {
+        "instanceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Instance whose herdr carrier (tab/panes/workspace) is closed first.\nAbsent for print-driver workers that own no tab."
+        },
+        "name": {
+          "description": "Worker name whose worktree/target dir are removed.",
+          "type": "string"
+        },
+        "workspaceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Registered workspace the worktree was created in."
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "WorkerRemoveResult": {
+      "description": "Result of `worker.remove`.",
+      "properties": {
+        "name": {
+          "description": "Worker name.",
+          "type": "string"
+        },
+        "reclaimedBytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Bytes reclaimed from the target dir."
+        },
+        "targetRemoved": {
+          "description": "True when a target dir was found and removed.",
+          "type": "boolean"
+        },
+        "worktreeRemoved": {
+          "description": "True when a worktree was found and removed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "worktreeRemoved",
+        "targetRemoved",
+        "reclaimedBytes"
+      ],
+      "type": "object"
+    },
+    "WorkerRoster": {
+      "description": "One row of the per-project worker roster.",
+      "properties": {
+        "branch": {
+          "description": "Branch `wt/<name>/<slug>`, product-assigned.",
+          "type": "string"
+        },
+        "briefObjectId": {
+          "description": "Brief delivered to the worker, as an objects-store attachment (`obj_…`).\nThe brief always rides the file path, never inline prompt text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "`created_at`; protocol §1.1."
+        },
+        "harness": {
+          "description": "Harness kind (`claude` / `codex` / `grok`).",
+          "type": "string"
+        },
+        "hostId": {
+          "$ref": "#/$defs/HostId",
+          "description": "Host the worker was placed on."
+        },
+        "id": {
+          "$ref": "#/$defs/WorkerRosterId",
+          "description": "`id`; protocol §1.1."
+        },
+        "instanceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Instance (`ins_…`) running the harness; absent if provisioning stopped\nbefore the agent launched."
+        },
+        "model": {
+          "description": "Model id the agent launched with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Human-facing worker name; unique among *active* rows of the project.\nBranch and worktree directory derive from it.",
+          "type": "string"
+        },
+        "portBlock": {
+          "description": "Allocated port block (e.g. `58600-58609`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projectId": {
+          "$ref": "#/$defs/ProjectId",
+          "description": "Owning project."
+        },
+        "providerProfileId": {
+          "description": "Provider profile used, when admission picked one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reclaimedBytes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bytes reclaimed from the target dir at retire (reported by the Node)."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "`revision`; protocol §1.1."
+        },
+        "state": {
+          "$ref": "#/$defs/WorkerState",
+          "description": "Lifecycle state."
+        },
+        "supplyDecision": {
+          "description": "The admission/placement decision JSON (reasons[]/rejected[]), stored for\nthe audit trail and the bot placement card."
+        },
+        "targetDir": {
+          "description": "Per-worker cargo target dir reported by the Node.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional bound task (`tsk_…`)."
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "`updated_at`; protocol §1.1."
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "Registered workspace the worktree belongs to."
+        },
+        "worktreePath": {
+          "description": "Absolute worktree path reported back by the Node (node-assigned under\nits managed worktree root).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "createdAt",
+        "updatedAt",
+        "projectId",
+        "name",
+        "hostId",
+        "workspaceId",
+        "harness",
+        "branch",
+        "worktreePath",
+        "state"
+      ],
+      "type": "object"
+    },
+    "WorkerRosterId": {
+      "pattern": "^(wkr)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "WorkerState": {
+      "description": "Lifecycle of a dispatched worker; design §1.1 goal 6.\n\nWire shape is adjacently tagged: `{\"state\":\"done\",\"sha\":\"…\"}`.",
+      "oneOf": [
+        {
+          "description": "Resources provisioned, agent not yet confirmed working.",
+          "properties": {
+            "state": {
+              "const": "dispatched",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Agent launched and working its brief.",
+          "properties": {
+            "state": {
+              "const": "working",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Worker replied `DONE <sha>`; the sha is a claim until `land` (I1).",
+          "properties": {
+            "sha": {
+              "description": "Claimed landed sha.",
+              "type": "string"
+            },
+            "state": {
+              "const": "done",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "sha"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Worker replied `BLOCKED <reason>`.",
+          "properties": {
+            "reason": {
+              "description": "Machine-and-human-readable block reason.",
+              "type": "string"
+            },
+            "state": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Tab closed and worktree/target dir reclaimed through the Node.",
+          "properties": {
+            "state": {
+              "const": "retired",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
         }
       ]
     },

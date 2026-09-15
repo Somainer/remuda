@@ -467,6 +467,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/{id}/hostcap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Show cores/load/disk, free slots and port blocks in use */
+        get: operations["hostCapacity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts/{id}/workspaces": {
         parameters: {
             query?: never;
@@ -1150,6 +1167,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/workers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the worker roster in the caller's project scope */
+        get: operations["workerList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/dispatch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Provision and launch a worker (requires the dispatch grant) */
+        post: operations["workerDispatch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one worker roster row by wkr_ id or active worker name */
+        get: operations["workerGet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/brief": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Re-deliver a brief/handback file to a live worker */
+        post: operations["workerBrief"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Close the worker tab and reclaim worktree + target dir */
+        post: operations["workerRetire"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Record a worker's DONE/BLOCKED/working state */
+        post: operations["workerState"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/worktrees": {
         parameters: {
             query?: never;
@@ -1354,6 +1473,23 @@ export interface components {
         FleetCreateResult: {
             fleetId?: string;
             instanceIds?: string[];
+        };
+        /** @description Current host capacity snapshot; design §2.2/§3.4/§7 #6. */
+        HostCapacity: {
+            activeWorkers?: number;
+            cores?: number | null;
+            diskFreeGb?: number | null;
+            freeSlots?: number;
+            hostId: string;
+            loadAvg1?: number | null;
+            loadPct?: number | null;
+            maxInstances?: number;
+            memPct?: number | null;
+            online?: boolean;
+            portBlocksInUse?: {
+                [key: string]: unknown;
+            }[];
+            running?: number;
         };
         HostCli: {
             /** @enum {string} */
@@ -2170,6 +2306,106 @@ export interface components {
         };
         /** @enum {string} */
         TuiMode: "fullscreen" | "default";
+        WorkerBriefResult: {
+            command?: {
+                [key: string]: unknown;
+            };
+            worker: components["schemas"]["WorkerRoster"];
+        };
+        WorkerBriefSend: {
+            content: string;
+            name?: string;
+        };
+        WorkerDispatch: {
+            /** @description Brief bytes (utf8); staged as an object attachment, never inlined. */
+            brief: string;
+            briefName?: string;
+            /** @enum {string} */
+            harness?: "claude" | "codex" | "grok";
+            hostId?: string;
+            model?: string;
+            /** @description Optional explicit worker name (one safe lowercase segment). */
+            name?: string;
+            /** @enum {string} */
+            placement?: "local" | "remote" | "auto";
+            projectId: string;
+            taskId?: string;
+        };
+        WorkerDispatchResult: {
+            instanceId?: string;
+            worker: components["schemas"]["WorkerRoster"];
+        };
+        WorkerPage: {
+            items: components["schemas"]["WorkerRoster"][];
+            nextCursor?: string | null;
+        };
+        WorkerRetire: {
+            /** @default false */
+            force: boolean;
+        };
+        WorkerRetireResult: {
+            node?: {
+                [key: string]: unknown;
+            };
+            worker: components["schemas"]["WorkerRoster"];
+        };
+        /** @description One row of the per-project worker roster; design §2.2④. */
+        WorkerRoster: {
+            branch: string;
+            briefObjectId?: string;
+            /** Format: date-time */
+            createdAt: string;
+            harness: string;
+            hostId: string;
+            id: string;
+            instanceId?: string;
+            model?: string;
+            name: string;
+            portBlock?: string | null;
+            projectId: string;
+            providerProfileId?: string;
+            reclaimedBytes?: string;
+            revision: string;
+            state: components["schemas"]["WorkerState"];
+            supplyDecision?: {
+                [key: string]: unknown;
+            } | null;
+            targetDir?: string | null;
+            taskId?: string;
+            /** Format: date-time */
+            updatedAt: string;
+            workspaceId: string;
+            worktreePath: string;
+        };
+        /** @description Adjacently tagged worker state ({state,sha?} / {state,reason?}). */
+        WorkerState: {
+            /** @constant */
+            state: "dispatched";
+        } | {
+            /** @constant */
+            state: "working";
+        } | {
+            sha: string;
+            /** @constant */
+            state: "done";
+        } | {
+            reason: string;
+            /** @constant */
+            state: "blocked";
+        } | {
+            /** @constant */
+            state: "retired";
+        };
+        /**
+         * @description Worker roster lifecycle state; design §2.2.
+         * @enum {string}
+         */
+        WorkerStateKind: "dispatched" | "working" | "done" | "blocked" | "retired";
+        WorkerStateUpdate: {
+            reason?: string;
+            sha?: string;
+            state: components["schemas"]["WorkerStateKind"];
+        };
         WorktreeCreate: {
             /** @description Start-point (default main). */
             base?: string;
@@ -3012,6 +3248,32 @@ export interface operations {
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
             500: components["responses"]["Error"];
+        };
+    };
+    hostCapacity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description hst_ host id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current host capacity and allocations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostCapacity"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
         };
     };
     hostWorkspaceList: {
@@ -4570,6 +4832,178 @@ export interface operations {
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    workerList: {
+        parameters: {
+            query?: {
+                /** @description prj_… project id */
+                project?: string;
+                /** @description worker state filter (dispatched|working|done|blocked|retired) */
+                state?: components["schemas"]["WorkerStateKind"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Worker roster page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerPage"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    workerDispatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerDispatch"];
+            };
+        };
+        responses: {
+            /** @description Provisioned worker roster row */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerDispatchResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            429: components["responses"]["Error"];
+        };
+    };
+    workerGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Worker roster row */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerRoster"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    workerBrief: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerBriefSend"];
+            };
+        };
+        responses: {
+            /** @description Brief delivered as an object attachment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerBriefResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    workerRetire: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerRetire"];
+            };
+        };
+        responses: {
+            /** @description Retired worker with reclaim report */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerRetireResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    workerState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerStateUpdate"];
+            };
+        };
+        responses: {
+            /** @description Updated worker roster row */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerRoster"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
         };
     };
     worktreeList: {

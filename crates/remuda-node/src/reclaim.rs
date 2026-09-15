@@ -109,6 +109,34 @@ impl DevNode {
         Ok(self)
     }
 
+    /// Close one instance's herdr carrier (tab/panes/workspace) at worker
+    /// retire (M1 batch 5a). Best-effort and idempotent: print-driver workers
+    /// and already-gone carriers report success. Only touches the resource the
+    /// Node itself recorded for `instance_id`.
+    pub(crate) async fn close_instance_carrier(&self, instance_id: &str) -> Result<(), NodeError> {
+        let Some(config) = &self.inner.herdr_config else {
+            return Ok(());
+        };
+        let socket = crate::carrier_recovery::herdr_socket(config);
+        if !socket.exists() {
+            return Ok(());
+        }
+        let parsed: InstanceId = instance_id.parse()?;
+        let resources = self.inner.store.pty_resources()?;
+        let Some(resource) = resources
+            .into_iter()
+            .find(|resource| resource.instance_id.as_ref() == Some(&parsed))
+        else {
+            return Ok(());
+        };
+        resource
+            .close()
+            .await
+            .map_err(|error| NodeError::InvalidRequest(format!("close worker carrier: {error}")))?;
+        self.inner.store.remove_pty_resource(&resource.key())?;
+        Ok(())
+    }
+
     /// Adopt known live panes and sweep orphans before accepting new commands.
     /// No prompt, approval, start, or semantic resume is replayed here.
     ///

@@ -4003,6 +4003,90 @@ export type WaitReason = ("condition-met" | "timeout" | "unknown");
 /** Where a window's numbers came from; §4.1.  Observed frames update `observed` fields but never erase a `declared` limit; `inferred` is filled by Hub-side usage aggregation (§4.5). */
 export type WindowSource = ("declared" | "observed" | "inferred");
 
+/** `worker.provision` params: create the product-assigned worktree and the per-worker cargo target directory on the Node.  The Node owns the filesystem layout: the request names the worker and the branch, but never absolute paths (security-review-2 M4, same rule as `worktree.create`). The Node creates the worktree under its managed `<repo>/../remuda-wt/<name>` root and the target dir under `<repo>/../remuda-target/<name>`. */
+export type WorkerProvisionParams = ({
+  "branch": (string);
+  "name": (string);
+  "startPoint"?: (string | null);
+  "workspaceId"?: (WorkspaceId | (null));
+  [key: string]: unknown;
+});
+
+/** Result of `worker.provision`. */
+export type WorkerProvisionResult = ({
+  "branch": (string);
+  "name": (string);
+  "startPoint": (string);
+  "targetDir": (string);
+  "worktreePath": (string);
+  [key: string]: unknown;
+});
+
+/** `worker.remove` params: reclaim one worker's filesystem resources.  Paths are never taken from the wire: the Node recomputes both locations from the managed roots and the `name`, then containment-checks before deleting. */
+export type WorkerRemoveParams = ({
+  "instanceId"?: (InstanceId | (null));
+  "name": (string);
+  "workspaceId"?: (WorkspaceId | (null));
+  [key: string]: unknown;
+});
+
+/** Result of `worker.remove`. */
+export type WorkerRemoveResult = ({
+  "name": (string);
+  "reclaimedBytes": U64;
+  "targetRemoved": (boolean);
+  "worktreeRemoved": (boolean);
+  [key: string]: unknown;
+});
+
+/** One row of the per-project worker roster. */
+export type WorkerRoster = ({
+  "branch": (string);
+  "briefObjectId"?: (string | null);
+  "createdAt": Timestamp;
+  "harness": (string);
+  "hostId": HostId;
+  "id": WorkerRosterId;
+  "instanceId"?: (InstanceId | (null));
+  "model"?: (string | null);
+  "name": (string);
+  "portBlock"?: (string | null);
+  "projectId": ProjectId;
+  "providerProfileId"?: (string | null);
+  "reclaimedBytes"?: (U64 | (null));
+  "revision": U64;
+  "state": WorkerState;
+  "supplyDecision"?: unknown;
+  "targetDir"?: (string | null);
+  "taskId"?: (TaskId | (null));
+  "updatedAt": Timestamp;
+  "workspaceId": WorkspaceId;
+  "worktreePath": (string);
+  [key: string]: unknown;
+});
+
+export type WorkerRosterId = (string);
+
+/** Lifecycle of a dispatched worker; design §1.1 goal 6.  Wire shape is adjacently tagged: `{"state":"done","sha":"…"}`. */
+export type WorkerState = (({
+  "state": "dispatched";
+  [key: string]: unknown;
+}) | ({
+  "state": "working";
+  [key: string]: unknown;
+}) | ({
+  "sha": (string);
+  "state": "done";
+  [key: string]: unknown;
+}) | ({
+  "reason": (string);
+  "state": "blocked";
+  [key: string]: unknown;
+}) | ({
+  "state": "retired";
+  [key: string]: unknown;
+}));
+
 /** WorkflowEngine wire values; `protocol.md` §5.3. */
 export type WorkflowEngine = ("claude-workflow");
 

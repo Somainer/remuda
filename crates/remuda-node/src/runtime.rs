@@ -1412,7 +1412,12 @@ async fn execute_queued(
         queued
     };
     let mut command = store.get_command(&queued.command_id)?;
-    if let DriverRequest::Send { prompt, .. } = &queued.request {
+    if let DriverRequest::Send {
+        prompt,
+        attachments,
+        ..
+    } = &queued.request
+    {
         store.set_instance_state(
             instance_id,
             None,
@@ -1423,8 +1428,14 @@ async fn execute_queued(
         // C2: the non-PTY synthesized user message carries the delivering
         // command id, and stdout/transcript user frames join its node the same
         // way the PTY transcript does — one user node per command, everywhere.
-        let mut payload =
-            crate::driver::message_payload(MessageRole::User, MessagePhase::Input, prompt.clone())?;
+        // D-027b: it also carries the landed image/file blocks, so the
+        // absolute landed path is recorded as journal metadata.
+        let mut payload = crate::driver::message_payload(
+            MessageRole::User,
+            MessagePhase::Input,
+            prompt.clone(),
+            crate::attachments::content_blocks(attachments),
+        )?;
         if let ObservationPayload::Message(message) = &mut payload {
             message.command_id = Some(queued.command_id.clone());
             prompts.register(

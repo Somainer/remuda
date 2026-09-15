@@ -749,7 +749,7 @@ export interface paths {
         put?: never;
         /**
          * Stage one image for a later instance.send (D-027)
-         * @description Raw image bytes with a Content-Type. Human or Bot devices only; an Agent-origin caller is refused. The media type is sniffed from the bytes and must agree with the declared Content-Type. Limits: 5 MiB per attachment, 64 MiB staged per instance, 4 attachments per send.
+         * @description Raw attachment bytes with a Content-Type (D-027b: any file type). Human or Bot devices only; an Agent-origin caller is refused. Images (PNG/JPEG/GIF/WebP) are magic-byte sniffed and the declared Content-Type must agree; other files keep a validated declared media type, are served back with attachment disposition + nosniff, and are never executed. Limits: 25 MiB per attachment by default (config key attachmentMaxBytes / REMUDA_ATTACHMENT_MAX_BYTES), 256 MiB staged per instance, 8 attachments per send. The optional `name` query parameter carries the original filename; it is sanitised (no path separators or control characters, length-capped).
          */
         post: operations["objectUpload"];
         delete?: never;
@@ -767,7 +767,7 @@ export interface paths {
         };
         /**
          * Read staged attachment bytes
-         * @description Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance — a Node cannot read another host's attachments — or as a Human/Bot device. Expired objects read as 404.
+         * @description Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance — a Node cannot read another host's attachments — or as a Human/Bot device. Images are served inline; non-images carry Content-Disposition: attachment with the sanitised filename plus X-Content-Type-Options: nosniff (D-027b). Expired objects read as 404.
          */
         get: operations["objectRead"];
         put?: never;
@@ -1188,33 +1188,49 @@ export interface components {
             instanceId: string;
             items: components["schemas"]["AttachmentRef"][];
         };
-        /** @description One staged attachment as the in-session MCP tools see it (D-028 §4.5). Metadata only; `AttachmentContent` adds the bytes. */
+        /** @description One staged attachment as the in-session MCP tools see it (D-028 §4.5, generalized to arbitrary files in D-027b). Metadata only; `AttachmentContent` adds the bytes. */
         AttachmentRef: {
             /** @description Lowercase hex SHA-256 of the stored bytes. */
             digest: string;
             expiresAt: string;
-            /** @description 1-based number matching the prompt's `[Image #n]` token, assigned by the send manifest that consumed the object; null while the object is only staged. `remuda_attachments_list` is ordered by this number. */
+            /** @description 1-based number matching the prompt's `[Image #n]`/`[File #n]` token, assigned by the send manifest that consumed the object; null while the object is only staged. `remuda_attachments_list` is ordered by this number. */
             index?: number | null;
             /** @description Session this attachment is staged for; also the read-authorization key. */
             instanceId: string;
+            /**
+             * @description `image` keeps native image delivery; `file` is delivered as a readable path reference (D-027b).
+             * @enum {string}
+             */
+            kind: "image" | "file";
+            /** @description Hub-accepted MIME type: magic-byte sniffed for images, validated declared essence for everything else. */
             mediaType: string;
-            /** @description Derived `<objectId>.<ext>`; a caller-supplied filename never survives. */
+            /** @description Sanitised original filename (no path separators, no control characters, length-capped); the derived `<objectId>.<ext>` name when none was supplied. */
             name: string;
             objectId: string;
             size: number;
+            /** @description Derived internal blob name `<objectId>.<ext>`. */
+            storedName?: string;
         };
-        /** @description Staged attachment metadata (D-027). The media type and name are the Hub's own: the type is sniffed from the bytes and the name is derived as <objectId>.<ext>, so a caller-supplied filename never survives. */
+        /** @description Staged attachment metadata (D-027/D-027b). Images are magic-byte sniffed; other files keep their validated declared media type. `name` is the sanitised original filename or null when none was supplied, and `storedName` is always the derived internal name. */
         AttachmentUpload: {
             /** @description Lowercase hex SHA-256 of the stored bytes. */
             digest: string;
             /** @description RFC3339. Staging is lazily expired, not swept by a job. */
             expiresAt: string;
             instanceId: string;
-            /** @enum {string} */
-            mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
-            name: string;
+            /**
+             * @description `image` for sniffed PNG/JPEG/GIF/WebP; `file` for everything else.
+             * @enum {string}
+             */
+            kind: "image" | "file";
+            /** @description Hub-accepted MIME essence (`image/png`, `application/pdf`, `text/plain`, …). */
+            mediaType: string;
+            /** @description Sanitised original filename, or null when the upload carried none. */
+            name: string | null;
             objectId: string;
             size: number;
+            /** @description Derived internal blob name `<objectId>.<ext>`. */
+            storedName: string;
         };
         CallerContext: {
             /** @description Direct children created by this instance; descendants do not inherit scope. */
@@ -3562,6 +3578,8 @@ export interface operations {
             query: {
                 /** @description Instance this attachment is staged for; it also scopes who may read it back. */
                 instanceId: string;
+                /** @description Original filename; sanitised server-side. Omit to use a derived <objectId>.<ext> name. */
+                name?: string;
             };
             header?: never;
             path?: never;
@@ -3569,10 +3587,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "image/gif": string;
-                "image/jpeg": string;
-                "image/png": string;
-                "image/webp": string;
+                "*/*": string;
             };
         };
         responses: {
@@ -3602,16 +3617,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Raw image bytes, served as an attachment with nosniff */
+            /** @description Raw attachment bytes. Images inline; other types as attachment with nosniff. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "image/gif": string;
-                    "image/jpeg": string;
-                    "image/png": string;
-                    "image/webp": string;
+                    "*/*": string;
                 };
             };
             401: components["responses"]["Error"];

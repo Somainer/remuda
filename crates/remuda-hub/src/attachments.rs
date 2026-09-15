@@ -176,13 +176,17 @@ fn view(object: &ObjectRecord) -> Value {
     json!({
         "objectId": object.object_id,
         "instanceId": object.instance_id,
+        "kind": object.kind,
         "mediaType": object.media_type,
-        "name": object.stored_name,
+        // The sanitised original name when one was supplied (D-027b), else the
+        // derived `<obj_id>.<ext>` name.
+        "name": object.original_name.clone().unwrap_or_else(|| object.stored_name.clone()),
+        "storedName": object.stored_name,
         "size": object.byte_len,
         "digest": object.digest,
         "expiresAt": object.expires_at,
-        // 1-based [Image #n] anchor; absent for objects never consumed by a
-        // numbered send (listed oldest-first in that case).
+        // 1-based [Image #n]/[File #n] anchor; absent for objects never
+        // consumed by a numbered send (listed oldest-first in that case).
         "index": object.anchor,
     })
 }
@@ -196,8 +200,8 @@ async fn live_objects(
     store
         .run(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT id, instance_id, host_id, media_type, stored_name, digest, byte_len,
-                        expires_at, anchor
+                "SELECT id, instance_id, host_id, media_type, stored_name, original_name, kind,
+                        digest, byte_len, expires_at, anchor
                  FROM objects
                  WHERE instance_id = ?1 AND expires_at > ?2
                  ORDER BY COALESCE(anchor, 9223372036854775807), created_at, id",
@@ -210,10 +214,12 @@ async fn live_objects(
                         host_id: row.get(2)?,
                         media_type: row.get(3)?,
                         stored_name: row.get(4)?,
-                        digest: row.get(5)?,
-                        byte_len: row.get(6)?,
-                        expires_at: row.get(7)?,
-                        anchor: row.get(8)?,
+                        original_name: row.get(5)?,
+                        kind: row.get(6)?,
+                        digest: row.get(7)?,
+                        byte_len: row.get(8)?,
+                        expires_at: row.get(9)?,
+                        anchor: row.get(10)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -267,7 +273,7 @@ mod tests {
 
     #[test]
     fn the_inline_ceiling_is_below_the_staging_ceiling() {
-        assert!(MAX_INLINE_ATTACHMENT_BYTES < crate::objects::MAX_OBJECT_BYTES as i64);
+        assert!(MAX_INLINE_ATTACHMENT_BYTES < crate::config::default_attachment_max_bytes() as i64);
         assert_eq!(MAX_INLINE_ATTACHMENT_BYTES, 3_670_016);
     }
 
@@ -284,6 +290,7 @@ mod tests {
             host_id: "hst_1".into(),
             media_type: "image/png".into(),
             extension: "png".into(),
+            original_name: None,
             digest: digest.to_owned(),
             bytes: vec![0x89, b'P', b'N', b'G', n],
             device_id: "dev_1".into(),

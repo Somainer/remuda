@@ -524,33 +524,34 @@ async fn listing_covers_this_session_and_operators_must_name_one() -> Result<()>
     Ok(())
 }
 
-/// The read route is media-type agnostic, but D-027's staging allowlist is
-/// images-only, so no `text/*` row can exist here yet. The MCP tool's text
-/// branch is therefore covered in `remuda`'s own tests, against a fake Hub —
-/// this asserts the gap rather than pretending to close it.
+/// D-027b generalized staging beyond images: a `text/plain` body now uploads
+/// (as kind=file), is readable back via the MCP route, and downloads with an
+/// attachment disposition. Images still sniff: a body that merely *claims*
+/// image/png without PNG magic is not stored as an image.
 #[tokio::test]
-async fn staging_is_images_only_so_no_text_row_can_reach_the_read_route() -> Result<()> {
+async fn arbitrary_files_stage_and_read_back_with_attachment_disposition() -> Result<()> {
     let mut fixture = fixture().await?;
     let addr = fixture.hub.addr;
-    // Every allowlisted upload sniffs to image/*; a text body is refused.
+    // A non-image file is accepted with its declared type.
     let (status, _, body) = raw(
         addr,
         "POST",
-        &format!("/v1/objects?instanceId={}", fixture.instance_id),
+        &format!(
+            "/v1/objects?instanceId={}&name=notes.txt",
+            fixture.instance_id
+        ),
         &[("Cookie", fixture.cookie.as_str())],
-        Some(("text/plain", b"hello agent")),
+        Some(("text/plain; charset=utf-8", b"hello agent")),
     )
     .await?;
-    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let staged: Value = serde_json::from_slice(&body)?;
+    let object_id = staged["objectId"].as_str().context("objectId")?;
+    assert_eq!(staged["kind"], json!("file"));
+    assert_eq!(staged["mediaType"], json!("text/plain"));
+    assert_eq!(staged["name"], json!("notes.txt"));
 
-    let object_id = stage(
-        addr,
-        &fixture.cookie,
-        &fixture.instance_id,
-        "image/png",
-        &png_bytes(64),
-    )
-    .await?;
+    // The MCP content route reads it back for the in-session agent.
     let (status, body) = get_as(
         addr,
         &format!("/v1/attachments/{object_id}/content"),
@@ -559,14 +560,72 @@ async fn staging_is_images_only_so_no_text_row_can_reach_the_read_route() -> Res
     .await?;
     assert_eq!(status, 200);
     let body = body.context("json")?;
-    assert!(
-        body["mediaType"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("image/")),
-        "{body}"
-    );
+    assert_eq!(body["mediaType"], json!("text/plain"));
+    assert_eq!(body["kind"], json!("file"));
     assert!(body["data"].as_str().is_some_and(|data| !data.is_empty()));
+
+    // GET serves non-images as an attachment with the sanitised filename and
+    // nosniff, never inline.
+    let (status, head, _) = raw(
+        addr,
+        "GET",
+        &format!("/v1/objects/{object_id}"),
+        &[("Cookie", fixture.cookie.as_str())],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-disposition: attachment"),
+        "{head}"
+    );
+    assert!(head.contains("notes.txt"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("x-content-type-options: nosniff"),
+        "nosniff header required"
+    );
+
+    // A file claiming image/png without PNG magic is not stored as an image.
+    let (status, _, fake) = raw(
+        addr,
+        "POST",
+        &format!("/v1/objects?instanceId={}", fixture.instance_id),
+        &[("Cookie", fixture.cookie.as_str())],
+        Some(("image/png", b"<html>pretending to be an image")),
+    )
+    .await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&fake));
+    let fake: Value = serde_json::from_slice(&fake)?;
+    assert_eq!(fake["kind"], json!("file"));
+    assert_eq!(fake["mediaType"], json!("application/octet-stream"));
+
     let _ = &mut fixture.node;
     fixture.hub.shutdown().await;
+    Ok(())
+}
+
+/// A traversal-shaped `name` is rejected rather than trusted: the upload is
+/// refused outright (defence in depth — the Node sanitises again anyway).
+#[tokio::test]
+async fn a_traversal_shaped_filename_is_rejected() -> Result<()> {
+    let fixture = fixture().await?;
+    let addr = fixture.hub.addr;
+    // Percent-encoded so the separators travel inside the `name` query value.
+    for hostile in ["%2e%2e%2fescape.txt", "a%5cb.pdf"] {
+        let (status, _, body) = raw(
+            addr,
+            "POST",
+            &format!(
+                "/v1/objects?instanceId={}&name={}",
+                fixture.instance_id, hostile
+            ),
+            &[("Cookie", fixture.cookie.as_str())],
+            Some(("text/plain", b"x")),
+        )
+        .await?;
+        assert_eq!(status, 400, "{hostile}: {}", String::from_utf8_lossy(&body));
+    }
     Ok(())
 }

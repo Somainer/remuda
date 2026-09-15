@@ -1953,6 +1953,7 @@ export type MediaBlock = ({
   "mediaType": (string);
   "name": (string | null);
   "objectId": Id;
+  "size"?: (number | null);
   [key: string]: unknown;
 });
 

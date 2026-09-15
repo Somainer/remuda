@@ -3,11 +3,12 @@ import { readDraft, writeDraft } from "../../lib/drafts";
 import { expandCodeQuotes } from "../../lib/codeAnchors";
 import {
   insertAnchorFor,
-  insertAnchorsFor,
-  referencedIndices,
+  insertAttachmentAnchors,
+  referencedAttachmentIndices,
   referencedIndicesFor,
-  removeAndRenumber,
+  removeAndRenumberAttachment,
   removeAndRenumberFor,
+  type AttachmentAnchor,
 } from "../../lib/imageAnchors";
 import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
 import { composing } from "../../lib/viewport";
@@ -174,7 +175,7 @@ export function Composer({
   };
 
   /**
-   * Insert a `[Image #n]` / `[Code #n]` token at the textarea caret
+   * Insert `[Image #n]`/`[Code #n]` token at the textarea caret
    * (mid-word inserts get surrounding spaces — see imageAnchors). Focus moves
    * to the composer after insert; on touch-sized layouts the composer is
    * scrolled into view so the chip/token is visible above the keyboard.
@@ -196,14 +197,15 @@ export function Composer({
   };
 
   /**
-   * Insert `[Image #n]` tokens for freshly staged files at the textarea caret.
-   * Multi-file paste chains the caret so tokens land in file order.
+   * Insert `[Image #n]`/`[File #n]` tokens for freshly staged files at the
+   * textarea caret. A multi-file paste chains the caret so tokens land in
+   * file order; images and files share one numbering space.
    */
-  const insertForImages = (indices: number[]) => {
-    if (indices.length === 0) return;
+  const insertForAttachments = (anchors: AttachmentAnchor[]) => {
+    if (anchors.length === 0) return;
     const area = inputRef.current;
     const caret = area && area.selectionStart != null ? area.selectionStart : textRef.current.length;
-    const result = insertAnchorsFor("Image", textRef.current, caret, indices);
+    const result = insertAttachmentAnchors(textRef.current, caret, anchors);
     textRef.current = result.text;
     setText(result.text);
     writeDraft(instanceId, result.text);
@@ -223,11 +225,11 @@ export function Composer({
   const insertCodeTokenRef = useRef(insertCodeToken);
   insertCodeTokenRef.current = insertCodeToken;
 
-  /** Chip × : unstage the image, pull its token(s) out, renumber the rest. */
+  /** Chip × : unstage the attachment, pull its token(s) out, renumber the rest. */
   const removeAttachment = (localId: string) => {
     const index = images.remove(localId);
     if (index === null) return;
-    const next = removeAndRenumber(textRef.current, index);
+    const next = removeAndRenumberAttachment(textRef.current, index);
     textRef.current = next;
     setText(next);
     writeDraft(instanceId, next);
@@ -242,11 +244,11 @@ export function Composer({
     writeDraft(instanceId, next);
   };
 
-  /** Chips whose [Image #n] token was edited out of the draft; still sent. */
+  /** Chips whose [Image #n]/[File #n] token was edited out; still sent. */
   const unreferenced = new Set(
     images.attachments
       .map((attachment, position) => ({ attachment, index: position + 1 }))
-      .filter(({ index }) => !referencedIndices(textRef.current).has(index))
+      .filter(({ index }) => !referencedAttachmentIndices(textRef.current).has(index))
       .map(({ attachment }) => attachment.localId),
   );
 
@@ -474,12 +476,11 @@ export function Composer({
           if (Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
         }}
         onDrop={(event) => {
-          const dropped = Array.from(event.dataTransfer.files).filter((file) =>
-            file.type.startsWith("image/"),
-          );
+          // Any file type, not only images (D-027b).
+          const dropped = Array.from(event.dataTransfer.files);
           if (dropped.length === 0) return;
           event.preventDefault();
-          insertForImages(images.add(dropped));
+          insertForAttachments(images.add(dropped));
         }}
       >
         <textarea
@@ -495,12 +496,12 @@ export function Composer({
             writeDraft(instanceId, e.target.value);
           }}
           onPaste={(event) => {
-            // Only swallow the paste when an image was actually taken:
-            // otherwise plain-text pasting and the iOS caret both break.
-            const indices = images.onPaste(event.clipboardData);
-            if (indices.length > 0) {
+            // Swallow the paste only when a file was actually taken: otherwise
+            // plain-text pasting and the iOS caret both break.
+            const anchors = images.onPaste(event.clipboardData);
+            if (anchors.length > 0) {
               event.preventDefault();
-              insertForImages(indices);
+              insertForAttachments(anchors);
             }
           }}
           onKeyDown={onKeyDown}
@@ -511,8 +512,8 @@ export function Composer({
           className={css.chip}
           disabled={disabled}
           mobile={mobile}
-          onFiles={(files) => insertForImages(images.add(files))}
-          onPasteClick={async () => insertForImages(await images.pasteFromClipboard())}
+          onFiles={(files) => insertForAttachments(images.add(files))}
+          onPasteClick={async () => insertForAttachments(await images.pasteFromClipboard())}
         />
         {caps.harness ? (
           <span className={css.chip} data-testid="harness-chip" data-readonly="1">

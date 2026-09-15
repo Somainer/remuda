@@ -71,7 +71,7 @@ use tokio::task::JoinHandle;
 pub use agent_scope::instance_token;
 pub use auth::{bootstrap_issued_at, rotate_bootstrap};
 pub use config::{
-    DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
+    DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
     DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS,
 };
 pub use error::HubError;
@@ -468,7 +468,7 @@ pub fn router(state: AppState) -> Router {
         .merge(providers::routes())
         .merge(supply::routes())
         .merge(agent_scope::routes())
-        .merge(objects::routes())
+        .merge(objects::routes(state.config.attachment_max_bytes))
         .merge(attachments::routes())
         .merge(workspaces::routes())
         .merge(bot::routes());

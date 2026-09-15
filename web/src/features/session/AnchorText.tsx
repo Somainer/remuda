@@ -1,11 +1,15 @@
 import type { ReactNode } from "react";
 import { findAllAnchors } from "../../lib/imageAnchors";
+import { formatSize } from "../../lib/attachments";
+import { objectUrl } from "./AttachmentChips";
 import css from "./AnchorText.module.css";
 
 /**
  * Render prompt text with anchor tokens turned into inline chips:
  *
  * - `[Image #n]` (2026-09-15): inline thumbnail linking the staged preview.
+ * - `[File #n]` (D-027b, 2026-09-15): an inline file chip (type glyph + name),
+ *   linking the Hub object download.
  * - `[Code #n]` (workbench-code-2): a quoted-code chip (no thumbnail), with
  *   the same number/token pairing.
  *
@@ -19,7 +23,12 @@ import css from "./AnchorText.module.css";
 export type AnchorAttachment = {
   objectId: string;
   name: string;
+  /** A viewable URL: blob URL for a staged image, Hub object URL otherwise. */
   previewUrl: string;
+  /** Image renders a thumbnail; file renders a type chip. */
+  kind: "image" | "file";
+  mediaType?: string;
+  size?: number;
   /** 1-based number matching the token. */
   index?: number;
 };
@@ -32,6 +41,18 @@ export type CodeAnchorView = {
   preview?: string;
 };
 
+function fileGlyph(name: string, mediaType?: string): string {
+  const ext = name
+    .slice(name.lastIndexOf(".") + 1)
+    .toLowerCase();
+  if (mediaType?.startsWith("audio/") || ["mp3", "wav", "ogg"].includes(ext)) return "🎵";
+  if (mediaType?.startsWith("video/") || ["mp4", "webm", "mov"].includes(ext)) return "🎬";
+  if (["zip", "gz", "tar", "7z"].includes(ext)) return "🗜️";
+  if (["pdf"].includes(ext)) return "📕";
+  if (["txt", "md", "log"].includes(ext) || mediaType?.startsWith("text/")) return "📄";
+  return "📎";
+}
+
 export function AnchorText({
   text,
   attachments,
@@ -43,9 +64,10 @@ export function AnchorText({
   codeQuotes?: readonly CodeAnchorView[];
   className?: string;
 }) {
-  const images = new Map<number, AnchorAttachment>();
+  // Images and files share one numbering space, keyed by position.
+  const media = new Map<number, AnchorAttachment>();
   for (const attachment of attachments ?? []) {
-    if (attachment.index) images.set(attachment.index, attachment);
+    if (attachment.index) media.set(attachment.index, attachment);
   }
   const quotes = new Map<number, CodeAnchorView>();
   for (const quote of codeQuotes ?? []) quotes.set(quote.index, quote);
@@ -55,10 +77,12 @@ export function AnchorText({
   for (const span of findAllAnchors(text)) {
     if (span.start > cursor) parts.push(text.slice(cursor, span.start));
     const label = `[${span.kind} #${span.index}]`;
-    const attachment = span.kind === "Image" ? images.get(span.index) : undefined;
+    const attachment = span.kind === "Image" || span.kind === "File"
+      ? media.get(span.index)
+      : undefined;
     const code = span.kind === "Code" ? quotes.get(span.index) : undefined;
     const key = `${span.kind}-${span.index}-${span.start}`;
-    if (attachment) {
+    if (attachment?.kind === "image") {
       parts.push(
         <a
           key={key}
@@ -71,6 +95,26 @@ export function AnchorText({
           title={attachment.name}
         >
           <img className={css.thumb} src={attachment.previewUrl} alt={attachment.name} />
+          <span className={css.label}>{label}</span>
+        </a>,
+      );
+    } else if (attachment) {
+      // A non-image file: a compact chip linking the Hub object.
+      parts.push(
+        <a
+          key={key}
+          className={css.fileAnchor}
+          data-testid="inline-file-anchor"
+          data-index={span.index}
+          href={objectUrl(attachment.objectId)}
+          target="_blank"
+          rel="noreferrer"
+          download={attachment.name}
+          title={attachment.size ? `${attachment.name} · ${formatSize(attachment.size)}` : attachment.name}
+        >
+          <span className={css.fileMark} aria-hidden>
+            {fileGlyph(attachment.name, attachment.mediaType)}
+          </span>
           <span className={css.label}>{label}</span>
         </a>,
       );
@@ -94,7 +138,13 @@ export function AnchorText({
         <span
           key={key}
           className={css.token}
-          data-testid={span.kind === "Image" ? "inline-image-token" : "inline-code-token"}
+          data-testid={
+            span.kind === "Image"
+              ? "inline-image-token"
+              : span.kind === "File"
+                ? "inline-file-token"
+                : "inline-code-token"
+          }
           data-index={span.index}
         >
           {label}

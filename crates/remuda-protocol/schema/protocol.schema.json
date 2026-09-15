@@ -8707,7 +8707,7 @@
       "description": "MediaBlock; `protocol.md` §5.2.",
       "properties": {
         "anchor": {
-          "description": "1-based anchor number matching the `[Image #n]` token in the\naccompanying text block (2026-09-15). Absent for producers that do not\nnumber attachments; consumers then use block order.",
+          "description": "1-based anchor number matching the `[Image #n]`/`[File #n]` token in\nthe accompanying text block (2026-09-15). Absent for producers that do\nnot number attachments; consumers then use block order.",
           "format": "uint32",
           "minimum": 0,
           "type": [
@@ -8729,6 +8729,15 @@
         "objectId": {
           "$ref": "#/$defs/Id",
           "description": "`object_id`; protocol §5.2."
+        },
+        "size": {
+          "description": "Stored byte length (D-027b, 2026-09-15). Used by path-reference\ndelivery for the human-readable `(mime, size)` line. Absent on older\nframes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [

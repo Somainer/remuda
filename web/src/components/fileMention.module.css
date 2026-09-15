@@ -1,0 +1,55 @@
+.mention {
+  margin: 2px 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  font-size: 12px;
+}
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  cursor: default;
+  list-style: none;
+  color: var(--paper);
+  min-width: 0;
+}
+
+.summary::-webkit-details-marker {
+  display: none;
+}
+
+.summary::before {
+  content: "▸";
+  color: var(--muted);
+  flex: none;
+}
+
+.mention[open] .summary::before {
+  content: "▾";
+}
+
+.name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.meta {
+  color: var(--muted);
+  flex: none;
+}
+
+.path {
+  /* A long absolute path must never force horizontal scroll at 390 px. */
+  margin: 0;
+  padding: 2px 8px 6px 22px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  word-break: break-all;
+  white-space: pre-wrap;
+}

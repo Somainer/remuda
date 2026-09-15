@@ -91,6 +91,7 @@ fn public_wire_types_are_registered_for_generation() {
         "InstanceCreateParams",
         "InstanceSendParams",
         "AttachmentRef",
+        "AttachmentKind",
         "InstanceCancelParams",
         "InstanceRespondParams",
         "JournalAppendParams",

@@ -977,6 +977,10 @@ async fn dispatch_rpc(
                 .ok_or_else(|| NodeError::InvalidRequest("events.ack requires throughSeq".to_owned()))?,
         })),
         "events.unsubscribe" | "tty.detach" => Ok(Value::Null),
+        "tty.screen" => {
+            let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
+            node.screen_read(&instance_id).await
+        }
         "tty.resize" => {
             let instance_id = parse_id_field::<InstanceId>(&params, "instanceId")?;
             let cols = params.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;

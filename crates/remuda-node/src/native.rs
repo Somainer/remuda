@@ -602,6 +602,16 @@ impl Driver for NativeAdapter {
         Box::pin(async move { self.native.tty_bridge().await })
     }
 
+    fn screen_read(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_,
+        >,
+    > {
+        Box::pin(async move { self.native.screen_read().await.map_err(map_driver_error) })
+    }
+
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {
         Box::pin(async move {
             match request {
@@ -1055,7 +1065,13 @@ fn instance_spec(
         "acceptEdits" | "accept-edits" => ClaudePermissionMode::AcceptEdits,
         "dontAsk" | "dont-ask" => ClaudePermissionMode::DontAsk,
         "plan" => ClaudePermissionMode::Plan,
-        "bypassPermissions" | "bypass-permissions" => ClaudePermissionMode::BypassPermissions,
+        // "bypass" is the spelling the Hub's own project defaults normalize
+        // *from* and what operators and scripts actually send; without it the
+        // request fell through to `Manual`, so a session asked for in bypass
+        // launched in manual mode and never had its disclaimer suppressed.
+        "bypassPermissions" | "bypass-permissions" | "bypass" => {
+            ClaudePermissionMode::BypassPermissions
+        }
         _ => ClaudePermissionMode::Manual,
     };
     let interaction = if matches!(
@@ -1505,6 +1521,118 @@ mod tests {
                 "{kind:?} must not exec the claude override: {resolved:?}"
             );
         }
+    }
+
+    /// native-carrier-4: the wire spelling operators actually send is
+    /// `bypass`, and it used to fall through to `Manual`. That is a silent
+    /// downgrade — the session launches in manual mode, the disclaimer is
+    /// never suppressed, and the screen says "manual mode on" for a request
+    /// that asked for bypass.
+    #[test]
+    fn every_bypass_spelling_reaches_bypass_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = NativeDriverConfig::new(dir.path().to_path_buf());
+        for spelling in ["bypass", "bypassPermissions", "bypass-permissions"] {
+            let instance = fixture_instance(
+                InstanceId::new(),
+                HostId::new(),
+                WorkspaceId::new(),
+                DriverKind::ShellPty,
+            )
+            .expect("instance");
+            let request = crate::CreateInstanceRequest {
+                origin: InputOrigin::Human,
+                agent_credential: None,
+                command_id: None,
+                instance_id: Some(instance.meta.id.clone()),
+                host_id: Some(instance.host_id.clone()),
+                workspace_id: Some(instance.workspace_id.clone()),
+                kind: AgentKind::Claude,
+                driver: DriverKind::ShellPty,
+                model: "haiku".into(),
+                args: Vec::new(),
+                binary_path: None,
+                binary_sha256: None,
+                provider_profile_id: "native".into(),
+                permission_mode: spelling.into(),
+                prompt: String::new(),
+                cwd: None,
+                delegation: None,
+                settings_overlay_path: None,
+                claude_config_dir: None,
+                max_budget_usd: None,
+                provider_overlay: None,
+                provider_auth_token: None,
+                resume_session_id: None,
+                resumed_from: None,
+                effort: None,
+                tui: None,
+            };
+            let launch = DriverLaunch {
+                instance,
+                request,
+                workspace_root: dir.path().to_path_buf(),
+                registered_workspace_root: dir.path().to_path_buf(),
+            };
+            let profile = provider_profile(&launch, Delegation::None).expect("profile");
+            let spec = instance_spec(&launch, &config, &profile).expect("spec");
+            let remuda_protocol::PermissionMode::Claude(claude) = spec.permission_mode else {
+                panic!("{spelling}: claude permission expected");
+            };
+            assert_eq!(
+                claude.mode,
+                ClaudePermissionMode::BypassPermissions,
+                "{spelling} must not silently degrade to manual"
+            );
+        }
+        // An unknown posture still falls back to the safe end.
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ShellPty,
+        )
+        .expect("instance");
+        let request = crate::CreateInstanceRequest {
+            origin: InputOrigin::Human,
+            agent_credential: None,
+            command_id: None,
+            instance_id: Some(instance.meta.id.clone()),
+            host_id: Some(instance.host_id.clone()),
+            workspace_id: Some(instance.workspace_id.clone()),
+            kind: AgentKind::Claude,
+            driver: DriverKind::ShellPty,
+            model: "haiku".into(),
+            args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
+            provider_profile_id: "native".into(),
+            permission_mode: "no-such-mode".into(),
+            prompt: String::new(),
+            cwd: None,
+            delegation: None,
+            settings_overlay_path: None,
+            claude_config_dir: None,
+            max_budget_usd: None,
+            provider_overlay: None,
+            provider_auth_token: None,
+            resume_session_id: None,
+            resumed_from: None,
+            effort: None,
+            tui: None,
+        };
+        let launch = DriverLaunch {
+            instance,
+            request,
+            workspace_root: dir.path().to_path_buf(),
+            registered_workspace_root: dir.path().to_path_buf(),
+        };
+        let profile = provider_profile(&launch, Delegation::None).expect("profile");
+        let spec = instance_spec(&launch, &config, &profile).expect("spec");
+        let remuda_protocol::PermissionMode::Claude(claude) = spec.permission_mode else {
+            panic!("claude permission expected");
+        };
+        assert_eq!(claude.mode, ClaudePermissionMode::Manual);
     }
 
     #[test]

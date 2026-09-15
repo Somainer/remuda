@@ -148,7 +148,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                 .await?;
             serde_json::to_value(&result).map_err(NodeError::from)
         }
-        "tty.write" | "instance.keys" | "tty.resize" | "tty.attach" => {
+        "tty.write" | "instance.keys" | "tty.resize" | "tty.attach" | "tty.screen" => {
             crate::transport::hubnode::dispatch_method(node, method, params).await
         }
         method if crate::worktree::is_worktree_method(method) => node.worktree_rpc(method, &params),

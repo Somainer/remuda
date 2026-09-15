@@ -1440,6 +1440,58 @@ pub(crate) async fn call_node(
     }
 }
 
+/// How long a screen read may wait on the Node.
+///
+/// Short on purpose: the Node answers from an in-memory emulator grid, so a
+/// slow reply means the Node is wedged, and a debugging tool that hangs for a
+/// minute is no use to whoever is trying to see why a session is stuck.
+const SCREEN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET /v1/instances/:id/screen` — what a PTY-carried session is showing.
+///
+/// The `shell-pty` carrier's missing debugging tool: an agent that parks on a
+/// dialog before its first hook fires has an empty journal, and the screen is
+/// the only evidence of why. Read-only, so it never disturbs the session.
+pub async fn get_screen(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
+    let instance = state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    match state
+        .nodes
+        .call(
+            &instance.host_id,
+            remuda_protocol::hubnode::METHOD_TTY_SCREEN,
+            json!({ "instanceId": instance_id }),
+            SCREEN_RPC_TIMEOUT,
+        )
+        .await
+    {
+        Ok(Some(response)) => {
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("node screen read failed");
+                return Err(HubError::BadRequest(message.to_string()));
+            }
+            Ok(Json(response.get("result").cloned().unwrap_or(response)))
+        }
+        // An offline Node cannot be asked, and saying "no screen" would be a
+        // lie about the session rather than about the connection.
+        Ok(None) => Err(HubError::Unsatisfiable {
+            reasons: vec![format!("host {} is not connected", instance.host_id)],
+        }),
+        Err(err) => Err(err),
+    }
+}
+
 /// `GET /v1/instances/:id/journal`
 pub async fn get_journal(
     State(state): State<AppState>,

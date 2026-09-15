@@ -237,6 +237,7 @@ pub async fn dispatch_method(
         }
         Some(HubNodeMethod::TtyResize) => dispatch_resize(node, params).await,
         Some(HubNodeMethod::TtyAttach) => dispatch_attach(node, params).await,
+        Some(HubNodeMethod::TtyScreen) => dispatch_screen(node, params).await,
         Some(HubNodeMethod::JournalAppend) => {
             let parsed: JournalAppendParams = serde_json::from_value(params)?;
             Ok(json!({
@@ -485,6 +486,16 @@ async fn dispatch_attach(node: &DevNode, params: Value) -> Result<Value, NodeErr
     let instance_id = InstanceId::from_str(instance_id)?;
     let _ = node.get_instance(&instance_id)?;
     node.tty().attach(&instance_id).await?.into_json()
+}
+
+/// `tty.screen`: the current screen as text. Read-only; opens no stream.
+async fn dispatch_screen(node: &DevNode, params: Value) -> Result<Value, NodeError> {
+    let instance_id = params
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| NodeError::InvalidRequest("tty.screen requires instanceId".into()))?;
+    let instance_id = InstanceId::from_str(instance_id)?;
+    node.screen_read(&instance_id).await
 }
 
 async fn dispatch_resize(node: &DevNode, params: Value) -> Result<Value, NodeError> {

@@ -50,16 +50,47 @@ test.afterAll(async ({ request }) => {
 });
 
 async function clearApprovals(page: Page, instanceId: string) {
+  // Use the approval answer shape the Hub validates. An `outcome` answer 422s
+  // and would leave the fake node's create-time approval pending, leaking an
+  // "echo e2e" card into the next spec's approvals page in a serial run.
+  // Wait until the requested row is durable before answering: the pipelined
+  // Node→Hub uplink can lag create, and answering a not-yet-persisted request
+  // would be resurrected when its late journal event lands.
   await page.evaluate(async (id) => {
-    const list = await (await fetch("/v1/interactions", { credentials: "include" })).json();
-    for (const item of list.items ?? []) {
-      if (item.instanceId !== id || item.state !== "pending") continue;
-      await fetch(`/v1/interactions/${item.interactionId}/answer`, {
+    const listPending = async () => {
+      const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
+      return (body.items ?? []).filter(
+        (item: { instanceId?: string; state?: string }) =>
+          item.instanceId === id && item.state === "pending",
+      );
+    };
+    const deadline = Date.now() + 10_000;
+    let mine = await listPending();
+    while (mine.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      mine = await listPending();
+    }
+    for (const item of mine) {
+      const optionId = item.request?.options?.[0]?.id;
+      if (!optionId) continue;
+      await fetch(`/v1/interactions/${item.interactionId ?? item.id}/answer`, {
         method: "POST",
         credentials: "include",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ answer: { kind: "outcome", outcome: "allow" } }),
+        body: JSON.stringify({
+          answer: {
+            kind: "approval",
+            optionId,
+            inputDigest: item.request?.inputDigest ?? "",
+          },
+        }),
       });
+    }
+    // Confirm the answer landed so a late journal event cannot resurrect it.
+    let remaining = await listPending();
+    while (remaining.length > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      remaining = await listPending();
     }
   }, instanceId);
 }

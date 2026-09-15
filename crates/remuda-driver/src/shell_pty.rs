@@ -2804,9 +2804,10 @@ mod tests {
             // the config scoped and the credential lookup where the human
             // logged in.
             assert!(
-                pinned.iter().any(|(name, value)| name
-                    == "CLAUDE_SECURESTORAGE_CONFIG_DIR"
-                    && value.is_empty()),
+                pinned
+                    .iter()
+                    .any(|(name, value)| name == "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+                        && value.is_empty()),
                 "hooks={hooks_on}: a pinned home must keep the default credential namespace"
             );
         }
@@ -2834,9 +2835,7 @@ mod tests {
         .unwrap();
         let unpinned = agent_env(&unpinned_options.target, &recipe, false);
         assert!(
-            !unpinned
-                .iter()
-                .any(|(name, _)| name == "CLAUDE_CONFIG_DIR"),
+            !unpinned.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR"),
             "an unpinned launch must not invent a config-dir env"
         );
         // An inherited home already resolves to the default credential

@@ -211,7 +211,9 @@ pub trait Driver: Send + Sync {
     fn screen_read(
         &self,
     ) -> Pin<
-        Box<dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_,
+        >,
     > {
         Box::pin(async { Ok(None) })
     }
@@ -522,7 +524,9 @@ impl Driver for NativeShellAdapter {
     fn screen_read(
         &self,
     ) -> Pin<
-        Box<dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<Option<remuda_driver::ScreenRead>, DriverError>> + Send + '_,
+        >,
     > {
         Box::pin(async move {
             use remuda_driver::Driver as _;

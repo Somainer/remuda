@@ -213,9 +213,9 @@ async fn dispatch_hub(
             ensure_pump(runtime, &instance_id);
             Ok(result)
         }
-        Some(
-            HubNodeMethod::TtyResize | HubNodeMethod::TtyAttach | HubNodeMethod::TtyScreen,
-        ) => crate::transport::hubnode::dispatch_method(&runtime.node, method, params).await,
+        Some(HubNodeMethod::TtyResize | HubNodeMethod::TtyAttach | HubNodeMethod::TtyScreen) => {
+            crate::transport::hubnode::dispatch_method(&runtime.node, method, params).await
+        }
         _ if method == "instance.purge" => {
             // Must be explicit: the catch-all below answers `{"ok": true}`,
             // which would report a successful purge while removing nothing.

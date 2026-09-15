@@ -1451,11 +1451,15 @@ pub(crate) async fn forward_if_online(
 
         Err(err) => {
             tracing::warn!(error = %err, command_id = %command.command_id, "node rpc unknown; will not resend");
-            state
+            // The request may still be executing on the Node (protocol §2.5:
+            // never resend on a missing ACK). Mark reconciliation in progress;
+            // the Node's mirrored journal is what converges this row to
+            // accepted/settled even though the RPC reply was lost.
+            let reconciled = state
                 .store
-                .get_command(command.command_id.clone())
-                .await?
-                .ok_or(HubError::NotFound)
+                .mark_reconciling(command.command_id.clone())
+                .await?;
+            Ok(reconciled)
         }
     }
 }

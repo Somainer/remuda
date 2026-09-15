@@ -2423,6 +2423,24 @@ impl Store {
         .await
     }
 
+    /// The RPC accept deadline elapsed: the request is on the wire and the
+    /// Node is still executing it (protocol §2.5: a timeout returns `unknown`,
+    /// the command is never resent). Record that convergence is now delegated
+    /// to the mirrored journal — `unknown → reconciling` — from which the
+    /// journaled accept wins and flips resolution back to `clear`.
+    pub async fn mark_reconciling(&self, command_id: String) -> Result<CommandRecord, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE commands SET resolution = 'reconciling', updated_at = ?1
+                 WHERE id = ?2 AND state = 'queued' AND resolution = 'unknown'",
+                params![now, command_id],
+            )?;
+            load_command(conn, &command_id)?.ok_or_else(|| StoreError::Id("unknown command".into()))
+        })
+        .await
+    }
+
     /// Node RPC success → `accepted`.
     pub async fn mark_accepted(&self, command_id: String) -> Result<CommandRecord, StoreError> {
         self.run(move |conn| {
@@ -4108,6 +4126,103 @@ mod tests {
             .expect("instance query")
             .expect("instance row");
         assert_eq!(online.connectivity, "connected");
+    }
+
+    /// A create RPC whose accept reply was lost past the Hub deadline is
+    /// `queued + unknown`; the timeout arm marks it `reconciling`, and the
+    /// Node's mirrored journal — not a resent RPC — wins: the journaled
+    /// `accepted` flips the row to `accepted + clear`. The command is never
+    /// resent (protocol §2.5).
+    #[tokio::test]
+    async fn a_lost_accept_reconciling_row_is_converged_by_the_journal_not_a_resend() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host_id = new_id("hst").expect("host id");
+        let token = enroll_token(&store, "enroll-reconcile").await;
+        let _ = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: token,
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("slow-node".into()),
+                    node_version: Some("test".into()),
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .expect("host enroll");
+        let instance = store
+            .insert_instance(
+                host_id.clone(),
+                None,
+                "claude".into(),
+                "shell-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .expect("instance");
+        let (command, _) = store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host_id.clone(),
+                "instance.create".into(),
+                json!({"instanceId": instance.instance_id}),
+                None,
+            )
+            .await
+            .expect("command");
+        store
+            .mark_forward_intent(command.command_id.clone())
+            .await
+            .expect("forward once");
+        // The RPC accept deadline elapsed: unknown, not resent.
+        let unknown = store
+            .get_command(command.command_id.clone())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(unknown.state, "queued");
+        assert_eq!(unknown.resolution, "unknown");
+
+        let reconciling = store
+            .mark_reconciling(command.command_id.clone())
+            .await
+            .expect("reconciling");
+        assert_eq!(reconciling.state, "queued");
+        assert_eq!(reconciling.resolution, "reconciling");
+
+        // The Node journaled its durable accept after the reply was lost.
+        store
+            .append_journal(
+                host_id.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity",
+                        "entityType": "command",
+                        "entityId": command.command_id,
+                        "state": "accepted",
+                        "entity": {
+                            "commandId": command.command_id,
+                            "state": "accepted"
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("journaled accept");
+        let converged = store
+            .get_command(command.command_id.clone())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(converged.state, "accepted");
+        assert_eq!(converged.resolution, "clear");
     }
 
     /// D-018: an enrolled host re-announces with its own stored node token,

@@ -248,14 +248,17 @@ replies) also passes: PONG at t+29 s, 20 events,
 ## 8. Test results
 
 `cargo test -p remuda-driver -p remuda-node -p remuda-hub -p remuda`: all suites
-pass except two failures that are **pre-existing on `main` (f76614f6)** and
-untouched by this branch — verified by checking out the base sources and
-re-running:
+pass except failures that are **pre-existing on `main` (f76614f6)** and
+untouched by this branch — verified in each case by checking out the base
+sources and re-running:
 
 - `remuda-driver --test adapters_parity::codex_and_grok_adapter_dumps_are_journal_diff_parity`
   (grok session-file paths; fails identically at the base)
 - `remuda --test merge_queue_cli::queue_killed_lane_is_a_failed_branch_while_others_land`
   (fails identically at the base)
+- `remuda-node --lib workspace_scm::tests::*` — 7 tests, all git-status/diff
+  shaped (`3 passed; 7 failed` at the base as well). This branch does not touch
+  `workspace_scm.rs`.
 
 One further flake, also in untouched code:
 `lifecycle::tests::a_cooperative_group_stops_at_the_first_rung` reaches the
@@ -278,7 +281,8 @@ One further flake, also in untouched code:
 
 - `coord-native-test.sh` reads `.items` instead of `.events`; the script is the
   coordinator's, so it is reported rather than edited here.
-- The two pre-existing test failures in §8 are left for their owners.
+- The pre-existing test failures in §8 (grok adapter parity, merge-queue CLI,
+  and the seven `workspace_scm` git tests) are left for their owners.
 - The credential-namespace fix is keyed to Claude's 2.1 scheme. If a future
   release changes how `aP()` derives the service name this needs revisiting;
   the unit test pins Remuda's half (the env var is exported) but cannot pin

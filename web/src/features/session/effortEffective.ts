@@ -71,11 +71,12 @@ export function effectiveFromObservation(
   return requested ? { effective: view, requested } : { effective: view };
 }
 
-/** Display name for an effective level: `ultracode` reads back as xhigh, and
- * when the flag was positively observed we keep the xhigh word (the flag is
- * shown by the ember of the request side). */
+/** Display name for an effective level: a positively observed ultracode flag
+ * reads back as tier xhigh but the chip shows the word the user actually
+ * chose — `ultracode`. */
 export function effectiveLabel(effective: EffortEffectiveView | null | undefined): string {
-  return effective ? effective.name : "?";
+  if (!effective) return "?";
+  return effective.ultracode === true ? "ultracode" : effective.name;
 }
 
 /** Whether no assistant record has ever reported a level for this session. */

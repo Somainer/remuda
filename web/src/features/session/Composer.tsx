@@ -67,6 +67,7 @@ export function Composer({
   effort,
   onEffort,
   effortEffective,
+  effortPending,
   onModel,
   contextLabel,
   effortDisabled,
@@ -94,6 +95,8 @@ export function Composer({
   onEffort?: (next: EffortSelection) => void;
   /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
   effortEffective?: EffortEffectiveView | null;
+  /** §9.1 a push-down in flight (chip shows 切换中 / 排队中 until read-back). */
+  effortPending?: { word: string; queued: boolean } | null;
   onModel?: (model: string) => void;
   contextLabel?: string | null;
   /** True when the session cannot take instance.configure (exited / observed-only). */
@@ -395,18 +398,25 @@ export function Composer({
   const effortChipLabel = effortStopName(harness, currentEffort.name, ultraOn);
   const effortWire = effortWireName(currentEffort);
   // §9.1: the chip text is the EFFECTIVE level read back from the transcript,
-  // not the requested selection. `?` until the first assistant record; a
-  // requested/effective divergence renders explicitly, it is never hidden.
+  // not the requested selection. `?` until the first read-back of a fresh
+  // session; a requested/effective divergence renders explicitly, it is never
+  // hidden. While a push-down is in flight the chip shows the requested word
+  // with a 切换中 / 排队中 tag instead of going ambiguous.
   const effectiveUnknown = isEffortUnknown(effortEffective);
-  const effectiveWord = effectiveLabel(effortEffective);
-  const mismatch = caps.effort
+  const pendingLabel = effortPending?.word ?? null;
+  const effectiveWord = pendingLabel ?? effectiveLabel(effortEffective);
+  const mismatch = caps.effort && !pendingLabel
     ? effortMismatch(effortWire, ultraOn, effortEffective)
     : null;
-  const effortChipTitle = effectiveUnknown
-    ? "实际档位：等待会话回读（？）"
-    : mismatch
-      ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
-      : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
+  const effortChipTitle = pendingLabel
+    ? effortPending?.queued
+      ? `排队中：${pendingLabel} 将在本回合结束后生效`
+      : `切换中：${pendingLabel}`
+    : effectiveUnknown
+      ? "实际档位：等待会话回读（？）"
+      : mismatch
+        ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
+        : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
   const primaryLabel = sending
     ? "发送中"
     : controls.primary.kind === "steer"
@@ -524,15 +534,16 @@ export function Composer({
         {caps.effort ? (
           <button
             type="button"
-            className={`${css.chip} ${ember ? css.ember : ""}`}
+            className={`${css.chip} ${ember ? css.ember : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
             data-testid="model-effort-chip"
             data-ember={ember ? "1" : "0"}
-            data-effort-effective={effectiveUnknown ? "unknown" : effectiveWord}
+            data-effort-effective={pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord}
+            data-effort-pending={pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
             data-effort-source={effortEffective?.source ?? "unknown"}
             data-effort-mismatch={mismatch ? "1" : "0"}
             aria-expanded={menu === "effort"}
             aria-haspopup="dialog"
-            aria-label={`Select effort, ${effortChipLabel}; effective ${effectiveUnknown ? "unknown" : effectiveWord}`}
+            aria-label={`Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
             title={effortChipTitle}
             onClick={() => toggle("effort")}
           >
@@ -544,8 +555,13 @@ export function Composer({
             </>
             ) : null}
             <span className={css.chipModel} data-testid="model-effort-chip-label">
-              {effectiveUnknown ? "?" : effectiveWord}
+              {pendingLabel ?? (effectiveUnknown ? "?" : effectiveWord)}
             </span>
+            {pendingLabel ? (
+              <span className={css.chipEffortPendingTag} data-testid="model-effort-pending">
+                {effortPending?.queued ? "排队中" : "切换中"}
+              </span>
+            ) : null}
             {mismatch ? (
               <span className={css.chipEffortMismatch} data-testid="model-effort-mismatch">
                 请求 {mismatch.requested} → 实际 {mismatch.effective}

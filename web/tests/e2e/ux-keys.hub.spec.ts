@@ -109,6 +109,9 @@ async function createSession(page: Page, name: string, prompt: string): Promise<
   expect(hostId).toBeTruthy();
   await hostPicker.selectOption(hostId!);
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, { timeout: 20_000 });
+  // Pin the directory explicitly: the fake node now registers several g2
+  // workspaces and a fresh context's first <option> is not necessarily e2e.
+  await page.getByTestId("new-session-workspace").selectOption("wsp_e2e");
 
   await page.getByTestId("new-session-advanced").click();
   await page.locator("label").filter({ hasText: "name" }).locator("input").fill(name);
@@ -162,6 +165,42 @@ async function rowBadges(page: Page): Promise<RowBadge[]> {
   );
 }
 
+/**
+ * Pin every test document to the `wsp_e2e` Space.
+ *
+ * The fake node registers several g2 workspaces and a new browser context
+ * defaults to the alphabetically-first Space (a g2 directory), so without
+ * this the list paints a different Space than the one the fixture sessions
+ * were created in and `session-row` resolves to zero. The app reads
+ * `remuda.spaces.v1` once at boot (same prefs shape SpacesPanel persists), so
+ * the pin is installed as an init script and takes effect on every test's
+ * first `page.goto`; QuickFind's spec resets the same key.
+ */
+async function pinE2eSpace(page: Page): Promise<void> {
+  const spaceId = await page.evaluate(async () => {
+    const hosts = (await (await fetch("/v1/hosts", { credentials: "include" })).json()) as {
+      items?: { hostId?: string; label?: string }[];
+    };
+    const hostId = hosts.items?.find((host) => host.label === "e2e-fake-node")?.hostId;
+    if (!hostId) throw new Error("fake node host missing");
+    return JSON.stringify([hostId, "wsp_e2e"]);
+  });
+  await page.context().addInitScript((pinnedSpaceId) => {
+    const prefs = {
+      version: 1,
+      collapsed: false,
+      groupCollapsed: {},
+      exitedOpen: {},
+      names: {},
+      order: [],
+      selectedSpaceId: pinnedSpaceId,
+      selectedTabs: {},
+      closedTabs: {},
+    };
+    localStorage.setItem("remuda.spaces.v1", JSON.stringify(prefs));
+  }, spaceId);
+}
+
 test.beforeAll(async ({ browser }) => {
   // Plenty of room: earlier files' force-deletes can lag under host
   // contention, and the fake node ships maxInstances 8. Original restored in
@@ -187,6 +226,7 @@ test.afterAll(async ({ browser }) => {
 
 test.beforeEach(async ({ page }) => {
   await login(page);
+  await pinE2eSpace(page);
 });
 
 test("hold reveals nine badges in tab order; digit opens the matching session; release hides them", async ({ page }, testInfo) => {

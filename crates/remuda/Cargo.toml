@@ -32,7 +32,7 @@ tokio.workspace = true
 toml = "0.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
-nix = { version = "0.28", features = ["process"] }
+nix = { version = "0.28", features = ["process", "fs"] }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 # Static Node artifacts (just linux-musl / deploy/m1) vendor OpenSSL so

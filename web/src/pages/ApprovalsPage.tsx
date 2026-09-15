@@ -158,6 +158,7 @@ export function ApprovalsPage() {
                     : <p className={`${css.preview} ${paused ? css.previewMute : ""}`}>{preview(item)}</p>}
                 </div>
                 {item.carrier === "native-tty" ? <p className={css.terminalNote}>来自终端屏幕 · 回答会发送按键</p> : null}
+                {item.carrier === "harness-hook" ? <p className={css.terminalNote}>来自工具钩子 · 回答直接决定工具是否执行</p> : null}
                 {!item.answerable ? <p className={css.terminalNote}>请打开会话查看完整终端提示</p> : null}
                 {paused ? <p className={css.note}>主机离线，交互暂停</p> : null}
               </div>

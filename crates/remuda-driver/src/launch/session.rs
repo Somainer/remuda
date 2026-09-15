@@ -155,6 +155,39 @@ impl HookSession {
         self.bus.binding()
     }
 
+    /// Whether a blocking hook for `id` is parked on this socket right now.
+    ///
+    /// The driver asks before answering so it can tell a hook-carried
+    /// interaction from a screen-carried one without consulting a second
+    /// table (D-028 §4.4).
+    #[must_use]
+    pub fn is_parked(&self, id: &remuda_protocol::InteractionId) -> bool {
+        self.bus.is_parked(id)
+    }
+
+    /// Deliver a device's answer to the hook parked under interaction `id`.
+    ///
+    /// The [`Outcome`](remuda_signal::Outcome) is the honesty gate: only
+    /// [`Answered`](remuda_signal::Outcome::Answered) means a waiting process
+    /// received the decision. [`Abandoned`](remuda_signal::Outcome::Abandoned)
+    /// is the ignored/confined case the screen-key fallback exists for — the
+    /// decision was real but nothing heard it (§14 risk 1).
+    pub fn resolve_answer(
+        &self,
+        id: &remuda_protocol::InteractionId,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> remuda_signal::Outcome {
+        self.bus.resolve_answer(id, answer)
+    }
+
+    /// Deny every parked hook (instance is closing).
+    ///
+    /// Without it each parked hook holds its agent's turn open until its own
+    /// deadline, minutes after the session is gone.
+    pub fn retire_parked(&self) {
+        self.bus.retire_all();
+    }
+
     /// Release only the renderer pin after an authenticated SessionStart binds.
     /// Callers must first verify that the binding belongs to the launched agent.
     pub fn release_tui_pin(&self) -> DriverResult<()> {

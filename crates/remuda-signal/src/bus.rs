@@ -4,9 +4,10 @@
 //! of state a hook stream needs: which native session this agent reported, and
 //! which pid it reported it from. Classification itself lives in [`crate::map`].
 //!
-//! In P1 the bus never answers a blocking event — every reply is `{}` and the
-//! agent keeps its own prompt on screen. The reply plumbing is real so that P5
-//! is a change of decision, not a change of transport.
+//! Non-blocking events are journaled and answered with no opinion; blocking
+//! events (`PermissionRequest`, `Elicitation`) additionally open an
+//! interaction and park the hook on [`PendingDecisions`] until a device
+//! answers or the bounded wait denies (D-028 §4.4 tier A, P5).
 
 use crate::event::{HookEnvelope, HookEvent, HookReply};
 use crate::live::LiveState;
@@ -61,15 +62,46 @@ pub struct SignalBus {
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     binding: std::sync::Mutex<Option<SessionBinding>>,
+    pending: crate::pending::PendingDecisions,
+    /// What each parked hook needs to turn a device's protocol answer back
+    /// into the decision JSON the harness reads. Keyed by the interaction id,
+    /// which is also the decision key.
+    parked: std::sync::Mutex<std::collections::HashMap<crate::pending::DecisionKey, ParkedHook>>,
+    blocking_wait: std::time::Duration,
+    /// P5 (c-hookgap): turns observed on the hook channel, most recent last,
+    /// plus the pid a `Stop`/`Esc` interrupt is aimed at.
     turn_active: std::sync::Mutex<VecDeque<TurnState>>,
     /// Live phase fold + deterministic tool node ids (design §3.1).
     live: std::sync::Mutex<LiveState>,
     interrupt_pid: Arc<AtomicI32>,
 }
 
+/// The context kept for one parked blocking hook, so an answer arriving later
+/// can be turned back into the decision the harness reads.
+#[derive(Clone)]
+struct ParkedHook {
+    /// Suggestions the harness offered; an allow-always answer echoes one.
+    suggestions: Vec<crate::PermissionSuggestion>,
+}
+
+/// A blocking hook whose card is open and whose process may await a decision.
+///
+/// Produced by the non-blocking fold and handed to the socket delivery task,
+/// which alone awaits it — keeping the observation pipeline unblocked.
+struct PendingDecision {
+    /// Rendezvous key, equal to the interaction id.
+    key: crate::pending::DecisionKey,
+    /// Event name the eventual reply must echo.
+    event: String,
+}
+
+/// One turn as seen on the hook channel (P5, c-hookgap).
 struct TurnState {
+    /// Agent pid for the turn, from the relay's parent.
     pid: i32,
+    /// Native session id, once a `SessionStart` named it.
     session_id: Option<String>,
+    /// Whether the turn is currently active.
     active: Option<bool>,
 }
 
@@ -87,10 +119,96 @@ impl SignalBus {
             events,
             seq,
             binding: std::sync::Mutex::new(None),
+            pending: crate::pending::PendingDecisions::new(),
+            parked: std::sync::Mutex::new(std::collections::HashMap::new()),
+            blocking_wait: crate::BLOCKING_WAIT,
             turn_active: std::sync::Mutex::new(VecDeque::new()),
             live: std::sync::Mutex::new(LiveState::new(live_scope)),
             interrupt_pid: Arc::new(AtomicI32::new(0)),
         }
+    }
+
+    /// Shorten the bounded wait. Tests only; production uses
+    /// [`BLOCKING_WAIT`](crate::BLOCKING_WAIT), which is aligned with the
+    /// broker TTL.
+    #[must_use]
+    pub fn with_blocking_wait(mut self, wait: std::time::Duration) -> Self {
+        self.blocking_wait = wait;
+        self
+    }
+
+    /// The rendezvous table this bus parks blocking hooks in.
+    ///
+    /// The Node resolves through this handle when a device answers.
+    #[must_use]
+    pub fn pending(&self) -> crate::pending::PendingDecisions {
+        self.pending.clone()
+    }
+
+    /// True while the interaction `id` belongs to a hook still waiting.
+    #[must_use]
+    pub fn is_parked(&self, id: &remuda_protocol::InteractionId) -> bool {
+        self.pending
+            .is_waiting(&crate::pending::DecisionKey::new(id.as_id().as_str()))
+    }
+
+    /// Resolve the hook behind interaction `id` with a device's answer.
+    ///
+    /// The returned [`Outcome`](crate::Outcome) is the honesty gate: only
+    /// [`Answered`](crate::Outcome::Answered) means the decision actually
+    /// reached a waiting process. [`Abandoned`](crate::Outcome::Abandoned) is
+    /// the confined/ignored case the screen-key fallback exists for — the
+    /// answer was real but the hook had already stopped listening.
+    pub fn resolve_answer(
+        &self,
+        id: &remuda_protocol::InteractionId,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> crate::Outcome {
+        let key = crate::pending::DecisionKey::new(id.as_id().as_str());
+        let parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        let Some(parked) = parked else {
+            // No parked context: the hook already ended. Still report
+            // honestly rather than claiming a delivery we cannot prove.
+            return self.pending.resolve(
+                &key,
+                crate::HookDecision::Deny {
+                    message: "Remuda: the answer arrived after the request closed".to_owned(),
+                },
+            );
+        };
+        let Some(decision) = parked.to_decision(answer) else {
+            tracing::warn!(?answer, "a hook answer did not match its interaction kind");
+            return self.pending.resolve(
+                &key,
+                crate::HookDecision::Deny {
+                    message: "Remuda: the answer did not match the request".to_owned(),
+                },
+            );
+        };
+        self.pending.resolve(&key, decision)
+    }
+
+    /// Retire every parked hook, denying them; called when the instance stops.
+    pub fn retire_all(&self) {
+        let keys: Vec<crate::pending::DecisionKey> = self
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for key in keys {
+            self.pending.retire(&key, crate::RetireReason::Shutdown);
+        }
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Share a pending interrupt with the PTY's screen observer. Zero means no
@@ -178,9 +296,37 @@ impl SignalBus {
         self.binding().is_some_and(|binding| binding.pid == ppid)
     }
 
-    /// Handle one authenticated event: journal it, then answer the agent.
+    /// Handle one authenticated event: fold and journal it.
+    ///
+    /// This never waits on a human. A blocking event's interaction card is
+    /// emitted and its hook parked, but the decision is awaited only by the
+    /// socket delivery path ([`SignalBus::deliver`]), so direct fold callers —
+    /// and the live observation pipeline — return immediately.
     pub async fn handle(&self, envelope: HookEnvelope) -> HookReply {
         let event = HookEvent::from_envelope(envelope);
+        self.fold_event(event).await;
+        HookReply::empty()
+    }
+
+    /// The socket delivery path: fold the event and, for a blocking event,
+    /// await the human's decision up to the bounded wait.
+    ///
+    /// This is the *only* entry point that blocks, and it runs on the
+    /// per-connection socket task, so a parked approval never stalls the
+    /// observation fold or any other event.
+    pub async fn deliver(&self, envelope: HookEnvelope) -> HookReply {
+        let event = HookEvent::from_envelope(envelope);
+        match self.fold_event(event).await {
+            Some(pending) => self.await_decision(pending).await,
+            None => HookReply::empty(),
+        }
+    }
+
+    /// The fold itself: bind session, track turns/live/OSC, journal the raw +
+    /// derived observations, and — for a blocking event — open the card and
+    /// park the hook. Returns the parked handle (if any) for the caller to
+    /// optionally await.
+    async fn fold_event(&self, event: HookEvent) -> Option<PendingDecision> {
         let mapped = map_event(&event);
         if mapped.kind == MappedKind::SessionStarted
             && let Some(session_id) = mapped.session_id.clone()
@@ -279,6 +425,9 @@ impl SignalBus {
                 tracing::debug!(%error, "confirmed interrupt not journaled");
             }
         }
+        // Live-derived content (MessageDisplay chunks, OSC budget phases) rides
+        // the same fold and is journaled before any blocking reply, so the card
+        // and its surrounding stream are ordered together.
         if let Some(at) = at {
             for payload in fold.extras {
                 if let Err(error) = self
@@ -289,25 +438,115 @@ impl SignalBus {
                 }
             }
         }
-        // P1 observes only. Answering `PermissionRequest` is P5; until then the
-        // agent's own dialog stays the single place a decision is made, so
-        // there is never a moment where Remuda thinks it answered and the
-        // agent thinks it did not.
-        //
-        // TODO(x-p5) D-028 P6: codex's `PermissionRequest` and grok's
-        // `PreToolUse{deny,ask}` are *blocking* hook events. The P6 adapters
-        // journal them (so the waiting interaction is visible) but the verdict
-        // transport belongs to P5's `InteractionRuntime`:
-        //   1. on a blocking event, insert a pending `InteractionRequested`
-        //      (carrier `ClaudeHook`/new `HarnessHook`) and await the broker;
-        //   2. return `{"behavior":"allow"|"deny"}` (claude) or the codex
-        //      `{"hookSpecificOutput":{"hookEventName":"PermissionRequest",
-        //      "decision":{"behavior":…},"message":…}}` wrapper;
-        //   3. on broker timeout, reply deny (§4.4: timeout is always deny).
-        // Until that lands, `{}` keeps the harness's own screen dialog as the
-        // authority — the measured grok path and the confined-session fallback
-        // both require exactly that.
-        HookReply::empty()
+        // A blocking event opens its interaction card and parks the hook in
+        // the same pass. The fold does not await the decision — it hands the
+        // handle back so the socket delivery task can.
+        if crate::event::is_blocking(&event.name) {
+            return self.open_and_park(&event).await;
+        }
+        None
+    }
+
+    /// Open the interaction card for a blocking event and park its hook.
+    ///
+    /// Returns the handle `await_decision` blocks on. Done synchronously with
+    /// the fold so the card and the phase observations are one ordered batch,
+    /// but *without* blocking on the human — that split is what lets the live
+    /// layer drain observations whether or not a decision ever arrives.
+    async fn open_and_park(&self, event: &HookEvent) -> Option<PendingDecision> {
+        let Some((interaction, key)) = self.open_interaction(event) else {
+            tracing::debug!(
+                event = %event.name,
+                "no interaction could be opened; the agent keeps its own prompt"
+            );
+            return None;
+        };
+        if !self.emit_interaction(interaction).await {
+            // Nobody can see a card that never reached the journal. Answering
+            // it is impossible, so the relay must not park for the full TTL.
+            tracing::debug!(event = %event.name, "interaction not journaled; not parking a hook");
+            return None;
+        }
+        let suggestions = crate::decision::PermissionRequestEvent::from_event(event)
+            .map(|request| request.suggestions)
+            .unwrap_or_default();
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), ParkedHook { suggestions });
+        Some(PendingDecision {
+            key,
+            event: event.name.clone(),
+        })
+    }
+
+    /// Block until the parked hook for `pending` is answered or its bounded
+    /// wait expires, then return the decision JSON the harness reads.
+    ///
+    /// This is the only place the bus awaits a human, and it runs on the socket
+    /// delivery task, never on the observation fold.
+    async fn await_decision(&self, pending: PendingDecision) -> HookReply {
+        let (decision, outcome) = self
+            .pending
+            .wait(pending.key.clone(), self.blocking_wait)
+            .await;
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&pending.key);
+        tracing::debug!(event = %pending.event, ?outcome, "blocking hook resolved");
+        HookReply {
+            decision: Some(decision.to_hook_json(&pending.event)),
+        }
+    }
+
+    /// Build the entity a device answers, plus the key its hook is filed under.
+    ///
+    /// The interaction id *is* the decision key, so a `respond_interaction` for
+    /// that id resolves the parked hook directly.
+    fn open_interaction(
+        &self,
+        event: &HookEvent,
+    ) -> Option<(remuda_protocol::Interaction, crate::pending::DecisionKey)> {
+        let interaction_id = remuda_protocol::InteractionId::new();
+        let context = crate::approval::ApprovalContext {
+            instance_id: self.context.instance_id.clone(),
+            host_id: self.context.host_id.clone(),
+            run_id: self.context.run_id.clone(),
+            interaction_id: interaction_id.clone(),
+            now: now_ts()?,
+            deadline: deadline_ts(self.blocking_wait)?,
+        };
+        let interaction = match event.name.as_str() {
+            "PermissionRequest" => {
+                let request = crate::decision::PermissionRequestEvent::from_event(event)?;
+                crate::approval::approval_interaction(&request, &context).ok()?
+            }
+            "Elicitation" => crate::approval::elicitation_interaction(event, &context).ok()?,
+            _ => return None,
+        };
+        Some((
+            interaction,
+            crate::pending::DecisionKey::new(interaction_id.as_id().as_str()),
+        ))
+    }
+
+    /// Journal `interaction.requested`. False when the channel is gone.
+    async fn emit_interaction(&self, interaction: remuda_protocol::Interaction) -> bool {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let mapped = Mapped {
+            kind: MappedKind::InteractionObserved,
+            completeness: Completeness::Structured,
+            payload: ObservationPayload::InteractionRequested(Box::new(
+                remuda_protocol::InteractionRequestedPayload { interaction },
+            )),
+            session_id: self.binding().map(|binding| binding.session_id),
+            transcript_path: None,
+        };
+        let Some(observation) = self.build(seq, &mapped) else {
+            return false;
+        };
+        self.events.send(observation).await.is_ok()
     }
 
     async fn emit(&self, mapped: &Mapped) -> Result<(), mpsc::error::SendError<Observation>> {
@@ -404,7 +643,7 @@ impl SignalSink for SignalBus {
         &self,
         envelope: HookEnvelope,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HookReply> + Send + '_>> {
-        Box::pin(self.handle(envelope))
+        Box::pin(SignalBus::deliver(self, envelope))
     }
 }
 
@@ -426,9 +665,85 @@ fn now_ts() -> Option<Timestamp> {
     .ok()
 }
 
+/// `now + wait`, for the deadline a card advertises.
+fn deadline_ts(wait: std::time::Duration) -> Option<Timestamp> {
+    let now = time::OffsetDateTime::now_utc() + time::Duration::seconds(wait.as_secs() as i64);
+    let date = now.date();
+    let (hour, minute, second) = now.time().as_hms();
+    Timestamp::try_from(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        date.year(),
+        u8::from(date.month()),
+        date.day(),
+        hour,
+        minute,
+        second,
+        now.millisecond(),
+    ))
+    .ok()
+}
+
 /// Completeness every hook observation carries. Exposed so tests elsewhere can
 /// assert the channel/completeness pair without rebuilding a bus.
 pub const HOOK_COMPLETENESS: Completeness = Completeness::Structured;
+
+impl ParkedHook {
+    /// Turn a device's protocol answer into the harness decision for this hook.
+    ///
+    /// Returns `None` when the answer kind does not match the interaction the
+    /// hook actually opened; the caller then denies rather than sending the
+    /// harness something it cannot interpret.
+    fn to_decision(
+        &self,
+        answer: &remuda_protocol::InteractionAnswer,
+    ) -> Option<crate::HookDecision> {
+        use remuda_protocol::InteractionAnswer;
+        match answer {
+            InteractionAnswer::Approval(answer) => {
+                // The option ids are exactly the ones the card offered (see
+                // approval.rs); anything else is an answer for a different
+                // request and must not be guessed.
+                if answer.option_id == crate::approval::ALLOW_ONCE {
+                    Some(crate::HookDecision::Allow {
+                        updated_input: None,
+                        updated_permissions: Vec::new(),
+                    })
+                } else if answer.option_id == crate::approval::DENY {
+                    Some(crate::HookDecision::Deny {
+                        message: "Denied through Remuda".to_owned(),
+                    })
+                } else if let Some(index) = crate::approval::allow_always_index(&answer.option_id) {
+                    // Echo the exact suggestion the button was built from. An
+                    // out-of-range index means the answer named a grant that
+                    // was never offered, which is the deny case, not an allow.
+                    let suggestion = self.suggestions.get(index)?.value.clone();
+                    Some(crate::HookDecision::Allow {
+                        updated_input: None,
+                        updated_permissions: vec![suggestion],
+                    })
+                } else {
+                    None
+                }
+            }
+            InteractionAnswer::Elicitation(answer) => {
+                let action = match answer.action {
+                    remuda_protocol::ElicitationAction::Accept => crate::ElicitationAction::Accept,
+                    remuda_protocol::ElicitationAction::Decline => {
+                        crate::ElicitationAction::Decline
+                    }
+                    remuda_protocol::ElicitationAction::Cancel => crate::ElicitationAction::Cancel,
+                };
+                Some(crate::HookDecision::Elicitation {
+                    action,
+                    content: answer.content.clone(),
+                })
+            }
+            // A Question / PlanReview answer cannot answer a hook that opened
+            // an Approval / Elicitation.
+            InteractionAnswer::Question(_) | InteractionAnswer::PlanReview(_) => None,
+        }
+    }
+}
 
 /// `ObservationPayload` accessor used by the Node's fold; keeps the match on
 /// lifecycle payloads in one place.
@@ -484,6 +799,26 @@ mod tests {
             SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0))),
             rx,
         )
+    }
+
+    /// A bus with a short blocking wait, so timeout tests do not sleep.
+    fn fast_bus() -> (SignalBus, mpsc::Receiver<Observation>) {
+        let (tx, rx) = mpsc::channel(128);
+        (
+            SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0)))
+                .with_blocking_wait(std::time::Duration::from_millis(50)),
+            rx,
+        )
+    }
+
+    fn permission_request() -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/tmp/p.txt", "content": "hi"},
+            "permission_suggestions": [
+                {"type": "setMode", "mode": "acceptEdits", "destination": "session"}
+            ],
+        })
     }
 
     /// Every observation a `handle` produced (the raw evidence plus any
@@ -737,32 +1072,221 @@ mod tests {
         assert_eq!(seqs.first(), Some(&1));
     }
 
-    #[tokio::test]
-    async fn p1_never_answers_a_blocking_event() {
-        let (bus, _rx) = bus();
-        for event in ["PermissionRequest", "Elicitation"] {
-            let reply = bus
-                .handle(envelope(event, serde_json::json!({"tool_name": "Write"})))
-                .await;
-            assert_eq!(
-                reply.to_hook_json(),
-                serde_json::json!({}),
-                "{event} must fall back to the agent's own prompt in P1"
-            );
+    /// Pull the next `interaction.requested` off the channel and return the
+    /// decision key its hook is parked under.
+    async fn next_decision_key(
+        rx: &mut mpsc::Receiver<Observation>,
+    ) -> crate::pending::DecisionKey {
+        use remuda_protocol::NativeRequestKey;
+        loop {
+            let observation = rx.recv().await.expect("an observation");
+            if let ObservationPayload::InteractionRequested(payload) = &observation.body
+                && let NativeRequestKey::Hook { invocation_id } =
+                    &payload.interaction.request_key.native
+            {
+                return crate::pending::DecisionKey::new(invocation_id.as_str());
+            }
         }
     }
 
     #[tokio::test]
-    async fn a_closed_journal_channel_does_not_stall_the_agent() {
-        let (tx, rx) = mpsc::channel(1);
-        drop(rx);
-        let bus = SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0)));
-        // The reply still arrives, so the agent is never left waiting on us.
+    async fn a_human_allow_comes_back_in_the_shape_the_harness_applies() {
+        // End-to-end through the bus: the hook arrives, an interaction is
+        // journaled, an external answer resolves it, and the reply is the
+        // nested shape measured to land on claude 2.1.221.
+        let (bus, mut rx) = bus();
+        let pending = bus.pending();
+        let handle = tokio::spawn(async move {
+            bus.deliver(envelope("PermissionRequest", permission_request()))
+                .await
+        });
+        let key = next_decision_key(&mut rx).await;
+        assert!(pending.is_waiting(&key));
+        assert!(matches!(
+            pending.resolve(
+                &key,
+                crate::HookDecision::Allow {
+                    updated_input: None,
+                    updated_permissions: Vec::new(),
+                },
+            ),
+            crate::Outcome::Answered
+        ));
+        let reply = handle.await.expect("handler");
+        assert_eq!(
+            reply.to_hook_json(),
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "allow"},
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_request_denies_rather_than_allowing() {
+        // §4.4 fail-closed, through the real bus wait.
+        let (bus, mut rx) = fast_bus();
+        let handle = tokio::spawn(async move {
+            bus.deliver(envelope("PermissionRequest", permission_request()))
+                .await
+        });
+        let _key = next_decision_key(&mut rx).await;
+        let reply = handle.await.expect("handler");
+        let json = reply.to_hook_json();
+        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "deny");
+    }
+
+    #[tokio::test]
+    async fn an_elicitation_is_answered_with_an_action() {
+        let (bus, mut rx) = bus();
+        let pending = bus.pending();
+        let handle = tokio::spawn(async move {
+            bus.deliver(envelope(
+                "Elicitation",
+                serde_json::json!({"message": "Which account?", "schema": {"type": "object"}}),
+            ))
+            .await
+        });
+        let key = next_decision_key(&mut rx).await;
+        assert!(matches!(
+            pending.resolve(
+                &key,
+                crate::HookDecision::Elicitation {
+                    action: crate::ElicitationAction::Accept,
+                    content: Some(serde_json::json!({"account": "ada"})),
+                },
+            ),
+            crate::Outcome::Answered
+        ));
+        let reply = handle.await.expect("handler");
+        assert_eq!(
+            reply.to_hook_json(),
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "Elicitation",
+                    "action": "accept",
+                    "content": {"account": "ada"},
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_blocking_event_still_gets_no_opinion() {
+        let (bus, _rx) = bus();
         assert_eq!(
             bus.handle(envelope("Stop", serde_json::json!({})))
                 .await
                 .to_hook_json(),
             serde_json::json!({})
         );
+    }
+
+    #[tokio::test]
+    async fn an_allow_always_carries_the_grant_back_to_the_harness() {
+        // Measured: with the suggestion echoed in updatedPermissions the next
+        // request for the same tool never fires. Dropping it here would make
+        // "always" silently mean "once".
+        let (bus, mut rx) = bus();
+        let pending = bus.pending();
+        let handle = tokio::spawn(async move {
+            bus.deliver(envelope("PermissionRequest", permission_request()))
+                .await
+        });
+        let key = next_decision_key(&mut rx).await;
+        let suggestion =
+            serde_json::json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"});
+        assert!(matches!(
+            pending.resolve(
+                &key,
+                crate::HookDecision::Allow {
+                    updated_input: None,
+                    updated_permissions: vec![suggestion.clone()],
+                },
+            ),
+            crate::Outcome::Answered
+        ));
+        let json = handle.await.expect("handler").to_hook_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["decision"]["updatedPermissions"],
+            serde_json::json!([suggestion])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_human_deny_reaches_the_agent_with_its_reason() {
+        let (bus, mut rx) = bus();
+        let pending = bus.pending();
+        let handle = tokio::spawn(async move {
+            bus.deliver(envelope("PermissionRequest", permission_request()))
+                .await
+        });
+        let key = next_decision_key(&mut rx).await;
+        assert!(matches!(
+            pending.resolve(
+                &key,
+                crate::HookDecision::Deny {
+                    message: "not that file".into(),
+                },
+            ),
+            crate::Outcome::Answered
+        ));
+        let json = handle.await.expect("handler").to_hook_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["decision"],
+            serde_json::json!({"behavior": "deny", "message": "not that file"})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_card_a_device_sees_carries_the_real_tool_input() {
+        // The whole point of tier A over screen scraping (§2.2).
+        let (bus, mut rx) = bus();
+        let handle = tokio::spawn(async move {
+            bus.handle(envelope("PermissionRequest", permission_request()))
+                .await
+        });
+        let mut card = None;
+        while card.is_none() {
+            let observation = rx.recv().await.expect("an observation");
+            if let ObservationPayload::InteractionRequested(payload) = &observation.body {
+                card = Some(payload.interaction.clone());
+            }
+        }
+        let card = card.expect("a card");
+        assert_eq!(
+            card.carrier,
+            remuda_protocol::InteractionCarrier::HarnessHook
+        );
+        assert!(card.blocking, "the agent really is parked on this");
+        let remuda_protocol::InteractionRequest::Approval(approval) = &card.request else {
+            panic!("expected an approval");
+        };
+        assert_eq!(approval.title, "Write");
+        assert_eq!(approval.description, "/tmp/p.txt");
+        // The suggestion claude offered became an always-allow button.
+        assert!(
+            approval
+                .options
+                .iter()
+                .any(|option| option.id == "allow-always-0"),
+            "{:?}",
+            approval.options
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_closed_journal_channel_does_not_stall_the_agent() {
+        let tx = mpsc::channel(1).0;
+        let bus = SignalBus::new(context(), tx, Arc::new(AtomicU64::new(0)));
+        // A blocking event whose card cannot be journaled must fall back to
+        // the agent's own prompt rather than parking for the whole TTL.
+        let reply = bus
+            .handle(envelope("PermissionRequest", permission_request()))
+            .await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
     }
 }

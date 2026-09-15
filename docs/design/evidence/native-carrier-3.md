@@ -54,7 +54,7 @@ carrier behaved differently from `claude-pty`):
 
 | Fact | Evidence |
 | --- | --- |
-| Trust decisions are per-cwd in `projects.<cwd>.hasTrustDialogAccepted`, and Claude walks **ancestor** project entries; an ancestor explicitly set to `false` blocks a descendant | copied host config containing `/home/wangruming.nana → false` parked a fresh `~/…/workspace` run; logarithmic bisection over the host config isolated it |
+| Trust decisions are per-cwd in `projects.<cwd>.hasTrustDialogAccepted`, and Claude walks **ancestor** project entries; an ancestor explicitly set to `false` blocks a descendant | copied host config containing `/home/<user> → false` parked a fresh `~/…/workspace` run; logarithmic bisection over the host config isolated it |
 | On a migrated 2.1.x config (`migrationVersion: 14`) the global `bypassPermissionsModeAccepted` is **ignored** at the TUI disclaimer; the honoured key is `skipDangerousModePermissionPrompt` in **settings.json** — the same key Claude writes itself when a human accepts | direct TUI probes: global key alone → disclaimer; settings key → composer; interactive acceptance writes `settings.json {"skipDangerousModePermissionPrompt": true}` |
 | The shell-pty agent recipe never exported `CLAUDE_CONFIG_DIR`, and the Node pointed `options.claude_home` at the node-wide override rather than the per-instance native home | a trusted-cwd run fired hooks but journaled `transcript_unbound`: the hook reported a transcript under `$HOME/.claude/projects/…` while the poller scanned the registered home |
 

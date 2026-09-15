@@ -168,6 +168,7 @@ impl MessageAssembler {
                 value: delta.message_id.clone(),
             },
             origin: Some(MessageOrigin::Human),
+            command_id: None,
             status: if delta.final_chunk {
                 ContentStatus::Complete
             } else {

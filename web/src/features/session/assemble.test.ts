@@ -265,6 +265,102 @@ describe("assembleTranscript", () => {
   });
 });
 
+describe("assembleTranscript · C2 commandId correlation", () => {
+  const userMessage = (seq: number, text: string, commandId?: string) =>
+    obs(seq, "message", {
+      nodeId: `obj_n${seq}`,
+      messageId: `obj_n${seq}`,
+      revision: "3",
+      baseRevision: "2",
+      operation: "replace",
+      role: "user",
+      phase: "input",
+      blocks: [{ type: "text", text }],
+      targetBlock: null,
+      parentToolCallId: null,
+      nativeOrigin: known("ui"),
+      origin: "human",
+      status: "complete",
+      ...(commandId ? { commandId } : {}),
+    });
+
+  const bubble = (
+    text: string,
+    extra: { commandId?: string | null; state?: string; attachments?: unknown } = {},
+  ) =>
+    ({
+      clientRequestId: `local_${text.replace(/\W/g, "_")}` as Id,
+      instanceId: "ins" as Id,
+      text,
+      commandId: extra.commandId === undefined ? null : (extra.commandId as Id | null),
+      state: extra.state ?? "accepted",
+      ...(extra.attachments ? { attachments: extra.attachments } : {}),
+      createdAt: "2026-09-15T00:00:00.000Z",
+    }) as never;
+
+  it("joins the optimistic bubble's local-only attachments onto the commandId node", () => {
+    const nodes = assembleTranscript([userMessage(1, "do it", "cmd_1")], [bubble("do it", { commandId: "cmd_1" })]);
+    const users = nodes.filter((n): n is Extract<(typeof nodes)[number], { type: "message" }> => n.type === "message" && n.role === "user");
+    expect(users).toHaveLength(1);
+    // The single row is the authoritative journal node, not an optimistic
+    // bubble (no `local`), so it keeps the journal testid and no withdraw button.
+    expect(users[0]).toMatchObject({ id: "obj_n1", commandId: "cmd_1" });
+    expect(users[0].local).toBeUndefined();
+  });
+
+  it("carries attachment thumbnails onto the joined commandId node (D-027 paste + send)", () => {
+    // The journal never echoes attachment thumbnails back; they live only on
+    // the optimistic bubble. Hiding the bubble must not lose them.
+    const withImage = bubble("describe it", {
+      commandId: "cmd_img",
+      attachments: [{ objectId: "obj_1", name: "red.png", previewUrl: "blob:red", index: 1 }],
+    });
+    const nodes = assembleTranscript([userMessage(1, "describe it", "cmd_img")], [withImage]);
+    const user = nodes.find(
+      (n): n is Extract<(typeof nodes)[number], { type: "message" }> =>
+        n.type === "message" && n.role === "user" && n.commandId === "cmd_img",
+    );
+    expect(user).toBeDefined();
+    // Carried as local-only enrichment, not by flipping the node to local.
+    expect(user!.local).toBeUndefined();
+    expect(user!.localAttachments).toEqual([
+      { objectId: "obj_1", name: "red.png", previewUrl: "blob:red", index: 1 },
+    ]);
+  });
+
+  it("keeps both when the journal node carries no matching commandId", () => {
+    const nodes = assembleTranscript([userMessage(1, "typed natively")], [bubble("my send", { commandId: "cmd_9" })]);
+    expect(nodes.filter((n) => n.type === "message" && n.role === "user")).toHaveLength(2);
+  });
+
+  it("does not settle a server-id bubble on text equality alone", () => {
+    // Identical text, but the journal node is unattributed (native typing):
+    // the server-id bubble stays visible until its own commandId node lands.
+    const nodes = assembleTranscript([userMessage(1, "same")], [bubble("same", { commandId: "cmd_7" })]);
+    const users = nodes.filter((n): n is Extract<(typeof nodes)[number], { type: "message" }> => n.type === "message" && n.role === "user");
+    expect(users).toHaveLength(2);
+    expect(users.map((n) => n.commandId)).toEqual([undefined, "cmd_7"]);
+  });
+
+  it("renders one bubble while queued even after a commandId node exists", () => {
+    const nodes = assembleTranscript([userMessage(1, "queued", "cmd_3")], [
+      bubble("queued", { commandId: "cmd_3", state: "queued" }),
+    ]);
+    // The queued bubble is the in-flight copy; the joined node is its backing
+    // evidence. Never two rows: the bubble wins while it is still queued.
+    expect(nodes.filter((n) => n.type === "message" && n.role === "user")).toHaveLength(1);
+  });
+
+  it("keeps the legacy text rule for bubbles without a server id", () => {
+    // POST failure: commandId null, but a pre-C2 producer later journals the
+    // same text. The old dedup still applies.
+    const nodes = assembleTranscript([userMessage(1, "legacy text")], [bubble("legacy text", { commandId: null })]);
+    const users = nodes.filter((n): n is Extract<(typeof nodes)[number], { type: "message" }> => n.type === "message" && n.role === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0].local).toBeUndefined();
+  });
+});
+
 describe("compactTranscript", () => {
   it("folds thought+tools after the assistant turn, not while in flight", () => {
     const thought = { type: "thought" as const, id: "t", text: "x", completeness: "structured" as const };

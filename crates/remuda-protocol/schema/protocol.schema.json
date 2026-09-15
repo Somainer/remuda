@@ -8794,6 +8794,17 @@
           },
           "type": "array"
         },
+        "commandId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`command_id`; protocol §5.2 (C2). Set only when this prompt text was\ndelivered through a Remuda command: the Node attaches the delivering\ncommand's id to the next matching prompt observation (the hook\n`UserPromptSubmit` turn event carries it in `related_ids`, and the\ntranscript user record carries it here and joins onto the queued\nmessage's node). Additive exactly like `origin`: a prompt typed\nnatively into the PTY has no command and serialises without this\nfield, which clients must read as \"human typed, no command\"."
+        },
         "messageId": {
           "$ref": "#/$defs/Id",
           "description": "`message_id`; protocol §5.2."

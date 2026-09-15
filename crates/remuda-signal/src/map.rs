@@ -85,6 +85,14 @@ pub fn map_event(event: &HookEvent) -> Mapped {
     if let Some(prompt) = event.text("prompt_id") {
         related.insert("promptId".into(), prompt.to_owned());
     }
+    // C2 prompt correlation: the Node joins `UserPromptSubmit` onto the
+    // command that delivered the prompt by this text. Untyped payloads simply
+    // omit the key and the observation stays unattributed (native typing).
+    if event.name == "UserPromptSubmit"
+        && let Some(prompt) = event.text("prompt")
+    {
+        related.insert("prompt".into(), prompt.to_owned());
+    }
     for (key, field) in [
         ("toolName", "tool_name"),
         ("toolUseId", "tool_use_id"),

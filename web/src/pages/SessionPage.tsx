@@ -16,7 +16,8 @@ import { assembleTranscript, collectTasks, compactTranscript } from "../features
 import { canShowTerminal, hasStructuredSignal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
 import { ViewSwitch } from "../features/session/ViewSwitch";
-import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode } from "../lib/status";
+import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode, UI_STATUS_LABEL } from "../lib/status";
+import { projectCommandStatus } from "../lib/commandStatus";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
@@ -122,6 +123,21 @@ export function SessionPage({
   }, [resolvedView]);
   const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
+  // C2: the header label speaks the P0-3 vocabulary while an optimistic
+  // bubble is in flight (null commandId + unknown state → 「状态待确认」,
+  // never a fake success). With no pending bubble it shows the instance-level
+  // status wording as before. This is the only commandStatus call on the
+  // page.
+  const pendingBubble = bubbles.at(-1) ?? null;
+  const commandRow = pendingBubble
+    ? projectCommandStatus({
+        instance,
+        interaction: pending[0] ? { interaction: pending[0] } : null,
+        hasServerCommandId: pendingBubble.commandId !== null,
+        localState: pendingBubble.state,
+      })
+    : null;
+  const statusLabel = commandRow?.label ?? UI_STATUS_LABEL[status];
   const usageEvent = events.findLast((e) => e.kind === "usage");
   const usage = usageEvent?.kind === "usage" ? usageEvent.payload : undefined;
   const tasks = collectTasks(compactTranscript(assembleTranscript(events, bubbles), hub.compact));
@@ -181,9 +197,9 @@ export function SessionPage({
             </Link>
           ) : null}
           <h1 className={session.title}>{workspace ? `${workspace} / ${title}` : title}</h1>
-          <span className={session.status}>
+          <span className={session.status} data-testid="session-status-label">
             <StateDot status={status} />
-            {status}
+            {statusLabel}
           </span>
           {promoted ? (
             <span className={session.status} data-testid="promoted-badge" title={

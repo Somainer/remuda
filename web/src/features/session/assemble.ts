@@ -11,6 +11,7 @@ import type {
   WorkflowRunPayload,
 } from "../../types/generated";
 import type { Interaction } from "../../types/generated";
+import type { Id } from "../../types/wire";
 import { knowledgeValue } from "../../types/command";
 import { familyFor, type ToolFamily } from "./toolRegistry";
 import type { LocalBubble } from "../../lib/store";
@@ -55,6 +56,21 @@ export type TranscriptNode =
        */
       origin: MessageOrigin;
       local?: LocalBubble;
+      /**
+       * Local-only enrichment merged from the optimistic bubble that joined
+       * this journal node by commandId (C2). The journal never echoes the
+       * staged attachment thumbnails (D-027) back, so they ride in here
+       * WITHOUT marking the whole node `local` — `local` would mis-render the
+       * authoritative journal node as an optimistic bubble (withdraw button,
+       * optimistic testid).
+       */
+      localAttachments?: LocalBubble["attachments"];
+      /**
+       * Server command that delivered this prompt (C2). Present only on human
+       * user nodes that came through a Remuda command; natively typed prompts
+       * leave it unset.
+       */
+      commandId?: Id;
     }
   | { type: "thought"; id: string; text: string; completeness: Observation["completeness"] }
   | ToolNode
@@ -177,6 +193,9 @@ function assembleMessages(events: Observation[], anchors: Map<TranscriptNode, bi
       // `origin` is additive: a producer that does not classify leaves it
       // undefined, and an unclassified message must stay visible.
       node.origin = payload.origin ?? "human";
+      // C2: carry the delivering command id so the UI can attribute the
+      // node and hide the matching optimistic bubble.
+      if (payload.commandId != null) node.commandId = payload.commandId;
       mutation = payload;
     }
     if (node) {
@@ -416,16 +435,53 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   }
   for (const bubble of bubbles) {
     if (bubble.state === "settled") continue;
-    if (seenUser.has(bubble.text) && bubble.state !== "queued") continue;
+    // C2: a journal node carrying the same commandId is the authoritative
+    // copy of this optimistic bubble — the Node joined hook/transcript
+    // evidence onto the delivering command. The Node journals its own queued
+    // observation as soon as the command is enqueued, which can beat the HTTP
+    // response, so this join happens even while the bubble is still `queued`.
+    //
+    // The bubble still owns a fact the journal never echoes back: the local
+    // attachment thumbnails (D-027). Carry them onto the joined node in place
+    // so the rendered row keeps them instead of dropping them when the
+    // optimistic bubble is hidden.
+    if (bubble.commandId) {
+      const joinedIndex = nodes.findIndex(
+        (node) =>
+          node.type === "message" &&
+          node.role === "user" &&
+          node.commandId === bubble.commandId,
+      );
+      if (joinedIndex >= 0) {
+        const joined = nodes[joinedIndex];
+        if (joined.type === "message") {
+          // Carry the bubble's local-only attachment thumbnails onto the
+          // authoritative journal node (the journal never echoes them back),
+          // but leave `local` unset so the node does not render as an
+          // optimistic bubble.
+          nodes[joinedIndex] = {
+            ...joined,
+            localAttachments: joined.localAttachments ?? bubble.attachments,
+          };
+        }
+        continue;
+      }
+    } else {
+      // No server id (pre-C2 producers / POST failure): keep the legacy text
+      // rule, which never hides an in-flight queued bubble.
+      if (bubble.state !== "queued" && seenUser.has(bubble.text)) continue;
+    }
     nodes.push({
       type: "message",
-      id: bubble.id,
+      // The node's local identity is the pre-POST clientRequestId.
+      id: bubble.clientRequestId,
       role: "user",
       text: bubble.text,
       status: bubble.state,
       // A local bubble is text this user just typed into the composer.
       origin: "human",
       local: bubble,
+      commandId: bubble.commandId ?? undefined,
     });
   }
 

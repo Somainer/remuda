@@ -241,6 +241,7 @@ pub fn message_payload(message_id: Id, role: MessageRole, text: String) -> Obser
         // distinguish skill/hook-injected user records the way the Claude
         // transcript does, so leave origin unclassified (renders as human).
         origin: None,
+        command_id: None,
         status: ContentStatus::Complete,
     }))
 }
@@ -264,6 +265,7 @@ pub fn message_chunk(node_id: Id, revision: u64, first: bool, text: String) -> O
         parent_tool_call_id: None,
         native_origin: Knowledge::NotApplicable,
         origin: None,
+        command_id: None,
         status: ContentStatus::Streaming,
     }))
 }
@@ -293,6 +295,7 @@ pub fn message_close(
         parent_tool_call_id: None,
         native_origin: Knowledge::NotApplicable,
         origin: None,
+        command_id: None,
         status,
     }))
 }

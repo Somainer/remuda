@@ -62,10 +62,22 @@ import {
 export type ConnectionUi = "live" | "reconnecting" | "offline";
 export type Toast = { id: string; text: string } | null;
 export type LocalBubble = {
-  id: Id;
+  /**
+   * Local request identity, generated before the POST. It is **never** a
+   * server `commandId` (exploration §5 P0-3): while it is the only id the
+   * bubble has, the send is unconfirmed — it must not query `/v1/commands`
+   * and must not be retried automatically.
+   */
+  clientRequestId: Id;
   instanceId: Id;
   text: string;
-  commandId: Id;
+  /**
+   * Server-assigned command identity. `null` until the POST response lands,
+   * and stays `null` on the failure path — a 5xx or an offline Node leaves
+   * the bubble in 「状态待确认」 rather than disguising the local id as a
+   * server one.
+   */
+  commandId: Id | null;
   state: Command["state"] | "unknown";
   createdAt: string;
   /**
@@ -622,21 +634,24 @@ class HubStore {
     previews: BubbleAttachment[] = [],
     mode?: PromptMode,
   ) {
-    // Anchor mapping (2026-09-15): the manifest carries the [Image #n] index
-    // in token order; pair it onto the local bubble's previews so the token
-    // renders as an inline thumbnail chip.
+    // Anchor mapping (D-027 + image anchors): the manifest carries the
+    // [Image #n] index in token order; pair it onto the local bubble's
+    // previews so the token renders as an inline thumbnail chip.
     const indexOf = new Map(attachments.map((ref) => [ref.objectId, ref.index]));
     const numberedPreviews = previews.map((preview) => {
       const index = indexOf.get(preview.objectId);
       return index ? { ...preview, index } : preview;
     });
-    const localId = id("local_");
+    const clientRequestId = id("local_");
     const bubble: LocalBubble = {
-      id: localId,
+      clientRequestId,
       instanceId,
       text: prompt,
       ...(numberedPreviews.length ? { attachments: numberedPreviews } : {}),
-      commandId: localId,
+      // No server identity yet; the projection below reads this null as
+      // 「等待发送」 while queued and 「状态待确认」 afterwards, never as
+      // delivery. (C2: the local id must never masquerade as a commandId.)
+      commandId: null,
       state: "queued",
       ...(mode ? { promptMode: mode } : {}),
       createdAt: now(),
@@ -644,9 +659,12 @@ class HubStore {
     this.emit({ bubbles: this.state.bubbles.concat(bubble) });
     try {
       const result = await api.instanceSend(instanceId, prompt, attachments, mode);
+      // The ONLY place commandId is assigned: the server response.
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
-          b.id === localId ? { ...b, state: result.command.state, commandId: result.command.commandId } : b,
+          b.clientRequestId === clientRequestId
+            ? { ...b, state: result.command.state, commandId: result.command.commandId }
+            : b,
         ),
       });
       await this.catchup(instanceId);
@@ -654,16 +672,21 @@ class HubStore {
       this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
       await this.refreshScreen(instanceId).catch(() => undefined);
     } catch {
+      // Keep `commandId: null`. The bubble is 「状态待确认」: no command id
+      // to query with, and nothing here re-POSTs. Recovering the send is a
+      // human decision taken from the transcript, not an automatic retry.
       this.emit({
-        bubbles: this.state.bubbles.map((b) => (b.id === localId ? { ...b, state: "unknown" } : b)),
+        bubbles: this.state.bubbles.map((b) =>
+          b.clientRequestId === clientRequestId ? { ...b, state: "unknown" } : b,
+        ),
       });
     }
   }
 
   retract(bubbleId: Id) {
-    const bubble = this.state.bubbles.find((b) => b.id === bubbleId);
+    const bubble = this.state.bubbles.find((b) => b.clientRequestId === bubbleId);
     if (!bubble || bubble.state === "accepted" || bubble.state === "settled") return;
-    this.emit({ bubbles: this.state.bubbles.filter((b) => b.id !== bubbleId) });
+    this.emit({ bubbles: this.state.bubbles.filter((b) => b.clientRequestId !== bubbleId) });
   }
 
   async close(instanceId: Id) {
@@ -858,10 +881,30 @@ function settleBubbles(bubbles: LocalBubble[], instanceId: Id, events: Observati
   return bubbles.map((bubble) => {
     if (bubble.instanceId !== instanceId) return bubble;
     if (bubble.state === "queued") return bubble;
-    const match = events.some(
-      (ev) => ev.kind === "message" && observationText(ev) === bubble.text && (ev.payload as { role?: string }).role === "user",
+    // C2: the Node joins the prompt's hook/transcript evidence onto the
+    // delivering command, so the journal user observation carries the same
+    // commandId. That is the authoritative settlement and works when two
+    // sends have identical text (a text comparison could not tell them
+    // apart).
+    if (bubble.commandId) {
+      const matched = events.some(
+        (ev) =>
+          ev.kind === "message" &&
+          (ev.payload as { commandId?: Id }).commandId === bubble.commandId,
+      );
+      return matched ? { ...bubble, state: "settled" as const } : bubble;
+    }
+    // No server id — pre-C2 producers / the in-browser mock append no
+    // commandId, so keep the old text rule for them. It only settles the
+    // bubble (hide the optimistic copy); it never attributes anything, and a
+    // bubble whose POST returned a server id is never settled on text alone.
+    const matchedByText = events.some(
+      (ev) =>
+        ev.kind === "message" &&
+        observationText(ev) === bubble.text &&
+        (ev.payload as { role?: string }).role === "user",
     );
-    return match ? { ...bubble, state: "settled" as const } : bubble;
+    return matchedByText ? { ...bubble, state: "settled" as const } : bubble;
   });
 }
 

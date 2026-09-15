@@ -17,6 +17,7 @@
 //!   re-capture.
 
 use crate::event::HookEvent;
+use crate::live::Phase;
 use remuda_protocol::{
     Completeness, Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle, ObservationPayload,
     Severity,
@@ -39,6 +40,15 @@ pub enum MappedKind {
     /// `Notification` / `PermissionRequest` / `Elicitation`: the agent wants a
     /// human. Observed only in P1; no answer is sent.
     InteractionObserved,
+    /// `PreToolUse`: a tool is about to run.
+    ToolStarted,
+    /// `PostToolUse` / `PostToolBatch`: a tool finished.
+    ToolFinished,
+    /// `PostToolUseFailure`: a tool finished with an error.
+    ///
+    /// Not registered by the overlay yet (design §3.1): the classify arm is
+    /// real but inert until c-hookgap registers the event.
+    ToolFailed,
     /// Tool activity and anything else: journaled, no state change.
     Diagnostic,
 }
@@ -83,9 +93,67 @@ pub fn map_event(event: &HookEvent) -> Mapped {
         ("reason", "reason"),
         ("source", "source"),
         ("permissionMode", "permission_mode"),
+        // r-ux-w: which agent a sub-agent hook belongs to. Main-session hooks
+        // omit these; workflow sub-agents send `workflow-subagent`.
+        ("agentId", "agent_id"),
+        ("agentType", "agent_type"),
     ] {
         if let Some(value) = event.text(field) {
             related.insert(key.into(), value.to_owned());
+        }
+    }
+    // r-ux-w: SubagentStop carries the agent transcript path (model/usage/timing
+    // tail) and the background-task snapshot (id/status/name/description).
+    if let Some(path) = event.text("agent_transcript_path") {
+        related.insert("agentTranscriptPath".into(), path.to_owned());
+    }
+    if let Some(duration) = event
+        .payload
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
+    {
+        related.insert("durationMs".into(), duration.to_string());
+    }
+    // Structured launch handle on PostToolUse(Workflow): runId / taskId /
+    // run directory / script path. Verified on claude 2.1.221 (r-ux-w).
+    let response = event.payload.get("tool_response");
+    for (key, field) in [
+        ("runId", "runId"),
+        ("taskId", "taskId"),
+        ("workflowName", "workflowName"),
+        ("transcriptDir", "transcriptDir"),
+        ("scriptPath", "scriptPath"),
+        ("taskType", "taskType"),
+    ] {
+        if let Some(value) = response
+            .and_then(|v| v.get(field))
+            .and_then(serde_json::Value::as_str)
+        {
+            related.insert(key.into(), value.to_owned());
+        }
+    }
+    // Background tasks on SubagentStop / Stop: curate the workflow row's
+    // id+status+name when exactly one workflow task is present.
+    let workflow_tasks: Vec<&serde_json::Value> = event
+        .payload
+        .get("background_tasks")
+        .and_then(serde_json::Value::as_array)
+        .map(|tasks| {
+            tasks
+                .iter()
+                .filter(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("workflow"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let [task] = workflow_tasks.as_slice() {
+        if let Some(value) = task.get("id").and_then(serde_json::Value::as_str) {
+            related.insert("backgroundTaskId".into(), value.to_owned());
+        }
+        if let Some(value) = task.get("status").and_then(serde_json::Value::as_str) {
+            related.insert("backgroundTaskStatus".into(), value.to_owned());
+        }
+        if let Some(value) = task.get("name").and_then(serde_json::Value::as_str) {
+            related.insert("backgroundTaskName".into(), value.to_owned());
         }
     }
     // MessageDisplay's delta is the payload P3 needs; index/final say where the
@@ -199,6 +267,28 @@ fn classify(event: &HookEvent) -> (MappedKind, LifecycleTopic, &'static str, Sev
             "waiting",
             Severity::Info,
         ),
+        // Tool events keep the inert `"observed"` status on purpose: they are
+        // intra-turn progress, never turn boundaries (D-6), so `hook_activity`
+        // and `InteractionRuntime::ingest` see exactly what they saw before.
+        // The live layer gives them real payloads from a second emission.
+        "PreToolUse" => (
+            MappedKind::ToolStarted,
+            LifecycleTopic::Diagnostic,
+            "observed",
+            Severity::Info,
+        ),
+        "PostToolUse" | "PostToolBatch" => (
+            MappedKind::ToolFinished,
+            LifecycleTopic::Diagnostic,
+            "observed",
+            Severity::Info,
+        ),
+        "PostToolUseFailure" => (
+            MappedKind::ToolFailed,
+            LifecycleTopic::Diagnostic,
+            "observed",
+            Severity::Info,
+        ),
         // SubagentStop reaches us only if something registers it; it is never
         // turn evidence, so it lands as an inert diagnostic.
         _ => (
@@ -208,6 +298,27 @@ fn classify(event: &HookEvent) -> (MappedKind, LifecycleTopic, &'static str, Sev
             Severity::Info,
         ),
     }
+}
+
+/// The live [`Phase`] a classified event opens, if any (design §2.2).
+///
+/// `SessionStart` / `SessionEnd` / `SubagentStop` and unknown events have no
+/// phase: a phase nobody produces is absent, and the projection latches the
+/// previous one instead of collapsing to idle. `thinking` and `tool-output`
+/// have no claude channel and are intentionally unreachable here.
+#[must_use]
+pub fn phase(_event: &HookEvent, kind: MappedKind) -> Option<Phase> {
+    Some(match kind {
+        MappedKind::TurnStarted => Phase::PromptAccepted,
+        MappedKind::TurnEnded => Phase::TurnEnded,
+        MappedKind::InteractionObserved => Phase::Blocked,
+        MappedKind::MessageDelta => Phase::TextStreaming,
+        MappedKind::ToolStarted => Phase::ToolStarted,
+        MappedKind::ToolFinished | MappedKind::ToolFailed => Phase::ToolFinished,
+        MappedKind::SessionStarted | MappedKind::SessionEnded | MappedKind::Diagnostic => {
+            return None;
+        }
+    })
 }
 
 #[cfg(test)]

@@ -95,6 +95,15 @@ wire_enum!(LaunchedBy, "2.3", {
     User => "user",
 });
 
+// Delegation-tree grant verbs; design §2.5. Enforcement reads these, never
+// the preset name stored as `role`.
+wire_enum!(GrantVerb, "2.5", {
+    Dispatch => "dispatch",
+    Land => "land",
+    Spend => "spend",
+    AddressOwner => "address-owner",
+});
+
 wire_enum!(Connectivity, "2.3", {
     Connected => "connected",
     Disconnected => "disconnected",

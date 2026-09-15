@@ -4,7 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { login } from "./hub-auth";
 
-const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/spaces-1");
+// Committed evidence is refreshed only on request (REMUDA_EVIDENCE=1); every other run —
+// including the merge gate, whose verify-tree step rejects a dirty worktree — writes
+// the same screenshots under the gitignored test-results/ instead.
+const evidence = process.env.REMUDA_EVIDENCE === "1"
+  ? path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/spaces-1")
+  : path.join(path.dirname(fileURLToPath(import.meta.url)), "../../test-results/evidence/spaces-1");
 const realNode = process.env.HUB_E2E_EXTERNAL === "1";
 type Workspace = { id: string; name: string; root: string; hostId?: string };
 type RegisteredWorkspace = { workspaceId: string; hostId: string; root: string };

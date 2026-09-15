@@ -384,6 +384,9 @@ pub struct ShellPtyDriver {
     /// Live hook path, when the instance opted in. Dropped on close, which
     /// unbinds the socket.
     hooks: Mutex<Option<Arc<crate::launch::HookSession>>>,
+    /// File-tail signal adapters (codex rollout, grok ACP files). Dropped on
+    /// close, which stops their poll tasks (D-028 P6).
+    adapters: Mutex<Option<crate::adapters::supervisor::AdapterHandle>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
@@ -422,6 +425,7 @@ impl ShellPtyDriver {
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
+            adapters: Mutex::new(None),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
             interrupt_pid: Arc::new(AtomicI32::new(0)),
@@ -586,47 +590,6 @@ impl ShellPtyDriver {
             .await
     }
 
-    /// Stand up this instance's hook path, when one was configured.
-    ///
-    /// The [`SignalBus`](remuda_signal::SignalBus) shares the promotion
-    /// poller's `seq` counter and identity, so hook and screen observations
-    /// land in one ordered stream rather than two that have to be interleaved
-    /// after the fact.
-    fn start_hooks(
-        &self,
-        ctx: &promotion::PromoteCtx,
-        events: &mpsc::Sender<remuda_protocol::Observation>,
-        base_settings: Option<serde_json::Value>,
-    ) -> DriverResult<Option<Arc<crate::launch::HookSession>>> {
-        let Some(config) = self.options.hooks.clone() else {
-            return Ok(None);
-        };
-        let bus = Arc::new(
-            remuda_signal::SignalBus::new(
-                remuda_signal::BusContext {
-                    instance_id: ctx.instance_id.clone(),
-                    host_id: ctx.host_id.clone(),
-                    journal_id: ctx.journal_id.clone(),
-                    run_id: ctx.run_id.clone(),
-                    driver_kind: DriverKind::ShellPty,
-                    adapter_version: crate::capabilities::ADAPTER_VERSION.to_owned(),
-                },
-                events.clone(),
-                Arc::clone(&self.seq),
-            )
-            .with_interrupt_tracker(Arc::clone(&self.interrupt_pid)),
-        );
-        Ok(Some(Arc::new(crate::launch::HookSession::start(
-            &crate::launch::HookSessionOptions {
-                instance_dir: config.instance_dir,
-                relay_binary: config.relay_binary,
-                tui: config.tui,
-                base_settings,
-            },
-            bus,
-        )?)))
-    }
-
     /// The native session a hook reported, if `SessionStart` has fired.
     pub async fn hook_session(&self) -> Option<remuda_signal::SessionBinding> {
         self.hooks.lock().await.as_ref()?.binding()
@@ -779,7 +742,34 @@ impl ShellPtyDriver {
         // §5.1: the recipe decides argv, and for an agent it is the real
         // materialized one — env allowlist, settings digest and provider all
         // filled in, not the stub the shell path used to emit for everything.
-        let (recipe, hooks) = self.prepare_launch(cwd, spec, &hook_ctx, &tx)?;
+        // Materialization is blocking (`--version`, the ~207 MB binary hash,
+        // overlay/shim/hook-socket writes); keep it off the async cores.
+        let (recipe, hooks) = {
+            let options = self.options.clone();
+            let cwd_owned = cwd.to_owned();
+            let spec_owned = spec.cloned();
+            let tx = tx.clone();
+            let hook_ctx = hook_ctx.clone();
+            let seq = Arc::clone(&self.seq);
+            let interrupt_pid = Arc::clone(&self.interrupt_pid);
+            let span = tracing::info_span!("materialize_launch");
+            tokio::task::spawn_blocking(move || {
+                let _guard = span.entered();
+                prepare_launch_blocking(
+                    &options,
+                    &cwd_owned,
+                    spec_owned.as_ref(),
+                    &hook_ctx,
+                    &tx,
+                    &seq,
+                    &interrupt_pid,
+                )
+            })
+            .await
+            .map_err(|error| {
+                pty_err(io::Error::other(format!("materialize panicked: {error}")))
+            })??
+        };
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
@@ -828,6 +818,15 @@ impl ShellPtyDriver {
             .map_err(DriverError::Io)?;
         *self.inner.lock().await = Some(Arc::clone(&state));
         *self.hooks.lock().await = hooks.clone();
+        // D-028 P6: file-tail signal adapters for the codex/grok structured
+        // channels. They read the shadow home the hook session materialized
+        // (which is the same path the child receives via CODEX_HOME /
+        // GROK_HOME), follow the child pid, and emit on the instance's one
+        // ordered observation channel. Hook-confirmed session identity wins
+        // over file discovery (Hook > File) via the adapter confirm path.
+        if let Some(handle) = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)? {
+            *self.adapters.lock().await = Some(handle);
+        }
         if self.options.promote {
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
@@ -843,6 +842,14 @@ impl ShellPtyDriver {
                 tx.clone(),
                 Arc::clone(&self.seq),
             ));
+            // A login shell has no agent at spawn; once promotion identifies a
+            // hand-typed codex/grok, start its file adapter against the native
+            // (not a shadow) home. §1.0 rule 2: the promoted path gets the
+            // same structured lifecycle channel as a launched one.
+            if self.options.target.agent_kind().is_none() {
+                *self.adapters.lock().await =
+                    Some(self.spawn_promoted_adapter_watch(&hook_ctx, tx.clone()));
+            }
         }
         // §5.5: a crashed agent used to stay `ready` forever, because EOF only
         // broke the read loop. Both witnesses now journal an exit.
@@ -861,69 +868,133 @@ impl ShellPtyDriver {
         Ok(RunHandle::new(recipe, DriverAck::transport_written(), rx))
     }
 
-    /// The launch recipe for this PTY's target.    ///
-    /// A shell keeps the lightweight recipe it always had; an agent goes
-    /// through the materializer so §5.1 step 4's audit fields are real.
-    fn recipe_for(
+    /// Start the per-kind file-tail adapter for a Remuda-launched agent.
+    ///
+    /// Returns `None` for shells, promoted hand-typed sessions (their adapter
+    /// starts when promotion identifies the kind), and kinds without a file
+    /// channel. The adapter reads from the shadow home the hook session
+    /// wrote, so it only exists when the hook path is live — without hooks
+    /// there is no per-session shadow home, and reading the user's real
+    /// `~/.codex` from a launched session would cross the §4.2 boundary.
+    fn spawn_adapters(
         &self,
-        cwd: &str,
-        spec: Option<&InstanceSpec>,
-        settings_overlay: Option<&Path>,
-    ) -> DriverResult<LaunchRecipe> {
-        let Target::Agent { kind, resume } = &self.options.target else {
-            return shell_recipe(&self.options, cwd);
-        };
-        let Some(agent) = self.options.agent.as_ref() else {
-            return Err(DriverError::InvalidLaunchSpec(
-                "an agent target needs its launch inputs".into(),
-            ));
-        };
-        let Some(spec) = spec else {
-            return Err(DriverError::InvalidLaunchSpec(
-                "an agent target needs an InstanceSpec to materialize".into(),
-            ));
-        };
-        if spec.kind != *kind {
-            return Err(DriverError::InvalidLaunchSpec(format!(
-                "spec kind {:?} does not match the launch target {kind:?}",
-                spec.kind
-            )));
-        }
-        let mut agent = agent.as_ref().clone();
-        if let Some(path) = settings_overlay {
-            agent.settings_overlay = Some(path.to_path_buf());
-        }
-        launch::agent_recipe(spec, &agent, cwd, resume.as_deref())
-    }
-
-    /// Validate the caller's native recipe first, then layer the hook overlay
-    /// into that same materializer so its argv and audit describe one file.
-    fn prepare_launch(
-        &self,
-        cwd: &str,
-        spec: Option<&InstanceSpec>,
+        hooks: &Option<Arc<crate::launch::HookSession>>,
+        recipe: &LaunchRecipe,
         ctx: &promotion::PromoteCtx,
         events: &mpsc::Sender<remuda_protocol::Observation>,
-    ) -> DriverResult<(LaunchRecipe, Option<Arc<crate::launch::HookSession>>)> {
-        let mut recipe = self.recipe_for(cwd, spec, None)?;
-        let native_claude = self.options.target.agent_kind() == Some(AgentKind::Claude);
-        let base_settings = if native_claude && self.options.hooks.is_some() {
-            recipe
-                .materialized_files
-                .iter()
-                .find(|file| file.role == crate::recipe::FileRole::Settings)
-                .map(|file| {
-                    Ok::<_, DriverError>(serde_json::from_slice(&std::fs::read(&file.path)?)?)
-                })
-                .transpose()?
-        } else {
-            None
+        pid: Option<i32>,
+        cwd: &str,
+    ) -> DriverResult<Option<crate::adapters::supervisor::AdapterHandle>> {
+        let Some(hooks) = hooks else {
+            return Ok(None);
         };
-        let hooks = self.start_hooks(ctx, events, base_settings)?;
-        if native_claude && let Some(hooks) = &hooks {
-            recipe = self.recipe_for(cwd, spec, Some(&hooks.overlay.path))?;
-        }
-        Ok((recipe, hooks))
+        let Some(kind) = self.options.target.agent_kind() else {
+            return Ok(None);
+        };
+        let Some(shadow) = &hooks.shadow else {
+            return Ok(None);
+        };
+        let home = crate::adapters::AdapterHome {
+            home: shadow.home.clone(),
+            cwd: PathBuf::from(cwd),
+            pid: pid.filter(|pid| *pid > 0).map(|pid| pid as u32),
+        };
+        let stamp = crate::adapters::supervisor::stamp_ctx(
+            ctx.instance_id.clone(),
+            ctx.host_id.clone(),
+            ctx.journal_id.clone(),
+            ctx.run_id.clone(),
+            recipe
+                .session_id
+                .clone()
+                .unwrap_or_else(|| format!("{kind:?}-pending")),
+        );
+        let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
+            stamp,
+            seq: Arc::clone(&self.seq),
+            events: events.clone(),
+            home,
+            fallback_model: Some(recipe.provider.model_requested.clone())
+                .filter(|model| !model.is_empty()),
+            hooks: Some(Arc::clone(hooks)),
+            agent_pid: pid,
+        };
+        crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
+    }
+
+    /// Watch the promoted agent; when it resolves to a codex/grok kind with a
+    /// discoverable native home, spawn that kind's file adapter once.
+    ///
+    /// A promoted session reads the user's *real* `~/.codex`/`~/.grok` (the
+    /// human started the binary themselves, outside the shadow), so the
+    /// adapter home comes from the Node environment rather than from a
+    /// materialized shadow. The poll cadence matches the promotion tick.
+    fn spawn_promoted_adapter_watch(
+        &self,
+        ctx: &promotion::PromoteCtx,
+        events: mpsc::Sender<remuda_protocol::Observation>,
+    ) -> crate::adapters::supervisor::AdapterHandle {
+        let promoted = Arc::clone(&self.promoted);
+        let options_cwd = self.options.cwd.clone();
+        let seq = Arc::clone(&self.seq);
+        let stamp_ctx = crate::adapters::supervisor::stamp_ctx(
+            ctx.instance_id.clone(),
+            ctx.host_id.clone(),
+            ctx.journal_id.clone(),
+            ctx.run_id.clone(),
+            "promoted-pending",
+        );
+        let task = tokio::spawn(async move {
+            let mut current: Option<remuda_protocol::AgentKind> = None;
+            let mut handle: Option<crate::adapters::supervisor::AdapterHandle> = None;
+            let mut tick = tokio::time::interval(PROMOTE_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if events.is_closed() {
+                    break;
+                }
+                let kind = promoted
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|found| found.kind));
+                if kind == current {
+                    continue;
+                }
+                // Kind changed (terminal → agent, or one agent → another):
+                // drop the previous adapter before starting the new one.
+                if let Some(old) = handle.take() {
+                    old.abort();
+                }
+                current = kind;
+                if let Some(kind @ (AgentKind::Codex | AgentKind::Grok)) = kind
+                    && let Some(found) = promoted.lock().ok().and_then(|slot| slot.clone())
+                    && let Some(home) = crate::adapters::supervisor::promoted_home(
+                        kind,
+                        options_cwd.clone(),
+                        u32::try_from(found.pid).ok(),
+                    )
+                {
+                    let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
+                        stamp: stamp_ctx.clone(),
+                        seq: Arc::clone(&seq),
+                        events: events.clone(),
+                        home,
+                        fallback_model: None,
+                        hooks: None,
+                        agent_pid: Some(found.pid),
+                    };
+                    match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
+                        Ok(Some(started)) => handle = Some(started),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::debug!(%error, ?kind, "promoted file adapter failed to start")
+                        }
+                    }
+                }
+            }
+        });
+        crate::adapters::supervisor::AdapterHandle { tasks: vec![task] }
     }
 
     /// Run the stop ladder against this PTY's process group (§5.3).
@@ -953,9 +1024,34 @@ impl ShellPtyDriver {
         // synchronous callback on a runtime thread.
         let mut master = state.master.lock().await.take();
         state.closed.store(true, Ordering::SeqCst);
-        lifecycle::stop_group(pgid, move || {
-            drop(master.take());
-        })
+        // Hold the child across the ladder so this is the only task reaping it.
+        // The leader is our direct child; a SIGKILLed child sits as a zombie
+        // until `wait`, and a zombie still answers killpg — that produced the
+        // false `stop-incomplete` against a process already in state E/Z.
+        let mut child = state.child.lock().await;
+        let mut reaped = false;
+        lifecycle::stop_group(
+            pgid,
+            move || {
+                drop(master.take());
+            },
+            &mut move || {
+                if reaped {
+                    return true;
+                }
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        reaped = true;
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(error) => {
+                        tracing::debug!(%error, "pty child reap failed");
+                        false
+                    }
+                }
+            },
+        )
         .await
     }
 
@@ -1023,6 +1119,113 @@ impl ShellPtyDriver {
 /// One context for both so hook and screen evidence share a journal, a run and
 /// a sequence counter. Node rebinds instance/journal/host on commit; the driver
 /// only needs locally consistent ids (same contract as claude-pty).
+/// Free-function form of [`ShellPtyDriver::prepare_launch`], so the whole
+/// blocking materialization (recipe pin/hash, hook overlay, shims, socket
+/// bind) can run inside `spawn_blocking` without borrowing a driver.
+fn prepare_launch_blocking(
+    options: &ShellPtyOptions,
+    cwd: &str,
+    spec: Option<&InstanceSpec>,
+    ctx: &promotion::PromoteCtx,
+    events: &mpsc::Sender<remuda_protocol::Observation>,
+    seq: &Arc<AtomicU64>,
+    interrupt_pid: &Arc<AtomicI32>,
+) -> DriverResult<(LaunchRecipe, Option<Arc<crate::launch::HookSession>>)> {
+    let recipe = recipe_for_blocking(options, cwd, spec, None)?;
+    let native_claude = options.target.agent_kind() == Some(AgentKind::Claude);
+    let base_settings = if native_claude && options.hooks.is_some() {
+        recipe
+            .materialized_files
+            .iter()
+            .find(|file| file.role == crate::recipe::FileRole::Settings)
+            .map(|file| Ok::<_, DriverError>(serde_json::from_slice(&std::fs::read(&file.path)?)?))
+            .transpose()?
+    } else {
+        None
+    };
+    let hooks = start_hooks_blocking(options, ctx, events, base_settings, seq, interrupt_pid)?;
+    let recipe = if native_claude && let Some(hooks) = &hooks {
+        recipe_for_blocking(options, cwd, spec, Some(&hooks.overlay.path))?
+    } else {
+        recipe
+    };
+    Ok((recipe, hooks))
+}
+
+/// Free-function form of [`ShellPtyDriver::recipe_for`] usable off the async
+/// runtime inside `spawn_blocking`.
+fn recipe_for_blocking(
+    options: &ShellPtyOptions,
+    cwd: &str,
+    spec: Option<&InstanceSpec>,
+    settings_overlay: Option<&Path>,
+) -> DriverResult<LaunchRecipe> {
+    let Target::Agent { kind, resume } = &options.target else {
+        return shell_recipe(options, cwd);
+    };
+    let Some(agent) = options.agent.as_ref() else {
+        return Err(DriverError::InvalidLaunchSpec(
+            "an agent target needs its launch inputs".into(),
+        ));
+    };
+    let Some(spec) = spec else {
+        return Err(DriverError::InvalidLaunchSpec(
+            "an agent target needs an InstanceSpec to materialize".into(),
+        ));
+    };
+    if spec.kind != *kind {
+        return Err(DriverError::InvalidLaunchSpec(format!(
+            "spec kind {:?} does not match the launch target {kind:?}",
+            spec.kind
+        )));
+    }
+    let mut agent = agent.as_ref().clone();
+    if let Some(path) = settings_overlay {
+        agent.settings_overlay = Some(path.to_path_buf());
+    }
+    launch::agent_recipe(spec, &agent, cwd, resume.as_deref())
+}
+
+/// Blocking half of hook session startup, callable off the async runtime.
+#[allow(clippy::too_many_arguments)]
+fn start_hooks_blocking(
+    options: &ShellPtyOptions,
+    ctx: &promotion::PromoteCtx,
+    events: &mpsc::Sender<remuda_protocol::Observation>,
+    base_settings: Option<serde_json::Value>,
+    seq: &Arc<AtomicU64>,
+    interrupt_pid: &Arc<AtomicI32>,
+) -> DriverResult<Option<Arc<crate::launch::HookSession>>> {
+    let Some(config) = options.hooks.clone() else {
+        return Ok(None);
+    };
+    let bus = Arc::new(
+        remuda_signal::SignalBus::new(
+            remuda_signal::BusContext {
+                instance_id: ctx.instance_id.clone(),
+                host_id: ctx.host_id.clone(),
+                journal_id: ctx.journal_id.clone(),
+                run_id: ctx.run_id.clone(),
+                driver_kind: DriverKind::ShellPty,
+                adapter_version: crate::capabilities::ADAPTER_VERSION.to_owned(),
+            },
+            events.clone(),
+            Arc::clone(seq),
+        )
+        .with_interrupt_tracker(Arc::clone(interrupt_pid)),
+    );
+    Ok(Some(Arc::new(crate::launch::HookSession::start(
+        &crate::launch::HookSessionOptions {
+            instance_dir: config.instance_dir,
+            relay_binary: config.relay_binary,
+            tui: config.tui,
+            base_settings,
+            kind: options.target.agent_kind().unwrap_or(AgentKind::Claude),
+        },
+        bus,
+    )?)))
+}
+
 fn promote_ctx(
     options: &ShellPtyOptions,
     cwd: &str,
@@ -1480,6 +1683,11 @@ impl Driver for ShellPtyDriver {
         // stay for `instance.purge` to remove with the rest of the instance
         // directory — they are launch audit evidence until then.
         self.hooks.lock().await.take();
+        // Stop the file-tail adapters; their shadow files likewise survive for
+        // purge as audit evidence.
+        if let Some(handle) = self.adapters.lock().await.take() {
+            handle.abort();
+        }
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();
@@ -1969,9 +2177,18 @@ mod tests {
         let mut driver = ShellPtyDriver::new(options);
         let ctx = promote_ctx(&driver.options, &spec.cwd, Some(&spec)).unwrap();
         let (events, _rx) = mpsc::channel(8);
-        let (recipe, hooks) = driver
-            .prepare_launch(&spec.cwd, Some(&spec), &ctx, &events)
-            .unwrap();
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let (recipe, hooks) = prepare_launch_blocking(
+            &driver.options,
+            &spec.cwd,
+            Some(&spec),
+            &ctx,
+            &events,
+            &seq,
+            &interrupt_pid,
+        )
+        .unwrap();
         let hooks = hooks.unwrap();
         assert!(recipe.argv.windows(2).any(|args| {
             args[0] == "--settings" && args[1] == hooks.overlay.path.to_string_lossy()
@@ -2000,9 +2217,16 @@ mod tests {
         driver.options.hooks.as_mut().unwrap().instance_dir = invalid_instance.clone();
         driver.options.agent.as_mut().unwrap().binary = Some(dir.path().join("missing-binary"));
         assert!(
-            driver
-                .prepare_launch(&spec.cwd, Some(&spec), &ctx, &events)
-                .is_err()
+            prepare_launch_blocking(
+                &driver.options,
+                &spec.cwd,
+                Some(&spec),
+                &ctx,
+                &events,
+                &seq,
+                &interrupt_pid,
+            )
+            .is_err()
         );
         assert!(
             !invalid_instance.exists(),

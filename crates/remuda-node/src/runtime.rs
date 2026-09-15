@@ -29,6 +29,50 @@ struct QueuedCommand {
     command_id: CommandId,
     request: DriverRequest,
     close_after: bool,
+    /// D-027 attachment refs from the Hub. Bytes are pulled in the instance
+    /// worker, never on the RPC path: a slow object fetch must not delay the
+    /// durable accept (or serialize the runtime link behind it).
+    attachment_refs: Vec<remuda_protocol::hubnode::AttachmentRef>,
+}
+
+/// Hub object source plus the Node data dir, used inside an instance worker to
+/// pull attachment bytes after the send has been durably accepted (D-027).
+#[derive(Clone)]
+pub(crate) struct AttachmentLoader {
+    source: Option<Arc<dyn crate::attachments::ObjectSource>>,
+    data_dir: Option<std::path::PathBuf>,
+}
+
+impl AttachmentLoader {
+    fn new(
+        source: Option<Arc<dyn crate::attachments::ObjectSource>>,
+        data_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self { source, data_dir }
+    }
+
+    /// Pull a send's attachment bytes in the worker. Runs off the RPC path, so
+    /// a slow Hub object store delays only the affected command.
+    async fn resolve(
+        &self,
+        instance_id: &InstanceId,
+        refs: Vec<remuda_protocol::hubnode::AttachmentRef>,
+    ) -> Result<Vec<crate::attachments::MaterializedAttachment>, NodeError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let source = self.source.as_ref().ok_or_else(|| {
+            NodeError::InvalidRequest(
+                "this Node has no Hub attachment source; send without attachments".into(),
+            )
+        })?;
+        let data_dir = self.data_dir.as_ref().ok_or_else(|| {
+            NodeError::InvalidRequest(
+                "attachments need a Node data directory; none is configured".into(),
+            )
+        })?;
+        crate::attachments::materialize(source, data_dir, instance_id, &refs).await
+    }
 }
 
 pub(crate) struct DevNodeInner {
@@ -306,7 +350,27 @@ impl DevNode {
     }
 
     /// Durably accept an Instance create, then materialize it in its worker.
+    ///
+    /// D-028 P2 follow-up: the reply must prove only the durable accept —
+    /// instance row, accepted command ledger entry, and its journal event.
+    /// Everything that can be slow (driver build, binary pin, overlay/shim
+    /// generation, PTY spawn) happens in the instance worker afterwards, with
+    /// progress journaled `preparing → starting → ready` (protocol §2.3).
+    /// A loaded host must never time this out at the Hub's 5 s accept deadline.
     pub async fn create_instance(
+        &self,
+        request: CreateInstanceRequest,
+    ) -> Result<CreateInstanceResponse, NodeError> {
+        let span = tracing::info_span!(
+            "instance.create",
+            kind = ?request.kind,
+            driver = ?request.driver
+        );
+        use tracing::Instrument;
+        self.create_instance_inner(request).instrument(span).await
+    }
+
+    async fn create_instance_inner(
         &self,
         request: CreateInstanceRequest,
     ) -> Result<CreateInstanceResponse, NodeError> {
@@ -352,24 +416,17 @@ impl DevNode {
                 command_id: request.command_id.clone().unwrap_or_default(),
             });
         }
-        let driver = self.inner.drivers.build(
-            request.driver,
-            DriverLaunch {
-                instance: instance.clone(),
-                request: request.clone(),
-                workspace_root,
-                registered_workspace_root: workspace.root_path.into(),
-            },
-        )?;
+        // Protocol §2.3: accepted-but-not-yet-materialized. The worker moves
+        // this through `starting` and `ready`; the Hub mirrors those states
+        // from the journal even when this RPC's reply arrives late.
+        instance.lifecycle = InstanceLifecycle::Preparing;
+        let launch = DriverLaunch {
+            instance: instance.clone(),
+            request: request.clone(),
+            workspace_root,
+            registered_workspace_root: workspace.root_path.into(),
+        };
         self.inner.store.insert_instance(instance)?;
-        driver.track_pty_resources(
-            instance_id.clone(),
-            Arc::new(crate::reclaim::ResourceStore(self.inner.store.clone())),
-        );
-        self.inner
-            .interactions
-            .register_driver(instance_id.clone(), Arc::clone(&driver))
-            .await;
 
         let command_id = request.command_id.clone().unwrap_or_default();
         let mut command = new_command(
@@ -393,6 +450,8 @@ impl DevNode {
             });
         }
         accept_command(&mut command)?;
+        // Journal first, reply second: a Hub that times out the RPC converges
+        // from these rows instead of leaving `requested / unknown` forever.
         self.inner.store.save_command(command.clone())?;
         append_command_lifecycle(
             self.inner.store.as_ref(),
@@ -400,7 +459,14 @@ impl DevNode {
             &command,
             "accepted",
         )?;
-        self.spawn_instance_worker(instance_id.clone(), driver, command.clone(), request.prompt)
+        append_instance_lifecycle(
+            self.inner.store.as_ref(),
+            &instance_id,
+            Some("requested"),
+            "preparing",
+            "create-accepted",
+        )?;
+        self.spawn_instance_worker(instance_id.clone(), launch, command.clone(), request.prompt)
             .await;
         let instance = self.inner.store.get_instance(&instance_id)?;
         Ok(CreateInstanceResponse { command, instance })
@@ -448,34 +514,6 @@ impl DevNode {
             .map(|config| config.data_dir.clone())
     }
 
-    /// Fetch and write this send's attachments, if it has any.
-    async fn materialize_attachments(
-        &self,
-        instance_id: &InstanceId,
-        request: &InstanceCommandRequest,
-    ) -> Result<Vec<crate::attachments::MaterializedAttachment>, NodeError> {
-        if request.attachments.is_empty() || request.operation != CommandAction::Send {
-            return Ok(Vec::new());
-        }
-        let source = self
-            .inner
-            .objects
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .ok_or_else(|| {
-                NodeError::InvalidRequest(
-                    "this Node has no Hub attachment source; send without attachments".into(),
-                )
-            })?;
-        let data_dir = self.data_dir().ok_or_else(|| {
-            NodeError::InvalidRequest(
-                "attachments need a Node data directory; none is configured".into(),
-            )
-        })?;
-        crate::attachments::materialize(&source, &data_dir, instance_id, &request.attachments).await
-    }
-
     /// Submit send/cancel/respond/close through an Instance's bounded queue.
     pub async fn submit_command(
         &self,
@@ -491,11 +529,11 @@ impl DevNode {
             return Err(NodeError::InvalidRequest("Node is shutting down".into()));
         }
         let instance = self.inner.store.get_instance(instance_id)?;
-        // D-027: pull attachment bytes before the command is queued, so a
-        // failure surfaces as a rejected send rather than as an agent
-        // answering a question about an image it never received.
-        let attachments = self.materialize_attachments(instance_id, &request).await?;
-        let (operation, driver_request, close_after) = command_parts(&request, attachments)?;
+        // D-027: attachment bytes are pulled by the instance worker *after* the
+        // command is durably accepted, so a slow Hub object fetch cannot delay
+        // this reply or serialize the runtime link.
+        let attachment_refs = request.attachments.clone();
+        let (operation, driver_request, close_after) = command_parts(&request, Vec::new())?;
         let command_id = request.command_id.clone().unwrap_or_default();
         let mut command = new_command(
             command_id.clone(),
@@ -519,7 +557,13 @@ impl DevNode {
         }
 
         let result = self
-            .enqueue_existing(instance_id, command_id, driver_request, close_after)
+            .enqueue_existing(
+                instance_id,
+                command_id,
+                driver_request,
+                close_after,
+                attachment_refs,
+            )
             .await;
         match result {
             Ok(command) => Ok(CommandResult {
@@ -641,7 +685,7 @@ impl DevNode {
     async fn spawn_instance_worker(
         &self,
         instance_id: InstanceId,
-        driver: Arc<dyn Driver>,
+        launch: DriverLaunch,
         create_command: Command,
         initial_prompt: String,
     ) {
@@ -651,20 +695,66 @@ impl DevNode {
             .write()
             .await
             .insert(instance_id.clone(), sender);
-        self.inner
-            .instance_drivers
-            .write()
-            .await
-            .insert(instance_id.clone(), driver.clone());
         let store = self.inner.store.clone();
+        let drivers = self.inner.drivers.clone();
         let interactions = Arc::clone(&self.inner.interactions);
         let tty = self.inner.tty.clone();
         let data_dir = self.data_dir();
+        let objects = self.inner.objects.read().ok().and_then(|slot| slot.clone());
         let worker_instance = instance_id.clone();
         let carrier = self.carrier_supervisor();
         let pumps = Arc::clone(&self.inner.pumps);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
+            // Building the driver is materialization, not acceptance: it runs
+            // `pin_binary` (a ~207 MB SHA-256 the first time, plus a blocking
+            // `--version` subprocess), writes the settings overlay and launch
+            // shims, and prepares the native home. None of it is allowed to
+            // stand between the Hub and the durable accept, so it happens
+            // here, after the reply was authorized — and on a blocking thread,
+            // so a 20-second `--version` cannot stall a runtime core.
+            let build_span = tracing::info_span!("build_driver", driver = ?launch.request.driver);
+            let build = tokio::task::spawn_blocking(move || {
+                let _span = build_span.entered();
+                drivers.build(launch.request.driver, launch.clone())
+            });
+            use tracing::Instrument;
+            let driver = match build
+                .instrument(tracing::info_span!("build_driver_wait"))
+                .await
+            {
+                Ok(Ok(driver)) => driver,
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "instance driver build failed");
+                    record_task_exit(store.as_ref(), &worker_instance, &error.to_string());
+                    if let Some(node) = node.upgrade() {
+                        node.senders.write().await.remove(&worker_instance);
+                    }
+                    return;
+                }
+                Err(join_error) => {
+                    let reason = format!("driver build task panicked: {join_error}");
+                    tracing::error!(%reason, "instance driver build panicked");
+                    record_task_exit(store.as_ref(), &worker_instance, &reason);
+                    if let Some(node) = node.upgrade() {
+                        node.senders.write().await.remove(&worker_instance);
+                    }
+                    return;
+                }
+            };
+            driver.track_pty_resources(
+                worker_instance.clone(),
+                Arc::new(crate::reclaim::ResourceStore(store.clone())),
+            );
+            interactions
+                .register_driver(worker_instance.clone(), Arc::clone(&driver))
+                .await;
+            if let Some(node) = node.upgrade() {
+                node.instance_drivers
+                    .write()
+                    .await
+                    .insert(worker_instance.clone(), Arc::clone(&driver));
+            }
             let result = std::panic::AssertUnwindSafe(materialize_instance(
                 store.clone(),
                 worker_instance.clone(),
@@ -675,6 +765,7 @@ impl DevNode {
                 create_command,
                 initial_prompt,
                 data_dir,
+                objects,
                 carrier,
                 pumps,
             ))
@@ -720,6 +811,8 @@ impl DevNode {
         let store = self.inner.store.clone();
         let interactions = Arc::clone(&self.inner.interactions);
         let data_dir = self.data_dir();
+        let objects = self.inner.objects.read().ok().and_then(|slot| slot.clone());
+        let loader = AttachmentLoader::new(objects, data_dir.clone());
         let id = instance_id.clone();
         let carrier = self.carrier_supervisor();
         let node = Arc::downgrade(&self.inner);
@@ -731,6 +824,7 @@ impl DevNode {
                 receiver,
                 interactions,
                 carrier,
+                loader,
             )
             .await
             {
@@ -755,6 +849,7 @@ impl DevNode {
         command_id: CommandId,
         request: DriverRequest,
         close_after: bool,
+        attachment_refs: Vec<remuda_protocol::hubnode::AttachmentRef>,
     ) -> Result<Command, NodeError> {
         let sender = self
             .inner
@@ -776,6 +871,7 @@ impl DevNode {
             command_id,
             request,
             close_after,
+            attachment_refs,
         });
         if close_after && !pty_queue::is_pty(self.inner.store.get_instance(instance_id)?.driver) {
             self.inner.senders.write().await.remove(instance_id);
@@ -855,10 +951,13 @@ fn spawn_observation_pump(
             {
                 record_native_session(store.as_ref(), &instance_id, &session);
             }
-            // D-028 §4.3: Hook outranks Screen. Without this the hook events
-            // are journaled but the instance still follows `agent_status`,
-            // which is a screen guess — the composer would keep believing the
-            // screen over the harness's own account of what it is doing.
+            // D-028 §4.3: Hook outranks File, and both outrank Screen. Without
+            // this the hook/file events are journaled but the instance still
+            // follows `agent_status`, which is a screen guess — the composer
+            // would keep believing the screen over the harness's own account.
+            //
+            // Promoted hand-typed sessions fold through the promoted-hook
+            // tracker; a launched session folds through the static classifier.
             let hook_activity = if promoted_hook {
                 promoted_hooks.activity(&observation)
             } else {
@@ -885,14 +984,23 @@ fn spawn_observation_pump(
                     activity_annotated = true;
                 }
             }
-            if let Some(activity) = hook_activity
+            // P6: File turn lifecycles fold only when no hook set activity and
+            // only for a kind with a file-tail adapter (codex/grok); the
+            // registry is the single lookup rather than another per-kind branch.
+            let activity = hook_activity.or_else(|| match store.get_instance(&instance_id) {
+                Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
+                    crate::signal::file_activity(&observation)
+                }
+                _ => None,
+            });
+            if let Some(activity) = activity
                 && let Err(error) = store.set_instance_state(
                     &instance_id,
                     None,
                     Some(remuda_protocol::Knowledge::Known { value: activity }),
                 )
             {
-                tracing::warn!(%error, "hook activity not applied");
+                tracing::warn!(%error, "hook/file activity not applied");
             }
             match store.append_driver_observation(&instance_id, observation) {
                 Ok(committed) => {
@@ -945,6 +1053,8 @@ async fn materialize_instance(
     initial_prompt: String,
     // Node data dir, so this worker can drop its attachments on the way out.
     data_dir: Option<std::path::PathBuf>,
+    // Hub object source, for worker-side attachment pulls (D-027).
+    objects: Option<Arc<dyn crate::attachments::ObjectSource>>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
     // Where this instance's observation pump is registered so a shutdown can
     // stop it. Just the map, not the whole Node: the pump outliving its Node is
@@ -952,7 +1062,23 @@ async fn materialize_instance(
     // would be a second way to do the same thing.
     pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
 ) -> Result<(), NodeError> {
-    let observations = match driver.start().await {
+    // Protocol §2.3: build is done; the dispatch intent is durable and the
+    // native process is about to be spawned. Journal `preparing → starting`
+    // before touching the driver so a Hub that never got the RPC reply still
+    // converges this instance instead of leaving it at `requested`.
+    journal_instance_phase(
+        store.as_ref(),
+        &instance_id,
+        InstanceLifecycle::Starting,
+        "preparing",
+        "driver-spawn",
+    )?;
+    let start_span = tracing::info_span!("driver.start");
+    let start_result = {
+        use tracing::Instrument;
+        driver.start().instrument(start_span).await
+    };
+    let observations = match start_result {
         Ok(observations) => observations,
         Err(error) => {
             notify_carrier(carrier.as_ref(), &error);
@@ -1015,11 +1141,14 @@ async fn materialize_instance(
             "tty bridge failed to start"
         );
     }
-    append_instance_lifecycle(
+    // §2.3: native initialization finished; the session owns a running PTY.
+    // Set the entity first, then journal it, so readers that observe `ready`
+    // find the event explaining it.
+    journal_instance_phase(
         store.as_ref(),
         &instance_id,
-        None,
-        "ready",
+        InstanceLifecycle::Ready,
+        "starting",
         "driver-started",
     )?;
     // D-028 §4.3/§6: the create-time snapshot is keyed by `DriverKind` and
@@ -1028,6 +1157,7 @@ async fn materialize_instance(
     // steer / queue / interrupt provisions instead of the static row.
     refresh_capabilities(store.as_ref(), &instance_id, driver.as_ref()).await;
 
+    let loader = AttachmentLoader::new(objects, data_dir.clone());
     if pty_queue::is_pty(driver.kind()) {
         let result = pty_queue::run(
             store,
@@ -1037,6 +1167,7 @@ async fn materialize_instance(
             interactions,
             Some((create_command, initial_prompt)),
             carrier,
+            loader,
         )
         .await;
         tty.stop(&instance_id).await;
@@ -1060,9 +1191,11 @@ async fn materialize_instance(
                     origin: crate::origin::input_origin(create_command.origin),
                 },
                 close_after: false,
+                attachment_refs: Vec::new(),
             },
             Arc::clone(&interactions),
             carrier.clone(),
+            loader.clone(),
         )
         .await?;
     }
@@ -1074,6 +1207,7 @@ async fn materialize_instance(
         receiver,
         interactions,
         carrier,
+        loader,
     )
     .await;
     tty.stop(&instance_id).await;
@@ -1136,6 +1270,7 @@ async fn instance_worker(
     mut receiver: mpsc::Receiver<QueuedCommand>,
     interactions: Arc<InteractionRuntime>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
+    loader: AttachmentLoader,
 ) -> Result<(), NodeError> {
     if pty_queue::is_pty(driver.kind()) {
         return pty_queue::run(
@@ -1146,6 +1281,7 @@ async fn instance_worker(
             interactions,
             None,
             carrier,
+            loader,
         )
         .await;
     }
@@ -1158,6 +1294,7 @@ async fn instance_worker(
             queued,
             Arc::clone(&interactions),
             carrier.clone(),
+            loader.clone(),
         )
         .await?;
         if close_after {
@@ -1171,10 +1308,39 @@ async fn execute_queued(
     store: Arc<dyn LocalStore>,
     instance_id: &InstanceId,
     driver: Arc<dyn Driver>,
-    queued: QueuedCommand,
+    mut queued: QueuedCommand,
     interactions: Arc<InteractionRuntime>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
+    loader: AttachmentLoader,
 ) -> Result<(), NodeError> {
+    // D-027: pull bytes in the worker, after the command was durably accepted.
+    // A fetch failure settles just this command (rejected, not dispatched)
+    // rather than killing the instance.
+    let queued = if let DriverRequest::Send { attachments, .. } = &mut queued.request {
+        match loader
+            .resolve(instance_id, queued.attachment_refs.clone())
+            .await
+        {
+            Ok(materialized) => {
+                *attachments = materialized;
+                queued
+            }
+            Err(error) => {
+                let mut command = store.get_command(&queued.command_id)?;
+                settle_command(
+                    &mut command,
+                    SettlementOutcome::Rejected,
+                    Some(error.to_string()),
+                    remuda_protocol::ExecutionState::NotDispatched,
+                )?;
+                store.save_command(command.clone())?;
+                append_command_lifecycle(store.as_ref(), instance_id, &command, "settled")?;
+                return Ok(());
+            }
+        }
+    } else {
+        queued
+    };
     let mut command = store.get_command(&queued.command_id)?;
     if let DriverRequest::Send { prompt, .. } = &queued.request {
         store.set_instance_state(
@@ -2009,6 +2175,26 @@ fn append_command_lifecycle(
     Ok(())
 }
 
+/// Move the instance entity to a new lifecycle and journal the transition.
+///
+/// The entity is updated first and the journal event appended second, so a
+/// reader that observes the new lifecycle always finds the event that explains
+/// it (the opposite ordering left a window the UI's poll lands in under load).
+pub(crate) fn journal_instance_phase(
+    store: &dyn LocalStore,
+    instance_id: &InstanceId,
+    lifecycle: InstanceLifecycle,
+    previous_state: &str,
+    reason: &str,
+) -> Result<(), NodeError> {
+    let state = serde_json::to_value(lifecycle)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    store.set_instance_state(instance_id, Some(lifecycle), None)?;
+    append_instance_lifecycle(store, instance_id, Some(previous_state), &state, reason)
+}
+
 pub(crate) fn append_instance_lifecycle(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
@@ -2787,6 +2973,100 @@ mod tests {
         let exited = node.get_instance(&instance.meta.id).unwrap();
         assert_eq!(exited.lifecycle, InstanceLifecycle::Exited);
         assert!(matches!(exited.exit, Knowledge::Known { .. }));
+    }
+
+    /// D-028 P2 follow-up: the RPC reply proves only the durable accept. A
+    /// driver whose materialization sleeps (slow `pin_binary`, overlay/shim
+    /// generation, PTY spawn) must not delay the create: the response lands
+    /// immediately with an accepted command and a `preparing` instance, and
+    /// the worker walks the instance to `ready` afterwards.
+    #[tokio::test]
+    async fn create_is_accepted_before_a_slow_launch_finishes() {
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!());
+        let store = Arc::new(MemoryStore::new(8));
+        let drivers = DriverRegistry::default();
+        // The shared instance: every built fake starts 400 ms after spawn.
+        let slow = Arc::new(
+            crate::FakeDriver::new(remuda_protocol::DriverKind::ClaudePrint)
+                .with_start_delay(Duration::from_millis(400)),
+        );
+        drivers.register(slow).expect("register slow fake");
+        let node = DevNode::with_parts(&config, store, drivers).expect("node");
+
+        let started = std::time::Instant::now();
+        let created = node
+            .create_instance(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "prompt": "",
+                }))
+                .expect("request"),
+            )
+            .await
+            .expect("create");
+        // The accept does not wait for the 400 ms launch.
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "durable ack took {:?}; it must not wait for materialization",
+            started.elapsed()
+        );
+        assert_eq!(
+            created.command.state,
+            CommandState::Accepted,
+            "the create command is accepted in the reply"
+        );
+        assert_eq!(
+            created.instance.lifecycle,
+            InstanceLifecycle::Preparing,
+            "the instance is accepted but not yet materialized"
+        );
+
+        // The worker then materializes and journals starting → ready.
+        let final_instance = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let instance = node
+                    .get_instance(&created.instance.meta.id)
+                    .expect("instance");
+                if instance.lifecycle == InstanceLifecycle::Ready {
+                    return instance;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reaches ready");
+        assert_eq!(final_instance.lifecycle, InstanceLifecycle::Ready);
+
+        // Preparing/starting transitions are visible in the journal, which is
+        // how a Hub that never got the RPC reply converges anyway.
+        let states: Vec<String> = node
+            .read_journal(&created.instance.journal_id, None, 128)
+            .expect("journal")
+            .events
+            .iter()
+            .filter_map(|event| {
+                let JournalEvent::Instance(observation) = event else {
+                    return None;
+                };
+                let ObservationPayload::Lifecycle(payload) = &observation.body else {
+                    return None;
+                };
+                match payload.as_ref() {
+                    LifecyclePayload::Entity(entity)
+                        if matches!(entity.entity_value, LifecycleEntity::Instance(_)) =>
+                    {
+                        Some(entity.state.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(states.contains(&"preparing".to_owned()), "{states:?}");
+        assert!(states.contains(&"starting".to_owned()), "{states:?}");
+        assert!(states.contains(&"ready".to_owned()), "{states:?}");
+        node.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

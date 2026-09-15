@@ -1,5 +1,6 @@
 //! Node instance management and outbound Hub connection.
 
+mod adapter_registry;
 mod attachments;
 mod carrier;
 mod carrier_recovery;
@@ -33,6 +34,7 @@ mod transport;
 mod tty;
 mod workspace;
 mod workspace_access;
+mod workspace_scm;
 mod worktree;
 
 pub use attachments::{

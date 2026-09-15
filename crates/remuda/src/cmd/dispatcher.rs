@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context, bail};
 use clap::Args as ClapArgs;
 use remuda_feishu::{
-    ConsumeEvent, ConsumeSettings, ConsumeSupervisor, Dispatcher, HubInstanceApi, InboundPolicy,
-    InstanceApi, LarkCli, RouteDefaults,
+    ConsumeEvent, ConsumeSettings, ConsumeSupervisor, Dispatcher, HubInstanceApi, HubTicketBackend,
+    InboundPolicy, InstanceApi, LarkCli, RouteDefaults, TicketBackend, register_owner_allowlist,
 };
 use remuda_hub_client::HubClient;
 use tokio::sync::{mpsc, watch};
@@ -139,7 +139,26 @@ pub(crate) async fn run_configured(
         result = &mut stop => return result,
         result = client.list_hosts() => { result.context("dispatcher cannot authenticate with the Hub")?; }
     }
-    let dispatcher = open_dispatcher(settings, &config.data_dir, HubInstanceApi::new(client))?;
+    // Register the owner open_ids this bot token may answer on behalf of.
+    // Until this succeeds every relayed card answer is refused at the Hub
+    // (fail closed); do not supervise until it is in place.
+    register_owner_allowlist(&client, &settings.owner_open_ids)
+        .await
+        .context("dispatcher cannot register its owner allowlist")?;
+    let ticket_backend: std::sync::Arc<dyn TicketBackend> =
+        std::sync::Arc::new(HubTicketBackend::new(client.clone()));
+    let mut dispatcher = open_dispatcher(
+        settings,
+        &config.data_dir,
+        HubInstanceApi::new(client),
+        Some(ticket_backend),
+    )?;
+    // Hydrate open card ticket bindings so a restart keeps cards answerable.
+    match dispatcher.hydrate_tickets(SystemTime::now()).await {
+        Ok(0) => {}
+        Ok(loaded) => tracing::info!(tickets = loaded, "dispatcher hydrated open card tickets"),
+        Err(error) => tracing::warn!(%error, "dispatcher ticket hydration failed"),
+    }
     tracing::info!(outbound = ?settings.outbound, "remuda dispatcher starting");
     supervise(
         dispatcher,
@@ -201,6 +220,7 @@ fn open_dispatcher<A: InstanceApi>(
     settings: &Settings,
     data_dir: &Path,
     api: A,
+    ticket_backend: Option<std::sync::Arc<dyn TicketBackend>>,
 ) -> anyhow::Result<Dispatcher<A>> {
     let outbound = match settings.outbound {
         DispatcherOutbound::DryRun => LarkCli::dry_run(),
@@ -230,7 +250,12 @@ fn open_dispatcher<A: InstanceApi>(
         .session_db
         .clone()
         .unwrap_or_else(|| data_dir.join("dispatcher/sessions.sqlite"));
-    Ok(Dispatcher::open(path, api, outbound, policy, defaults)?)
+    match ticket_backend {
+        Some(backend) => Ok(Dispatcher::open_with_backend(
+            path, api, outbound, policy, defaults, backend,
+        )?),
+        None => Ok(Dispatcher::open(path, api, outbound, policy, defaults)?),
+    }
 }
 
 /// Stop accepting events, terminate consume children, and drain accepted events.
@@ -454,7 +479,7 @@ mod tests {
                 next_seq: 1,
             },
         );
-        let dispatcher = open_dispatcher(&settings, dir.path(), api).expect("dispatcher");
+        let dispatcher = open_dispatcher(&settings, dir.path(), api, None).expect("dispatcher");
         let stopped_dir = dir.path().to_owned();
         let stop = async move {
             entered.notified().await;
@@ -546,8 +571,8 @@ mod tests {
         consume
             .extra_env
             .push(("REMUDA_TEST_LARK_UNREADY".into(), "1".into()));
-        let dispatcher =
-            open_dispatcher(&settings, dir.path(), FakeInstanceApi::default()).expect("dispatcher");
+        let dispatcher = open_dispatcher(&settings, dir.path(), FakeInstanceApi::default(), None)
+            .expect("dispatcher");
         let startup_timeout = Duration::from_secs(60);
         let task = tokio::spawn(supervise(
             dispatcher,
@@ -593,7 +618,8 @@ mod tests {
             release,
             followed: followed.clone(),
         };
-        let mut dispatcher = open_dispatcher(&settings(), dir.path(), api).expect("dispatcher");
+        let mut dispatcher =
+            open_dispatcher(&settings(), dir.path(), api, None).expect("dispatcher");
         let line = include_str!("../../tests/fixtures/dispatcher-inbound.jsonl")
             .lines()
             .find(|line| line.contains("om_dispatcher_prompt"))
@@ -668,7 +694,7 @@ mod tests {
             release: Arc::new(Notify::new()),
             followed: Arc::new(Notify::new()),
         };
-        let dispatcher = open_dispatcher(&settings, dir.path(), api).expect("dispatcher");
+        let dispatcher = open_dispatcher(&settings, dir.path(), api, None).expect("dispatcher");
         let error = supervise(
             dispatcher,
             consume,

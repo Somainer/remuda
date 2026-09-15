@@ -1,0 +1,260 @@
+/*
+ * Code block + syntax-token palette.
+ *
+ * No highlight.js theme file is vendored: token colours are CSS variables
+ * declared per theme here, and the `.hljs-*` classes the tokeniser emits are
+ * mapped onto them below. The block sits inside a `.md` markdown container,
+ * so `.root .pre` is scoped with extra specificity to win over
+ * `.md :global(pre)`.
+ */
+
+.root {
+  --tok-comment: #8a8175;
+  --tok-keyword: #d08770;
+  --tok-type: #7fa8b8;
+  --tok-string: #a3b87a;
+  --tok-number: #d2a65a;
+  --tok-function: #e0c9a0;
+  --tok-meta: #b08d57;
+  --tok-attr: #8fb3c2;
+  --tok-del: #b4634f;
+  --tok-add: #7a8f62;
+
+  position: relative;
+  margin: 0 0 0.6em;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  max-width: 100%;
+  /* The pre owns horizontal scroll; rounded corners must not leak it. */
+  overflow: hidden;
+}
+
+/*
+ * MarkdownText is a column-flex item inside an assistant row, where the
+ * automatic minimum size would grow the wrapper to a code block's
+ * max-content and push the overflow past the transcript column. Opting into
+ * shrink here keeps every long line inside the pre instead.
+ */
+.mdSurface {
+  min-width: 0;
+  max-width: 100%;
+}
+
+:global([data-theme="ledger"]) .root {
+  --tok-comment: #8a8378;
+  --tok-keyword: #9a4a33;
+  --tok-type: #3d5a68;
+  --tok-string: #556a3c;
+  --tok-number: #8c6a16;
+  --tok-function: #6d5a2e;
+  --tok-meta: #7a5a30;
+  --tok-attr: #3d5a68;
+  --tok-del: #8f3d2c;
+  --tok-add: #556a3c;
+}
+
+/* Floating pill, top-right inside the block. It stays out of the way until
+   the pointer or keyboard reaches the block. */
+.toolbar {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--ink-1) 90%, transparent);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.root:hover .toolbar,
+.toolbar:focus-within {
+  opacity: 1;
+}
+
+.label,
+.note {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1;
+  color: var(--mute);
+  user-select: none;
+  white-space: nowrap;
+}
+
+.label {
+  padding: 0 6px 0 5px;
+}
+
+.note {
+  padding: 0 8px 0 2px;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--mute);
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease;
+}
+
+.button:hover {
+  color: var(--paper);
+  background: color-mix(in srgb, var(--paper) 8%, transparent);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--cold);
+  outline-offset: 1px;
+  color: var(--paper);
+}
+
+.button[data-active="true"] {
+  color: var(--paper);
+  background: color-mix(in srgb, var(--paper) 10%, transparent);
+}
+
+.button[data-copied="true"] {
+  color: var(--ok);
+}
+
+/* Touch/narrow overrides live below — they must follow the base .button and
+   .pre rules (equal specificity; in dev, source order is the tiebreak). */
+
+.root .pre {
+  margin: 0;
+  /* The top strip is the floating toolbar's lane: it must never sit on top of
+     code text (long first lines on narrow screens), so the pre starts below
+     it. */
+  padding: 34px 12px 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--paper);
+  white-space: pre;
+  overflow-x: auto;
+  /* Keep scroll inside the pre under every flex/grid ancestor. */
+  max-width: 100%;
+  min-width: 0;
+  scrollbar-width: thin;
+}
+
+.root .preWrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Touch has no hover, and a phone-sized window wants the fat hit area even
+   when a mouse is driving it: the toolbar is always shown, the buttons carry
+   the full 44px hit area, and the pre leaves a taller toolbar lane. Placed
+   AFTER every base rule it overrides — equal specificity, and in dev source
+   order is the cascade tiebreak. */
+@media (pointer: coarse), (max-width: 560px) {
+  .toolbar {
+    opacity: 1;
+  }
+  .button {
+    width: var(--touch);
+    height: var(--touch);
+  }
+  .root .pre {
+    padding-top: 52px;
+  }
+}
+
+/* highlight.js token classes → palette variables. */
+.root :global(.hljs-comment),
+.root :global(.hljs-quote) {
+  color: var(--tok-comment);
+  font-style: italic;
+}
+
+.root :global(.hljs-keyword),
+.root :global(.hljs-selector-tag),
+.root :global(.hljs-doctag) {
+  color: var(--tok-keyword);
+}
+
+.root :global(.hljs-type),
+.root :global(.hljs-built_in),
+.root :global(.hljs-title.class_),
+.root :global(.hljs-title.class_.inherited__) {
+  color: var(--tok-type);
+}
+
+.root :global(.hljs-string),
+.root :global(.hljs-regexp),
+.root :global(.hljs-char) {
+  color: var(--tok-string);
+}
+
+.root :global(.hljs-number),
+.root :global(.hljs-literal),
+.root :global(.hljs-symbol),
+.root :global(.hljs-bullet) {
+  color: var(--tok-number);
+}
+
+.root :global(.hljs-title),
+.root :global(.hljs-title.function_),
+.root :global(.hljs-section) {
+  color: var(--tok-function);
+}
+
+.root :global(.hljs-meta),
+.root :global(.hljs-meta .hljs-keyword) {
+  color: var(--tok-meta);
+}
+
+.root :global(.hljs-attr),
+.root :global(.hljs-attribute),
+.root :global(.hljs-variable),
+.root :global(.hljs-template-variable),
+.root :global(.hljs-property),
+.root :global(.hljs-params),
+.root :global(.hljs-name) {
+  color: var(--tok-attr);
+}
+
+.root :global(.hljs-deletion) {
+  color: var(--tok-del);
+}
+
+.root :global(.hljs-addition) {
+  color: var(--tok-add);
+}
+
+.root :global(.hljs-emphasis) {
+  font-style: italic;
+}
+
+.root :global(.hljs-strong) {
+  font-weight: 700;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toolbar,
+  .button {
+    transition: none;
+  }
+}

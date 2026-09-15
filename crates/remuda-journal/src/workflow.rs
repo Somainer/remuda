@@ -27,12 +27,13 @@ pub struct WorkflowJournalTailer {
 impl WorkflowJournalTailer {
     /// `session_dir` is `<projects>/<enc>/<sid>/` (the directory that contains `subagents/`).
     pub fn new(session_dir: impl Into<PathBuf>, mut ctx: MapContext) -> Self {
+        let ids = NativeIds::new(ctx.instance_id.as_id().as_str());
         ctx.channel = SourceChannel::WorkflowJournal;
         Self {
             session_dir: session_dir.into(),
             ctx,
             tails: HashMap::new(),
-            ids: NativeIds::new(),
+            ids,
             meta: HashMap::new(),
         }
     }
@@ -182,6 +183,11 @@ impl WorkflowJournalTailer {
                         state: WorkflowState::Running,
                         revision: U64(1),
                         title,
+                        name: None,
+                        description: None,
+                        totals: None,
+                        live: None,
+                        note: None,
                         result_ref: None,
                     })),
                 )?])
@@ -223,6 +229,12 @@ impl WorkflowJournalTailer {
                         model_resolved: model,
                         result_ref: None,
                         revision: U64(1),
+                        latest_tool: None,
+                        tokens: None,
+                        calls: None,
+                        duration_ms: None,
+                        started_at: None,
+                        ended_at: None,
                     })),
                 )?])
             }
@@ -251,6 +263,12 @@ impl WorkflowJournalTailer {
                         model_resolved: unknown("not-emitted"),
                         result_ref: None,
                         revision: U64(2),
+                        latest_tool: None,
+                        tokens: None,
+                        calls: None,
+                        duration_ms: None,
+                        started_at: None,
+                        ended_at: None,
                     })),
                 )?])
             }

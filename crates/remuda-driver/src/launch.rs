@@ -18,10 +18,12 @@
 
 pub mod overlay;
 pub mod session;
+mod shadow;
 pub mod shim;
 
 pub use overlay::{HookOverlay, OverlayOptions, TuiMode, materialize_overlay};
 pub use session::{HookSession, HookSessionOptions};
+pub use shadow::{ShadowFile, ShadowHome, ShadowOptions, materialize_codex, materialize_grok};
 pub use shim::{ShimSet, materialize_shims, shim_disabled};
 
 /// Environment variable that turns the shim off for a session.

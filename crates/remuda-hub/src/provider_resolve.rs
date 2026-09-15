@@ -16,6 +16,8 @@ pub const SOURCE_UNIVERSAL_DEFAULT: &str = "universal-default";
 pub const SOURCE_HOST_INVENTORY: &str = "host-inventory";
 /// No default profile matched; let the host determine whether native auth works.
 pub const SOURCE_NATIVE_FALLBACK: &str = "native-fallback";
+/// Project default provider, between explicit and host binding; design §6.
+pub const SOURCE_PROJECT: &str = "project-default";
 
 /// Chosen Claude provider for one host.
 #[derive(Clone, Debug)]
@@ -67,6 +69,11 @@ pub struct ResolveInput<'a> {
     pub delegation: Option<&'a str>,
     /// Explicit `providerProfileId` from the create body.
     pub provider_profile_id: Option<&'a str>,
+    /// Project default profile id; wins over host bindings but loses to the
+    /// explicit request (design §6).
+    pub project_profile_id: Option<&'a str>,
+    /// Project default delegation (`gateway` / `direct`).
+    pub project_delegation: Option<&'a str>,
 }
 
 /// `universal` or `host:<hostId>`.
@@ -192,57 +199,107 @@ pub fn resolve(input: ResolveInput<'_>) -> Result<ResolvedProvider, HubError> {
         });
     }
 
+    // Project layer: explicit > project > host > global (design §6).
+    let project_delegation = input
+        .project_delegation
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let project_profile = input
+        .project_profile_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     if !explicit_provider {
-        match binding_of(&input.host.provider_binding) {
-            Binding::Native => {
-                return Ok(ResolvedProvider::Native {
-                    source: SOURCE_HOST_BINDING,
-                });
+        if let Some(id) = project_profile.filter(|id| is_real_profile_id(id)) {
+            return match find_profile(input.profiles, id) {
+                Some(profile) if profile_allowed_on_host(&profile.scope, host_id) => {
+                    Ok(ResolvedProvider::Profile {
+                        profile: Box::new(profile.clone()),
+                        source: SOURCE_PROJECT,
+                    })
+                }
+                Some(profile) => Err(HubError::Unsatisfiable {
+                    reasons: vec![format!(
+                        "{host_id}: project profile {} is bound to {}",
+                        profile.id, profile.scope
+                    )],
+                }),
+                None => Err(HubError::Unsatisfiable {
+                    reasons: vec![format!("project provider profile {id} is missing")],
+                }),
+            };
+        }
+        if matches!(project_delegation, Some("none")) {
+            return Ok(ResolvedProvider::Native {
+                source: SOURCE_PROJECT,
+            });
+        }
+        // A project that pins gateway/direct suppresses the host binding: the
+        // project layer sits strictly above it.
+        if project_delegation.is_none() {
+            match binding_of(&input.host.provider_binding) {
+                Binding::Native => {
+                    return Ok(ResolvedProvider::Native {
+                        source: SOURCE_HOST_BINDING,
+                    });
+                }
+                Binding::Profile(id) => {
+                    return match find_profile(input.profiles, &id) {
+                        Some(profile) if profile_allowed_on_host(&profile.scope, host_id) => {
+                            Ok(ResolvedProvider::Profile {
+                                profile: Box::new(profile.clone()),
+                                source: SOURCE_HOST_BINDING,
+                            })
+                        }
+                        Some(profile) => Err(HubError::Unsatisfiable {
+                            reasons: vec![format!(
+                                "{host_id}: host binding profile {} is bound to {}",
+                                profile.id, profile.scope
+                            )],
+                        }),
+                        None => Err(HubError::Unsatisfiable {
+                            reasons: vec![format!(
+                                "{host_id}: host binding profile {id} is missing"
+                            )],
+                        }),
+                    };
+                }
+                Binding::Auto => {}
             }
-            Binding::Profile(id) => {
-                return match find_profile(input.profiles, &id) {
-                    Some(profile) if profile_allowed_on_host(&profile.scope, host_id) => {
-                        Ok(ResolvedProvider::Profile {
-                            profile: Box::new(profile.clone()),
-                            source: SOURCE_HOST_BINDING,
-                        })
-                    }
-                    Some(profile) => Err(HubError::Unsatisfiable {
-                        reasons: vec![format!(
-                            "{host_id}: host binding profile {} is bound to {}",
-                            profile.id, profile.scope
-                        )],
-                    }),
-                    None => Err(HubError::Unsatisfiable {
-                        reasons: vec![format!("{host_id}: host binding profile {id} is missing")],
-                    }),
-                };
-            }
-            Binding::Auto => {}
         }
     }
 
+    let default_source = if project_delegation.is_some() {
+        SOURCE_PROJECT
+    } else {
+        SOURCE_HOST_SCOPED_DEFAULT
+    };
     let host_scope = format!("host:{host_id}");
     if let Some(profile) = default_gateway_in(input.profiles, &host_scope) {
         return Ok(ResolvedProvider::Profile {
             profile: Box::new(profile.clone()),
-            source: SOURCE_HOST_SCOPED_DEFAULT,
+            source: default_source,
         });
     }
+    let universal_source = if project_delegation.is_some() {
+        SOURCE_PROJECT
+    } else {
+        SOURCE_UNIVERSAL_DEFAULT
+    };
     if let Some(profile) = default_gateway_in(input.profiles, "universal") {
         return Ok(ResolvedProvider::Profile {
             profile: Box::new(profile.clone()),
-            source: SOURCE_UNIVERSAL_DEFAULT,
+            source: universal_source,
         });
     }
-    if explicit_gateway {
+    if explicit_gateway || project_delegation == Some("gateway") {
         return Err(HubError::ProviderNotConfigured {
             reasons: vec![format!(
                 "no gateway provider configured for host {host_id}; add a provider or choose native"
             )],
         });
     }
-    if !explicit_provider && host_reports_native_claude(input.host) {
+    if !explicit_provider && project_delegation.is_none() && host_reports_native_claude(input.host)
+    {
         return Ok(ResolvedProvider::Native {
             source: SOURCE_HOST_INVENTORY,
         });
@@ -401,6 +458,8 @@ mod tests {
             profiles,
             delegation,
             provider_profile_id,
+            project_profile_id: None,
+            project_delegation: None,
         })
     }
 

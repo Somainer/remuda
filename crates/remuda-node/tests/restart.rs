@@ -77,18 +77,38 @@ async fn fake_driver_restart_lists_instances_and_replays_folds() {
     let data = tempfile::tempdir().expect("data dir");
     let http = loopback_config(data.path());
     let config = ServeConfig::fake(http, data.path().to_path_buf());
-    let created = {
+    let (instance_id, journal_id, created) = {
         let node = compose(&config).expect("compose");
         let created = node
             .create_instance(create_req("durable hello"))
             .await
             .expect("create");
         wait_for_settlement(&node, &created.command.command_id).await;
-        created
+        // The fast ack returns at `preparing`; wait for the worker to reach
+        // `ready` so the durability assertion reads the terminal lifecycle.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if node
+                    .get_instance(&created.instance.meta.id)
+                    .is_ok_and(|instance| instance.lifecycle == InstanceLifecycle::Ready)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("instance reaches ready");
+        let ready = node
+            .get_instance(&created.instance.meta.id)
+            .expect("ready instance");
+        (ready.meta.id.clone(), ready.journal_id.clone(), created)
     };
-    let instance_id = created.instance.meta.id.clone();
-    let journal_id = created.instance.journal_id.clone();
-    assert_eq!(created.instance.lifecycle, InstanceLifecycle::Ready);
+    assert_eq!(
+        created.instance.lifecycle,
+        InstanceLifecycle::Preparing,
+        "the ack itself is returned while materialization is still running"
+    );
 
     let restarted = compose(&config).expect("reopen");
     let listed = restarted.list_instances().expect("list");

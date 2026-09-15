@@ -19,6 +19,7 @@ pub mod approval;
 pub mod bus;
 pub mod decision;
 pub mod event;
+pub mod live;
 pub mod map;
 pub mod pending;
 pub mod socket;
@@ -30,6 +31,7 @@ pub use decision::{
     decision_behavior,
 };
 pub use event::{HookEnvelope, HookEvent, HookReply};
+pub use live::{LiveFold, LiveState, Phase, tool_node_id};
 pub use map::{Mapped, MappedKind, map_event};
 pub use pending::{DecisionKey, Outcome, PendingDecisions, RetireReason};
 pub use socket::{Delivery, HookServer, SignalSink, SocketError, deliver_event, send_event};

@@ -386,6 +386,28 @@ pub struct InstanceCreateParams {
     pub workspace_id: Option<String>,
 }
 
+/// Kind of a staged attachment (D-027b, 2026-09-15).
+///
+/// Images keep the native image delivery a harness supports (a base64 image
+/// block for `claude-print`, a readable path for the PTY family); every other
+/// kind is delivered as a path reference the harness can open with its own
+/// file tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentKind {
+    /// PNG, JPEG, GIF or WebP, sniffed from the bytes by the Hub.
+    Image,
+    /// Any other file. Delivered as a path reference, never inlined.
+    File,
+}
+
+impl Default for AttachmentKind {
+    /// Frames written before D-027b carried images only.
+    fn default() -> Self {
+        Self::Image
+    }
+}
+
 /// One staged attachment referenced by an `instance.send` command (D-027).
 ///
 /// Metadata only. The bytes live behind `GET /v1/objects/{objectId}` on the
@@ -396,14 +418,25 @@ pub struct InstanceCreateParams {
 pub struct AttachmentRef {
     /// Hub object identity (`obj_…`).
     pub object_id: String,
-    /// Sniffed media type (`image/png`, `image/jpeg`, `image/gif`, `image/webp`).
+    /// Image vs. arbitrary file (D-027b). Defaults to image for frames written
+    /// before the field existed.
+    #[serde(default)]
+    pub kind: AttachmentKind,
+    /// MIME type as determined by the Hub: magic-byte sniff for images, the
+    /// sanitised declared `Content-Type` for everything else.
     pub media_type: String,
-    /// Display name for the UI. Never used to build a local path.
+    /// Sanitised original filename (no path separators, no control characters,
+    /// length-capped). The Node lands the pull under this name; it is never
+    /// used unsanitised as a path component.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Stored byte length, for local budget checks before the pull.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Lowercase hex SHA-256 of the bytes, so the Node can verify the pull
+    /// landed byte-identical (D-027b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     /// 1-based anchor number, matching the `[Image #n]` token in the prompt
     /// text and the composer chip (2026-09-15). The array is ordered by token
     /// appearance; older clients omit this and the receiver falls back to the
@@ -434,6 +467,120 @@ pub struct InstanceSendParams {
     /// not know this field simply degrades the send to text-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentRef>,
+}
+
+impl AttachmentKind {
+    /// Classify a Hub-accepted media type. Images keep native delivery;
+    /// everything else is delivered as a path reference (D-027b).
+    #[must_use]
+    pub fn from_media_type(media_type: &str) -> Self {
+        match media_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" => {
+                AttachmentKind::Image
+            }
+            _ => AttachmentKind::File,
+        }
+    }
+
+    /// Wire form used in SQLite rows and journal metadata.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttachmentKind::Image => "image",
+            AttachmentKind::File => "file",
+        }
+    }
+}
+
+impl std::str::FromStr for AttachmentKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "image" => Ok(AttachmentKind::Image),
+            "file" => Ok(AttachmentKind::File),
+            other => Err(format!("unknown attachment kind {other}")),
+        }
+    }
+}
+
+/// Longest original filename carried through staging (D-027b).
+///
+/// One byte under the usual 256 NAME_MAX so a sanitised name never lands on a
+/// filesystem that rejects the boundary itself.
+pub const MAX_ATTACHMENT_NAME_LEN: usize = 255;
+
+/// Sanitise a caller-supplied attachment filename (D-027b).
+///
+/// The name is metadata, not a trusted path: it must contain no path
+/// separators (`/`, `\`), no control characters (including NUL), and is capped
+/// at [`MAX_ATTACHMENT_NAME_LEN`] bytes. Leading/trailing whitespace and dots
+/// are trimmed so a name cannot hide as a dotfile or trailing-dot junk.
+/// Returns `None` when nothing usable remains — the caller then synthesises a
+/// name rather than rejecting the upload.
+#[must_use]
+pub fn sanitize_attachment_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains(['/', '\\'])
+        || trimmed.chars().any(char::is_control)
+        || trimmed.len() > MAX_ATTACHMENT_NAME_LEN
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// Conventional extension (without the dot) for a media type, used when no
+/// original filename is available. Unknown types fall back to `bin`.
+#[must_use]
+pub fn extension_for_media_type(media_type: &str) -> &'static str {
+    match media_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        "application/json" => "json",
+        "application/zip" | "application/x-zip-compressed" => "zip",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/x-tar" => "tar",
+        "application/x-bzip2" => "bz2",
+        "application/x-7z-compressed" => "7z",
+        "application/x-xz" => "xz",
+        "application/rtf" => "rtf",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.ms-powerpoint" => "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "pptx",
+        "audio/mpeg" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/ogg" => "ogg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        _ => "bin",
+    }
 }
 
 /// `instance.cancel` params.
@@ -1044,6 +1191,62 @@ mod tests {
         .expect("de");
         assert_eq!(wrapped.attachments()[0].object_id, "obj_2");
         assert_eq!(wrapped.attachments()[0].name, None);
+    }
+
+    #[test]
+    fn attachment_kind_defaults_to_image_and_classifies_files() {
+        assert_eq!(AttachmentKind::default(), AttachmentKind::Image);
+        assert_eq!(
+            AttachmentKind::from_media_type("image/png"),
+            AttachmentKind::Image
+        );
+        assert_eq!(
+            AttachmentKind::from_media_type("image/jpeg; charset=binary"),
+            AttachmentKind::Image
+        );
+        assert_eq!(
+            AttachmentKind::from_media_type("application/pdf"),
+            AttachmentKind::File
+        );
+        assert_eq!(AttachmentKind::from_media_type(""), AttachmentKind::File);
+        let legacy: AttachmentRef =
+            serde_json::from_value(json!({"objectId":"o","mediaType":"image/png"}))
+                .expect("legacy frame");
+        assert_eq!(legacy.kind, AttachmentKind::Image);
+    }
+
+    #[test]
+    fn filename_sanitisation_rejects_paths_controls_and_oversize() {
+        assert_eq!(
+            sanitize_attachment_name("report.pdf").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            sanitize_attachment_name("  季度报告 Q3.pdf  ").as_deref(),
+            Some("季度报告 Q3.pdf")
+        );
+        assert_eq!(sanitize_attachment_name("../etc/passwd"), None);
+        assert_eq!(sanitize_attachment_name("a\\b.txt"), None);
+        assert_eq!(sanitize_attachment_name("nul\0.txt"), None);
+        assert_eq!(sanitize_attachment_name("line\nbreak.txt"), None);
+        assert_eq!(sanitize_attachment_name("   "), None);
+        assert_eq!(sanitize_attachment_name("..."), None);
+        assert_eq!(sanitize_attachment_name(&"a".repeat(256)), None);
+        let max_name = "a".repeat(255);
+        assert_eq!(
+            sanitize_attachment_name(&max_name).as_deref(),
+            Some(max_name.as_str())
+        );
+    }
+
+    #[test]
+    fn extensions_map_for_known_and_unknown_types() {
+        assert_eq!(extension_for_media_type("application/pdf"), "pdf");
+        assert_eq!(extension_for_media_type("text/plain; charset=utf-8"), "txt");
+        assert_eq!(extension_for_media_type("application/zip"), "zip");
+        assert_eq!(extension_for_media_type("image/png"), "png");
+        assert_eq!(extension_for_media_type("application/x-weird-blob"), "bin");
+        assert_eq!(extension_for_media_type(""), "bin");
     }
 
     #[test]

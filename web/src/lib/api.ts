@@ -487,8 +487,19 @@ export type HubApi = {
   ): Promise<CommandResult>;
   /** D-028 §5.3: interrupt the current turn; the process and session stay alive. */
   instanceCancel(instanceId: Id): Promise<CommandResult>;
-  /** Stage one image for a later send (D-027). Returns its `obj_…` id. */
-  objectUpload(instanceId: Id, blob: Blob, mediaType: string): Promise<{ objectId: string; size: number }>;
+  /** Stage one attachment for a later send (D-027/D-027b). Returns its id. */
+  objectUpload(
+    instanceId: Id,
+    blob: Blob,
+    mediaType: string,
+    fileName?: string,
+  ): Promise<{
+    objectId: string;
+    size: number;
+    kind: "image" | "file";
+    name: string | null;
+    mediaType: string;
+  }>;
   instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
   fleetBroadcast(body: FleetBroadcastBody): Promise<FleetBroadcastResult>;
   worktreeList(hostId?: string): Promise<WorktreePage>;
@@ -753,11 +764,17 @@ function createMockApi(): HubApi {
     async instanceCancel(instanceId) {
       return mockCancel(instanceId);
     },
-    async objectUpload(_instanceId, blob, mediaType) {
+    async objectUpload(_instanceId, blob, mediaType, fileName) {
       // The mock Hub stages nothing; a deterministic id keeps the composer
       // exercisable offline.
       void mediaType;
-      return { objectId: id("obj_"), size: blob.size };
+      return {
+        objectId: id("obj_"),
+        size: blob.size,
+        kind: mediaType.startsWith("image/") ? ("image" as const) : ("file" as const),
+        name: fileName ?? null,
+        mediaType,
+      };
     },
     async instanceKeys(instanceId, key) {
       return mockKeys(instanceId, key);
@@ -1194,23 +1211,23 @@ function createLiveApi(): HubApi {
     async instanceCancel(instanceId) {
       return command(instanceId, "instance.cancel", {});
     },
-    async objectUpload(instanceId, blob, mediaType) {
+    async objectUpload(instanceId, blob, mediaType, fileName) {
       // Raw body plus Content-Type: no multipart, and the bytes never pass
       // through JSON. `rest` always sends application/json, so this posts
-      // directly.
+      // directly. The original filename rides the `name` query parameter;
+      // the Hub sanitises it (D-027b).
       const session = readSession();
-      const res = await fetch(
-        `${hubBase()}/v1/objects?instanceId=${encodeURIComponent(instanceId)}`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "content-type": mediaType,
-            ...(session ? { "X-Remuda-Device-Id": session.deviceId } : {}),
-          },
-          body: blob,
+      const query = new URLSearchParams({ instanceId });
+      if (fileName) query.set("name", fileName);
+      const res = await fetch(`${hubBase()}/v1/objects?${query.toString()}`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "content-type": mediaType,
+          ...(session ? { "X-Remuda-Device-Id": session.deviceId } : {}),
         },
-      );
+        body: blob,
+      });
       if (!res.ok) {
         const text = await res.text();
         let code = `HTTP_${res.status}`;
@@ -1224,8 +1241,20 @@ function createLiveApi(): HubApi {
         }
         throw new HubHttpError(res.status, code, message, []);
       }
-      const body = (await res.json()) as { objectId: string; size: number };
-      return { objectId: body.objectId, size: body.size };
+      const body = (await res.json()) as {
+        objectId: string;
+        size: number;
+        kind?: "image" | "file";
+        name?: string | null;
+        mediaType?: string;
+      };
+      return {
+        objectId: body.objectId,
+        size: body.size,
+        kind: body.kind ?? "image",
+        name: body.name ?? null,
+        mediaType: body.mediaType ?? mediaType,
+      };
     },
     async instanceKeys(instanceId, key) {
       return command(instanceId, "tty.write", { keys: [key], source: "ui" });

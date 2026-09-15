@@ -73,14 +73,18 @@ export type LocalBubble = {
 };
 
 /**
- * One image shown under a sent bubble. `index` is its 1-based `[Image #n]`
- * anchor (from the send manifest), so an inline token can be paired with the
- * thumbnail.
+ * One file/image shown under a sent bubble. `index` is its 1-based
+ * `[Image #n]`/`[File #n]` anchor (from the send manifest), so an inline
+ * token can be paired with the chip.
  */
 export type BubbleAttachment = {
   objectId: string;
   name: string;
+  /** Blob URL for an optimistic image; files link straight to the Hub. */
   previewUrl: string;
+  kind: "image" | "file";
+  mediaType: string;
+  size: number;
   index?: number;
 };
 

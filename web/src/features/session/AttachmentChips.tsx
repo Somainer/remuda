@@ -1,17 +1,20 @@
-import type { Attachment } from "../../lib/attachments";
+import type { Attachment, AttachmentKind } from "../../lib/attachments";
+import { formatSize } from "../../lib/attachments";
 import type { DraftCodeQuote } from "../../lib/codeAnchors";
 import { quotePreview } from "../../lib/codeAnchors";
 import css from "./AttachmentChips.module.css";
 
 /**
- * Thumbnails for images staged on the current draft (D-027).
+ * Thumbnails/type chips for files staged on the current draft (D-027/D-027b).
  *
  * A failed chip stays in place with its message rather than disappearing, so
  * the upload can be retried without re-picking the file.
  *
  * Each chip carries its 1-based anchor number (2026-09-15): the same number
- * is in the prompt's `[Image #n]` token. A chip whose token was edited out of
- * the text is marked "未引用" — the image is still sent — rather than removed.
+ * is in the prompt's `[Image #n]`/`[File #n]` token. Images show a thumbnail;
+ * every other file shows a type glyph (D-027b, 2026-09-15). A chip whose
+ * token was edited out of the text is marked "未引用" — the file is still sent
+ * — rather than removed.
  */
 export function AttachmentChips({
   attachments,
@@ -20,7 +23,7 @@ export function AttachmentChips({
   onRetry,
 }: {
   attachments: Attachment[];
-  /** localIds whose `[Image #n]` token no longer appears in the draft text. */
+  /** localIds whose anchor token no longer appears in the draft text. */
   unreferenced?: ReadonlySet<string>;
   onRemove: (localId: string) => void;
   onRetry?: (localId: string) => void;
@@ -36,12 +39,23 @@ export function AttachmentChips({
             key={attachment.localId}
             className={css.chip}
             data-state={attachment.state}
+            data-kind={attachment.kind}
             data-unreferenced={orphan ? "1" : "0"}
             data-index={index}
             data-testid="attachment-chip"
           >
             <span className={css.thumbWrap}>
-              <img className={css.thumb} src={attachment.previewUrl} alt={attachment.name} />
+              {attachment.kind === "image" ? (
+                <img
+                  className={css.thumb}
+                  src={attachment.previewUrl}
+                  alt={attachment.name}
+                />
+              ) : (
+                <span className={css.fileGlyph} aria-hidden>
+                  {fileGlyph(attachment.name, attachment.mediaType)}
+                </span>
+              )}
               <span className={css.indexBadge} data-testid="attachment-index" aria-hidden>
                 {index}
               </span>
@@ -74,7 +88,7 @@ export function AttachmentChips({
             <button
               type="button"
               className={css.remove}
-              aria-label={`移除 ${attachment.name}（图片 ${index}）`}
+              aria-label={`移除 ${attachment.name}（附件 ${index}）`}
               data-testid="attachment-remove"
               onClick={() => onRemove(attachment.localId)}
             >
@@ -87,39 +101,114 @@ export function AttachmentChips({
   );
 }
 
-/** Thumbnails shown beneath a message that was sent with images. */
+/** Short extension label for a non-image chip badge. */
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1) return "";
+  return name.slice(dot + 1).slice(0, 4).toUpperCase();
+}
+
+/** Type glyph for a non-image file. */
+function fileGlyph(name: string, mediaType: string): string {
+  const ext = extensionOf(name).toLowerCase();
+  if (mediaType.startsWith("audio/") || ["mp3", "wav", "ogg", "flac"].includes(ext)) return "🎵";
+  if (mediaType.startsWith("video/") || ["mp4", "webm", "mov"].includes(ext)) return "🎬";
+  if (["zip", "gz", "tar", "bz2", "7z", "xz", "rar"].includes(ext)) return "🗜️";
+  if (["pdf"].includes(ext)) return "📕";
+  if (["doc", "docx"].includes(ext)) return "📘";
+  if (["xls", "xlsx", "csv"].includes(ext)) return "📗";
+  if (["ppt", "pptx"].includes(ext)) return "📙";
+  if (["txt", "md", "log"].includes(ext) || mediaType.startsWith("text/")) return "📄";
+  if (["json", "js", "ts", "tsx", "rs", "py", "go", "java", "c", "cpp", "sh"].includes(ext)) {
+    return "📜";
+  }
+  return "📎";
+}
+
+/** Relative Hub object URL — same-origin in prod and through the Vite proxy. */
+export function objectUrl(objectId: string): string {
+  return `/v1/objects/${encodeURIComponent(objectId)}`;
+}
+
+/** Files/images shown beneath a message that was sent with attachments. */
 export function SentAttachments({
   attachments,
 }: {
-  attachments: { objectId: string; name: string; previewUrl: string; index?: number }[];
+  attachments: SentAttachment[];
 }) {
   if (attachments.length === 0) return null;
   return (
     <div className={css.sent} data-testid="sent-attachments">
-      {attachments.map((attachment) => (
-        <span key={attachment.objectId} className={css.sentWrap}>
-          <img
-            className={css.sentThumb}
-            src={attachment.previewUrl}
-            alt={attachment.name}
-            data-index={attachment.index ?? ""}
-          />
-          {attachment.index ? (
-            <span className={css.indexBadge} data-testid="sent-attachment-index" aria-hidden>
-              {attachment.index}
+      {attachments.map((attachment) => {
+        const indexLabel = attachment.index ? ` #${attachment.index}` : "";
+        if (attachment.kind === "image") {
+          return (
+            <span key={attachment.objectId} className={css.sentWrap}>
+              <a href={objectUrl(attachment.objectId)} target="_blank" rel="noreferrer">
+                <img
+                  className={css.sentThumb}
+                  // For a freshly sent bubble this is the local blob URL; a
+                  // reloaded view would use the Hub object URL instead.
+                  src={attachment.previewUrl}
+                  alt={attachment.name}
+                  data-index={attachment.index ?? ""}
+                />
+              </a>
+              {attachment.index ? (
+                <span className={css.indexBadge} data-testid="sent-attachment-index" aria-hidden>
+                  {attachment.index}
+                </span>
+              ) : null}
             </span>
-          ) : null}
-        </span>
-      ))}
+          );
+        }
+        return (
+          <a
+            key={attachment.objectId}
+            className={css.sentFile}
+            href={objectUrl(attachment.objectId)}
+            target="_blank"
+            rel="noreferrer"
+            download={attachment.name}
+            data-testid="sent-file"
+            data-index={attachment.index ?? ""}
+            title={`下载 ${attachment.name}`}
+          >
+            <span className={css.sentFileGlyph} aria-hidden>
+              {fileGlyph(attachment.name, attachment.mediaType)}
+            </span>
+            <span className={css.sentFileMeta}>
+              <span className={css.sentFileName}>{attachment.name}</span>
+              <span className={css.sentFileSize}>
+                {formatSize(attachment.size)}
+                {indexLabel}
+              </span>
+            </span>
+          </a>
+        );
+      })}
     </div>
   );
 }
 
+/** A file/image shown under a sent bubble. */
+export type SentAttachment = {
+  objectId: string;
+  name: string;
+  /** Blob URL for an optimistic image; unused for files (they link to Hub). */
+  previewUrl: string;
+  kind: AttachmentKind;
+  mediaType: string;
+  size: number;
+  /** 1-based number matching the prompt token. */
+  index?: number;
+};
+
 /**
  * Draft chips for quoted code blocks (workbench-code-2). Same visual language
- * as the image chips: numbered badge, title row, a one-line preview, and the
+ * as the file chips: numbered badge, title row, a one-line preview, and the
  * × that strips the `[Code #n]` token. A quote whose token was edited out is
- * dashed + "未引用（仍会发送）", exactly like image chips.
+ * dashed + "未引用（仍会发送）", exactly like file chips.
  */
 export function CodeQuoteChips({
   quotes,
@@ -178,20 +267,13 @@ export function CodeQuoteChips({
   );
 }
 
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 /**
- * The three ways to attach an image.
+ * The ways to attach a file.
  *
- * Three, not one, because no single entry point covers every platform: the
- * file picker is the reliable path on mobile, the camera entry is a
- * convenience, and the explicit paste button is the only escape hatch when
- * iOS declares a clipboard image but exposes no file, or when the on-screen
- * keyboard offers no paste affordance at all.
+ * The picker accepts any file type (D-027b); the camera entry stays
+ * image-only. The explicit paste button reads images from the async
+ * clipboard API — the escape hatch when iOS declares a clipboard image but
+ * exposes no file.
  */
 export function AttachButtons({
   disabled,
@@ -209,11 +291,14 @@ export function AttachButtons({
   const pick = (capture?: "environment") => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = "image/*";
+    // Any file type; images are normalised in the browser, everything else
+    // passes through to the Hub unchanged (D-027b).
+    if (!capture) input.accept = "*/*";
+    else input.accept = "image/*";
     input.multiple = true;
     if (capture) input.capture = capture;
     input.onchange = () => {
-      const files = Array.from(input.files ?? []).filter((file) => file.type.startsWith("image/"));
+      const files = Array.from(input.files ?? []);
       if (files.length) onFiles(files);
     };
     input.click();
@@ -224,8 +309,8 @@ export function AttachButtons({
         type="button"
         className={className}
         data-testid="attach-file"
-        aria-label="添加图片"
-        title="添加图片"
+        aria-label="添加附件"
+        title="添加附件"
         disabled={disabled}
         onClick={() => pick()}
       >
@@ -248,12 +333,12 @@ export function AttachButtons({
         type="button"
         className={className}
         data-testid="attach-paste"
-        aria-label="粘贴图片"
-        title="粘贴图片"
+        aria-label="粘贴附件"
+        title="粘贴附件"
         disabled={disabled}
         onClick={onPasteClick}
       >
-        粘贴图片
+        粘贴附件
       </button>
     </>
   );

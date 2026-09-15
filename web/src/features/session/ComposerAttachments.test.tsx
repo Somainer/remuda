@@ -46,7 +46,23 @@ function pasteEvent(files: File[], types = ["image/png"]) {
 
 beforeEach(() => {
   upload.mockReset();
-  upload.mockResolvedValue({ objectId: "obj_pasted", size: 4 });
+  // Echo the uploaded blob's size/type/name so the chip settles with the same
+  // metadata the real Hub would resolve.
+  upload.mockImplementation(
+    (
+      _instanceId: string,
+      blob: Blob,
+      mediaType: string,
+      fileName?: string,
+    ) =>
+      Promise.resolve({
+        objectId: "obj_pasted",
+        size: blob.size,
+        kind: mediaType.startsWith("image/") ? "image" : "file",
+        name: fileName ?? null,
+        mediaType,
+      }),
+  );
   globalThis.URL.createObjectURL = vi.fn(() => "blob:preview");
   globalThis.URL.revokeObjectURL = vi.fn();
 });
@@ -83,7 +99,14 @@ describe("composer attachments", () => {
     const [text, refs] = onSend.mock.calls[0];
     expect(text).toBe("what colour is this? [Image #1]");
     expect(refs).toEqual([
-      { index: 1, objectId: "obj_pasted", mediaType: "image/png", name: "shot.png", size: 4 },
+      {
+        index: 1,
+        objectId: "obj_pasted",
+        kind: "image",
+        mediaType: "image/png",
+        name: "shot.png",
+        size: 4,
+      },
     ]);
   });
 
@@ -128,7 +151,13 @@ describe("composer attachments", () => {
 
   // A half-uploaded reference would not resolve on the Hub.
   it("blocks sending while an upload is still in flight", async () => {
-    let release: (value: { objectId: string; size: number }) => void = () => {};
+    let release: (value: {
+      objectId: string;
+      size: number;
+      kind: "image" | "file";
+      name: string | null;
+      mediaType: string;
+    }) => void = () => {};
     upload.mockImplementation(
       () => new Promise<{ objectId: string; size: number }>((resolve) => (release = resolve)),
     );
@@ -140,22 +169,34 @@ describe("composer attachments", () => {
     await waitFor(() =>
       expect(screen.getByTestId("composer-send").hasAttribute("disabled")).toBe(true),
     );
-    release({ objectId: "obj_late", size: 4 });
+    release({
+      objectId: "obj_late",
+      size: 4,
+      kind: "image",
+      name: "shot.png",
+      mediaType: "image/png",
+    });
     await waitFor(() =>
       expect(screen.getByTestId("composer-send").hasAttribute("disabled")).toBe(false),
     );
   });
 
   it("keeps a failed upload on screen so it can be retried", async () => {
-    upload.mockRejectedValueOnce(new Error("图片太大（上限 5 MB）"));
+    upload.mockRejectedValueOnce(new Error("文件太大（上限 25.0 MB）"));
     render(<Composer instanceId="ins_fail" mobile={false} onSend={vi.fn()} />);
     fireEvent.paste(screen.getByTestId("composer-input"), pasteEvent([png()]));
 
     const chip = await screen.findByTestId("attachment-chip");
     await waitFor(() => expect(chip.getAttribute("data-state")).toBe("failed"));
-    expect(screen.getByText("图片太大（上限 5 MB）")).toBeTruthy();
+    expect(screen.getByText("文件太大（上限 25.0 MB）")).toBeTruthy();
 
-    upload.mockResolvedValue({ objectId: "obj_retried", size: 4 });
+    upload.mockResolvedValue({
+      objectId: "obj_retried",
+      size: 4,
+      kind: "image",
+      name: "shot.png",
+      mediaType: "image/png",
+    });
     fireEvent.click(screen.getByTestId("attachment-retry"));
     await waitFor(() => expect(chip.getAttribute("data-state")).toBe("ready"));
   });
@@ -195,5 +236,46 @@ describe("composer attachments", () => {
     expect(screen.getByTestId("attach-file")).toBeTruthy();
     expect(screen.getByTestId("attach-camera")).toBeTruthy();
     expect(screen.getByTestId("attach-paste")).toBeTruthy();
+    // D-027b: labels say attachment, not image.
+    expect(screen.getByTestId("attach-file").getAttribute("aria-label")).toBe("添加附件");
+    expect(screen.getByTestId("attach-paste").textContent).toBe("粘贴附件");
+  });
+
+  // D-027b: a non-image paste stages a file chip, inserts [File #1] (not an
+  // image token), and the manifest carries kind=file.
+  it("stages a pasted PDF as a file chip with a [File #1] token", async () => {
+    const onSend = vi.fn();
+    const { container } = render(
+      <Composer instanceId="ins_file" mobile={false} onSend={onSend} />,
+    );
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    const pdf = new File([new Uint8Array(1200)], "Q3 report.pdf", {
+      type: "application/pdf",
+    });
+    fireEvent.paste(input, pasteEvent([pdf], ["application/pdf"]));
+
+    const chip = await screen.findByTestId("attachment-chip");
+    expect(chip.getAttribute("data-kind")).toBe("file");
+    expect(screen.getByText("Q3 report.pdf")).toBeTruthy();
+    expect(input.value).toBe("[File #1]");
+    expect(container.querySelector("img")).toBeNull();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-send").hasAttribute("disabled")).toBe(false),
+    );
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(onSend).toHaveBeenCalled());
+    const [text, refs] = onSend.mock.calls[0];
+    expect(text).toBe("[File #1]");
+    expect(refs).toEqual([
+      {
+        index: 1,
+        objectId: "obj_pasted",
+        kind: "file",
+        mediaType: "application/pdf",
+        name: "Q3 report.pdf",
+        size: 1200,
+      },
+    ]);
   });
 });

@@ -380,6 +380,7 @@ async fn create_fleet(
                 spec: host_spec,
                 operation: "instance.create",
                 idempotency_key: None,
+                delegation: crate::store::InstanceDelegation::default(),
             },
         )
         .await?;

@@ -152,6 +152,16 @@ impl HubClient {
         self.send(reqwest::Method::POST, path, Some(body)).await
     }
 
+    /// `PATCH` JSON.
+    pub async fn patch(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
+        self.send(reqwest::Method::PATCH, path, Some(body)).await
+    }
+
+    /// `DELETE` with a JSON body.
+    pub async fn delete(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
+        self.send(reqwest::Method::DELETE, path, Some(body)).await
+    }
+
     /// `GET /v1/hosts` → `items`.
     pub async fn list_hosts(&self) -> Result<Vec<Value>, ClientError> {
         let body = self.get("/v1/hosts").await?;

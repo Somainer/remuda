@@ -14,6 +14,7 @@ mod agent_scope;
 mod alerts;
 mod attachments;
 mod auth;
+mod bot;
 mod config;
 mod devices;
 mod error;
@@ -27,6 +28,7 @@ mod maintenance;
 mod objects;
 mod passkeys;
 mod placement;
+mod projects;
 mod provider_models;
 mod provider_resolve;
 mod providers;
@@ -36,6 +38,7 @@ mod rate_limit;
 mod registry;
 pub mod ssh_hosts;
 mod store;
+mod store_tickets;
 mod transport;
 mod tty;
 mod web;
@@ -88,6 +91,29 @@ pub struct AppState {
     challenges: passkeys::ChallengeStore,
 }
 
+/// Test-only constructors for types private modules would otherwise hide
+/// from integration tests. Not part of the supported API.
+#[doc(hidden)]
+pub mod store_test_support {
+    use crate::store::InstanceDelegation;
+
+    /// A leaf-worker delegation scoped to one project.
+    pub fn leaf_delegation(project_id: &str) -> Result<InstanceDelegation, String> {
+        let project = remuda_protocol::ProjectId::try_from(project_id.to_string())
+            .map_err(|err| err.to_string())?;
+        Ok(InstanceDelegation {
+            role: Some(remuda_protocol::ROLE_WORKER.into()),
+            scope: remuda_protocol::InstanceScope {
+                project_ids: vec![project],
+                ..Default::default()
+            },
+            grants: Vec::new(),
+            task_id: None,
+            enforce_tree: true,
+        })
+    }
+}
+
 /// A bound Hub that shuts down when dropped.
 pub struct RunningHub {
     /// Actual listen address (port may be ephemeral).
@@ -97,6 +123,8 @@ pub struct RunningHub {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
     store: Option<Store>,
+    /// Live in-process state, for tests that register a synthetic Node.
+    state: AppState,
 }
 
 impl RunningHub {
@@ -104,6 +132,80 @@ impl RunningHub {
     #[must_use]
     pub fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// Test helper: insert an online host row directly (no WS enroll).
+    #[doc(hidden)]
+    pub async fn test_insert_host(&self, host_id: &str) -> anyhow::Result<()> {
+        if let Some(store) = self.store.as_ref() {
+            let host_id = host_id.to_owned();
+            store
+                .run(move |conn| {
+                    let now = crate::config::now_rfc3339();
+                    conn.execute(
+                        "INSERT OR REPLACE INTO hosts
+                            (id, label, token_hash, state, last_seen_at, node_version, cli_json,
+                             capabilities_json, created_at, transport, labels_json, herdr_json,
+                             resources_json, max_instances, hostname, token_prefix)
+                         VALUES (?1, ?1, 'x', 'online', ?2, '0.1.0-test', '[]', '{}', ?2,
+                                 'outbound-wss', '[]', NULL, NULL, 8, 'scripted-node', NULL)",
+                        rusqlite::params![host_id, now],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Test helper: mint an instance-scoped agent credential (operator-only
+    /// routes must reject it with 403).
+    #[doc(hidden)]
+    pub async fn test_mint_agent_token(
+        &self,
+        device_name: &str,
+        instance_id: &str,
+    ) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let token = config::random_token();
+        let hash = auth::hash_secret(&token)?;
+        let prefix = auth::token_prefix(&token)
+            .ok_or_else(|| anyhow::anyhow!("generated device token is not indexable"))?
+            .to_owned();
+        store
+            .insert_device_as(
+                device_name.into(),
+                hash,
+                prefix,
+                "agent".into(),
+                Some(instance_id.into()),
+            )
+            .await?;
+        Ok(token)
+    }
+
+    /// Test helper: replace a host's live Node transport with a synthetic one
+    /// whose every RPC returns `reply` (the full JSON-RPC frame; `None` models
+    /// an unwritable session → 422). Insert the host row first.
+    #[doc(hidden)]
+    pub async fn test_set_node_reply(&self, host_id: &str, reply: Option<serde_json::Value>) {
+        use std::sync::Arc as StdArc;
+        self.state
+            .nodes
+            .insert(
+                host_id.to_owned(),
+                StdArc::new(crate::transport::ScriptedTransport::new(reply)),
+            )
+            .await;
+    }
+
+    /// Test helper: drop the live Node session for `host_id` (host goes offline).
+    #[doc(hidden)]
+    pub async fn test_disconnect_node(&self, host_id: &str) {
+        self.state.nodes.remove(host_id).await;
     }
 
     /// Mint a scoped device token against this Hub's store (D-018).
@@ -269,7 +371,7 @@ async fn spawn_inner(
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
     let reaper_state = state.clone();
-    let app = router(state);
+    let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
     persist_listen(&config.data_dir, addr)?;
@@ -307,6 +409,7 @@ async fn spawn_inner(
         shutdown: Some(tx),
         task: Some(task),
         store: Some(store),
+        state,
     })
 }
 
@@ -350,6 +453,7 @@ pub fn router(state: AppState) -> Router {
         .merge(tty::routes())
         .merge(ws::routes())
         .merge(placement::routes())
+        .merge(projects::routes())
         .merge(fleet::routes())
         .merge(devices::routes())
         .merge(passkeys::routes())
@@ -357,7 +461,8 @@ pub fn router(state: AppState) -> Router {
         .merge(agent_scope::routes())
         .merge(objects::routes())
         .merge(attachments::routes())
-        .merge(workspaces::routes());
+        .merge(workspaces::routes())
+        .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));
     }

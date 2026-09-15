@@ -6,10 +6,11 @@ use futures::{SinkExt, StreamExt};
 use remuda_hub::{DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, spawn};
 use remuda_protocol::{HostId, InteractionId};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -237,9 +238,17 @@ async fn fake_node(
             .context("authorization header")?,
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    let host = host_id.as_id().as_str();
     let workspaces = json!([
-        { "workspaceId": "wsp_e2e", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e" },
-        { "workspaceId": "wsp_e2e_second", "hostId": host_id.as_id().as_str(), "root": "/tmp/remuda-e2e-second" }
+        { "workspaceId": "wsp_e2e", "hostId": host, "root": "/tmp/remuda-e2e" },
+        { "workspaceId": "wsp_e2e_second", "hostId": host, "root": "/tmp/remuda-e2e-second" },
+        // G2 files-view synthetic scenarios (docs/design/files-view-contract.md §3.6).
+        { "workspaceId": "wsp_g2_changes", "hostId": host, "root": "/tmp/remuda-g2/changes" },
+        { "workspaceId": "wsp_g2_clean", "hostId": host, "root": "/tmp/remuda-g2/clean" },
+        { "workspaceId": "wsp_g2_nogit", "hostId": host, "root": "/tmp/remuda-g2/nogit" },
+        { "workspaceId": "wsp_g2_denied", "hostId": host, "root": "/tmp/remuda-g2/denied" },
+        { "workspaceId": "wsp_g2_trunc", "hostId": host, "root": "/tmp/remuda-g2/trunc" },
+        { "workspaceId": "wsp_g2_changed", "hostId": host, "root": "/tmp/remuda-g2/changed" }
     ]);
     ws.send(Message::Text(
         json!({
@@ -257,6 +266,8 @@ async fn fake_node(
                     "labels": { "role": "e2e" },
                     // The shared Hub, slider and spaces scenarios create five instances.
                     "maxInstances": 8,
+                    // Inventory only: this harness never launches herdr.
+                    "herdr": { "version": "e2e-fake" },
                     "cli": [{
                         "kind": "claude",
                         "version": "2.1.268",
@@ -279,6 +290,11 @@ async fn fake_node(
                             "kind": "claude-print",
                             "launchable": true,
                             "reasonCode": "fake-node-legacy"
+                        },
+                        {
+                            "kind": "claude-pty",
+                            "launchable": true,
+                            "reasonCode": "fake-node-resume"
                         },
                         {
                             "kind": "generic-pty",
@@ -312,6 +328,8 @@ async fn fake_node(
     // (so the test can prove an Escape reached the process rather than being
     // swallowed by the browser) and echoes a visible marker back.
     let mut ttys: HashMap<String, TtyFake> = HashMap::new();
+    // A failed Claude launch must not acquire a TTY through lazy attach.
+    let mut claude_ptys = HashSet::new();
     while let Some(msg) = ws.next().await {
         let Ok(Message::Text(text)) = msg else {
             continue;
@@ -341,7 +359,54 @@ async fn fake_node(
                 )
                 .await?;
             }
-            "instance.create" => {
+            "instance.create" | "instance.resume" => {
+                let spec = params.get("spec").unwrap_or(&params);
+                if spec.get("driver").and_then(Value::as_str) == Some("claude-pty") {
+                    claude_ptys.insert(instance_id.clone());
+                    // Model the real driver's launch prerequisite, so this
+                    // e2e fails if resume omits either provider delivery field.
+                    let has_overlay = spec.get("providerOverlay").is_some_and(Value::is_object);
+                    let has_token = spec
+                        .get("providerAuthToken")
+                        .and_then(Value::as_str)
+                        .is_some_and(|token| !token.is_empty());
+                    if spec.get("delegation").and_then(Value::as_str) == Some("gateway")
+                        && (!has_overlay || !has_token)
+                    {
+                        send_rpc_error(
+                            &mut ws,
+                            id,
+                            "gateway delegation requires a settings overlay: fake Node did not receive providerOverlay and providerAuthToken",
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let session_id = spec
+                        .get("resumeSessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                    ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                    append_n = append_instance_state(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "ready",
+                        Some(&session_id),
+                    )
+                    .await?;
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "instanceId": instance_id }),
+                    )
+                    .await?;
+                    continue;
+                }
+                if method == "instance.resume" {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    continue;
+                }
                 let kind = params
                     .pointer("/spec/kind")
                     .or_else(|| params.get("kind"))
@@ -401,6 +466,18 @@ async fn fake_node(
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
                 append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
+                // r-ux-w: synthetic workflow timeline-card scenarios.
+                if let Some(kind) = workflow_kind(prompt) {
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "instanceId": instance_id }),
+                    )
+                    .await?;
+                    append_n =
+                        append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
+                    continue;
+                }
                 // D-027: echo the attachment metadata the Hub resolved, so the
                 // e2e can prove staging reached the Node without a real agent.
                 let attachments = params
@@ -443,7 +520,13 @@ async fn fake_node(
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
-            "instance.close" | "instance.resume" => {
+            "instance.close" => {
+                if claude_ptys.contains(&instance_id) {
+                    ttys.remove(&instance_id);
+                    append_n =
+                        append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
+                            .await?;
+                }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
             "interaction.list" => {
@@ -461,7 +544,15 @@ async fn fake_node(
                 )
                 .await?;
             }
+            "workspace.scm.status" | "workspace.scm.diff" | "workspace.scm.file" => {
+                let result = g2_scm_answer(method, &params);
+                send_rpc_ok(&mut ws, id, result).await?;
+            }
             "tty.attach" => {
+                if claude_ptys.contains(&instance_id) && !ttys.contains_key(&instance_id) {
+                    send_rpc_error(&mut ws, id, "instance has no TTY bridge").await?;
+                    continue;
+                }
                 // The Hub asks for the live PTY stream when a follower opens
                 // the terminal tab. Registering lazily keeps resume onto a
                 // session created before this node connection behaved.
@@ -532,6 +623,140 @@ async fn fake_node(
     Ok(())
 }
 
+/// Synthetic answers for the three read-only `workspace.scm.*` RPCs. Every body
+/// is hand-authored fixture data (no real models, no real repository); the
+/// workspace id selects the §3.6 availability scenario the Playwright spec
+/// drives. `changed_first_status` implements row 9's stale-snapshot-then-refresh.
+fn g2_scm_answer(method: &str, params: &Value) -> Value {
+    let workspace_id = params
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .unwrap_or("wsp_e2e");
+    let observed_at = "2026-09-14T12:00:00.000Z";
+    let head = "9c2f1a4b7d8e0f11223344556677889900aabbcc";
+    let limits = json!({"maxEntries": 5000, "maxDiffBytes": 262144, "maxFileBytes": 1048576});
+    let no_trunc = json!({"entries": false, "entriesOmitted": 0, "nonUtf8Omitted": 0,
+                           "statusBytes": false});
+    let status_envelope = |entries: Value, truncated: Value, root: &str| {
+        json!({
+            "workspaceId": workspace_id, "root": root, "scm": "git", "availability": "ok",
+            "headOid": head,
+            "branch": {"state": "known", "value": "feat/workbench-g2"},
+            "observedAt": observed_at, "entries": entries, "limits": limits,
+            "truncated": truncated, "ignoreRules": "git-default",
+        })
+    };
+
+    if method == "workspace.scm.status" {
+        return match workspace_id {
+            "wsp_g2_clean" => status_envelope(json!([]), no_trunc, "/tmp/remuda-g2/clean"),
+            "wsp_g2_nogit" => json!({
+                "workspaceId": workspace_id, "root": "/tmp/remuda-g2/nogit", "scm": "git",
+                "availability": "unsupported", "unsupportedReason": "not-a-git-repository",
+                "headOid": null, "branch": {"state": "unknown", "reason": "unknown"},
+                "observedAt": observed_at, "entries": [], "limits": limits,
+                "truncated": no_trunc,
+            }),
+            "wsp_g2_denied" => json!({
+                "workspaceId": workspace_id, "root": "/tmp/remuda-g2/denied", "scm": "git",
+                "availability": "denied", "deniedReason": "permission-denied",
+                "headOid": null, "branch": {"state": "unknown", "reason": "unknown"},
+                "observedAt": observed_at, "entries": [], "limits": limits,
+                "truncated": no_trunc,
+            }),
+            "wsp_g2_trunc" => status_envelope(
+                json!([
+                    {"path": "big.txt", "origPath": null, "xy": " M", "kind": "modified",
+                     "sizeBytes": 2000000, "oldOid": "1111111111111111111111111111111111111111",
+                     "newOid": "2222222222222222222222222222222222222222",
+                     "digest": {"state": "unknown", "reason": "not-collected"}},
+                    {"path": "many.txt", "origPath": null, "xy": "??", "kind": "untracked",
+                     "sizeBytes": 300000, "oldOid": null, "newOid": null,
+                     "digest": {"state": "unknown", "reason": "not-collected"}}
+                ]),
+                json!({"entries": true, "entriesOmitted": 12, "nonUtf8Omitted": 0,
+                       "statusBytes": false}),
+                "/tmp/remuda-g2/trunc",
+            ),
+            "wsp_g2_changed" => status_envelope(
+                json!([
+                    {"path": "src/edited.rs", "origPath": null, "xy": " M",
+                     "kind": "modified", "sizeBytes": 64,
+                     "oldOid": "3333333333333333333333333333333333333333",
+                     "newOid": "4444444444444444444444444444444444444444",
+                     "digest": {"state": "unknown", "reason": "not-collected"}}
+                ]),
+                no_trunc,
+                "/tmp/remuda-g2/changed",
+            ),
+            _ => status_envelope(
+                json!([
+                    {"path": "src/main.rs", "origPath": null, "xy": " M", "kind": "modified",
+                     "sizeBytes": 42,
+                     "oldOid": "5555555555555555555555555555555555555555",
+                     "newOid": "6666666666666666666666666666666666666666",
+                     "digest": {"state": "unknown", "reason": "not-collected"}},
+                    {"path": "notes/todo.md", "origPath": null, "xy": "??", "kind": "untracked",
+                     "sizeBytes": 14, "oldOid": null, "newOid": null,
+                     "digest": {"state": "unknown", "reason": "not-collected"}},
+                    {"path": "assets/logo.bin", "origPath": null, "xy": " M",
+                     "kind": "modified", "sizeBytes": 2048,
+                     "oldOid": "7777777777777777777777777777777777777777",
+                     "newOid": "8888888888888888888888888888888888888888",
+                     "digest": {"state": "unknown", "reason": "not-collected"}}
+                ]),
+                no_trunc,
+                "/tmp/remuda-e2e",
+            ),
+        };
+    }
+
+    if method == "workspace.scm.diff" {
+        let path = params["paths"][0].as_str().unwrap_or("");
+        let item = if workspace_id == "wsp_g2_trunc" {
+            json!({"path": path, "patch": "diff --git a/many.txt b/many.txt\n@@\n+…\n",
+                   "binary": false, "truncated": true, "bytesAvailable": 262144})
+        } else if path == "assets/logo.bin" {
+            json!({"path": path, "patch": null, "binary": true,
+                   "truncated": false, "bytesAvailable": 0})
+        } else {
+            json!({"path": path,
+                   "patch": "diff --git a/src/main.rs b/src/main.rs\nindex 5555555..6666666 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n fn main() {\n+    println!(\"workbench g2\");\n }\n",
+                   "binary": false, "truncated": false, "bytesAvailable": 96})
+        };
+        let diff_truncated = workspace_id == "wsp_g2_trunc";
+        return json!({
+            "workspaceId": workspace_id, "scm": "git", "availability": "ok",
+            "headOid": head,
+            "staged": params.get("staged").and_then(Value::as_bool).unwrap_or(false),
+            "observedAt": observed_at, "items": [item], "limits": limits,
+            "truncated": {"diffBytes": diff_truncated,
+                          "bytesOmitted": if diff_truncated { 37856 } else { 0 }},
+        });
+    }
+
+    // workspace.scm.file
+    let path = params.get("path").and_then(Value::as_str).unwrap_or("");
+    if workspace_id == "wsp_g2_trunc" {
+        return json!({
+            "workspaceId": workspace_id, "scm": "git", "availability": "ok",
+            "path": path, "headOid": head, "observedAt": observed_at,
+            "mediaType": "text/plain", "binary": false, "sizeBytes": 2000000,
+            "digest": {"state": "unknown", "reason": "file-exceeds-inline-limit"},
+            "content": null, "truncated": true, "limits": limits,
+        });
+    }
+    json!({
+        "workspaceId": workspace_id, "scm": "git", "availability": "ok",
+        "path": path, "headOid": head, "observedAt": observed_at,
+        "mediaType": "text/plain", "binary": false, "sizeBytes": 14,
+        "digest": {"state": "known",
+                   "value": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff0000"},
+        "content": "# TODO\n- g2\n- ship\n",
+        "truncated": false, "limits": limits,
+    })
+}
+
 /// A script-free PTY double for the QuickFind xterm test.
 ///
 /// It models only what that test needs: a stable stream id the Hub binds the
@@ -569,6 +794,54 @@ async fn send_rpc_ok(
     ))
     .await?;
     Ok(())
+}
+
+async fn send_rpc_error(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: Value,
+    message: &str,
+) -> Result<()> {
+    ws.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": message } })
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Confirm resource lifecycle and the native identity needed by Hub resume.
+async fn append_instance_state(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    n: u64,
+    state: &str,
+    session_id: Option<&str>,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": format!("j{seq}"), "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity", "entityType": "instance", "state": state,
+                        "entity": { "nativeRef": { "sessionId": { "value": session_id } } }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    Ok(seq)
 }
 
 async fn append_journal(
@@ -692,6 +965,697 @@ async fn append_native_status(
     ))
     .await?;
     Ok(seq)
+}
+
+/// r-ux-w: select a synthetic workflow scenario by prompt prefix.
+fn workflow_kind(prompt: &str) -> Option<&'static str> {
+    const PREFIX: &str = "workflow card";
+    if !prompt.starts_with(PREFIX) {
+        return None;
+    }
+    let tail = prompt[PREFIX.len()..].trim();
+    Some(match tail {
+        "fold" => "fold",
+        "fold running" => "fold-running",
+        "fail" => "fail",
+        "legacy" => "legacy",
+        "demo running" => "demo-running",
+        "demo done" => "demo-done",
+        _ => "demo",
+    })
+}
+
+/// Append one arbitrary observation and drain its RPC result.
+async fn append_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    n: u64,
+    kind: &str,
+    payload: Value,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": format!("j{seq}"),
+            "method": "journal.append",
+            "params": { "instanceId": instance_id, "event": { "kind": kind, "payload": payload } }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
+}
+
+fn wf_known(value: Value) -> Value {
+    json!({ "state": "known", "value": value })
+}
+
+fn wf_unknown() -> Value {
+    json!({ "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] })
+}
+
+/// Build one workflow member observation (r-ux-w timeline card fixture).
+#[allow(clippy::too_many_arguments)]
+fn wf_member(
+    workflow_id: &str,
+    member_id: &str,
+    phase_id: &str,
+    label: &str,
+    state: &str,
+    revision: u64,
+    model: Option<&str>,
+    latest_tool: Option<&str>,
+    tokens: Option<u64>,
+    calls: Option<u64>,
+    duration_ms: Option<u64>,
+) -> Value {
+    json!({
+        "workflowId": workflow_id,
+        "memberId": member_id,
+        "nativeAgentId": wf_known(json!(format!("native-{member_id}"))),
+        "nativeKey": wf_unknown(),
+        "attempt": wf_known(json!("1")),
+        "phaseId": phase_id,
+        "label": wf_known(json!(label)),
+        "state": state,
+        "modelRequested": wf_unknown(),
+        "modelResolved": model.map(|m| wf_known(json!(m))).unwrap_or_else(wf_unknown),
+        "resultRef": null,
+        "revision": revision.to_string(),
+        "latestTool": latest_tool.map(|t| wf_known(json!(t))),
+        "tokens": tokens.map(|t| json!(t.to_string())),
+        "calls": calls.map(|c| json!(c.to_string())),
+        "durationMs": duration_ms.map(|d| json!(d.to_string())),
+        "startedAt": null,
+        "endedAt": null,
+    })
+}
+
+fn wf_phase(workflow_id: &str, phase_id: &str, label: &str, state: &str) -> Value {
+    json!({
+        "workflowId": workflow_id,
+        "phaseId": phase_id,
+        "nativePhaseId": wf_known(json!(phase_id)),
+        "label": wf_known(json!(label)),
+        "state": state,
+        "revision": "1",
+        "parentPhaseId": null,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+async fn append_workflow_scenario(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    mut n: u64,
+    kind: &str,
+) -> Result<u64> {
+    // Stable workflow ids across the running/done two-prompt scenarios.
+    let tag = match kind {
+        "demo-running" | "demo-done" => "demo",
+        "fold-running" => "fold",
+        other => other,
+    };
+    let workflow_id = format!("obj_wf_{tag}");
+    let tool_id = format!("obj_wft_{tag}");
+    let phase = |i: u8| format!("obj_wfp_{tag}_{i}");
+    let member = |i: u8| format!("obj_wfm_{tag}_{i:02}");
+    let script = json!({
+        "name": format!("card-{tag}"),
+        "description": "synthetic timeline card run",
+        "phases": [{ "title": "Review" }, { "title": "Verify" }],
+    });
+
+    // The Workflow tool call the card hangs on.
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "tool_call",
+        json!({
+            "nodeId": tool_id,
+            "revision": "1",
+            "operation": "open",
+            "baseRevision": null,
+            "toolCallId": tool_id,
+            "parentToolCallId": null,
+            "toolName": wf_known(json!("Workflow")),
+            "displayTitle": wf_known(json!("Workflow")),
+            "category": "workflow",
+            "input": wf_known(json!({ "script": script.to_string() })),
+            "inputTextDelta": null,
+            "state": "running",
+            "executor": wf_unknown(),
+        }),
+    )
+    .await?;
+
+    let run = |state: &str, revision: u64, totals: Value, live: Value, note: Option<&str>| {
+        json!({
+            "workflowId": workflow_id,
+            "engine": "claude-workflow",
+            "nativeRunId": wf_known(json!(format!("wf-native-{tag}"))),
+            "nativeTaskId": wf_known(json!(format!("task-{tag}"))),
+            "toolCallId": tool_id,
+            "state": state,
+            "revision": revision.to_string(),
+            "title": wf_known(json!(format!("card-{tag}"))),
+            "name": wf_known(json!(format!("card-{tag}"))),
+            "description": wf_known(json!("synthetic timeline card run")),
+            "totals": totals,
+            "live": live,
+            "note": note,
+            "resultRef": null,
+        })
+    };
+    let totals = |done: u64,
+                  failed: u64,
+                  killed: u64,
+                  running: u64,
+                  total: u64,
+                  total_known: bool,
+                  tokens: u64,
+                  calls: u64,
+                  elapsed_ms: u64| {
+        json!({
+            "totalKnown": total_known,
+            "agentsTotal": total.to_string(),
+            "agentsDone": done.to_string(),
+            "agentsFailed": failed.to_string(),
+            "agentsKilled": killed.to_string(),
+            "agentsRunning": running.to_string(),
+            "tokens": tokens.to_string(),
+            "calls": calls.to_string(),
+            "elapsedMs": elapsed_ms.to_string(),
+        })
+    };
+    let live_running = |phase_title: &str, agent: &str| {
+        json!({
+            "phaseTitle": wf_known(json!(phase_title)),
+            "agentLabel": wf_known(json!(agent)),
+            "summary": wf_unknown(),
+        })
+    };
+    let live_done = |summary: &str| {
+        json!({
+            "phaseTitle": wf_unknown(),
+            "agentLabel": wf_unknown(),
+            "summary": wf_known(json!(summary)),
+        })
+    };
+
+    if kind == "legacy" {
+        // Decision 6: old daemon — run with a note and no phase/member detail.
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "running",
+                1,
+                json!(null),
+                json!(null),
+                Some("daemon 版本较旧，暂无阶段明细"),
+            ),
+        )
+        .await?;
+        return Ok(n);
+    }
+
+    // Terminal half of the demo scenario (second prompt after "demo running"):
+    // only completion revisions, same workflow/tool ids.
+    if kind == "demo-done" {
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(2),
+                &phase(1),
+                "review:security",
+                "completed",
+                2,
+                Some("opus-5[1m]"),
+                Some("Grep"),
+                Some(44_000),
+                Some(8),
+                Some(122_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(3),
+                &phase(2),
+                "verify:auth.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Bash"),
+                Some(31_000),
+                Some(5),
+                Some(80_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(4),
+                &phase(2),
+                "verify:api.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Read"),
+                Some(27_000),
+                Some(4),
+                Some(65_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Review", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(2), "Verify", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "completed",
+                2,
+                totals(4, 0, 0, 0, 4, true, 412_000, 106, 298_000),
+                live_done("Dynamic workflow \"card-demo\" completed"),
+                None,
+            ),
+        )
+        .await?;
+        return Ok(n);
+    }
+
+    if kind == "demo-running" || kind == "demo" {
+        let running_only = kind == "demo-running";
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "running",
+                1,
+                totals(1, 0, 0, 1, 4, true, 69_000, 5, 222_000),
+                live_running("Review", "review:security"),
+                None,
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Review", "running"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(2), "Verify", "queued"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(1),
+                &phase(1),
+                "review:perf",
+                "completed",
+                1,
+                Some("haiku-4.5"),
+                Some("Grep"),
+                Some(39_000),
+                Some(4),
+                Some(108_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(2),
+                &phase(1),
+                "review:security",
+                "running",
+                1,
+                Some("opus-5[1m]"),
+                Some("Grep"),
+                Some(21_000),
+                Some(2),
+                Some(62_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(3),
+                &phase(2),
+                "verify:auth.ts",
+                "queued",
+                1,
+                Some("haiku-4.5"),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(4),
+                &phase(2),
+                "verify:api.ts",
+                "queued",
+                1,
+                Some("haiku-4.5"),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await?;
+        if running_only {
+            return Ok(n);
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(2),
+                &phase(1),
+                "review:security",
+                "completed",
+                2,
+                Some("opus-5[1m]"),
+                Some("Grep"),
+                Some(44_000),
+                Some(8),
+                Some(122_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(3),
+                &phase(2),
+                "verify:auth.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Bash"),
+                Some(31_000),
+                Some(5),
+                Some(80_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(4),
+                &phase(2),
+                "verify:api.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Read"),
+                Some(27_000),
+                Some(4),
+                Some(65_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Review", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(2), "Verify", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "completed",
+                2,
+                totals(4, 0, 0, 0, 4, true, 412_000, 106, 298_000),
+                live_done("Dynamic workflow \"card-demo\" completed"),
+                None,
+            ),
+        )
+        .await?;
+        return Ok(n);
+    }
+
+    if kind == "fold" {
+        // One 20-agent phase: the >12-row quiet tail must fold behind 还有 8 个.
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "running",
+                1,
+                totals(0, 0, 0, 1, 20, true, 0, 0, 1_000),
+                live_running("Gen", "gen:batch-01"),
+                None,
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Gen", "running"),
+        )
+        .await?;
+        for i in 0..20 {
+            let state = if i == 0 { "running" } else { "queued" };
+            n = append_event(
+                ws,
+                instance_id,
+                n,
+                "workflow.member",
+                wf_member(
+                    &workflow_id,
+                    &member(i),
+                    &phase(1),
+                    &format!("gen:batch-{:02}", i + 1),
+                    state,
+                    1,
+                    Some("opus-5[1m]"),
+                    if i == 0 { Some("Write") } else { None },
+                    if i == 0 { Some(7_200) } else { None },
+                    if i == 0 { Some(1) } else { None },
+                    if i == 0 { Some(31_000) } else { None },
+                ),
+            )
+            .await?;
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        for i in 0..20 {
+            n = append_event(
+                ws,
+                instance_id,
+                n,
+                "workflow.member",
+                wf_member(
+                    &workflow_id,
+                    &member(i),
+                    &phase(1),
+                    &format!("gen:batch-{:02}", i + 1),
+                    "completed",
+                    2,
+                    Some("opus-5[1m]"),
+                    Some("Write"),
+                    Some(58_000 + u64::from(i) * 200),
+                    Some(3),
+                    Some(75_000),
+                ),
+            )
+            .await?;
+        }
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Gen", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "completed",
+                2,
+                totals(20, 0, 0, 0, 20, true, 1_180_000, 60, 391_000),
+                live_done("Dynamic workflow \"card-fold\" completed"),
+                None,
+            ),
+        )
+        .await?;
+        return Ok(n);
+    }
+
+    // kind == "fail": 14 done, 1 failed. Failed rows never fold.
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.run",
+        run(
+            "failed",
+            2,
+            totals(14, 1, 0, 0, 15, true, 388_000, 94, 361_000),
+            live_done("Dynamic workflow \"card-fail\" failed"),
+            None,
+        ),
+    )
+    .await?;
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.phase",
+        wf_phase(&workflow_id, &phase(1), "Review", "failed"),
+    )
+    .await?;
+    for i in 0..14 {
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(i),
+                &phase(1),
+                &format!("review:item-{i:02}"),
+                "completed",
+                1,
+                Some("opus-5[1m]"),
+                Some("Read"),
+                Some(36_000),
+                Some(3),
+                Some(99_000),
+            ),
+        )
+        .await?;
+    }
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.member",
+        wf_member(
+            &workflow_id,
+            &member(99),
+            &phase(1),
+            "review:security",
+            "failed",
+            2,
+            Some("opus-5[1m]"),
+            Some("Bash"),
+            Some(22_000),
+            Some(2),
+            Some(72_000),
+        ),
+    )
+    .await?;
+    Ok(n)
 }
 
 fn fake_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {

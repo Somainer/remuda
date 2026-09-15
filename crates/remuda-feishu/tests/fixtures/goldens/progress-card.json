@@ -1,0 +1,23 @@
+{
+  "schema": "2.0",
+  "config": {
+    "compact_width": false,
+    "update_multi": true,
+    "streaming_mode": false,
+    "enable_forward": false
+  },
+  "header": {
+    "template": "blue",
+    "title": { "tag": "plain_text", "content": "Running", "text_align": "left" }
+  },
+  "body": {
+    "elements": [
+      {
+        "tag": "markdown",
+        "element_id": "progress_md",
+        "content": "**Tool:** Read\n\nREADME.md\n\nElapsed: 0s",
+        "text_align": "left"
+      }
+    ]
+  }
+}

@@ -13,11 +13,13 @@ process.env.REMUDA_E2E_BACKEND = "hub";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  // New hub-backed specs follow the .hub.spec.ts suffix convention and match
-  // the second pattern automatically; the first entry is the historical
-  // per-file allowlist.
+  // An array so new hub-backed specs never edit this config again:
+  //  - keep the legacy spec-file names that predate the suffix convention;
+  //  - any *.hub.spec.ts file is picked up automatically.
+  // Convention: name a Hub-live (fake-node) spec `*.hub.spec.ts` and leave this
+  // list alone. See docs/design/testing-fake-harness.md.
   testMatch: [
-    /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|ux-status|ux-quickfind|new-session)\.spec\.ts/,
+    /(?:hub-live|spaces-hub-live|pairing|providers-discovery|passkey-hub-live|promoted-claude-hub-live|ux-status|ux-quickfind|new-session)\.spec\.ts/,
     /\.hub\.spec\.ts$/,
   ],
   fullyParallel: false,

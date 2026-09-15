@@ -4414,6 +4414,31 @@
         }
       ]
     },
+    "GrantVerb": {
+      "description": "GrantVerb wire values; `protocol.md` §2.5.",
+      "oneOf": [
+        {
+          "const": "dispatch",
+          "description": "Wire value `dispatch`.",
+          "type": "string"
+        },
+        {
+          "const": "land",
+          "description": "Wire value `land`.",
+          "type": "string"
+        },
+        {
+          "const": "spend",
+          "description": "Wire value `spend`.",
+          "type": "string"
+        },
+        {
+          "const": "address-owner",
+          "description": "Wire value `address-owner`.",
+          "type": "string"
+        }
+      ]
+    },
     "GrokPermission": {
       "description": "GrokPermission; `protocol.md` §4.1.",
       "properties": {
@@ -5002,7 +5027,7 @@
       ]
     },
     "Id": {
-      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|prj|tsk)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
     "InputAccounting": {
@@ -5650,6 +5675,40 @@
         "providerProfileRevision",
         "expectedPreviousGeneration"
       ],
+      "type": "object"
+    },
+    "InstanceScope": {
+      "description": "Resource reach of one delegation node; design §2.5.\n\nScope narrows monotonically down the tree: a child scope must be a subset\nof its parent's. An *empty* dimension means \"no narrowing on this\ndimension\" for the dimension's parent view — a node with every dimension\nempty is the universe root (the human-seated top coordinator).",
+      "properties": {
+        "hostIds": {
+          "description": "Hosts this node may place work on.",
+          "items": {
+            "$ref": "#/$defs/HostId"
+          },
+          "type": "array"
+        },
+        "projectIds": {
+          "description": "Projects this node may touch.",
+          "items": {
+            "$ref": "#/$defs/ProjectId"
+          },
+          "type": "array"
+        },
+        "supplyGrants": {
+          "description": "Provider profiles / supply buckets this node may spend. Entries are\n`pvp_…` profile ids; batch 3 (co-supply) adds structured grants.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "workspaceIds": {
+          "description": "Workspaces this node may touch.",
+          "items": {
+            "$ref": "#/$defs/WorkspaceId"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "InstanceSendParams": {
@@ -9674,6 +9733,40 @@
         }
       ]
     },
+    "ModelRoles": {
+      "description": "Project speaks model roles, not concrete model ids; design §3.2.",
+      "properties": {
+        "cheap": {
+          "description": "Cheap model id/alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "frontier": {
+          "description": "Frontier model id/alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewer": {
+          "description": "Model used for review.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workhorse": {
+          "description": "Default workhorse model id/alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ModelSwitchInput": {
       "description": "ModelSwitchInput; `protocol.md` §3.1.",
       "properties": {
@@ -11738,6 +11831,634 @@
         "id",
         "revision"
       ],
+      "type": "object"
+    },
+    "Project": {
+      "description": "Thin authoritative Hub Project entity; design §3.1–§3.2.",
+      "properties": {
+        "branchPattern": {
+          "default": "wt/{worker}/{topic}",
+          "description": "Worktree branch pattern.",
+          "type": "string"
+        },
+        "briefRef": {
+          "default": ".remuda/brief.md",
+          "description": "Repo-relative brief template (advisory layer lives in the repo).",
+          "type": "string"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "`created_at`; protocol §1.1."
+        },
+        "defaultBaseBranch": {
+          "default": "main",
+          "description": "Default base branch for worktrees/gates.",
+          "type": "string"
+        },
+        "defaultEffort": {
+          "description": "Default effort tier name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gate": {
+          "$ref": "#/$defs/ProjectGate",
+          "default": {
+            "affected": true,
+            "command": "scripts/ci/gate.sh",
+            "landSerialization": "global-cas",
+            "mandatorySteps": [
+              "secret-scan",
+              "no-tunnel-scan",
+              "gen-api-current",
+              "verify-tree"
+            ],
+            "web": "auto"
+          },
+          "description": "Gate configuration placeholder."
+        },
+        "homeHost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host the project coordinator seat is pinned to."
+        },
+        "hosts": {
+          "description": "Per-host capacity views.",
+          "items": {
+            "$ref": "#/$defs/ProjectHostQuota"
+          },
+          "type": "array"
+        },
+        "id": {
+          "$ref": "#/$defs/ProjectId",
+          "description": "`id`; protocol §1.1."
+        },
+        "members": {
+          "description": "Workspaces participating in the project (Space key reused).",
+          "items": {
+            "$ref": "#/$defs/ProjectMember"
+          },
+          "type": "array"
+        },
+        "modelRoles": {
+          "$ref": "#/$defs/ModelRoles",
+          "default": {},
+          "description": "Model role → model alias map."
+        },
+        "name": {
+          "description": "Project display name.",
+          "type": "string"
+        },
+        "permissionPosture": {
+          "description": "`ask` / `accept-edits` / `bypass`. Agent launches are forced non-yolo.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "placement": {
+          "$ref": "#/$defs/ProjectPlacement",
+          "default": {
+            "default": ""
+          },
+          "description": "Placement defaults."
+        },
+        "policy": {
+          "$ref": "#/$defs/ProjectPolicy",
+          "default": {
+            "configurable": {
+              "allowMultipleDispatchers": false,
+              "completionLine": "DONE <sha>",
+              "coordinatorFanOut": 8,
+              "defaultPlacement": "remote-when-build-heavy",
+              "maxConcurrentWorkers": 8,
+              "maxDelegationDepth": 3,
+              "maxFanOutPerTask": 6,
+              "nudgeThrottleMins": 15,
+              "stallThresholdMins": 20
+            },
+            "enforced": {
+              "allocatedPortBlocks": true,
+              "casAncestorCheck": true,
+              "gateBeforeLand": true,
+              "noDeployScripts": true,
+              "noOsSettingsChanges": true,
+              "noTunnelTools": true,
+              "oneWorktreePerWorker": true,
+              "reclaimDiskOnRetire": true,
+              "secretsNeverInBriefs": true,
+              "workersNeverPush": true
+            }
+          },
+          "description": "Policy envelope."
+        },
+        "provider": {
+          "$ref": "#/$defs/ProjectProviderRef",
+          "default": {},
+          "description": "Provider reference (never a secret)."
+        },
+        "repoRemote": {
+          "description": "Optional git remote, validation only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "`revision`; protocol §1.1."
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "`updated_at`; protocol §1.1."
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "createdAt",
+        "updatedAt",
+        "name",
+        "defaultBaseBranch",
+        "branchPattern",
+        "placement",
+        "provider",
+        "modelRoles",
+        "gate",
+        "policy",
+        "briefRef"
+      ],
+      "type": "object"
+    },
+    "ProjectConfigurablePolicy": {
+      "description": "Configurable policy. Owner-tunable; the first four delegate-tree limits\nimplement design §2.5 ⑤ (depth/fan-out are policy, not schema).",
+      "properties": {
+        "allowMultipleDispatchers": {
+          "default": false,
+          "description": "Relax \"one active dispatch holder per project\".",
+          "type": "boolean"
+        },
+        "completionLine": {
+          "default": "DONE <sha>",
+          "description": "Literal worker completion line.",
+          "type": "string"
+        },
+        "coordinatorFanOut": {
+          "default": 8,
+          "description": "Active children one node may delegate, overriding the Hub default (8).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "defaultPlacement": {
+          "default": "remote-when-build-heavy",
+          "description": "Placement tendency policy name.",
+          "type": "string"
+        },
+        "maxConcurrentWorkers": {
+          "default": 8,
+          "description": "Max concurrent workers in this project.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "maxDelegationDepth": {
+          "default": 3,
+          "description": "Delegation depth limit overriding the Hub default (3).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "maxFanOutPerTask": {
+          "default": 6,
+          "description": "Max children per delegated task.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "nudgeThrottleMins": {
+          "default": 15,
+          "description": "Nudge throttle per worker, minutes.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "stallThresholdMins": {
+          "default": 20,
+          "description": "Stall threshold, minutes.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maxConcurrentWorkers",
+        "nudgeThrottleMins",
+        "stallThresholdMins",
+        "maxFanOutPerTask",
+        "completionLine",
+        "defaultPlacement",
+        "maxDelegationDepth",
+        "coordinatorFanOut",
+        "allowMultipleDispatchers"
+      ],
+      "type": "object"
+    },
+    "ProjectEnforcedPolicy": {
+      "description": "Enforced policy switches. All default on; agents may never change them\n(D-031 — read-only for coordinators, change requires escalation).",
+      "properties": {
+        "allocatedPortBlocks": {
+          "default": true,
+          "description": "Port blocks are product-allocated.",
+          "type": "boolean"
+        },
+        "casAncestorCheck": {
+          "default": true,
+          "description": "Land requires an ancestor check + CAS.",
+          "type": "boolean"
+        },
+        "gateBeforeLand": {
+          "default": true,
+          "description": "No landing without a green gate.",
+          "type": "boolean"
+        },
+        "noDeployScripts": {
+          "default": true,
+          "description": "Never run anything under `deploy/`.",
+          "type": "boolean"
+        },
+        "noOsSettingsChanges": {
+          "default": true,
+          "description": "No OS settings changes from agents.",
+          "type": "boolean"
+        },
+        "noTunnelTools": {
+          "default": true,
+          "description": "Never probe/install tunnel tooling (D-031).",
+          "type": "boolean"
+        },
+        "oneWorktreePerWorker": {
+          "default": true,
+          "description": "One worktree per worker.",
+          "type": "boolean"
+        },
+        "reclaimDiskOnRetire": {
+          "default": true,
+          "description": "Retire must reclaim scratch disk.",
+          "type": "boolean"
+        },
+        "secretsNeverInBriefs": {
+          "default": true,
+          "description": "Briefs never carry secrets.",
+          "type": "boolean"
+        },
+        "workersNeverPush": {
+          "default": true,
+          "description": "Workers never push; landing goes through the gate.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "noDeployScripts",
+        "noTunnelTools",
+        "workersNeverPush",
+        "gateBeforeLand",
+        "casAncestorCheck",
+        "oneWorktreePerWorker",
+        "allocatedPortBlocks",
+        "reclaimDiskOnRetire",
+        "noOsSettingsChanges",
+        "secretsNeverInBriefs"
+      ],
+      "type": "object"
+    },
+    "ProjectGate": {
+      "description": "Gate configuration; design §3.2 (placeholder, consumed by r-mergequeue).",
+      "properties": {
+        "affected": {
+          "default": true,
+          "description": "Run affected-only gates.",
+          "type": "boolean"
+        },
+        "command": {
+          "description": "Gate command; authority is the merged worktree's copy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "landSerialization": {
+          "description": "`global-cas` — verify may parallelize, land is always serialized.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lanes": {
+          "description": "Verification lanes.",
+          "items": {
+            "$ref": "#/$defs/ProjectGateLane"
+          },
+          "type": "array"
+        },
+        "mandatorySteps": {
+          "description": "Mandatory gate steps.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "web": {
+          "description": "Web gate mode (`auto` / `always` / `never`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "affected"
+      ],
+      "type": "object"
+    },
+    "ProjectGateLane": {
+      "description": "One gate lane; consumed later by r-mergequeue's `--onto/--lanes`.\n\nPlaceholder for batch 1: stored and returned verbatim, not yet enforced.",
+      "properties": {
+        "hostId": {
+          "$ref": "#/$defs/HostId",
+          "description": "Host that runs the lane."
+        },
+        "id": {
+          "description": "Stable lane id.",
+          "type": "string"
+        },
+        "ports": {
+          "description": "Allocated port block.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote": {
+          "description": "SSH remote alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repoPath": {
+          "description": "Checkout path on that host.",
+          "type": "string"
+        },
+        "targetDir": {
+          "description": "Dedicated cargo target dir.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "hostId",
+        "repoPath",
+        "targetDir"
+      ],
+      "type": "object"
+    },
+    "ProjectHostQuota": {
+      "description": "Project-side capacity view of one host with capacity; design §3.2.",
+      "properties": {
+        "diskBudgetGb": {
+          "description": "Scratch disk budget (GiB); retire must reclaim.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "hostId": {
+          "$ref": "#/$defs/HostId",
+          "description": "Host this quota describes; it must also appear (with a workspace) in\n`members` for placement to select it."
+        },
+        "latencyClass": {
+          "description": "`local` / `remote` latency class.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "maxBuilding": {
+          "description": "How many instances may be building at once.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxInstances": {
+          "description": "Project cap, never above the host's own `maxInstances`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "portBlocks": {
+          "description": "Port blocks allocated to this project on this host.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requires": {
+          "description": "Hard host-label requirements (`toolchain=rust`, …); design §3.4 step 1.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hostId"
+      ],
+      "type": "object"
+    },
+    "ProjectId": {
+      "pattern": "^(prj)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "ProjectLaunchDefaults": {
+      "description": "Launch-relevant defaults folded into an instance create; design §3.2 / §6.\n\nFold priority is explicit (request body) > project > host > global, so\nevery field here only fills a key the request did not name.",
+      "properties": {
+        "agent": {
+          "description": "Default agent kind.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "delegation": {
+          "description": "Provider delegation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "driver": {
+          "description": "Default driver.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "description": "Default effort tier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "launchArgs": {
+          "description": "Default extra launch args.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "Default model id/alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissionPosture": {
+          "description": "Default permission posture.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providerProfileId": {
+          "description": "Provider profile id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProjectMember": {
+      "description": "One `(hostId, workspaceId)` pair — the same key Space uses (D-024).",
+      "properties": {
+        "hostId": {
+          "$ref": "#/$defs/HostId",
+          "description": "Member host."
+        },
+        "role": {
+          "default": "member",
+          "description": "Member role label (`primary` / `build` / …); display only.",
+          "type": "string"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "Registered workspace on that host (D-023)."
+        }
+      },
+      "required": [
+        "hostId",
+        "workspaceId",
+        "role"
+      ],
+      "type": "object"
+    },
+    "ProjectPlacement": {
+      "description": "Project placement defaults.",
+      "properties": {
+        "default": {
+          "default": "auto",
+          "description": "`auto` / `local` / `remote`.",
+          "type": "string"
+        },
+        "hostIds": {
+          "description": "Explicit candidate hosts; empty means every member host.",
+          "items": {
+            "$ref": "#/$defs/HostId"
+          },
+          "type": "array"
+        },
+        "labels": {
+          "description": "Labels every selected host must carry.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "default"
+      ],
+      "type": "object"
+    },
+    "ProjectPolicy": {
+      "description": "Full project policy envelope; design §3.2.",
+      "properties": {
+        "configurable": {
+          "$ref": "#/$defs/ProjectConfigurablePolicy",
+          "default": {
+            "allowMultipleDispatchers": false,
+            "completionLine": "DONE <sha>",
+            "coordinatorFanOut": 8,
+            "defaultPlacement": "remote-when-build-heavy",
+            "maxConcurrentWorkers": 8,
+            "maxDelegationDepth": 3,
+            "maxFanOutPerTask": 6,
+            "nudgeThrottleMins": 15,
+            "stallThresholdMins": 20
+          },
+          "description": "Owner-configurable limits."
+        },
+        "enforced": {
+          "$ref": "#/$defs/ProjectEnforcedPolicy",
+          "default": {
+            "allocatedPortBlocks": true,
+            "casAncestorCheck": true,
+            "gateBeforeLand": true,
+            "noDeployScripts": true,
+            "noOsSettingsChanges": true,
+            "noTunnelTools": true,
+            "oneWorktreePerWorker": true,
+            "reclaimDiskOnRetire": true,
+            "secretsNeverInBriefs": true,
+            "workersNeverPush": true
+          },
+          "description": "Enforced switches; read-only for coordinator agents (D-031)."
+        }
+      },
+      "required": [
+        "enforced",
+        "configurable"
+      ],
+      "type": "object"
+    },
+    "ProjectProviderRef": {
+      "description": "Provider reference (no secret — projects hold only a profileId; design §3.2).",
+      "properties": {
+        "delegation": {
+          "description": "`gateway` / `direct` / `none`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profileId": {
+          "description": "`pvp_…` profile id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "PromptInput": {
@@ -14723,6 +15444,10 @@
       ],
       "type": "object"
     },
+    "TaskId": {
+      "pattern": "^(tsk)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
     "TerminalEvidence": {
       "description": "TerminalEvidence; `protocol.md` §2.4.",
       "properties": {
@@ -15871,6 +16596,29 @@
         }
       ]
     },
+    "WorkflowLive": {
+      "description": "The card's live line under the header; additive r-ux-w, §5.3.",
+      "properties": {
+        "agentLabel": {
+          "$ref": "#/$defs/Knowledge2",
+          "description": "Label of the currently (or last) active agent."
+        },
+        "phaseTitle": {
+          "$ref": "#/$defs/Knowledge2",
+          "description": "Phase title of the currently (or last) active agent."
+        },
+        "summary": {
+          "$ref": "#/$defs/Knowledge2",
+          "description": "Terminal one-line result summary, when the run has finished."
+        }
+      },
+      "required": [
+        "phaseTitle",
+        "agentLabel",
+        "summary"
+      ],
+      "type": "object"
+    },
     "WorkflowMemberPayload": {
       "description": "WorkflowMemberPayload; `protocol.md` §5.3.",
       "properties": {
@@ -15878,9 +16626,53 @@
           "$ref": "#/$defs/Knowledge3",
           "description": "`attempt`; protocol §5.3."
         },
+        "calls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Number of tool calls; additive r-ux-w."
+        },
+        "durationMs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-agent wall time; additive r-ux-w."
+        },
+        "endedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Stop timestamp; additive r-ux-w."
+        },
         "label": {
           "$ref": "#/$defs/Knowledge2",
           "description": "`label`; protocol §5.3."
+        },
+        "latestTool": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Knowledge2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Last tool the agent called; additive r-ux-w timeline card."
         },
         "memberId": {
           "$ref": "#/$defs/Id",
@@ -15928,9 +16720,31 @@
           "$ref": "#/$defs/U64",
           "description": "`revision`; protocol §5.3."
         },
+        "startedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Spawn timestamp; additive r-ux-w."
+        },
         "state": {
           "$ref": "#/$defs/WorkflowState",
           "description": "`state`; protocol §5.3."
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Summed token usage (input + output + cache); additive r-ux-w."
         },
         "workflowId": {
           "$ref": "#/$defs/Id",
@@ -16006,9 +16820,42 @@
     "WorkflowRunPayload": {
       "description": "WorkflowRunPayload; `protocol.md` §5.3.",
       "properties": {
+        "description": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Knowledge2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Script meta `description`; additive r-ux-w."
+        },
         "engine": {
           "$ref": "#/$defs/WorkflowEngine",
           "description": "`engine`; protocol §5.3."
+        },
+        "live": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowLive"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Live \"current phase: agent\" line / terminal result line; additive."
+        },
+        "name": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Knowledge2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Script meta `name` (e.g. `review-changes`); additive r-ux-w. Absent on\nproducers/journals written before the timeline card."
         },
         "nativeRunId": {
           "$ref": "#/$defs/Knowledge2",
@@ -16017,6 +16864,13 @@
         "nativeTaskId": {
           "$ref": "#/$defs/Knowledge2",
           "description": "`native_task_id`; protocol §5.3."
+        },
+        "note": {
+          "description": "When phase detail cannot be provided the card degrades to a plain tool\nrow plus this explanation; additive r-ux-w.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "resultRef": {
           "anyOf": [
@@ -16051,6 +16905,17 @@
             }
           ],
           "description": "`tool_call_id`; protocol §5.3."
+        },
+        "totals": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowTotals"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Aggregate counters for the card's summary rail; additive r-ux-w."
         },
         "workflowId": {
           "$ref": "#/$defs/Id",
@@ -16104,6 +16969,59 @@
           "type": "string"
         }
       ]
+    },
+    "WorkflowTotals": {
+      "description": "Aggregate counters shown on a Workflow card; additive r-ux-w, §5.3.\n\nAll values are a point-in-time snapshot: a running run's `tokens` /\n`elapsed_ms` keep moving until the terminal revision.",
+      "properties": {
+        "agentsDone": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents in a terminal success state."
+        },
+        "agentsFailed": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents that failed."
+        },
+        "agentsKilled": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents stopped with the run (TaskStop)."
+        },
+        "agentsRunning": {
+          "$ref": "#/$defs/U64",
+          "description": "Agents currently running."
+        },
+        "agentsTotal": {
+          "$ref": "#/$defs/U64",
+          "description": "Total agent slots (done + running + queued). Meaningful with `total_known`."
+        },
+        "calls": {
+          "$ref": "#/$defs/U64",
+          "description": "Summed subagent tool calls."
+        },
+        "elapsedMs": {
+          "$ref": "#/$defs/U64",
+          "description": "Wall time since launch."
+        },
+        "tokens": {
+          "$ref": "#/$defs/U64",
+          "description": "Summed subagent token usage."
+        },
+        "totalKnown": {
+          "description": "Whether `agents_total` is a real denominator. Dynamic scripts whose\nqueued calls cannot be counted statically report `false`, and the card\nshows a running count without \"/ total\".",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "totalKnown",
+        "agentsTotal",
+        "agentsDone",
+        "agentsFailed",
+        "agentsKilled",
+        "agentsRunning",
+        "tokens",
+        "calls",
+        "elapsedMs"
+      ],
+      "type": "object"
     },
     "WorkflowWaitParams": {
       "description": "WorkflowWaitParams; `protocol.md` §7.2.",

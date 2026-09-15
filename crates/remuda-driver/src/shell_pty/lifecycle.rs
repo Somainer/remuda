@@ -140,15 +140,164 @@ pub fn group_alive(pgid: i32) -> bool {
     }
 }
 
+/// One member of a process group as read from the host process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupMember {
+    pub pid: i32,
+    /// Zombie / defunct — dead but not yet reaped by its parent.
+    pub zombie: bool,
+}
+
+/// List group members with their liveness state.
+///
+/// A zombie is a process that has died and is only waiting for its parent to
+/// `wait`. `killpg(0)` still counts one, but the ladder must not: the Node is
+/// the parent of the group leader and is about to reap it, and a grandchild
+/// zombie has already been reparented to init, which reaps it.
+#[cfg(unix)]
+fn group_members(pgid: i32) -> Vec<GroupMember> {
+    #[cfg(target_os = "linux")]
+    {
+        proc_group_members(pgid)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        ps_group_members(pgid)
+    }
+}
+
+/// Whether the group contains a member that is still actually running.
+///
+/// Reaps (via the supplied callback) are performed by the caller; this answers
+/// the zombie-aware question `killpg(0)` cannot: a dead-but-unreaped child is
+/// not a survivor, and naming it in `stop-incomplete` is the defect that
+/// produced `the process group outlived SIGKILL` against a process already in
+/// state `E`/`Z`.
+#[must_use]
+pub(crate) fn group_has_live_member(pgid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        group_members(pgid).iter().any(|member| !member.zombie)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        false
+    }
+}
+
+/// `/proc/<pid>/stat` scan: exact, no `ps` dependency (Linux).
+///
+/// `/proc/stat` field 2 (`comm`) is wrapped in parentheses and may itself
+/// contain spaces or parentheses, so parsing starts after the *last* `)`.
+/// The following fields are: state(3) ppid(4) pgrp(5) …
+#[cfg(target_os = "linux")]
+fn proc_group_members(pgid: i32) -> Vec<GroupMember> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        // /proc unreadable: fail toward the conservative killpg answer.
+        return if group_alive(pgid) {
+            vec![GroupMember {
+                pid: pgid,
+                zombie: false,
+            }]
+        } else {
+            Vec::new()
+        };
+    };
+    let mut members = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
+            continue;
+        };
+        let mut fields = after_comm.split_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let _ppid = fields.next();
+        let Some(group) = fields.next() else {
+            continue;
+        };
+        if group.parse::<i32>().ok() == Some(pgid) {
+            members.push(GroupMember {
+                pid,
+                zombie: state == "Z",
+            });
+        }
+    }
+    members
+}
+
+/// `ps -eo pgid=,pid=,stat=` scan for non-Linux unixes (macOS zombies are `Z`).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_group_members(pgid: i32) -> Vec<GroupMember> {
+    let output = std::process::Command::new("ps")
+        .args(["-eo", "pgid=,pid=,stat="])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let mut members = Vec::new();
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut parts = line.split_whitespace();
+                let Some(group) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
+                    continue;
+                };
+                let Some(pid) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
+                    continue;
+                };
+                let state = parts.next().unwrap_or("");
+                if group == pgid {
+                    members.push(GroupMember {
+                        pid,
+                        zombie: state.starts_with('Z'),
+                    });
+                }
+            }
+            members
+        }
+        _ => {
+            if group_alive(pgid) {
+                vec![GroupMember {
+                    pid: pgid,
+                    zombie: false,
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// Wait up to `grace` for the group to disappear.
-async fn settled(pgid: i32, grace: Duration) -> bool {
+///
+/// Before every liveness check the caller's reaper runs: the group leader is
+/// this Node's direct child, a `SIGKILL`ed child sits in `Z` until reaped, and
+/// an unreaped zombie still answers `killpg(0)` — exactly the false survivor
+/// the demo found.
+async fn settled<R>(pgid: i32, grace: Duration, reap: &mut R) -> bool
+where
+    R: FnMut() -> bool,
+{
     let deadline = tokio::time::Instant::now() + grace;
     loop {
-        if !group_alive(pgid) {
+        reap();
+        if !group_has_live_member(pgid) {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            // One last reap before giving up; the leader may have exited in the
+            // final poll window.
+            reap();
+            return !group_has_live_member(pgid);
         }
         tokio::time::sleep(POLL).await;
     }
@@ -161,17 +310,28 @@ async fn settled(pgid: i32, grace: Duration) -> bool {
 /// holding the master keeps the slave's other end open and a shell waiting on
 /// input never notices the hangup.
 ///
+/// `reap` collects this Node's dead direct child (the group leader) and
+/// returns whether it did. It runs before every liveness check: a
+/// `SIGKILL`ed child is a zombie until waited, and a zombie still answers
+/// `killpg(0)` — without the reap the ladder reported a false
+/// `stop-incomplete` against a process already dead in `E`/`Z`.
+///
 /// Never returns an error for "the group would not die" — that is a
 /// [`StopOutcome`] with `group_gone: false`, which the caller journals as
 /// `stop-incomplete`. An `Err` here means the *signal call itself* failed,
 /// which is a bug in the caller's pgid, not a stubborn process.
-pub(super) async fn stop_group<F>(pgid: i32, mut close_master: F) -> DriverResult<StopOutcome>
+pub(super) async fn stop_group<F, R>(
+    pgid: i32,
+    mut close_master: F,
+    reap: &mut R,
+) -> DriverResult<StopOutcome>
 where
     F: FnMut(),
+    R: FnMut() -> bool,
 {
     #[cfg(not(unix))]
     {
-        let _ = (&mut close_master, pgid);
+        let _ = (&mut close_master, pgid, reap);
         return Err(DriverError::CapabilityUnsupported(
             "the stop ladder requires unix process groups".into(),
         ));
@@ -180,13 +340,21 @@ where
     {
         use nix::sys::signal::Signal;
 
-        if pgid <= 0 || !group_alive(pgid) {
+        if pgid <= 0 {
+            close_master();
+            return Ok(StopOutcome::already_gone());
+        }
+        // Collect an already-dead leader first: a process that exited on its
+        // own is a zombie its parent never waited, and the zombie still
+        // answers killpg. When nothing live remains there is no ladder to run.
+        reap();
+        if !group_has_live_member(pgid) {
             close_master();
             return Ok(StopOutcome::already_gone());
         }
 
         signal_group(pgid, Signal::SIGINT)?;
-        if settled(pgid, GRACE_INT).await {
+        if settled(pgid, GRACE_INT, reap).await {
             close_master();
             return Ok(StopOutcome {
                 rung: StopRung::Interrupt,
@@ -199,7 +367,7 @@ where
         // §5.3 step 2: the hangup and the master fd go together.
         close_master();
         signal_group(pgid, Signal::SIGHUP)?;
-        if settled(pgid, GRACE_HUP).await {
+        if settled(pgid, GRACE_HUP, reap).await {
             return Ok(StopOutcome {
                 rung: StopRung::Hangup,
                 group_gone: true,
@@ -209,29 +377,42 @@ where
         }
 
         signal_group(pgid, Signal::SIGKILL)?;
-        let gone = settled(pgid, GRACE_KILL).await;
+        let gone = settled(pgid, GRACE_KILL, reap).await;
         Ok(StopOutcome {
             rung: StopRung::Kill,
             group_gone: gone,
             pgid: Some(pgid),
-            survivors: if gone { Vec::new() } else { survivors(pgid) },
+            // Only genuinely-live members are survivors: a zombie is gone,
+            // whether this caller reaped it or init did after reparenting.
+            survivors: if gone {
+                Vec::new()
+            } else {
+                live_survivors(pgid)
+            },
         })
     }
 }
 
-/// Pids still in `pgid`, for a `stop-incomplete` diagnostic.
+/// Pids in `pgid` that are still running (not zombies), for a
+/// `stop-incomplete` diagnostic.
 ///
-/// Diagnostic-only, so shelling out to `ps` is acceptable here in a way it
-/// would not be on the liveness path: an empty vec from a missing `ps` weakens
-/// the message but never turns a survivor into a clean exit, because
-/// [`group_alive`] already made that call.
-fn survivors(pgid: i32) -> Vec<i32> {
-    use crate::promote::{ProcessTable, SystemProcessTable};
-    SystemProcessTable
-        .process_group(pgid)
-        .into_iter()
-        .map(|row| row.pid)
-        .collect()
+/// Diagnostic-only: a table that cannot be read weakens the message but never
+/// turns a live process into a clean exit — [`group_has_live_member`] already
+/// made that call on the liveness path.
+fn live_survivors(pgid: i32) -> Vec<i32> {
+    #[cfg(unix)]
+    {
+        group_members(pgid)
+            .into_iter()
+            .filter(|member| !member.zombie)
+            .map(|member| member.pid)
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        Vec::new()
+    }
 }
 
 /// How a PTY-hosted process ended. §5.5 requires both witnesses.
@@ -450,6 +631,53 @@ mod tests {
         pid
     }
 
+    /// Spawn `script` as its own process-group leader, leaving the [`Child`]
+    /// in the caller's hands: the caller decides when to reap, which is the
+    /// whole point of the zombie tests.
+    #[cfg(unix)]
+    async fn spawn_leader_unreaped(
+        script: &str,
+        ready: &std::path::Path,
+    ) -> (i32, std::process::Child) {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", script]).process_group(0);
+        let child = command.spawn().expect("spawn");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fixture never signalled readiness"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (pid, child)
+    }
+
+    /// Wait until `pid` is a zombie in `/proc` (Linux).
+    #[cfg(all(unix, target_os = "linux"))]
+    async fn wait_for_zombie(pid: i32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false);
+            if zombie {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{pid} never became a zombie"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// A shell that traps SIGINT and SIGHUP and then stays resident.
     ///
     /// The `while` loop is load-bearing: with a single trailing `sleep`, `sh`
@@ -468,11 +696,15 @@ mod tests {
         // The whole point of the ladder: a process that catches SIGINT (every
         // agent TUI does) must still be stopped, and the outcome must name the
         // rung that actually worked rather than claiming the first one did.
+        // `spawn_leader` reaps in a background thread, so the ladder's own
+        // reaper is a no-op here.
         let dir = tempfile::tempdir().expect("tempdir");
         let ready = dir.path().join("ready");
         let pid = spawn_leader(&stubborn(&ready), &ready).await;
 
-        let outcome = stop_group(pid, || {}).await.expect("ladder runs");
+        let outcome = stop_group(pid, || {}, &mut || false)
+            .await
+            .expect("ladder runs");
         assert_eq!(
             outcome.rung,
             StopRung::Kill,
@@ -490,7 +722,9 @@ mod tests {
         let script = format!(": > {}; while :; do sleep 0.1; done", ready.display());
         let pid = spawn_leader(&script, &ready).await;
 
-        let outcome = stop_group(pid, || {}).await.expect("ladder runs");
+        let outcome = stop_group(pid, || {}, &mut || false)
+            .await
+            .expect("ladder runs");
         assert_eq!(outcome.rung, StopRung::Interrupt);
         assert!(outcome.group_gone);
     }
@@ -506,7 +740,7 @@ mod tests {
         let _ = child.wait();
 
         let mut closed = false;
-        let outcome = stop_group(pid, || closed = true)
+        let outcome = stop_group(pid, || closed = true, &mut || false)
             .await
             .expect("ladder runs");
         assert_eq!(outcome.rung, StopRung::AlreadyGone);
@@ -538,11 +772,65 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
-        let outcome = stop_group(pid, || {}).await.expect("ladder runs");
+        let outcome = stop_group(pid, || {}, &mut || false)
+            .await
+            .expect("ladder runs");
         assert!(outcome.group_gone);
         assert!(
             !group_alive(grandchild),
             "the grandchild must not be orphaned; that is the defect §5.3 names"
         );
+    }
+
+    /// The defect from the live demo (native-pty-2c): a SIGKILLed child that
+    /// nobody reaped is a zombie, still a member of its process group, and a
+    /// zombie still answers `killpg(pgid, 0)`. The old ladder counted it as a
+    /// survivor and emitted `stop-incomplete: the process group outlived
+    /// SIGKILL` against a process that was already dead in `E`/`Z`.
+    ///
+    /// Here the child is killed, deliberately left unreaped, and then the
+    /// ladder runs: the ladder reaps it itself and reports the group gone with
+    /// zero survivors.
+    #[cfg(all(unix, target_os = "linux"))]
+    #[tokio::test]
+    async fn an_unreaped_zombie_leader_is_reaped_by_the_ladder_not_named_a_survivor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("ready");
+        // `exec sleep` replaces the shell: one process in the group, so after
+        // the SIGKILL the only member is its zombie.
+        let script = format!(": > {}; exec sleep 30", ready.display());
+        let (pid, mut child) = spawn_leader_unreaped(&script, &ready).await;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .expect("kill leader");
+        // Prove the premise: it really is a zombie, and killpg still sees it.
+        wait_for_zombie(pid).await;
+        assert!(group_alive(pid), "a zombie still answers killpg(0)");
+        assert!(!group_has_live_member(pid), "...but it is not alive");
+
+        // Cell rather than a captured `bool`: the closure owns what it moves,
+        // and a copied flag would leave the assertion here looking at a value
+        // the closure could never change.
+        let reaped = std::cell::Cell::new(false);
+        let outcome = stop_group(pid, || {}, &mut || {
+            if reaped.get() {
+                return true;
+            }
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    reaped.set(true);
+                    true
+                }
+                _ => false,
+            }
+        })
+        .await
+        .expect("ladder runs");
+        assert!(reaped.get(), "the ladder reaps its own dead child");
+        assert!(outcome.group_gone, "a zombie is not an outlived group");
+        assert!(outcome.survivors.is_empty());
+        assert_eq!(outcome.rung, StopRung::AlreadyGone);
     }
 }

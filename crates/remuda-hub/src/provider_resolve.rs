@@ -445,6 +445,7 @@ mod tests {
             last_test_message: None,
             created_at: "2026-09-13T00:00:00.000Z".into(),
             updated_at: "2026-09-13T00:00:00.000Z".into(),
+            supply: Default::default(),
         }
     }
 

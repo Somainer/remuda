@@ -453,14 +453,20 @@ async fn fake_node(
                     .await
                     .insert(interaction_id.as_id().as_str().to_string(), card);
                 append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
-                append_n = append_journal(
-                    &mut ws,
-                    &instance_id,
-                    append_n,
-                    "assistant",
-                    &format!("echo: {prompt}"),
-                )
-                .await?;
+                if let Some(reply) = code_comment_reply(prompt) {
+                    // r-ux-comment: a fenced block to exercise 评论.
+                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                        .await?;
+                } else {
+                    append_n = append_journal(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "assistant",
+                        &format!("echo: {prompt}"),
+                    )
+                    .await?;
+                }
                 // A freshly launched native-PTY agent is mid-turn until the
                 // web drives it; the approval keeps it blocked until answered.
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "working").await?;
@@ -478,6 +484,17 @@ async fn fake_node(
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
                 append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
+                // r-ux-comment: reply with a fenced code block so the browser
+                // spec can exercise the 评论 quote action. The prompt is also
+                // echoed verbatim below, proving the expanded quote arrived.
+                if let Some(reply) = code_comment_reply(prompt) {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                        .await?;
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    continue;
+                }
                 // r-ux-w: synthetic workflow timeline-card scenarios.
                 if let Some(kind) = workflow_kind(prompt) {
                     send_rpc_ok(
@@ -1061,6 +1078,26 @@ fn fake_hook_approval(instance_id: &str, host_id: &str, interaction_id: &str) ->
 }
 
 /// r-ux-w: select a synthetic workflow scenario by prompt prefix.
+/// r-ux-comment: prompts mentioning code get an assistant reply containing a
+/// fenced ts block, so the browser spec can quote it with the 评论 action.
+fn code_comment_reply(prompt: &str) -> Option<String> {
+    if !prompt.contains("show me code") {
+        return None;
+    }
+    Some(
+        "here is the function:\n\
+         \n\
+         ```ts src/math.ts\n\
+         export function add(a: number, b: number): number {\n\
+         \x20 return a + b;\n\
+         }\n\
+         ```\n\
+         \n\
+         ask about any line."
+            .to_owned(),
+    )
+}
+
 fn workflow_kind(prompt: &str) -> Option<&'static str> {
     const PREFIX: &str = "workflow card";
     if !prompt.starts_with(PREFIX) {

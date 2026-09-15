@@ -20,6 +20,7 @@ mod project;
 mod rpc;
 mod scalar;
 pub mod schema;
+mod supply;
 mod task;
 
 pub use binary::*;
@@ -35,6 +36,7 @@ pub use observation::*;
 pub use project::*;
 pub use rpc::*;
 pub use scalar::*;
+pub use supply::*;
 pub use task::*;
 
 /// Hub policy default for delegation depth (edges from a human root); §2.5 ⑤.

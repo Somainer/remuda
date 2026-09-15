@@ -1,0 +1,330 @@
+{
+ "liveRun": {
+  "description": {
+   "state": "known",
+   "value": "r-wfprod end-to-end evidence run"
+  },
+  "engine": "claude-workflow",
+  "live": {
+   "agentLabel": {
+    "state": "known",
+    "value": "plan:a"
+   },
+   "phaseTitle": {
+    "state": "known",
+    "value": "Plan"
+   },
+   "summary": {
+    "evidenceEventIds": [],
+    "reason": "not-emitted",
+    "state": "unknown"
+   }
+  },
+  "name": {
+   "state": "known",
+   "value": "wfprod-evidence-1"
+  },
+  "nativeRunId": {
+   "state": "known",
+   "value": "wf_fcfd9e24-f8f"
+  },
+  "nativeTaskId": {
+   "state": "known",
+   "value": "whk9dywf6"
+  },
+  "resultRef": null,
+  "revision": "2",
+  "state": "running",
+  "title": {
+   "state": "known",
+   "value": "r-wfprod end-to-end evidence run"
+  },
+  "toolCallId": "obj_5c2a67ea-1409-7363-ac27-103c95aa440b",
+  "totals": {
+   "agentsDone": "0",
+   "agentsFailed": "0",
+   "agentsKilled": "0",
+   "agentsRunning": "1",
+   "agentsTotal": "3",
+   "calls": "0",
+   "elapsedMs": "2007378",
+   "tokens": "22729",
+   "totalKnown": true
+  },
+  "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+ },
+ "livePhases": [
+  {
+   "label": {
+    "state": "known",
+    "value": "Plan"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Plan"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5869432faa1",
+   "revision": "2",
+   "state": "running",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  },
+  {
+   "label": {
+    "state": "known",
+    "value": "Check"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Check"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5874a7b5236",
+   "revision": "1",
+   "state": "queued",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  }
+ ],
+ "liveMembers": [
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "0",
+   "durationMs": "4601",
+   "label": {
+    "state": "known",
+    "value": "plan:a"
+   },
+   "memberId": "obj_01a0a530-68be-7347-8397-e820d37920d0",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "a4a39a508adeb7482"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:5a4945be73390e1cfe26bc112ce60561386beeaa05b3a191c22d16d2cf60ac63"
+   },
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5869432faa1",
+   "resultRef": null,
+   "revision": "1",
+   "startedAt": "2026-09-15T12:36:40.940Z",
+   "state": "running",
+   "tokens": "22729",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  }
+ ],
+ "doneRun": {
+  "description": {
+   "state": "known",
+   "value": "r-wfprod end-to-end evidence run"
+  },
+  "engine": "claude-workflow",
+  "live": {
+   "agentLabel": {
+    "evidenceEventIds": [],
+    "reason": "not-emitted",
+    "state": "unknown"
+   },
+   "phaseTitle": {
+    "evidenceEventIds": [],
+    "reason": "not-emitted",
+    "state": "unknown"
+   },
+   "summary": {
+    "state": "known",
+    "value": "Dynamic workflow \\\"r-wfprod end-to-end evidence run\\\" completed"
+   }
+  },
+  "name": {
+   "state": "known",
+   "value": "wfprod-evidence-1"
+  },
+  "nativeRunId": {
+   "state": "known",
+   "value": "wf_fcfd9e24-f8f"
+  },
+  "nativeTaskId": {
+   "state": "known",
+   "value": "whk9dywf6"
+  },
+  "resultRef": null,
+  "revision": "8",
+  "state": "completed",
+  "title": {
+   "state": "known",
+   "value": "r-wfprod end-to-end evidence run"
+  },
+  "toolCallId": "obj_5c2a67ea-1409-7363-ac27-103c95aa440b",
+  "totals": {
+   "agentsDone": "3",
+   "agentsFailed": "0",
+   "agentsKilled": "0",
+   "agentsRunning": "0",
+   "agentsTotal": "3",
+   "calls": "2",
+   "elapsedMs": "248501",
+   "tokens": "68900",
+   "totalKnown": true
+  },
+  "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+ },
+ "donePhases": [
+  {
+   "label": {
+    "state": "known",
+    "value": "Plan"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Plan"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5869432faa1",
+   "revision": "3",
+   "state": "completed",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  },
+  {
+   "label": {
+    "state": "known",
+    "value": "Check"
+   },
+   "nativePhaseId": {
+    "state": "known",
+    "value": "Check"
+   },
+   "parentPhaseId": null,
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5874a7b5236",
+   "revision": "3",
+   "state": "completed",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  }
+ ],
+ "doneMembers": [
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "0",
+   "durationMs": "4601",
+   "endedAt": "2026-09-15T12:36:45.541Z",
+   "label": {
+    "state": "known",
+    "value": "plan:a"
+   },
+   "memberId": "obj_01a0a530-68be-7347-8397-e820d37920d0",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "a4a39a508adeb7482"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:5a4945be73390e1cfe26bc112ce60561386beeaa05b3a191c22d16d2cf60ac63"
+   },
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5869432faa1",
+   "resultRef": null,
+   "revision": "2",
+   "startedAt": "2026-09-15T12:36:40.940Z",
+   "state": "completed",
+   "tokens": "22729",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  },
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "0",
+   "durationMs": "80296",
+   "endedAt": "2026-09-15T12:38:01.237Z",
+   "label": {
+    "state": "known",
+    "value": "plan:b"
+   },
+   "memberId": "obj_01a0a530-68bf-779e-a1da-a2927679d304",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "a8c8c8db280940216"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:4e5ebcc5f09bc31df50a1b3e79274efc3d8fda20058d25aa8cc6033f7bdd2bc7"
+   },
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5869432faa1",
+   "resultRef": null,
+   "revision": "2",
+   "startedAt": "2026-09-15T12:36:40.941Z",
+   "state": "completed",
+   "tokens": "22729",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  },
+  {
+   "attempt": {
+    "state": "known",
+    "value": "1"
+   },
+   "calls": "2",
+   "durationMs": "168144",
+   "endedAt": "2026-09-15T12:40:49.441Z",
+   "label": {
+    "state": "known",
+    "value": "check:summary"
+   },
+   "latestTool": {
+    "state": "known",
+    "value": "Read"
+   },
+   "memberId": "obj_01a0a530-68c2-7792-91a3-00914ad85cfc",
+   "modelRequested": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "modelResolved": {
+    "state": "known",
+    "value": "claude-opus-4-8"
+   },
+   "nativeAgentId": {
+    "state": "known",
+    "value": "afb04b5027c0fdbf8"
+   },
+   "nativeKey": {
+    "state": "known",
+    "value": "v2:89139676dd5445d052605513e723df834bce037aa82a31b4deec8de2268e66b7"
+   },
+   "phaseId": "obj_01a0a530-6859-710a-a14d-b5874a7b5236",
+   "resultRef": null,
+   "revision": "2",
+   "startedAt": "2026-09-15T12:38:01.297Z",
+   "state": "completed",
+   "tokens": "23442",
+   "workflowId": "obj_01a0a530-6859-710a-a14d-b585f1efc990"
+  }
+ ]
+}

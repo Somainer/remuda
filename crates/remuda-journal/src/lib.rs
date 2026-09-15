@@ -28,4 +28,6 @@ pub use projection::{
 pub use source::{ADAPTER_VERSION, FileTail, MapContext, Source, SourceResume};
 pub use store::{Follow, FsyncPolicy, Journal, JournalOptions, Snapshot};
 pub use util::{digest_of, timestamp_now};
-pub use workflow::WorkflowJournalTailer;
+pub use workflow::{
+    AgentCallSite, MatchedCall, WorkflowJournalTailer, WorkflowLaunch, WorkflowScript,
+};

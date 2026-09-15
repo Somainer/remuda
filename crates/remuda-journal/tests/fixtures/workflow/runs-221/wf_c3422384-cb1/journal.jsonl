@@ -1,0 +1,8 @@
+{"type":"started","key":"v2:fdc74efd0cb6889adc0bc2b8c033ad6ba01a8959d991fc92edfa0c8acfe8cbb1","agentId":"aae139d44933cefe2"}
+{"type":"started","key":"v2:cf96cd0af8d9e5ea79c3c88fcd729f7627b7b8dca12474292bb0b6efc71ff7e1","agentId":"a600b756a51671bdd"}
+{"type":"result","key":"v2:fdc74efd0cb6889adc0bc2b8c033ad6ba01a8959d991fc92edfa0c8acfe8cbb1","agentId":"aae139d44933cefe2","result":"hello-alpha-1\ndone-alpha-1"}
+{"type":"result","key":"v2:cf96cd0af8d9e5ea79c3c88fcd729f7627b7b8dca12474292bb0b6efc71ff7e1","agentId":"a600b756a51671bdd","result":"hello-alpha-2\ndone-alpha-2"}
+{"type":"started","key":"v2:fa9298c4be08fb8630515f2d120309870e0a8e34c551a18c49f4ba6f18c153f3","agentId":"aa0c6a535232f3334"}
+{"type":"started","key":"v2:61839973f9fd07c65376b3c6b1091ee50d549404fd74f3eb8efcbbee6688e802","agentId":"a03d5a31534ff70f8"}
+{"type":"result","key":"v2:fa9298c4be08fb8630515f2d120309870e0a8e34c551a18c49f4ba6f18c153f3","agentId":"aa0c6a535232f3334","result":"PONG"}
+{"type":"result","key":"v2:61839973f9fd07c65376b3c6b1091ee50d549404fd74f3eb8efcbbee6688e802","agentId":"a03d5a31534ff70f8","result":"hello-beta-two"}

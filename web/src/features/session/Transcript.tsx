@@ -682,6 +682,7 @@ function ToolRow({
       result={node.result}
       completeness={node.completeness}
       diffState={node.diffState}
+      workflow={node.workflow}
       defaultFolded={failed ? false : opts.defaultFolded}
       settle={opts.settle}
     />
@@ -780,7 +781,7 @@ function renderNode(
             <ToolRow
               key={child.id}
               node={child}
-              opts={{ defaultFolded: opts.defaultFolded, collapseTick: opts.collapseTick, settle: opts.settle}}
+              opts={{ defaultFolded: opts.defaultFolded, collapseTick: opts.collapseTick, settle: opts.settle }}
             />
           ) : child.type === "thought" ? (
             <details key={child.id} className={session.thought}>

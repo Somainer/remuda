@@ -815,6 +815,9 @@ impl DevNode {
         let loader = AttachmentLoader::new(objects, data_dir.clone());
         let id = instance_id.clone();
         let carrier = self.carrier_supervisor();
+        // An adopted instance starts with no live prompt correlations: pending
+        // registrations are in-memory and die with the Node that owned them.
+        let prompts = Arc::new(crate::prompt_correlation::PromptCorrelator::new());
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             if let Err(error) = instance_worker(
@@ -825,6 +828,7 @@ impl DevNode {
                 interactions,
                 carrier,
                 loader,
+                prompts,
             )
             .await
             {
@@ -886,6 +890,7 @@ fn spawn_observation_pump(
     instance_id: InstanceId,
     mut observations: mpsc::Receiver<remuda_protocol::Observation>,
     driver: Arc<dyn Driver>,
+    prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // D-028 §7: `MessageDisplay` deltas are the only live text an
@@ -894,152 +899,206 @@ fn spawn_observation_pump(
         // fill in line by line instead of a whole message at a time.
         let mut assembler = crate::signal_messages::MessageAssembler::new();
         let mut promoted_hooks = crate::signal::PromotedHooks::default();
-        while let Some(mut observation) = observations.recv().await {
-            if observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty
-                && observation.source.channel == remuda_protocol::SourceChannel::Hook
-                && !store.get_instance(&instance_id).is_ok_and(|instance| {
-                    // This receiver already belongs to the Node instance.
-                    // Drivers mint local envelope ids; the store replaces
-                    // them with Node identity when committing the journal.
-                    observation.process_generation == instance.process_ref.process_generation
-                })
-            {
-                tracing::warn!("stale hook observation ignored");
-                continue;
-            }
-            // §5.5 before the generic failure fold: a clean exit carries
-            // `Severity::Info` and would otherwise fall through both, leaving
-            // a finished instance reported as `ready`.
-            if let Some(exit) = native_exit(&observation) {
-                record_native_exit(store.as_ref(), &instance_id, &exit);
-            } else if let Some(reason) = native_failure_reason(&observation) {
-                record_task_exit(store.as_ref(), &instance_id, &reason);
-            }
-            if let Some(promotion) = promotion_change(&observation) {
-                if let Err(error) = store.set_instance_promotion(
-                    &instance_id,
-                    promotion.kind,
-                    promotion.mode,
-                    promotion.promoted_at,
-                ) {
-                    tracing::warn!(%error, "instance promotion not applied");
-                } else {
-                    // Promotion is precisely the event that changes the
-                    // answer: the PTY was carrying a login shell and is now
-                    // carrying an agent, so steer / queue / interrupt move
-                    // from "not provided" to that harness's measured
-                    // provisions (§4.3, §6).
-                    refresh_capabilities(store.as_ref(), &instance_id, driver.as_ref()).await;
+        // r-wfprod: hook-triggered Workflow run producer with a 250 ms file
+        // drain tick.
+        let mut workflow = crate::workflow_producer::WorkflowProducer::new(instance_id.clone());
+        let mut workflow_tick = tokio::time::interval(crate::workflow_producer::WORKFLOW_POLL);
+        workflow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                maybe_observation = observations.recv() => {
+                    let Some(observation) = maybe_observation else { break };
+                    pump_one_observation(
+                        &store,
+                        &interactions,
+                        &instance_id,
+                        &driver,
+                        &prompts,
+                        &mut assembler,
+                        &mut promoted_hooks,
+                        &mut workflow,
+                        observation,
+                    ).await;
                 }
-            }
-            let promoted_hook =
-                observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty;
-            let bound = promoted_hooks.observe(&observation);
-            if let Some(session) = bound {
-                record_native_session(
-                    store.as_ref(),
-                    &instance_id,
-                    &NativeSessionEvidence {
-                        session_id: session.session_id,
-                        transcript_path: session.transcript_path,
-                        signal_tier: Some(remuda_protocol::SignalTier::Hook),
-                    },
-                );
-            } else if !(promoted_hook
-                && observation.source.channel == remuda_protocol::SourceChannel::Hook)
-                && let Some(session) = native_session_evidence(&observation)
-            {
-                record_native_session(store.as_ref(), &instance_id, &session);
-            }
-            // D-028 §4.3: Hook outranks File, and both outrank Screen. Without
-            // this the hook/file events are journaled but the instance still
-            // follows `agent_status`, which is a screen guess — the composer
-            // would keep believing the screen over the harness's own account.
-            //
-            // Promoted hand-typed sessions fold through the promoted-hook
-            // tracker; a launched session folds through the static classifier.
-            let hook_activity = if promoted_hook {
-                promoted_hooks.activity(&observation)
-            } else {
-                crate::signal::hook_activity(&observation)
-            };
-            let mut activity_annotated = false;
-            if promoted_hook
-                && let ObservationPayload::Lifecycle(payload) = &mut observation.body
-                && let LifecyclePayload::Native(native) = payload.as_mut()
-            {
-                // This annotation belongs to the Node, never to the harness.
-                // Carry validated state on its causal event so Hub/web need
-                // not wait for a second serialized journal append/ACK.
-                native.related_ids.remove("remudaActivity");
-                let activity = match hook_activity {
-                    Some(Activity::Working) => Some("working"),
-                    Some(Activity::Idle) => Some("idle"),
-                    _ => None,
-                };
-                if let Some(activity) = activity {
-                    native
-                        .related_ids
-                        .insert("remudaActivity".into(), activity.into());
-                    activity_annotated = true;
-                }
-            }
-            // P6: File turn lifecycles fold only when no hook set activity and
-            // only for a kind with a file-tail adapter (codex/grok); the
-            // registry is the single lookup rather than another per-kind branch.
-            let activity = hook_activity.or_else(|| match store.get_instance(&instance_id) {
-                Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
-                    crate::signal::file_activity(&observation)
-                }
-                _ => None,
-            });
-            if let Some(activity) = activity
-                && let Err(error) = store.set_instance_state(
-                    &instance_id,
-                    None,
-                    Some(remuda_protocol::Knowledge::Known { value: activity }),
-                )
-            {
-                tracing::warn!(%error, "hook/file activity not applied");
-            }
-            match store.append_driver_observation(&instance_id, observation) {
-                Ok(committed) => {
-                    if let Err(error) = interactions.ingest(&committed).await {
-                        tracing::debug!(%error, "interaction ingest failed");
-                    }
-                    // The hook event itself is the evidence and is journaled
-                    // above; this is the readable message derived from it. It
-                    // follows the hook so the two stay in seq order, and is
-                    // built from `committed` so it inherits the envelope the
-                    // store just stamped. Unbound/foreign shell hooks remain
-                    // raw evidence; only the verified foreground can add text.
-                    if (!promoted_hook || promoted_hooks.owns_hook(&committed))
-                        && let Some(delta) = crate::signal_messages::message_delta(&committed)
-                        && let Some(payload) = assembler.fold(&delta)
-                    {
-                        let message = crate::signal_messages::MessageAssembler::observation(
-                            &committed, payload,
-                        );
-                        if let Err(error) = store.append_driver_observation(&instance_id, message) {
-                            tracing::warn!(%error, "streamed message not journaled");
+                _ = workflow_tick.tick() => {
+                    for derived in workflow.poll() {
+                        if let Err(error) =
+                            store.append_driver_observation(&instance_id, derived)
+                        {
+                            tracing::error!(%error, "workflow observation commit failed");
                         }
                     }
-                    if hook_activity.is_some() && !activity_annotated {
-                        record_hook_activity(store.as_ref(), &instance_id);
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
-                    record_task_exit(
-                        store.as_ref(),
-                        &instance_id,
-                        "native-observation-commit-failed",
-                    );
-                    break;
                 }
             }
         }
     })
+}
+
+/// Fold and commit one driver observation, then any Workflow observations its
+/// hook trigger synthesized.
+#[allow(clippy::too_many_arguments)]
+async fn pump_one_observation(
+    store: &Arc<dyn LocalStore>,
+    interactions: &Arc<InteractionRuntime>,
+    instance_id: &InstanceId,
+    driver: &Arc<dyn Driver>,
+    prompts: &Arc<crate::prompt_correlation::PromptCorrelator>,
+    assembler: &mut crate::signal_messages::MessageAssembler,
+    promoted_hooks: &mut crate::signal::PromotedHooks,
+    workflow: &mut crate::workflow_producer::WorkflowProducer,
+    mut observation: remuda_protocol::Observation,
+) {
+    if observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty
+        && observation.source.channel == remuda_protocol::SourceChannel::Hook
+        && !store.get_instance(instance_id).is_ok_and(|instance| {
+            // This receiver already belongs to the Node instance.
+            // Drivers mint local envelope ids; the store replaces
+            // them with Node identity when committing the journal.
+            observation.process_generation == instance.process_ref.process_generation
+        })
+    {
+        tracing::warn!("stale hook observation ignored");
+        return;
+    }
+    // C2: stamp this observation with the command that delivered its prompt,
+    // if any. Runs after the stale-hook drop so foreign events are never
+    // attributed; natively typed prompts match nothing and pass through.
+    prompts.correlate(&mut observation);
+    // §5.5 before the generic failure fold: a clean exit carries
+    // `Severity::Info` and would otherwise fall through both, leaving
+    // a finished instance reported as `ready`.
+    if let Some(exit) = native_exit(&observation) {
+        record_native_exit(store.as_ref(), instance_id, &exit);
+    } else if let Some(reason) = native_failure_reason(&observation) {
+        record_task_exit(store.as_ref(), instance_id, &reason);
+    }
+    if let Some(promotion) = promotion_change(&observation) {
+        if let Err(error) = store.set_instance_promotion(
+            instance_id,
+            promotion.kind,
+            promotion.mode,
+            promotion.promoted_at,
+        ) {
+            tracing::warn!(%error, "instance promotion not applied");
+        } else {
+            // Promotion is precisely the event that changes the
+            // answer: the PTY was carrying a login shell and is now
+            // carrying an agent, so steer / queue / interrupt move
+            // from "not provided" to that harness's measured
+            // provisions (§4.3, §6).
+            refresh_capabilities(store.as_ref(), instance_id, driver.as_ref()).await;
+        }
+    }
+    let promoted_hook = observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty;
+    let bound = promoted_hooks.observe(&observation);
+    if let Some(session) = bound {
+        record_native_session(
+            store.as_ref(),
+            instance_id,
+            &NativeSessionEvidence {
+                session_id: session.session_id,
+                transcript_path: session.transcript_path,
+                signal_tier: Some(remuda_protocol::SignalTier::Hook),
+            },
+        );
+    } else if !(promoted_hook && observation.source.channel == remuda_protocol::SourceChannel::Hook)
+        && let Some(session) = native_session_evidence(&observation)
+    {
+        record_native_session(store.as_ref(), instance_id, &session);
+    }
+    // D-028 §4.3: Hook outranks File, and both outrank Screen. Without
+    // this the hook/file events are journaled but the instance still
+    // follows `agent_status`, which is a screen guess — the composer
+    // would keep believing the screen over the harness's own account.
+    //
+    // Promoted hand-typed sessions fold through the promoted-hook
+    // tracker; a launched session folds through the static classifier.
+    let hook_activity = if promoted_hook {
+        promoted_hooks.activity(&observation)
+    } else {
+        crate::signal::hook_activity(&observation)
+    };
+    let mut activity_annotated = false;
+    if promoted_hook
+        && let ObservationPayload::Lifecycle(payload) = &mut observation.body
+        && let LifecyclePayload::Native(native) = payload.as_mut()
+    {
+        // This annotation belongs to the Node, never to the harness.
+        // Carry validated state on its causal event so Hub/web need
+        // not wait for a second serialized journal append/ACK.
+        native.related_ids.remove("remudaActivity");
+        let activity = match hook_activity {
+            Some(Activity::Working) => Some("working"),
+            Some(Activity::Idle) => Some("idle"),
+            _ => None,
+        };
+        if let Some(activity) = activity {
+            native
+                .related_ids
+                .insert("remudaActivity".into(), activity.into());
+            activity_annotated = true;
+        }
+    }
+    // P6: File turn lifecycles fold only when no hook set activity and
+    // only for a kind with a file-tail adapter (codex/grok); the
+    // registry is the single lookup rather than another per-kind branch.
+    let activity = hook_activity.or_else(|| match store.get_instance(instance_id) {
+        Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
+            crate::signal::file_activity(&observation)
+        }
+        _ => None,
+    });
+    if let Some(activity) = activity
+        && let Err(error) = store.set_instance_state(
+            instance_id,
+            None,
+            Some(remuda_protocol::Knowledge::Known { value: activity }),
+        )
+    {
+        tracing::warn!(%error, "hook/file activity not applied");
+    }
+    match store.append_driver_observation(instance_id, observation) {
+        Ok(committed) => {
+            if let Err(error) = interactions.ingest(&committed).await {
+                tracing::debug!(%error, "interaction ingest failed");
+            }
+            // The hook event itself is the evidence and is journaled
+            // above; this is the readable message derived from it. It
+            // follows the hook so the two stay in seq order, and is
+            // built from `committed` so it inherits the envelope the
+            // store just stamped. Unbound/foreign shell hooks remain
+            // raw evidence; only the verified foreground can add text.
+            if (!promoted_hook || promoted_hooks.owns_hook(&committed))
+                && let Some(delta) = crate::signal_messages::message_delta(&committed)
+                && let Some(payload) = assembler.fold(&delta)
+            {
+                let message =
+                    crate::signal_messages::MessageAssembler::observation(&committed, payload);
+                if let Err(error) = store.append_driver_observation(instance_id, message) {
+                    tracing::warn!(%error, "streamed message not journaled");
+                }
+            }
+            if hook_activity.is_some() && !activity_annotated {
+                record_hook_activity(store.as_ref(), instance_id);
+            }
+            // r-wfprod: synthesize Workflow card observations from
+            // this hook trigger (launch snapshot / member start) and
+            // append them immediately so the latency budgets hold.
+            for derived in workflow.on_observation(&committed) {
+                if let Err(error) = store.append_driver_observation(instance_id, derived) {
+                    tracing::warn!(%error, "workflow observation not journaled");
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, instance_id = %instance_id.as_id(), "native observation commit failed");
+            record_task_exit(
+                store.as_ref(),
+                instance_id,
+                "native-observation-commit-failed",
+            );
+        }
+    }
 }
 
 async fn materialize_instance(
@@ -1062,6 +1121,9 @@ async fn materialize_instance(
     // would be a second way to do the same thing.
     pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
 ) -> Result<(), NodeError> {
+    // C2: per-instance registry joining command-delivered prompts onto the
+    // hook/transcript observations that confirm them.
+    let prompts = Arc::new(crate::prompt_correlation::PromptCorrelator::new());
     // Protocol §2.3: build is done; the dispatch intent is durable and the
     // native process is about to be spawned. Journal `preparing → starting`
     // before touching the driver so a Hub that never got the RPC reply still
@@ -1119,6 +1181,7 @@ async fn materialize_instance(
             instance_id.clone(),
             observations,
             Arc::clone(&driver),
+            Arc::clone(&prompts),
         );
         pumps.lock().await.insert(instance_id.clone(), pump);
     }
@@ -1168,6 +1231,7 @@ async fn materialize_instance(
             Some((create_command, initial_prompt)),
             carrier,
             loader,
+            Arc::clone(&prompts),
         )
         .await;
         tty.stop(&instance_id).await;
@@ -1196,6 +1260,7 @@ async fn materialize_instance(
             Arc::clone(&interactions),
             carrier.clone(),
             loader.clone(),
+            Arc::clone(&prompts),
         )
         .await?;
     }
@@ -1208,6 +1273,7 @@ async fn materialize_instance(
         interactions,
         carrier,
         loader,
+        prompts,
     )
     .await;
     tty.stop(&instance_id).await;
@@ -1271,6 +1337,7 @@ async fn instance_worker(
     interactions: Arc<InteractionRuntime>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
     loader: AttachmentLoader,
+    prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> Result<(), NodeError> {
     if pty_queue::is_pty(driver.kind()) {
         return pty_queue::run(
@@ -1282,6 +1349,7 @@ async fn instance_worker(
             None,
             carrier,
             loader,
+            prompts,
         )
         .await;
     }
@@ -1295,6 +1363,7 @@ async fn instance_worker(
             Arc::clone(&interactions),
             carrier.clone(),
             loader.clone(),
+            Arc::clone(&prompts),
         )
         .await?;
         if close_after {
@@ -1312,6 +1381,7 @@ async fn execute_queued(
     interactions: Arc<InteractionRuntime>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
     loader: AttachmentLoader,
+    prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> Result<(), NodeError> {
     // D-027: pull bytes in the worker, after the command was durably accepted.
     // A fetch failure settles just this command (rejected, not dispatched)
@@ -1355,20 +1425,28 @@ async fn execute_queued(
                 value: Activity::Working,
             }),
         )?;
-        // D-027b: the journal user message carries the landed image/file
-        // blocks, so the absolute landed path is recorded as metadata.
-        store.append_observation(
-            instance_id,
-            None,
-            Completeness::Structured,
-            crate::driver::message_payload(
-                MessageRole::User,
-                MessagePhase::Input,
-                prompt.clone(),
-                crate::attachments::content_blocks(attachments),
-            )?,
+        // C2: the non-PTY synthesized user message carries the delivering
+        // command id, and stdout/transcript user frames join its node the same
+        // way the PTY transcript does — one user node per command, everywhere.
+        // D-027b: it also carries the landed image/file blocks, so the
+        // absolute landed path is recorded as journal metadata.
+        let mut payload = crate::driver::message_payload(
+            MessageRole::User,
+            MessagePhase::Input,
+            prompt.clone(),
+            crate::attachments::content_blocks(attachments),
         )?;
+        if let ObservationPayload::Message(message) = &mut payload {
+            message.command_id = Some(queued.command_id.clone());
+            prompts.register(
+                queued.command_id.clone(),
+                message.mutation.node_id.clone(),
+                prompt.clone(),
+            );
+        }
+        store.append_observation(instance_id, None, Completeness::Structured, payload)?;
         if let Err(error) = driver.wait_control().await {
+            prompts.cancel(&queued.command_id);
             notify_carrier(carrier.as_ref(), &error);
             let diagnostic = DriverEmission::NativeLifecycle {
                 name: "control-wait".to_owned(),
@@ -1434,10 +1512,18 @@ async fn execute_queued(
             // A lost carrier is the Node's problem to fix, not the command's.
             // Recovery runs in the background; this command still settles now.
             notify_carrier(carrier.as_ref(), &error);
+            // §9.1: an effort switch a carrier cannot do (claude-print) is an
+            // honest capability rejection, not a driver fault — name it for the
+            // operation so the UI can show "unsupported in this session".
+            let diagnostic_name = if matches!(queued.request, DriverRequest::Configure { .. }) {
+                "instance.configure"
+            } else {
+                "fake-driver-error"
+            };
             let diagnostic = DriverEmission::NativeLifecycle {
-                name: "fake-driver-error".to_owned(),
-                status: error.to_string(),
-                severity: remuda_protocol::Severity::Error,
+                name: diagnostic_name.to_owned(),
+                status: format!("rejected: {error}"),
+                severity: remuda_protocol::Severity::Warning,
             };
             store.append_observation(
                 instance_id,
@@ -1445,7 +1531,10 @@ async fn execute_queued(
                 Completeness::Structured,
                 diagnostic.into_payload()?,
             )?;
-            if !pty_queue::is_pty(driver.kind()) {
+            // A control operation's rejection (e.g. an effort switch a carrier
+            // cannot do) must not mark the instance itself failed.
+            let is_control = matches!(queued.request, DriverRequest::Configure { .. });
+            if !pty_queue::is_pty(driver.kind()) && !is_control {
                 record_task_exit(store.as_ref(), instance_id, &error.to_string());
             }
             settle_command(
@@ -2522,6 +2611,7 @@ mod tests {
             id.clone(),
             rx,
             Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
         );
         let mut session = native_lifecycle(
             remuda_protocol::LifecycleTopic::Hook,
@@ -2604,6 +2694,7 @@ mod tests {
             id.clone(),
             rx,
             Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
         );
 
         async fn settled(

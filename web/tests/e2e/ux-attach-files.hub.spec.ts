@@ -305,8 +305,13 @@ test("a second send of the same filename lands with a numeric collision suffix",
   await pasteTextAndPdf(page);
   await expect(page.getByTestId("composer-send")).toBeEnabled({ timeout: 20_000 });
   await page.getByTestId("composer-send").click();
+  // Both the user bubble (file chips, via C2 correlation) and the assistant
+  // echo name the file; assert the echo specifically.
   await expect(
-    page.getByTestId("message").filter({ hasText: "e2e notes.txt" }),
+    page
+      .getByTestId("message")
+      .filter({ hasText: "echo: [File #1] [File #2]" })
+      .first(),
   ).toBeVisible({ timeout: 20_000 });
 
   // Send the same two filenames again; the second landing must not overwrite.

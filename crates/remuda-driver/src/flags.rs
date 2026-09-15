@@ -70,13 +70,26 @@ const EXTRA_CLAUDE: &[&str] = &[
     "ide",
 ];
 
-/// Codex/grok/agy inherit the historical set unchanged.
+/// Grok inherits the historical set, widened with the effort flag it actually
+/// parses (`--reasoning-effort`, with `--effort` a visible alias).
 ///
-/// Widening any of these needs the same `--help` evidence claude got, and
-/// narrowing them is a capability regression this change has no reason to
-/// make — so they keep exactly what they accepted before, in their own table,
-/// where a future per-CLI probe can correct them independently.
-const EXTRA_LEGACY: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-config", "name"];
+/// Widening any of these needs the same `--help` evidence claude got.
+const EXTRA_GROK: &[&str] = &[
+    "effort",
+    "reasoning-effort",
+    "max-budget-usd",
+    "add-dir",
+    "mcp-config",
+    "name",
+];
+
+/// Codex parses NEITHER `--effort` nor `--reasoning-effort` — both are clap
+/// errors at startup (`unexpected argument`); its effort axis is the
+/// `-c model_reasoning_effort=…` overlay, emitted by [`crate::effort`].
+const EXTRA_CODEX: &[&str] = &["max-budget-usd", "add-dir", "mcp-config", "name"];
+
+/// agy keeps the historical set until a `--help` probe says otherwise.
+const EXTRA_AGY: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-config", "name"];
 
 /// The allowlist a driver's `spec.args` are checked against.
 ///
@@ -87,19 +100,27 @@ const EXTRA_LEGACY: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-conf
 fn extra_allowlist(driver: DriverKind) -> &'static [&'static str] {
     match driver {
         DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => EXTRA_CLAUDE,
-        DriverKind::CodexAppserver | DriverKind::GrokAcp | DriverKind::AgyPrint => EXTRA_LEGACY,
+        DriverKind::CodexAppserver => EXTRA_CODEX,
+        DriverKind::GrokAcp => EXTRA_GROK,
+        DriverKind::AgyPrint => EXTRA_AGY,
         DriverKind::ShellPty | DriverKind::GenericPty => EXTRA_CLAUDE,
     }
 }
 
-/// Values `--effort` accepts: the five D-028 §9.1 levels plus `ultracode`.
+/// Values `--effort` accepts on Claude-shaped CLIs: the five D-028 §9.1
+/// levels plus `ultracode`.
 ///
 /// The legacy tier names (`default` / `think` / `think-hard`) are normalized
 /// to levels by [`remuda_protocol::EffortSelection`] *before* argv is built,
 /// so reaching this allowlist with one of them means a caller hand-wrote a
 /// flag that the binary would reject. Refuse it here, where the error names
 /// the flag, instead of at launch where it is a startup crash.
-const EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
+const CLAUDE_EFFORT_FLAG_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
+
+/// Values grok's `--reasoning-effort` (alias `--effort`) accepts: the built-in
+/// `/effort` menu. Evidence: grok-build `ReasoningEffort::from_str` + user
+/// guide, documented in composer-slider-5.md.
+const GROK_EFFORT_FLAG_VALUES: &[&str] = &["low", "medium", "high", "xhigh"];
 
 /// Env names that disable native features. A spec may set these to a falsy
 /// value; anything truthy is refused. The full denylist is
@@ -166,12 +187,18 @@ pub fn validate_spec_args(driver: DriverKind, args: &[String]) -> DriverResult<V
                 ));
             }
         }
-        if key == "effort" {
+        if key == "effort" || key == "reasoning-effort" {
             let value = flag.value.as_deref().unwrap_or_default().trim();
-            if !EFFORT_VALUES.contains(&value) {
+            let allowed = match driver {
+                DriverKind::GrokAcp => GROK_EFFORT_FLAG_VALUES,
+                // Codex never reaches here (its flags are not on its
+                // allowlist); claude/agy/shell/generic take the Claude set.
+                _ => CLAUDE_EFFORT_FLAG_VALUES,
+            };
+            if !allowed.contains(&value) {
                 return Err(DriverError::InvalidLaunchSpec(format!(
-                    "--effort {value} is not one of {}",
-                    EFFORT_VALUES.join(" / ")
+                    "--{key} {value} is not one of {}",
+                    allowed.join(" / ")
                 )));
             }
         }
@@ -300,6 +327,7 @@ fn takes_value(canonical_name: &str) -> bool {
     matches!(
         canonical_name,
         "effort"
+            | "reasoning-effort"
             | "max-budget-usd"
             | "add-dir"
             | "mcp-config"
@@ -341,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn effort_values_are_the_five_levels_plus_ultracode() {
+    fn effort_values_follow_each_clis_vocabulary() {
         for value in ["low", "medium", "high", "xhigh", "max", "ultracode"] {
             assert!(
                 validate_spec_args(
@@ -349,11 +377,11 @@ mod tests {
                     &["--effort".into(), value.to_string()]
                 )
                 .is_ok(),
-                "{value}"
+                "shell {value}"
             );
             assert!(
                 validate_spec_args(DriverKind::ShellPty, &[format!("--effort={value}")]).is_ok(),
-                "{value}="
+                "shell {value}="
             );
         }
         // D-028 §9.1 retires the legacy tier names. They are normalized to
@@ -368,6 +396,31 @@ mod tests {
                 .is_err(),
                 "{value}"
             );
+        }
+        // Codex parses NO effort flag at all.
+        for token in ["--effort", "--reasoning-effort"] {
+            assert!(
+                validate_spec_args(DriverKind::CodexAppserver, &[token.into(), "high".into()])
+                    .is_err()
+            );
+        }
+        // Grok takes the built-in menu values under either spelling, and
+        // rejects the invented `quick/standard/max` table as much as `ultra`.
+        for flag in ["--effort", "--reasoning-effort"] {
+            for value in ["low", "medium", "high", "xhigh"] {
+                assert!(
+                    validate_spec_args(DriverKind::GrokAcp, &[flag.into(), value.to_string()])
+                        .is_ok(),
+                    "grok {flag} {value}"
+                );
+            }
+            for value in ["quick", "standard", "max", "ultra", "minimal", ""] {
+                assert!(
+                    validate_spec_args(DriverKind::GrokAcp, &[flag.into(), value.to_string()])
+                        .is_err(),
+                    "grok {flag} {value}"
+                );
+            }
         }
     }
 

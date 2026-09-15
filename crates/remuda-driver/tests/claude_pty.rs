@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use base64::Engine as _;
+
 fn ensure_fake_herdr_bin() -> PathBuf {
     ensure_workspace_bin("fake-herdr")
 }
@@ -196,6 +198,123 @@ async fn fake_herdr_start_prompt_idle_close() {
     }
     assert!(exited, "close must emit an exit observation");
     driver.close().await.expect("idempotent close");
+}
+
+/// Build the three-frame relay script: inline paint, a scripted enter of the
+/// DEC alt screen (`?1049h`), then a leave (`?1049l`). Sleep directives make
+/// each mode observable before the next flip.
+fn write_alt_screen_frames(path: &Path) {
+    let frame = |seq: u64, full: bool, bytes: &[u8]| {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        serde_json::json!({
+            "type": "terminal.frame",
+            "seq": seq,
+            "encoding": "ansi",
+            "width": 80,
+            "height": 24,
+            "full": full,
+            "bytes": encoded,
+        })
+        .to_string()
+    };
+    let body = [
+        frame(1, true, b"inline fake harness\r\n$ "),
+        "# sleep-ms 800".to_string(),
+        frame(
+            2,
+            false,
+            b"\x1b[?1049h\x1b[2J\x1b[Hfullscreen fake harness\r\n",
+        ),
+        "# sleep-ms 800".to_string(),
+        frame(3, false, b"\x1b[?1049lback inline\r\n$ "),
+    ]
+    .join("\n")
+        + "\n";
+    fs::write(path, body).unwrap();
+}
+
+async fn poll_alt_screen(driver: &ClaudePtyDriver, want: Option<bool>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if driver.alt_screen().await == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alt-screen did not reach {want:?} (last: {:?})",
+            driver.alt_screen().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The herdr relay tracks alt-screen deterministically from the pane byte
+/// stream: before any relay has attached there is no observation (`None`);
+/// once attached the badge data is `Some(false)` (inline), flips to
+/// `Some(true)` when the harness enters the alt screen, and returns to
+/// `Some(false)` when it leaves. No herdr mode API is involved — the fake
+/// relay just plays frames containing the DEC sequences.
+#[tokio::test]
+async fn claude_pty_alt_screen_flips_when_the_harness_enters_fullscreen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_fake_herdr_bin();
+
+    // The relay subprocess discovers `<socket>.frames` next to the API
+    // socket, so point the server at the same scripted file.
+    let frames_path = socket_dir.join("herdr.sock.frames");
+    write_alt_screen_frames(&frames_path);
+
+    let mut options = FakeHerdrOptions::new(&socket);
+    options.frames = frames_path.clone();
+    let _fake = FakeHerdrServer::spawn(options).unwrap();
+
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let claude = stub_claude(tmp.path());
+
+    let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        profile: profile(),
+        launch_dir: launch,
+        native_home: home,
+        binary: BinarySource::Pinned(pin_binary(&claude).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
+        extra_env: Default::default(),
+        agent_mcp: None,
+        setting_sources: None,
+        agent_start_timeout_ms: 5_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        host_claude_config: None,
+    });
+
+    let _handle = driver.start(spec(&cwd)).await.expect("start");
+
+    // No relay has attached yet: the carrier honestly reports "unknown".
+    assert_eq!(driver.alt_screen().await, None);
+
+    let native_ref = driver.native_ref().await.expect("native ref");
+    driver.attach(native_ref).await.expect("attach");
+
+    // First frame is the inline shell paint.
+    poll_alt_screen(&driver, Some(false)).await;
+    // The scripted harness switches to `?1049`.
+    poll_alt_screen(&driver, Some(true)).await;
+    // And leaves it again.
+    poll_alt_screen(&driver, Some(false)).await;
+
+    driver.close().await.expect("close");
 }
 
 #[ignore = "live: isolated remuda-test herdr session, claude --model haiku once"]

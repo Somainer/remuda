@@ -26,7 +26,7 @@ pub use notification::{
     TypedServerNotification, WarningNotification,
 };
 pub use peer::JsonRpcPeer;
-pub use process::{CodexAppServer, SpawnSpec};
+pub use process::{CodexAppServer, REASONING_EFFORTS, SpawnSpec};
 pub use rpc::{
     DEFAULT_MAX_LINE_BYTES, Inbound, JsonRpcError, JsonRpcErrorBody, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, RequestId, WireFrame, encode_line,

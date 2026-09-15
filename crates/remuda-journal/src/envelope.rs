@@ -41,6 +41,12 @@ pub struct Envelope {
     pub completeness: Completeness,
     /// Related prior event IDs.
     pub evidence_event_ids: Vec<EventId>,
+    /// Deterministic event identity, when the source can derive one
+    /// (`(instance scope, native record) → Id::derive`). The journal uses it
+    /// verbatim so two channels observing the same native record converge on
+    /// one observation; `None` lets the journal mint a fresh id. D-028 §9.1
+    /// effort edges always carry one.
+    pub event_id: Option<EventId>,
     /// Discriminated payload.
     pub body: ObservationPayload,
     /// Native bytes to persist first; runtime-only facts may omit this.

@@ -20,18 +20,19 @@ use remuda_claude_wire::{
 use remuda_protocol::hubnode::AttachmentKind;
 use remuda_protocol::{
     ApprovalRequest, ClaudePermissionMode, Completeness, ContentBlock, ContentStatus, Cost,
-    DecisionEffect, DecisionOption, Digest, DriverInput, DriverKind, EventId, HostId, Id,
-    InputAccounting, InputOrigin, InstanceId, InstanceSpec, Interaction, InteractionAnswer,
-    InteractionCarrier, InteractionId, InteractionKind, InteractionRequest, InteractionRequestKey,
-    InteractionState, Knowledge, LifecyclePayload, LifecycleTopic, MessagePayload, MessagePhase,
-    MessageRole, MutationOperation, NativeLifecycle, NativeRef, NativeRequestKey,
-    NativeRequestValueType, NodeMutation, Observation, ObservationPayload, ObservationSource,
-    OpaqueImpact, OpaquePayload, OpaqueReason, PermissionMode, QuestionField, QuestionInput,
-    QuestionOption, QuestionRequest, RawRef, Redaction, ResultStage, RunId, RuntimeCursor,
-    SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, TextBlock,
-    ThoughtPayload, ThoughtRepresentation, Timestamp, ToolCallPayload, ToolCallState, ToolCategory,
-    ToolOutcome, ToolResultPayload, U64, UsageMode, UsagePayload, UsageScope, WorkflowEngine,
-    WorkflowPhasePayload, WorkflowRunPayload, WorkflowState,
+    DecisionEffect, DecisionOption, Digest, DriverInput, DriverKind, EffortEffective,
+    EffortPayload, EventId, HostId, Id, InputAccounting, InputOrigin, InstanceId, InstanceSpec,
+    Interaction, InteractionAnswer, InteractionCarrier, InteractionId, InteractionKind,
+    InteractionRequest, InteractionRequestKey, InteractionState, Knowledge, LifecyclePayload,
+    LifecycleTopic, MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
+    NativeRef, NativeRequestKey, NativeRequestValueType, NodeMutation, Observation,
+    ObservationPayload, ObservationSource, OpaqueImpact, OpaquePayload, OpaqueReason,
+    PermissionMode, QuestionField, QuestionInput, QuestionOption, QuestionRequest, RawRef,
+    Redaction, ResultStage, RunId, RuntimeCursor, SchemaVersion, Severity, SourceChannel,
+    SourceCursor, SourceDelivery, TextBlock, ThoughtPayload, ThoughtRepresentation, Timestamp,
+    ToolCallPayload, ToolCallState, ToolCategory, ToolOutcome, ToolResultPayload, U64, UsageMode,
+    UsagePayload, UsageScope, WorkflowEngine, WorkflowPhasePayload, WorkflowRunPayload,
+    WorkflowState,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -522,6 +523,22 @@ impl Driver for ClaudePrintDriver {
             }
             DriverInput::Steer(_) => Err(DriverError::CapabilityUnknown("steer".into())),
             DriverInput::ModelSwitch(switch) => {
+                // §9.1: stream-json has no in-session effort channel. A
+                // `set_settings` control request is silently ignored by
+                // claude -p (measured 2.1.221, see evidence/effort-sync-1.md),
+                // so accepting an effort switch here would be a lie — the
+                // level only changes via `--effort` at launch on this carrier.
+                if switch
+                    .effort
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    return Err(DriverError::CapabilityUnsupported(
+                        "claude-print cannot switch effort in-session: relaunch with --effort; \
+                         use the claude-pty or shell-pty carrier for /effort"
+                            .into(),
+                    ));
+                }
                 if !switch.model_id.is_empty() {
                     live.process
                         .set_model(Some(switch.model_id.clone()))
@@ -868,6 +885,7 @@ fn user_text_message(
             // Overwritten by the transcript mapper, which has the evidence to
             // classify. stdout `user` frames are the prompt we just sent.
             origin: Some(remuda_protocol::MessageOrigin::Human),
+            command_id: None,
             status: ContentStatus::Complete,
         })),
     )
@@ -1814,6 +1832,12 @@ pub struct TranscriptMapper {
     seen_prompts: std::collections::HashSet<(String, String)>,
     /// Record uuids already mapped, so a re-read tail cannot double-emit.
     seen_uuids: std::collections::HashSet<String>,
+    /// §9.1 effort read-back state (dedup + source attribution).
+    effort: remuda_protocol::EffortTracker,
+    /// Rendezvous for Remuda-initiated switches awaiting read-back.
+    effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
+    /// Generation the tracker is currently armed with.
+    effort_generation: Option<u64>,
 }
 
 impl TranscriptMapper {
@@ -1848,7 +1872,25 @@ impl TranscriptMapper {
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
             seen_uuids: std::collections::HashSet::new(),
+            effort: remuda_protocol::EffortTracker::new(),
+            effort_bridge: None,
+            effort_generation: None,
         }
+    }
+
+    /// Attach the §9.1 effort bridge so this mapper drives switch read-back and
+    /// emits `effort` observations. `launch` names the `--effort` selection the
+    /// process started with, when there was one.
+    pub(crate) fn with_effort_bridge(
+        mut self,
+        bridge: Arc<crate::effort::EffortBridge>,
+        launch: Option<remuda_protocol::EffortSelection>,
+    ) -> Self {
+        if launch.is_some() {
+            self.effort.mark_launch();
+        }
+        self.effort_bridge = Some(bridge);
+        self
     }
 
     /// Map one transcript line. Blank lines and undecodable JSON yield nothing:
@@ -1939,7 +1981,13 @@ impl TranscriptMapper {
             self.mapper.session_id = session.to_owned();
         }
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-        match kind {
+        let mut extra = Vec::new();
+        if kind == "assistant" {
+            extra = self.map_effort_assistant(&value)?;
+        } else if kind == "user" {
+            self.note_effort_slash(&value);
+        }
+        let mut mapped = match kind {
             "assistant" => self.map_assistant_record(value),
             "user" => {
                 // Any user record ends the assistant run before it.
@@ -1953,7 +2001,88 @@ impl TranscriptMapper {
             "permission-mode" | "mode" => self.map_permission_mode(&value),
             "attachment" => self.map_attachment(&value),
             _ => Ok(Vec::new()),
+        }?;
+        mapped.splice(0..0, extra);
+        Ok(mapped)
+    }
+
+    /// §9.1: a `/effort` user record marks the source of the next changed
+    /// assistant record. When the bytes were Remuda's own pending switch the
+    /// attribution is `remuda`, not `slash` — the same transcript record is
+    /// produced in both cases, so the bridge is the only thing that can tell.
+    fn note_effort_slash(&mut self, value: &Value) {
+        let Some(message) = value.get("message") else {
+            return;
+        };
+        let Some(word) = remuda_protocol::slash_effort_word(&records::record_text(message)) else {
+            return;
+        };
+        let from_remuda = self
+            .effort_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.pending())
+            .is_some_and(|request| request.command_word() == word);
+        if from_remuda
+            && let Some(bridge) = &self.effort_bridge
+            && let Some((generation, request)) = bridge.pending_with_gen()
+        {
+            self.effort_generation = Some(generation);
+            self.effort.arm_awaiting(request.observed_name());
         }
+        self.effort.note_slash(&word, from_remuda);
+    }
+
+    /// §9.1: read `effort` / `perTurnEffort` off an assistant record, arm a
+    /// Remuda switch awaiting read-back, and emit an `effort` observation on
+    /// edges. Conversation mapping is unaffected — this is a side channel.
+    fn map_effort_assistant(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        // Pick up a switch the driver armed since the last record.
+        if let Some(bridge) = &self.effort_bridge
+            && let Some((generation, request)) = bridge.pending_with_gen()
+            && self.effort_generation != Some(generation)
+        {
+            self.effort_generation = Some(generation);
+            self.effort.arm_awaiting(request.observed_name());
+            self.effort.note_slash(request.command_word(), true);
+        }
+        let effort = value.get("effort").and_then(Value::as_str);
+        let per_turn = value.get("perTurnEffort").and_then(Value::as_str);
+        let Some((observed, source)) = self.effort.observe(effort, per_turn) else {
+            return Ok(Vec::new());
+        };
+        if source == remuda_protocol::EffortSource::Remuda
+            && let Some(generation) = self.effort_generation.take()
+            && let Some(bridge) = &self.effort_bridge
+        {
+            bridge.resolve(generation, observed);
+        }
+        let requested = self
+            .effort_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.requested())
+            .map(|request| remuda_protocol::EffortSelection {
+                name: request.name,
+                ultracode: request.ultracode,
+            });
+        let raw = effort
+            .filter(|value| !value.is_empty())
+            .or(per_turn.filter(|value| !value.is_empty()))
+            .map(str::to_owned);
+        let payload = ObservationPayload::Effort(Box::new(EffortPayload {
+            requested,
+            effective: EffortEffective {
+                name: observed.name,
+                ultracode: observed.ultracode,
+                source,
+                observed_at: now()?,
+            },
+            raw,
+        }));
+        Ok(vec![self.mapper.observation(
+            Completeness::Structured,
+            NativeRequestKey::None,
+            payload,
+        )?])
     }
 
     /// Buffer an assistant record, flushing the previous run when superseded.

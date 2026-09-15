@@ -28,6 +28,9 @@ pub enum WireError {
     /// A `-c` override contained a double quote and would break TOML-on-argv quoting.
     #[error("config override must not contain double quotes: {0}")]
     InvalidConfigOverride(String),
+    /// A `model_reasoning_effort` value was not in codex's verified vocabulary.
+    #[error("unknown codex model_reasoning_effort {0:?} (one of: minimal/low/medium/high/xhigh)")]
+    InvalidReasoningEffort(String),
     /// `tokio::process::Command` failed before the child started.
     #[error("failed to spawn codex app-server: {0}")]
     Spawn(#[source] std::io::Error),

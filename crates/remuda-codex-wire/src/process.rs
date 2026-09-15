@@ -17,6 +17,13 @@ use crate::types::{
     TurnStartResponse,
 };
 
+/// Verified `model_reasoning_effort` vocabulary for the pinned codex-cli
+/// (0.147.0 `ReasoningEffort::from_str` + the embedded model catalog's common
+/// set). The enum also parses `none`/`max`/`ultra`/custom strings, but those
+/// are model-gated or advanced-picker only; an unknown word must never reach
+/// the binary from this crate. See `docs/design/evidence/composer-slider-5.md`.
+pub const REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+
 /// Launch recipe for one app-server child. Always `--listen stdio://`.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -77,6 +84,9 @@ impl SpawnSpec {
             args.extend(config_flag("model", model)?);
         }
         if let Some(effort) = &self.reasoning_effort {
+            if !REASONING_EFFORTS.contains(&effort.as_str()) {
+                return Err(WireError::InvalidReasoningEffort(effort.clone()));
+            }
             args.extend(config_flag("model_reasoning_effort", effort)?);
         }
         if let Some(policy) = &self.approval_policy {
@@ -343,5 +353,23 @@ mod tests {
                 "approval_policy=\"never\"",
             ]
         );
+    }
+
+    #[test]
+    fn rejects_effort_outside_the_verified_vocabulary() {
+        for value in ["ultra", "max", "bogus", "HIGH"] {
+            let mut spec = SpawnSpec::new("/usr/bin/codex".into(), "/tmp".into()).expect("abs");
+            spec.reasoning_effort = Some(value.into());
+            let error = spec.argv().unwrap_err();
+            assert!(
+                matches!(error, WireError::InvalidReasoningEffort(ref v) if v == value),
+                "{value}: {error:?}"
+            );
+        }
+        for value in REASONING_EFFORTS {
+            let mut spec = SpawnSpec::new("/usr/bin/codex".into(), "/tmp".into()).expect("abs");
+            spec.reasoning_effort = Some((*value).into());
+            assert!(spec.argv().is_ok(), "{value}");
+        }
     }
 }

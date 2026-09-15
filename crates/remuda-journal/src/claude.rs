@@ -5,11 +5,12 @@ use crate::envelope::Envelope;
 use crate::source::{FileTail, MapContext, Source, SourceResume};
 use crate::util::{known, parse_timestamp, timestamp_now, unknown};
 use remuda_protocol::{
-    Completeness, ContentBlock, ContentStatus, FileCursor, Id, Knowledge, LifecyclePayload,
-    LifecycleTopic, MessageOrigin, MessagePayload, MessagePhase, MessageRole, MutationOperation,
-    NativeLifecycle, NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource,
-    OpaqueImpact, OpaquePayload, OpaqueReason, ResultStage, Severity, SourceChannel, SourceCursor,
-    TextBlock, ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
+    Completeness, ContentBlock, ContentStatus, EffortEffective, EffortPayload, EffortTracker,
+    EventId, FileCursor, Id, Knowledge, LifecyclePayload, LifecycleTopic, MessageOrigin,
+    MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
+    NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource, OpaqueImpact,
+    OpaquePayload, OpaqueReason, ResultStage, Severity, SourceChannel, SourceCursor, TextBlock,
+    ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
     ToolOutcome, ToolResultPayload, U64,
 };
 use serde_json::{Map, Value};
@@ -29,10 +30,13 @@ use std::path::PathBuf;
 pub struct NativeIds {
     scope: String,
     messages: HashMap<String, (Id, u64)>,
-    tools: HashMap<String, Id>,
     thoughts: HashMap<String, Id>,
+    tools: HashMap<String, Id>,
     workflows: HashMap<String, Id>,
     members: HashMap<String, Id>,
+    phases: HashMap<String, Id>,
+    /// §9.1 effective-effort edges across this tail.
+    effort: EffortTracker,
 }
 
 impl NativeIds {
@@ -45,7 +49,20 @@ impl NativeIds {
             thoughts: HashMap::new(),
             workflows: HashMap::new(),
             members: HashMap::new(),
+            phases: HashMap::new(),
+            effort: EffortTracker::new(),
         }
+    }
+
+    /// Deterministic event id for an §9.1 effort edge read from one assistant
+    /// record. Same `(instance, record, level)` from the live channel and this
+    /// tailer draws the same id (see [`remuda_protocol::effort_event_id`]).
+    pub(crate) fn effort_event(
+        &self,
+        assistant_native_id: &str,
+        name: remuda_protocol::EffortName,
+    ) -> EventId {
+        remuda_protocol::effort_event_id(&self.scope, assistant_native_id, name)
     }
 
     /// Deterministic id for a native object in this instance's scope.
@@ -81,7 +98,8 @@ impl NativeIds {
         Ok(id)
     }
 
-    pub(crate) fn workflow(&mut self, native: &str) -> Result<Id, Error> {
+    pub(crate) fn workflow(&mut self, native: impl AsRef<str>) -> Result<Id, Error> {
+        let native = native.as_ref();
         if let Some(id) = self.workflows.get(native) {
             return Ok(id.clone());
         }
@@ -90,12 +108,23 @@ impl NativeIds {
         Ok(id)
     }
 
-    pub(crate) fn member(&mut self, native: &str) -> Result<Id, Error> {
+    pub(crate) fn member(&mut self, native: impl AsRef<str>) -> Result<Id, Error> {
+        let native = native.as_ref();
         if let Some(id) = self.members.get(native) {
             return Ok(id.clone());
         }
         let id = Id::new("obj")?;
         self.members.insert(native.to_owned(), id.clone());
+        Ok(id)
+    }
+
+    pub(crate) fn phase(&mut self, native: impl AsRef<str>) -> Result<Id, Error> {
+        let native = native.as_ref();
+        if let Some(id) = self.phases.get(native) {
+            return Ok(id.clone());
+        }
+        let id = Id::new("obj")?;
+        self.phases.insert(native.to_owned(), id.clone());
         Ok(id)
     }
 }
@@ -327,6 +356,10 @@ fn map_user(
     let content = message.get("content").cloned().unwrap_or(Value::Null);
     let uuid = native_uuid(value);
     let mut out = Vec::new();
+    // §9.1: a typed `/effort <word>` attributes the next level edge.
+    if let Some(word) = remuda_protocol::slash_effort_word(&user_record_text(&content)) {
+        ids.effort.note_slash(&word, false);
+    }
     match content {
         Value::String(text) => {
             out.push(user_message(
@@ -390,6 +423,55 @@ fn map_user(
     Ok(out)
 }
 
+/// §9.1 effective-effort envelope for an assistant-record edge.
+#[allow(clippy::too_many_arguments)]
+fn effort_envelope(
+    ctx: &MapContext,
+    ids: &NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+    assistant_native_id: &str,
+    observed: remuda_protocol::ObservedEffort,
+    source: remuda_protocol::EffortSource,
+    raw: Option<&str>,
+) -> Result<Envelope, Error> {
+    let event_id = ids.effort_event(assistant_native_id, observed.name);
+    let mut env = envelope(
+        ctx,
+        cursor,
+        line,
+        value,
+        Completeness::Structured,
+        native_uuid(value).as_deref(),
+        ObservationPayload::Effort(Box::new(EffortPayload {
+            requested: None,
+            effective: EffortEffective {
+                name: observed.name,
+                ultracode: observed.ultracode,
+                source,
+                observed_at: timestamp_now()?,
+            },
+            raw: raw.map(str::to_owned),
+        })),
+    )?;
+    env.event_id = Some(event_id);
+    Ok(env)
+}
+
+/// Plain-text view of a user record's content (string or text-block array).
+fn user_record_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 fn map_assistant(
     ctx: &MapContext,
     ids: &mut NativeIds,
@@ -409,6 +491,26 @@ fn map_assistant(
         .map(ToOwned::to_owned)
         .or_else(|| native_uuid(value));
     let mut out = Vec::new();
+    // §9.1: every assistant record carries the effective level; emit on edges
+    // before the content blocks so the journal orders the change first.
+    let raw_effort = value.get("effort").and_then(Value::as_str);
+    let raw_per_turn = value.get("perTurnEffort").and_then(Value::as_str);
+    if let Some((observed, source)) = ids.effort.observe(raw_effort, raw_per_turn) {
+        let effort_native = native_msg
+            .clone()
+            .unwrap_or_else(|| format!("assistant-{}", cursor.offset.0));
+        out.push(effort_envelope(
+            ctx,
+            ids,
+            value,
+            line,
+            cursor,
+            &effort_native,
+            observed,
+            source,
+            raw_effort.or(raw_per_turn),
+        )?);
+    }
     let has_tool = content
         .iter()
         .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
@@ -750,6 +852,7 @@ fn user_message(
             parent_tool_call_id: None,
             native_origin: known("claude-jsonl".into()),
             origin: Some(user_origin(value)),
+            command_id: None,
             status: ContentStatus::Complete,
         })),
     )
@@ -795,6 +898,7 @@ fn assistant_message(
             native_origin: known("claude-jsonl".into()),
             // Assistant output is never an injected user record.
             origin: Some(MessageOrigin::Human),
+            command_id: None,
             status: ContentStatus::Complete,
         })),
     )
@@ -1118,6 +1222,7 @@ pub(crate) fn envelope(
         },
         completeness,
         evidence_event_ids: Vec::new(),
+        event_id: None,
         body,
         raw: None,
     };

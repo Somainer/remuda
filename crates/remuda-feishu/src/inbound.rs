@@ -988,8 +988,7 @@ mod tests {
             parse_intent("/new"),
             Intent::Command(ExplicitCommand::New)
         ));
-        let Intent::Command(ExplicitCommand::Host { name }) = parse_intent("/host devbox")
-        else {
+        let Intent::Command(ExplicitCommand::Host { name }) = parse_intent("/host devbox") else {
             panic!("host");
         };
         assert_eq!(name, "devbox");

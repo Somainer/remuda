@@ -32,6 +32,7 @@ pub(super) async fn run(
     create: Option<(Command, String)>,
     carrier: Option<crate::carrier_recovery::CarrierSupervisor>,
     loader: super::AttachmentLoader,
+    prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
 ) -> Result<(), NodeError> {
     let capacity = receiver.max_capacity();
     let mut pending = VecDeque::new();
@@ -45,6 +46,7 @@ pub(super) async fn run(
                 // A create-time prompt never carries attachments (D-027).
                 Vec::new(),
                 crate::origin::input_origin(command.origin),
+                prompts.as_ref(),
             )?);
         }
         // Creating the live runtime and delivering its first input are separate facts.
@@ -56,22 +58,23 @@ pub(super) async fn run(
         tokio::select! {
             queued = receiver.recv() => {
                 let Some(queued) = queued else {
-                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance worker closed")?;
+                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance worker closed", prompts.as_ref())?;
                     return Err(NodeError::DriverUnavailable);
                 };
                 if let DriverRequest::Send { prompt, attachments: _, origin } = queued.request {
                     if pending.len() == capacity {
                         let command = store.get_command(&queued.command_id)?;
+                        prompts.cancel(&queued.command_id);
                         reject_before_dispatch(store.as_ref(), &instance_id, command, "instance-queue-full")?;
                     } else {
-                        pending.push_back(enqueue(store.as_ref(), &instance_id, queued.command_id, prompt, queued.attachment_refs, origin)?);
+                        pending.push_back(enqueue(store.as_ref(), &instance_id, queued.command_id, prompt, queued.attachment_refs, origin, prompts.as_ref())?);
                     }
                 } else {
                     let close_after = queued.close_after;
                     if matches!(queued.request, DriverRequest::Cancel | DriverRequest::Close) {
-                        interrupt_pending(store.as_ref(), &instance_id, &mut pending, "queued input cancelled")?;
+                        interrupt_pending(store.as_ref(), &instance_id, &mut pending, "queued input cancelled", prompts.as_ref())?;
                     }
-                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone(), loader.clone()).await?;
+                    execute_queued(store.clone(), &instance_id, driver.clone(), queued, interactions.clone(), carrier.clone(), loader.clone(), Arc::clone(&prompts)).await?;
                     if close_after && store.get_instance(&instance_id)?.lifecycle == InstanceLifecycle::Exited {
                         // The Instance is exited, so nothing may still hold a
                         // pane in the operator's Herdr session. The driver's
@@ -82,6 +85,7 @@ pub(super) async fn run(
                         receiver.close();
                         while let Some(queued) = receiver.recv().await {
                             let command = store.get_command(&queued.command_id)?;
+                            prompts.cancel(&queued.command_id);
                             reject_before_dispatch(store.as_ref(), &instance_id, command, "instance closed")?;
                         }
                         return Ok(());
@@ -93,11 +97,11 @@ pub(super) async fn run(
             }
             _ = tick.tick(), if !pending.is_empty() => {
                 if store.get_instance(&instance_id)?.lifecycle != InstanceLifecycle::Ready {
-                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance no longer ready")?;
+                    interrupt_pending(store.as_ref(), &instance_id, &mut pending, "instance no longer ready", prompts.as_ref())?;
                     continue;
                 }
                 if let Some(prompt) = pending.front_mut()
-                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt, carrier.as_ref(), &loader).await?
+                    && deliver(store.as_ref(), &instance_id, driver.as_ref(), &interactions, prompt, carrier.as_ref(), &loader, prompts.as_ref()).await?
                 {
                     pending.pop_front();
                 }
@@ -113,6 +117,7 @@ fn enqueue(
     prompt: String,
     attachment_refs: Vec<remuda_protocol::hubnode::AttachmentRef>,
     origin: remuda_protocol::InputOrigin,
+    prompts: &crate::prompt_correlation::PromptCorrelator,
 ) -> Result<PendingPrompt, NodeError> {
     let ObservationPayload::Message(mut message) = crate::driver::message_payload(
         MessageRole::User,
@@ -124,12 +129,19 @@ fn enqueue(
         return Err(NodeError::InvalidRequest("expected user message".into()));
     };
     message.status = ContentStatus::Queued;
+    // C2: the queued message is the server-command-authored copy. Its
+    // commandId lets the web upgrade the optimistic bubble in place the
+    // moment this observation arrives, and the correlator joins the
+    // subsequent hook/transcript evidence onto this same node.
+    let node_id = message.mutation.node_id.clone();
+    message.command_id = Some(command_id.clone());
     store.append_observation(
         instance_id,
         None,
         Completeness::Structured,
         ObservationPayload::Message(message.clone()),
     )?;
+    prompts.register(command_id.clone(), node_id, prompt.clone());
     mark_pending(store, instance_id)?;
     Ok(PendingPrompt {
         command_id,
@@ -179,6 +191,7 @@ async fn deliver(
     prompt: &mut PendingPrompt,
     carrier: Option<&crate::carrier_recovery::CarrierSupervisor>,
     loader: &super::AttachmentLoader,
+    prompts: &crate::prompt_correlation::PromptCorrelator,
 ) -> Result<bool, NodeError> {
     // D-027: bytes are pulled only when the prompt reaches the front of the
     // queue, so a slow Hub object store delays this prompt and nothing else.
@@ -189,6 +202,7 @@ async fn deliver(
         Ok(attachments) => attachments,
         Err(error) => {
             update_message(store, instance_id, prompt, ContentStatus::Interrupted)?;
+            prompts.cancel(&prompt.command_id);
             let command = store.get_command(&prompt.command_id)?;
             if command.state != CommandState::Settled {
                 reject_before_dispatch(
@@ -265,6 +279,9 @@ async fn deliver(
         }
         Err(error) => {
             // A failed/uncertain send is never replayed and does not invalidate a live PTY.
+            // The bytes may or may not have reached the harness, so drop the
+            // correlation: claiming the later evidence would be guessing.
+            prompts.cancel(&prompt.command_id);
             // A carrier loss is the exception worth acting on: the session
             // server, not this prompt, is what needs restarting.
             super::notify_carrier(carrier, &error);
@@ -327,9 +344,13 @@ fn interrupt_pending(
     instance_id: &InstanceId,
     pending: &mut VecDeque<PendingPrompt>,
     reason: &str,
+    prompts: &crate::prompt_correlation::PromptCorrelator,
 ) -> Result<(), NodeError> {
     while let Some(mut prompt) = pending.pop_front() {
         update_message(store, instance_id, &mut prompt, ContentStatus::Interrupted)?;
+        // The prompt was never written, so later hook/transcript evidence for
+        // this text belongs to whatever produced it, not this command.
+        prompts.cancel(&prompt.command_id);
         let command = store.get_command(&prompt.command_id)?;
         if command.state != CommandState::Settled {
             reject_before_dispatch(store, instance_id, command, reason)?;

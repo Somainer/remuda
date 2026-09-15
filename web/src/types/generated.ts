@@ -682,15 +682,35 @@ export type DriverInput = (PromptInput & ({
 /** DriverKind wire values; `protocol.md` §3.1. */
 export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
 
-/** EffortName wire values; `protocol.md` §4.1. */
-export type EffortName = ("low" | "medium" | "high" | "xhigh" | "max");
+/** Effective effort, read back from a Claude assistant transcript record (`effort` / `perTurnEffort`); D-028 §9.1.  This is the *observed* tier, never the requested one. Claude reports `ultracode` sessions as level `xhigh` and does not repeat the workflow flag on assistant records, so `ultracode` is `None` unless the observation path has positive evidence (e.g. an immediately preceding `/effort ultracode` switch the driver itself made). */
+export type EffortEffective = ({
+  "name": EffortName;
+  "observedAt": Timestamp;
+  "source": EffortSource;
+  "ultracode"?: (boolean | null);
+  [key: string]: unknown;
+});
 
-/** Native effort selection; `protocol.md` §4.1 (D-028 §9.1).  Five Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only, and is never persisted as a level name.  Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes legacy tier **names**, so a stored row or an old client keeps working:  | legacy `name` | normalized | | --- | --- | | `default` | `low` | | `think` | `high` | | `think-hard` | `xhigh` | | `ultracode` | `xhigh` + `ultracode: true` | | anything unrecognized | `high` (the documented default tier) |  Normalization is by **name**, never by index: the legacy tables had different lengths per harness, so index 3 meant `ultracode` for Claude and `ultra` for Codex. `index` on the wire is therefore ignored on read and not written back. */
+/** EffortName wire values; `protocol.md` §4.1. */
+export type EffortName = ("minimal" | "low" | "medium" | "high" | "xhigh" | "max");
+
+/** EffortPayload; `protocol.md` §5.1 (D-028 §9.1).  Emitted whenever an assistant transcript record's `effort` / `perTurnEffort` is observed. Unchanged values are deduped by the emitting driver, so the Hub only sees edges. The UI renders from this observation — never from the requested selection. */
+export type EffortPayload = ({
+  "effective": EffortEffective;
+  "raw"?: (string | null);
+  "requested"?: (EffortSelection | (null));
+  [key: string]: unknown;
+});
+
+/** Native effort selection; `protocol.md` §4.1 (D-028 §9.1).  Five Claude levels plus an orthogonal `ultracode` boolean. `ultracode` is **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only, and is never persisted as a level name.  [`EffortName`] additionally carries `minimal`, which Claude Code does not expose: the Codex/Grok vocabularies do. It is rejected at Claude launches by the driver, so it can never reach `claude --effort`.  Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes legacy tier **names** through [`normalize_legacy_effort`], so a stored row or an old client keeps working. Legacy normalization is **per harness**:  | legacy `name` | harness | normalized | | --- | --- | --- | | `default` | any | `low` | | `think` | claude | `high` | | `think-hard` | claude | `xhigh` | | `ultra` | any | `xhigh` (the old invented web/codex top tier) | | `quick` / `standard` / `max` | grok | `low` / `medium` / `xhigh` | | `ultracode` | claude | `xhigh` + `ultracode: true` | | anything unrecognized | any | the harness default (`high` for claude, `medium` otherwise) |  Normalization is by **name**, never by index: the legacy tables had different lengths per harness, so index 3 meant `ultracode` for Claude and `ultra` for Codex. `index` on the wire is therefore ignored on read and not written back. */
 export type EffortSelection = ({
   "name": EffortName;
   "ultracode": (boolean);
   [key: string]: unknown;
 });
+
+/** EffortSource wire values; `protocol.md` §9.1. */
+export type EffortSource = ("launch" | "slash" | "remuda" | "unknown");
 
 /** ElicitationAction wire values; `protocol.md` §5.4. */
 export type ElicitationAction = ("accept" | "decline" | "cancel");
@@ -1944,6 +1964,7 @@ export type MessageOrigin = ("human" | "injected-skill" | "injected-command-outp
 export type MessagePayload = ({
   "baseRevision": (U64 | (null));
   "blocks": ((ContentBlock)[]);
+  "commandId"?: (CommandId | (null));
   "messageId": Id;
   "nativeOrigin": Knowledge2;
   "nodeId": Id;
@@ -2441,6 +2462,10 @@ export type Observation = (({
   "payload": ArtifactPayload;
   [key: string]: unknown;
 }) | ({
+  "kind": "effort";
+  "payload": EffortPayload;
+  [key: string]: unknown;
+}) | ({
   "kind": "raw_tty";
   "payload": RawTtyPayload;
   [key: string]: unknown;
@@ -2468,7 +2493,7 @@ export type Observation = (({
 });
 
 /** ObservationKind wire values; `protocol.md` §5.1. */
-export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "raw_tty" | "opaque");
+export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "effort" | "raw_tty" | "opaque");
 
 /** ObservationPayload; `protocol.md` §5.1. */
 export type ObservationPayload = (({
@@ -2524,6 +2549,10 @@ export type ObservationPayload = (({
   "payload": ArtifactPayload;
   [key: string]: unknown;
 }) | ({
+  "kind": "effort";
+  "payload": EffortPayload;
+  [key: string]: unknown;
+}) | ({
   "kind": "raw_tty";
   "payload": RawTtyPayload;
   [key: string]: unknown;
@@ -2547,6 +2576,13 @@ export type ObservationSource = ({
   "nativeSessionId": Knowledge2;
   "nativeTurnId": Knowledge2;
   "sourceCursor": SourceCursor;
+  [key: string]: unknown;
+});
+
+/** An effort level as read off an assistant transcript record. */
+export type ObservedEffort = ({
+  "name": EffortName;
+  "ultracode": (boolean | null);
   [key: string]: unknown;
 });
 

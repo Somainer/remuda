@@ -554,6 +554,7 @@ pub(crate) fn message_payload(
         // A Node-synthesized message is the real correspondent's text (the
         // queued prompt, the fake driver's reply), never an injected record.
         origin: Some(remuda_protocol::MessageOrigin::Human),
+        command_id: None,
         status: ContentStatus::Complete,
     })))
 }

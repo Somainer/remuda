@@ -193,13 +193,16 @@ test.describe("composer control bar and effort", () => {
     await expect(slider).toHaveAttribute("data-name", "ultracode");
     await expect(slider).toHaveAttribute("data-index", "5");
     await expect(slider).toHaveAttribute("data-tier-index", "3");
+    await expect(slider).toHaveAttribute("data-effort-look", "ultracode");
     await expect(slider).toHaveAttribute("data-ember", "1");
-    // One stop left is plain max.
+    // One stop left is max: restrained top accent, ember off.
     await slider.focus();
     await page.keyboard.press("ArrowLeft");
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max");
     await expect(page.getByTestId("model-effort-chip")).toContainText("max");
     await expect(slider).toHaveAttribute("data-index", "4");
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    await expect(slider).toHaveAttribute("data-ember", "0");
   });
 
   test("the ultracode stop sits past max on the one slider, plays dense ember and reads ultracode", async ({ page }) => {
@@ -223,8 +226,8 @@ test.describe("composer control bar and effort", () => {
     }
     await expect(slider).toHaveAttribute("data-tier-index", "3");
     await expect(slider).toHaveAttribute("data-ultracode", "1");
+    await expect(slider).toHaveAttribute("data-effort-look", "ultracode");
     await expect(slider).toHaveAttribute("data-ember", "1");
-    // A stop, not a lock: the track stays enabled and Home/End/arrows all work.
     await expect(slider).toHaveAttribute("aria-disabled", "false");
     await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(0);
     await expect(page.getByTestId("effort-embers")).toBeVisible();
@@ -248,9 +251,13 @@ test.describe("composer control bar and effort", () => {
     const panel = page.getByTestId("effort-slider-panel");
     await expect(panel).toHaveAttribute("data-view", "list");
     await expect(page.getByTestId("effort-slider")).toHaveCount(0);
-    // Both ember stops mark: max and the ultracode stop beneath it.
-    await expect(page.getByTestId("effort-tier-max")).toHaveAttribute("data-ember", "1");
-    await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ember", "1");
+    // The three-level ladder in the list, too: max is the restrained top
+    // accent and only the ultracode row carries the strongest look.
+    await expect(page.getByTestId("effort-tier-max")).toHaveAttribute("data-effort-look", "top");
+    await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute(
+      "data-effort-look",
+      "ultracode",
+    );
     await expect(page.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ultracode", "1");
     await expect(page.getByTestId("effort-list")).toContainText(/默认档|最省|日常|跨文件|最高档|工作流/);
     await expect(page.getByTestId("effort-menu")).toContainText("切换只影响后续回合，不重写已发出的 prompt");
@@ -260,7 +267,8 @@ test.describe("composer control bar and effort", () => {
     await page.getByTestId("effort-tier-xhigh").click();
     await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "xhigh");
     await expect(panel).toHaveAttribute("data-view", "slider");
-    // Plain xhigh is not the ember tier.
+    // Plain xhigh carries the restrained top accent but not the ember field.
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", "top");
     await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "0");
   });
 
@@ -270,8 +278,42 @@ test.describe("composer control bar and effort", () => {
     await page.getByTestId("view-switch-structured").click();
     await expect(page.getByTestId("composer")).toHaveAttribute("data-harness", "grok");
     await openEffort(page);
-    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "quick,standard,max");
-    await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("data-tiers", /think/);
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute(
+      "data-tiers",
+      "low,medium,high,xhigh",
+    );
+    await expect(page.getByTestId("effort-slider")).not.toHaveAttribute("data-tiers", /quick|standard/);
+    // Its top row is the static accent only, never an ember.
+    await page.getByTestId("effort-slider").focus();
+    await page.keyboard.press("End");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-name", "xhigh");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", "top");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "0");
+    await expect(page.getByTestId("effort-embers")).toHaveCount(0);
+  });
+
+  test("codex New Session sheet enumerates the verified minimal..xhigh vocabulary 1:1", async ({ page }) => {
+    await page.goto("/sessions/new");
+    await page.getByTestId("new-session-kind-codex").click();
+    const slider = page.getByTestId("new-session-effort-slider");
+    await expect(slider).toHaveAttribute("data-tiers", "minimal,low,medium,high,xhigh");
+    // The invented `ultra` word is gone, along with model-gated `max`.
+    await expect(slider).not.toHaveAttribute("data-tiers", /ultra|max/);
+    await expect(slider).toHaveAttribute("aria-valuemax", "4");
+    // The CLI default is medium (index 2), not a ratio-mapped Claude high.
+    await expect(slider).toHaveAttribute("data-name", "medium");
+    // Every stop maps 1:1 onto a native word; only the top row carries an accent.
+    await slider.press("Home");
+    const words = ["minimal", "low", "medium", "high", "xhigh"] as const;
+    for (const [i, word] of words.entries()) {
+      await expect(slider).toHaveAttribute("data-name", word);
+      await expect(slider).toHaveAttribute("data-effort-look", i === 4 ? "top" : "plain");
+      await expect(slider).toHaveAttribute("data-ember", "0");
+      await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(0);
+      if (i < words.length - 1) await slider.press("ArrowRight");
+    }
+    // The stamped wire word is a current codex value — never `ultra`.
+    await expect(page.getByTestId("new-session-effort")).toHaveAttribute("data-effort", "xhigh");
   });
 
   test("an existing session shows the harness as a label, not a menu", async ({ page }) => {
@@ -371,13 +413,15 @@ test.describe("composer control bar and effort", () => {
     const slider = page.getByTestId("new-session-effort-slider");
     await expect(slider).toHaveAttribute("data-name", "max");
     await expect(slider).toHaveAttribute("data-index", "4");
-    await expect(slider).toHaveAttribute("data-ember", "1");
-    // Switching the harness re-snaps onto the new native table, ember to ember.
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    await expect(slider).toHaveAttribute("data-ember", "0");
+    // Switching the harness re-snaps onto the new native table, top to top.
     await page.getByTestId("new-session-kind-grok").click();
-    await expect(slider).toHaveAttribute("data-tiers", "quick,standard,max");
-    await expect(slider).toHaveAttribute("data-name", "max");
-    await expect(slider).toHaveAttribute("data-ember", "1");
-    await expect(page.getByTestId("new-session-effort-title")).toHaveText("max");
+    await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh");
+    await expect(slider).toHaveAttribute("data-name", "xhigh");
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    await expect(slider).toHaveAttribute("data-ember", "0");
+    await expect(page.getByTestId("new-session-effort-title")).toHaveText("xhigh");
   });
 
   test("effort selection persists after reload, incl. the ultracode stop", async ({ page }) => {
@@ -409,7 +453,7 @@ test.describe("composer control bar and effort", () => {
     await expect(page.getByTestId("permission-chip")).toContainText(/always-approve/);
   });
 
-  test("the brand fill reaches the knob at every stop, ember layers on max and denser on ultracode", async ({ page }) => {
+  test("the fill reaches the knob at every stop; the ember field exists on ultracode alone", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await openEffort(page);
@@ -420,46 +464,47 @@ test.describe("composer control bar and effort", () => {
     await expect(slider).toHaveAttribute("data-index", "0");
     await assertFillReachesKnob(page);
     await expect(page.getByTestId("effort-embers")).toHaveCount(0);
-    // Walk medium → xhigh; embers stay off through plain xhigh (stop 3).
-    for (const index of ["1", "2", "3"] as const) {
+    // Walk medium → xhigh: plain tiers carry no accent at all.
+    for (const index of ["1", "2"] as const) {
       await page.keyboard.press("ArrowRight");
       await expect(slider).toHaveAttribute("data-index", index);
+      await expect(slider).toHaveAttribute("data-effort-look", "plain");
       await expect(slider).toHaveAttribute("data-ember", "0");
       await assertFillReachesKnob(page);
     }
-    // max (stop 4): glow wash plus three drifting spark layers over the gradient.
+    // xhigh (stop 3): restrained top accent, still no ember field.
+    await page.keyboard.press("ArrowRight");
+    await expect(slider).toHaveAttribute("data-index", "3");
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    await expect(slider).toHaveAttribute("data-ember", "0");
+    await assertFillReachesKnob(page);
+    // max (stop 4): the SAME static top accent — visibly not the ember.
     await page.keyboard.press("ArrowRight");
     await expect(slider).toHaveAttribute("data-index", "4");
     await assertFillReachesKnob(page);
-    await expect(slider).toHaveAttribute("data-ember", "1");
-    const embers = page.getByTestId("effort-embers");
-    await expect(embers).toBeVisible();
-    await expect(embers.locator("span")).toHaveCount(4);
-    let motion = await embers.locator("span").evaluateAll((nodes) =>
-      nodes.map((node) => {
-        const style = getComputedStyle(node);
-        return { duration: style.animationDuration, name: style.animationName };
-      }),
-    );
-    // Three spark layers at three different speeds is what gives the field depth.
-    let drifting = motion.filter((m) => m.name.includes("emberDrift"));
-    expect(drifting).toHaveLength(3);
-    expect(new Set(drifting.map((m) => m.duration)).size).toBe(3);
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    await expect(slider).toHaveAttribute("data-ember", "0");
+    await expect(page.getByTestId("effort-embers")).toHaveCount(0);
 
-    // ultracode (stop 5): the same field plus a fourth, denser dotted drift.
+    // ultracode (stop 5) ALONE gets the full field; all five spans mount here.
     await page.keyboard.press("ArrowRight");
     await expect(slider).toHaveAttribute("data-index", "5");
     await expect(slider).toHaveAttribute("data-name", "ultracode");
     await assertFillReachesKnob(page);
+    await expect(slider).toHaveAttribute("data-effort-look", "ultracode");
+    await expect(slider).toHaveAttribute("data-ember", "1");
+    const embers = page.getByTestId("effort-embers");
+    await expect(embers).toBeVisible();
     await expect(embers).toHaveAttribute("data-intensity", "ultra");
     await expect(embers.locator("span")).toHaveCount(5);
-    motion = await embers.locator("span").evaluateAll((nodes) =>
+    const motion = await embers.locator("span").evaluateAll((nodes) =>
       nodes.map((node) => {
         const style = getComputedStyle(node);
         return { duration: style.animationDuration, name: style.animationName };
       }),
     );
-    drifting = motion.filter((m) => m.name.includes("emberDrift"));
+    // Four drift layers at four different speeds give the strongest field depth.
+    const drifting = motion.filter((m) => m.name.includes("emberDrift"));
     expect(drifting).toHaveLength(4);
     expect(new Set(drifting.map((m) => m.duration)).size).toBe(4);
     // Motion is transform/opacity only — nothing here animates layout.
@@ -476,13 +521,14 @@ test.describe("composer control bar and effort", () => {
     await assertTouchTargets(page);
   });
 
-  test("reduced motion drops the ember animation but keeps the tier", async ({ page }) => {
+  test("reduced motion freezes the ultracode ember but keeps the strongest static state", async ({ page }) => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await openEffort(page);
     await page.getByTestId("effort-slider").focus();
     await page.keyboard.press("End");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", "ultracode");
     await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-ember", "1");
     const embers = page.getByTestId("effort-embers");
     await expect(embers).toBeVisible();
@@ -492,9 +538,13 @@ test.describe("composer control bar and effort", () => {
       return [own, ...layers];
     });
     for (const name of names) expect(name).toBe("none");
+    // max stays static-accent with no field at all under reduced motion.
+    await page.keyboard.press("ArrowLeft");
+    await expect(page.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", "top");
+    await expect(page.getByTestId("effort-embers")).toHaveCount(0);
   });
 
-  test("effort slider evidence: night/ledger at 1440 and 400", async ({ page }, info) => {
+  test("effort ladder evidence: night/ledger at 1440, 768 and 390", async ({ page }, info) => {
     test.skip(info.project.name !== "chromium", "evidence shots from chromium only");
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.goto("/sessions");
@@ -506,25 +556,25 @@ test.describe("composer control bar and effort", () => {
       }, theme);
       for (const [width, height, tag] of [
         [1440, 900, "1440"],
-        [400, 844, "400"],
+        [768, 900, "768"],
+        [390, 844, "390"],
       ] as const) {
         await page.setViewportSize({ width, height });
-        // mid = plain xhigh, max = the ember tier, ultra = the denser ultracode stop.
-        for (const [state, keys] of [
-          ["mid", ["Home", "ArrowRight", "ArrowRight", "ArrowRight"]],
-          ["max", ["End", "ArrowLeft"]],
-          ["ultra", ["End"]],
+        // plain = ordinary high; top = restrained max accent; ultra = the
+        // ultracode stop, the only ember. Static frames (reduced motion).
+        for (const [state, keys, name, look, ember] of [
+          ["plain", ["Home", "ArrowRight", "ArrowRight"], "high", "plain", "0"],
+          ["top", ["End", "ArrowLeft"], "max", "top", "0"],
+          ["ultra", ["End"], "ultracode", "ultracode", "1"],
         ] as const) {
           await page.keyboard.press("Escape");
           await openEffort(page);
           await page.getByTestId("effort-slider").focus();
           for (const key of keys) await page.keyboard.press(key);
           const slider = page.getByTestId("effort-slider");
-          await expect(slider).toHaveAttribute(
-            "data-name",
-            state === "mid" ? "xhigh" : state === "max" ? "max" : "ultracode",
-          );
-          await expect(slider).toHaveAttribute("data-ember", state === "mid" ? "0" : "1");
+          await expect(slider).toHaveAttribute("data-name", name);
+          await expect(slider).toHaveAttribute("data-effort-look", look);
+          await expect(slider).toHaveAttribute("data-ember", ember);
           await expect(page.getByTestId("effort-knob")).toBeVisible();
           await assertPillGeometry(page);
           const box = await page.getByTestId("effort-menu").boundingBox();
@@ -535,12 +585,12 @@ test.describe("composer control bar and effort", () => {
         }
       }
     }
-    await page.setViewportSize({ width: 400, height: 844 });
+    await page.setViewportSize({ width: 390, height: 844 });
     await page.keyboard.press("Escape");
     await openEffort(page);
     const menu = await page.getByTestId("effort-menu").boundingBox();
     expect(menu).toBeTruthy();
-    expect(menu!.width).toBeLessThanOrEqual(400);
+    expect(menu!.width).toBeLessThanOrEqual(390);
     await assertPillGeometry(page);
     await assertFillReachesKnob(page);
   });

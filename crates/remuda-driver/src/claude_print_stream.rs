@@ -69,6 +69,7 @@ impl Block {
                 native_origin: known_or_unknown(Some(native)),
                 // Assistant text is never an injection.
                 origin: Some(MessageOrigin::Human),
+                command_id: None,
                 status,
             })),
             "thinking" | "redacted_thinking" => {

@@ -144,6 +144,154 @@ async fn get_instance(
     Ok(serde_json::from_str(body.trim())?)
 }
 
+/// A create whose RPC reply is lost past the Hub accept deadline still
+/// converges: the HTTP call returns `queued / reconciling` (never resent), and
+/// the Node's independently-mirrored journal — the durable accept and the
+/// materialization phases — wins the row over to `accepted` and the instance
+/// to `running`. This is the native-pty-2c failure: on a loaded host the
+/// Node's ack landed after the 5 s deadline and the instance stayed
+/// `requested / unknown` for the whole 60 s window.
+#[tokio::test]
+async fn a_late_create_ack_converges_from_the_journal_without_a_resend() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+    let mut config = HubConfig::for_test(data_dir.clone());
+    // Fail the RPC accept fast, but never expire the `requested` row under us.
+    config.command_accept_timeout_ms = 50;
+    config.requested_grace_ms = 600_000;
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &bootstrap).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut node, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req)).await??;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "hello",
+            "method": "node.hello",
+            "params": { "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+
+    let body = json!({
+        "kind": "terminal",
+        "driver": "shell-pty",
+        "hostId": host_id.as_id().as_str()
+    })
+    .to_string();
+    let cookie_clone = cookie.clone();
+    // The HTTP call blocks until the 50 ms accept deadline; run it while the
+    // fake Node drains the forwarded RPC without ever replying.
+    let post = tokio::spawn(async move {
+        http(
+            addr,
+            "POST",
+            "/v1/instances",
+            &[("Cookie", cookie_clone.as_str())],
+            Some(&body),
+        )
+        .await
+    });
+    let forwarded = recv_json(&mut node).await?;
+    let rpc_id = forwarded["id"]
+        .as_str()
+        .expect("the forwarded create has an rpc id")
+        .to_string();
+    let (status, _, body) = tokio::time::timeout(TIMEOUT, post).await??.unwrap();
+    assert_eq!(status, 200, "a timeout is still a 200, not an error");
+    let created: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(created["command"]["state"], json!("queued"));
+    assert_eq!(
+        created["command"]["resolution"],
+        json!("reconciling"),
+        "a timed-out accept is unknown → reconciling, not silently dropped"
+    );
+    assert_eq!(created["instance"]["lifecycle"], json!("requested"));
+    let ins = created["instance"]["instanceId"]
+        .as_str()
+        .or_else(|| created["instanceId"].as_str())
+        .expect("instance id")
+        .to_owned();
+    let command_id = created["command"]["commandId"]
+        .as_str()
+        .expect("command id")
+        .to_owned();
+
+    // The Node durably accepted and materialized; it journals those facts
+    // independently of the RPC reply it never got to send.
+    append(
+        &mut node,
+        "s1",
+        &ins,
+        json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity",
+                "entityType": "command",
+                "entityId": command_id,
+                "state": "accepted",
+                "entity": { "commandId": command_id, "state": "accepted" }
+            }
+        }),
+    )
+    .await?;
+    append(
+        &mut node,
+        "s2",
+        &ins,
+        json!({
+            "kind": "lifecycle",
+            "payload": { "type": "entity", "state": "starting", "reasonCode": "driver-spawn" }
+        }),
+    )
+    .await?;
+    append(
+        &mut node,
+        "s3",
+        &ins,
+        json!({
+            "kind": "lifecycle",
+            "payload": { "type": "entity", "state": "ready", "reasonCode": "driver-started" }
+        }),
+    )
+    .await?;
+
+    // No resend happened: the create rpc id was never answered and the Hub did
+    // not forward it again. A second inbound frame would be a journal-related
+    // response only; assert there is nothing new queued on the socket.
+    let dangling = tokio::time::timeout(Duration::from_millis(150), recv_json(&mut node)).await;
+    assert!(
+        dangling.is_err(),
+        "a lost accept must not be resent: {dangling:?}"
+    );
+    // Keep the dangling rpc id referenced: this is exactly the unanswered call.
+    assert!(!rpc_id.is_empty());
+
+    let view = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let view = get_instance(addr, &cookie, &ins).await?;
+            if view["lifecycle"] == json!("running") {
+                return Ok::<_, anyhow::Error>(view);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+    assert_eq!(view["lifecycle"], json!("running"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn journal_replay_derives_lifecycle_and_herdr_idle() -> Result<()> {
     let dir = tempfile::tempdir()?;

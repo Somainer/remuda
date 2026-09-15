@@ -5,6 +5,12 @@ import { asRecord, asString, jsonPreview } from "../../lib/format";
 import { DiffBlock } from "../../components/DiffBlock";
 import { familyFor, splitMcpName } from "./toolRegistry";
 import { presentTool } from "./toolPresenters";
+import { WorkflowTimelineCard } from "./workflow/WorkflowTimelineCard";
+import type {
+  WorkflowMemberPayload,
+  WorkflowPhasePayload,
+  WorkflowRunPayload,
+} from "../../types/generated";
 import type { DiffState } from "./assemble";
 import css from "./session.module.css";
 
@@ -125,31 +131,6 @@ function ReadCard({ call, result }: { call: ToolCallPayload; result: ToolResultP
   );
 }
 
-function WorkflowCard({
-  runTitle,
-  members,
-}: {
-  runTitle?: string;
-  members?: { label: string; state: string }[];
-}) {
-  return (
-    <article className={css.tool}>
-      <div className={css.toolHead}>
-        <span className={css.toolTitle}>Workflow</span>
-        <span className={css.path}>{runTitle ?? "running"}</span>
-      </div>
-      <ul className={css.wfMembers}>
-        {(members ?? []).map((m) => (
-          <li key={m.label} className={css.member}>
-            <span className={css.memberName}>{m.label}</span>
-            <span className={css.memberMeta}>{m.state}</span>
-          </li>
-        ))}
-      </ul>
-    </article>
-  );
-}
-
 function McpCard({ call, result }: { call: ToolCallPayload; result: ToolResultPayload | null }) {
   const name = knowledgeValue(call.toolName) ?? "mcp";
   const { server, tool } = splitMcpName(name);
@@ -244,8 +225,7 @@ export function ToolCard({
   result,
   completeness,
   diffState,
-  workflowTitle,
-  workflowMembers,
+  workflow,
   defaultFolded = false,
   settle = true,
 }: {
@@ -254,8 +234,12 @@ export function ToolCard({
   result: ToolResultPayload | null;
   completeness: string;
   diffState: DiffState;
-  workflowTitle?: string;
-  workflowMembers?: { label: string; state: string }[];
+  /** r-ux-w: live timeline data mounted on this Workflow tool row. */
+  workflow?: {
+    run: WorkflowRunPayload;
+    phases: WorkflowPhasePayload[];
+    members: WorkflowMemberPayload[];
+  };
   defaultFolded?: boolean;
   settle?: boolean;
 }) {
@@ -284,10 +268,10 @@ export function ToolCard({
       <EditWriteCard family={family} call={call} result={shown} diffState={diffState} />
     ) : family === "Read" ? (
       <ReadCard call={call} result={shown} />
-    ) : family === "Workflow" && workflowMembers?.length ? (
-      // A `workflow.run` observation gives us real members to draw; the tool
-      // call on its own does not, and used to render an empty card.
-      <WorkflowCard runTitle={workflowTitle} members={workflowMembers} />
+    ) : family === "Workflow" && workflow ? (
+      // r-ux-w: the timeline card hangs directly on this tool row, visible by
+      // default; the presenter card is the fallback when no run data exists.
+      <WorkflowTimelineCard run={workflow.run} phases={workflow.phases} members={workflow.members} />
     ) : family === "MCP" ? (
       <McpCard call={call} result={shown} />
     ) : (

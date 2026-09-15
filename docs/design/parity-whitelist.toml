@@ -66,6 +66,24 @@ reason = """
 exists on the native PTY path. They are dropped from both sides rather than
 compared — `claude-print` has no equivalent to align them against."""
 
+# `turn.live` observations: hook-derived turn edges with no print counterpart.
+[[rule]]
+lifecycle = "turn"
+allow-unmatched = true
+reason = """
+print is retired (claude --print streamed no live turn edges), so the live
+`turn.live` vocabulary — the hook-derived prompt-accepted / turn-ended
+lifecycle observations (UserPromptSubmit / Stop on the `turn` topic), with
+the phase/provision/tier tags riding their relatedIds — has no counterpart
+on the print side. A missing print peer must not block the structured view,
+nor must a present print-only turn edge require one. Anything a turn
+observation *reports* (status, outcome, and the collapsed message/tool
+nodes) is still compared field by field; only the event's carrier-specific
+presence is excused. Deletion condition: once `claude print` is removed and
+the gate becomes pty@N vs pty@N+1 (D-028 §12), both carriers have the hook
+tier, `turn.live` must appear on both sides, and this rule is deleted so a
+missing turn edge fails the gate again."""
+
 [[rule]]
 kind = "raw_tty"
 ignore = true

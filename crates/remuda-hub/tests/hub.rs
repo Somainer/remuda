@@ -1420,6 +1420,9 @@ async fn agent_scoped_create_cannot_set_args_or_binary_path() -> Result<()> {
         "kind": "claude",
         "driver": "claude-print",
         "permissionMode": "manual",
+        // §2.5: delegating a child needs the dispatch grant; this test's
+        // subject is the args/binaryPath refusal, not delegation itself.
+        "grants": ["dispatch"],
         "prompt": "parent"
     })
     .to_string();

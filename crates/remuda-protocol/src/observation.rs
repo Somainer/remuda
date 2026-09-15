@@ -387,9 +387,67 @@ pub struct WorkflowRunPayload {
     pub revision: U64,
     /// `title`; protocol §5.3.
     pub title: Knowledge<String>,
+    /// Script meta `name` (e.g. `review-changes`); additive r-ux-w. Absent on
+    /// producers/journals written before the timeline card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<Knowledge<String>>,
+    /// Script meta `description`; additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<Knowledge<String>>,
+    /// Aggregate counters for the card's summary rail; additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totals: Option<WorkflowTotals>,
+    /// Live "current phase: agent" line / terminal result line; additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<WorkflowLive>,
+    /// When phase detail cannot be provided the card degrades to a plain tool
+    /// row plus this explanation; additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// `result_ref`; protocol §5.3.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub result_ref: Option<Id>,
+}
+
+/// Aggregate counters shown on a Workflow card; additive r-ux-w, §5.3.
+///
+/// All values are a point-in-time snapshot: a running run's `tokens` /
+/// `elapsed_ms` keep moving until the terminal revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowTotals {
+    /// Whether `agents_total` is a real denominator. Dynamic scripts whose
+    /// queued calls cannot be counted statically report `false`, and the card
+    /// shows a running count without "/ total".
+    pub total_known: bool,
+    /// Total agent slots (done + running + queued). Meaningful with `total_known`.
+    pub agents_total: U64,
+    /// Agents in a terminal success state.
+    pub agents_done: U64,
+    /// Agents that failed.
+    pub agents_failed: U64,
+    /// Agents stopped with the run (TaskStop).
+    pub agents_killed: U64,
+    /// Agents currently running.
+    pub agents_running: U64,
+    /// Summed subagent token usage.
+    pub tokens: U64,
+    /// Summed subagent tool calls.
+    pub calls: U64,
+    /// Wall time since launch.
+    pub elapsed_ms: U64,
+}
+
+/// The card's live line under the header; additive r-ux-w, §5.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowLive {
+    /// Phase title of the currently (or last) active agent.
+    pub phase_title: Knowledge<String>,
+    /// Label of the currently (or last) active agent.
+    pub agent_label: Knowledge<String>,
+    /// Terminal one-line result summary, when the run has finished.
+    pub summary: Knowledge<String>,
 }
 
 /// WorkflowPhasePayload; `protocol.md` §5.3.
@@ -443,6 +501,24 @@ pub struct WorkflowMemberPayload {
     pub result_ref: Option<Id>,
     /// `revision`; protocol §5.3.
     pub revision: U64,
+    /// Last tool the agent called; additive r-ux-w timeline card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_tool: Option<Knowledge<String>>,
+    /// Summed token usage (input + output + cache); additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<U64>,
+    /// Number of tool calls; additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<U64>,
+    /// Per-agent wall time; additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<U64>,
+    /// Spawn timestamp; additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
+    /// Stop timestamp; additive r-ux-w.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Timestamp>,
 }
 
 /// InteractionRequestedPayload; `protocol.md` §5.4.

@@ -1,10 +1,11 @@
 //! D-027: the Node pulls staged attachment bytes, writes them privately next
 //! to the instance, and removes them when the instance is gone.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use remuda_node::{
     DevNode, DevServerConfig, MaterializedAttachment, ObjectSource, ServeConfig, compose,
 };
+use remuda_protocol::CommandState;
 use remuda_protocol::InstanceId;
 use remuda_protocol::hubnode::AttachmentRef;
 use serde_json::{Value, json};
@@ -123,6 +124,31 @@ async fn send(
     Ok(serde_json::to_value(result)?)
 }
 
+/// Pull the durable settlement error for an accepted command.
+///
+/// Since the fast-ack change, the RPC returns as soon as the command is
+/// durably accepted; attachment materialization happens in the instance
+/// worker and settles the command afterwards. A failure reads back here.
+async fn rejection_message(node: &DevNode, command_id: &str) -> Result<String> {
+    for _ in 0..100 {
+        if let Some(command) = node
+            .get_command(&command_id.parse()?)
+            .ok()
+            .filter(|command| command.state == CommandState::Settled)
+        {
+            return match command.settlement {
+                remuda_protocol::Knowledge::Known { value } => Ok(value
+                    .error
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "command settled without an error".to_owned())),
+                _ => bail!("settled command carried no settlement"),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    bail!("command {command_id} never settled")
+}
+
 /// The happy path: bytes land under the instance, named from the object id.
 #[tokio::test]
 async fn a_send_pulls_its_attachments_to_the_instance_directory() -> Result<()> {
@@ -145,6 +171,12 @@ async fn a_send_pulls_its_attachments_to_the_instance_directory() -> Result<()> 
     let red = dir.join("obj_red.png");
     // The extension follows the media type, not the sender's claimed name.
     let blue = dir.join("obj_blue.jpg");
+    for _ in 0..100 {
+        if red.is_file() && blue.is_file() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert!(red.is_file(), "missing {}", red.display());
     assert!(blue.is_file(), "missing {}", blue.display());
     assert_eq!(std::fs::read(&red)?.len(), 512);
@@ -168,8 +200,10 @@ async fn a_send_pulls_its_attachments_to_the_instance_directory() -> Result<()> 
     Ok(())
 }
 
-/// A failed pull must fail the send. Degrading to a text-only prompt would
-/// leave the agent answering about an image it never got.
+/// A failed pull must reject the send. Degrading to a text-only prompt would
+/// leave the agent answering about an image it never got. The reject now
+/// settles the accepted command asynchronously — fast ack first, worker-side
+/// pull second.
 #[tokio::test]
 async fn a_failed_pull_rejects_the_whole_send() -> Result<()> {
     let fixture = fixture()?;
@@ -177,27 +211,29 @@ async fn a_failed_pull_rejects_the_whole_send() -> Result<()> {
     fixture.node.set_object_source(objects.clone());
     let instance = create_instance(&fixture.node).await?;
 
-    let error = send(
+    let result = send(
         &fixture.node,
         &instance,
         vec![attachment("obj_missing", "image/png")],
     )
-    .await
-    .expect_err("a missing object must fail the send");
+    .await?;
+    let command_id = result["command"]["commandId"].as_str().unwrap();
+    let message = rejection_message(&fixture.node, command_id).await?;
     assert!(
-        error.to_string().contains("obj_missing"),
-        "{error} should name the object"
+        message.contains("obj_missing"),
+        "{message} should name the object"
     );
 
     *objects.fail.lock().expect("lock") = Some("hub unreachable".into());
-    let error = send(
+    let result = send(
         &fixture.node,
         &instance,
         vec![attachment("obj_present", "image/png")],
     )
-    .await
-    .expect_err("an unreachable Hub must fail the send");
-    assert!(error.to_string().contains("hub unreachable"), "{error}");
+    .await?;
+    let command_id = result["command"]["commandId"].as_str().unwrap();
+    let message = rejection_message(&fixture.node, command_id).await?;
+    assert!(message.contains("hub unreachable"), "{message}");
 
     // Nothing partial is left behind for the caller to trip over.
     let dir = remuda_node::attachments_dir(&fixture.data_dir, &instance);
@@ -216,17 +252,15 @@ async fn unsupported_media_types_are_refused_before_any_fetch() -> Result<()> {
     fixture.node.set_object_source(objects.clone());
     let instance = create_instance(&fixture.node).await?;
 
-    let error = send(
+    let result = send(
         &fixture.node,
         &instance,
         vec![attachment("obj_doc", "application/pdf")],
     )
-    .await
-    .expect_err("pdf is not in the allowlist");
-    assert!(
-        error.to_string().contains("unsupported media type"),
-        "{error}"
-    );
+    .await?;
+    let command_id = result["command"]["commandId"].as_str().unwrap();
+    let message = rejection_message(&fixture.node, command_id).await?;
+    assert!(message.contains("unsupported media type"), "{message}");
     assert_eq!(
         objects.fetches.load(Ordering::SeqCst),
         0,
@@ -235,21 +269,22 @@ async fn unsupported_media_types_are_refused_before_any_fetch() -> Result<()> {
     Ok(())
 }
 
-/// Without a Hub link there is nowhere to pull from, so the send is refused
+/// Without a Hub link there is nowhere to pull from, so the send is rejected
 /// rather than quietly stripped of its images.
 #[tokio::test]
 async fn a_node_with_no_object_source_refuses_attachments_but_still_sends_text() -> Result<()> {
     let fixture = fixture()?;
     let instance = create_instance(&fixture.node).await?;
 
-    let error = send(
+    let result = send(
         &fixture.node,
         &instance,
         vec![attachment("obj_x", "image/png")],
     )
-    .await
-    .expect_err("no source means no attachments");
-    assert!(error.to_string().contains("attachment source"), "{error}");
+    .await?;
+    let command_id = result["command"]["commandId"].as_str().unwrap();
+    let message = rejection_message(&fixture.node, command_id).await?;
+    assert!(message.contains("attachment source"), "{message}");
 
     // A text-only send on the same instance is unaffected.
     send(&fixture.node, &instance, Vec::new()).await?;
@@ -273,10 +308,10 @@ async fn more_attachments_than_the_cap_are_refused() -> Result<()> {
         .iter()
         .map(|(id, _)| attachment(id, "image/png"))
         .collect();
-    let error = send(&fixture.node, &instance, refs)
-        .await
-        .expect_err("five attachments exceed the per-message cap");
-    assert!(error.to_string().contains("per-message limit"), "{error}");
+    let result = send(&fixture.node, &instance, refs).await?;
+    let command_id = result["command"]["commandId"].as_str().unwrap();
+    let message = rejection_message(&fixture.node, command_id).await?;
+    assert!(message.contains("per-message limit"), "{message}");
     Ok(())
 }
 
@@ -296,6 +331,12 @@ async fn closing_an_instance_removes_its_attachments() -> Result<()> {
     .await?;
 
     let dir = remuda_node::attachments_dir(&fixture.data_dir, &instance);
+    for _ in 0..100 {
+        if dir.join("obj_keep.png").is_file() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert!(dir.join("obj_keep.png").is_file());
 
     let close: remuda_node::InstanceCommandRequest = serde_json::from_value(json!({
@@ -354,14 +395,15 @@ async fn a_traversal_shaped_object_id_never_becomes_a_path() -> Result<()> {
         .set_object_source(FakeObjects::with(&[("../../escape", png(16))]));
     let instance = create_instance(&fixture.node).await?;
 
-    let error = send(
+    let result = send(
         &fixture.node,
         &instance,
         vec![attachment("../../escape", "image/png")],
     )
-    .await
-    .expect_err("a traversal id is not a bare identifier");
-    assert!(error.to_string().contains("bare identifier"), "{error}");
+    .await?;
+    let command_id = result["command"]["commandId"].as_str().unwrap();
+    let message = rejection_message(&fixture.node, command_id).await?;
+    assert!(message.contains("bare identifier"), "{message}");
     assert!(
         !fixture
             .data_dir

@@ -430,15 +430,29 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
     // copy of this optimistic bubble — the Node joined hook/transcript
     // evidence onto the delivering command. The Node journals its own queued
     // observation as soon as the command is enqueued, which can beat the HTTP
-    // response, so this match hides the bubble even while it is still
-    // `queued`: the journal node carries that status itself.
+    // response, so this join happens even while the bubble is still `queued`.
+    //
+    // The bubble still owns facts the journal never echoes back: the local
+    // attachment thumbnails (D-027) and the PromptMode badge. Merge those onto
+    // the joined node in place so the rendered row keeps them instead of
+    // dropping them when the optimistic bubble is hidden.
     if (bubble.commandId) {
-      const joinedById = events.some(
-        (ev) =>
-          ev.kind === "message" &&
-          (ev.payload as { commandId?: string }).commandId === bubble.commandId,
+      const joinedIndex = nodes.findIndex(
+        (node) =>
+          node.type === "message" &&
+          node.role === "user" &&
+          node.commandId === bubble.commandId,
       );
-      if (joinedById) continue;
+      if (joinedIndex >= 0) {
+        const joined = nodes[joinedIndex];
+        if (joined.type === "message") {
+          // Carry the bubble's local-only state (attachment thumbnails and
+          // the PromptMode badge) onto the authoritative journal node so the
+          // rendered row keeps them after the optimistic bubble is hidden.
+          nodes[joinedIndex] = { ...joined, local: bubble };
+        }
+        continue;
+      }
     } else {
       // No server id (pre-C2 producers / POST failure): keep the legacy text
       // rule, which never hides an in-flight queued bubble.

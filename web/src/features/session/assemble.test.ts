@@ -284,22 +284,47 @@ describe("assembleTranscript · C2 commandId correlation", () => {
       ...(commandId ? { commandId } : {}),
     });
 
-  const bubble = (text: string, extra: { commandId?: string | null; state?: string } = {}) =>
+  const bubble = (
+    text: string,
+    extra: { commandId?: string | null; state?: string; attachments?: unknown } = {},
+  ) =>
     ({
       clientRequestId: `local_${text.replace(/\W/g, "_")}` as Id,
       instanceId: "ins" as Id,
       text,
       commandId: extra.commandId === undefined ? null : (extra.commandId as Id | null),
       state: extra.state ?? "accepted",
+      ...(extra.attachments ? { attachments: extra.attachments } : {}),
       createdAt: "2026-09-15T00:00:00.000Z",
     }) as never;
 
-  it("hides the optimistic bubble once the commandId journal node arrives", () => {
+  it("joins the optimistic bubble's local state onto the commandId journal node", () => {
     const nodes = assembleTranscript([userMessage(1, "do it", "cmd_1")], [bubble("do it", { commandId: "cmd_1" })]);
     const users = nodes.filter((n): n is Extract<(typeof nodes)[number], { type: "message" }> => n.type === "message" && n.role === "user");
     expect(users).toHaveLength(1);
+    // The single row is the authoritative journal node, not the optimistic id.
     expect(users[0]).toMatchObject({ id: "obj_n1", commandId: "cmd_1" });
-    expect(users[0].local).toBeUndefined();
+    // …but it carries the bubble's local-only state (attachments/mode).
+    expect(users[0].local).toMatchObject({ commandId: "cmd_1" });
+    expect(users[0].local!.clientRequestId.startsWith("local_")).toBe(true);
+  });
+
+  it("carries attachment thumbnails onto the joined commandId node (D-027 paste + send)", () => {
+    // The journal never echoes attachment thumbnails back; they live only on
+    // the optimistic bubble. Hiding the bubble must not lose them.
+    const withImage = bubble("describe it", {
+      commandId: "cmd_img",
+      attachments: [{ objectId: "obj_1", name: "red.png", previewUrl: "blob:red", index: 1 }],
+    });
+    const nodes = assembleTranscript([userMessage(1, "describe it", "cmd_img")], [withImage]);
+    const user = nodes.find(
+      (n): n is Extract<(typeof nodes)[number], { type: "message" }> =>
+        n.type === "message" && n.role === "user" && n.commandId === "cmd_img",
+    );
+    expect(user).toBeDefined();
+    expect(user!.local?.attachments).toEqual([
+      { objectId: "obj_1", name: "red.png", previewUrl: "blob:red", index: 1 },
+    ]);
   });
 
   it("keeps both when the journal node carries no matching commandId", () => {

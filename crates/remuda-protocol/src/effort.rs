@@ -41,6 +41,9 @@ fn name_wire(name: EffortName) -> &'static str {
         EffortName::High => "high",
         EffortName::Xhigh => "xhigh",
         EffortName::Max => "max",
+        // Claude assistant records never report the Codex/Grok-only `minimal`
+        // word; it only exists on launch argv for those harnesses.
+        EffortName::Minimal => "minimal",
     }
 }
 

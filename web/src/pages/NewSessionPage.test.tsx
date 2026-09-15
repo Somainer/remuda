@@ -159,19 +159,19 @@ it("re-snaps the slider onto the new harness table when the runtime changes", ()
   expect(slider()).toHaveAttribute("data-name", "high");
   expect(slider()).toHaveAttribute("data-index", "2");
 
-  // codex: the midpoint (2/4) maps onto `high` by nearest position.
+  // codex (five stops): the midpoint maps onto `medium` by nearest position.
   fireEvent.click(screen.getByTestId("new-session-kind-codex"));
-  expect(slider()).toHaveAttribute("data-tiers", "low,medium,high,ultra");
-  expect(slider()).toHaveAttribute("data-name", "high");
+  expect(slider()).toHaveAttribute("data-tiers", "minimal,low,medium,high,xhigh");
+  expect(slider()).toHaveAttribute("data-name", "medium");
   expect(slider()).toHaveAttribute("data-index", "2");
   // ultracode is Claude-only; other harnesses never show the extra stop.
-  expect(slider()).toHaveAttribute("aria-valuemax", "3");
+  expect(slider()).toHaveAttribute("aria-valuemax", "4");
 
-  // grok has three: the midpoint snaps onto `standard`.
+  // grok has four stops; the midpoint (2/4) snaps onto `high`.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
-  expect(slider()).toHaveAttribute("data-tiers", "quick,standard,max");
-  expect(slider()).toHaveAttribute("data-name", "standard");
-  expect(slider()).toHaveAttribute("data-index", "1");
+  expect(slider()).toHaveAttribute("data-tiers", "low,medium,high,xhigh");
+  expect(slider()).toHaveAttribute("data-name", "high");
+  expect(slider()).toHaveAttribute("data-index", "2");
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
@@ -185,20 +185,23 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   expect(slider()).toHaveAttribute("data-index", "5");
   expect(slider()).toHaveAttribute("data-ember", "1");
 
-  // grok's table is shorter; the flag drops and the ember tier maps ember→ember.
+  // The ultracode flag is Claude-only; leaving Claude drops it and maps the
+  // xhigh tier (3/4) by ratio onto grok `high` (2/3) — top accents map to the
+  // static accent, the ember never crosses harnesses.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
-  expect(slider()).toHaveAttribute("data-name", "max");
+  expect(slider()).toHaveAttribute("data-name", "high");
   expect(slider()).toHaveAttribute("data-index", "2");
-  expect(slider()).toHaveAttribute("data-ember", "1");
+  expect(slider()).toHaveAttribute("data-effort-look", "plain");
+  expect(slider()).toHaveAttribute("data-ember", "0");
 
   // ...and back, without the stale draft the unmounted card held.
   fireEvent.click(screen.getByTestId("new-session-kind-codex"));
-  expect(slider()).toHaveAttribute("data-name", "ultra");
-  expect(slider()).toHaveAttribute("data-ember", "1");
+  expect(slider()).toHaveAttribute("data-name", "high");
+  expect(slider()).toHaveAttribute("data-index", "3");
   fireEvent.keyDown(slider(), { key: "Home" });
-  expect(slider()).toHaveAttribute("data-name", "low");
+  expect(slider()).toHaveAttribute("data-name", "minimal");
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
-  expect(slider()).toHaveAttribute("data-name", "quick");
+  expect(slider()).toHaveAttribute("data-name", "low");
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
@@ -264,7 +267,7 @@ it("writes the harness-native tier after a runtime switch", async () => {
   fireEvent.keyDown(screen.getByTestId("new-session-effort-slider"), { key: "End" });
   fireEvent.click(screen.getByTestId("new-session-start"));
   await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
-    kind: "grok", effortIndex: 2, effortName: "max",
+    kind: "grok", effortIndex: 3, effortName: "xhigh",
   })));
 });
 

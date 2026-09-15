@@ -98,9 +98,10 @@ describe("Composer shortcuts", () => {
     await user.click(screen.getByTestId("effort-open-list"));
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "list");
     expect(screen.queryByTestId("effort-slider")).toBeNull();
-    // Both ember stops — max and ultracode — sit at the bottom of the list.
-    expect(screen.getByTestId("effort-tier-max")).toHaveAttribute("data-ember", "1");
-    expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ember", "1");
+    // The ladder in the list: max carries the restrained top accent, only
+    // ultracode plays the full ember look.
+    expect(screen.getByTestId("effort-tier-max")).toHaveAttribute("data-effort-look", "top");
+    expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-effort-look", "ultracode");
     expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ultracode", "1");
     expect(screen.getByTestId("effort-tier-high")).toHaveAttribute("data-selected", "1");
     expect(screen.getByTestId("effort-list")).toHaveTextContent("跨文件 · 长任务");
@@ -114,7 +115,7 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
   });
 
-  it("turns the pill and the tier name ember on the max tier", async () => {
+  it("max carries the restrained top accent, not the ember (ultracode alone ember)", async () => {
     const user = userEvent.setup();
     render(
       <Composer
@@ -128,9 +129,11 @@ describe("Composer shortcuts", () => {
       />,
     );
     await user.click(screen.getByTestId("model-effort-chip"));
-    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-ember", "1");
-    expect(screen.getByTestId("effort-title")).toHaveAttribute("data-ember", "1");
-    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-effort-look", "top");
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-ember", "0");
+    expect(screen.getByTestId("effort-title")).toHaveAttribute("data-effort-look", "top");
+    // The collapsed chip never animates on max.
+    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0");
   });
 
   it("plain xhigh is not ember; the ultracode stop plays ember and names itself ultracode", async () => {
@@ -255,10 +258,10 @@ describe("Composer shortcuts", () => {
     );
     await user.click(screen.getByTestId("model-effort-chip"));
     const slider = screen.getByTestId("effort-slider");
-    expect(slider).toHaveAttribute("data-tiers", "quick,standard,max");
+    expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh");
     slider.focus();
     await user.keyboard("{Home}");
-    expect(onEffort).toHaveBeenCalledWith({ index: 0, name: "quick", kind: "grok" });
+    expect(onEffort).toHaveBeenCalledWith({ index: 0, name: "low", kind: "grok" });
     rerender(
       <Composer
         instanceId="ins_keys"
@@ -271,8 +274,8 @@ describe("Composer shortcuts", () => {
       />,
     );
     await user.click(screen.getByTestId("effort-reset"));
-    // Claude high (midpoint) maps by nearest position onto grok's middle tier.
-    expect(onEffort).toHaveBeenCalledWith({ index: 1, name: "standard", kind: "grok" });
+    // The grok CLI default is `medium` (index 1).
+    expect(onEffort).toHaveBeenCalledWith({ index: 1, name: "medium", kind: "grok" });
   });
 
   it("locks the slider when the session is not configurable", async () => {
@@ -312,7 +315,7 @@ describe("Composer shortcuts", () => {
       />,
     );
     await user.click(screen.getByTestId("model-effort-chip"));
-    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,ultra");
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "minimal,low,medium,high,xhigh");
     expect(screen.queryByTestId("effort-ultracode")).toBeNull();
   });
 

@@ -345,7 +345,14 @@ wire_enum!(ModelEffective, "3.1", {
     NextTurn => "next-turn",
 });
 
+// Native reasoning-effort vocabulary shared by the harness CLIs.
+//
+// `minimal` is not a Claude Code level: Claude exposes only `low..=max`,
+// while Codex's `model_reasoning_effort` and Grok's `--reasoning-effort`
+// also accept `minimal` (Codex parser; Grok power-user spelling). The
+// driver gates which values each kind may launch with.
 wire_enum!(EffortName, "4.1", {
+    Minimal => "minimal",
     Low => "low",
     Medium => "medium",
     High => "high",

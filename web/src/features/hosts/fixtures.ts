@@ -30,7 +30,11 @@ export const HOST_FIXTURES: HostView[] = [
     rttMs: 12,
     agentVersion: "0.1.0",
     resources: { cpuPct: 8, memPct: 31 },
-    cli: [claudeCli("logged_in"), { kind: "grok", version: "1.0.0", path: "/usr/local/bin/grok", auth: "unknown" }],
+    cli: [
+      claudeCli("logged_in"),
+      { kind: "codex", version: "0.147.0", path: "/home/devuser/.local/bin/codex", auth: "unknown" },
+      { kind: "grok", version: "1.0.30", path: "/usr/local/bin/grok", auth: "unknown" },
+    ],
     labels: ["region:sg", "herdr", "gateway"],
     maxInstances: 8,
     instanceCount: 4,

@@ -40,6 +40,18 @@ export type EffortSelection = {
 };
 
 /**
+ * The three visual treatments of the one slider (composer-slider-5):
+ *
+ * - `plain` — ordinary tiers: the cold brand fill, no amber.
+ * - `top` — a restrained static top-tier accent for `xhigh`/`max` (and the
+ *   native top tier of codex/grok). Same family as the Desktop's max look:
+ *   warm label/tint, never the animated ember field.
+ * - `ultracode` — the Claude ultracode stop ALONE: the full ember glow,
+ *   drifting spark layers, its own label colour and thumb state.
+ */
+export type EffortLook = "plain" | "top" | "ultracode";
+
+/**
  * The real Claude Code levels, in CLI order (`claude --effort`).
  * low · medium · high (default) · xhigh · max.
  */
@@ -51,36 +63,44 @@ const CLAUDE: EffortTier[] = [
   { name: "max", description: "最高档 · 慢且贵" },
 ];
 
-/** Claude forces this tier while ultracode is on. */
-export const CLAUDE_ULTRACODE_INDEX = 3;
-
-/** Position of the ultracode stop on the six-stop Claude slider (past `max`). */
-export const CLAUDE_ULTRACODE_STOP = 5;
-
 /**
- * The ultracode stop, in the Desktop's slot: the rightmost stop past `max`,
- * still the `xhigh` tier plus the workflow flag on the wire.
+ * Codex `model_reasoning_effort`, in CLI/enum order (codex-cli 0.147.0
+ * `ReasoningEffort::from_str`): minimal · low · medium · high · xhigh.
+ *
+ * Evidence: the installed binary + upstream enum and the embedded model
+ * catalog — `low/medium/high/xhigh` are advertised by every current model,
+ * `minimal` is parsed by the enum/config (newest models only), while `max`
+ * (5.6-luna and newer) and `ultra` (5.6-sol/terra only) are model-gated
+ * behind the advanced picker and never offered here. The slider passes these
+ * 1:1 to `-c model_reasoning_effort=…`; see
+ * docs/design/evidence/composer-slider-5.md.
  */
-const CLAUDE_ULTRACODE_STOP_DEF: EffortStop = {
-  name: "ultracode",
-  description: "多代理工作流 · 锁 xhigh",
-  index: CLAUDE_ULTRACODE_INDEX,
-  ultracode: true,
-  short: "ultra",
-};
-
 const CODEX: EffortTier[] = [
+  { name: "minimal", description: "极简思考" },
   { name: "low", description: "不额外思考" },
   { name: "medium", description: "默认档" },
   { name: "high", description: "跨文件重构、长任务" },
-  { name: "ultra", description: "最高档 · 慢且贵" },
+  { name: "xhigh", description: "最深推理 · 慢且贵" },
 ];
 
+/** Index of the real per-table default tier (codex/grok: `medium`). */
+const CODEX_DEFAULT_INDEX = 2;
+
+/**
+ * Grok `--reasoning-effort` (visible alias `--effort`), the built-in
+ * `/effort` menu order low · medium · high · xhigh.
+ *
+ * Evidence: the public xAI grok-build repository's sampling-types
+ * `ReasoningEffort` enum (see docs/design/evidence/composer-slider-5.md).
+ */
 const GROK: EffortTier[] = [
-  { name: "quick", description: "不额外思考" },
-  { name: "standard", description: "默认档" },
-  { name: "max", description: "最高档 · 慢且贵" },
+  { name: "low", description: "更快 · 更轻的思考" },
+  { name: "medium", description: "默认档" },
+  { name: "high", description: "重度思考" },
+  { name: "xhigh", description: "延展推理 · 慢且贵" },
 ];
+
+const GROK_DEFAULT_INDEX = 1;
 
 const AGY: EffortTier[] = [{ name: "default", description: "agy CLI 默认档" }];
 
@@ -102,12 +122,46 @@ const CLAUDE_LEGACY_NAMES: Record<string, { tier: string; ultracode?: boolean }>
   ultracode: { tier: "xhigh", ultracode: true },
 };
 
+/**
+ * Legacy Codex names from before the verified vocabulary. The old top stop
+ * `ultra` is NOT a codex value — it migrates to the real top `xhigh`;
+ * anything else lands on the codex default `medium`.
+ */
+const CODEX_LEGACY_NAMES: Record<string, string> = {
+  ultra: "xhigh",
+};
+
+/**
+ * Legacy Grok names from the invented quick/standard/max table. They migrate
+ * by name onto the real low/medium/high/xhigh menu; unknown → `medium`.
+ */
+const GROK_LEGACY_NAMES: Record<string, string> = {
+  quick: "low",
+  standard: "medium",
+  max: "xhigh",
+};
+
+/** Real default-tier index per harness table. */
+const TABLE_DEFAULT: Partial<Record<string, number>> = {
+  claude: DEFAULT_EFFORT_INDEX,
+  codex: CODEX_DEFAULT_INDEX,
+  grok: GROK_DEFAULT_INDEX,
+  agy: 0,
+};
+
 export function effortTable(kind: EffortKind | string): EffortTier[] {
   if (kind === "claude") return CLAUDE;
   if (kind === "codex") return CODEX;
   if (kind === "grok") return GROK;
   if (kind === "agy") return AGY;
   return EMPTY;
+}
+
+/** Index of the harness's real CLI default tier. */
+export function effortDefaultIndex(kind: EffortKind | string): number {
+  const table = effortTable(kind);
+  if (table.length === 0) return 0;
+  return TABLE_DEFAULT[kind] ?? clampEffortIndex(Math.floor((table.length - 1) / 2), table.length);
 }
 
 /**
@@ -119,7 +173,7 @@ export function effortStops(kind: EffortKind | string): EffortStop[] {
   const table = effortTable(kind);
   // The ~280px composer popover cannot fit six full tick labels; New Session's
   // inline field is wider and renders the full names (see EffortSlider).
-  const popoverShort: Record<string, string> = { medium: "med" };
+  const popoverShort: Record<string, string> = { medium: "med", minimal: "min" };
   const stops: EffortStop[] = table.map((tier, index) => ({
     ...tier,
     index,
@@ -129,6 +183,24 @@ export function effortStops(kind: EffortKind | string): EffortStop[] {
   if (kind === "claude") stops.push({ ...CLAUDE_ULTRACODE_STOP_DEF });
   return stops;
 }
+
+/** Claude forces this tier while ultracode is on. */
+export const CLAUDE_ULTRACODE_INDEX = 3;
+
+/** Position of the ultracode stop on the six-stop Claude slider (past `max`). */
+export const CLAUDE_ULTRACODE_STOP = 5;
+
+/**
+ * The ultracode stop, in the Desktop's slot: the rightmost stop past `max`,
+ * still the `xhigh` tier plus the workflow flag on the wire.
+ */
+const CLAUDE_ULTRACODE_STOP_DEF: EffortStop = {
+  name: "ultracode",
+  description: "多代理工作流 · 锁 xhigh",
+  index: CLAUDE_ULTRACODE_INDEX,
+  ultracode: true,
+  short: "ultra",
+};
 
 /** Slider position (0..stops-1) of a Claude tier/flag pair. Ultracode is the last stop. */
 export function effortStopIndex(
@@ -181,7 +253,56 @@ export function normalizeClaudeName(
   return { tier: table[index].name, index, ultracode: legacy?.ultracode === true };
 }
 
-/** 0..1 position of a snapped index on a discrete track. A single-tier table sits at the ember end. */
+/**
+ * Resolve a stored/legacy NAME on a non-Claude harness table to a current row.
+ * Legacy words migrate (codex `ultra→xhigh`; grok `quick/standard/max`); an
+ * unrecognised word lands on that harness's real CLI default. Returns the
+ * table index and tier name.
+ */
+export function normalizeHarnessName(
+  kind: EffortKind | string,
+  name: string,
+): { tier: string; index: number } {
+  const table = effortTable(kind);
+  if (table.length === 0) return { tier: name, index: 0 };
+  const direct = table.findIndex((tier) => tier.name === name);
+  if (direct >= 0) return { tier: table[direct].name, index: direct };
+  const legacyMap = kind === "codex" ? CODEX_LEGACY_NAMES : kind === "grok" ? GROK_LEGACY_NAMES : {};
+  const target = legacyMap[name] ?? table[effortDefaultIndex(kind)].name;
+  const index = Math.max(0, table.findIndex((tier) => tier.name === target));
+  return { tier: table[index].name, index };
+}
+
+/**
+ * The exact native word to put on a harness's effort channel, or throw.
+ *
+ * Unlike the record reader (which migrates legacy words) this is the guard for
+ * values about to be persisted/sent: only a CURRENT tier row of that harness
+ * is accepted, so an unknown word can never be passed straight to the CLI.
+ * The driver enforces the same set again in Rust.
+ */
+export class UnknownEffortError extends Error {
+  constructor(
+    kind: string,
+    name: string,
+  ) {
+    super(`unknown ${kind} effort tier ${JSON.stringify(name)}`);
+    this.name = "UnknownEffortError";
+  }
+}
+
+export function nativeEffortWord(kind: EffortKind | string, name: string): string {
+  const table = effortTable(kind);
+  // Kinds with no effort axis (terminal/generic) carry the Hub's opaque
+  // string; there is no native vocabulary to validate against.
+  if (table.length === 0) return name;
+  if (!table.some((tier) => tier.name === name)) {
+    throw new UnknownEffortError(String(kind), name);
+  }
+  return name;
+}
+
+/** 0..1 position of a snapped index on a discrete track. A single-tier table sits at the top end. */
 export function effortRatio(index: number, length: number): number {
   if (length <= 1) return length === 1 ? 1 : 0;
   return clampEffortIndex(index, length) / (length - 1);
@@ -215,17 +336,14 @@ export function keyboardEffortIndex(current: number, key: string, length: number
 }
 
 /**
- * The reset/default stop for a harness. The device setting is a Claude index,
- * so on another table it maps by nearest position (「换 harness 后按新表就近映射」)
- * rather than hard-clamping — Claude `high` at the midpoint lands on grok's
- * middle tier, not on its ember `max`.
+ * The reset/default stop for a harness: the CLI's own real default
+ * (claude `high`, codex/grok `medium`), rather than a ratio-mapped position.
  */
 export function defaultEffortIndex(kind: EffortKind | string): number {
-  const to = effortTable(kind);
-  return mapEffortIndex(DEFAULT_EFFORT_INDEX, effortTable("claude").length, to.length);
+  return effortDefaultIndex(kind);
 }
 
-/** Map a stored index onto another table. Top tier always lands on the new top (ember) tier. */
+/** Map a stored index onto another table. Top tier always lands on the new top tier. */
 export function mapEffortIndex(fromIndex: number, fromLen: number, toLen: number): number {
   if (toLen <= 0) return 0;
   if (fromLen <= 1) return clampEffortIndex(fromIndex, toLen);
@@ -271,10 +389,14 @@ export function effortFromRecord(
     }
     return effortAt("claude", index ?? DEFAULT_EFFORT_INDEX, ultracode === true);
   }
-  if (name) {
-    const found = table.findIndex((tier) => tier.name === name);
-    if (found >= 0) return { index: found, name, kind: harness };
-    if (index != null) return effortAt(harness, index);
+  if (table.length > 0) {
+    if (name) {
+      // Migrate legacy words (ultra / quick / standard / max) to the real
+      // table; unknown words land on the CLI default — never passed through.
+      const norm = normalizeHarnessName(harness, name);
+      return { index: norm.index, name: norm.tier, kind: harness };
+    }
+    return effortAt(harness, index ?? effortDefaultIndex(harness));
   }
   if (index != null) return effortAt(harness, index);
   return undefined;
@@ -291,35 +413,63 @@ export function mapEffort(current: EffortSelection, nextKind: EffortKind | strin
   return effortAt(nextKind, index);
 }
 
-/** The top table row (max for Claude). */
+/**
+ * The visual look for a stop. The animated ember field exists ONLY on the
+ * Claude ultracode stop; `xhigh`/`max` (and each harness's native top tier)
+ * carry the restrained static `top` accent; everything else is plain.
+ */
+export function effortLook(
+  kind: EffortKind | string,
+  index: number,
+  ultracode?: boolean,
+): EffortLook {
+  if (kind === "claude" && ultracode === true) return "ultracode";
+  const table = effortTable(kind);
+  if (kind === "claude") {
+    // xhigh and max share the restrained top-tier accent.
+    return index >= CLAUDE_ULTRACODE_INDEX ? "top" : "plain";
+  }
+  // Other harnesses: their single native top row gets the same static accent;
+  // a single-tier table (agy) stays plain.
+  if (table.length > 1 && index === table.length - 1) return "top";
+  return "plain";
+}
+
+/** The single top table row only (`max` for Claude): the strongest non-ultra tier. */
 export function isEmberTier(kind: EffortKind | string, index: number): boolean {
   const table = effortTable(kind);
   return table.length > 0 && index === table.length - 1;
 }
 
-/** Ember plays on the top tier (max) and whenever Claude ultracode is on. */
+/**
+ * The full animated ember plays ONLY on the Claude ultracode stop. Kept under
+ * this name for the existing chip/list call sites; a top-tier selection
+ * (xhigh/max) is the restrained `top` look, not the ember.
+ */
 export function isEmberEffort(
   kind: EffortKind | string,
   index: number,
   ultracode?: boolean,
 ): boolean {
-  if (kind === "claude" && ultracode === true) return true;
-  return isEmberTier(kind, index);
+  return effortLook(kind, index, ultracode) === "ultracode";
 }
 
 export function isEmberName(kind: EffortKind | string, name: string): boolean {
-  const table = effortTable(kind);
-  return table.length > 0 && table[table.length - 1]?.name === name;
+  const stops = effortStops(kind);
+  const stop = stops.find((s) => s.name === name);
+  return stop ? effortLook(kind, stop.index, stop.ultracode) === "ultracode" : false;
 }
 
 /**
  * The tier name to put on the wire. The current Hub stores an opaque effort
  * name, so an ultracode selection round-trips as the legacy `"ultracode"`
  * string until x-p1-proto lands the `{name, ultracode}` shape; reads map it
- * back through {@link normalizeClaudeName}.
+ * back through {@link normalizeClaudeName}. Non-Claude names must be current
+ * tier words — legacy words migrate before this point, never pass through.
  */
 export function effortWireName(selection: EffortSelection): string {
-  return selection.kind === "claude" && selection.ultracode ? "ultracode" : selection.name;
+  if (selection.kind === "claude" && selection.ultracode) return "ultracode";
+  return nativeEffortWord(selection.kind, selection.name);
 }
 
 export function effortCaps(kind: EffortKind | string): {

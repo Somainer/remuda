@@ -462,10 +462,12 @@ mod d028 {
         }
     }
 
-    /// §9.1: legacy tier names normalize to levels by NAME. Index is ignored
-    /// on read — it was per-harness, so carrying it would change the tier.
+    /// §9.1: legacy tier names normalize to levels by NAME, per harness.
+    /// This shared table is the ONE migration consumed by the Hub store, the
+    /// Node model, the driver argv mapper and (by table shape) the web layer.
     #[test]
     fn effort_selection_normalizes_legacy_tier_names() {
+        use remuda_protocol::{AgentKind, effort_kind_from_str, normalize_legacy_effort};
         for (legacy, name, ultracode) in [
             ("default", EffortName::Low, false),
             ("low", EffortName::Low, false),
@@ -476,16 +478,23 @@ mod d028 {
             ("xhigh", EffortName::Xhigh, false),
             ("max", EffortName::Max, false),
             ("ultracode", EffortName::Xhigh, true),
-            // Unrecognized spellings fall to the documented default rather
+            // The old web/codex top tier `ultra` migrates to the current top.
+            ("ultra", EffortName::Xhigh, false),
+            // Unrecognized spellings fall to the Claude default rather
             // than failing a launch over a stale UI string.
-            ("ultra", EffortName::High, false),
             ("whatever-the-ui-said", EffortName::High, false),
         ] {
             let expected = EffortSelection { name, ultracode };
+            // Claude keeps the historical kind-less normalization.
             assert_eq!(
                 EffortSelection::from_legacy_name(legacy),
                 expected,
                 "{legacy}"
+            );
+            assert_eq!(
+                normalize_legacy_effort(AgentKind::Claude, legacy),
+                expected,
+                "claude {legacy}"
             );
             // Three spellings a client might send, all landing on one value:
             // the pre-D-028 object, a bare string, and the D-028 object.
@@ -498,6 +507,30 @@ mod d028 {
                     from_json_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
                 assert_eq!(decoded, expected, "{legacy} via {payload}");
             }
+        }
+        // Per-harness migrations — the values the web/driver tables enforce.
+        for (kind, legacy, expected) in [
+            // codex: the invented `ultra` is not a codex word → xhigh; the
+            // enum also parses minimal; unknown → the CLI default medium.
+            ("codex", "ultra", (EffortName::Xhigh, false)),
+            ("codex", "minimal", (EffortName::Minimal, false)),
+            ("codex", "bogus", (EffortName::Medium, false)),
+            // grok: quick/standard/max was an invented table; the verified
+            // menu is low/medium/high/xhigh.
+            ("grok", "quick", (EffortName::Low, false)),
+            ("grok", "standard", (EffortName::Medium, false)),
+            ("grok", "max", (EffortName::Xhigh, false)),
+            ("grok", "ultra", (EffortName::Xhigh, false)),
+            ("grok", "bogus", (EffortName::Medium, false)),
+        ] {
+            assert_eq!(
+                normalize_legacy_effort(effort_kind_from_str(kind), legacy),
+                EffortSelection {
+                    name: expected.0,
+                    ultracode: expected.1
+                },
+                "{kind}:{legacy}"
+            );
         }
         // The canonical shape round-trips; `index` is not written back.
         let value = json!({"name": "xhigh", "ultracode": true});

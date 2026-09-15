@@ -29,7 +29,12 @@ import { login } from "./hub-auth";
 test.describe.configure({ mode: "serial" });
 
 const created: string[] = [];
-const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence");
+// Committed evidence is refreshed only on request (REMUDA_EVIDENCE=1); every other run —
+// including the merge gate, whose verify-tree step rejects a dirty worktree — writes
+// the same screenshot under the gitignored test-results/ instead.
+const evidence = process.env.REMUDA_EVIDENCE === "1"
+  ? path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence")
+  : path.join(path.dirname(fileURLToPath(import.meta.url)), "../../test-results/evidence");
 
 type RowBadge = { href: string | null; badge: string | null; held: string | null; aria: string | null };
 

@@ -774,6 +774,7 @@ impl WorkflowJournalTailer {
             },
             completeness: Completeness::Structured,
             evidence_event_ids: Vec::new(),
+            event_id: None,
             body,
             raw: None,
         }

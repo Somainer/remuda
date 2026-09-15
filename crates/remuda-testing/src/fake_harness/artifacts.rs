@@ -275,6 +275,11 @@ pub fn claude_user_record(
 }
 
 /// One assistant content block record (`text`, `thinking`, or `tool_use`).
+///
+/// `effort` stamps the top-level `effort` / `perTurnEffort` fields a real claude
+/// transcript carries (D-028 §9.1), so the driver effort read-back can be
+/// exercised against the fake harness. `None` omits both fields.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn claude_assistant_block(
     meta: &SessionMeta,
@@ -284,8 +289,9 @@ pub fn claude_assistant_block(
     block: Value,
     stop_reason: &str,
     usage: &UsageSpec,
+    effort: Option<&str>,
 ) -> Value {
-    json!({
+    let mut record = json!({
         "parentUuid": Uuid::nil().to_string(),
         "isSidechain": false,
         "message": {
@@ -310,7 +316,57 @@ pub fn claude_assistant_block(
         "entrypoint": "cli",
         "version": meta.version,
         "gitBranch": "HEAD"
-    })
+    });
+    if let Some(effort) = effort
+        && let Some(obj) = record.as_object_mut()
+    {
+        obj.insert("effort".into(), json!(effort));
+        obj.insert("perTurnEffort".into(), Value::Null);
+    }
+    record
+}
+
+/// The `user` records a typed `/effort <word>` produces in a real claude
+/// transcript: the command markup and the local-command stdout line (D-028
+/// §9.1), sharing one `promptId` as the real binary writes them.
+#[must_use]
+pub fn claude_effort_slash_records(
+    meta: &SessionMeta,
+    clock: &FakeClock,
+    word: &str,
+    stdout: &str,
+) -> Vec<Value> {
+    let prompt_id = Uuid::new_v4().to_string();
+    let make = |uuid: &str, content: &str| {
+        json!({
+            "parentUuid": Uuid::nil().to_string(),
+            "isSidechain": false,
+            "promptId": prompt_id,
+            "type": "user",
+            "message": { "role": "user", "content": content },
+            "uuid": uuid,
+            "timestamp": clock.rfc3339(),
+            "userType": "external",
+            "entrypoint": "cli",
+            "sessionId": meta.session_id,
+            "session_id": meta.session_id,
+            "version": meta.version,
+            "gitBranch": "HEAD"
+        })
+    };
+    vec![
+        make(
+            &Uuid::new_v4().to_string(),
+            &format!(
+                "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n\
+                 <command-args>{word}</command-args>"
+            ),
+        ),
+        make(
+            &Uuid::new_v4().to_string(),
+            &format!("<local-command-stdout>{stdout}</local-command-stdout>"),
+        ),
+    ]
 }
 
 fn claude_usage(usage: &UsageSpec) -> Value {

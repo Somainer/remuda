@@ -1,83 +1,185 @@
-# Composer effort slider · ultracode is the slider's top stop (six stops)
+# Composer effort slider · pass 6 — the three-level look and the real Codex/Grok vocabularies
 
-Fifth pass, from user feedback with a Claude Desktop screenshot (one slider, Faster → Smarter, its rightmost stop `ultracode`):
+Sixth pass, from two owner-reported defects after the six-stop slider
+([composer-slider-4](./composer-slider-4.md), [composer-slider-5](./composer-slider-5.md)):
 
-> 「和 Claude Desktop 一样，我希望 ultracode 是在 max 右边的档位，而不是一个单独的按钮然后切到 xhigh，我知道实现是这样，但我还是希望用同一个 slider，不要独立按钮」
+> 1. 「max 和 ultracode 的特效要区分，只有 ultracode 才有最强的特效」
+> 2. 「codex 的档位是不全的」— the table was `low/medium/high/ultra`, and
+>    `ultra` would have been passed straight into
+>    `-c model_reasoning_effort="ultra"`.
 
-Pass 4 modelled ultracode as a standalone toggle chip that forced and locked the track on `xhigh`. That interaction is gone: ultracode is now the **sixth stop on the one slider**, immediately to the right of `max`. The underlying implementation shape is unchanged.
+Mock UI (`VITE_MOCK=1`, Playwright chromium / iPhone 13 against the local vite
+port) plus the installed Codex CLI on this host and upstream Grok source.
+Night Corral (`night`) and Ledger (`ledger`). Shots are composer/effort-element
+crops only — no personal paths, no hostnames. Static frames
+(`animations: "disabled"` / `prefers-reduced-motion: reduce`), so drift and
+twinkle are captured as a still ember field and the reduced-motion rules are
+what the evidence shows.
 
-Night Corral (`night`) and Ledger (`ledger`). Shots are composer/effort-element crops only — no personal paths, no hostnames. Static frames (`animations: "disabled"`), so ember drift is captured as a still field.
+## 1 · The three-level visual ladder
 
-Implementation: `web/src/features/session/effort.ts` (tier table + stop model), `web/src/features/session/EffortSlider.tsx`, `session.module.css`, `web/src/pages/NewSessionPage.tsx`.
+| look | stops | treatment |
+| --- | --- | --- |
+| `plain` | claude `low/medium/high`; every non-top stop of the other tables; agy | the cold brand fill, muted tick, plain thumb |
+| `top` | claude `xhigh` **and** `max`; the native top row of codex (`xhigh`) and grok (`xhigh`) | restrained static accent: cold→dust gradient, dust tick/title, one thin dust thumb ring. No glow, no spark field, no animation |
+| `ultracode` | the Claude `ultracode` stop **alone** | full amber ember: four drifting spark layers + breathing wash + brighter halo, its own `--ember-ultra` label colour and its own thumb state |
 
-## 1 · One slider, six stops
+The distinction is asserted without screenshots through
+`data-effort-look="plain|top|ultracode"` on the slider root, the panel, the
+title and every list row (e2e:
+`the fill reaches the knob at every stop; the ember field exists on ultracode alone`,
+`codex … vocabulary 1:1`, `grok session lists the native grok effort table`).
+`data-ember="1"` is now strictly equivalent to `data-effort-look="ultracode"`.
 
-Stop order for Claude:
-
-| stop index | stop name | wire selection | ember |
-|---|---|---|---|
-| 0 | `low` | `{name: "low", ultracode: false}` | — |
-| 1 | `medium` | `{name: "medium", ultracode: false}` | — |
-| 2 | `high` (default) | `{name: "high", ultracode: false}` | — |
-| 3 | `xhigh` | `{name: "xhigh", ultracode: false}` | — |
-| 4 | `max` | `{name: "max", ultracode: false}` | amber |
-| 5 | `ultracode` | **`{name: "xhigh", ultracode: true}`** | denser amber |
-
-The five real `claude --effort` tiers (`low medium high xhigh max`) are unchanged; the sixth stop is presentation-only (`effortStops()` / `EffortStop`). Selecting it maps to the D-028 §9.1 wire shape `{name: "xhigh", ultracode: true}` — the wire format and the Rust/API client are untouched. The slider is **never locked** any more: every stop is a normal stop, so ←/→ move across all six and Home/End jump to `low`/`ultracode`. Dragging snaps across six intervals.
-
-**Reverse mapping:** a record `{xhigh, ultracode: true}` renders at stop 5 (`effortStopIndex`), `{xhigh, false}` at stop 3. Legacy names still normalize by name: `default → low`, `think → high`, `think-hard → xhigh`, `ultracode` (old sentinel) → the ultracode stop. Unit tests round-trip all six stops selection → stop position → selection, including the reload path.
-
-**Display:** every surface that names the current stop shows **`ultracode`** while the flag is set — popover title, New Session label row, collapsed composer chip (which now reads `ultracode`, not the tier name) — while the form's `data-effort` attribute keeps carrying the `ultracode` wire sentinel. `codex / grok / agy` tables, stops and cross-harness mapping are byte-for-byte unchanged; the flag is Claude-only and drops when switching harnesses.
-
-## 2 · The standalone chip is removed everywhere
-
-The `ultracode` toggle chip (popover header, inline label row), its lock semantics (`aria-disabled` + removed tab order while on) and the old list-view exclusion are deleted. Ultracode now appears:
-
-- as the sixth dot and tick on the pill,
-- as the sixth row of the chevron tier/model list (marked ember, `data-ultracode="1"`, tooltip 「ultracode · 锁定 xhigh，启用多代理工作流编排」),
-- nowhere else.
-
-## 3 · Ember on max, denser on ultracode
-
-`max` keeps the existing field: amber gradient, breathing wash, three drifting spark layers at three speeds, knob halo. The ultracode stop plays the **same field plus a fourth layer** — small, tightly spaced bright dots counter-drifting (the Desktop's dotted-glow feel), a slightly brighter wash and a tighter/faster knob halo. `data-intensity="ultra"` marks the field; under `prefers-reduced-motion` all motion still freezes while the still field remains.
-
-## 4 · Tick labels and the 400px width
-
-Every stop carries a label under its dot, both in the popover and inline:
-
-- **Composer popover (~280px):** short labels always — `low med high xhigh max ultra` (`EffortStop.short`, 10px).
-- **New Session inline field:** full names `low medium high xhigh max ultracode`; under the 767px breakpoint they swap (CSS-only, both spans are in the DOM) to the same short labels. First/last inline labels edge-align to the track ends, so `medium`/`ultracode` never overhang.
-- The collapsed composer chip (`ultracode`, 9 chars) stays single-line at both 390 and 1440.
-
-## Screenshots
-
-`mid` = plain `xhigh`, `max` = the ember tier, `ultra` = the ultracode stop (denser ember).
-
-**Inline New Session field (layout A):**
+### Composer popover card
 
 | | night | ledger |
 |---|---|---|
-| mid · 1440 | [composer-slider-5-new-mid-night-1440.png](./composer-slider-5-new-mid-night-1440.png) | [composer-slider-5-new-mid-ledger-1440.png](./composer-slider-5-new-mid-ledger-1440.png) |
-| mid · 400 | [composer-slider-5-new-mid-night-400.png](./composer-slider-5-new-mid-night-400.png) | [composer-slider-5-new-mid-ledger-400.png](./composer-slider-5-new-mid-ledger-400.png) |
-| max · 1440 | [composer-slider-5-new-max-night-1440.png](./composer-slider-5-new-max-night-1440.png) | [composer-slider-5-new-max-ledger-1440.png](./composer-slider-5-new-max-ledger-1440.png) |
-| max · 400 | [composer-slider-5-new-max-night-400.png](./composer-slider-5-new-max-night-400.png) | [composer-slider-5-new-max-ledger-400.png](./composer-slider-5-new-max-ledger-400.png) |
-| ultra · 1440 | [composer-slider-5-new-ultra-night-1440.png](./composer-slider-5-new-ultra-night-1440.png) | [composer-slider-5-new-ultra-ledger-1440.png](./composer-slider-5-new-ultra-ledger-1440.png) |
-| ultra · 400 | [composer-slider-5-new-ultra-night-400.png](./composer-slider-5-new-ultra-night-400.png) | [composer-slider-5-new-ultra-ledger-400.png](./composer-slider-5-new-ultra-ledger-400.png) |
+| plain (`high`) | [plain-night-1440](./composer-slider-5-plain-night-1440.png) | [plain-ledger-1440](./composer-slider-5-plain-ledger-1440.png) |
+| top (`max`, restrained accent) | [top-night-1440](./composer-slider-5-top-night-1440.png) | [top-ledger-1440](./composer-slider-5-top-ledger-1440.png) |
+| ultracode (full ember) | [ultra-night-1440](./composer-slider-5-ultra-night-1440.png) | [ultra-ledger-1440](./composer-slider-5-ultra-ledger-1440.png) |
 
-**Composer popover card:**
+The same three frames at **768**:
+[plain-night-768](./composer-slider-5-plain-night-768.png) ·
+[top-night-768](./composer-slider-5-top-night-768.png) ·
+[ultra-night-768](./composer-slider-5-ultra-night-768.png) ·
+[plain-ledger-768](./composer-slider-5-plain-ledger-768.png) ·
+[top-ledger-768](./composer-slider-5-top-ledger-768.png) ·
+[ultra-ledger-768](./composer-slider-5-ultra-ledger-768.png)
+
+and at **390** (short tick labels; the hit area keeps ≥44px):
+[plain-night-390](./composer-slider-5-plain-night-390.png) ·
+[top-night-390](./composer-slider-5-top-night-390.png) ·
+[ultra-night-390](./composer-slider-5-ultra-night-390.png) ·
+[plain-ledger-390](./composer-slider-5-plain-ledger-390.png) ·
+[top-ledger-390](./composer-slider-5-top-ledger-390.png) ·
+[ultra-ledger-390](./composer-slider-5-ultra-ledger-390.png)
+
+### Inline New Session field (layout A)
 
 | | night | ledger |
 |---|---|---|
-| mid · 1440 | [composer-slider-5-mid-night-1440.png](./composer-slider-5-mid-night-1440.png) | [composer-slider-5-mid-ledger-1440.png](./composer-slider-5-mid-ledger-1440.png) |
-| mid · 400 | [composer-slider-5-mid-night-400.png](./composer-slider-5-mid-night-400.png) | [composer-slider-5-mid-ledger-400.png](./composer-slider-5-mid-ledger-400.png) |
-| max · 1440 | [composer-slider-5-max-night-1440.png](./composer-slider-5-max-night-1440.png) | [composer-slider-5-max-ledger-1440.png](./composer-slider-5-max-ledger-1440.png) |
-| max · 400 | [composer-slider-5-max-night-400.png](./composer-slider-5-max-night-400.png) | [composer-slider-5-max-ledger-400.png](./composer-slider-5-max-ledger-400.png) |
-| ultra · 1440 | [composer-slider-5-ultra-night-1440.png](./composer-slider-5-ultra-night-1440.png) | [composer-slider-5-ultra-ledger-1440.png](./composer-slider-5-ultra-ledger-1440.png) |
-| ultra · 400 | [composer-slider-5-ultra-night-400.png](./composer-slider-5-ultra-night-400.png) | [composer-slider-5-ultra-ledger-400.png](./composer-slider-5-ultra-ledger-400.png) |
+| plain | [new-plain-night-1440](./composer-slider-5-new-plain-night-1440.png) | [new-plain-ledger-1440](./composer-slider-5-new-plain-ledger-1440.png) |
+| top (`max`) | [new-top-night-1440](./composer-slider-5-new-top-night-1440.png) | [new-top-ledger-1440](./composer-slider-5-new-top-ledger-1440.png) |
+| ultracode | [new-ultra-night-1440](./composer-slider-5-new-ultra-night-1440.png) | [new-ultra-ledger-1440](./composer-slider-5-new-ultra-ledger-1440.png) |
+
+768 and 390 variants sit alongside with the same `-768`/`-390` suffixes.
+
+Accessibility and geometry, unchanged and re-checked:
+`prefers-reduced-motion` keeps the **static strongest state** (all ember
+animations `none`, field and thumb ring still painted — e2e
+`reduced motion freezes the ultracode ember but keeps the strongest static state`),
+the pill stays 40px tall with a 36px knob, and the touch hit area stays
+≥44px through padding, never the visual size
+(`touch targets stay >= 44px while the pill stays 40px` on iPhone 13).
+
+## 2 · Codex vocabulary — what the binary actually accepts
+
+Installed binary: **codex-cli 0.147.0** (`codex --version`, npm
+`@openai/codex` under `~/.nvm/.../@openai/codex`). Evidence gathered on this
+host, all in throwaway `/tmp/remuda-r-effort2/` homes:
+
+1. **There is no `--effort` flag.** Both `codex --effort xhigh --version` and
+   `codex exec --effort xhigh` fail at clap parse with
+   `error: unexpected argument '--effort' found`. The old materializer emitted
+   `--effort <name>` for every agent kind, which is a startup crash for codex;
+   it now emits the `-c` overlay instead.
+2. **`-c model_reasoning_effort=…` is the channel** — the exact argv shape
+   `remuda-codex-wire` already builds: `-c model_reasoning_effort="low"`.
+3. **The parsed enum** (`codex-rs/protocol/src/openai_models.rs`, tag
+   `rust-v0.147.0`, `ReasoningEffort::from_str`):
+   `none · minimal · low · medium · high · xhigh · max · ultra · Custom(…)`,
+   with `#[default] Medium`. The app-server protocol models the value as a
+   free-form string (`v2.ReasoningEffort` is "a non-empty reasoning effort
+   value advertised by the model") — `thread/start` admitted even `bogus`, so
+   the closed set has to be enforced by us, which it now is in both the web
+   layer and `remuda-codex-wire` (`InvalidReasoningEffort`).
+4. **Per-model advertising** from the catalog embedded in the pinned binary
+   (its `supported_reasoning_levels` JSON):
+
+   | model | default | advertised levels |
+   | --- | --- | --- |
+   | gpt-5.6-sol | low | low medium high xhigh max ultra |
+   | gpt-5.6-terra | medium | low medium high xhigh max ultra |
+   | gpt-5.6-luna | medium | low medium high xhigh max |
+   | gpt-5.5 / 5.4 / 5.4-mini / 5.2 | medium | low medium high xhigh |
+
+   The TUI source agrees (`reasoning_shortcuts.rs`): *"Raising never silently
+   crosses into Max or Ultra; those efforts require the explicit
+   advanced-reasoning picker."*
+
+The slider therefore offers the common verified set, in CLI order,
+**minimal · low · medium · high · xhigh** with the real default **medium**:
+
+```ts
+// web/src/features/session/effort.ts
+const CODEX = [minimal, low, medium(默认档), high, xhigh];
+```
+
+`max`/`ultra` stay out: they are model-gated advanced tiers this client has no
+picker for, and `none` is the auto-review-only absence-of-reasoning.
+
+Migration (`normalizeHarnessName`, applied on the record read path exactly
+like `CLAUDE_LEGACY_NAMES`): `ultra → xhigh`; any other unknown word →
+`medium`. Values about to be persisted or sent pass through
+`nativeEffortWord()`, which throws the typed `UnknownEffortError` on anything
+that is not a current row — an unknown word is never forwarded to the CLI.
+
+## 3 · Grok vocabulary — quick/standard/max was invented
+
+The earlier `quick/standard/max` table dates from slider pass 1 and was never
+verified against a grok binary; the grok 1.0.30 binary from the
+[grok-signals spike](./grok-signals-1.md) is no longer installed on this host.
+The CLI is **xai-org/grok-build** (a Claude Code fork), so its public source
+is the vocabulary authority:
+
+- the pager CLI struct (`crates/codegen/…/src/app/cli.rs`):
+  `--reasoning-effort <EFFORT>` with `visible_alias = "effort"`.
+- the sampling-types crate's `ReasoningEffort::from_str` parses
+  `none · minimal · low · medium · high(default) · xhigh · max` and rejects
+  anything else (`invalid reasoning effort …`).
+- the pager slash commands (`…/slash/commands/effort_levels.rs`) and the
+  user guide (`/effort`): the built-in menu is exactly
+  **xhigh · high · medium · low**; *"`none`/`minimal` are still accepted by
+  `ReasoningEffort::from_str` for power users."*
+
+The grok slider is therefore **low · medium · high · xhigh** (menu order,
+default `medium`), the driver emits the canonical
+`--reasoning-effort <word>`, and the driver rejects `quick/standard/max/ultra`
+in hand-written `spec.args`. The legacy stored words migrate by name:
+`quick → low`, `standard → medium`, `max → xhigh`; unknown → `medium`.
+
+## 4 · Wire mapping, 1:1, with typed rejection
+
+- `remuda-protocol`: `EffortName` gains `Minimal`;
+  `EffortSelection::from_legacy_name` migrates the old web/codex `ultra` to
+  `xhigh` (round-trip tests in `remuda-protocol/tests/wire.rs`).
+- `remuda-driver/src/effort.rs` (new): one mapper per kind —
+  claude/agy `--effort <low..max|ultracode>`, codex
+  `-c model_reasoning_effort="<minimal|low|medium|high|xhigh>"`, grok
+  `--reasoning-effort <low|medium|high|xhigh>` — returning
+  `DriverError::InvalidLaunchSpec` on out-of-vocabulary values;
+  `materialize_shell_pty_agent` calls it per kind, and
+  `ensure_no_effort_in_extras` stops `spec.args` from smuggling a duplicate
+  (codex's flag allowlist no longer contains `effort` at all; grok's adds the
+  real `reasoning-effort`). Unit tests: `remuda-driver/src/effort.rs`,
+  `flags.rs`, `tests/materializer.rs`.
+- `remuda-codex-wire`: `SpawnSpec.argv()` now rejects a
+  `reasoning_effort` outside `REASONING_EFFORTS` with the typed
+  `WireError::InvalidReasoningEffort` before spawn.
+- Web: `effortWireName` only emits current native words (plus the claude
+  `ultracode` sentinel), the Hub openapi enum gains `minimal`, and both
+  generated TS files were regenerated (`just gen-types`, `pnpm gen:api`).
 
 ## Tests
 
-- `pnpm --dir web test` — all files green (422 tests, 69 files). New coverage in `effort.test.ts`: six-stop order, all-six-stops selection ↔ stop-position round-trip, `{xhigh, ultracode:true|false}` reverse mapping, legacy name → stop, six-stop arrows/Home/End; `Composer.test.tsx` / `NewSessionPage.test.tsx` walk `xhigh → max → ultracode` on the one slider and assert the chip/title read `ultracode`.
-- `pnpm --dir web exec tsc -b` — clean. `pnpm --dir web lint` — no new warnings.
-- Playwright mock specs `composer-effort.spec.ts` + `new-session.spec.ts` (chromium): six-stop tiers/ticks/keyboard, drag to far end selects ultracode, persist-after-reload reverse mapping, three vs four ember drift layers (`data-intensity`), 390/1440 single-line chips and label fit. Two unrelated PTY-fixture failures (`grok pty … yolo`, `kind terminal … shell-pty`) fail identically on origin/main.
-- `pnpm --dir web run test:e2e:hub` — run once against the live `remuda-hub` example; the configure spec now drags to the far-right stop and asserts the `ultracode` configure wire name, then Home → `low`. (Two unrelated suite tests flaked on timing in the full run and passed on an immediate re-run, on both the branch and origin/main.)
+- `pnpm --dir web test`: 76 files / 535 tests green, incl. the new
+  `EffortSlider.test.tsx` look-ladder suite and rewritten `effort.test.ts`
+  (tables, defaults, migration, closed wire vocabulary, looks, round-trips).
+- Playwright mock specs: codex enumeration 1:1 from the New Session sheet,
+  grok table + top-row-not-ember, the full plain/top/ultracode walk, reduced
+  motion. Three host-UI flakes (`grok pty … readonly`, terminal shell-pty
+  view, mobile install-bar intercept) reproduce identically on the unmodified
+  tree and are unrelated to the slider.
+- Cargo: `remuda-protocol`, `remuda-driver`, `remuda-codex-wire` test suites
+  green.

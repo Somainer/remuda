@@ -576,6 +576,51 @@ async fn fake_node(
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
+            "instance.configure" => {
+                // §9.1: emulate a native agent that accepted `/effort` and
+                // whose next assistant record reports the level back. When the
+                // requested level differs from what the transcript says, the
+                // fake agent reports a *clamped* level — exactly the
+                // 请求 max → 实际 xhigh path the UI must render.
+                if let Some(effort) = params.get("effort")
+                    && let Some(requested) = effort.get("name").and_then(Value::as_str)
+                {
+                    let observed = match requested {
+                        // The fake agent's environment caps at xhigh.
+                        "max" => "xhigh",
+                        other => other,
+                    };
+                    let observed_at = "2026-09-14T12:00:00.000Z";
+                    let event = json!({
+                        "kind": "effort",
+                        "completeness": "structured",
+                        "payload": {
+                            "requested": {"name": requested,
+                                "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
+                            "effective": {
+                                "name": observed,
+                                "ultracode": if requested == "ultracode" {
+                                    serde_json::Value::Bool(true)
+                                } else {
+                                    serde_json::Value::Null
+                                },
+                                "source": "remuda",
+                                "observedAt": observed_at
+                            },
+                            "raw": observed
+                        }
+                    });
+                    append_n = append_event(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "effort",
+                        event["payload"].clone(),
+                    )
+                    .await?;
+                }
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
             "instance.close" => {
                 if claude_ptys.contains(&instance_id) {
                     ttys.remove(&instance_id);
@@ -622,6 +667,9 @@ async fn fake_node(
                         "snapshotBase64": base64::engine::general_purpose::STANDARD
                             .encode(&tty.screen),
                         "availableFrom": "0",
+                        // Trustworthy current mode, the way the Node's
+                        // byte-stream scanner reports it for a herdr pane.
+                        "altScreen": tty.alt_screen,
                     }),
                 )
                 .await?;
@@ -637,7 +685,42 @@ async fn fake_node(
                     .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
                     .unwrap_or_default();
                 let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
-                tty.received.extend_from_slice(&bytes);
+                // Scripted alt-screen transition: the sentinel produces the
+                // raw DEC frame (so xterm paints the switched buffer) and a
+                // tty.mode notice exactly like the Node's scanner relay.
+                if let Some((frame, alt_screen)) = tty.note_input(&bytes) {
+                    ws.send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "tty.frame",
+                            "params": {
+                                "instanceId": instance_id,
+                                "streamId": tty.stream_id,
+                                "dataBase64": base64::engine::general_purpose::STANDARD
+                                    .encode(&frame),
+                            },
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                    ws.send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "tty.mode",
+                            "params": {
+                                "instanceId": instance_id,
+                                "streamId": tty.stream_id,
+                                "altScreen": alt_screen,
+                            },
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    continue;
+                }
                 let mut reply = Vec::new();
                 for byte in &bytes {
                     // ESC is a control byte for the process, not display text.
@@ -824,7 +907,15 @@ struct TtyFake {
     stream_id: String,
     screen: Vec<u8>,
     received: Vec<u8>,
+    /// Current DEC alt-screen mode reported at attach and on `tty.mode`.
+    alt_screen: bool,
 }
+
+/// Typing this line (followed by Enter) scripts the fake harness into the
+/// DEC alternate screen; the `_OFF` counterpart leaves it. They are plain
+/// ASCII sentinels a Playwright keyboard can type into xterm.
+const TTY_ALT_ON_SENTINEL: &[u8] = b"TTYMODE_ALT_ON";
+const TTY_ALT_OFF_SENTINEL: &[u8] = b"TTYMODE_ALT_OFF";
 
 impl TtyFake {
     fn new() -> Self {
@@ -832,7 +923,40 @@ impl TtyFake {
             stream_id: format!("tty_{}", uuid::Uuid::now_v7()),
             screen: b"fake-harness terminal\r\n$ ".to_vec(),
             received: Vec::new(),
+            alt_screen: false,
         }
+    }
+
+    /// Scripted sentinels ride the raw input channel. Returns the frame bytes
+    /// to push when a sentinel completed this write, plus the new mode.
+    fn note_input(&mut self, bytes: &[u8]) -> Option<(Vec<u8>, bool)> {
+        self.received.extend_from_slice(bytes);
+        let mut tail: Vec<u8> = self
+            .received
+            .iter()
+            .rev()
+            .take(32)
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        while matches!(tail.last(), Some(b'\r' | b'\n')) {
+            tail.pop();
+        }
+        if tail.ends_with(TTY_ALT_ON_SENTINEL) && !self.alt_screen {
+            self.alt_screen = true;
+            let frame = b"\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN_FAKE_HARNESS\r\n".to_vec();
+            self.screen.extend_from_slice(&frame);
+            return Some((frame, true));
+        }
+        if tail.ends_with(TTY_ALT_OFF_SENTINEL) && self.alt_screen {
+            self.alt_screen = false;
+            let frame = b"\x1b[?1049lINLINE_FAKE_HARNESS\r\n$ ".to_vec();
+            self.screen.extend_from_slice(&frame);
+            return Some((frame, false));
+        }
+        None
     }
 }
 

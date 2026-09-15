@@ -128,16 +128,23 @@ pub struct NativeHome {
 /// **not** a sixth level: it is `xhigh` plus dynamic workflow, is session-only,
 /// and is never persisted as a level name.
 ///
-/// Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes
-/// legacy tier **names**, so a stored row or an old client keeps working:
+/// [`EffortName`] additionally carries `minimal`, which Claude Code does not
+/// expose: the Codex/Grok vocabularies do. It is rejected at Claude launches
+/// by the driver, so it can never reach `claude --effort`.
 ///
-/// | legacy `name` | normalized |
-/// | --- | --- |
-/// | `default` | `low` |
-/// | `think` | `high` |
-/// | `think-hard` | `xhigh` |
-/// | `ultracode` | `xhigh` + `ultracode: true` |
-/// | anything unrecognized | `high` (the documented default tier) |
+/// Deserialization accepts the pre-D-028 shape `{index, name}` and normalizes
+/// legacy tier **names** through [`normalize_legacy_effort`], so a stored row
+/// or an old client keeps working. Legacy normalization is **per harness**:
+///
+/// | legacy `name` | harness | normalized |
+/// | --- | --- | --- |
+/// | `default` | any | `low` |
+/// | `think` | claude | `high` |
+/// | `think-hard` | claude | `xhigh` |
+/// | `ultra` | any | `xhigh` (the old invented web/codex top tier) |
+/// | `quick` / `standard` / `max` | grok | `low` / `medium` / `xhigh` |
+/// | `ultracode` | claude | `xhigh` + `ultracode: true` |
+/// | anything unrecognized | any | the harness default (`high` for claude, `medium` otherwise) |
 ///
 /// Normalization is by **name**, never by index: the legacy tables had
 /// different lengths per harness, so index 3 meant `ultracode` for Claude and
@@ -146,10 +153,87 @@ pub struct NativeHome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EffortSelection {
-    /// One of the five Claude effort levels.
+    /// Claude level (`low..=max`); `minimal` is Codex/Grok-only.
     pub name: EffortName,
     /// Dynamic-workflow flag (`--effort ultracode`). Session-only.
     pub ultracode: bool,
+}
+
+/// The one legacy-name normalizer every crate consumes (Hub store, Node
+/// model, driver/web tables) so the per-harness vocabulary cannot diverge
+/// again.
+///
+/// `kind` may be a loose wire string; an unparseable kind is treated as
+/// claude (the historical default), exactly like the old kind-less
+/// normalizer did.
+pub fn normalize_legacy_effort(kind: AgentKind, name: &str) -> EffortSelection {
+    match name.trim().to_ascii_lowercase().as_str() {
+        // Current words are identities on every harness (minimal has no
+        // meaning for claude, but a current-looking word is passed through;
+        // the driver rejects it at launch if the CLI cannot parse it).
+        "minimal" => EffortName::Minimal,
+        "low" => EffortName::Low,
+        "medium" => EffortName::Medium,
+        "high" => EffortName::High,
+        "xhigh" => EffortName::Xhigh,
+        // claude's real top.
+        "max" => {
+            // The invented grok table's top word was `max`; grok has no such
+            // menu row, so it migrates onto the real top `xhigh`.
+            if kind == AgentKind::Grok {
+                EffortName::Xhigh
+            } else {
+                EffortName::Max
+            }
+        }
+        // Cross-harness legacy words, by name not index.
+        "default" => EffortName::Low,
+        "think" => EffortName::High,
+        "think-hard" | "ultra" => EffortName::Xhigh,
+        // The invented grok quick/standard/max table (slider pass 1, never a
+        // grok vocabulary — grok-build parses low/medium/high/xhigh).
+        "quick" if kind == AgentKind::Grok => EffortName::Low,
+        "standard" if kind == AgentKind::Grok => EffortName::Medium,
+        "ultracode" => {
+            return EffortSelection {
+                name: EffortName::Xhigh,
+                ultracode: true,
+            };
+        }
+        _ => {
+            return if kind == AgentKind::Claude {
+                EffortSelection::DEFAULT
+            } else {
+                // The real CLI default for codex/grok is medium.
+                EffortSelection {
+                    name: EffortName::Medium,
+                    ultracode: false,
+                }
+            };
+        }
+    }
+    .into_selection()
+}
+
+impl EffortName {
+    fn into_selection(self) -> EffortSelection {
+        EffortSelection {
+            name: self,
+            ultracode: false,
+        }
+    }
+}
+
+/// Parse the agent kind for a loose wire value before normalizing effort.
+pub fn effort_kind_from_str(kind: &str) -> AgentKind {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "codex" => AgentKind::Codex,
+        "grok" => AgentKind::Grok,
+        "agy" => AgentKind::Agy,
+        "generic" => AgentKind::Generic,
+        "terminal" => AgentKind::Terminal,
+        _ => AgentKind::Claude,
+    }
 }
 
 impl EffortSelection {
@@ -159,39 +243,14 @@ impl EffortSelection {
         ultracode: false,
     };
 
-    /// Normalize a legacy or current tier **name** into a selection; §9.1.
+    /// Normalize a legacy or current Claude tier **name** into a selection.
     ///
-    /// Unrecognized names normalize to [`EffortName::High`] rather than
-    /// erroring: an effort tier is a preference, and refusing a launch over a
-    /// stale UI string would be worse than running at the documented default.
+    /// Equivalent to [`normalize_legacy_effort`] with `AgentKind::Claude`.
+    /// Kept for the kind-less call sites; new code should normalize with the
+    /// harness kind so codex/grok legacy words (ultra, quick/standard/max)
+    /// migrate onto the right native table.
     pub fn from_legacy_name(name: &str) -> Self {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "low" | "default" => Self {
-                name: EffortName::Low,
-                ultracode: false,
-            },
-            "medium" => Self {
-                name: EffortName::Medium,
-                ultracode: false,
-            },
-            "high" | "think" => Self {
-                name: EffortName::High,
-                ultracode: false,
-            },
-            "xhigh" | "think-hard" => Self {
-                name: EffortName::Xhigh,
-                ultracode: false,
-            },
-            "max" => Self {
-                name: EffortName::Max,
-                ultracode: false,
-            },
-            "ultracode" => Self {
-                name: EffortName::Xhigh,
-                ultracode: true,
-            },
-            _ => Self::DEFAULT,
-        }
+        normalize_legacy_effort(AgentKind::Claude, name)
     }
 
     /// Wire spelling of the level alone, ignoring `ultracode`; §9.1.
@@ -201,6 +260,7 @@ impl EffortSelection {
     /// than collapsing into a name that is not one of the five.
     pub fn level_name(&self) -> &'static str {
         match self.name {
+            EffortName::Minimal => "minimal",
             EffortName::Low => "low",
             EffortName::Medium => "medium",
             EffortName::High => "high",
@@ -256,6 +316,29 @@ impl<'de> Deserialize<'de> for EffortSelection {
         }
         Ok(selection)
     }
+}
+
+/// Effective effort, read back from a Claude assistant transcript record
+/// (`effort` / `perTurnEffort`); D-028 §9.1.
+///
+/// This is the *observed* tier, never the requested one. Claude reports
+/// `ultracode` sessions as level `xhigh` and does not repeat the workflow flag
+/// on assistant records, so `ultracode` is `None` unless the observation path
+/// has positive evidence (e.g. an immediately preceding `/effort ultracode`
+/// switch the driver itself made).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EffortEffective {
+    /// Observed level name.
+    pub name: EffortName,
+    /// Observed dynamic-workflow flag; `None` when the transcript does not
+    /// expose it (the common case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ultracode: Option<bool>,
+    /// What established this level.
+    pub source: EffortSource,
+    /// When the observation was made.
+    pub observed_at: Timestamp,
 }
 
 /// Claude renderer requested at launch (D-028 §9.2).

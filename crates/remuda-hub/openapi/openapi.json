@@ -375,10 +375,10 @@
         "type": "object"
       },
       "EffortSelection": {
-        "description": "Native effort selection (D-028 \u00a79.1): five Claude levels plus an orthogonal ultracode boolean. Legacy tier names (default / think / think-hard / ultracode) are accepted and normalized by NAME \u2014 never by index, because the old per-harness tables differed in length.",
+        "description": "Native effort selection (D-028 \u00a79.1): the harness-native level plus an orthogonal ultracode boolean (Claude only). Claude takes low | medium | high | xhigh | max; Codex and Grok add minimal on the low end. Legacy tier names (default / think / think-hard / ultra / ultracode) are accepted and normalized by NAME \u2014 never by index, because the old per-harness tables differed in length.",
         "properties": {
           "name": {
-            "description": "low | medium | high | xhigh | max, or a legacy tier name to be normalized.",
+            "description": "minimal | low | medium | high | xhigh | max (minimal is Codex/Grok-only), or a legacy tier name to be normalized.",
             "type": "string"
           },
           "ultracode": {
@@ -1160,9 +1160,31 @@
               "null"
             ]
           },
+          "effortEffective": {
+            "type": ["object", "null"],
+            "description": "D-028 §9.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown.",
+            "properties": {
+              "name": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "xhigh", "max"]
+              },
+              "ultracode": {
+                "type": ["boolean", "null"],
+                "description": "Observed dynamic-workflow flag; null unless positively observed (the native transcript spells ultracode as xhigh and omits the boolean)."
+              },
+              "source": {
+                "type": "string",
+                "enum": ["launch", "slash", "remuda", "unknown"]
+              },
+              "observedAt": { "type": "string" }
+            },
+            "required": ["name", "source", "observedAt"],
+            "additionalProperties": true
+          },
           "effortName": {
-            "description": "Normalized D-028 \u00a79.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default\u2192low, think\u2192high, think-hard\u2192xhigh, ultracode\u2192xhigh with effortUltracode true).",
+            "description": "Normalized D-028 \u00a79.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default\u2192low, think\u2192high, think-hard/ultra\u2192xhigh, ultracode\u2192xhigh with effortUltracode true). `minimal` is Codex/Grok-only and never emitted for a Claude launch.",
             "enum": [
+              "minimal",
               "low",
               "medium",
               "high",

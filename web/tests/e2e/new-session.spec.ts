@@ -177,20 +177,28 @@ test.describe("new session sheet (mock-backed)", () => {
     await page.keyboard.press("ArrowRight");
     await expect(slider).toHaveAttribute("data-name", "xhigh");
     await expect(page.getByTestId("new-session-effort-title")).toContainText("xhigh");
-    // Plain xhigh is not the ember tier.
+    // Plain xhigh carries the restrained top accent in the three-level ladder.
     await expect(slider).toHaveAttribute("data-ember", "0");
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
     await page.keyboard.press("ArrowRight");
     await expect(slider).toHaveAttribute("data-name", "max");
     await expect(slider).toHaveAttribute("data-index", "4");
-    await expect(slider).toHaveAttribute("data-ember", "1");
-    await expect(page.getByTestId("new-session-effort-embers")).toBeVisible();
+    // max carries the restrained top accent but NOT the ember field — the
+    // strongest treatment is reserved for the ultracode stop alone.
+    await expect(slider).toHaveAttribute("data-ember", "0");
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    await expect(page.getByTestId("new-session-effort-embers")).toHaveCount(0);
     await assertPill(page);
-    // One more stop: ultracode — the xhigh tier plus the workflow flag.
+    // One more stop: ultracode — the xhigh tier plus the workflow flag, the
+    // only stop that plays the full ember.
     await page.keyboard.press("ArrowRight");
     await expect(slider).toHaveAttribute("data-name", "ultracode");
     await expect(slider).toHaveAttribute("data-index", "5");
     await expect(slider).toHaveAttribute("data-tier-index", "3");
     await expect(slider).toHaveAttribute("data-ultracode", "1");
+    await expect(slider).toHaveAttribute("data-effort-look", "ultracode");
+    await expect(slider).toHaveAttribute("data-ember", "1");
+    await expect(page.getByTestId("new-session-effort-embers")).toBeVisible();
     await expect(page.getByTestId("new-session-effort-title")).toContainText("ultracode");
 
     // Back to xhigh so the asserted value is not simply the End default.
@@ -248,22 +256,25 @@ test.describe("new session sheet (mock-backed)", () => {
     await page.keyboard.press("ArrowLeft");
     await expect(slider).toHaveAttribute("data-name", "max");
 
-    // grok's table is three tiers; the top tier stays the top tier.
+    // grok's verified table has four tiers; the top row stays the top row.
     await page.getByTestId("new-session-kind-grok").click();
-    await expect(slider).toHaveAttribute("data-tiers", "quick,standard,max");
-    await expect(slider).toHaveAttribute("data-name", "max");
-    await expect(slider).toHaveAttribute("aria-valuemax", "2");
-    await expect(slider).toHaveAttribute("data-ember", "1");
-    // ultracode is Claude-only: no sixth stop and no chip.
+    await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh");
+    await expect(slider).toHaveAttribute("data-name", "xhigh");
+    await expect(slider).toHaveAttribute("aria-valuemax", "3");
+    // The static top accent crosses harnesses; the ember never does.
+    await expect(slider).toHaveAttribute("data-effort-look", "top");
+    await expect(slider).toHaveAttribute("data-ember", "0");
+    // ultracode is Claude-only: no extra stop and no chip.
     await expect(page.getByTestId("new-session-effort-ultracode")).toHaveCount(0);
     await slider.focus();
     await page.keyboard.press("Home");
-    await expect(slider).toHaveAttribute("data-name", "quick");
+    await expect(slider).toHaveAttribute("data-name", "low");
 
     // ...and back to claude, renamed onto the six-stop table, ember dropped.
     await page.getByTestId("new-session-kind-claude").click();
     await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
     await expect(slider).toHaveAttribute("data-name", "low");
+    await expect(slider).toHaveAttribute("data-effort-look", "plain");
     await expect(slider).toHaveAttribute("data-ember", "0");
 
     // terminal has no effort axis at all, so the whole field unmounts.
@@ -295,13 +306,14 @@ test.describe("new session sheet (mock-backed)", () => {
     expect(footBox!.x).toBeGreaterThanOrEqual(f!.x - 1);
   });
 
-  test("new session slider evidence: night/ledger at 1440 and 400", async ({ page }, info) => {
+  test("new session slider evidence: night/ledger at 1440, 768 and 390", async ({ page }, info) => {
     test.skip(info.project.name !== "chromium", "evidence shots from chromium only");
     await page.emulateMedia({ reducedMotion: "reduce" });
     for (const theme of ["night", "ledger"] as const) {
       for (const [width, height, tag] of [
         [1440, 900, "1440"],
-        [400, 844, "400"],
+        [768, 900, "768"],
+        [390, 844, "390"],
       ] as const) {
         await page.setViewportSize({ width, height });
         await page.goto("/sessions/new");
@@ -310,53 +322,28 @@ test.describe("new session sheet (mock-backed)", () => {
         }, theme);
         const slider = page.getByTestId("new-session-effort-slider");
         await expect(slider).toBeVisible();
-        // mid = plain xhigh, max = the ember tier, ultra = the ultracode stop.
-        for (const [state, keys] of [
-          ["mid", ["Home", "ArrowRight", "ArrowRight", "ArrowRight"]],
-          ["max", ["End", "ArrowLeft"]],
-          ["ultra", ["End"]],
+        // plain = ordinary `high`, top = the restrained `max` accent,
+        // ultra = the ultracode stop (the only animated ember).
+        for (const [state, keys, look, ember] of [
+          ["plain", ["Home", "ArrowRight", "ArrowRight"], "plain", "0"],
+          ["top", ["End", "ArrowLeft"], "top", "0"],
+          ["ultra", ["End"], "ultracode", "1"],
         ] as const) {
           await slider.focus();
           for (const key of keys) await page.keyboard.press(key);
           await expect(slider).toHaveAttribute(
             "data-name",
-            state === "mid" ? "xhigh" : state === "max" ? "max" : "ultracode",
+            state === "plain" ? "high" : state === "top" ? "max" : "ultracode",
           );
-          await expect(slider).toHaveAttribute("data-ember", state === "mid" ? "0" : "1");
+          await expect(slider).toHaveAttribute("data-effort-look", look);
+          await expect(slider).toHaveAttribute("data-ember", ember);
           await assertPill(page);
-          // The knob stays reachable at 400px.
+          // The knob stays reachable at 390px.
           const knob = page.getByTestId("new-session-effort-knob");
           await expect(knob).toBeVisible();
           await shotEffort(page, `composer-slider-5-new-${state}-${theme}-${tag}.png`);
         }
       }
-    }
-  });
-
-  test("ultracode evidence: the sixth stop at desktop and 400, night theme", async ({ page }, info) => {
-    test.skip(info.project.name !== "chromium", "evidence shots from chromium only");
-    await page.emulateMedia({ reducedMotion: "reduce" });
-    for (const [width, height, tag] of [
-      [1440, 900, "1440"],
-      [400, 844, "400"],
-    ] as const) {
-      await page.setViewportSize({ width, height });
-      await page.goto("/sessions/new");
-      await page.evaluate(() => document.documentElement.setAttribute("data-theme", "night"));
-      const slider = page.getByTestId("new-session-effort-slider");
-      await slider.focus();
-      await page.keyboard.press("End");
-      await expect(slider).toHaveAttribute("data-name", "ultracode");
-      await expect(slider).toHaveAttribute("data-index", "5");
-      await expect(slider).toHaveAttribute("data-tier-index", "3");
-      await expect(slider).toHaveAttribute("data-ultracode", "1");
-      await expect(slider).toHaveAttribute("data-ember", "1");
-      await expect(page.getByTestId("new-session-effort-embers")).toHaveAttribute(
-        "data-intensity",
-        "ultra",
-      );
-      await assertPill(page);
-      await shotEffort(page, `composer-slider-5-new-ultra-night-${tag}.png`);
     }
   });
 });

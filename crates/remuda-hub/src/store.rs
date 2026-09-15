@@ -373,6 +373,13 @@ pub struct InstanceRecord {
         rename = "effortIndex"
     )]
     pub effort_index: Option<u32>,
+    /// §9.1 effective effort read back from assistant transcript records.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortEffective"
+    )]
+    pub effort_effective: Option<Value>,
     /// Native session id reported by the driver, resumable with `--resume` (D-026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
@@ -2354,10 +2361,21 @@ impl Store {
                     .and_then(Value::as_str)
                     .map(|name| json!(name))
             });
-            if let Some(incoming) = incoming
-                && let Ok(selection) =
-                    serde_json::from_value::<remuda_protocol::EffortSelection>(incoming)
-            {
+            if let Some(incoming) = incoming {
+                // Normalize with the instance's own kind, the same shared
+                // per-harness map insert uses.
+                let kind = object
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("claude");
+                let effort_kind = remuda_protocol::effort_kind_from_str(kind);
+                let selection = if let Some(name) = incoming.as_str() {
+                    // A bare legacy word goes through the per-kind migrator.
+                    remuda_protocol::normalize_legacy_effort(effort_kind, name)
+                } else {
+                    // The D-028 object: deserialize the current enum word.
+                    serde_json::from_value::<remuda_protocol::EffortSelection>(incoming)?
+                };
                 object.insert(
                     "effort".into(),
                     json!({
@@ -3694,6 +3712,28 @@ fn migrate_provider_models(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// §9.1: persist the transcript-observed effective effort onto the spec.
+fn apply_effective_effort_projection(
+    conn: &Connection,
+    instance_id: &str,
+    effective: &Value,
+) -> Result<(), StoreError> {
+    let spec_raw: String = conn.query_row(
+        "SELECT spec_json FROM instances WHERE id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let mut spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+    if let Some(object) = spec.as_object_mut() {
+        object.insert("effortEffective".into(), effective.clone());
+        conn.execute(
+            "UPDATE instances SET spec_json = ?1 WHERE id = ?2",
+            params![Value::Object(object.clone()).to_string(), instance_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_instance_projection(
     conn: &Connection,
     instance_id: &str,
@@ -3704,6 +3744,11 @@ fn apply_instance_projection(
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
     let payload = event.get("payload").cloned().unwrap_or(Value::Null);
     let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind == "effort"
+        && let Some(effective) = payload.get("effective")
+    {
+        apply_effective_effort_projection(conn, instance_id, effective)?;
+    }
     let mut lifecycle: Option<&str> = None;
     let mut last_error: Option<String> = None;
     if kind == "lifecycle"
@@ -4711,6 +4756,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_effort_tier_names_normalize_by_name_not_index() {
         let (_dir, store, host) = store_with_host("enroll-legacy-effort").await;
+        // Claude rows use the Claude legacy table; unknown → high.
         for (legacy, index, level, ultracode) in [
             ("default", 0, "low", false),
             ("think", 1, "high", false),
@@ -4718,7 +4764,6 @@ mod tests {
             ("ultracode", 3, "xhigh", true),
             // Codex's index 3 was `ultra`, not `ultracode` — normalizing by
             // index instead of name would silently turn it into ultracode.
-            ("ultra", 3, "high", false),
             ("max", 4, "max", false),
         ] {
             let instance = store
@@ -4742,6 +4787,74 @@ mod tests {
             // The legacy index survives for older clients but never decided
             // the tier above.
             assert_eq!(reloaded.effort_index, Some(index), "{legacy}");
+        }
+        // Cross-crate: for EVERY legacy word the web/driver tables migrate,
+        // the Hub store must land on exactly what the shared
+        // remuda-protocol normalizer returns. This pins the three layers
+        // (protocol table, Hub row, driver argv) to the one function.
+        let cases = [
+            ("claude", "default"),
+            ("claude", "think"),
+            ("claude", "think-hard"),
+            ("claude", "ultra"),
+            ("claude", "ultracode"),
+            ("claude", "whatever"),
+            ("codex", "ultra"),
+            ("codex", "bogus"),
+            ("grok", "quick"),
+            ("grok", "standard"),
+            ("grok", "max"),
+            ("grok", "bogus"),
+        ];
+        for (kind, legacy) in cases {
+            let expected = remuda_protocol::normalize_legacy_effort(
+                remuda_protocol::effort_kind_from_str(kind),
+                legacy,
+            );
+            // Insert below the maxInstances gate so the large cross-crate
+            // table exercises load_instance's normalization directly.
+            let instance_id = new_id("ins").unwrap();
+            let journal_id = new_id("obj").unwrap();
+            let now = now_rfc3339();
+            let spec = json!({ "effortName": legacy, "effortIndex": 9 }).to_string();
+            let reload_id = instance_id.clone();
+            store
+                .run({
+                    let host = host.clone();
+                    move |conn| {
+                        conn.execute(
+                            "INSERT INTO instances
+                                (id, host_id, workspace_id, kind, driver, lifecycle, activity,
+                                 connectivity, title, journal_id, durable_seq, spec_json,
+                                 created_at, updated_at)
+                             VALUES (?1, ?2, NULL, ?3, 'generic-pty', 'running', 'idle',
+                                     'connected', ?4, ?5, 0, ?6, ?7, ?7)",
+                            params![
+                                instance_id.clone(),
+                                host,
+                                kind,
+                                format!("legacy-{kind}-{legacy}"),
+                                journal_id,
+                                spec,
+                                now
+                            ],
+                        )?;
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
+            let reloaded = store.get_instance(reload_id).await.unwrap().unwrap();
+            assert_eq!(
+                reloaded.effort_name.as_deref(),
+                Some(expected.level_name()),
+                "{kind}:{legacy} disagrees with remuda-protocol"
+            );
+            assert_eq!(
+                reloaded.effort_ultracode,
+                Some(expected.ultracode),
+                "{kind}:{legacy} disagrees with remuda-protocol"
+            );
         }
     }
 
@@ -5265,6 +5378,48 @@ mod tests {
             .expect("enroll");
         assert!(matches!(outcome, HostAuthOutcome::Authenticated { .. }));
     }
+    /// §9.1: an `effort` journal event persists the transcript-read-back level
+    /// as `effortEffective`, and never overwrites the requested `effort`.
+    #[tokio::test]
+    async fn effort_observation_projects_effective_without_touching_requested() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+        let instance = seed_instance(&store, &host).await;
+        store
+            .patch_instance_configure(
+                instance.instance_id.clone(),
+                json!({"effort": {"name": "max", "index": 4}}),
+            )
+            .await
+            .expect("configure");
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"effort","payload":{
+                    "requested":{"name":"max","ultracode":false},
+                    "effective":{"name":"xhigh","ultracode":null,
+                        "source":"slash","observedAt":"2026-09-14T12:00:00.000Z"},
+                    "raw":"xhigh"}}),
+            )
+            .await
+            .expect("effort event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.effort_name.as_deref(), Some("max"));
+        let effective = row.effort_effective.expect("effortEffective stored");
+        assert_eq!(effective.get("name").and_then(Value::as_str), Some("xhigh"));
+        assert_eq!(
+            effective.get("source").and_then(Value::as_str),
+            Some("slash")
+        );
+    }
 }
 
 fn touch_host_online(
@@ -5575,10 +5730,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let effort = spec.get("effort");
-            // D-028 §9.1: normalize by NAME, never by index. The legacy
-            // tables were per-harness and different lengths, so index 3 was
-            // `ultracode` for claude but `ultra` for codex — carrying the
-            // index across would silently change the tier.
+            // D-028 §9.1: normalize by NAME, never by index, using the shared
+            // per-harness normalizer (remuda-protocol): codex `ultra` and the
+            // invented grok quick/standard/max table migrate onto the verified
+            // vocabulary here, exactly as the driver and the web table do.
             let legacy_name = effort
                 .and_then(|value| value.get("name"))
                 .and_then(Value::as_str)
@@ -5588,8 +5743,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(|value| value.get("ultracode"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let effort_kind =
+                remuda_protocol::effort_kind_from_str(row.get::<_, String>(3)?.as_str());
             let normalized = legacy_name.map(|name| {
-                let mut selection = remuda_protocol::EffortSelection::from_legacy_name(name);
+                let mut selection = remuda_protocol::normalize_legacy_effort(effort_kind, name);
                 if effort_ultracode {
                     selection.ultracode = true;
                 }
@@ -5606,6 +5763,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                         .and_then(Value::as_u64)
                         .map(|n| n as u32)
                 });
+            let effort_effective = spec.get("effortEffective").cloned();
             let mode: Option<String> = row.get(15)?;
             let promoted_at: Option<String> = row.get(16)?;
             let stored: Option<String> = row.get(17)?;
@@ -5659,6 +5817,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 effort_name,
                 effort_ultracode,
                 effort_index,
+                effort_effective,
                 native_session_id: spec
                     .get("nativeSessionId")
                     .and_then(Value::as_str)

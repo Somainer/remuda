@@ -419,7 +419,7 @@ impl Store {
         let seq = self.watermark(instance)? + 1;
         let mut obs = Observation {
             schema_version: SchemaVersion,
-            event_id: remuda_protocol::EventId::new(),
+            event_id: envelope.event_id.unwrap_or_default(),
             journal_id: envelope.journal_id,
             instance_id: envelope.instance_id,
             run_id: envelope.run_id,

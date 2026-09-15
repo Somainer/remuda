@@ -185,6 +185,7 @@ async fn interaction_first_writer_wins() -> Result<()> {
         .source,
         completeness: Completeness::Structured,
         evidence_event_ids: Vec::new(),
+        event_id: None,
         body: ObservationPayload::InteractionRequested(Box::new(InteractionRequestedPayload {
             interaction: interaction.clone(),
         })),
@@ -214,6 +215,7 @@ async fn interaction_first_writer_wins() -> Result<()> {
         .source,
         completeness: Completeness::Structured,
         evidence_event_ids: Vec::new(),
+        event_id: None,
         body: ObservationPayload::InteractionAnswered(Box::new(InteractionAnsweredPayload {
             interaction_id: interaction.meta.id.clone(),
             request_version: U64(1),
@@ -252,6 +254,7 @@ async fn interaction_first_writer_wins() -> Result<()> {
         .source,
         completeness: Completeness::Structured,
         evidence_event_ids: Vec::new(),
+        event_id: None,
         body: ObservationPayload::InteractionExpired(Box::new(InteractionExpiredPayload {
             interaction_id: interaction.meta.id.clone(),
             request_version: U64(1),
@@ -374,5 +377,113 @@ async fn source_trait_object_and_opaque_unknown_types() -> Result<()> {
     assert_eq!(mapped.len(), 1);
     assert!(matches!(mapped[0].body, ObservationPayload::Opaque(_)));
     assert_eq!(source.name(), "claude-jsonl");
+    Ok(())
+}
+
+#[test]
+fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
+    let (_, _, _, map) = ctx("effort-session");
+    let lines = [
+        serde_json::json!({
+            "type":"user","uuid":"u1","sessionId":"effort-session",
+            "message":{"role":"user","content":"say ok"}
+        }),
+        serde_json::json!({
+            "type":"assistant","uuid":"a1","sessionId":"effort-session",
+            "message":{"id":"m1","role":"assistant","type":"message",
+                "content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"},
+            "effort":"high","perTurnEffort":null
+        }),
+        serde_json::json!({
+            "type":"user","uuid":"c1","sessionId":"effort-session",
+            "message":{"role":"user","content":
+                "<command-name>/effort</command-name><command-args>max</command-args>"}
+        }),
+        serde_json::json!({
+            "type":"assistant","uuid":"a2","sessionId":"effort-session",
+            "message":{"id":"m2","role":"assistant","type":"message",
+                "content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"},
+            "effort":"max","perTurnEffort":null
+        }),
+        serde_json::json!({
+            "type":"assistant","uuid":"a3","sessionId":"effort-session",
+            "message":{"id":"m3","role":"assistant","type":"message",
+                "content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"},
+            "effort":"max","perTurnEffort":null
+        }),
+    ];
+    let contents = lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let envelopes = map_file(&contents, &map)?;
+    let effort: Vec<_> = envelopes
+        .iter()
+        .filter_map(|env| match &env.body {
+            ObservationPayload::Effort(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    // high (first sight), max (after the slash), then the second max is deduped.
+    assert_eq!(effort.len(), 2, "{effort:?}");
+    // The effort edge event id is deterministic: the same (instance, record,
+    // level) from the live channel and this tailer converge on one identity.
+    let id_a = envelopes
+        .iter()
+        .find_map(|env| match &env.body {
+            ObservationPayload::Effort(payload)
+                if payload.effective.name == remuda_protocol::EffortName::Max =>
+            {
+                Some(env.event_id.clone())
+            }
+            _ => None,
+        })
+        .expect("max effort envelope")
+        .expect("effort envelope carries a derived event_id");
+    let mut ids2 = NativeIds::new(map.instance_id.as_id().as_str());
+    let remapped: Vec<Envelope> = {
+        let mut out = Vec::new();
+        let mut offset = 0u64;
+        for line in contents.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let cursor = FileCursor {
+                file_identity: Id::new("obj")?,
+                file_generation: U64(1),
+                offset: U64(offset),
+                length: U64(line.len() as u64),
+                digest: remuda_journal::digest_of(line.as_bytes()),
+            };
+            offset += line.len() as u64 + 1;
+            out.extend(map_claude_line(&map, &mut ids2, line.as_bytes(), &cursor)?);
+        }
+        out
+    };
+    let id_b = remapped
+        .iter()
+        .find_map(|env| match &env.body {
+            ObservationPayload::Effort(payload)
+                if payload.effective.name == remuda_protocol::EffortName::Max =>
+            {
+                Some(env.event_id.clone())
+            }
+            _ => None,
+        })
+        .expect("max effort envelope on remap")
+        .expect("derived again");
+    assert_eq!(id_a, id_b, "effort event id is stable across mappings");
+
+    assert_eq!(effort[0].effective.name, remuda_protocol::EffortName::High);
+    assert_eq!(
+        effort[0].effective.source,
+        remuda_protocol::EffortSource::Unknown
+    );
+    assert_eq!(effort[1].effective.name, remuda_protocol::EffortName::Max);
+    assert_eq!(
+        effort[1].effective.source,
+        remuda_protocol::EffortSource::Slash
+    );
     Ok(())
 }

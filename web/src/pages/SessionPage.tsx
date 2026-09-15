@@ -10,6 +10,7 @@ import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import { Transcript } from "../features/session/Transcript";
+import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
@@ -416,6 +417,7 @@ export function SessionPage({
         )}
       </div>
       {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock}>
+        <LiveStatusStrip events={events} nativeRef={instance.nativeRef} />
         <TaskTrack tasks={tasks} />
         {pending.map((item) =>
           item.kind === "question" ? (

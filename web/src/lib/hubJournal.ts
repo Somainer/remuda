@@ -49,6 +49,18 @@ const STUB_SOURCE: Observation["source"] = {
   sourceCursor: { type: "runtime", ledgerRevision: "1" },
 };
 
+/**
+ * The Hub stores the real ObservationSource (channel, driverKind, native
+ * request keys, …); preserve every field it carries. Older Hub/fake-node
+ * journals omit `source` entirely, in which case the stub supplies the shape
+ * the rest of the app reads. Replacing a real `hook`/`transcript` channel
+ * with the stub would silently break channel-derived projections.
+ */
+function observationSource(raw: unknown): Observation["source"] {
+  const source = asRecord(raw);
+  return { ...STUB_SOURCE, ...source } as Observation["source"];
+}
+
 /** Hub journal rows wrap the observation in `{ event, seq, eventId }`. */
 export function coerceObservation(raw: unknown, journalId: Id, instanceId: Id, fallbackSeq?: string): Observation | null {
   const row = asRecord(raw);
@@ -70,7 +82,7 @@ export function coerceObservation(raw: unknown, journalId: Id, instanceId: Id, f
     seq: seq as U64,
     observedAt: String(inner.observedAt ?? row.observedAt ?? new Date().toISOString()),
     nativeAt: known(String(inner.observedAt ?? row.observedAt ?? "")),
-    source: STUB_SOURCE,
+    source: observationSource(inner.source),
     kind,
     completeness: (typeof inner.completeness === "string" ? inner.completeness : "structured") as Observation["completeness"],
     rawRef: null,

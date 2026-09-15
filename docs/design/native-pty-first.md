@@ -71,14 +71,14 @@ herdr 剩下的**唯一不可替代价值是跨 Node 重启存活**（以及现�
 
 | harness | A 可直接作答 | B 结构化观测 | C OSC（地板） | D 屏幕签名 |
 |---|---|---|---|---|
-| **claude** | **[V]** `PermissionRequest` hook 阻塞返回 `{"behavior":"allow"｜"deny"}`，无需按键；`Elicitation` 可返回 `action` | **[V]** 二进制内含 **33 个 hook 事件**（远超公开的 9 个），含 `MessageDisplay`（行级 delta）、`Notification`、`SessionEnd`、`StopFailure`、`PostToolBatch`；payload 直接给 `transcript_path`；transcript JSONL 追加 | **[V]** `OSC 9;4;3/0`、`OSC 0` 标题、`OSC 777;notify` | 兜底 |
+| **claude** | **[V]** `PermissionRequest` hook 阻塞返回 `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"｜"deny"}}}`，无需按键（**裸 `{"behavior":…}` 无效**，见 §3.1）；`Elicitation` 可返回 `action` | **[V]** 二进制内含 **33 个 hook 事件**（远超公开的 9 个），含 `MessageDisplay`（行级 delta）、`Notification`、`SessionEnd`、`StopFailure`、`PostToolBatch`；payload 直接给 `transcript_path`；transcript JSONL 追加 | **[V]** `OSC 9;4;3/0`、`OSC 0` 标题、`OSC 777;notify` | 兜底 |
 | **grok** | **[V]** **没有 `PermissionRequest` hook**：该事件名注册时被静默忽略，相邻条目照常加载；但 `PreToolUse` 返回 `{"decision":"deny"｜"ask"}` **[V]** 生效（deny 连 `--always-approve` 都拦得住，`ask` 能逼出可见审批框）——**只能拦，不能替用户答**；**[V]** ACP `session/request_permission` **不写进 `updates.jsonl`**（54 帧全是 `session/update` / `_x.ai/session/update`），作答仍靠按键（[grok-signals-1](./evidence/grok-signals-1.md) A3/A5） | **[V]** `updates.jsonl` 是 **ACP `session/update` 逐字帧**（`remuda-acp-wire` 可直接解，含 `turn_completed{stop_reason,elapsed_ms}`）+ `events.jsonl`（`turn_started`/`phase_changed`/`first_token`/**`turn_ended{outcome}`**/`permission_requested`/`permission_resolved`）+ `usage.json`；**[V]** `active_sessions.json` 的 `pid` 就是 TUI 进程本身（不是 recorder、不是父 shell），但**条目在 shutdown 时先于进程退出被移除** → 只能当发现路径，**不能当 liveness**（同上 A1/A2） | **[V]** 原始 PTY 抓包实测到 `OSC 0` 标题（载荷含 `⚠ Action Required` / `Thinking` / `Running: <tool>`）与 `OSC 9;4;1;-1` / `9;4;0;0`，72 个去重样本；**herdr 的 rendered-ansi 已把这些控制序列吃掉**，必须抓原始字节（同上 A4） | 作答路径 |
 | **codex** | **[V]** `hooks.json` 的 `PermissionRequest` **同步阻塞并返回真实裁决**：`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"｜"deny"}}}`，allow/deny 双向实测落地（deny 侧 rollout 记 `Rejected(...)`，allow 侧记 exit 0）；**stdin 无 `tool_use_id`**、tool 名被归一成 `Bash` → **不得复用 `PreToolUse`/`PostToolUse` 的关联 schema**（[codex-signals-1](./evidence/codex-signals-1.md) A1） | **[V]** rollout JSONL（`task_started`/`task_complete`/`item_completed`/`response_item`/`token_usage_record`/`turn_aborted`/`turn_context`）实时追加 + `session_index.jsonl`（**[V]** 只是 append-only 的**名字索引**，不是 PID 注册表，也不是全量线程目录）；**[V]** **hooks trust gate 已破**：`[features] hooks = true` 是开关，**per-handler canonical hash**（handler 归一 → 补 snake_case `event_name` → TOML → JSON 递归排序 → compact → `sha256:`）写进 `hooks.state` 即持久化 trust，无需任何 bypass | **[U]** | tier D 兜底（**不再是审批的唯一出路**） |
 | **agy** | — | **[V]** hook 只有 namespace 化的 `PreInvocation`/`PostInvocation`；transcript 是 SQLite + protobuf blob，无 schema 不可读 | **[V]** 二进制内含 `OSC 9;4` 进度发射 | 状态与作答 |
 
 ### 3.1 已验证的坑
 
-- **[V]** claude 的 `permissionDecision` 键（`PreToolUse` 用的）在 `PermissionRequest` 上被静默忽略；必须用 `{"behavior": …}` 形状。
+- **[V]** claude 的 `permissionDecision` 键（`PreToolUse` 用的）在 `PermissionRequest` 上被静默忽略；**裸的 `{"behavior": …}` 同样被静默忽略**（2.1.221 实测：审批框照常弹出、工具被拒、回复里没有任何出错迹象——这正是 §14 风险 1 的「点了批准但没动」）。唯一生效的形状是嵌套的 `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"｜"deny"}}}`，且 `hookEventName` 必须与被调用的事件一致，否则整条被丢弃并报 `Hook returned incorrect event name`。allow-always 走同一 `decision` 下的 `updatedPermissions`，原样回传 `permission_suggestions` 即可。见 [native-pty-5](./evidence/native-pty-5.md) §3–§4。
 - **[V]** **confined session 里 allow 无效**：二进制明确告知「受限会话只接受命令行上的授权」。→ 审批链路必须能回落按键，否则会出现「点了批准但没动」。
 - **[V]** `SubagentStop` 在没有 subagent 时也会触发（recap/summary），**绝不能当作 working**。
 - **[V]** grok 即使重定向 `GROK_HOME`，仍会吃 `~/.claude/settings.json` 里的 hook 条目 → hook 脚本必须按 `$0`/env 自辨 harness 并幂等去重。**[V]** `CLAUDE_CONFIG_DIR` **重定向不了**这条发现路径（实测失败），唯一有效的中和开关是 **`GROK_CLAUDE_HOOKS_ENABLED=0`**（实测把 26 条 Claude hook 从 `enabled` 变 `disabled`）；它只停用**激活**，不阻止 grok 继续读 Claude 配置做清单。
@@ -168,7 +168,7 @@ New Session = 在一个 Remuda 自持 PTY 里**预填 launch command 并回车**
 
 | kind | 基础 argv 与环境 | yolo argv（仅 Human/Bot 且显式 bypass） | overlay | session id 来源 |
 |---|---|---|---|---|
-| claude | `claude` + `--settings <overlay>` + `--setting-sources user,project,local` + `--effort <v>` | `--dangerously-skip-permissions` | settings overlay：hooks、`tui`、`showStatusInTerminalTab`、`terminalProgressBarEnabled` | `SessionStart` hook → `session-meta.json` |
+| claude | `claude` + `--settings <overlay>` + `--effort <v>` | `--dangerously-skip-permissions` | settings overlay：hooks、`tui`、`showStatusInTerminalTab`、`terminalProgressBarEnabled` | `SessionStart` hook → `session-meta.json` |
 | codex | `codex`，`CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` | 影子 `config.toml`（`hooks = true`、`notify`）+ `hooks.json` | `SessionStart` hook；否则 `session_index.jsonl` 最新 `updated_at` |
 | grok | `grok`，`GROK_HOME` 指向影子目录 | `--always-approve` | 影子 `hooks/*.json`（须自辨 harness，见 §3.1） | `active_sessions.json` 按 PTY 子进程 pid 匹配 |
 | agy | `agy` | `--yolo` | `config/hooks.json`（namespace 键） | `PreInvocation.conversationId` |
@@ -352,16 +352,22 @@ resume = **新开一个 session，预填 `--resume <sid>`**——与 New Session
 
 ### 9.2 tui / 终端状态信号
 
-在同一份 per-session settings overlay 里**钉死**三个键：
+启动时在同一份 per-session settings overlay 里钉住三个键：
 
 | 键 | 值 | 为什么必须钉 |
 |---|---|---|
-| `tui` | `"fullscreen"` / `"default"` | **两个方向都要显式写**，否则宿主 `~/.claude/settings.json` 会经 `--setting-sources` 的 user 层漏进来，渲染器跨机器不确定 |
-| `showStatusInTerminalTab` | `true` | 关掉就没有 OSC 标题 → 丢掉一整层 idle/working 信号 |
-| `terminalProgressBarEnabled` | `true` | 关掉就没有 `OSC 9;4` 进度 → 同上 |
+| `tui` | `"fullscreen"` / `"default"` | 两个方向都显式写，确保启动选择覆盖 user/project/local；前台 SessionStart 绑定后仅释放这个键 |
+| `showStatusInTerminalTab` | `true` | 保留 OSC 标题信号，renderer relaunch 后仍钉住 |
+| `terminalProgressBarEnabled` | `true` | 保留 `OSC 9;4` 进度信号，renderer relaunch 后仍钉住 |
 
-- **保留 `--setting-sources`**。它是确定性保证；代价只是会话内 `/tui` 被拒（该 flag 会触发 fork-restricted 检查）——而渲染器已经在启动时由 Remuda 决定，切换方式是「改 launch overlay + 重开实例」，不是让用户敲 `/tui`。`--settings` 本身不触发该限制。
-- **不得假设 fullscreen 生效**：崩溃闩、screen reader、嵌套复用器都会静默降级。**从字节流里探测 `ESC[?1049h`** 判定实际模式，并经 `TtyAttach` 的 `altScreen` 上报给 web（§4.6）。
+- **§9.2 follow-up 修正**：不再自动追加 `--setting-sources user,project,local`。这三个来源原本就会加载；确定性来自 `--settings` 的优先级，不需要该 flag。显式 `--settings <relay>` 也必须先经 shim 合并 overlay。优先级是 managed > `--settings` > local > project > user；hooks 在各层合并。
+- **允许会话内 `/tui X`**：只在通过认证的 SessionStart 与检测到的前台 PID 匹配后，Node 的驱动监督器原子重写本实例的 base/private merged overlay，删除 `tui`，保留 hooks 和另外两个终端键。每次新实例启动仍重新钉住两个方向。Claude 会写用户偏好并携带原 argv relaunch；仅去掉 flag、继续钉 `tui` 会静默覆盖用户切换。
+- **启动选择**：可选 `InstanceSpec.tui`，session 值替换 host `defaultTui`，均未设置时为 fullscreen。适用于启用 hook overlay 的 native PTY；旧 print/herdr 路径没有本轮的绑定后释放机制。New Session 高级区使用「全屏渲染（推荐）」/「行内渲染」，提示「启动时使用此渲染方式，会话内可用 /tui 切换」。
+- **身份跟随**：新 PID 的 relaunch 走 replacement-process promotion；同 PID、新 native session ID 的 exec relaunch 以认证 SessionStart + cwd 内 transcript 更新绑定、重建 tail。不能把新 SessionStart 误当作旧 transcript 的继续。
+- **不得假设 fullscreen 生效**：崩溃闩、screen reader、嵌套复用器都可能降级。终端模拟器从 `ESC[?1049h`/`ESC[?1049l` 维护实际状态，经 attach `altScreen` 和 live `tty.mode` 上报。raw-ring fallback 无法判断时为 unknown。UI 根据观测显示，requested fullscreen 但尚未见 alt screen 时只给轻量提示。
+- **原生优先级仍生效**：`/tui` 写 user 设置；如果 project/local/managed 仍设了 `tui`，它们会继续覆盖该用户偏好。Remuda 不改这些设置，实际模式以 `altScreen` 为准。
+
+2.1.270 bundle predicate、实际 `/tui` 对照与测试边界见 [native-pty-9b](./evidence/native-pty-9b.md)。
 
 ---
 
@@ -507,7 +513,7 @@ reason = "…"                     # 必填，且不得为空白
 | **P2** | `AgentPty`：kind/driver 矩阵、New Session 预填、per-kind recipe + yolo、effort/tui overlay、生命周期五件事（§5） | **已落地**（[native-pty-2](./evidence/native-pty-2.md)）：两条路径的 agent 事件流逐条相同；停进程后进程组确实消失（`rung="sigint"`，复查为空）；agent 退出 ≤2 s 内落 `exited`/`failed` 并带退出码。**残留**：`launchedBy` 两条路径都读成 `remuda`（Hub 仍从 `mode == promoted` 推断，而 §1.0 规则 2 已使该推断失效，见 §14 风险 16） | 4 | **W3**（`remuda-protocol/*`、`materializer.rs`、`flags.rs`、`capabilities.rs`、enums）+ **W2**（driver 实现） |
 | **P3** | 实时流式：`MessageDisplay` 接入 + `TranscriptMapper` 重组修复 + grok `updates.jsonl` 解码 | 结构视图**行级**增量出现；tool-call 与 tool-result 配对 100%；`queue-operation` 进 journal | 3 | **W2**：`claude_print.rs` 的 mapper 段、`shell_pty/promotion.rs` |
 | **P4** | steer / 排队 / 打断：按 §6 已实测的键位落地 + native/emulated 映射 + composer 三态 + 诚实 capabilities | claude Enter = 入队 + 工具边界消费（`enqueue` → `remove{absorbed_mid_turn}`）、`Esc` 打断后队列存活；codex Enter steer / `Tab` 排队 / `Esc` 打断；grok Enter 排队、**空 Enter 取消并发送**、**双 `Ctrl+C`** 取消（`Esc` 不是打断键）；`steer`/`queue`/`interrupt` 三项逐 harness 标 `native｜emulated`，agy 显示「尚未验证」而非假灰 | 2 | **W1**（`web/src/features/session/*`）+ **W3**（`PromptMode` 增量） |
-| **P5** | `PermissionRequest` 裁决 + hook 路径 `respond_interaction` | allow/deny 均生效；超时 deny；confined 会话能回落按键 | 3 | **W2** |
+| **P5** | `PermissionRequest` 裁决 + hook 路径 `respond_interaction` | **已落地**（[native-pty-5](./evidence/native-pty-5.md)）：allow / deny / allow-always 三者实测生效且不弹框；超时 deny（够不到 Node 则 `{}`，两者不可混同）；hook 未生效时回落按键**恰好一次**并以「框消失」为准。**残留**：`Elicitation` 仅按二进制读取端形状实现，**[U]** 未取得实机 payload；confined session 本身 **[U]** 未单独复现（2.1.221 已无该字样），本轮由「回复形状错误」这条真实路径覆盖同一条回落逻辑 | 3 | **W2** |
 | **P6** | codex adapter（**hooks `PermissionRequest` 阻塞裁决 + rollout tail**，trust 由 Remuda 写 `hooks.state`）/ grok adapter（**`events.jsonl` + `updates.jsonl` + `active_sessions.json` 发现**）+ `UsageAdapter` + MCP 附件 | 三家 lifecycle 来自结构化通道（codex `task_started`/`task_complete`/`turn_aborted`；grok `turn_ended{outcome}` + `turn_completed{stop_reason}`）；codex 审批走 hook allow/deny 且超时 deny；**grok 审批如实上报为屏幕作答（emulated）**；usage 覆盖三家；图片三家可读 | 4 | **W4a** `codex_adapter.rs`、**W4b** `grok_adapter.rs`（各自独立文件） |
 | **P7** | 规则表移植 + capabilities 运行时化 + web 去 driver 分支 + parity gate + 逐 harness 翻默认 + print→legacy / herdr→optional | 规则表带版本；UI 门禁改看 `signalTier`；parity 连续 3 次全绿方可翻默认 | 4 | **W1**（规则表/引擎、web）+ **W3**（capabilities、enums、feature gate） |
 | **P8** | `remuda-ptyd`：跨 Node 重启存活（已拍板排后，§8） | Node 重启后终端与结构视图无感续接；孤儿清扫可验证 | 5+ | **W5**：`crates/remuda-ptyd/*` + Node adopt 路径 |
@@ -526,7 +532,7 @@ reason = "…"                     # 必填，且不得为空白
 
 | # | 风险 | 处置 |
 |---|---|---|
-| 1 | **confined session 的 allow 无效**（**[V]**） | P5 前置验收：allow 必须能回落按键，否则出现「点了批准但没动」 |
+| 1 | **allow 可能被忽略**（**[V]**） | **P5 已落地并实测**（[native-pty-5](./evidence/native-pty-5.md)）。本轮复现到的成因**不是** confined session，而是**回复形状**：裸 `{"behavior":"allow"}` 被静默丢弃（框还在、工具被拒、无任何报错），嵌套 `hookSpecificOutput` 形状才生效。两种成因的处置相同：回落**只在 hook 路径自证未生效时**武装（`Outcome::Abandoned`/`TimedOut`），**不能**用「屏幕上有框」当判据——实测审批框与「hook 仍在等待」是并存的（75 s 的 hook 全程显示框，晚到的 allow 仍然生效），据此发键会在每次慢审批上重复作答。回落每个 interaction 仅一次、写前记账、截断/歧义/非审批框一个键都不按，且**必须观察到框消失**才算 applied。confined session 本身 **[U]** 未单独复现（2.1.221 二进制中已无该字样） |
 | 2 | **shim 劫持 PATH**：`which claude` 显示 Remuda 路径、可能撞用户 wrapper、非 login shell 注入失败、用户用绝对路径绕开 | 透明 `exec`、提供 `REMUDA_SHIM=off`、失败自动降到 tier C/D 并在 UI 明示降级原因 |
 | 3 | ~~**codex 审批无结构化通道**~~ → **已解除（RESOLVED）** | [codex-signals-1](./evidence/codex-signals-1.md) A1 实测：`[features] hooks = true` + **per-handler canonical hash** 写进 `hooks.state` 即持久化 trust，`PermissionRequest` **阻塞返回 allow/deny 双向生效**。**残留约束**（转为实现细则，不再是风险 P）：stdin **无 `tool_use_id`**（须另建关联，不得复用 `PreToolUse` schema）、**超时 deny 策略未验**（本轮在 60 s 超时前就给了答案）、哈希**不认脚本内容变更**、`--dangerously-bypass-hook-trust` 对 `app-server` 无效。app-server（`turn/steer`、`turn/interrupt`，**源码可见、本轮未实跑**）保留为旁路 |
 | 4 | **模拟器内存/CPU 未测量**（N × maxInstances） | P0 必须带基准并限制 scrollback 行数 |
@@ -591,7 +597,7 @@ reason = "…"                     # 必填，且不得为空白
 | 3 | 工作中 composer：steer / 排队 / 打断，逐 harness 键位，能力诚实 | §6（键位表 + native/emulated 映射 + composer 三态 + `unknown` 诚实上报） | P4 | **已实测三家**（claude / codex / grok，证据见 §6 末列）；agy 仍 **[U]** |
 | 4 | 结构化视图实时流式（文本/思考/工具增量） | §7（`MessageDisplay` 行级 + ACP chunk + mapper 重组修复） | P3 | 设计已定 |
 | 5 | effort：5 档 + ultracode；`--effort` + `/effort`；显示 effective vs requested | §9.1 | P2 | 部分 **[U]**（PTY 内 `/effort` 未实测） |
-| 6 | 滚动 + 全屏 TUI：真字节修 scrollback；overlay 钉 `tui`；保留 `--setting-sources` | §4.6 + §9.2 | P0 / P2 | 设计已定 |
+| 6 | 滚动 + 全屏 TUI：真字节修 scrollback；overlay 启动钉 `tui`、绑定后释放；保留正常 settings sources | §4.6 + §9.2 | P0 / P2 | 设计已定 |
 | 7 | 识别手敲启动的 agent（D-025 promotion），给同样的结构化视图 | §1.0 规则 2 + §4.2 launch shim + P1 验收 | P1 | 设计已定 |
 
 ---

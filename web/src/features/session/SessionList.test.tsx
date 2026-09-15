@@ -1,10 +1,11 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
 import { known } from "../../types/wire";
+import { detectPlatform, setPlatformForTest } from "../../lib/platform";
 import { SessionList } from "./SessionList";
 
 // jsdom has no matchMedia; the workbench viewport hook needs one to pick the
@@ -235,5 +236,98 @@ describe("SessionList scope and conditions", () => {
     renderList();
     await user.click(screen.getByTestId("session-filter-open"));
     expect(screen.getByTestId("session-filter-panel")).toHaveAttribute("data-variant", "sheet");
+  });
+});
+
+/** Space id the real buildSpaces() derives for the fixture host/workspace. */
+const derivedSpace = { id: '["host-a","wsp-a"]', name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
+
+function renderKeyList() {
+  return render(
+    <MemoryRouter initialEntries={["/sessions"]}>
+      <SessionList variant="full" instances={hub.instances} title="sfe-root" space={derivedSpace} />
+    </MemoryRouter>,
+  );
+}
+
+describe("SessionList hold-modifier badges (⌘1–9)", () => {
+  beforeEach(() => {
+    setPlatformForTest(detectPlatform({ platform: "MacIntel" }));
+    localStorage.removeItem("remuda.spaces.v1");
+  });
+
+  afterEach(() => {
+    setPlatformForTest(null);
+    mobileViewport = false;
+  });
+
+  it("numbers the rows in tab order and advertises the shortcut permanently", () => {
+    renderKeyList();
+    const rows = screen.getAllByTestId("session-row");
+    expect(rows).toHaveLength(2);
+    // The blocked group paints before the idle one, so the first *visible*
+    // row is the second tab: numbers follow the shared tab ordering Shell's
+    // digit handler uses, not the screen position of status groups.
+    expect(rows[0]).toHaveAttribute("aria-keyshortcuts", "Meta+2");
+    expect(rows[1]).toHaveAttribute("aria-keyshortcuts", "Meta+1");
+
+    const badges = screen.getAllByText(/⌘ [12]/);
+    expect(badges).toHaveLength(2);
+    // Hidden until held, invisible to assistive tech at all times.
+    for (const badge of badges) {
+      expect(badge).toHaveAttribute("aria-hidden", "true");
+      expect(badge).toHaveAttribute("data-held", "0");
+    }
+  });
+
+  it("renders Ctrl glyphs and Control+ shortcuts on Windows/Linux", () => {
+    setPlatformForTest(detectPlatform({ platform: "Win32" }));
+    renderKeyList();
+    expect(screen.getAllByText(/Ctrl [12]/)).toHaveLength(2);
+    expect(screen.getAllByTestId("session-row")[0]).toHaveAttribute("aria-keyshortcuts", "Control+2");
+    expect(screen.getByTestId("session-switch-hint")).toHaveTextContent("按住 Ctrl 快捷切换");
+  });
+
+  it("reveals badges only while the modifier is held", async () => {
+    renderKeyList();
+    const user = userEvent.setup();
+    const badge = screen.getAllByText(/⌘ [12]/)[0];
+    expect(badge).toHaveAttribute("data-held", "0");
+
+    await user.keyboard("{Meta>}");
+    expect(badge).toHaveAttribute("data-held", "1");
+
+    await user.keyboard("{/Meta}");
+    expect(badge).toHaveAttribute("data-held", "0");
+  });
+
+  it("hides badges again when focus moves into a text field while held", async () => {
+    renderKeyList();
+    const user = userEvent.setup();
+    await user.keyboard("{Meta>}");
+    const badge = screen.getAllByText(/⌘ [12]/)[0];
+    expect(badge).toHaveAttribute("data-held", "1");
+
+    await user.click(screen.getByTestId("session-search"));
+    expect(badge).toHaveAttribute("data-held", "0");
+  });
+
+  it("shows the discreet hold hint on desktop but neither hint nor badges on a touch platform", () => {
+    const desktop = renderKeyList();
+    expect(screen.getByTestId("session-switch-hint")).toHaveTextContent("按住 ⌘ 快捷切换");
+    desktop.unmount();
+
+    setPlatformForTest(detectPlatform({ platform: "iPad", maxTouchPoints: 5 }));
+    renderKeyList();
+    expect(screen.queryByTestId("session-switch-hint")).toBeNull();
+    expect(screen.queryByText(/⌘ /)).toBeNull();
+    expect(screen.getAllByTestId("session-row")[0]).not.toHaveAttribute("aria-keyshortcuts");
+  });
+
+  it("renders no badges or hint in the mobile layout", () => {
+    mobileViewport = true;
+    renderKeyList();
+    expect(screen.queryByTestId("session-switch-hint")).toBeNull();
+    expect(screen.queryByText(/⌘ /)).toBeNull();
   });
 });

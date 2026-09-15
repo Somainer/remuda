@@ -281,6 +281,22 @@ pub struct EffortEffective {
     pub observed_at: Timestamp,
 }
 
+/// Claude renderer requested at launch (D-028 §9.2).
+///
+/// This is intent only; the terminal snapshot's `altScreen` reports the
+/// observed screen state after Claude applies platform and accessibility rules.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiMode {
+    /// Fullscreen renderer; the launch default when no preference is supplied.
+    #[default]
+    Fullscreen,
+    /// Inline renderer, named `default` by Claude's settings format.
+    Default,
+}
+
 /// InstanceSpec; `protocol.md` §4.1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -328,6 +344,9 @@ pub struct InstanceSpec {
     /// `--effort` flag at all rather than guessing a level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<EffortSelection>,
+    /// Requested renderer; omission uses the host default, then fullscreen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui: Option<TuiMode>,
     /// `permission_mode`; protocol §4.1.
     pub permission_mode: PermissionMode,
     /// `env`; protocol §4.1.

@@ -184,6 +184,56 @@ fn project_write_target(path: &str) -> bool {
     }
 }
 
+/// `GET /v1/tasks…` / `GET /v1/own…`; design §2.2/§2.4. Handlers re-check
+/// scope, and write handlers require the `dispatch`/`land` grants.
+fn task_read_target(method: &axum::http::Method, path: &str) -> bool {
+    if method != axum::http::Method::GET && path != "/v1/own/check" {
+        return false;
+    }
+    if path == "/v1/tasks" || path == "/v1/own" || path == "/v1/own/check" {
+        return true;
+    }
+    match path.strip_prefix("/v1/tasks/") {
+        Some(rest) => {
+            // `/{id}` and `/{id}/placements`; never the write sub-routes.
+            rest.split('/').count() == 1
+                || (rest.split('/').count() == 2 && rest.ends_with("/placements"))
+        }
+        None => false,
+    }
+}
+
+/// Task-ledger writes: handlers re-check the `dispatch`/`land` grants, so leaf
+/// workers reach the refusal rather than failing open; design §2.4.
+fn task_write_target(method: &axum::http::Method, path: &str) -> bool {
+    if path == "/v1/tasks" {
+        return method == axum::http::Method::POST;
+    }
+    match path.strip_prefix("/v1/tasks/") {
+        Some(rest) => {
+            let segments: Vec<&str> = rest.split('/').collect();
+            match segments.as_slice() {
+                [_id] => {
+                    matches!(
+                        *method,
+                        axum::http::Method::PATCH | axum::http::Method::DELETE
+                    )
+                }
+                [_id, sub] => matches!(
+                    (*sub, method),
+                    ("split", &axum::http::Method::POST)
+                        | ("land", &axum::http::Method::POST)
+                        | ("own", &axum::http::Method::POST)
+                        | ("own", &axum::http::Method::DELETE)
+                        | ("placements", &axum::http::Method::POST)
+                ),
+                _ => false,
+            }
+        }
+        None => false,
+    }
+}
+
 pub async fn same_host(state: &AppState, device: &Device, host: &str) -> Result<bool, HubError> {
     let Some(caller) = device.instance_id.as_deref() else {
         return Ok(false);
@@ -514,7 +564,10 @@ pub async fn restrict_agent_routes(
     {
         let device = caller(&state, request.headers()).await?;
         if origin(&device) == InputOrigin::Agent {
-            let read = request.method() == axum::http::Method::GET
+            // `/v1/own/check` is a read-shaped gate primitive even though it
+            // is POST (it carries a diff in the body); the handler still
+            // enforces scope.
+            let read = (request.method() == axum::http::Method::GET
                 && (path == "/v1/caller"
                     // D-028 §4.5: the in-session MCP server reads its own
                     // session's attachments. The handlers pin every read to
@@ -524,22 +577,27 @@ pub async fn restrict_agent_routes(
                     // §2.4: coordinators list/read projects and instances
                     // inside their scope; handlers re-check grants + scope.
                     || project_read_target(path)
+                    || task_read_target(request.method(), path)
                     || path == "/v1/instances"
                     || match read_target(path) {
                         Some(id) => owns(&state, &device, id).await?,
                         None => false,
-                    });
+                    }))
+                || (request.method() == axum::http::Method::POST && path == "/v1/own/check");
             let write = request.method() == axum::http::Method::POST
                 && (path == "/v1/instances"
                     || path == "/v1/fleet/instances"
                     || path == "/v1/fleet/broadcast"
                     || (path.starts_with("/v1/instances/") && path.ends_with("/commands"))
-                    || (path.starts_with("/v1/projects/") && path.ends_with("/members")))
-                || request.method() == axum::http::Method::PATCH && project_write_target(path)
+                    || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
+                    || task_write_target(request.method(), path))
+                || request.method() == axum::http::Method::PATCH
+                    && (project_write_target(path) || task_write_target(request.method(), path))
                 || (request.method() == axum::http::Method::DELETE
-                    && path
+                    && ((path
                         .strip_prefix("/v1/projects/")
-                        .is_some_and(|rest| rest.ends_with("/members")));
+                        .is_some_and(|rest| rest.ends_with("/members")))
+                        || task_write_target(request.method(), path)));
             if !read && !write {
                 return Err(HubError::Forbidden);
             }

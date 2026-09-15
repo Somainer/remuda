@@ -7,6 +7,8 @@ import {
   DELEGATION_OPTIONS,
   PERMISSION_OPTIONS,
   PTY_YOLO_FLAGS,
+  TUI_OPTIONS,
+  TUI_LAUNCH_HINT,
   YOLO_ACK,
   YOLO_HINT,
   normalizeDelegation,
@@ -40,7 +42,7 @@ import {
 import { COMMAND_STATUS_LABEL } from "../lib/commandStatus";
 import { notify } from "../lib/notify";
 import type { DriverKind } from "../types/nativeRef";
-import type { Kind } from "../types/instance";
+import type { Kind, TuiMode } from "../types/instance";
 import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
 import {
   defaultDriver,
@@ -161,6 +163,7 @@ export function NewSessionPage() {
   // visible rather than something you have to know.
   const [launchArgs, setLaunchArgs] = useState(prefs.launchArgs ?? "");
   const [binaryPath, setBinaryPath] = useState("");
+  const [tui, setTui] = useState<TuiMode | undefined>(undefined);
   const [name, setName] = useState("");
   const [phase, setPhase] = useState<SubmitPhase>("idle");
   // `error` is a definite, fixable refusal; `uncertain` means the create may
@@ -453,6 +456,7 @@ export function NewSessionPage() {
                 maxBudgetUsd: maxBudgetUsd || undefined,
                 args: launchArgTokens.length ? launchArgTokens : undefined,
                 binaryPath: binaryPath.trim() || undefined,
+                tui: activeKind === "claude" ? tui : undefined,
                 name: name || worktree || (plainTerminal ? "terminal" : undefined),
                 effortIndex: sessionEffort.index,
                 effortName: effortWireName(sessionEffort),
@@ -875,6 +879,24 @@ export function NewSessionPage() {
                       </div>
                     ) : null}
                   </fieldset>
+                ) : null}
+                {activeKind === "claude" ? (
+                  <label className={css.field}>
+                    <span className={css.label}>终端渲染</span>
+                    <div className={css.selectWrap}>
+                      <select
+                        className={css.select}
+                        data-testid="new-session-tui"
+                        disabled={phase !== "idle"}
+                        value={tui ?? host?.defaultTui ?? "fullscreen"}
+                        onChange={(e) => setTui(e.target.value as TuiMode)}
+                        aria-describedby="new-session-tui-hint"
+                      >
+                        {TUI_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+                      </select>
+                    </div>
+                    <span className={css.hint} id="new-session-tui-hint" data-testid="new-session-tui-hint">{TUI_LAUNCH_HINT}</span>
+                  </label>
                 ) : null}
                 <label className={css.field}>
                   <span className={css.label}>settings overlay 路径</span>

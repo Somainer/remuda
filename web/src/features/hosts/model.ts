@@ -1,4 +1,4 @@
-import type { Host } from "../../types/instance";
+import type { Host, TuiMode } from "../../types/instance";
 import type { Id } from "../../types/wire";
 
 /** Proposal §4.6 carriers. ssh-dev / ssh-tunnel map onto ssh-stdio. */
@@ -50,6 +50,7 @@ export type HostView = {
   providerBinding: string;
   /** Per-host default extra CLI args, applied when a create omits `args`. */
   defaultLaunchArgs?: string[];
+  defaultTui?: TuiMode;
   /** Per-host default claude executable. Validated by the Node, not the Hub. */
   claudeBinaryPath?: string;
 };

@@ -1552,7 +1552,7 @@ pub(crate) fn inject_session_start_hook(
     }
     recipe.audit.settings_digest = Some(digest);
     ensure_settings_flag(&mut recipe.argv, &settings_path);
-    ensure_setting_sources(&mut recipe.argv)?;
+    validate_setting_sources(&recipe.argv)?;
     recipe.audit.redacted_argv = recipe
         .argv
         .iter()
@@ -1620,7 +1620,7 @@ fn ensure_settings_flag(argv: &mut Vec<String>, settings_path: &Path) {
     argv.push(path);
 }
 
-fn ensure_setting_sources(argv: &mut Vec<String>) -> DriverResult<()> {
+fn validate_setting_sources(argv: &[String]) -> DriverResult<()> {
     if let Some(index) = argv.iter().position(|token| token == "--setting-sources") {
         let value = argv.get(index + 1).map(String::as_str).unwrap_or("");
         if value.trim().is_empty() || value.starts_with('-') {
@@ -1642,8 +1642,6 @@ fn ensure_setting_sources(argv: &mut Vec<String>) -> DriverResult<()> {
         }
         return Ok(());
     }
-    argv.push("--setting-sources".into());
-    argv.push("user,project,local".into());
     Ok(())
 }
 
@@ -1966,9 +1964,9 @@ pub mod review {
         apply_tty_bypass_flag(recipe);
     }
 
-    /// Default `--setting-sources user,project,local` when missing; reject empty.
-    pub fn ensure_sources(argv: &mut Vec<String>) -> DriverResult<()> {
-        ensure_setting_sources(argv)
+    /// Validate an explicit `--setting-sources`; normal sources stay implicit.
+    pub fn ensure_sources(argv: &[String]) -> DriverResult<()> {
+        validate_setting_sources(argv)
     }
 
     /// Screen-derived blocked payloads (lifecycle + interaction).

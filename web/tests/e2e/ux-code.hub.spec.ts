@@ -30,7 +30,12 @@ const FENCED_PROMPT = [
   "```",
 ].join("\n");
 
-const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence");
+// Committed evidence is refreshed only on request (REMUDA_EVIDENCE=1); every other run —
+// including the merge gate, whose verify-tree step rejects a dirty worktree — writes
+// the same screenshots under the gitignored test-results/ instead.
+const evidence = process.env.REMUDA_EVIDENCE === "1"
+  ? path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence")
+  : path.join(path.dirname(fileURLToPath(import.meta.url)), "../../test-results/evidence");
 
 /** Same fake-node dance as ux-status.spec: raise the shared 8-instance cap. */
 async function raiseCap(page: Page, to: number): Promise<{ hostId: string; previous: number } | null> {
@@ -230,10 +235,16 @@ test.describe("390px", () => {
     await expect(first.getByTestId("code-toolbar")).toHaveCSS("opacity", "1");
 
     for (const name of ["换行", "复制"]) {
-      const box = await first.getByRole("button", { name }).boundingBox();
-      expect(box, `${name} button must have a box`).toBeTruthy();
-      expect(box!.width).toBeGreaterThanOrEqual(44);
-      expect(box!.height).toBeGreaterThanOrEqual(44);
+      // The transcript re-renders while live observations arrive; poll the box
+      // instead of sampling it once (a mid-render sample returns null).
+      const button = first.getByRole("button", { name });
+      await expect(button, `${name} button must be visible`).toBeVisible();
+      await expect
+        .poll(async () => (await button.boundingBox())?.width ?? 0, { message: `${name} button width` })
+        .toBeGreaterThanOrEqual(44);
+      await expect
+        .poll(async () => (await button.boundingBox())?.height ?? 0, { message: `${name} button height` })
+        .toBeGreaterThanOrEqual(44);
     }
 
     const noPageOverflow = await page.evaluate(() => ({

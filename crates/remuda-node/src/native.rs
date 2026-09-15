@@ -370,11 +370,14 @@ impl DriverFactory for NativeClaudeFactory {
                     options.hooks = Some(remuda_driver::shell_pty::HookConfig {
                         instance_dir: instance_dir.clone(),
                         relay_binary: relay_binary(&self.config)?,
-                        // §9.2 wants the renderer pinned in both directions.
-                        // Under a promoted terminal the human already chose it
-                        // and pinning `default` would fight them; when Remuda
-                        // owns the launch, it owns the choice.
-                        tui: remuda_driver::TuiMode::Fullscreen,
+                        // Pin the requested start mode, then release only tui
+                        // after the foreground SessionStart is bound (§9.2).
+                        tui: match launch.request.tui.unwrap_or_default() {
+                            remuda_protocol::TuiMode::Fullscreen => {
+                                remuda_driver::TuiMode::Fullscreen
+                            }
+                            remuda_protocol::TuiMode::Default => remuda_driver::TuiMode::Default,
+                        },
                     });
                 }
                 Arc::new(ShellPtyDriver::new(options))
@@ -1113,6 +1116,7 @@ fn instance_spec(
         },
         model_id,
         effort: launch.request.effort,
+        tui: launch.request.tui,
         permission_mode: PermissionMode::Claude(Box::new(ClaudePermission { mode, interaction })),
         env: BTreeMap::new(),
         args: with_max_budget(
@@ -1297,6 +1301,7 @@ mod tests {
                 resume_session_id: None,
                 resumed_from: None,
                 effort: None,
+                tui: None,
             };
             let driver = registry
                 .build(
@@ -1488,6 +1493,7 @@ mod tests {
             resume_session_id: None,
             resumed_from: None,
             effort: None,
+            tui: None,
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -1537,6 +1543,7 @@ mod tests {
             resume_session_id: None,
             resumed_from: None,
             effort: None,
+            tui: None,
         };
         registry
             .build(
@@ -1589,6 +1596,7 @@ mod tests {
             resume_session_id: None,
             resumed_from: None,
             effort: None,
+            tui: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -1767,6 +1775,7 @@ mod tests {
             resume_session_id: None,
             resumed_from: None,
             effort: None,
+            tui: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,

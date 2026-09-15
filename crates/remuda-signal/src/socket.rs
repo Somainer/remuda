@@ -181,27 +181,65 @@ fn credential_matches(expected: &str, supplied: &str) -> bool {
         == 0
 }
 
+/// What became of one attempt to deliver an event.
+///
+/// The two failure modes are different answers, not one, and collapsing them
+/// is how an approval path goes wrong:
+///
+/// - [`Delivery::TimedOut`] — the Node was reached and simply never answered.
+///   Somebody may well be looking at a card right now, so a blocking event
+///   must **fail closed** here (§4.4: "timeout is always deny").
+/// - [`Delivery::Unreachable`] — there is no Node: no socket, connection
+///   refused, a malformed reply. Remuda is not in the loop at all, so the
+///   honest move is no opinion, which leaves the agent's own dialog as the
+///   single place the decision gets made.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Delivery {
+    /// The Node answered. May still be [`HookReply::empty`].
+    Replied(HookReply),
+    /// Reached the Node; it did not answer inside the budget.
+    TimedOut,
+    /// Never reached a Node.
+    Unreachable,
+}
+
+/// Send one event and report what became of it, bounded by `timeout`.
+///
+/// Callers that need to tell a timeout from an absent Node use this;
+/// [`send_event`] is the convenience wrapper for those that do not.
+pub async fn deliver_event(
+    socket: &Path,
+    envelope: &HookEnvelope,
+    timeout: std::time::Duration,
+) -> Delivery {
+    match tokio::time::timeout(timeout, exchange(socket, envelope)).await {
+        Ok(Ok(reply)) => Delivery::Replied(reply),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "hook relay send failed");
+            Delivery::Unreachable
+        }
+        Err(_) => {
+            tracing::debug!("hook relay timed out");
+            Delivery::TimedOut
+        }
+    }
+}
+
 /// Send one event and read the reply, bounded by `timeout`.
 ///
 /// On any failure — no socket, no Node, a Node that never answers — the caller
 /// gets [`HookReply::empty`] and the agent falls back to its own behaviour.
 /// A hook that fails must never be able to stall the agent the user is typing
-/// into.
+/// into. Use [`deliver_event`] when the difference between those failures
+/// matters.
 pub async fn send_event(
     socket: &Path,
     envelope: &HookEnvelope,
     timeout: std::time::Duration,
 ) -> HookReply {
-    match tokio::time::timeout(timeout, exchange(socket, envelope)).await {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(error)) => {
-            tracing::debug!(%error, "hook relay send failed");
-            HookReply::empty()
-        }
-        Err(_) => {
-            tracing::debug!("hook relay timed out; falling back to the agent's own prompt");
-            HookReply::empty()
-        }
+    match deliver_event(socket, envelope, timeout).await {
+        Delivery::Replied(reply) => reply,
+        Delivery::TimedOut | Delivery::Unreachable => HookReply::empty(),
     }
 }
 

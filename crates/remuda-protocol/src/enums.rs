@@ -241,6 +241,7 @@ wire_enum!(InteractionState, "2.6", {
 wire_enum!(InteractionCarrier, "2.6", {
     ClaudeControl => "claude-control",
     ClaudeHook => "claude-hook",
+    HarnessHook => "harness-hook",
     CodexRpc => "codex-rpc",
     AcpRpc => "acp-rpc",
     NativeTty => "native-tty",

@@ -560,6 +560,14 @@ export type ContentBlock = (TextBlock & ({
 /** ContentStatus wire values; `protocol.md` §5.2. */
 export type ContentStatus = ("queued" | "streaming" | "complete" | "interrupted" | "unknown");
 
+/** Context-size requirements of a task; §4.3. */
+export type ContextNeed = ({
+  "expectedInputTokens"?: (U64 | (null));
+  "needsLongContext"?: (boolean);
+  "repoScope"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** ConversationNode; `protocol.md` §7.3. */
 export type ConversationNode = (({
   "kind": "message";
@@ -624,6 +632,14 @@ export type DecisionOption = ({
 
 /** DeliveryState wire values; `protocol.md` §2.6. */
 export type DeliveryState = ("not-sent" | "intent-durable" | "written" | "confirmed" | "rejected" | "unknown");
+
+/** Result of reconciling a diff against a task's `owns[]`; design §4.3 (`scopeCheck.diffMustStayWithin: owns`) — the single highest-value new primitive (playbook), and the pure function the later merge gate calls. */
+export type DiffScopeCheck = ({
+  "checked": (number);
+  "violations"?: (((string))[]);
+  "within": (boolean);
+  [key: string]: unknown;
+});
 
 export type Digest = (string);
 
@@ -1314,6 +1330,7 @@ export type InstanceSpec = ({
   "requiredCapabilities": ((CapabilityName)[]);
   "schemaVersion": SchemaVersion;
   "settingsOverlay": SettingsOverlay;
+  "tui"?: (TuiMode | (null));
   "workspaceId": WorkspaceId;
   "worktree"?: (WorktreeSpec | (null));
   [key: string]: unknown;
@@ -1371,7 +1388,7 @@ export type InteractionAnsweredPayload = ({
 });
 
 /** InteractionCarrier wire values; `protocol.md` §2.6. */
-export type InteractionCarrier = ("claude-control" | "claude-hook" | "codex-rpc" | "acp-rpc" | "native-tty" | "unsupported");
+export type InteractionCarrier = ("claude-control" | "claude-hook" | "harness-hook" | "codex-rpc" | "acp-rpc" | "native-tty" | "unsupported");
 
 /** InteractionExpiredPayload; `protocol.md` §5.4. */
 export type InteractionExpiredPayload = ({
@@ -1915,6 +1932,21 @@ export type LiteralEnv = ({
   [key: string]: unknown;
 });
 
+/** The inherited owner-intent chain carried by every task; design §2.5. */
+export type Mandate = ({
+  "chain": ((MandateLink)[]);
+  [key: string]: unknown;
+});
+
+/** One edge of the inherited owner-intent chain.  Every delegation edge attaches the upstream's own words, so a depth-3 node still reads the owner's original instruction rather than a retelling. */
+export type MandateLink = ({
+  "depth": (number);
+  "intent": (string);
+  "taskId": TaskId;
+  "title": (string);
+  [key: string]: unknown;
+});
+
 /** MediaBlock; `protocol.md` §5.2. */
 export type MediaBlock = ({
   "anchor"?: (number | null);
@@ -2140,6 +2172,9 @@ export type MethodCall = (({
 
 /** MethodName wire values; `protocol.md` §7.2. */
 export type MethodName = ("runtime.hello" | "runtime.heartbeat" | "host.report" | "host.get" | "host.list" | "driver.list" | "driver.capabilities" | "workspace.register" | "workspace.get" | "workspace.list" | "worktree.create" | "worktree.remove" | "instance.create" | "instance.attach" | "instance.open_terminal" | "instance.resume" | "instance.send" | "instance.configure" | "instance.fork" | "instance.cancel" | "instance.close" | "instance.get" | "instance.list" | "command.get" | "command.list" | "run.get" | "run.list" | "run.wait" | "workflow.wait" | "interaction.list" | "interaction.get" | "interaction.respond" | "events.subscribe" | "events.read" | "events.ack" | "events.unsubscribe" | "reconcile.instance" | "tty.attach" | "tty.detach" | "tty.write" | "tty.resize" | "object.stat" | "object.read" | "object.prepare" | "object.write" | "object.commit");
+
+/** Model capability class used by `TaskSpec.minClass` and the catalog; §4.2. */
+export type ModelClass = ("cheap" | "workhorse" | "frontier");
 
 /** ModelEffective wire values; `protocol.md` §3.1. */
 export type ModelEffective = ("next-turn");
@@ -2549,6 +2584,12 @@ export type ObservedEffort = ({
   [key: string]: unknown;
 });
 
+/** One observed Codex `account/rateLimits/updated` frame, normalized; §4.2.  The Node does not relay these frames yet (r-p6); the REST `…/supply/events` path accepts this shape so the loop is wired end to end. */
+export type ObservedRateLimits = ({
+  "windows": ((RateLimitWindow)[]);
+  [key: string]: unknown;
+});
+
 /** OpaqueBlock; `protocol.md` §5.2. */
 export type OpaqueBlock = ({
   "nativeType": (string);
@@ -2620,6 +2661,31 @@ export type PermissionMode = (ClaudePermission & ({
   "kind": "generic";
   [key: string]: unknown;
 }));
+
+/** One placement-ledger row; design §2.2 ⑥/§5.6.  `reasons` / `rejected` are both the audit trail and the future bot card body — the two never diverge because there is no second representation. */
+export type PlacementLedgerRow = ({
+  "branch"?: (string | null);
+  "createdAt": Timestamp;
+  "createdBy": (string);
+  "harness"?: (string | null);
+  "hostId"?: (HostId | (null));
+  "id": Id;
+  "instanceId"?: (InstanceId | (null));
+  "kind": (string);
+  "model"?: (string | null);
+  "projectId": ProjectId;
+  "reasons"?: (((string))[]);
+  "rejected"?: ((PlacementRejection)[]);
+  "taskId": TaskId;
+  [key: string]: unknown;
+});
+
+/** One rejected candidate and why; design §4.4/§5.6. */
+export type PlacementRejection = ({
+  "candidate": (string);
+  "reason": (string);
+  [key: string]: unknown;
+});
 
 /** PlanReviewAnswer; `protocol.md` §5.4. */
 export type PlanReviewAnswer = ({
@@ -2952,6 +3018,21 @@ export type QuestionOption = ({
 export type QuestionRequest = ({
   "fields": ((QuestionField)[]);
   "title": (string);
+  [key: string]: unknown;
+});
+
+/** One rate-limit window — the Codex `RateLimitWindow` vocabulary (§4.2).  `appliesTo` is the field that makes fallback correct: `["*"]` is an account/session/weekly bucket a model switch cannot escape; `["<family>"]` is a family bucket a sibling family can dodge (§4.6). */
+export type RateLimitWindow = ({
+  "appliesTo": (((string))[]);
+  "backoffAttempts"?: (number);
+  "cooldownUntil"?: (number | null);
+  "id": (string);
+  "limit"?: (U64 | (null));
+  "observedAt"?: (number | null);
+  "resetsAt"?: (number | null);
+  "source": WindowSource;
+  "usedPercent"?: (number | null);
+  "windowDurationMins"?: (number | null);
   [key: string]: unknown;
 });
 
@@ -3430,6 +3511,9 @@ export type SendInput = (PromptInput & ({
   [key: string]: unknown;
 }));
 
+/** Generic low/normal/high sensitivity knob. */
+export type Sensitivity = ("low" | "normal" | "high");
+
 /** SettingsFormat wire values; `protocol.md` §4.1. */
 export type SettingsFormat = ("claude-json" | "codex-toml" | "grok-toml" | "agy-json" | "none");
 
@@ -3494,6 +3578,14 @@ export type SourceCursor = (StreamCursor & ({
 /** SourceDelivery wire values; `protocol.md` §5.1. */
 export type SourceDelivery = ("live" | "replay" | "unknown");
 
+/** Spend-control panel numbers (billing-site data, never inferred); §4.2. */
+export type SpendControl = ({
+  "limit"?: (string | null);
+  "remainingPercent"?: (number | null);
+  "used"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** StateConfidence wire values; `protocol.md` §2.4. */
 export type StateConfidence = ("confirmed" | "unknown");
 
@@ -3520,7 +3612,122 @@ export type SubscriptionParams = ({
   [key: string]: unknown;
 });
 
+/** Account-level concurrency ceiling; §4.4 step 2 — the primitive that was entirely missing while only host `maxInstances` existed. */
+export type SupplyConcurrency = ({
+  "max"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** Subscription/credits presence; §4.2. */
+export type SupplyCredits = ({
+  "hasCredits"?: (boolean | null);
+  "unlimited"?: (boolean);
+  [key: string]: unknown;
+});
+
+/** Declared supply plus observed state for one provider profile; §4.2.  Every field is optional/defaulted so a user can declare as little as "workhorse: X, scarce: Y" and grow from there. Observed runtime fields (`state`, `cooldownUntil`, `lastError`, window cooldowns) are written by the Hub feedback loop, never by the user. */
+export type SupplyProfile = ({
+  "concurrency": SupplyConcurrency;
+  "cooldownUntil"?: (number | null);
+  "credits"?: (SupplyCredits | (null));
+  "dailyUsd"?: (number | null);
+  "lastError"?: (string | null);
+  "ordinaryUsageAllowed"?: (boolean | null);
+  "priority"?: (number);
+  "reserve": SupplyReserve;
+  "resetWindowMins"?: (number | null);
+  "spendControl"?: (SpendControl | (null));
+  "state": SupplyState;
+  "weeklyUsd"?: (number | null);
+  "windows"?: ((RateLimitWindow)[]);
+  [key: string]: unknown;
+});
+
+/** Who may spend a supply; §4.2 (`reserve`). */
+export type SupplyReserve = ("none" | "coordinator-only");
+
+/** Account-level supply state; §4.2. */
+export type SupplyState = ("available" | "degraded" | "cooling" | "exhausted" | "unknown");
+
+/** One row of the task ledger; design §2.2/§8.1 row 4. */
+export type Task = ({
+  "blockedReason"?: (string | null);
+  "budget": TaskBudget;
+  "class": TaskClass;
+  "createdAt": Timestamp;
+  "deps"?: ((TaskDep)[]);
+  "id": TaskId;
+  "landedSha"?: (string | null);
+  "mandate": Mandate;
+  "owns"?: (((string))[]);
+  "parentTaskId"?: (TaskId | (null));
+  "placement"?: (TaskPlacementRef | (null));
+  "projectId": ProjectId;
+  "revision": U64;
+  "state": TaskState;
+  "title": (string);
+  "updatedAt": Timestamp;
+  [key: string]: unknown;
+});
+
+/** Estimated budget envelope; design §4.3. Amounts are estimates (§4.5). */
+export type TaskBudget = ({
+  "maxTurns"?: (number | null);
+  "maxUsd"?: (number | null);
+  "maxWallMins"?: (number | null);
+  [key: string]: unknown;
+});
+
+/** TaskClass wire values; `protocol.md` §4.3. */
+export type TaskClass = ("research" | "implement" | "review" | "test" | "merge-gate" | "triage" | "docs");
+
+/** One dependency edge. Edges unlock only when the referenced task carries a landed sha (invariant I1, design §7 #8). */
+export type TaskDep = ({
+  "note"?: (string | null);
+  "taskId": TaskId;
+  [key: string]: unknown;
+});
+
 export type TaskId = (string);
+
+/** Explicit pin that disables automatic supply choice; §4.3. */
+export type TaskPin = ({
+  "harness"?: (string | null);
+  "model"?: (string | null);
+  "supplyId"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** Where the task's worker is (or was) placed; updated from placement rows. */
+export type TaskPlacementRef = ({
+  "branch"?: (string | null);
+  "hostId"?: (HostId | (null));
+  "instanceId"?: (InstanceId | (null));
+  "model"?: (string | null);
+  "placementId"?: (Id | (null));
+  [key: string]: unknown;
+});
+
+/** What a coordinator submits at dispatch/instance-create; §4.3.  Carried additively on the instance create body as `taskSpec`. Only `class`/sensitivities are LLM assignments; the rest is planner bookkeeping. */
+export type TaskSpec = ({
+  "allowDowngrade"?: (boolean);
+  "budget"?: (TaskBudget | (null));
+  "class": TaskClass;
+  "contextNeed": ContextNeed;
+  "costSensitivity": Sensitivity;
+  "effort"?: (string | null);
+  "latencySensitivity": Sensitivity;
+  "minClass"?: (ModelClass | (null));
+  "parent"?: (TaskId | (null));
+  "pin"?: (TaskPin | (null));
+  "projectId"?: (ProjectId | (null));
+  "requires"?: (((string))[]);
+  "taskId"?: (TaskId | (null));
+  [key: string]: unknown;
+});
+
+/** TaskState wire values; `protocol.md` §2.2/5.3. */
+export type TaskState = ("pending" | "placed" | "running" | "stalled" | "done" | "failed" | "parked" | "deferred");
 
 /** TerminalEvidence; `protocol.md` §2.4. */
 export type TerminalEvidence = ({
@@ -3741,6 +3948,9 @@ export type TtyWriterLease = ({
   [key: string]: unknown;
 });
 
+/** Claude renderer requested at launch (D-028 §9.2).  This is intent only; the terminal snapshot's `altScreen` reports the observed screen state after Claude applies platform and accessibility rules. */
+export type TuiMode = ("fullscreen" | "default");
+
 export type U64 = (string);
 
 /** UrlLocator; `protocol.md` §5.5. */
@@ -3777,6 +3987,9 @@ export type UsageScope = ("message" | "turn" | "session" | "workflow-member");
 
 /** WaitReason wire values; `protocol.md` §7.2. */
 export type WaitReason = ("condition-met" | "timeout" | "unknown");
+
+/** Where a window's numbers came from; §4.1.  Observed frames update `observed` fields but never erase a `declared` limit; `inferred` is filled by Hub-side usage aggregation (§4.5). */
+export type WindowSource = ("declared" | "observed" | "inferred");
 
 /** WorkflowEngine wire values; `protocol.md` §5.3. */
 export type WorkflowEngine = ("claude-workflow");

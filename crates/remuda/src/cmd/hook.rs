@@ -8,10 +8,12 @@
 //! Three properties matter more than anything else here, because this process
 //! sits between a human's keystroke and the agent responding to it:
 //!
-//! 1. **It never fails the agent.** A missing socket, a stopped Node, a Node
-//!    that never answers — all print `{}` and exit 0, which every hook event
-//!    reads as "no opinion". The agent then does exactly what it would have
-//!    done without Remuda.
+//! 1. **It never fails the agent.** A missing socket or a stopped Node prints
+//!    `{}` and exits 0, which every hook event reads as "no opinion": the agent
+//!    does exactly what it would have done without Remuda. The one deliberate
+//!    exception is a *blocking* event that reached the Node and got no answer
+//!    in time — see [`decide`], where §4.4's fail-closed rule makes that a deny
+//!    rather than a shrug.
 //! 2. **The wait is bounded.** Blocking events wait up to the interaction
 //!    broker's TTL; everything else gets a short wait, because a
 //!    fire-and-forget event has nothing worth waiting for.
@@ -22,7 +24,9 @@
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use remuda_signal::{BLOCKING_WAIT, HookEnvelope, event::is_blocking, send_event};
+use remuda_signal::{
+    BLOCKING_WAIT, Delivery, HookDecision, HookEnvelope, deliver_event, event::is_blocking,
+};
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -124,6 +128,7 @@ fn emit(args: EmitArgs) -> Result<i32> {
         .timeout_ms
         .map(Duration::from_millis)
         .unwrap_or_else(|| wait_for(&args.event));
+    let event = args.event.clone();
     let envelope = HookEnvelope {
         credential,
         event: args.event,
@@ -136,11 +141,33 @@ fn emit(args: EmitArgs) -> Result<i32> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let reply = runtime.block_on(send_event(&args.socket, &envelope, timeout));
-    println!("{}", reply.to_hook_json());
+    let delivery = runtime.block_on(deliver_event(&args.socket, &envelope, timeout));
+    println!("{}", decide(&event, delivery));
     // Always 0: a non-zero exit from a hook is a signal to the harness, and
     // "Remuda could not be reached" is not something the agent should act on.
     Ok(0)
+}
+
+/// What the relay prints, given what became of the delivery.
+///
+/// The three outcomes are deliberately not the same answer:
+///
+/// - **Replied** — print it verbatim, whatever it is. A `{}` from the Node is
+///   the Node declining to have an opinion, which is its right.
+/// - **TimedOut on a blocking event** — print a deny. The Node was *there* and
+///   a human may be staring at a card; §4.4 requires an approval nobody
+///   answered in time to fail closed rather than hang or default to allow.
+/// - **Unreachable** — print `{}`. Remuda is not in the loop, so the agent's
+///   own dialog is the only place a decision can be made, and denying here
+///   would break every tool call on a host whose Node merely stopped.
+///
+/// A non-blocking event never denies: there is nothing to refuse.
+fn decide(event: &str, delivery: Delivery) -> serde_json::Value {
+    match delivery {
+        Delivery::Replied(reply) => reply.to_hook_json(),
+        Delivery::TimedOut if is_blocking(event) => HookDecision::timed_out().to_hook_json(event),
+        Delivery::TimedOut | Delivery::Unreachable => serde_json::json!({}),
+    }
 }
 
 /// Wait budget for one event.
@@ -199,6 +226,69 @@ mod tests {
             let wait = wait_for(event);
             assert_eq!(wait, NONBLOCKING_WAIT, "{event}");
             assert!(wait < BLOCKING_WAIT);
+        }
+    }
+
+    #[test]
+    fn a_reply_is_printed_verbatim_including_an_empty_one() {
+        // `{}` from the Node is the Node declining to have an opinion.
+        let reply = remuda_signal::HookReply {
+            decision: Some(serde_json::json!({"hookSpecificOutput": {"x": 1}})),
+        };
+        assert_eq!(
+            decide("PermissionRequest", Delivery::Replied(reply)),
+            serde_json::json!({"hookSpecificOutput": {"x": 1}})
+        );
+        assert_eq!(
+            decide(
+                "PermissionRequest",
+                Delivery::Replied(remuda_signal::HookReply::empty())
+            ),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn an_approval_nobody_answered_in_time_denies() {
+        // §4.4 fail-closed. Printing `{}` here would drop the agent onto its
+        // own dialog with no one watching, and an allow would run a tool
+        // nobody approved.
+        let json = decide("PermissionRequest", Delivery::TimedOut);
+        assert_eq!(
+            json["hookSpecificOutput"]["decision"]["behavior"], "deny",
+            "{json}"
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_elicitation_also_denies() {
+        let json = decide("Elicitation", Delivery::TimedOut);
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "Elicitation");
+        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "deny");
+    }
+
+    #[test]
+    fn an_absent_node_leaves_the_decision_to_the_agents_own_dialog() {
+        // Remuda is not in the loop; denying every tool call because the Node
+        // stopped would make a dead Node look like a hostile one.
+        assert_eq!(
+            decide("PermissionRequest", Delivery::Unreachable),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn a_non_blocking_event_never_denies() {
+        // There is nothing to refuse, and a deny-shaped reply to `Stop` would
+        // be read as a decision about something.
+        for event in ["SessionStart", "Stop", "MessageDisplay"] {
+            for delivery in [Delivery::TimedOut, Delivery::Unreachable] {
+                assert_eq!(decide(event, delivery), serde_json::json!({}), "{event}");
+            }
         }
     }
 }

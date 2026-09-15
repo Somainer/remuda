@@ -248,13 +248,12 @@ pub async fn materialize(
             .digest
             .as_deref()
             .filter(|value| !value.is_empty())
+            && expected != digest
         {
-            if expected != digest {
-                return Err(NodeError::InvalidRequest(format!(
-                    "attachment {} failed integrity check: digest {digest} != manifest {expected}",
-                    reference.object_id
-                )));
-            }
+            return Err(NodeError::InvalidRequest(format!(
+                "attachment {} failed integrity check: digest {digest} != manifest {expected}",
+                reference.object_id
+            )));
         }
         let name = landing_name(reference)?;
         let file_name = collision_free_name(&dir, &mut claimed, &name, &reference.object_id)?;

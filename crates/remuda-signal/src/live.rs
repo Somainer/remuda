@@ -145,6 +145,13 @@ pub struct LiveState {
     /// Tool calls already reported finished, so a later `PostToolBatch`
     /// cannot emit a second result.
     finished: HashSet<String>,
+    /// Backgrounded subagent launches still awaiting their real completion,
+    /// keyed by the harness `agentId`. The launch's PostToolUse is a
+    /// `Partial` result (the subagent keeps running); a matching
+    /// `SubagentStop` — or the transcript's task-notification — closes it.
+    bg_agents: std::collections::HashMap<String, String>,
+    /// Native tool ids holding a background launch whose row is still running.
+    bg_open: HashSet<String>,
     /// The phase currently latched, so a repeated hook is not a new transition.
     current: Option<Phase>,
     /// Anchor of the latched phase; later chunks of one episode share it.
@@ -179,6 +186,15 @@ impl LiveState {
         now: &str,
         allowed: bool,
     ) -> LiveFold {
+        // SubagentStop is never turn evidence (no phase), but closing a task
+        // row is not a turn transition: when the agent id matches a
+        // backgrounded subagent still awaiting completion, emit the final
+        // ToolResult onto its launch node. This is the hook-channel twin of
+        // the transcript's `<task-notification>` fold; whichever channel
+        // arrives first closes the row.
+        if event.name == "SubagentStop" {
+            return self.subagent_stop(event, allowed);
+        }
         let Some(phase) = phase(event, mapped.kind) else {
             return LiveFold::default();
         };
@@ -307,9 +323,10 @@ impl LiveState {
         fold: &mut LiveFold,
     ) {
         // PostToolUse always precedes PostToolBatch for the same call. A
-        // summary for an already-finished call is the same transition, so it
-        // carries no phase tag and no result.
-        if self.finished.contains(native_id) {
+        // summary for an already-finished call (or an async launch whose
+        // Partial already emitted) is the same transition, so it carries no
+        // phase tag and no result.
+        if self.finished.contains(native_id) || self.bg_open.contains(native_id) {
             return;
         }
         self.phase_tags(
@@ -329,10 +346,95 @@ impl LiveState {
         let was_open = self.open.remove(native_id);
         if allowed {
             fold.extras
-                .push(self.tool_result(native_id, response, failed, was_open, event));
+                .push(self.tool_result(native_id, tool_name, response, failed, was_open, event));
+        }
+        if let Some(agent_id) = async_agent_id(tool_name, response) {
+            // Background subagent launch: the immediate PostToolUse is not the
+            // subagent's completion. Keep the row alive (do not mark finished)
+            // and remember the agentId so a later SubagentStop closes it.
+            self.bg_agents.insert(agent_id, native_id.to_owned());
+            self.bg_open.insert(native_id.to_owned());
+            // Do NOT add to `finished`: another result (SubagentStop /
+            // task-notification transcript fold) must close this node.
+            fold.transition = self.latch(phase, now);
+            return;
         }
         self.finished.insert(native_id.to_owned());
         fold.transition = self.latch(phase, now);
+    }
+
+    /// Fold a `SubagentStop` into the background task row it closes.
+    ///
+    /// Never turn evidence: no phase is latched, no `related` tags touch the
+    /// raw lifecycle (the caller's `classify` keeps this event `Diagnostic`).
+    /// Closing a task row is a tool mutation, not a turn transition — the
+    /// "SubagentStop is never turn evidence" rule holds for the turn phase.
+    fn subagent_stop(&mut self, event: &HookEvent, allowed: bool) -> LiveFold {
+        let mut fold = LiveFold::default();
+        if !allowed {
+            return fold;
+        }
+        let Some(agent_id) = event.text("agent_id") else {
+            return fold;
+        };
+        let Some(native_id) = self.bg_agents.remove(agent_id) else {
+            // A foreground subagent's SubagentStop also fires, but its row was
+            // closed normally by the launch result; nothing to do.
+            return fold;
+        };
+        self.bg_open.remove(&native_id);
+        self.finished.insert(native_id.clone());
+        fold.extras
+            .push(self.subagent_result(&native_id, agent_id, event));
+        fold
+    }
+
+    /// The final result a `SubagentStop` folds onto a background launch node.
+    fn subagent_result(
+        &self,
+        native_id: &str,
+        agent_id: &str,
+        event: &HookEvent,
+    ) -> ObservationPayload {
+        let node = tool_node_id(&self.scope, native_id)
+            .unwrap_or_else(|| Id::new("obj").expect("obj prefix"));
+        // No outcome field on SubagentStop (claude-channels §1.2: the terminal
+        // status is deliberately absent); a subagent that reached Stop without
+        // an error is treated as succeeded. Killed/failed completions reach the
+        // task-notification fold with their real status instead.
+        let text = event
+            .text("last_assistant_message")
+            .unwrap_or_default()
+            .to_owned();
+        let mut structured = serde_json::Map::new();
+        structured.insert("agentId".into(), Value::String(agent_id.to_owned()));
+        ObservationPayload::ToolResult(Box::new(ToolResultPayload {
+            mutation: NodeMutation {
+                node_id: node.clone(),
+                // Shared revision convention for one tool node across all
+                // channels: call open 1 / close 2, async launch result 3,
+                // SubagentStop completion 4. The transcript's
+                // `<task-notification>` completion is revision 5, so when both
+                // channels are present the notification (which carries the
+                // authoritative status, e.g. killed) outranks this result.
+                revision: U64(4),
+                operation: MutationOperation::Close,
+                base_revision: Some(U64(3)),
+            },
+            tool_call_id: node,
+            stage: ResultStage::Final,
+            outcome: ToolOutcome::Succeeded,
+            blocks: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text(Box::new(TextBlock { text }))]
+            },
+            structured_result: Knowledge::Known {
+                value: Value::Object(structured),
+            },
+            exit_code: Knowledge::NotApplicable,
+            changes: Vec::new(),
+        }))
     }
 
     fn latch(&mut self, phase: Phase, now: &str) -> bool {
@@ -378,6 +480,7 @@ impl LiveState {
     fn tool_result(
         &self,
         native_id: &str,
+        tool_name: Option<&str>,
         response: Option<&Value>,
         failed: bool,
         was_open: bool,
@@ -395,12 +498,20 @@ impl LiveState {
             ToolOutcome::Succeeded
         };
         let text = response.map(tool_response_text).unwrap_or_default();
-        // A result whose open we saw closes revision 2; an orphan result
-        // (missed/batch-only) matches the transcript mapper's rev-1 close.
-        let (revision, base_revision) = if was_open {
-            (U64(2), Some(U64(1)))
+        // A background subagent launch returns immediately ("agent started in
+        // background"); the launch result is `Partial` at revision 3 (the call
+        // owns 1–2, matching the transcript mapper) and a SubagentStop /
+        // task-notification closes it at revision 4.
+        let async_launch = async_agent_id(tool_name, response).is_some() && !failed;
+        let (revision, base_revision, stage) = if async_launch {
+            (U64(3), Some(U64(2)), ResultStage::Partial)
+        } else if was_open {
+            // A result whose open we saw closes revision 2.
+            (U64(2), Some(U64(1)), ResultStage::Final)
         } else {
-            (U64(1), None)
+            // An orphan result (missed/batch-only) matches the transcript
+            // mapper's rev-1 close.
+            (U64(1), None, ResultStage::Final)
         };
         ObservationPayload::ToolResult(Box::new(ToolResultPayload {
             mutation: NodeMutation {
@@ -410,7 +521,7 @@ impl LiveState {
                 base_revision,
             },
             tool_call_id: node,
-            stage: ResultStage::Final,
+            stage,
             outcome,
             blocks: if text.is_empty() {
                 Vec::new()
@@ -543,6 +654,33 @@ fn response_interrupted(response: &Value) -> bool {
         .get("interrupted")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Extract the background subagent's `agentId` from a Task/Agent launch
+/// response, when the call started a backgrounded subagent.
+///
+/// The PostToolUse `tool_response` mirrors the transcript's `toolUseResult`:
+/// `{isAsync: true, status: "async_launched", agentId: "acf1…"}`. Only the
+/// Agent/Task tool can launch one; other tools' JSON is left alone.
+fn async_agent_id(tool_name: Option<&str>, response: Option<&Value>) -> Option<String> {
+    let name = tool_name.unwrap_or("");
+    if name != "Task" && name != "Agent" {
+        return None;
+    }
+    let value = response?;
+    let async_launch = value.get("isAsync").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("async_launched" | "launched" | "backgrounded")
+        );
+    if !async_launch {
+        return None;
+    }
+    value
+        .get("agentId")
+        .or_else(|| value.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Best-effort exit code from a tool response.

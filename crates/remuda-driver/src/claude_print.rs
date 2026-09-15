@@ -154,6 +154,15 @@ struct NativeIds {
     tools: HashMap<String, Id>,
     workflows: HashMap<String, Id>,
     phases: HashMap<String, Id>,
+    /// Per-native-tool result revision. The tool call occupies revisions
+    /// 1 (open) and 2 (block close); the first ToolResult is revision 3 and a
+    /// background completion is revision 4. Monotonic revisions are what let
+    /// the hook relay and this transcript tailer overwrite one another's
+    /// same-node payloads instead of being rejected as stale (and what let a
+    /// later final replace the launch's `Partial` result).
+    tool_result_rev: HashMap<String, u64>,
+    /// Instance id scope for [`Id::derive`], set when the mapper knows it.
+    scope: Option<String>,
 }
 
 impl NativeIds {
@@ -171,9 +180,37 @@ impl NativeIds {
         if let Some(id) = self.tools.get(native) {
             return Ok(id.clone());
         }
-        let id = Id::new("obj")?;
+        // Deterministic on (instance scope, native tool_use_id) so the hook
+        // relay's Pre/PostToolUse observations and this transcript replay fold
+        // onto one node (live-view design §2.3); random ids would draw a second
+        // card whenever both channels are present (promoted shell-pty).
+        let id = match &self.scope {
+            Some(scope) => Id::derive("obj", scope, native)?,
+            None => Id::new("obj")?,
+        };
         self.tools.insert(native.to_owned(), id.clone());
         Ok(id)
+    }
+
+    /// Next ToolResult revision for the first result on a native tool id. The
+    /// call owns revisions 1–2; the first result — a normal Final, or the
+    /// background launch's Partial — sits at revision 3. The hook SubagentStop
+    /// completion is revision 4 and the transcript `<task-notification>` is a
+    /// fixed revision 5 (it carries the authoritative terminal status).
+    fn tool_result_revision(&mut self, native: &str) -> U64 {
+        let rev = self.tool_result_rev.entry(native.to_owned()).or_insert(2);
+        *rev += 1;
+        U64(*rev)
+    }
+
+    /// Build id tables whose tool ids derive deterministically from the instance
+    /// scope, matching the hook relay's `Id::derive("obj", instance, native)`
+    /// (live-view design §2.3).
+    fn scoped(scope: impl Into<String>) -> Self {
+        Self {
+            scope: Some(scope.into()),
+            ..Self::default()
+        }
     }
 
     fn workflow(&mut self, native: &str) -> DriverResult<Id> {
@@ -894,6 +931,9 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
     let mut out = Vec::new();
     match &msg.message.content {
         UserContent::Text(text) => {
+            // An injected task-notification can arrive as a bare string too;
+            // fold it before the human-shaped copy is rendered.
+            out.extend(task_notification_results(mapper, text)?);
             out.push(user_text_message(
                 mapper,
                 msg.uuid.as_deref(),
@@ -920,37 +960,49 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         let id = mapper.ids.tool(tool_use_id)?;
-                        let (result_id, revision, operation) =
-                            mapper.ids.message(&format!("tool-result:{tool_use_id}"))?;
                         let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
                         let text = match block.get("content") {
                             Some(Value::String(s)) => s.clone(),
                             Some(other) => other.to_string(),
                             None => String::new(),
                         };
+                        // A backgrounded (or build-deferred) subagent's launch
+                        // tool_result is written *immediately* with
+                        // `toolUseResult.isAsync`; the real completion arrives
+                        // later as an injected `<task-notification>` user
+                        // record. Mark the launch `Partial` so the task row
+                        // stays running (and the web shows "running in
+                        // background"); the notification closes it for real.
+                        let async_launch = remuda_protocol::tool_result_is_async_launch(
+                            msg.tool_use_result.as_ref(),
+                        );
+                        let revision = mapper.ids.tool_result_revision(tool_use_id);
                         out.push(mapper.observation(
                             Completeness::Structured,
                             NativeRequestKey::None,
                             ObservationPayload::ToolResult(Box::new(ToolResultPayload {
                                 mutation: NodeMutation {
-                                    node_id: result_id,
+                                    node_id: id.clone(),
                                     revision,
-                                    operation: if operation == MutationOperation::Open {
-                                        operation
-                                    } else {
-                                        MutationOperation::Replace
-                                    },
-                                    base_revision: (revision.0 > 1).then_some(U64(revision.0 - 1)),
+                                    operation: MutationOperation::Close,
+                                    base_revision: Some(U64(revision.0 - 1)),
                                 },
                                 tool_call_id: id,
-                                stage: ResultStage::Final,
+                                stage: if async_launch && !is_error {
+                                    ResultStage::Partial
+                                } else {
+                                    ResultStage::Final
+                                },
                                 outcome: if is_error {
                                     ToolOutcome::Failed
                                 } else {
                                     ToolOutcome::Succeeded
                                 },
                                 blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
-                                structured_result: Knowledge::NotApplicable,
+                                structured_result: match msg.tool_use_result.clone() {
+                                    Some(value) => Knowledge::Known { value },
+                                    None => Knowledge::NotApplicable,
+                                },
                                 exit_code: Knowledge::NotApplicable,
                                 changes: Vec::new(),
                             })),
@@ -958,6 +1010,12 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                     }
                     _ => {}
                 }
+            }
+            // Task-notification text rides alongside tool results in the same
+            // user record on some builds; fold every one before emitting the
+            // joined human-readable text message.
+            for text in &texts {
+                out.extend(task_notification_results(mapper, text)?);
             }
             if !texts.is_empty() {
                 out.push(user_text_message(
@@ -969,6 +1027,64 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
         }
     }
     Ok(out)
+}
+
+/// Turn an injected `<task-notification>` text block into the final
+/// ToolResult that closes the background subagent's task row.
+///
+/// Returns zero observations when the text is not a notification or carries no
+/// `<tool-use-id>` (a background shell command with no tool row to fold onto).
+/// The message itself is still rendered by the caller.
+fn task_notification_results(mapper: &mut Mapper, text: &str) -> DriverResult<Vec<Observation>> {
+    let Some(note) = remuda_protocol::TaskNotification::parse(text) else {
+        return Ok(Vec::new());
+    };
+    let Some(native_tool_id) = note.tool_use_id.clone().filter(|id| !id.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let id = mapper.ids.tool(&native_tool_id)?;
+    // Fixed revision 5: call 1–2, launch result 3, hook SubagentStop 4, and
+    // this authoritative notification (it carries the real status, including
+    // killed/failed) 5 — so it always outranks a same-node SubagentStop.
+    let revision = U64(5);
+    let outcome = note.outcome();
+    let status = note.status.clone();
+    let task_id = note.task_id.clone();
+    let summary = note.summary.clone();
+    let body = note
+        .result
+        .clone()
+        .or_else(|| note.summary.clone())
+        .unwrap_or_default();
+    Ok(vec![mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::ToolResult(Box::new(ToolResultPayload {
+            mutation: NodeMutation {
+                node_id: id.clone(),
+                revision,
+                operation: MutationOperation::Close,
+                base_revision: Some(U64(4)),
+            },
+            tool_call_id: id,
+            stage: ResultStage::Final,
+            outcome,
+            blocks: if body.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text(Box::new(TextBlock { text: body }))]
+            },
+            structured_result: Knowledge::Known {
+                value: serde_json::json!({
+                    "taskId": task_id,
+                    "status": status,
+                    "summary": summary,
+                }),
+            },
+            exit_code: Knowledge::NotApplicable,
+            changes: Vec::new(),
+        })),
+    )?])
 }
 
 fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<Observation>> {
@@ -1773,7 +1889,9 @@ fn tool_category(name: &str) -> ToolCategory {
         "Write" | "Edit" => ToolCategory::FileWrite,
         "Grep" | "Glob" => ToolCategory::Search,
         "Workflow" => ToolCategory::Workflow,
-        "Task" => ToolCategory::Agent,
+        // 2.1.x renamed Task to Agent; both spellings must classify as Agent so
+        // the structured view's task track collects the row.
+        "Task" | "Agent" => ToolCategory::Agent,
         other if other.starts_with("mcp__") => ToolCategory::Mcp,
         _ => ToolCategory::Other,
     }
@@ -1838,7 +1956,7 @@ impl TranscriptMapper {
         Self {
             mapper: Mapper {
                 stream: stream::StreamState::default(),
-                ids: NativeIds::default(),
+                ids: NativeIds::scoped(instance_id.as_id().as_str()),
                 seq: 0,
                 instance_id,
                 run_id,
@@ -1926,6 +2044,12 @@ impl TranscriptMapper {
                 };
                 frame.insert(wire.into(), found.clone());
             }
+        }
+        // The launch sidecar (`isAsync` / `async_launched` / `agentId`) is what
+        // distinguishes an immediate background-launch tool_result from the
+        // subagent's real completion; the wire frame spells it `tool_use_result`.
+        if let Some(sidecar) = value.get("toolUseResult") {
+            frame.insert("tool_use_result".into(), sidecar.clone());
         }
         // The link from a result back to its call. `parentToolUseId` — what this
         // mapper used to read — does not occur in a transcript at all (0 hits);

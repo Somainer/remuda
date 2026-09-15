@@ -145,6 +145,32 @@ pub struct ToolSpec {
     /// Mark the result an error (default false).
     #[serde(default)]
     pub is_error: Option<bool>,
+    /// Script this call as a backgrounded Agent launch: the tool result and
+    /// PostToolUse response return immediately with
+    /// `{isAsync:true,status:"async_launched",agentId}`, and a
+    /// `<task-notification>` for the same tool call is enqueued and delivered
+    /// after the turn ends (with a `SubagentStop` hook), carrying
+    /// `async_status` / `async_result`. Reproduces the c-tasktrack lifecycle.
+    #[serde(default)]
+    pub async_agent: Option<AsyncAgent>,
+}
+
+/// A backgrounded Agent launch and its later completion.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct AsyncAgent {
+    /// Harness agentId surfaced in the launch result. Defaults to a fixed id.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Completion `<status>`: `completed` (default), `killed`, `failed`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Completion `<result>` body.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// Completion `<summary>` line.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 impl ToolSpec {

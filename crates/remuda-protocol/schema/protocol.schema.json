@@ -16409,6 +16409,48 @@
       "pattern": "^(tsk)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "TaskNotification": {
+      "description": "One parsed `<task-notification>` body.",
+      "properties": {
+        "result": {
+          "description": "`<result>` body when present (the subagent's final report).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Raw `<status>` spelling (`completed` / `killed` / `failed` / …).",
+          "type": "string"
+        },
+        "summary": {
+          "description": "`<summary>` when present (one human-readable line).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "description": "`<task-id>` — the background task / subagent agentId (16 hex for a\nsubagent, `bsl…` for a background shell command).",
+          "type": "string"
+        },
+        "tool_use_id": {
+          "description": "`<tool-use-id>` — the native `tool_use_id` of the launch call. Present\non 2.1.221+; older records can omit it, in which case the completion\ncannot be folded onto a tool row.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "task_id",
+        "tool_use_id",
+        "status",
+        "summary",
+        "result"
+      ],
+      "type": "object"
+    },
     "TaskPin": {
       "description": "Explicit pin that disables automatic supply choice; §4.3.",
       "properties": {

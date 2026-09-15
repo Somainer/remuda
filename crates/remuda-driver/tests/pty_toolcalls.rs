@@ -95,11 +95,11 @@ fn an_interleaved_tool_turn_hydrates_every_block_in_order() {
             "message:close",
             "toolCall:open",
             "toolCall:close",
-            "toolResult:open",
+            "toolResult:close",
             // The second tool is a separate assistant record with its own id.
             "toolCall:open",
             "toolCall:close",
-            "toolResult:open",
+            "toolResult:close",
             // A user text block that is not a tool_result is still a message.
             "message:open",
             // The final reply, released by the end-of-batch flush.

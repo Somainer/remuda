@@ -302,10 +302,12 @@ fn tool_json_deltas_reconcile_snapshot_and_result_without_reopening_call() {
         })
         .collect();
     assert_eq!(results.len(), 1);
+    // c-tasktrack: a tool_result folds onto the same node as its call (the
+    // deterministic derived tool id), so the task track can pair call/result.
     assert_eq!(results[0].tool_call_id, calls[0].tool_call_id);
-    assert_ne!(results[0].mutation.node_id, calls[0].mutation.node_id);
-    assert_eq!(results[0].mutation.operation, MutationOperation::Open);
-    assert_eq!(results[0].mutation.revision, U64(1));
+    assert_eq!(results[0].mutation.node_id, calls[0].mutation.node_id);
+    assert_eq!(results[0].mutation.operation, MutationOperation::Close);
+    assert_eq!(results[0].mutation.revision, U64(3));
     assert_eq!(results[0].outcome, ToolOutcome::Succeeded);
 }
 

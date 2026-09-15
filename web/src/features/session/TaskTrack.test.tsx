@@ -5,7 +5,12 @@ import { known, unknownKnowledge, type Id } from "../../types/wire";
 import type { ToolNode } from "./assemble";
 import { TaskTrack } from "./TaskTrack";
 
-function task(idVal: string, prompt: string, outcome?: "succeeded" | "failed" | "denied"): ToolNode {
+function task(
+  idVal: string,
+  prompt: string,
+  outcome?: "succeeded" | "failed" | "denied",
+  stage: "final" | "partial" = "final",
+): ToolNode {
   return {
     type: "tool",
     id: idVal,
@@ -36,7 +41,7 @@ function task(idVal: string, prompt: string, outcome?: "succeeded" | "failed" | 
             operation: "close",
             baseRevision: null,
             toolCallId: idVal as Id,
-            stage: "final",
+            stage,
             outcome,
             blocks: [],
             structuredResult: unknownKnowledge("text"),
@@ -93,5 +98,23 @@ describe("TaskTrack", () => {
     expect(items[3]?.textContent).toContain("denied");
     // Failed outcomes take the warning class so they read as problems.
     expect(container.querySelector('[data-task-outcome="failed"] span:last-child')?.className).not.toHaveLength(0);
+  });
+
+  it("marks a launched background subagent as running in background until its final result", () => {
+    // Launch returns immediately with a partial result (agentId); completion
+    // folds a final result later. The row must read "running in background"
+    // in between, never "succeeded".
+    const { rerender } = render(
+      <TaskTrack tasks={[task("bg", "background work", "succeeded", "partial")]} />,
+    );
+    let item = screen.getByTestId("task-track-item");
+    expect(item.getAttribute("data-task-outcome")).toBe("background");
+    expect(item.textContent).toContain("running in background");
+    expect(item.textContent).not.toContain("succeeded");
+
+    rerender(<TaskTrack tasks={[task("bg", "background work", "succeeded", "final")]} />);
+    item = screen.getByTestId("task-track-item");
+    expect(item.getAttribute("data-task-outcome")).toBe("succeeded");
+    expect(item.textContent).not.toContain("running in background");
   });
 });

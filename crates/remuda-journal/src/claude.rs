@@ -348,6 +348,11 @@ fn map_user(
     }
     match content {
         Value::String(text) => {
+            // A background subagent completion is injected as its own
+            // `<task-notification>` user record; close the launch row first.
+            out.extend(task_notification_results(
+                ctx, ids, value, line, cursor, &text,
+            )?);
             out.push(user_message(
                 ctx,
                 ids,
@@ -381,6 +386,12 @@ fn map_user(
                         uuid.clone(),
                     )?);
                 }
+            }
+            // A notification can also ride alongside tool results in one array.
+            for text in &texts {
+                out.extend(task_notification_results(
+                    ctx, ids, value, line, cursor, text,
+                )?);
             }
             if !texts.is_empty() {
                 out.push(user_message(
@@ -1001,7 +1012,18 @@ fn tool_result(
         .get("is_error")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // `toolUseResult` is the sidecar Claude writes beside the content block;
+    // `{isAsync:true,status:"async_launched"}` marks an immediate background
+    // subagent launch whose real completion arrives as a task-notification.
+    let sidecar = value.get("toolUseResult");
+    let async_launch = remuda_protocol::tool_result_is_async_launch(sidecar) && !is_error;
     let text = tool_result_text(block);
+    // Shared node-revision convention across channels: call open is revision 1;
+    // a normal result closes at revision 2, an async-launch Partial at 3. A
+    // task-notification completion is revision 5 (see below), leaving 4 for the
+    // hook SubagentStop. Globally comparable revisions let the web assembler
+    // pick the latest same-node result regardless of which channel produced it.
+    let revision = if async_launch { U64(3) } else { U64(2) };
     envelope(
         ctx,
         cursor,
@@ -1012,23 +1034,91 @@ fn tool_result(
         ObservationPayload::ToolResult(Box::new(ToolResultPayload {
             mutation: NodeMutation {
                 node_id: tool_call_id.clone(),
-                revision: U64(1),
+                revision,
                 operation: MutationOperation::Close,
-                base_revision: None,
+                base_revision: Some(U64(revision.0 - 1)),
             },
             tool_call_id,
-            stage: ResultStage::Final,
+            stage: if async_launch {
+                ResultStage::Partial
+            } else {
+                ResultStage::Final
+            },
             outcome: if is_error {
                 ToolOutcome::Failed
             } else {
                 ToolOutcome::Succeeded
             },
             blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
-            structured_result: unknown("not-emitted"),
+            structured_result: match sidecar {
+                Some(v) => known(v.clone()),
+                None => unknown("not-emitted"),
+            },
             exit_code: unknown("not-emitted"),
             changes: Vec::new(),
         })),
     )
+}
+
+/// Fold an injected `<task-notification>` text into the final ToolResult that
+/// closes a backgrounded subagent's launch row. No observations when the text
+/// is not a notification or carries no `<tool-use-id>` to join on.
+fn task_notification_results(
+    ctx: &MapContext,
+    ids: &mut NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+    text: &str,
+) -> Result<Vec<Envelope>, Error> {
+    let Some(note) = remuda_protocol::TaskNotification::parse(text) else {
+        return Ok(Vec::new());
+    };
+    let Some(native_id) = note.tool_use_id.clone().filter(|id| !id.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let tool_call_id = ids.tool(&native_id)?;
+    // Revision 5: outranks the launch Partial (3) and the hook SubagentStop
+    // (4), since the notification carries the authoritative terminal status.
+    let revision = U64(5);
+    let outcome = note.outcome();
+    let body = note
+        .result
+        .clone()
+        .or(note.summary.clone())
+        .unwrap_or_default();
+    let structured = serde_json::json!({
+        "taskId": note.task_id,
+        "status": note.status,
+        "summary": note.summary,
+    });
+    Ok(vec![envelope(
+        ctx,
+        cursor,
+        line,
+        value,
+        Completeness::Structured,
+        Some(&native_id),
+        ObservationPayload::ToolResult(Box::new(ToolResultPayload {
+            mutation: NodeMutation {
+                node_id: tool_call_id.clone(),
+                revision,
+                operation: MutationOperation::Close,
+                base_revision: Some(U64(4)),
+            },
+            tool_call_id,
+            stage: ResultStage::Final,
+            outcome,
+            blocks: if body.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text(Box::new(TextBlock { text: body }))]
+            },
+            structured_result: known(structured),
+            exit_code: unknown("not-emitted"),
+            changes: Vec::new(),
+        })),
+    )?])
 }
 
 fn tool_result_text(block: &Value) -> String {

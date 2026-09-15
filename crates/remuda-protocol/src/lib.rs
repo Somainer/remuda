@@ -23,6 +23,7 @@ mod scalar;
 pub mod schema;
 mod supply;
 mod task;
+mod task_notification;
 
 pub use binary::*;
 pub use capabilities::*;
@@ -40,6 +41,7 @@ pub use rpc::*;
 pub use scalar::*;
 pub use supply::*;
 pub use task::*;
+pub use task_notification::*;
 
 /// Hub policy default for delegation depth (edges from a human root); §2.5 ⑤.
 pub const DEFAULT_MAX_DELEGATION_DEPTH: u32 = 3;

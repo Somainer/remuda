@@ -629,9 +629,22 @@ type MaterializedLaunch = {
 };
 ~~~
 
-**effort（D-028 §9.1）。** 五档 `low` / `medium` / `high` / `xhigh` / `max`，默认 `high`（成本基准 1.0）。`ultracode` **不是第六档**，是正交 boolean（等价 `xhigh` + dynamic workflow），session-only、永不持久化为档名。落地为 argv 上的**一个** flag：`--effort <档名>`，置了 ultracode 时为 `--effort ultracode`（原生 flag 只收一个值）。`effort` 缺省表示「交给 harness 决定」，materializer **不发** `--effort`——这与请求默认档不是一回事。
+**Claude effort（D-028 §9.1）。** 五档 `low` / `medium` / `high` / `xhigh` / `max`，默认 `high`（成本基准 1.0）。`ultracode` **不是第六档**，是正交 boolean（等价 `xhigh` + dynamic workflow），session-only、永不持久化为档名。落地为 argv 上的**一个** flag：`--effort <档名>`，置了 ultracode 时为 `--effort ultracode`（原生 flag 只收一个值）。`effort` 缺省表示「交给 harness 决定」，materializer **不发** `--effort`——这与请求默认档不是一回事。
 
 历史档名按**名字**归一，绝不按 index：`default→low`、`think→high`、`think-hard→xhigh`、`ultracode→xhigh + ultracode:true`，无法识别的名字落到 `high`（一个过期的 UI 字符串不该让启动失败）。按 index 归一会出错，因为旧表是 per-harness 且长度不同——claude 的 index 3 是 `ultracode`，codex 的 index 3 是 `ultra`。旧客户端发来的 `{index, name}` 仍然接受，`index` 在读取时被忽略、也不写回。
+
+**Codex effort（codex-cli 0.154.0）。** 六档按原生 picker 顺序展示，默认 `medium`。`max` 和 `ultra` 原样持久化并传入 `-c model_reasoning_effort="<v>"`；历史输入 `minimal` 归一为 `low`，未知名字回落到默认档。`ultra` 是 Codex 的真实档位，Claude/agy/Grok 拒绝它；`ultracode` 仍是 Claude-only workflow flag。跨 harness 历史名字只按名字读取，不按旧 index 推测。
+
+| wire value | picker name | subtitle / tooltip |
+| --- | --- | --- |
+| `low` | Low | Fast responses with lighter reasoning |
+| `medium` | Medium | Balances speed and reasoning depth for everyday tasks |
+| `high` | High | Greater reasoning depth for complex problems |
+| `xhigh` | Extra high | Extra high reasoning depth for complex problems |
+| `max` | Max | For difficult problems when quality matters more than speed · higher usage |
+| `ultra` | Ultra | For demanding work using multiple agents · highest usage |
+
+Max 使用与 Claude max 相同的静态强调；Ultra 使用最强的 ember 效果，与 Claude ultracode 共用视觉效果但不设置其 flag。验证边界及 390/1440 截图见 [effort-codex-tiers-1](evidence/effort-codex-tiers-1.md)。
 
 **绝不使用 `CLAUDE_CODE_EFFORT_LEVEL`**：它的优先级高于会话内 `/effort`，会把 PTY 的实时改档钉死。反向地，`child_env` 必须从子进程环境中**剥离**宿主继承的该变量，否则外部环境静默覆盖一切。
 
@@ -698,7 +711,7 @@ Herdr 负责 pane 生存，Node 负责 Instance/native session 对应；runtime 
 | kind | argv 模板 | 配置注入 | yolo argv（仅 Human/Bot 且显式 bypass） |
 | --- | --- | --- | --- |
 | `claude` | `--setting-sources user,project,local` [`--settings <overlay>`] [`--effort <v>`] | argv 上的 settings overlay | `--dangerously-skip-permissions` |
-| `codex` | [`--effort <v>`] | env `CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` |
+| `codex` | [`-c model_reasoning_effort="<v>"`] | env `CODEX_HOME` 指向影子目录 | `--dangerously-bypass-approvals-and-sandbox` |
 | `grok` | [`--effort <v>`] | env `GROK_HOME` 指向影子目录 | `--always-approve` |
 | `agy` | [`--effort <v>`] | 无 | `--yolo` |
 

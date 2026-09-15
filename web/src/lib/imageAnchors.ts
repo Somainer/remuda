@@ -11,12 +11,13 @@
  * reading the textarea caret and restoring it after an insert.
  *
  * The same machinery is parameterised by `AnchorKind` so `[Code #n]` quote
- * anchors (2026-09-15, workbench-code-2) reuse the exact token shape instead
- * of inventing a second syntax.
+ * anchors (2026-09-15, workbench-code-2) and `[File #n]` arbitrary-file
+ * anchors (D-027b) reuse the exact token shape instead of inventing new
+ * syntax.
  */
 
-/** Token families: `[Image #n]` and `[Code #n]` share the same shape. */
-export type AnchorKind = "Image" | "Code";
+/** Token families: `[Image #n]`, `[File #n]` and `[Code #n]` share the shape. */
+export type AnchorKind = "Image" | "File" | "Code";
 
 /** The literal token for position `index` (1-based). */
 export function anchorToken(index: number): string {
@@ -34,14 +35,19 @@ export function anchorTokenFor(kind: AnchorKind, index: number): string {
  */
 export const IMAGE_ANCHOR_RE = /\[Image #(\d+)\]/g;
 
+/** Same contract for file anchors. */
+export const FILE_ANCHOR_RE = /\[File #(\d+)\]/g;
+
 /** Same contract for code quote anchors. */
 export const CODE_ANCHOR_RE = /\[Code #(\d+)\]/g;
 
-/** Matches either family; capture group 1 is the family word, 2 the number. */
-export const ANY_ANCHOR_RE = /\[(Image|Code) #(\d+)\]/g;
+/** Matches any attachment family; capture group 1 is the family word, 2 the number. */
+export const ANY_ANCHOR_RE = /\[(Image|File|Code) #(\d+)\]/g;
 
 export function anchorRegex(kind: AnchorKind): RegExp {
-  return kind === "Image" ? /\[Image #(\d+)\]/g : /\[Code #(\d+)\]/g;
+  if (kind === "Image") return /\[Image #(\d+)\]/g;
+  if (kind === "File") return /\[File #(\d+)\]/g;
+  return /\[Code #(\d+)\]/g;
 }
 
 /** One parsed token: its 1-based index and its half-open byte-ish offset. */
@@ -227,4 +233,47 @@ export function removeAndRenumberFor(kind: AnchorKind, text: string, removed: nu
   return renumberAnchorsFor(kind, text, (index) =>
     index === removed ? null : index > removed ? index - 1 : index,
   );
+}
+
+/**
+ * Mixed attachment anchors (D-027b): images and files share one numbering
+ * space (the chip position), each rendered with its own family token.
+ */
+export type AttachmentAnchor = { kind: AnchorKind; index: number };
+
+/** Insert image/file tokens in order, chaining the caret through each. */
+export function insertAttachmentAnchors(
+  text: string,
+  caret: number,
+  items: AttachmentAnchor[],
+): InsertResult {
+  let next = text;
+  let at = caret;
+  for (const item of items) {
+    const result = insertAnchorFor(item.kind, next, at, item.index);
+    next = result.text;
+    at = result.caret;
+  }
+  return { text: next, caret: at };
+}
+
+/** Distinct attachment token indices present ([Image #n] or [File #n]). */
+export function referencedAttachmentIndices(text: string): Set<number> {
+  const indices = referencedIndices(text);
+  for (const span of findAnchorsFor("File", text)) indices.add(span.index);
+  return indices;
+}
+
+/**
+ * A chip was removed from the shared attachment list: strip its number in
+ * BOTH token families (a position could have been quoted as either family)
+ * and shift every higher `[Image #n]`/`[File #n]` down by one. Code tokens
+ * are untouched — they own a separate numbering space.
+ */
+export function removeAndRenumberAttachment(text: string, removed: number): string {
+  const shift = (kind: "Image" | "File", value: string) =>
+    renumberAnchorsFor(kind, value, (index) =>
+      index === removed ? null : index > removed ? index - 1 : index,
+    );
+  return shift("File", shift("Image", text));
 }

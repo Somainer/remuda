@@ -159,15 +159,16 @@ it("re-snaps the slider onto the new harness table when the runtime changes", ()
   expect(slider()).toHaveAttribute("data-name", "high");
   expect(slider()).toHaveAttribute("data-index", "2");
 
-  // codex (five stops): the midpoint maps onto `medium` by nearest position.
+  // Codex (six native stops): the midpoint maps onto Extra high by nearest position.
   fireEvent.click(screen.getByTestId("new-session-kind-codex"));
-  expect(slider()).toHaveAttribute("data-tiers", "minimal,low,medium,high,xhigh");
-  expect(slider()).toHaveAttribute("data-name", "medium");
-  expect(slider()).toHaveAttribute("data-index", "2");
-  // ultracode is Claude-only; other harnesses never show the extra stop.
-  expect(slider()).toHaveAttribute("aria-valuemax", "4");
+  expect(slider()).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultra");
+  expect(slider()).toHaveAttribute("data-name", "xhigh");
+  expect(slider()).toHaveAttribute("data-index", "3");
+  // Ultra is a native Codex tier; the workflow flag remains Claude-only.
+  expect(slider()).toHaveAttribute("aria-valuemax", "5");
+  expect(slider()).toHaveAttribute("data-ultracode", "0");
 
-  // grok has four stops; the midpoint (2/4) snaps onto `high`.
+  // Grok has four stops; the Codex position (3/5) snaps onto high.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
   expect(slider()).toHaveAttribute("data-tiers", "low,medium,high,xhigh");
   expect(slider()).toHaveAttribute("data-name", "high");
@@ -196,10 +197,10 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
 
   // ...and back, without the stale draft the unmounted card held.
   fireEvent.click(screen.getByTestId("new-session-kind-codex"));
-  expect(slider()).toHaveAttribute("data-name", "high");
+  expect(slider()).toHaveAttribute("data-name", "xhigh");
   expect(slider()).toHaveAttribute("data-index", "3");
   fireEvent.keyDown(slider(), { key: "Home" });
-  expect(slider()).toHaveAttribute("data-name", "minimal");
+  expect(slider()).toHaveAttribute("data-name", "low");
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
   expect(slider()).toHaveAttribute("data-name", "low");
   expect(slider()).toHaveAttribute("data-ember", "0");

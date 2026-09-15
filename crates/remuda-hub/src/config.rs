@@ -15,6 +15,8 @@ pub const MIN_CREATE_SETTLE_TIMEOUT_MS: u64 = 120_000;
 pub const DEFAULT_BOOTSTRAP_TTL_HOURS: u64 = 24;
 /// Default lifetime of a minted node enroll token (D-018).
 pub const DEFAULT_ENROLL_TOKEN_TTL_MINUTES: u64 = 60;
+/// Default per-file attachment staging ceiling (D-027b): 25 MiB.
+pub const DEFAULT_ATTACHMENT_MAX_BYTES: usize = 25 * 1024 * 1024;
 
 /// How Hub binds and authenticates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,6 +80,16 @@ pub struct HubConfig {
     /// Global authentication token refill (tokens/second).
     #[serde(default = "default_auth_global_refill_per_sec")]
     pub auth_global_refill_per_sec: f64,
+    /// Per-file attachment staging ceiling in bytes (D-027b). The browser and
+    /// Node quote the same value; default 25 MiB covers PDFs and small archives
+    /// while bounding the SQLite blob store. Config key `attachmentMaxBytes`.
+    #[serde(default = "default_attachment_max_bytes")]
+    pub attachment_max_bytes: usize,
+}
+
+/// Default per-file attachment ceiling (D-027b): 25 MiB.
+pub fn default_attachment_max_bytes() -> usize {
+    DEFAULT_ATTACHMENT_MAX_BYTES
 }
 
 fn default_auth_ip_burst() -> f64 {
@@ -152,6 +164,7 @@ impl Default for HubConfig {
             auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
             auth_global_burst: default_auth_global_burst(),
             auth_global_refill_per_sec: default_auth_global_refill_per_sec(),
+            attachment_max_bytes: default_attachment_max_bytes(),
         }
     }
 }
@@ -185,6 +198,7 @@ impl HubConfig {
             auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
             auth_global_burst: default_auth_global_burst(),
             auth_global_refill_per_sec: default_auth_global_refill_per_sec(),
+            attachment_max_bytes: default_attachment_max_bytes(),
         }
     }
 

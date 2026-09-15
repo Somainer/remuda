@@ -121,7 +121,7 @@
         "type": "object"
       },
       "AttachmentRef": {
-        "description": "One staged attachment as the in-session MCP tools see it (D-028 \u00a74.5). Metadata only; `AttachmentContent` adds the bytes.",
+        "description": "One staged attachment as the in-session MCP tools see it (D-028 \u00a74.5, generalized to arbitrary files in D-027b). Metadata only; `AttachmentContent` adds the bytes.",
         "properties": {
           "digest": {
             "description": "Lowercase hex SHA-256 of the stored bytes.",
@@ -134,11 +134,24 @@
             "description": "Session this attachment is staged for; also the read-authorization key.",
             "type": "string"
           },
+          "kind": {
+            "description": "`image` keeps native image delivery; `file` is delivered as a readable path reference (D-027b).",
+            "enum": [
+              "image",
+              "file"
+            ],
+            "type": "string"
+          },
           "mediaType": {
+            "description": "Hub-accepted MIME type: magic-byte sniffed for images, validated declared essence for everything else.",
             "type": "string"
           },
           "name": {
-            "description": "Derived `<objectId>.<ext>`; a caller-supplied filename never survives.",
+            "description": "Sanitised original filename (no path separators, no control characters, length-capped); the derived `<objectId>.<ext>` name when none was supplied.",
+            "type": "string"
+          },
+          "storedName": {
+            "description": "Derived internal blob name `<objectId>.<ext>`.",
             "type": "string"
           },
           "objectId": {
@@ -152,12 +165,13 @@
               "integer",
               "null"
             ],
-            "description": "1-based number matching the prompt's `[Image #n]` token, assigned by the send manifest that consumed the object; null while the object is only staged. `remuda_attachments_list` is ordered by this number."
+            "description": "1-based number matching the prompt's `[Image #n]`/`[File #n]` token, assigned by the send manifest that consumed the object; null while the object is only staged. `remuda_attachments_list` is ordered by this number."
           }
         },
         "required": [
           "objectId",
           "instanceId",
+          "kind",
           "mediaType",
           "name",
           "size",
@@ -167,7 +181,7 @@
         "type": "object"
       },
       "AttachmentUpload": {
-        "description": "Staged attachment metadata (D-027). The media type and name are the Hub's own: the type is sniffed from the bytes and the name is derived as <objectId>.<ext>, so a caller-supplied filename never survives.",
+        "description": "Staged attachment metadata (D-027/D-027b). Images are magic-byte sniffed; other files keep their validated declared media type. `name` is the sanitised original filename or null when none was supplied, and `storedName` is always the derived internal name.",
         "properties": {
           "digest": {
             "description": "Lowercase hex SHA-256 of the stored bytes.",
@@ -180,16 +194,27 @@
           "instanceId": {
             "type": "string"
           },
-          "mediaType": {
+          "kind": {
+            "description": "`image` for sniffed PNG/JPEG/GIF/WebP; `file` for everything else.",
             "enum": [
-              "image/png",
-              "image/jpeg",
-              "image/gif",
-              "image/webp"
+              "image",
+              "file"
             ],
             "type": "string"
           },
+          "mediaType": {
+            "description": "Hub-accepted MIME essence (`image/png`, `application/pdf`, `text/plain`, …).",
+            "type": "string"
+          },
           "name": {
+            "description": "Sanitised original filename, or null when the upload carried none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "storedName": {
+            "description": "Derived internal blob name `<objectId>.<ext>`.",
             "type": "string"
           },
           "objectId": {
@@ -201,10 +226,12 @@
         },
         "required": [
           "objectId",
+          "kind",
           "mediaType",
           "size",
           "digest",
           "name",
+          "storedName",
           "instanceId",
           "expiresAt"
         ],
@@ -375,10 +402,10 @@
         "type": "object"
       },
       "EffortSelection": {
-        "description": "Native effort selection (D-028 \u00a79.1): the harness-native level plus an orthogonal ultracode boolean (Claude only). Claude takes low | medium | high | xhigh | max; Codex and Grok add minimal on the low end. Legacy tier names (default / think / think-hard / ultra / ultracode) are accepted and normalized by NAME \u2014 never by index, because the old per-harness tables differed in length.",
+        "description": "Native effort selection (D-028 \u00a79.1): the harness-native level plus an orthogonal ultracode boolean (Claude only). Claude takes low | medium | high | xhigh | max; Codex takes low | medium | high | xhigh | max | ultra. Codex accepts legacy minimal as low; ultra is a real Codex level, independent of the Claude-only ultracode flag. Legacy tier names (default / think / think-hard / ultracode) are accepted and normalized by NAME \u2014 never by index, because the old per-harness tables differed in length.",
         "properties": {
           "name": {
-            "description": "minimal | low | medium | high | xhigh | max (minimal is Codex/Grok-only), or a legacy tier name to be normalized.",
+            "description": "low | medium | high | xhigh | max | ultra (ultra is Codex-only), or a legacy tier name to be normalized; Codex minimal maps to low.",
             "type": "string"
           },
           "ultracode": {
@@ -1166,7 +1193,7 @@
             "properties": {
               "name": {
                 "type": "string",
-                "enum": ["low", "medium", "high", "xhigh", "max"]
+                "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
               },
               "ultracode": {
                 "type": ["boolean", "null"],
@@ -1182,7 +1209,7 @@
             "additionalProperties": true
           },
           "effortName": {
-            "description": "Normalized D-028 \u00a79.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default\u2192low, think\u2192high, think-hard/ultra\u2192xhigh, ultracode\u2192xhigh with effortUltracode true). `minimal` is Codex/Grok-only and never emitted for a Claude launch.",
+            "description": "Normalized D-028 \u00a79.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default\u2192low, think\u2192high, think-hard\u2192xhigh, ultracode\u2192xhigh with effortUltracode true). Codex minimal maps to low; Codex max and ultra persist unchanged. Ultra is rejected by Claude, agy and Grok.",
             "enum": [
               "minimal",
               "low",
@@ -1190,6 +1217,7 @@
               "high",
               "xhigh",
               "max",
+              "ultra",
               null
             ],
             "type": [
@@ -5382,7 +5410,7 @@
     },
     "/v1/objects": {
       "post": {
-        "description": "Raw image bytes with a Content-Type. Human or Bot devices only; an Agent-origin caller is refused. The media type is sniffed from the bytes and must agree with the declared Content-Type. Limits: 5 MiB per attachment, 64 MiB staged per instance, 4 attachments per send.",
+        "description": "Raw attachment bytes with a Content-Type (D-027b: any file type). Human or Bot devices only; an Agent-origin caller is refused. Images (PNG/JPEG/GIF/WebP) are magic-byte sniffed and the declared Content-Type must agree; other files keep a validated declared media type, are served back with attachment disposition + nosniff, and are never executed. Limits: 25 MiB per attachment by default (config key attachmentMaxBytes / REMUDA_ATTACHMENT_MAX_BYTES), 256 MiB staged per instance, 8 attachments per send. The optional `name` query parameter carries the original filename; it is sanitised (no path separators or control characters, length-capped).",
         "operationId": "objectUpload",
         "parameters": [
           {
@@ -5393,29 +5421,20 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Original filename; sanitised server-side. Omit to use a derived <objectId>.<ext> name.",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
           "content": {
-            "image/gif": {
-              "schema": {
-                "format": "binary",
-                "type": "string"
-              }
-            },
-            "image/jpeg": {
-              "schema": {
-                "format": "binary",
-                "type": "string"
-              }
-            },
-            "image/png": {
-              "schema": {
-                "format": "binary",
-                "type": "string"
-              }
-            },
-            "image/webp": {
+            "*/*": {
               "schema": {
                 "format": "binary",
                 "type": "string"
@@ -5456,7 +5475,7 @@
     },
     "/v1/objects/{id}": {
       "get": {
-        "description": "Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance \u2014 a Node cannot read another host's attachments \u2014 or as a Human/Bot device. Expired objects read as 404.",
+        "description": "Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance \u2014 a Node cannot read another host's attachments \u2014 or as a Human/Bot device. Images are served inline; non-images carry Content-Disposition: attachment with the sanitised filename plus X-Content-Type-Options: nosniff (D-027b). Expired objects read as 404.",
         "operationId": "objectRead",
         "parameters": [
           {
@@ -5466,32 +5485,14 @@
         "responses": {
           "200": {
             "content": {
-              "image/gif": {
-                "schema": {
-                  "format": "binary",
-                  "type": "string"
-                }
-              },
-              "image/jpeg": {
-                "schema": {
-                  "format": "binary",
-                  "type": "string"
-                }
-              },
-              "image/png": {
-                "schema": {
-                  "format": "binary",
-                  "type": "string"
-                }
-              },
-              "image/webp": {
+              "*/*": {
                 "schema": {
                   "format": "binary",
                   "type": "string"
                 }
               }
             },
-            "description": "Raw image bytes, served as an attachment with nosniff"
+            "description": "Raw attachment bytes. Images inline; other types as attachment with nosniff."
           },
           "401": {
             "$ref": "#/components/responses/Error"

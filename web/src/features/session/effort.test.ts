@@ -31,6 +31,7 @@ import {
 } from "./effort";
 import type { UsagePayload } from "../../types/generated";
 import { known, unknownKnowledge } from "../../types/wire";
+import { effectiveFromObservation, effectiveFromRecord, effortMismatch } from "./effortEffective";
 
 describe("harness-native effort tables", () => {
   it("exposes the real Claude Code levels in CLI order, never fast/standard/deep", () => {
@@ -47,18 +48,24 @@ describe("harness-native effort tables", () => {
     expect(effortTable("claude").map((t) => t.name)).not.toContain("think");
   });
 
-  it("exposes the verified codex model_reasoning_effort vocabulary in enum order", () => {
-    // codex-cli 0.147.0 ReasoningEffort::from_str common set; see composer-slider-5.md.
+  it("exposes all six Codex 0.154.0 picker tiers in native order with exact English copy", () => {
     expect(effortTable("codex").map((t) => t.name)).toEqual([
-      "minimal",
       "low",
       "medium",
       "high",
       "xhigh",
+      "max",
+      "ultra",
     ]);
-    // `ultra` was never a codex value; max/ultra are model-gated advanced tiers.
-    expect(effortTable("codex").map((t) => t.name)).not.toContain("ultra");
-    expect(effortTable("codex").map((t) => t.name)).not.toContain("max");
+    expect(effortTable("codex").map((t) => t.name)).not.toContain("minimal");
+    expect(effortTable("codex").map((t) => [t.label, t.description])).toEqual([
+      ["Low", "Fast responses with lighter reasoning"],
+      ["Medium", "Balances speed and reasoning depth for everyday tasks"],
+      ["High", "Greater reasoning depth for complex problems"],
+      ["Extra high", "Extra high reasoning depth for complex problems"],
+      ["Max", "For difficult problems when quality matters more than speed · higher usage"],
+      ["Ultra", "For demanding work using multiple agents · highest usage"],
+    ]);
   });
 
   it("exposes the verified grok --reasoning-effort menu, not quick/standard/max", () => {
@@ -72,8 +79,8 @@ describe("harness-native effort tables", () => {
   it("marks each table's real CLI default", () => {
     expect(DEFAULT_EFFORT_INDEX).toBe(2);
     expect(defaultEffortIndex("claude")).toBe(2);
-    expect(effortDefaultIndex("codex")).toBe(2);
-    expect(defaultEffortIndex("codex")).toBe(2);
+    expect(effortDefaultIndex("codex")).toBe(1);
+    expect(defaultEffortIndex("codex")).toBe(1);
     expect(effortAt("codex", defaultEffortIndex("codex")).name).toBe("medium");
     expect(effortDefaultIndex("grok")).toBe(1);
     expect(effortAt("grok", defaultEffortIndex("grok")).name).toBe("medium");
@@ -83,8 +90,8 @@ describe("harness-native effort tables", () => {
   it("marks only the last row as the single top tier", () => {
     expect(isEmberTier("claude", 4)).toBe(true);
     expect(isEmberTier("claude", 3)).toBe(false);
-    expect(isEmberTier("codex", 4)).toBe(true);
-    expect(isEmberTier("codex", 3)).toBe(false);
+    expect(isEmberTier("codex", 5)).toBe(true);
+    expect(isEmberTier("codex", 4)).toBe(false);
     expect(isEmberTier("grok", 3)).toBe(true);
     expect(isEmberTier("grok", 2)).toBe(false);
     expect(isEmberTier("agy", 0)).toBe(true);
@@ -105,13 +112,14 @@ describe("legacy name normalization", () => {
     expect(normalizeClaudeName("bogus")).toMatchObject({ tier: "high", index: 2, ultracode: false });
   });
 
-  it("migrates the legacy codex ultra tier to xhigh and unknowns to the default", () => {
-    expect(normalizeHarnessName("codex", "ultra")).toEqual({ tier: "xhigh", index: 4 });
-    expect(normalizeHarnessName("codex", "minimal")).toEqual({ tier: "minimal", index: 0 });
-    expect(normalizeHarnessName("codex", "xhigh")).toEqual({ tier: "xhigh", index: 4 });
+  it("preserves Codex max/ultra, migrates minimal to low and unknowns to the default", () => {
+    expect(normalizeHarnessName("codex", "ultra")).toEqual({ tier: "ultra", index: 5 });
+    expect(normalizeHarnessName("codex", "max")).toEqual({ tier: "max", index: 4 });
+    expect(normalizeHarnessName("codex", "minimal")).toEqual({ tier: "low", index: 0 });
+    expect(normalizeHarnessName("codex", "xhigh")).toEqual({ tier: "xhigh", index: 3 });
     // An unrecognised stored word lands on the real default (medium), never
     // passed straight into -c model_reasoning_effort.
-    expect(normalizeHarnessName("codex", "bogus")).toEqual({ tier: "medium", index: 2 });
+    expect(normalizeHarnessName("codex", "bogus")).toEqual({ tier: "medium", index: 1 });
   });
 
   it("migrates the invented grok quick/standard/max table onto the real menu", () => {
@@ -138,18 +146,42 @@ describe("legacy name normalization", () => {
     expect(effortFromRecord("claude", null, 1)).toMatchObject({ name: "medium", index: 1 });
     expect(effortFromRecord("claude")).toBeUndefined();
     // Codex/grok legacy records migrate too.
-    expect(effortFromRecord("codex", "ultra")).toMatchObject({ name: "xhigh", index: 4 });
-    expect(effortFromRecord("codex", "bogus")).toMatchObject({ name: "medium", index: 2 });
+    expect(effortFromRecord("codex", "minimal")).toMatchObject({ name: "low", index: 0 });
+    expect(effortFromRecord("codex", "max", 0)).toEqual({ name: "max", index: 4, kind: "codex" });
+    expect(effortFromRecord("codex", "ultra", 0)).toEqual({ name: "ultra", index: 5, kind: "codex" });
+    expect(effortFromRecord("codex", "bogus")).toMatchObject({ name: "medium", index: 1 });
     expect(effortFromRecord("grok", "standard")).toMatchObject({ name: "medium", index: 1 });
     expect(effortFromRecord("grok", "quick")).toMatchObject({ name: "low", index: 0 });
   });
 });
 
 describe("native wire vocabulary is closed", () => {
+  it.each(["max", "ultra"])("round-trips Codex %s across request, record and native observation", (name) => {
+    const selection = effortFromRecord("codex", name)!;
+    const requestedWord = effortWireName(selection);
+    expect(requestedWord).toBe(name);
+    expect(selection.ultracode).toBeUndefined();
+    const observed = effectiveFromObservation({
+      kind: "effort",
+      payload: {
+        requested: { name: requestedWord },
+        effective: { name, source: "slash", observedAt: "2026-09-15T00:00:00Z" },
+      },
+    })!;
+    expect(observed.requested?.name).toBe(name);
+    expect(observed.effective.name).toBe(name);
+    expect(effectiveFromRecord(observed.effective)).toEqual(observed.effective);
+    expect(effortMismatch(requestedWord, false, observed.effective)).toBeNull();
+    expect(effortFromRecord("codex", observed.effective.name)).toEqual(selection);
+  });
+
   it("returns current tier words and throws a typed error on anything else", () => {
     expect(nativeEffortWord("codex", "xhigh")).toBe("xhigh");
     expect(nativeEffortWord("grok", "low")).toBe("low");
-    expect(() => nativeEffortWord("codex", "ultra")).toThrowError(UnknownEffortError);
+    expect(nativeEffortWord("codex", "max")).toBe("max");
+    expect(nativeEffortWord("codex", "ultra")).toBe("ultra");
+    expect(() => nativeEffortWord("codex", "minimal")).toThrowError(UnknownEffortError);
+    expect(() => nativeEffortWord("codex", "ultracode")).toThrowError(UnknownEffortError);
     expect(() => nativeEffortWord("codex", "bogus")).toThrow(/unknown codex effort tier/);
     expect(() => nativeEffortWord("grok", "max")).toThrowError(UnknownEffortError);
   });
@@ -159,15 +191,18 @@ describe("native wire vocabulary is closed", () => {
     expect(effortWireName(effortAt("claude", 3, false))).toBe("xhigh");
     expect(effortWireName(effortAt("claude", 4, false))).toBe("max");
     for (const [kind, index, word] of [
-      ["codex", 0, "minimal"],
-      ["codex", 4, "xhigh"],
+      ["codex", 0, "low"],
+      ["codex", 3, "xhigh"],
+      ["codex", 4, "max"],
+      ["codex", 5, "ultra"],
       ["grok", 0, "low"],
       ["grok", 3, "xhigh"],
     ] as const) {
       expect(effortWireName(effortAt(kind, index))).toBe(word);
     }
     // A migrated legacy selection resolves to the new word, not the old one.
-    expect(effortWireName(effortFromRecord("codex", "ultra")!)).toBe("xhigh");
+    expect(effortWireName(effortFromRecord("codex", "minimal")!)).toBe("low");
+    expect(effortWireName(effortFromRecord("codex", "ultra")!)).toBe("ultra");
     expect(effortWireName(effortFromRecord("grok", "standard")!)).toBe("medium");
   });
 });
@@ -184,7 +219,7 @@ describe("three-level visual ladder", () => {
     expect(effortLook("claude", 4, false)).toBe("top");
   });
 
-  it("the ultracode stop alone is the strongest look, on any tier index", () => {
+  it("the Claude ultracode stop has the strongest look, on any tier index", () => {
     expect(effortLook("claude", 3, true)).toBe("ultracode");
     // ultracode forces the tier to xhigh but the look is keyed on the flag.
     expect(isEmberEffort("claude", 3, true)).toBe(true);
@@ -193,12 +228,16 @@ describe("three-level visual ladder", () => {
     expect(isEmberEffort("claude", 2, false)).toBe(false);
   });
 
-  it("codex/grok top rows get the static accent, never the ember; no ultracode", () => {
+  it("Codex Max shares Claude Max's accent and Ultra alone gets the strongest native-tier look", () => {
     expect(effortLook("codex", 4, false)).toBe("top");
+    expect(effortLook("codex", 4, false)).toBe(effortLook("claude", 4, false));
     expect(effortLook("codex", 3, false)).toBe("plain");
+    expect(effortLook("codex", 5, false)).toBe("ultracode");
+    expect(effortLook("codex", 5, false)).toBe(effortLook("claude", 3, true));
+    expect(isEmberEffort("codex", 5, false)).toBe(true);
     expect(effortLook("grok", 3, false)).toBe("top");
     expect(effortLook("grok", 1, false)).toBe("plain");
-    // The flag is Claude-only and can never produce an ember elsewhere.
+    // The Claude-only flag cannot change another harness's native-tier look.
     expect(isEmberEffort("codex", 4, true)).toBe(false);
     expect(isEmberEffort("grok", 3, true)).toBe(false);
     // agy's lone tier stays plain.
@@ -226,10 +265,10 @@ describe("ultracode", () => {
 
   it("drops ultracode when mapping away from Claude and re-locks on return", () => {
     const ultra = effortAt("claude", 3, true);
-    // Ratio map: claude xhigh (3/4) lands on codex high (3/4) and grok's
-    // xhigh (2/3); the flag drops and the tier is the nearest native row.
+    // Ratio map: Claude xhigh (3/4) lands on Codex max (4/5) and Grok high
+    // (2/3); the flag drops and the tier is the nearest native row.
     const codex = mapEffort(ultra, "codex");
-    expect(codex).toMatchObject({ index: 3, name: "high", kind: "codex" });
+    expect(codex).toMatchObject({ index: 4, name: "max", kind: "codex" });
     expect(codex.ultracode).toBeUndefined();
     expect(mapEffort(ultra, "grok")).toMatchObject({ index: 2, name: "high" });
     // A non-ultra claude selection maps by ratio like any other table.
@@ -245,10 +284,10 @@ describe("mapping by index", () => {
     expect(mapEffortIndex(4, 5, 4)).toBe(3);
     expect(mapEffortIndex(0, 5, 4)).toBe(0);
     const max = effortAt("claude", 4);
-    expect(mapEffort(max, "codex")).toEqual({ index: 4, name: "xhigh", kind: "codex" });
+    expect(mapEffort(max, "codex")).toEqual({ index: 5, name: "ultra", kind: "codex" });
     expect(mapEffort(max, "grok")).toMatchObject({ index: 3, name: "xhigh" });
-    // Both real defaults are the midpoint of equal-length five-stop tables.
-    expect(mapEffort(effortAt("claude", DEFAULT_EFFORT_INDEX), "codex").name).toBe("medium");
+    // Cross-harness remapping preserves the nearest position on the new table.
+    expect(mapEffort(effortAt("claude", DEFAULT_EFFORT_INDEX), "codex").name).toBe("xhigh");
   });
 
   it("clamps an out-of-range index onto a shorter table", () => {
@@ -319,11 +358,12 @@ describe("six-stop Claude slider", () => {
       "ultracode",
     ]);
     expect(effortStops("codex").map((s) => s.name)).toEqual([
-      "minimal",
       "low",
       "medium",
       "high",
       "xhigh",
+      "max",
+      "ultra",
     ]);
     expect(effortStops("grok").map((s) => s.name)).toEqual(["low", "medium", "high", "xhigh"]);
     expect(effortStops("agy").map((s) => s.name)).toEqual(["default"]);
@@ -332,6 +372,7 @@ describe("six-stop Claude slider", () => {
     expect(ultra).toMatchObject({ index: 3, ultracode: true });
     expect(effortStops("claude").slice(0, 5).every((s) => s.ultracode === false)).toBe(true);
     expect(CLAUDE_ULTRACODE_STOP).toBe(5);
+    expect(effortStops("codex").every((s) => s.ultracode === false)).toBe(true);
   });
 
   it("round-trips every stop: selection → stop position → selection", () => {
@@ -385,6 +426,20 @@ describe("six-stop Claude slider", () => {
     let stop = 0;
     for (let i = 0; i < 5; i++) stop = keyboardEffortIndex(stop, "ArrowRight", 6) ?? stop;
     expect(stop).toBe(5);
+  });
+});
+
+describe("six-stop Codex slider", () => {
+  it("round-trips every native tier and renders picker labels without a workflow flag", () => {
+    const names = ["low", "medium", "high", "xhigh", "max", "ultra"];
+    const labels = ["Low", "Medium", "High", "Extra high", "Max", "Ultra"];
+    for (let stop = 0; stop < names.length; stop++) {
+      const selection = effortAtStop("codex", stop);
+      expect(selection).toEqual({ name: names[stop], index: stop, kind: "codex" });
+      expect(effortStopIndex("codex", selection.index, selection.ultracode)).toBe(stop);
+      expect(effortStopName("codex", selection.name, selection.ultracode)).toBe(labels[stop]);
+      expect(effortWireName(selection)).toBe(names[stop]);
+    }
   });
 });
 

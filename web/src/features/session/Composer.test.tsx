@@ -330,7 +330,7 @@ describe("Composer shortcuts", () => {
       />,
     );
     await user.click(screen.getByTestId("model-effort-chip"));
-    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "minimal,low,medium,high,xhigh");
+    expect(screen.getByTestId("effort-slider")).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultra");
     expect(screen.queryByTestId("effort-ultracode")).toBeNull();
   });
 

@@ -103,6 +103,7 @@ describe("refsOf", () => {
   const base: Attachment = {
     localId: "att_1",
     name: "a.png",
+    kind: "image",
     mediaType: "image/png",
     size: 10,
     previewUrl: "blob:a",
@@ -121,6 +122,7 @@ describe("refsOf", () => {
     expect(refs[0]).toEqual({
       index: 1,
       objectId: "obj_1",
+      kind: "image",
       mediaType: "image/png",
       name: "a.png",
       size: 10,
@@ -157,6 +159,30 @@ describe("refsOf", () => {
     expect(refs.map((ref) => [ref.objectId, ref.index])).toEqual([
       ["obj_2", 2],
       ["obj_1", 1],
+    ]);
+  });
+
+  it("orders mixed [Image #n] and [File #n] tokens by appearance", () => {
+    const file: Attachment = {
+      ...base,
+      localId: "att_pdf",
+      objectId: "obj_pdf",
+      name: "report.pdf",
+      kind: "file",
+      mediaType: "application/pdf",
+    };
+    const image: Attachment = {
+      ...base,
+      localId: "att_png",
+      objectId: "obj_png",
+      name: "shot.png",
+      kind: "image",
+    };
+    // Chip positions: file=#1, image=#2. Prompt quotes #2 before #1.
+    const refs = refsOf([file, image], "see [Image #2] and read [File #1]");
+    expect(refs.map((ref) => [ref.objectId, ref.kind, ref.index])).toEqual([
+      ["obj_png", "image", 2],
+      ["obj_pdf", "file", 1],
     ]);
   });
 });

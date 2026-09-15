@@ -1188,6 +1188,7 @@ mod tests {
             remuda_protocol::MessageRole::Assistant,
             remuda_protocol::MessagePhase::Final,
             "one".to_owned(),
+            Vec::new(),
         )
         .expect("message");
         store
@@ -1197,6 +1198,7 @@ mod tests {
             remuda_protocol::MessageRole::Assistant,
             remuda_protocol::MessagePhase::Final,
             "two".to_owned(),
+            Vec::new(),
         )
         .expect("message");
         store
@@ -1227,6 +1229,7 @@ mod tests {
             remuda_protocol::MessageRole::Assistant,
             remuda_protocol::MessagePhase::Final,
             "durable".to_owned(),
+            Vec::new(),
         )
         .expect("message");
 

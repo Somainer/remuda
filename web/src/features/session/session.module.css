@@ -981,6 +981,23 @@
   flex: 1;
 }
 
+.effortCard[data-harness="codex"] .effortRow {
+  display: grid;
+  grid-template-columns: 11px minmax(0, 1fr);
+  gap: 4px 10px;
+}
+
+.effortCard[data-harness="codex"] .effortName,
+.effortCard[data-harness="codex"] .effortDesc {
+  grid-column: 2;
+  width: auto;
+}
+
+.effortCard[data-harness="codex"] .radio {
+  grid-column: 1;
+  grid-row: 1;
+}
+
 /*
  * Pill scale shared by both frames: the composer's framed card and New
  * Session's frameless inline field. Knob face reads as the palette's "white":
@@ -1156,6 +1173,18 @@
   display: inline;
 }
 
+/* Codex keeps the picker's full English labels, including Extra high. */
+.effortTicksPop[data-harness="codex"] {
+  height: 25px;
+}
+
+.effortTicksPop[data-harness="codex"] .effortTick {
+  width: 42px;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.1;
+}
+
 @media (max-width: 767px) {
   .effortTicks:not(.effortTicksPop) .effortTickFull {
     display: none;
@@ -1163,6 +1192,17 @@
 
   .effortTicks:not(.effortTicksPop) .effortTickShort {
     display: inline;
+  }
+
+  .effortTicks[data-harness="codex"] {
+    height: 25px;
+  }
+
+  .effortTicks[data-harness="codex"] .effortTick {
+    width: 42px;
+    white-space: normal;
+    text-align: center;
+    line-height: 1.1;
   }
 }
 
@@ -1276,6 +1316,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.effortCard[data-harness="codex"] .effortModel {
+  padding-inline: 8px;
+  white-space: normal;
 }
 
 .effortHit {

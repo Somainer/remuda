@@ -17,6 +17,7 @@ use remuda_claude_wire::{
     StreamEventMessage, SystemInit, SystemMessage, TaskNotification, TaskProgress, TaskStarted,
     TaskUpdated, UserContent, UserMessage,
 };
+use remuda_protocol::hubnode::AttachmentKind;
 use remuda_protocol::{
     ApprovalRequest, ClaudePermissionMode, Completeness, ContentBlock, ContentStatus, Cost,
     DecisionEffect, DecisionOption, Digest, DriverInput, DriverKind, EffortEffective,
@@ -1552,7 +1553,10 @@ const MAX_INLINE_IMAGE_BYTES: usize = 3_584 * 1024;
 ///
 /// With no attachments this is the plain string it has always been. With
 /// attachments it becomes Anthropic content blocks: each image inlined as
-/// base64, then the text.
+/// base64, then the text. Non-image files (D-027b) are never inlined — the
+/// CLI has no file block verified to work — so their `[File #n] … saved at …`
+/// lines are prepended to the text block, which the harness's Read tool acts
+/// on.
 ///
 /// Base64 is not a preference. The design verified that a `source.type` of
 /// `file` or a bare path is silently downgraded to text by the CLI, so the
@@ -1562,9 +1566,15 @@ fn prompt_content(blocks: &[ContentBlock]) -> DriverResult<UserContent> {
     if attachments.is_empty() {
         return Ok(UserContent::Text(prompt_text(blocks)?));
     }
-    let mut images = Vec::with_capacity(attachments.len());
+    let images: Vec<_> = attachments
+        .iter()
+        .filter(|attachment| attachment.kind == AttachmentKind::Image)
+        .collect();
+    // Any non-image attachment rides a text block instead of an image block.
+    let has_files = attachments.len() != images.len();
+    let mut inline = Vec::with_capacity(images.len());
     let mut total = 0usize;
-    for attachment in &attachments {
+    for attachment in &images {
         let bytes = attachment.read()?;
         total = total.saturating_add(bytes.len());
         if total > MAX_INLINE_IMAGE_BYTES {
@@ -1579,7 +1589,7 @@ fn prompt_content(blocks: &[ContentBlock]) -> DriverResult<UserContent> {
                 crate::attachment::text_with_path_mentions(blocks)?,
             ));
         }
-        images.push(serde_json::json!({
+        inline.push(serde_json::json!({
             "type": "image",
             "source": {
                 "type": "base64",
@@ -1588,11 +1598,17 @@ fn prompt_content(blocks: &[ContentBlock]) -> DriverResult<UserContent> {
             },
         }));
     }
-    let text = crate::attachment::text_of(blocks);
+    // File-reference lines precede the user text; when every attachment is an
+    // image the text block is the prompt unchanged.
+    let text = if has_files {
+        crate::attachment::with_file_lines(&crate::attachment::text_of(blocks), &attachments)
+    } else {
+        crate::attachment::text_of(blocks)
+    };
     if !text.is_empty() {
-        images.push(serde_json::json!({"type": "text", "text": text}));
+        inline.push(serde_json::json!({"type": "text", "text": text}));
     }
-    Ok(UserContent::Blocks(images))
+    Ok(UserContent::Blocks(inline))
 }
 
 fn base64_of(bytes: &[u8]) -> String {
@@ -2406,6 +2422,7 @@ mod attachment_tests {
                 media_type: "image/png".into(),
                 name: Some("shot.png".into()),
                 anchor: None,
+                size: None,
             })),
             ContentBlock::Resource(Box::new(ResourceBlock {
                 uri: format!("file://{}", path.display()),

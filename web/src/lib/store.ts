@@ -41,6 +41,23 @@ import {
   effectiveFromRecord,
   type EffortEffectiveView,
 } from "../features/session/effortEffective";
+import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
+import { isUnauthorized } from "./httpError";
+import { JournalClient, type JournalRead } from "./journal";
+import { id, now } from "./ids";
+import { mockGappedTail, mockJournalIds } from "./mock";
+import { readDeviceSettings } from "../features/settings/prefs";
+import {
+  MOCK_BOOTSTRAP_TOKEN,
+  clearSession,
+  dropDeviceCookie,
+  readLoggedOut,
+  readSession,
+  writeSession,
+  type DeviceSession,
+  type PairCode,
+  type PairedDevice,
+} from "./session";
 
 /** A push-down in flight (chip shows 切换中 / 排队中 until it settles). */
 export type EffortPending = {
@@ -79,23 +96,6 @@ function effortLifecycleStatus(status: unknown):
   }
   return null;
 }
-import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
-import { isUnauthorized } from "./httpError";
-import { JournalClient, type JournalRead } from "./journal";
-import { id, now } from "./ids";
-import { mockGappedTail, mockJournalIds } from "./mock";
-import { readDeviceSettings } from "../features/settings/prefs";
-import {
-  MOCK_BOOTSTRAP_TOKEN,
-  clearSession,
-  dropDeviceCookie,
-  readLoggedOut,
-  readSession,
-  writeSession,
-  type DeviceSession,
-  type PairCode,
-  type PairedDevice,
-} from "./session";
 
 export type ConnectionUi = "live" | "reconnecting" | "offline";
 export type Toast = { id: string; text: string } | null;
@@ -128,14 +128,18 @@ export type LocalBubble = {
 };
 
 /**
- * One image shown under a sent bubble. `index` is its 1-based `[Image #n]`
- * anchor (from the send manifest), so an inline token can be paired with the
- * thumbnail.
+ * One file/image shown under a sent bubble. `index` is its 1-based
+ * `[Image #n]`/`[File #n]` anchor (from the send manifest), so an inline
+ * token can be paired with the chip.
  */
 export type BubbleAttachment = {
   objectId: string;
   name: string;
+  /** Blob URL for an optimistic image; files link straight to the Hub. */
   previewUrl: string;
+  kind: "image" | "file";
+  mediaType: string;
+  size: number;
   index?: number;
 };
 

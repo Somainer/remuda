@@ -127,6 +127,26 @@ materialize 在 dispatch 前**同步**完成；失败（磁盘满 / 404 / 已过
 
 v2 的 `crates/remuda-driver/src/clipboard.rs`：macOS `osascript` 写 `«class PNGf»`、X11 `xclip -selection clipboard -t image/png -i`、Wayland `wl-copy --type image/png`；探测结果进 host capability。**OSC 52 不可替代**：它只改终端模拟器的剪贴板且限纯文本，而 agent 读的是宿主 pasteboard。
 
+#### 5.3.1 D-027b（2026-09-15）：任意文件投递行为
+
+图片仍走上面的原生路径；**非图片文件一律不内联**，只在用户文本**之前**展开一行路径引用：
+
+```
+[File #n] <原始文件名> (<mime>, <人类可读大小>) saved at <宿主机绝对路径>
+```
+
+该行由 `remuda-driver/src/attachment.rs` 的 `file_mention_lines()` 生成，所有 PTY 驱动共用同一 `text_with_path_mentions()`；各 harness 的实际行为：
+
+| driver | 图片（保持 MVP） | 任意文件（D-027b） |
+|---|---|---|
+| `claude_print` | base64 image block（>3.5 MiB 退化路径） | 不内联；文件行作为 text block 前置，Claude 用 Read 工具打开 |
+| `claude_pty` | 文本后追加 `附件: /abs/path.png` + Read 提示 | 文本前置 `[File #n] … saved at …`，Read 工具可读 |
+| `generic_pty`（codex） | 显式「读取 /abs/path.png」路径提及 | 文本前置 `[File #n] … saved at …`；codex 文件工具直接按绝对路径打开（不像图片需要 `LocalImage`） |
+| `generic_pty`（grok） | 路径提及 + 一次性「不支持读图」journal 徽标 | 路径行前置，**不触发**读图徽标（普通文本/PDF 路径其文件工具可读） |
+| `shell_pty` | shell-quoted 路径追加 | shell-quoted 路径追加（原始 shell，无 agent 工具语义） |
+
+节点落盘用 Hub 净化过的原始文件名（无路径分隔符/控制字符、长度截断），重名加 `-<n>` 数字后缀，并校验 sha256；文件永不执行（0600、独立 attachments 目录）。
+
 ### 5.4 安全
 
 - 鉴权：`require_origin` + device cookie，仅 owner device 可上传；agent-origin 一律 403（MVP），v2 再把 `object.attach` 纳入 `agent_scope` 的 approval 类别。`GET /v1/objects/{id}` 双重绑定 account + 该对象绑定的 instance；Node 只能读它所托管 instance 的对象。

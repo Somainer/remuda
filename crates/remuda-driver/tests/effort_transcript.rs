@@ -84,7 +84,8 @@ impl WireName for remuda_protocol::EffortName {
             remuda_protocol::EffortName::High => "high",
             remuda_protocol::EffortName::Xhigh => "xhigh",
             remuda_protocol::EffortName::Max => "max",
-            // Codex/Grok-only launch word; never observed on a Claude record.
+            remuda_protocol::EffortName::Ultra => "ultra",
+            // Legacy input word; never observed on a Claude record.
             remuda_protocol::EffortName::Minimal => "minimal",
         }
     }

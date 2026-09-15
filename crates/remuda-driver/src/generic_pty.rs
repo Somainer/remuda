@@ -563,11 +563,17 @@ impl Driver for GenericPtyDriver {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
         // D-027: grok has no remote image input at all — not a flag, not a
-        // content block, not a path its tooling will open. The prompt still
-        // carries the path, but say plainly that this agent will not see the
-        // image, so a wrong answer is not mistaken for a model failure.
-        if !attachments.is_empty() && live.preset_id.eq_ignore_ascii_case("grok") {
-            note_attachments_unreadable(live, &self.seq, attachments.len()).await;
+        // content block, not a path its tooling will open as an image. The
+        // prompt still carries the path, but say plainly that this agent will
+        // not see the image, so a wrong answer is not mistaken for a model
+        // failure. D-027b: arbitrary files do not trigger the note — a path
+        // to a PDF or text file is readable with ordinary file tools.
+        let image_count = attachments
+            .iter()
+            .filter(|attachment| attachment.kind == remuda_protocol::hubnode::AttachmentKind::Image)
+            .count();
+        if image_count > 0 && live.preset_id.eq_ignore_ascii_case("grok") {
+            note_attachments_unreadable(live, &self.seq, image_count).await;
         }
         let ctx = obs_ctx(
             DriverKind::GenericPty,

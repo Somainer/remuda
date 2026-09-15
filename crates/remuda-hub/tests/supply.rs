@@ -340,7 +340,7 @@ async fn catalog_endpoint_lists_revisioned_capabilities() -> Result<()> {
     .await?;
     assert_eq!(status, 200, "{body}");
     let value: Value = serde_json::from_str(body.trim())?;
-    assert_eq!(value["revision"], 1);
+    assert_eq!(value["revision"], remuda_hub::CATALOG_REVISION);
     let models = value["models"].as_array().unwrap();
     let opus = models
         .iter()

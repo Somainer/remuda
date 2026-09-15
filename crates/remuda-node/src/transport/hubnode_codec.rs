@@ -329,6 +329,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             // Filled by apply_spec_launch_fields from the Hub spec.
             effort: None,
             tui: None,
+            extra_env: std::collections::BTreeMap::new(),
         },
     };
     request.apply_spec_launch_fields(&spec);

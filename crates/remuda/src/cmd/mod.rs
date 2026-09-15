@@ -1,11 +1,14 @@
 //! Command registration. Feature modules own arguments, help and execution.
 
 pub mod agents;
+mod brief;
 pub mod dev;
+mod dispatch;
 pub mod dispatcher;
 pub mod doctor;
 pub mod fleet;
 pub mod hook;
+mod hostcap;
 pub mod hub;
 pub mod hub_client;
 mod hub_maintenance;
@@ -19,6 +22,7 @@ mod own;
 mod profile;
 mod project;
 pub(crate) mod registry;
+mod retire;
 pub mod ssh;
 pub mod table;
 mod task;
@@ -56,6 +60,10 @@ commands! {
     Task(task::TaskArgs),
     Own(own::OwnArgs),
     Profile(profile::ProfileArgs),
+    Dispatch(dispatch::DispatchArgs),
+    Retire(retire::RetireArgs),
+    Hostcap(hostcap::HostcapArgs),
+    Brief(brief::BriefArgs),
     Fleet(fleet::Args),
     Worktree(worktree::Args),
     Merge(merge::MergeArgs),

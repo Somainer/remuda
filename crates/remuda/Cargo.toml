@@ -25,6 +25,7 @@ remuda-signal.workspace = true
 remuda-ssh.workspace = true
 remuda-hub-client.workspace = true
 regex = "1"
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

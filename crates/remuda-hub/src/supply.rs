@@ -538,8 +538,18 @@ pub fn build_candidates(input: &SolveInput<'_>) -> Vec<SupplyCandidate> {
             windows.extend(model_windows.iter().cloned());
             let unknown_supply = supply.windows.is_empty() && model_windows.is_empty();
             let pinned = input.task.pin.as_ref().is_some_and(|pin| {
-                pin.supply_id.as_deref() == Some(profile.id.as_str())
-                    && pin.model.as_deref().is_none_or(|id| id == model.id)
+                // An explicit model pin (the `--model` dispatch flag) matches
+                // the model on *any* profile that carries it; a supply pin is
+                // additionally scoped to that profile.
+                let supply_match = pin
+                    .supply_id
+                    .as_deref()
+                    .is_none_or(|id| id == profile.id.as_str());
+                let model_match = pin
+                    .model
+                    .as_deref()
+                    .is_none_or(|id| id == model.id.as_str());
+                supply_match && model_match
             });
             candidates.push(SupplyCandidate {
                 profile_id: profile.id.clone(),
@@ -1041,6 +1051,49 @@ async fn caller_is_coordinator(state: &AppState, headers: &HeaderMap) -> Result<
         .grants
         .iter()
         .any(|verb| verb == "dispatch" || verb == "spend"))
+}
+
+/// Check whether an explicitly pinned model is currently parked (observed
+/// 429 window cooling, or declared exhausted) on any profile that carries it.
+///
+/// The solver's pin bypasses rank filters by design (honour the explicit
+/// choice), but design §4.4 #8 / §3.4 back-pressure still require refusing a
+/// 429-parked model with its park reason rather than launching into the limit.
+#[must_use]
+pub fn model_park_reason(
+    profiles: &[ProviderRecord],
+    wanted_model: &str,
+    _decision: Value,
+) -> Option<String> {
+    let now = now_epoch_secs();
+    for profile in profiles {
+        for model in profile.models.iter().filter(|model| model.enabled) {
+            if model.id != wanted_model {
+                continue;
+            }
+            let mut windows = profile.supply.windows.clone();
+            windows.extend(model.windows.iter().cloned());
+            let state = refresh_state(&mut windows, Some(profile.supply.state), now);
+            if matches!(state, SupplyState::Cooling | SupplyState::Exhausted) {
+                let until = windows
+                    .iter()
+                    .filter_map(|window| window.cooldown_until)
+                    .filter(|until| *until > now)
+                    .max();
+                return Some(match until {
+                    Some(until) => format!(
+                        "model {wanted_model} is parked ({state:?}) on profile {}; cooling until {until} — dispatch deferred, not retried against a downgrade",
+                        profile.name
+                    ),
+                    None => format!(
+                        "model {wanted_model} is {state:?} on profile {} — dispatch deferred",
+                        profile.name
+                    ),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Gather inputs and run a solve against live Hub state.

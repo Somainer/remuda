@@ -48,6 +48,7 @@ mod transport;
 mod tty;
 mod usage_store;
 mod web;
+mod workers;
 mod workspaces;
 mod ws;
 
@@ -471,6 +472,7 @@ pub fn router(state: AppState) -> Router {
         .merge(objects::routes(state.config.attachment_max_bytes))
         .merge(attachments::routes())
         .merge(workspaces::routes())
+        .merge(workers::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

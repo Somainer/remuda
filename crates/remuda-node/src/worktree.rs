@@ -38,6 +38,158 @@ pub fn handle_rpc(repo: &Path, method: &str, params: &Value) -> Option<Result<Va
     }
 }
 
+/// Result of provisioning a worker worktree (M1 batch 5a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedWorktree {
+    /// Absolute worktree path.
+    pub path: String,
+    /// Branch checked out there.
+    pub branch: String,
+    /// Start point used.
+    pub start_point: String,
+}
+
+/// Provision the product-assigned worktree for a dispatched worker.
+///
+/// Unlike [`create_record`] (the `remuda worktree create` path that allocates
+/// `wt/<name>/work[-N]`), the branch is assigned by the Hub as
+/// `wt/<name>/<slug>` and the checkout starts at a *remote* ref (default
+/// `origin/main`): the Node fetches first so a worker never branches from a
+/// stale local main. Idempotent — an existing worktree with the same name and
+/// branch is reused, matching the remote-spawn scripts.
+pub fn provision_record(
+    repo: &Path,
+    name: &str,
+    branch: &str,
+    start_point: &str,
+) -> Result<ProvisionedWorktree, NodeError> {
+    validate_name(name)?;
+    crate::worker::validate_branch(branch)?;
+    let repo_root = repo_root(Some(repo))?;
+    let git_common = git_common_dir(&repo_root)?;
+    let abs_path = resolve_path(&repo_root, name, None)?;
+    let mut catalog = load_catalog(&git_common)?;
+
+    // Reuse: a recorded worktree of the same name that still exists and is on
+    // the same assigned branch.
+    if let Some(existing) = catalog
+        .worktrees
+        .iter()
+        .find(|row| row.name == name)
+        .cloned()
+    {
+        if Path::new(&existing.path).exists() && existing.branch == branch {
+            return Ok(ProvisionedWorktree {
+                path: existing.path,
+                branch: existing.branch,
+                start_point: start_point.to_string(),
+            });
+        }
+        catalog.worktrees.retain(|row| row.name != name);
+    }
+
+    if let Some(parent) = abs_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            NodeError::InvalidRequest(format!("create {}: {err}", parent.display()))
+        })?;
+    }
+
+    // Refresh the remote-tracking refs first; a failed fetch (offline LAN,
+    // transient network) is fatal rather than silently branching from a stale
+    // local main — the coordinator scripts do the same.
+    git_fetch(&repo_root)?;
+    if ref_exists(&repo_root, branch)? {
+        return Err(NodeError::InvalidRequest(format!(
+            "worker branch {branch} already exists; refusing to provision a second worktree"
+        )));
+    }
+    git(
+        &repo_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            &abs_path.to_string_lossy(),
+            start_point,
+        ],
+    )?;
+    let path = abs_path
+        .canonicalize()
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .into_owned();
+    let record = WorktreeRecord {
+        name: name.to_string(),
+        path: path.clone(),
+        branch: branch.to_string(),
+        base: start_point.to_string(),
+    };
+    upsert(&mut catalog, record);
+    save_catalog(&git_common, &catalog)?;
+    Ok(ProvisionedWorktree {
+        path,
+        branch: branch.to_string(),
+        start_point: start_point.to_string(),
+    })
+}
+
+/// Remove a worker's provisioned worktree with `git worktree remove --force`
+/// and drop it from the catalog. The branch itself is kept (gate/land owns
+/// branch deletion); only the working tree is reclaimed.
+pub fn remove_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
+    validate_name(name)?;
+    let repo_root = repo_root(Some(repo))?;
+    let git_common = git_common_dir(&repo_root)?;
+    let mut catalog = load_catalog(&git_common)?;
+    let Some(record) = catalog
+        .worktrees
+        .iter()
+        .find(|row| row.name == name)
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    let path = PathBuf::from(&record.path);
+    if path.exists() {
+        // A worker can leave untracked/modified files behind; --force is the
+        // documented retire semantics (tab close → worktree remove → rm).
+        if let Err(error) = git(&repo_root, &["worktree", "remove", "--force", &record.path]) {
+            // Fall back to manual removal + prune for a corrupt administrative
+            // directory, then verify the path is actually gone.
+            let _ = fs::remove_dir_all(&path);
+            let _ = git(&repo_root, &["worktree", "prune"]);
+            if path.exists() {
+                return Err(error);
+            }
+        }
+    }
+    catalog.worktrees.retain(|row| row.name != name);
+    save_catalog(&git_common, &catalog)?;
+    Ok(true)
+}
+
+/// `git fetch origin` (or the remote the start point namespaces). Unbounded:
+/// like worktree mutation, a large fetch must not be killed by a probe deadline.
+fn git_fetch(repo: &Path) -> Result<(), NodeError> {
+    crate::workspace_access_check(repo)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "-q", "origin"])
+        .current_dir("/")
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(NodeError::InvalidRequest(format!(
+            "git fetch origin failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 /// True when `method` is a worktree Hub RPC.
 pub fn is_worktree_method(method: &str) -> bool {
     matches!(method, "worktree.create" | "worktree.list")

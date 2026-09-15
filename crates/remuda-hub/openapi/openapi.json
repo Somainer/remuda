@@ -203,7 +203,7 @@
             "type": "string"
           },
           "mediaType": {
-            "description": "Hub-accepted MIME essence (`image/png`, `application/pdf`, `text/plain`, …).",
+            "description": "Hub-accepted MIME essence (`image/png`, `application/pdf`, `text/plain`, \u2026).",
             "type": "string"
           },
           "name": {
@@ -1188,24 +1188,48 @@
             ]
           },
           "effortEffective": {
-            "type": ["object", "null"],
-            "description": "D-028 §9.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown.",
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "D-028 \u00a79.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown.",
             "properties": {
               "name": {
                 "type": "string",
-                "enum": ["low", "medium", "high", "xhigh", "max", "ultra"]
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max",
+                  "ultra"
+                ]
               },
               "ultracode": {
-                "type": ["boolean", "null"],
+                "type": [
+                  "boolean",
+                  "null"
+                ],
                 "description": "Observed dynamic-workflow flag; null unless positively observed (the native transcript spells ultracode as xhigh and omits the boolean)."
               },
               "source": {
                 "type": "string",
-                "enum": ["launch", "slash", "remuda", "unknown"]
+                "enum": [
+                  "launch",
+                  "slash",
+                  "remuda",
+                  "unknown"
+                ]
               },
-              "observedAt": { "type": "string" }
+              "observedAt": {
+                "type": "string"
+              }
             },
-            "required": ["name", "source", "observedAt"],
+            "required": [
+              "name",
+              "source",
+              "observedAt"
+            ],
             "additionalProperties": true
           },
           "effortName": {
@@ -3410,6 +3434,411 @@
           "default"
         ],
         "type": "string"
+      },
+      "WorkerStateKind": {
+        "type": "string",
+        "enum": [
+          "dispatched",
+          "working",
+          "done",
+          "blocked",
+          "retired"
+        ],
+        "description": "Worker roster lifecycle state; design \u00a72.2."
+      },
+      "WorkerState": {
+        "description": "Adjacently tagged worker state ({state,sha?} / {state,reason?}).",
+        "oneOf": [
+          {
+            "properties": {
+              "state": {
+                "const": "dispatched"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "working"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "done"
+              },
+              "sha": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "sha"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "blocked"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "retired"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WorkerRoster": {
+        "description": "One row of the per-project worker roster; design \u00a72.2\u2463.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "pattern": "^wkr_",
+            "type": "string"
+          },
+          "revision": {
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "projectId": {
+            "pattern": "^prj_",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "instanceId": {
+            "pattern": "^ins_",
+            "type": "string"
+          },
+          "hostId": {
+            "pattern": "^hst_",
+            "type": "string"
+          },
+          "workspaceId": {
+            "pattern": "^wsp_",
+            "type": "string"
+          },
+          "harness": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "providerProfileId": {
+            "pattern": "^pvp_",
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "worktreePath": {
+            "type": "string"
+          },
+          "portBlock": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "targetDir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "briefObjectId": {
+            "pattern": "^obj_",
+            "type": "string"
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WorkerState"
+          },
+          "supplyDecision": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "reclaimedBytes": {
+            "pattern": "^[0-9]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "createdAt",
+          "updatedAt",
+          "projectId",
+          "name",
+          "hostId",
+          "workspaceId",
+          "harness",
+          "branch",
+          "worktreePath",
+          "state"
+        ]
+      },
+      "WorkerPage": {
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkerRoster"
+            }
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "WorkerDispatch": {
+        "type": "object",
+        "properties": {
+          "projectId": {
+            "pattern": "^prj_",
+            "type": "string"
+          },
+          "brief": {
+            "type": "string",
+            "description": "Brief bytes (utf8); staged as an object attachment, never inlined."
+          },
+          "briefName": {
+            "type": "string"
+          },
+          "taskId": {
+            "pattern": "^tsk_",
+            "type": "string"
+          },
+          "harness": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "codex",
+              "grok"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Optional explicit worker name (one safe lowercase segment)."
+          },
+          "hostId": {
+            "pattern": "^hst_",
+            "type": "string"
+          },
+          "placement": {
+            "type": "string",
+            "enum": [
+              "local",
+              "remote",
+              "auto"
+            ]
+          }
+        },
+        "required": [
+          "projectId",
+          "brief"
+        ]
+      },
+      "WorkerDispatchResult": {
+        "type": "object",
+        "properties": {
+          "worker": {
+            "$ref": "#/components/schemas/WorkerRoster"
+          },
+          "instanceId": {
+            "pattern": "^ins_",
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker"
+        ]
+      },
+      "WorkerRetire": {
+        "type": "object",
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "WorkerRetireResult": {
+        "type": "object",
+        "properties": {
+          "worker": {
+            "$ref": "#/components/schemas/WorkerRoster"
+          },
+          "node": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "worker"
+        ]
+      },
+      "WorkerStateUpdate": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/WorkerStateKind"
+          },
+          "sha": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "WorkerBriefSend": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ]
+      },
+      "WorkerBriefResult": {
+        "type": "object",
+        "properties": {
+          "worker": {
+            "$ref": "#/components/schemas/WorkerRoster"
+          },
+          "command": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "worker"
+        ]
+      },
+      "HostCapacity": {
+        "type": "object",
+        "description": "Current host capacity snapshot; design \u00a72.2/\u00a73.4/\u00a77 #6.",
+        "properties": {
+          "hostId": {
+            "pattern": "^hst_",
+            "type": "string"
+          },
+          "online": {
+            "type": "boolean"
+          },
+          "cores": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "loadPct": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "loadAvg1": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "memPct": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "diskFreeGb": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "maxInstances": {
+            "type": "integer"
+          },
+          "running": {
+            "type": "integer"
+          },
+          "freeSlots": {
+            "type": "integer"
+          },
+          "activeWorkers": {
+            "type": "integer"
+          },
+          "portBlocksInUse": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "required": [
+          "hostId"
+        ]
       }
     }
   },
@@ -7024,6 +7453,335 @@
           "worktrees"
         ]
       }
+    },
+    "/v1/workers": {
+      "get": {
+        "operationId": "workerList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerPage"
+                }
+              }
+            },
+            "description": "Worker roster page"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the worker roster in the caller's project scope",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "prj_\u2026 project id",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "worker state filter (dispatched|working|done|blocked|retired)",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/WorkerStateKind"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/dispatch": {
+      "post": {
+        "operationId": "workerDispatch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerDispatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerDispatchResult"
+                }
+              }
+            },
+            "description": "Provisioned worker roster row"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Provision and launch a worker (requires the dispatch grant)",
+        "tags": [
+          "workers"
+        ]
+      }
+    },
+    "/v1/workers/{id}": {
+      "get": {
+        "operationId": "workerGet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRoster"
+                }
+              }
+            },
+            "description": "Worker roster row"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get one worker roster row by wkr_ id or active worker name",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/retire": {
+      "post": {
+        "operationId": "workerRetire",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerRetire"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRetireResult"
+                }
+              }
+            },
+            "description": "Retired worker with reclaim report"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Close the worker tab and reclaim worktree + target dir",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/state": {
+      "post": {
+        "operationId": "workerState",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerStateUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerRoster"
+                }
+              }
+            },
+            "description": "Updated worker roster row"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Record a worker's DONE/BLOCKED/working state",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/brief": {
+      "post": {
+        "operationId": "workerBrief",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerBriefSend"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerBriefResult"
+                }
+              }
+            },
+            "description": "Brief delivered as an object attachment"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Re-deliver a brief/handback file to a live worker",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/hosts/{id}/hostcap": {
+      "get": {
+        "operationId": "hostCapacity",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostCapacity"
+                }
+              }
+            },
+            "description": "Current host capacity and allocations"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Show cores/load/disk, free slots and port blocks in use",
+        "tags": [
+          "hosts"
+        ],
+        "parameters": [
+          {
+            "description": "hst_ host id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^hst_",
+              "type": "string"
+            }
+          }
+        ]
+      }
     }
   },
   "servers": [
@@ -7071,6 +7829,9 @@
     },
     {
       "name": "projects"
+    },
+    {
+      "name": "workers"
     }
   ]
 }

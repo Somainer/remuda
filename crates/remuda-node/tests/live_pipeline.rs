@@ -181,6 +181,7 @@ async fn start_run(hooks: bool) -> LiveRun {
         binary_path: Some(binary.to_string_lossy().into_owned()),
         binary_sha256: None,
         tui: None,
+        extra_env: std::collections::BTreeMap::new(),
         provider_profile_id: "dev-fake".into(),
         permission_mode: "manual".into(),
         prompt: "LIVE probe".into(),

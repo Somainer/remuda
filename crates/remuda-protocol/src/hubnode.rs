@@ -34,6 +34,10 @@ pub const METHOD_WORKSPACE_LIST: &str = "workspace.list";
 pub const METHOD_WORKSPACE_REGISTER: &str = "workspace.register";
 /// Prepare or commit persistent workspace removal.
 pub const METHOD_WORKSPACE_UNREGISTER: &str = "workspace.unregister";
+/// Provision a worker's worktree and per-worker target directory (M1 batch 5a).
+pub const METHOD_WORKER_PROVISION: &str = "worker.provision";
+/// Reclaim a worker's tab, worktree and target directory (M1 batch 5a).
+pub const METHOD_WORKER_REMOVE: &str = "worker.remove";
 /// Create an Instance on the Node.
 pub const METHOD_INSTANCE_CREATE: &str = "instance.create";
 /// Continue an exited Instance's native session on a new Instance (D-026).
@@ -140,6 +144,10 @@ pub enum HubNodeMethod {
     WorkspaceRegister,
     /// [`METHOD_WORKSPACE_UNREGISTER`].
     WorkspaceUnregister,
+    /// [`METHOD_WORKER_PROVISION`].
+    WorkerProvision,
+    /// [`METHOD_WORKER_REMOVE`].
+    WorkerRemove,
     /// [`METHOD_INSTANCE_CREATE`].
     InstanceCreate,
     /// [`METHOD_INSTANCE_RESUME`].
@@ -833,6 +841,8 @@ impl HubNodeMethod {
             Self::WorkspaceList => METHOD_WORKSPACE_LIST,
             Self::WorkspaceRegister => METHOD_WORKSPACE_REGISTER,
             Self::WorkspaceUnregister => METHOD_WORKSPACE_UNREGISTER,
+            Self::WorkerProvision => METHOD_WORKER_PROVISION,
+            Self::WorkerRemove => METHOD_WORKER_REMOVE,
             Self::InstanceCreate => METHOD_INSTANCE_CREATE,
             Self::InstanceResume => METHOD_INSTANCE_RESUME,
             Self::InstanceSend => METHOD_INSTANCE_SEND,
@@ -863,6 +873,8 @@ impl HubNodeMethod {
             METHOD_WORKSPACE_LIST => Self::WorkspaceList,
             METHOD_WORKSPACE_REGISTER => Self::WorkspaceRegister,
             METHOD_WORKSPACE_UNREGISTER => Self::WorkspaceUnregister,
+            METHOD_WORKER_PROVISION => Self::WorkerProvision,
+            METHOD_WORKER_REMOVE => Self::WorkerRemove,
             METHOD_INSTANCE_CREATE => Self::InstanceCreate,
             METHOD_INSTANCE_RESUME => Self::InstanceResume,
             METHOD_INSTANCE_SEND => Self::InstanceSend,

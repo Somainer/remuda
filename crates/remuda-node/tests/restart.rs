@@ -47,6 +47,7 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         resumed_from: None,
         effort: None,
         tui: None,
+        extra_env: std::collections::BTreeMap::new(),
     }
 }
 

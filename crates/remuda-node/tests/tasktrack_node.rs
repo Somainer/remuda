@@ -136,6 +136,7 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
         binary_path: Some(binary.to_string_lossy().into_owned()),
         binary_sha256: None,
         tui: None,
+        extra_env: std::collections::BTreeMap::new(),
         provider_profile_id: "dev-fake".into(),
         permission_mode: "manual".into(),
         prompt: "FGAGENT foreground".into(),

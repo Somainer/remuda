@@ -47,7 +47,9 @@ nix = { version = "0.28", features = ["process", "fs", "signal"] }
 
 [dev-dependencies]
 portable-pty.workspace = true
+remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-hub.workspace = true
 remuda-testing.workspace = true
+serde_json.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true

@@ -11620,7 +11620,7 @@
           "description": "Observed level."
         },
         "ultracode": {
-          "description": "Observed dynamic-workflow flag; `None` unless positively observed via\nan immediately preceding `/effort ultracode`.",
+          "description": "Observed dynamic-workflow flag; positively true after\n`Set effort level to ultracode`, positively false after a plain level\naccept, `None` until a verdict says either way.",
           "type": [
             "boolean",
             "null"

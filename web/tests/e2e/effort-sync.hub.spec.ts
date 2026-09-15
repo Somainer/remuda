@@ -9,7 +9,13 @@ import { login } from "./hub-auth";
  * 2. moving the slider to xhigh posts `instance.configure`; the fake node
  *    appends an `effort` observation reporting xhigh — agreement, no mismatch;
  * 3. moving to max, the fake node clamps the effective level to xhigh, so the
- *    chip renders the observed level and 请求 max → 实际 xhigh.
+ *    chip renders the observed level and 请求 max → 实际 xhigh;
+ * 4. the ultracode stop reads back xhigh + the flag and the chip says
+ *    "ultracode" (effort-sync-2);
+ * 5. a terminal-side `/effort low` (a send, not a configure) moves the slider
+ *    to low with NO configure posted (single source of truth, no ping-pong);
+ * 6. while the turn is working, a queued push-down shows the 排队中 tag;
+ * 7. a rejected switch shows no read-back level change and reverts the chip.
  *
  * No real model is invoked — the fake node writes the transcript events.
  */
@@ -145,4 +151,88 @@ test("slider change reaches the fake node; transcript read-back drives the effec
   await expect(mismatch).toBeVisible();
   expect(await mismatch.textContent()).toContain("请求 max");
   expect(await mismatch.textContent()).toContain("实际 xhigh");
+});
+
+test("ultracode read-back names the chip ultracode; a terminal /effort moves the slider without configure", async ({
+  page,
+}) => {
+  const instanceId = await createSession(page, "effort terminal sync");
+  await clearApprovals(page, instanceId);
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
+
+  // Count every instance.configure command so the terminal-side fold below
+  // can be proven not to ping-pong a configure back into the PTY.
+  let configureCalls = 0;
+  await page.route("**/v1/instances/*/commands", async (route) => {
+    const request = route.request();
+    if (request.method() === "POST") {
+      const body = request.postDataJSON() as { operation?: string } | null;
+      if (body?.operation === "instance.configure") configureCalls += 1;
+    }
+    await route.continue();
+  });
+
+  // low → med → high → xhigh → max → ultracode (End from default).
+  await moveSlider(page, "End");
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("ultracode", {
+    timeout: 15_000,
+  });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
+    "data-effort-effective",
+    "ultracode",
+  );
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
+  const configuresAfterSlider = configureCalls;
+  expect(configuresAfterSlider).toBeGreaterThanOrEqual(1);
+
+  // Terminal side: a send carrying the sentinel the fake node maps to a
+  // hand-typed `/effort low` slash observation.
+  const composer = page.getByTestId("composer-input");
+  await composer.fill("/effort:low");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("low", { timeout: 15_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-source", "slash");
+  // Give any (incorrect) configure a moment to happen, then prove none did.
+  await page.waitForTimeout(800);
+  expect(configureCalls).toBe(configuresAfterSlider);
+});
+
+test("a queued push-down shows 排队中; a rejected one reverts the chip", async ({ page }) => {
+  const instanceId = await createSession(page, "effort queue and reject");
+  await clearApprovals(page, instanceId);
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
+
+  // Post the sentinel command directly (the UI slider never offers these
+  // words): the fake node answers with only an effort-queued lifecycle.
+  await page.evaluate(async (id) => {
+    const res = await fetch(`/v1/instances/${id}/commands`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        operation: "instance.configure",
+        payload: { effort: { name: "__queued__:xhigh", index: 3 } },
+      }),
+    });
+    if (!res.ok) throw new Error(`queued configure ${res.status}`);
+  }, instanceId);
+  await expect(page.getByTestId("model-effort-pending")).toHaveText("排队中", { timeout: 10_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
+    "data-effort-pending",
+    "queued",
+  );
+
+  // A degraded verdict (Esc on the native dialog) reverts and clears pending.
+  await page.evaluate(async (id) => {
+    await fetch(`/v1/instances/${id}/commands`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        operation: "instance.configure",
+        payload: { effort: { name: "__degrade__:max", index: 4 } },
+      }),
+    });
+  }, instanceId);
+  await expect(page.getByTestId("model-effort-pending")).toHaveCount(0, { timeout: 10_000 });
 });

@@ -183,13 +183,28 @@ describe("Composer shortcuts", () => {
     expect(slider).toHaveAttribute("data-ember", "1");
     // The stop is a normal slider stop: the track stays enabled...
     expect(slider).toHaveAttribute("aria-disabled", "false");
-    // §9.1: the chip reads the EFFECTIVE transcript level ("xhigh", the level
-    // ultracode runs at); the requested "ultracode" shows in the open slider.
-    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("xhigh");
+    // §9.1: the read-back is tier xhigh + the ultracode flag, and the chip
+    // names the stop the user actually chose — "ultracode" (effort-sync-2).
+    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("ultracode");
+    expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-effective", "ultracode");
     expect(screen.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "1");
-    // One arrow left returns to max — no locked track.
+    // One arrow left from the ultracode stop returns to max — no locked track.
     await user.keyboard("{ArrowLeft}");
     expect(onEffort).toHaveBeenLastCalledWith({ index: 4, name: "max", kind: "claude", ultracode: false });
+    // A bare xhigh read-back without the flag is still the tier word.
+    rerender(
+      <Composer
+        instanceId="ins_ultra"
+        mobile={false}
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 3, false)}
+        effortEffective={{ name: "xhigh", ultracode: false, source: "remuda", observedAt: "2026-09-14T00:00:01Z" }}
+        onEffort={onEffort}
+      />,
+    );
+    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("xhigh");
   });
 
   it("snaps a pointer drag to the nearest of the six Claude stops", async () => {

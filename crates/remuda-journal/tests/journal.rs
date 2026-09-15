@@ -487,3 +487,65 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
     );
     Ok(())
 }
+
+/// Verbatim replay of the real claude 2.1.272 PTY walk captured by
+/// `crates/remuda-driver/examples/effort_probe.rs` (evidence effort-sync-2.md).
+#[test]
+fn real_21272_walk_settles_effort_from_the_stdout_verdict() -> Result<()> {
+    let (_, _, _, map) = ctx("effort-session-21272");
+    let contents = include_str!("fixtures/effort-21272/effort-walk-21272.jsonl");
+    let envelopes = map_file(contents, &map)?;
+    let edges: Vec<_> = envelopes
+        .iter()
+        .filter_map(|env| match &env.body {
+            ObservationPayload::Effort(payload) => Some((
+                payload.effective.name,
+                payload.effective.source,
+                payload.effective.ultracode,
+            )),
+            _ => None,
+        })
+        .collect();
+    // The stdout verdict — not the next assistant turn — emits the xhigh edge,
+    // the ultracode edge carries Some(true), and high clears the flag.
+    assert!(
+        edges.iter().any(
+            |(name, _, ultra)| *name == remuda_protocol::EffortName::Xhigh && *ultra == Some(false)
+        ),
+        "xhigh accepted from stdout: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(
+            |(name, _, ultra)| *name == remuda_protocol::EffortName::Xhigh && *ultra == Some(true)
+        ),
+        "ultracode accepted from stdout: {edges:?}"
+    );
+    assert!(
+        edges.iter().any(
+            |(name, _, ultra)| *name == remuda_protocol::EffortName::High && *ultra == Some(false)
+        ),
+        "high accept clears the flag: {edges:?}"
+    );
+    // The dismissed-dialog max never becomes an edge.
+    assert!(
+        !edges
+            .iter()
+            .any(|(name, _, _)| *name == remuda_protocol::EffortName::Max),
+        "Esc-on-dialog max must not settle: {edges:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn real_21272_reject_records_map_to_no_effort_envelopes() -> Result<()> {
+    let (_, _, _, map) = ctx("effort-session-21272-reject");
+    let contents = include_str!("fixtures/effort-21272/effort-reject-21272.jsonl");
+    let envelopes = map_file(contents, &map)?;
+    assert!(
+        envelopes
+            .iter()
+            .all(|env| !matches!(env.body, ObservationPayload::Effort(_))),
+        "Kept/Invalid verdicts emit no effort edges"
+    );
+    Ok(())
+}

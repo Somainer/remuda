@@ -42,6 +42,10 @@ pub mod usage;
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;
 
+/// Test-only bridge/mapper constructors for §9.1 integration tests.
+#[cfg(any(test, feature = "test-stub"))]
+pub mod test_support;
+
 pub use attachment::{PromptAttachment, attachments_of, text_with_path_mentions};
 pub use binary::{
     BinaryOverrideGuard, BinaryPin, default_command, hash_file, pin_binary, resolve_binary,

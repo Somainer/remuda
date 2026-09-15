@@ -143,14 +143,15 @@ pub fn ensure_no_effort_in_extras(kind: AgentKind, extras: &[String]) -> DriverR
 }
 
 // ───────────────────────── Live two-way effort sync ──────────────────────────
-/// Bounded wait for the post-switch assistant record.
+/// Bounded wait for the post-switch read-back.
 ///
-/// The switch only affects the *next* turn, and read-back therefore arrives
-/// when the user next prompts. 45 s covers the "switch, immediate prompt"
-/// path on a slow network while bounding the blocking configure call; a
-/// switch made while the agent is working is queued instead (see
-/// [`SwitchOutcome`]) and is not subject to this timeout.
-pub(crate) const EFFORT_READBACK_TIMEOUT_MS: u64 = 45_000;
+/// The acceptance channel is the `/effort` command's
+/// `<local-command-stdout>` verdict, which lands a few hundred ms after the
+/// dialog is confirmed (measured ~125–270 ms on claude 2.1.272, see
+/// `docs/design/evidence/effort-sync-2.md`). This window only bounds the
+/// synchronous idle-path configure call against a wedged TUI; a switch made
+/// while the agent is working is queued instead.
+pub(crate) const EFFORT_READBACK_TIMEOUT_MS: u64 = 10_000;
 /// Poll cadence while waiting for read-back.
 pub(crate) const EFFORT_READBACK_POLL_MS: u64 = 250;
 /// Settle pause between writes (composer body, the submitting CR, the confirm
@@ -264,15 +265,27 @@ impl SwitchOutcome {
     }
 }
 
+/// Terminal verdict of a switch's read-back wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Readback {
+    /// The stdout verdict accepted the level; this is what is now in effect.
+    Applied(remuda_protocol::ObservedEffort),
+    /// Claude refused the switch (dialog dismissed with Esc, invalid argument)
+    /// and the journaled reason names why.
+    Rejected {
+        /// Stable reason code (`dialog-kept`, `invalid-argument`).
+        reason: String,
+    },
+}
+
 /// Coordination between the driver's switch call and the transcript pump.
 ///
 /// The driver arming a switch is synchronous with typing `/effort`; the
-/// read-back only arrives later, when the next assistant record is mapped.
-/// The bridge is that rendezvous: the mapper arms its [`EffortTracker`] from
-/// [`pending`](Self::pending), and resolves the generation once the level is
-/// observed. The switch call waits bounded; on timeout it fails the
-/// generation so a much later natural change to the same level is not
-/// mis-attributed to Remuda.
+/// read-back now arrives when the transcript pump maps the command's
+/// `<local-command-stdout>` verdict (measured ~300 ms), rather than waiting
+/// for the next turn's assistant record. The bridge is that rendezvous. A
+/// much later natural change to the same level is not mis-attributed: the
+/// generation only resolves on the verdict of its own command.
 pub(crate) struct EffortBridge {
     state: Mutex<BridgeState>,
     notify: Notify,
@@ -280,11 +293,11 @@ pub(crate) struct EffortBridge {
 
 #[derive(Default)]
 struct BridgeState {
-    /// A switch waiting for its assistant-record read-back.
+    /// A switch waiting for its command verdict.
     pending: Option<(u64, EffortRequest)>,
-    /// Generation whose read-back has arrived.
-    observed_gen: u64,
-    observed: Option<remuda_protocol::ObservedEffort>,
+    /// Generation whose verdict has arrived.
+    verdict_gen: u64,
+    verdict: Option<Readback>,
     /// The latest thing any side asked for (payload `requested` field).
     requested: Option<EffortRequest>,
     generation: u64,
@@ -339,7 +352,7 @@ impl EffortBridge {
         self.lock().requested
     }
 
-    /// Mapper side: the level `generation` was waiting for has been observed.
+    /// Mapper side: the command verdict `generation` was waiting for arrived.
     pub(crate) fn resolve(&self, generation: u64, observed: remuda_protocol::ObservedEffort) {
         {
             let mut state = self.lock();
@@ -348,13 +361,31 @@ impl EffortBridge {
             {
                 state.pending = None;
             }
-            state.observed = Some(observed);
-            state.observed_gen = generation;
+            state.verdict = Some(Readback::Applied(observed));
+            state.verdict_gen = generation;
         }
         self.notify.notify_waiters();
     }
 
-    /// Give up on a generation without an observation (bounded timeout).
+    /// Mapper side: Claude refused the command (Esc on the confirmation dialog
+    /// → "Kept effort level", or an invalid argument).
+    pub(crate) fn reject(&self, generation: u64, reason: impl Into<String>) {
+        {
+            let mut state = self.lock();
+            if let Some((pending_gen, _)) = state.pending
+                && pending_gen == generation
+            {
+                state.pending = None;
+            }
+            state.verdict = Some(Readback::Rejected {
+                reason: reason.into(),
+            });
+            state.verdict_gen = generation;
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Give up on a generation without a verdict (bounded timeout).
     pub(crate) fn fail(&self, generation: u64) {
         {
             let mut state = self.lock();
@@ -367,20 +398,20 @@ impl EffortBridge {
         self.notify.notify_waiters();
     }
 
-    /// Wait until generation `generation` reads back, bounded by `timeout`.
+    /// Wait until generation `generation` gets a verdict, bounded by `timeout`.
     pub(crate) async fn wait(
         &self,
         generation: u64,
         timeout: std::time::Duration,
-    ) -> Option<remuda_protocol::ObservedEffort> {
+    ) -> Option<Readback> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             {
                 let state = self.lock();
-                if state.observed_gen == generation {
-                    return state.observed;
+                if state.verdict_gen == generation {
+                    return state.verdict.clone();
                 }
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -417,10 +448,12 @@ pub(crate) trait EffortSwitchIo: Send + Sync {
 }
 
 /// Type the slash command, clear the confirmation dialog Claude opens for a
-/// cached conversation, then wait for the transcript read-back.
+/// cached conversation, then wait for the command's stdout verdict.
 ///
 /// The body and both Enter presses are separate writes with a settle gap,
-/// matching [`crate::shell_pty::send`]'s measured requirement.
+/// matching [`crate::shell_pty::send`]'s measured requirement. The dialog is
+/// polled rather than read once after a fixed sleep: measured paint is ~100 ms,
+/// and the idle-path budget is ~2 s end to end.
 pub(crate) async fn perform_switch(
     request: EffortRequest,
     bridge: &EffortBridge,
@@ -428,7 +461,7 @@ pub(crate) async fn perform_switch(
 ) -> SwitchOutcome {
     let word = request.command_word();
     // Arm before typing so the mapper correlates the slash record the command
-    // produces, even when the read-back assistant record is still a turn away.
+    // produces with this generation.
     let generation = bridge.arm(request);
 
     if let Err(error) = io.type_body(&request.command_body()).await {
@@ -454,29 +487,33 @@ pub(crate) async fn perform_switch(
     }
 
     // A cached conversation makes Claude confirm ("Change effort level? …
-    // 1. Yes, switch …"). Read, accept only when the dialog is really there.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    match io.screen_text().await {
-        Ok(text) if text.contains("Change effort level") => {
-            tokio::time::sleep(std::time::Duration::from_millis(EFFORT_WRITE_SETTLE_MS)).await;
-            if let Err(error) = io.press_enter().await {
-                tracing::warn!(%error, "effort switch: confirm write failed");
+    // 1. Yes, switch …"). Poll for the dialog text and accept only when it is
+    // really there; an invalid argument renders an error instead and must not
+    // get a confirming CR. `Esc` cancels, so the extra CR is gated.
+    let dialog_deadline = std::time::Duration::from_millis(1_500);
+    let dialog_start = std::time::Instant::now();
+    let mut dialog_seen = false;
+    while dialog_start.elapsed() < dialog_deadline {
+        match io.screen_text().await {
+            Ok(text) if text.contains("Change effort level") => {
+                dialog_seen = true;
+                break;
+            }
+            Ok(text) if text.contains("Invalid argument") => break,
+            Ok(_) => {}
+            Err(error) => {
+                // The dialog read failing must not stop the switch: it may
+                // already be applied. The verdict is the authority.
+                tracing::debug!(%error, "effort switch: dialog screen read failed; continuing");
+                break;
             }
         }
-        Ok(text) if text.contains("Invalid argument") => {
-            bridge.fail(generation);
-            io.journal(
-                SwitchOutcome::Degraded.journal_status(word, "invalid-argument"),
-                Severity::Warning,
-            )
-            .await;
-            return SwitchOutcome::Degraded;
-        }
-        Ok(_) => {}
-        Err(error) => {
-            // The dialog read failing must not stop the switch: it may already
-            // be applied. Read-back is the authority, not this screen probe.
-            tracing::debug!(%error, "effort switch: dialog screen read failed; continuing");
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    if dialog_seen {
+        tokio::time::sleep(std::time::Duration::from_millis(EFFORT_WRITE_SETTLE_MS)).await;
+        if let Err(error) = io.press_enter().await {
+            tracing::warn!(%error, "effort switch: confirm write failed");
         }
     }
 
@@ -487,10 +524,21 @@ pub(crate) async fn perform_switch(
         )
         .await
     {
-        Some(_) => SwitchOutcome::Applied,
+        Some(Readback::Applied(_)) => SwitchOutcome::Applied,
+        Some(Readback::Rejected { reason }) => {
+            // The dialog was dismissed (Esc) or the argument rejected. The
+            // effective level never changed; the UI reverts on this lifecycle.
+            bridge.fail(generation);
+            io.journal(
+                SwitchOutcome::Degraded.journal_status(word, &reason),
+                Severity::Warning,
+            )
+            .await;
+            SwitchOutcome::Degraded
+        }
         None => {
-            // Never claim applied without an observation. A switch the user
-            // does not prompt after simply has no assistant record to read.
+            // Never claim applied without a verdict. A switch the user does
+            // nothing after simply has no command record to read.
             bridge.fail(generation);
             io.journal(
                 SwitchOutcome::Degraded.journal_status(word, "no-readback-within-window"),
@@ -749,7 +797,28 @@ mod sync_tests {
             .wait(generation, std::time::Duration::from_secs(2))
             .await
             .expect("read-back resolves");
-        assert_eq!(got.name, EffortName::Xhigh);
+        match got {
+            Readback::Applied(observed) => {
+                assert_eq!(observed.name, EffortName::Xhigh);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(bridge.pending().is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_carry_the_reason() {
+        let bridge = EffortBridge::new();
+        let generation = bridge.arm(EffortRequest::from_level("xhigh").unwrap());
+        bridge.reject(generation, "dialog-kept");
+        match bridge
+            .wait(generation, std::time::Duration::from_secs(1))
+            .await
+            .expect("verdict")
+        {
+            Readback::Rejected { reason } => assert_eq!(reason, "dialog-kept"),
+            other => panic!("{other:?}"),
+        }
         assert!(bridge.pending().is_none());
     }
 
@@ -893,9 +962,8 @@ mod switch_tests {
 
     #[tokio::test]
     async fn missing_read_back_degrades_and_never_claims_applied() {
-        // Short timeout is not configurable per call, so this test runs the real
-        // bounded window: the contract is that a silent transcript cannot be
-        // claimed as applied.
+        // The contract is that a silent transcript (no slash/stdout verdict)
+        // cannot be claimed as applied.
         let bridge = Arc::new(EffortBridge::new());
         let io = Arc::new(MockIo::default());
         io.set_idle(true);
@@ -908,8 +976,9 @@ mod switch_tests {
         .await;
         assert_eq!(outcome, SwitchOutcome::Degraded);
         assert!(
-            start.elapsed().as_millis() >= 40_000,
-            "waits the bounded window"
+            start.elapsed().as_millis() >= 9_000,
+            "waits the bounded window: {:?}",
+            start.elapsed()
         );
         assert!(io.journals().iter().any(|(status, severity)| {
             status.starts_with("effort-degraded:max") && *severity == Severity::Warning

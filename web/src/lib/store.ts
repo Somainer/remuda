@@ -41,6 +41,44 @@ import {
   effectiveFromRecord,
   type EffortEffectiveView,
 } from "../features/session/effortEffective";
+
+/** A push-down in flight (chip shows 切换中 / 排队中 until it settles). */
+export type EffortPending = {
+  /** Wire word the user chose (`low…max | ultracode`). */
+  word: string;
+  /** True while the agent is working — it applies at the next idle. */
+  queued: boolean;
+  /** Wall-clock ms the pending state was entered (stale-state safety net). */
+  at: number;
+};
+
+/** Pending entries older than this without a verdict are dropped. */
+const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
+
+/** Parse an `instance.configure` effort lifecycle status the driver journals. */
+function effortLifecycleStatus(status: unknown):
+  | { kind: "queued" | "applied" | "degraded"; word: string; reason: string }
+  | null {
+  if (typeof status !== "string") return null;
+  if (status.startsWith("effort-queued:")) {
+    return { kind: "queued", word: status.slice("effort-queued:".length), reason: "" };
+  }
+  if (status.startsWith("effort-applied:")) {
+    return { kind: "applied", word: status.slice("effort-applied:".length), reason: "" };
+  }
+  const prefix = "effort-degraded:";
+  if (status.startsWith(prefix)) {
+    const rest = status.slice(prefix.length);
+    const colon = rest.indexOf(":");
+    if (colon < 0) return { kind: "degraded", word: rest, reason: "" };
+    return {
+      kind: "degraded",
+      word: rest.slice(0, colon),
+      reason: rest.slice(colon + 1),
+    };
+  }
+  return null;
+}
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -124,6 +162,10 @@ export type HubState = {
   effort: Record<string, EffortSelection>;
   /** §9.1 transcript-read-back effective effort per instance; absent = `?`. */
   effortEffective: Record<string, EffortEffectiveView>;
+  /** §9.1 a push-down in flight: `queued` while the agent works (applies at
+   *  the next idle), `queued:false` on the idle fast path. Cleared when the
+   *  effective read-back lands or the switch is rejected. */
+  effortPending: Record<string, EffortPending>;
   models: Record<string, string>;
   compact: boolean;
   answering: Record<string, true>;
@@ -150,6 +192,7 @@ const initial: HubState = {
   permissionMode: {},
   effort: {},
   effortEffective: {},
+  effortPending: {},
   models: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
@@ -242,16 +285,104 @@ class HubStore {
     if (updated) this.emit({ effortEffective: next });
   }
 
-  /** Apply one transcript-read-back effort observation to the live map. */
+  /** Apply one transcript-read-back effort observation to the live map.
+   *  Settles any pending push-down and, when the change came from the
+   *  terminal side, moves the slider to the observed stop (single source of
+   *  truth; never calls configure, so no push-down ping-pong). */
   private noteEffortObservation(instanceId: Id, observation: Observation): boolean {
     const parsed = effectiveFromObservation(observation);
     if (!parsed) return false;
     const current = this.state.effortEffective[instanceId];
     if (current && parsed.effective.observedAt < current.observedAt) return false;
-    this.emit({
-      effortEffective: { ...this.state.effortEffective, [instanceId]: parsed.effective },
-    });
+    const patch: Partial<HubState> = {
+      effortEffective: {
+        ...this.state.effortEffective,
+        [instanceId]: parsed.effective,
+      },
+    };
+    const pending = this.state.effortPending[instanceId];
+    if (pending) {
+      // Our own push-down settled: leave the slider where the user put it (the
+      // mismatch line renders if the native side clamped it).
+      patch.effortPending = { ...this.state.effortPending };
+      delete patch.effortPending[instanceId];
+    } else {
+      // Terminal-side switch: the observed level is the truth — move the
+      // slider to it. This is local state only, so it cannot re-trigger a
+      // configure.
+      const instance = this.state.instances.find((row) => row.id === instanceId);
+      const kind = (instance?.kind ?? "claude") as EffortKind;
+      const selection = effortFromRecord(
+        kind,
+        parsed.effective.name,
+        null,
+        parsed.effective.ultracode === true,
+      );
+      if (selection) {
+        const stored = this.state.effort[instanceId];
+        if (
+          !stored
+          || stored.name !== selection.name
+          || (stored.ultracode === true) !== (selection.ultracode === true)
+        ) {
+          patch.effort = { ...this.state.effort, [instanceId]: selection };
+        }
+      }
+    }
+    this.emit(patch);
     return true;
+  }
+
+  /** Fold one `instance.configure` effort lifecycle into the pending map. */
+  private noteEffortLifecycle(instanceId: Id, observation: Observation) {
+    const payload = observation.payload as
+      | { type?: string; nativeName?: string; status?: unknown }
+      | undefined;
+    if (payload?.type !== "native" || payload.nativeName !== "instance.configure") return;
+    // The journal persists status as a bare string; newer runs may wrap it.
+    const value =
+      typeof payload.status === "string"
+        ? payload.status
+        : payload.status && typeof payload.status === "object" && "value" in payload.status
+          ? (payload.status as { value: unknown }).value
+          : undefined;
+    const parsed = effortLifecycleStatus(value);
+    if (!parsed) return;
+    const pending = { ...this.state.effortPending };
+    if (parsed.kind === "queued") {
+      pending[instanceId] = { word: parsed.word, queued: true, at: Date.now() };
+      this.emit({ effortPending: pending });
+      return;
+    }
+    if (!pending[instanceId] && parsed.kind === "applied") return;
+    delete pending[instanceId];
+    if (parsed.kind === "degraded") {
+      // The native side refused: revert the slider to the last observed level
+      // (or drop the optimistic request so the record default returns).
+      const effective = this.state.effortEffective[instanceId];
+      const effort = { ...this.state.effort };
+      if (effective) {
+        const instance = this.state.instances.find((row) => row.id === instanceId);
+        const kind = (instance?.kind ?? "claude") as EffortKind;
+        const selection = effortFromRecord(
+          kind,
+          effective.name,
+          null,
+          effective.ultracode === true,
+        );
+        if (selection) effort[instanceId] = selection;
+      } else {
+        delete effort[instanceId];
+      }
+      const reason =
+        { "dialog-kept": "已取消切换", "invalid-argument": "档位无效", "no-readback-within-window": "未收到回读" }[
+          parsed.reason
+        ] ?? parsed.reason;
+      this.toast(`effort 切换被拒绝：${reason}`);
+      this.emit({ effortPending: pending, effort });
+    } else {
+      this.emit({ effortPending: pending });
+    }
   }
 
   toast(text: string) {
@@ -520,7 +651,10 @@ class HubStore {
     });
     // §9.1: the Hub record usually already carries the latest effective level;
     // replay history effort edges too so a reconnect before refresh is honest.
-    for (const event of history) this.noteEffortObservation(instanceId, event);
+    for (const event of history) {
+      this.noteEffortObservation(instanceId, event);
+      this.noteEffortLifecycle(instanceId, event);
+    }
     const read: JournalRead = async (args) => {
       if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
         await new Promise((resolve) => setTimeout(resolve, 500));
@@ -535,7 +669,10 @@ class HubStore {
         const fresh = events.filter((e) => !seen.has(e.eventId));
         // §9.1: live effort edges update the effective level immediately —
         // the slider reflects the transcript, not the optimistic request.
-        for (const event of fresh) this.noteEffortObservation(instanceId, event);
+        for (const event of fresh) {
+          this.noteEffortObservation(instanceId, event);
+          this.noteEffortLifecycle(instanceId, event);
+        }
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
         this.emit({
@@ -785,8 +922,40 @@ class HubStore {
     });
   }
 
+  /** §9.1: pending effort push-down for an instance, if any. */
+  effortPendingOf(instanceId: Id): EffortPending | null {
+    const pending = this.state.effortPending[instanceId];
+    if (pending && Date.now() - pending.at > EFFORT_PENDING_MAX_AGE_MS) {
+      const next = { ...this.state.effortPending };
+      delete next[instanceId];
+      this.state = { ...this.state, effortPending: next };
+      return null;
+    }
+    return pending ?? null;
+  }
+
   async setEffort(instanceId: Id, effort: EffortSelection) {
-    await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });
+    const word = effortWireName(effort);
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    const busy =
+      instance?.activity?.state === "known" ? instance.activity.value === "working" : false;
+    // Optimistic pending so the chip never shows the old level ambiguously:
+    // 切换中 on the idle fast path, 排队中 while the agent works. The driver's
+    // `effort-queued` lifecycle and the effective read-back settle it.
+    this.emit({
+      effortPending: {
+        ...this.state.effortPending,
+        [instanceId]: { word, queued: busy, at: Date.now() },
+      },
+    });
+    try {
+      await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });
+    } catch (error) {
+      const pending = { ...this.state.effortPending };
+      delete pending[instanceId];
+      this.emit({ effortPending: pending });
+      throw error;
+    }
   }
 
   async setModel(instanceId: Id, model: string) {

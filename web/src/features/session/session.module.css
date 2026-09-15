@@ -824,6 +824,30 @@
   padding: 0 2px;
 }
 
+/* §9.1: a push-down in flight — the requested word with a pulsing tag so the
+   chip never shows the old level ambiguously (切换中 idle, 排队中 working). */
+.chipEffortPending .chipModel {
+  opacity: 0.85;
+}
+
+.chipEffortPendingTag {
+  color: var(--info, #57b7ff);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+  animation: effortPendingPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes effortPendingPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
 .barSpacer {
   flex: 1;
 }

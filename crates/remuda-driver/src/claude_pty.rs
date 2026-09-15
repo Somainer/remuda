@@ -1011,7 +1011,10 @@ fn spawn_hook_watch(
 }
 
 /// Poll interval for the native transcript, matching the hook watcher's cadence.
-const TRANSCRIPT_POLL: Duration = Duration::from_millis(300);
+/// Transcript tail poll. §9.1 measured the `/effort` stdout verdict landing
+/// ~125–270 ms after the confirm CR; a 300 ms poll could double that, so the
+/// tail is checked at 75 ms (one stat + appended-bytes read, no busy spin).
+const TRANSCRIPT_POLL: Duration = Duration::from_millis(75);
 
 /// Follow the native transcript and map it into structured Observations.
 ///

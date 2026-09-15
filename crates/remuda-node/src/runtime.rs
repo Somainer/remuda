@@ -289,19 +289,61 @@ impl DevNode {
                 Err(_) => break,
             }
         }
+        // Still live after the grace. The Hub only purges behind a delete it
+        // has already decided to perform (`?force=1` stops the instance
+        // first), so refusing here does not keep the session alive — it just
+        // orphans the process: the Hub drops its row anyway and logs
+        // "node rejected instance.purge", and the Node is left holding a
+        // running agent nobody can reach. That is what left a claude process
+        // parented to the Node after every forced delete on macOS, where the
+        // shell-pty stop ladder (SIGINT 2s + SIGHUP 2s + SIGKILL + reap) takes
+        // longer than this grace.
+        //
+        // So close it here and then purge. Closing a driver is idempotent and
+        // is exactly what the queued `instance.close` would have done.
         if let Ok(instance) = self.inner.store.get_instance(instance_id)
             && !matches!(
                 instance.lifecycle,
                 InstanceLifecycle::Exited | InstanceLifecycle::Failed
             )
         {
-            let state = serde_json::to_value(instance.lifecycle)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "live".to_owned());
-            return Err(NodeError::Conflict(format!(
-                "instance is {state}; stop it before purging"
-            )));
+            let driver = self
+                .inner
+                .instance_drivers
+                .read()
+                .await
+                .get(instance_id)
+                .cloned();
+            match driver {
+                Some(driver) => {
+                    tracing::info!(
+                        instance = %instance_id.as_id(),
+                        lifecycle = ?instance.lifecycle,
+                        "purge is closing a still-live instance rather than orphaning its process"
+                    );
+                    if let Err(error) = driver.execute(DriverRequest::Close).await {
+                        // The process may still be there, so the directory must
+                        // not be removed under it.
+                        return Err(NodeError::Driver(format!(
+                            "purge could not stop the instance: {error}"
+                        )));
+                    }
+                    finish_instance_operation(
+                        self.inner.store.as_ref(),
+                        instance_id,
+                        &DriverRequest::Close,
+                    )?;
+                }
+                None => {
+                    // No live driver to close: nothing of this instance is
+                    // running here, so the rows and directory are safe to drop.
+                    tracing::warn!(
+                        instance = %instance_id.as_id(),
+                        lifecycle = ?instance.lifecycle,
+                        "purging an instance with no live driver; its lifecycle row was stale"
+                    );
+                }
+            }
         }
         let removed = self.inner.store.remove_instance(instance_id)?;
         let mut directory_removed = false;

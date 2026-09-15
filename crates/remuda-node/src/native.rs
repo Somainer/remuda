@@ -1063,7 +1063,13 @@ fn instance_spec(
         "acceptEdits" | "accept-edits" => ClaudePermissionMode::AcceptEdits,
         "dontAsk" | "dont-ask" => ClaudePermissionMode::DontAsk,
         "plan" => ClaudePermissionMode::Plan,
-        "bypassPermissions" | "bypass-permissions" => ClaudePermissionMode::BypassPermissions,
+        // "bypass" is the spelling the Hub's own project defaults normalize
+        // *from* and what operators and scripts actually send; without it the
+        // request fell through to `Manual`, so a session asked for in bypass
+        // launched in manual mode and never had its disclaimer suppressed.
+        "bypassPermissions" | "bypass-permissions" | "bypass" => {
+            ClaudePermissionMode::BypassPermissions
+        }
         _ => ClaudePermissionMode::Manual,
     };
     let interaction = if matches!(

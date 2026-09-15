@@ -262,14 +262,27 @@ impl ShellPtyOptions {
 }
 
 struct PtyState {
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// Write half of the master, taken from it at spawn.
+    ///
+    /// `None` once the stop ladder has released the PTY. This is a *separate
+    /// dup of the master fd*, so dropping the master box alone does not close
+    /// the PTY — see [`PtyState::master`].
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     /// The PTY master. `None` once the stop ladder has dropped it.
     ///
     /// §5.3 step 2 pairs `SIGHUP` with closing the master, and that has to be
     /// a real close: while any fd to the master is open, the slave's other end
     /// stays open too, so a shell blocked on input never sees the hangup and
-    /// the ladder escalates to `SIGKILL` for no reason. Dropping the box is the
-    /// close — `portable-pty` releases the fd in `Drop`.
+    /// the ladder escalates to `SIGKILL` for no reason.
+    ///
+    /// "The master" is three file descriptors, not one: `portable-pty` dups it
+    /// for [`MasterPty::take_writer`] and again for
+    /// [`MasterPty::try_clone_reader`]. Dropping only this box leaves the other
+    /// two open, the slave never sees EOF, and on macOS the SIGKILLed leader
+    /// parks in `E` (exiting) forever instead of becoming a reapable zombie —
+    /// the `?Es` process the demo left behind on every delete. Closing the PTY
+    /// therefore means releasing all three, which is what
+    /// [`PtyState::release_pty`] does.
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     /// Signals the child independently of whoever holds `child`.
@@ -300,6 +313,23 @@ struct PtyState {
 }
 
 impl PtyState {
+    /// Close every file descriptor this process holds on the PTY master.
+    ///
+    /// `portable-pty` hands out three: the master box, a `take_writer` dup and
+    /// a `try_clone_reader` dup. The slave's hangup is only delivered once the
+    /// *last* of them is gone, so releasing one and calling the PTY closed is
+    /// the bug that left a SIGKILLed macOS leader parked in `E` forever —
+    /// `waitpid` cannot reap a process that is still wedged in exit, and the
+    /// kernel will not finish the exit while the terminal has a live endpoint.
+    ///
+    /// The reader thread owns the third dup and cannot be reached from here;
+    /// it closes it by returning, which it does as soon as this close makes
+    /// its blocking `read` report EOF.
+    async fn release_pty(&self) {
+        drop(self.writer.lock().await.take());
+        drop(self.master.lock().await.take());
+    }
+
     fn screen_evidence(&self) -> (u64, ScreenGrid) {
         // The reader holds this same lock while updating both the rendered
         // grid and marker count. Sampling them separately can consume a new
@@ -891,7 +921,7 @@ impl ShellPtyDriver {
             std::sync::Mutex::new(Emulator::new(cols, rows))
         });
         let state = Arc::new(PtyState {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             master: Mutex::new(Some(master)),
             child: Mutex::new(child),
             killer: Mutex::new(killer),
@@ -1155,11 +1185,20 @@ impl ShellPtyDriver {
         // shell inside never notices the SIGHUP and the ladder escalates to
         // SIGKILL for a process that would have hung up politely.
         //
-        // The box is taken out here, before the ladder runs, and moved into the
-        // closure — so the close is a plain `drop` of an owned value at exactly
-        // the rung that needs it, with no lock acquired from inside a
-        // synchronous callback on a runtime thread.
+        // *Every* dup counts. `portable-pty` hands out three fds on the master
+        // — the box, the `take_writer` dup and the reader thread's
+        // `try_clone_reader` dup — and the slave hangs up only when the last
+        // one goes. Closing the box alone is why a SIGKILLed macOS leader sat
+        // in `E` (exiting) indefinitely: unreapable, because the kernel will
+        // not finish an exit while the terminal still has a live endpoint.
+        //
+        // Both owned halves are taken out here, before the ladder runs, and
+        // moved into the closure, so the close is a plain `drop` of owned
+        // values at exactly the rung that needs it, with no lock acquired from
+        // inside a synchronous callback on a runtime thread. The reader's dup
+        // closes itself: this drop is what makes its blocking read see EOF.
         let mut master = state.master.lock().await.take();
+        let mut writer = state.writer.lock().await.take();
         state.closed.store(true, Ordering::SeqCst);
         // Hold the child across the ladder so this is the only task reaping it.
         // The leader is our direct child; a SIGKILLed child sits as a zombie
@@ -1183,13 +1222,22 @@ impl ShellPtyDriver {
                 }
             }
         };
-        let outcome = lifecycle::stop_group(pgid, move || drop(master.take()), reaper).await?;
+        let outcome = lifecycle::stop_group(
+            pgid,
+            move || {
+                drop(writer.take());
+                drop(master.take());
+            },
+            reaper,
+        )
+        .await?;
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
         // the group gone, but leaving it unreaped is how the demo's `?Es`
-        // process lingered as a child of the Node for minutes. Wait it out —
-        // bounded, because a process wedged in uninterruptible exit is a kernel
+        // process lingered as a child of the Node. With every master fd now
+        // released the transition to a zombie takes milliseconds; the bound is
+        // kept because a process wedged in uninterruptible exit is a kernel
         // problem no userspace wait can hurry.
         if !reaped {
             let deadline = tokio::time::Instant::now() + REAP_EXITING_GRACE;
@@ -1200,10 +1248,17 @@ impl ShellPtyDriver {
                         tokio::time::sleep(lifecycle::EXIT_REAP_POLL).await;
                     }
                     Ok(None) => {
-                        tracing::warn!(
+                        // Not "left for init": init only adopts orphans once
+                        // *this* process exits, and the Node keeps running, so
+                        // an abandoned leader stays our unreaped child for the
+                        // life of the Node. Reaching here means something still
+                        // holds the PTY open (see `release_pty`) or the kernel
+                        // is genuinely wedged — either way it is a defect to
+                        // report, not a tidy handover.
+                        tracing::error!(
                             pgid,
-                            "the process group is dead but the leader has not become reapable \
-                             within {:?}; it is exiting in the kernel and is left for init",
+                            "reap-incomplete: the process group is dead but the leader has not \
+                             become reapable within {:?}; it stays a child of this Node",
                             REAP_EXITING_GRACE
                         );
                         break;
@@ -1584,6 +1639,10 @@ impl LocalPty for PtyState {
             return Err(DriverError::ControlUnavailable);
         }
         let mut writer = self.writer.lock().await;
+        let Some(writer) = writer.as_mut() else {
+            // The stop ladder released the PTY; there is nothing to write to.
+            return Err(DriverError::ControlUnavailable);
+        };
         writer.write_all(bytes)?;
         writer.flush()?;
         Ok(())
@@ -2207,6 +2266,27 @@ fn agent_env(
         && !entries.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
     {
         entries.push(("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone()));
+        // Keep the *credentials* where the operator logged in, while the
+        // config stays scoped.
+        //
+        // Claude 2.1 namespaces its OS credential store by config directory:
+        // the macOS keychain service is `Claude Code…-credentials` plus, when
+        // `CLAUDE_CONFIG_DIR` is set, `-<sha256(dir)[..8]>`. Pinning a
+        // per-instance home therefore points the CLI at a namespace nobody has
+        // ever logged into, and the session answers "Not logged in · Please
+        // run /login" instead of the prompt — exactly what the macOS demo hit.
+        // `CLAUDE_SECURESTORAGE_CONFIG_DIR=""` selects the default (unsuffixed)
+        // namespace explicitly, so the launch reads the same credential a human
+        // running `claude` in this account would.
+        //
+        // Remuda neither reads, copies nor writes the credential: this names a
+        // lookup namespace, and the value stays in the OS keychain throughout.
+        if !entries
+            .iter()
+            .any(|(name, _)| name == "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        {
+            entries.push(("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), String::new()));
+        }
     }
     entries
 }

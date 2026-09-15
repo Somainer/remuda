@@ -25,6 +25,7 @@ mod instances;
 mod interactions;
 mod inventory;
 mod maintenance;
+mod model_catalog;
 mod objects;
 mod passkeys;
 mod placement;
@@ -39,8 +40,10 @@ mod registry;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;
+mod supply;
 mod transport;
 mod tty;
+mod usage_store;
 mod web;
 mod workspaces;
 mod ws;
@@ -458,6 +461,7 @@ pub fn router(state: AppState) -> Router {
         .merge(devices::routes())
         .merge(passkeys::routes())
         .merge(providers::routes())
+        .merge(supply::routes())
         .merge(agent_scope::routes())
         .merge(objects::routes())
         .merge(attachments::routes())

@@ -56,7 +56,15 @@ pub enum HubError {
         /// `hst_…` that has no connected Node.
         host_id: String,
     },
-    /// SQLite or actor mailbox.
+    /// No supply candidate passed admission; the task is explicitly deferred
+    /// rather than silently downgraded (coordinator §4.4 step 8). The carried
+    /// JSON is the full supply decision (`reasons[]`/`rejected[]`).
+    #[error("supply deferred")]
+    SupplyDeferred {
+        /// Machine-readable supply decision for the ledger/bot card.
+        decision: serde_json::Value,
+    },
+    /// SQLite or journal actor mailbox.
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
     /// Internal invariant.
@@ -78,6 +86,7 @@ impl HubError {
             Self::Unsatisfiable { .. } | Self::ProviderNotConfigured { .. } => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
+            Self::SupplyDeferred { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::HostOffline { .. } => StatusCode::CONFLICT,
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -95,6 +104,7 @@ impl HubError {
             Self::Superseded { .. } => "INTERACTION_SUPERSEDED",
             Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",
             Self::ProviderNotConfigured { .. } => "PROVIDER_NOT_CONFIGURED",
+            Self::SupplyDeferred { .. } => "SUPPLY_DEFERRED",
             Self::HostOffline { .. } => "HOST_OFFLINE",
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
         }
@@ -115,6 +125,16 @@ impl IntoResponse for HubError {
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert("reasons".into(), json!(reasons));
+        }
+        if let Self::SupplyDeferred { decision } = &self
+            && let Some(obj) = body.as_object_mut()
+            && let Some(decision) = decision.as_object()
+        {
+            // The decision IS the response body: caller/bot/CLI need the
+            // ranked list and rejection reasons verbatim.
+            for (key, value) in decision {
+                obj.insert(key.clone(), value.clone());
+            }
         }
         if let Self::Superseded { winner } = &self
             && !winner.is_empty()

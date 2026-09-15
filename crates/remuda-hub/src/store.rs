@@ -909,6 +909,9 @@ pub struct ProviderRecord {
     /// Last `/test` message (no secrets).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_test_message: Option<String>,
+    /// Declared supply + observed window state (coordinator §4.2).
+    #[serde(default)]
+    pub supply: remuda_protocol::SupplyProfile,
     /// Create-time.
     pub created_at: String,
     /// Update-time.
@@ -943,6 +946,7 @@ impl ProviderRecord {
                 "checkedAt": self.last_test_at,
                 "message": self.last_test_message,
             })),
+            "supply": self.supply,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         })
@@ -2920,7 +2924,8 @@ impl Store {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                             is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
+                            supply_json
                      FROM provider_profiles
                      WHERE scope = 'universal' OR scope = '' OR scope = ?1
                      ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
@@ -2932,7 +2937,8 @@ impl Store {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                             is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                            last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
+                            supply_json
                      FROM provider_profiles
                      ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
                 )?;
@@ -2988,6 +2994,7 @@ impl Store {
         secret_name: Option<String>,
         secret_last4: Option<String>,
         secret_fingerprint: Option<String>,
+        supply: remuda_protocol::SupplyProfile,
     ) -> Result<ProviderRecord, StoreError> {
         self.run(move |conn| {
             let now = now_rfc3339();
@@ -3001,8 +3008,8 @@ impl Store {
                 "INSERT INTO provider_profiles
                  (id, name, kind, base_url, models_json, default_model, headers_json,
                   is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                  created_at, updated_at, scope)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13)",
+                  created_at, updated_at, scope, supply_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13, ?14)",
                 params![
                     id,
                     name,
@@ -3017,6 +3024,7 @@ impl Store {
                     secret_fingerprint,
                     now,
                     scope,
+                    serde_json::to_string(&supply)?,
                 ],
             )?;
             load_provider(conn, &id)?
@@ -3041,6 +3049,7 @@ impl Store {
         secret_name: Option<Option<String>>,
         secret_last4: Option<Option<String>>,
         secret_fingerprint: Option<Option<String>>,
+        supply: Option<remuda_protocol::SupplyProfile>,
     ) -> Result<ProviderRecord, StoreError> {
         self.run(move |conn| {
             let existing = load_provider(conn, &id)?
@@ -3119,6 +3128,12 @@ impl Store {
                     params![secret_fingerprint, id],
                 )?;
             }
+            if let Some(supply) = supply {
+                conn.execute(
+                    "UPDATE provider_profiles SET supply_json = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&supply)?, id],
+                )?;
+            }
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE provider_profiles SET revision = revision + 1, updated_at = ?1 WHERE id = ?2",
@@ -3152,6 +3167,117 @@ impl Store {
         .await
     }
 
+    /// Replace a profile's declared/observed supply envelope; §4.2.
+    ///
+    /// Used by `PATCH …/supply` (user declaration) and by the feedback loop
+    /// (429 / structured rate-limit frames). Bumps revision like other
+    /// profile metadata edits.
+    pub async fn update_provider_supply(
+        &self,
+        id: String,
+        supply: remuda_protocol::SupplyProfile,
+    ) -> Result<ProviderRecord, StoreError> {
+        self.run(move |conn| {
+            if load_provider(conn, &id)?.is_none() {
+                return Err(StoreError::Id("unknown provider".into()));
+            }
+            let encoded = serde_json::to_string(&supply)?;
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE provider_profiles SET supply_json = ?1, revision = revision + 1, updated_at = ?2
+                 WHERE id = ?3",
+                params![encoded, now, id],
+            )?;
+            load_provider(conn, &id)?.ok_or_else(|| StoreError::Id("unknown provider".into()))
+        })
+        .await
+    }
+
+    /// Read every live instance (same lifecycle set as host counts) for
+    /// supply concurrency accounting.
+    pub async fn list_live_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM instances
+                 WHERE lifecycle IN
+                    ('preparing', 'starting', 'ready', 'running', 'closing', 'reconciling')",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            ids.into_iter()
+                .map(|id| {
+                    load_instance(conn, &id)?
+                        .ok_or_else(|| StoreError::Id("instance missing during live list".into()))
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Append one placement decision to the audit ledger; §5.6.
+    pub async fn insert_placement_ledger(
+        &self,
+        instance_id: Option<String>,
+        project_id: Option<String>,
+        profile_id: Option<String>,
+        model_id: Option<String>,
+        host_id: Option<String>,
+        decision: Value,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            let encoded = serde_json::to_string(&decision)?;
+            conn.execute(
+                "INSERT INTO placement_ledger
+                    (instance_id, project_id, profile_id, model_id, host_id, decision_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![instance_id, project_id, profile_id, model_id, host_id, encoded, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Recent placement ledger rows (newest first); tests/support/CLI read.
+    pub async fn list_placement_ledger(&self, limit: i64) -> Result<Vec<Value>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT instance_id, project_id, profile_id, model_id, host_id, decision_json, created_at
+                 FROM placement_ledger ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], |row| {
+                let decision_json: String = row.get(5)?;
+                let mut decision: Value =
+                    serde_json::from_str(&decision_json).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = decision.as_object_mut() {
+                    if let Ok(v) = row.get::<_, Option<String>>(0) {
+                        obj.insert("instanceId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(1) {
+                        obj.insert("projectId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(2) {
+                        obj.insert("profileId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(3) {
+                        obj.insert("modelId".into(), json!(v));
+                    }
+                    if let Ok(v) = row.get::<_, Option<String>>(4) {
+                        obj.insert("hostId".into(), json!(v));
+                    }
+                    let created_at: String = row.get(6)?;
+                    obj.insert("placedAt".into(), json!(created_at));
+                }
+                Ok(decision)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
     /// Delete a profile row. Caller deletes the vault entry.
     pub async fn delete_provider(&self, id: String) -> Result<Option<ProviderRecord>, StoreError> {
         self.run(move |conn| {
@@ -3169,7 +3295,8 @@ fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderRecord>, 
     conn.query_row(
         "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                 is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope
+                last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
+                supply_json
          FROM provider_profiles WHERE id = ?1",
         params![id],
         load_provider_row,
@@ -3189,6 +3316,10 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         .get::<_, Option<String>>(17)?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "universal".into());
+    let supply_json: String = row
+        .get::<_, Option<String>>(18)?
+        .unwrap_or_else(|| "{}".into());
+    let supply = serde_json::from_str(&supply_json).unwrap_or_default();
     Ok(ProviderRecord {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -3209,6 +3340,7 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         created_at: row.get(15)?,
         updated_at: row.get(16)?,
         scope,
+        supply,
     })
 }
 
@@ -3439,6 +3571,13 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "scope",
         "TEXT NOT NULL DEFAULT 'universal'",
     )?;
+    // Declared supply + observed window state (coordinator batch 3, §4.2).
+    ensure_column(
+        &conn,
+        "provider_profiles",
+        "supply_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "instances", "mode", "TEXT")?;
     ensure_column(&conn, "instances", "promoted_at", "TEXT")?;
@@ -3475,6 +3614,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
     crate::workspaces::migrate(&conn)?;
     crate::projects::migrate(&conn)?;
+    crate::supply::migrate(&conn)?;
+    crate::usage_store::migrate(&conn)?;
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;

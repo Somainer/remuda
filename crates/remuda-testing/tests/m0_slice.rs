@@ -123,6 +123,7 @@ fn envelope(obs: &Observation) -> Envelope {
         source: obs.source.clone(),
         completeness: obs.completeness,
         evidence_event_ids: obs.evidence_event_ids.clone(),
+        event_id: None,
         body: obs.body.clone(),
         raw: None,
     }

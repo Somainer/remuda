@@ -1515,6 +1515,18 @@ export interface components {
             delegation?: string | null;
             driver: string;
             durableSeq: string;
+            /** @description D-028 §9.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown. */
+            effortEffective?: ({
+                /** @enum {string} */
+                name: "low" | "medium" | "high" | "xhigh" | "max";
+                observedAt: string;
+                /** @enum {string} */
+                source: "launch" | "slash" | "remuda" | "unknown";
+                /** @description Observed dynamic-workflow flag; null unless positively observed (the native transcript spells ultracode as xhigh and omits the boolean). */
+                ultracode?: boolean | null;
+            } & {
+                [key: string]: unknown;
+            }) | null;
             /** @description Legacy per-harness table index. Preserved for older clients; never used to derive the tier, because the old tables differed in length per harness. */
             effortIndex?: number | null;
             /**

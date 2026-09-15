@@ -258,6 +258,29 @@ impl<'de> Deserialize<'de> for EffortSelection {
     }
 }
 
+/// Effective effort, read back from a Claude assistant transcript record
+/// (`effort` / `perTurnEffort`); D-028 §9.1.
+///
+/// This is the *observed* tier, never the requested one. Claude reports
+/// `ultracode` sessions as level `xhigh` and does not repeat the workflow flag
+/// on assistant records, so `ultracode` is `None` unless the observation path
+/// has positive evidence (e.g. an immediately preceding `/effort ultracode`
+/// switch the driver itself made).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EffortEffective {
+    /// Observed level name.
+    pub name: EffortName,
+    /// Observed dynamic-workflow flag; `None` when the transcript does not
+    /// expose it (the common case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ultracode: Option<bool>,
+    /// What established this level.
+    pub source: EffortSource,
+    /// When the observation was made.
+    pub observed_at: Timestamp,
+}
+
 /// Claude renderer requested at launch (D-028 §9.2).
 ///
 /// This is intent only; the terminal snapshot's `altScreen` reports the

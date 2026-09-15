@@ -217,6 +217,7 @@ fn envelope(obs: &Observation) -> Envelope {
         source: obs.source.clone(),
         completeness: obs.completeness,
         evidence_event_ids: obs.evidence_event_ids.clone(),
+        event_id: None,
         body: obs.body.clone(),
         raw: None,
     }
@@ -390,6 +391,7 @@ fn kind_name(obs: &Observation) -> &'static str {
             remuda_protocol::ObservationKind::Lifecycle => "lifecycle",
             remuda_protocol::ObservationKind::Usage => "usage",
             remuda_protocol::ObservationKind::Artifact => "artifact",
+            remuda_protocol::ObservationKind::Effort => "effort",
             remuda_protocol::ObservationKind::RawTty => "raw_tty",
             remuda_protocol::ObservationKind::Opaque => "opaque",
         },

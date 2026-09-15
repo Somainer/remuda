@@ -24,12 +24,13 @@ use serde_json::{Value, json};
 
 use crate::fake_harness::artifacts::{
     ArtifactKind, ArtifactPaths, ArtifactSet, CodexCounters, CommandOutcome, GrokTurnIds,
-    SessionMeta, claude_assistant_block, claude_queue_op, claude_queued_attachment,
-    claude_tool_result, claude_user_record, codex_assistant_message, codex_command_item_completed,
-    codex_function_call, codex_function_output, codex_session_index, codex_session_meta,
-    codex_task_complete, codex_task_started, codex_token_usage, codex_turn_aborted,
-    codex_user_item_completed, codex_user_message, grok_chunk_update, grok_tool_call,
-    grok_tool_update_completed, grok_tool_update_failed, grok_turn_completed, grok_write_registry,
+    SessionMeta, claude_assistant_block, claude_effort_slash_records, claude_queue_op,
+    claude_queued_attachment, claude_tool_result, claude_user_record, codex_assistant_message,
+    codex_command_item_completed, codex_function_call, codex_function_output, codex_session_index,
+    codex_session_meta, codex_task_complete, codex_task_started, codex_token_usage,
+    codex_turn_aborted, codex_user_item_completed, codex_user_message, grok_chunk_update,
+    grok_tool_call, grok_tool_update_completed, grok_tool_update_failed, grok_turn_completed,
+    grok_write_registry,
 };
 use crate::fake_harness::clock::FakeClock;
 use crate::fake_harness::hooks::{
@@ -176,6 +177,9 @@ struct Engine {
     codex_counters: CodexCounters,
     draft: String,
     claude_queue: Vec<QueuedPrompt>,
+    /// §9.1: current in-session effort level, stamped on assistant records;
+    /// changed by a typed `/effort <word>`.
+    effort: String,
     codex_queue: VecDeque<String>,
     grok_queue: VecDeque<String>,
     consumed: BTreeMap<usize, ()>,
@@ -374,6 +378,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         codex_counters: CodexCounters::new(),
         draft: String::new(),
         claude_queue: Vec::new(),
+        effort: "high".into(),
         codex_queue: VecDeque::new(),
         grok_queue: VecDeque::new(),
         consumed: BTreeMap::new(),
@@ -1309,6 +1314,46 @@ impl Engine {
             self.should_exit = true;
             return;
         }
+        // §9.1: a typed `/effort <word>` changes the level stamped on every
+        // subsequent assistant record and is journaled as the same two user
+        // records a real claude writes (command markup + local stdout), so the
+        // driver's read-back path runs unchanged.
+        if self.dialect == Dialect::Claude
+            && let Some(word) = prompt
+                .trim()
+                .strip_prefix("/effort")
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+        {
+            let word = word
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let valid = matches!(
+                word.as_str(),
+                "low" | "medium" | "high" | "xhigh" | "max" | "ultracode" | "auto"
+            );
+            let stdout = if valid {
+                // `ultracode` runs at xhigh + workflow; the assistant record
+                // level is therefore xhigh.
+                let stamped = if word == "ultracode" { "xhigh" } else { &word };
+                self.effort = stamped.to_string();
+                format!("Set effort level to {word} (in-session)")
+            } else {
+                format!(
+                    "Invalid argument: {word}. Valid options are: low, medium, high, xhigh, max, \
+                     ultracode, auto"
+                )
+            };
+            self.event("effort_command", json!({ "word": word, "accepted": valid }));
+            for record in claude_effort_slash_records(&self.meta, &self.clock, &word, &stdout) {
+                if let Err(error) = self.artifacts.append(record) {
+                    tracing::warn!(%error, "failed to append effort slash record");
+                }
+            }
+            return;
+        }
         self.fire_prompt_hook(&prompt);
         self.event("submit", json!({ "content": prompt }));
         self.start_turn(prompt, None);
@@ -1630,6 +1675,7 @@ impl Engine {
                     block,
                     "tool_use",
                     &self.usage_spec(),
+                    Some(&self.effort),
                 );
                 self.artifacts.append(record)?;
                 self.turn.as_mut().unwrap().claude_seq += 1;
@@ -2047,6 +2093,7 @@ impl Engine {
                     json!({ "type": "text", "text": text }),
                     stop_reason,
                     &usage,
+                    Some(&self.effort),
                 );
                 self.artifacts.append(record)?;
             }

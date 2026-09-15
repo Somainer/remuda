@@ -60,6 +60,13 @@ export type Instance = EntityMeta & {
   effortUltracode?: boolean | null;
   /** Legacy index. Preserved for older clients; never used to derive the tier. */
   effortIndex?: number | null;
+  /** §9.1 effective effort read back from the native transcript; null = unobserved → UI shows `?`. */
+  effortEffective?: {
+    name: string;
+    ultracode?: boolean | null;
+    source: "launch" | "slash" | "remuda" | "unknown";
+    observedAt: string;
+  } | null;
   /** How this instance reached its `kind`; `promoted` = a terminal that an agent CLI took over (D-025). */
   mode?: InstanceMode | null;
   /** When the promotion happened. Only set while `mode` is `promoted`. */

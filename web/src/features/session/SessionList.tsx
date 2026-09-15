@@ -592,6 +592,15 @@ export function SessionList({
                       <span>· {instance.driver}</span>
                       {(() => {
                         const effort = hubStore.effortOf(instance.id, instance.kind);
+                        // §9.1: the list row shows the transcript-read-back
+                        // effective level too, with `?` until it is observed.
+                        const effective = hubStore.effortEffectiveOf(instance.id);
+                        const effectiveName = effective?.name ?? "?";
+                        const mismatch =
+                          effective &&
+                          (effort.ultracode === true
+                            ? !(effective.name === "xhigh" && effective.ultracode === true)
+                            : effort.name !== effective.name);
                         const ember = isEmberEffort(instance.kind, effort.index, effort.ultracode);
                         return (
                           <>
@@ -600,8 +609,15 @@ export function SessionList({
                               className={ember ? css.effortEmber : undefined}
                               data-testid="session-effort"
                               data-ember={ember ? "1" : "0"}
+                              data-effort-effective={effective ? effective.name : "unknown"}
+                              data-effort-mismatch={mismatch ? "1" : "0"}
+                              title={
+                                effective
+                                  ? `请求 ${effort.ultracode ? "ultracode" : effort.name} · 实际 ${effective.name}（${effective.source}）`
+                                  : "实际档位尚未从会话回读"
+                              }
                             >
-                              {effort.name}
+                              {effectiveName}
                             </span>
                           </>
                         );

@@ -855,6 +855,7 @@ impl LocalStore for MemoryStore {
                 source: runtime_source(&record.instance, seq),
                 completeness,
                 evidence_event_ids: Vec::new(),
+                event_id: None,
                 body,
                 raw: None,
             };
@@ -927,6 +928,8 @@ impl LocalStore for MemoryStore {
                         source: observation.source,
                         completeness: observation.completeness,
                         evidence_event_ids: observation.evidence_event_ids,
+                        // Runtime-emitted observations keep their own id.
+                        event_id: Some(observation.event_id.clone()),
                         body: observation.body,
                         raw: None,
                     },

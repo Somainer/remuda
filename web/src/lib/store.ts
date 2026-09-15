@@ -36,6 +36,11 @@ import {
   type EffortKind,
   type EffortSelection,
 } from "../features/session/effort";
+import {
+  effectiveFromObservation,
+  effectiveFromRecord,
+  type EffortEffectiveView,
+} from "../features/session/effortEffective";
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -105,6 +110,8 @@ export type HubState = {
   bubbles: LocalBubble[];
   permissionMode: Record<string, string>;
   effort: Record<string, EffortSelection>;
+  /** §9.1 transcript-read-back effective effort per instance; absent = `?`. */
+  effortEffective: Record<string, EffortEffectiveView>;
   models: Record<string, string>;
   compact: boolean;
   answering: Record<string, true>;
@@ -130,6 +137,7 @@ const initial: HubState = {
   bubbles: [],
   permissionMode: {},
   effort: {},
+  effortEffective: {},
   models: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
@@ -206,6 +214,34 @@ class HubStore {
     for (const listener of this.listeners) listener();
   }
 
+  /** §9.1: fold Hub-record `effortEffective` into the live map, newest wins. */
+  private hydrateEffortEffective(instances: Instance[]) {
+    let updated = false;
+    const next = { ...this.state.effortEffective };
+    for (const instance of instances) {
+      const view = effectiveFromRecord(instance.effortEffective);
+      if (!view) continue;
+      const current = next[instance.id];
+      if (!current || view.observedAt >= current.observedAt) {
+        next[instance.id] = view;
+        updated = true;
+      }
+    }
+    if (updated) this.emit({ effortEffective: next });
+  }
+
+  /** Apply one transcript-read-back effort observation to the live map. */
+  private noteEffortObservation(instanceId: Id, observation: Observation): boolean {
+    const parsed = effectiveFromObservation(observation);
+    if (!parsed) return false;
+    const current = this.state.effortEffective[instanceId];
+    if (current && parsed.effective.observedAt < current.observedAt) return false;
+    this.emit({
+      effortEffective: { ...this.state.effortEffective, [instanceId]: parsed.effective },
+    });
+    return true;
+  }
+
   toast(text: string) {
     this.emit({ toast: { id: String(Date.now()), text } });
   }
@@ -267,6 +303,7 @@ class HubStore {
         workspaces: registeredHosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)),
         interactions,
       });
+      this.hydrateEffortEffective(instances.items);
       this.stopWorkspaceFollow?.();
       this.stopWorkspaceFollow = api.hostWorkspaceSubscribe(
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
@@ -440,7 +477,11 @@ class HubStore {
 
   async refresh() {
     const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
-    this.emit({ instances: mergeInstanceSnapshots(instances.items, this.state.instances), interactions });
+    this.emit({
+      instances: mergeInstanceSnapshots(instances.items, this.state.instances),
+      interactions,
+    });
+    this.hydrateEffortEffective(instances.items);
   }
 
   async follow(instanceId: Id) {
@@ -465,6 +506,9 @@ class HubStore {
       instances: applyInstanceActivity(this.state.instances, history),
       events: { ...this.state.events, [instanceId]: history },
     });
+    // §9.1: the Hub record usually already carries the latest effective level;
+    // replay history effort edges too so a reconnect before refresh is honest.
+    for (const event of history) this.noteEffortObservation(instanceId, event);
     const read: JournalRead = async (args) => {
       if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
         await new Promise((resolve) => setTimeout(resolve, 500));
@@ -476,7 +520,11 @@ class HubStore {
       onEvents: (events) => {
         const current = this.state.events[instanceId] ?? [];
         const seen = new Set(current.map((e) => e.eventId));
-        const next = current.concat(events.filter((e) => !seen.has(e.eventId)));
+        const fresh = events.filter((e) => !seen.has(e.eventId));
+        // §9.1: live effort edges update the effective level immediately —
+        // the slider reflects the transcript, not the optimistic request.
+        for (const event of fresh) this.noteEffortObservation(instanceId, event);
+        const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
         this.emit({
           instances: applyInstanceActivity(this.state.instances, events),
@@ -765,6 +813,27 @@ class HubStore {
     const recorded = effortFromRecord(fallbackKind, instance?.effortName, instance?.effortIndex);
     if (recorded) return recorded;
     return effortAt(fallbackKind, readDeviceSettings().defaultEffortIndex ?? DEFAULT_EFFORT_INDEX);
+  }
+
+  /** §9.1: transcript-read-back effective effort, or `null` when unobserved. */
+  effortEffectiveOf(instanceId: Id): EffortEffectiveView | null {
+    return this.state.effortEffective[instanceId] ?? null;
+  }
+
+  /** The word the slider last requested for this instance (wire spelling). */
+  effortRequestedWordOf(instanceId: Id): { word: string; ultracode: boolean } {
+    const selected = this.state.effort[instanceId];
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    const fallback =
+      effortFromRecord(
+        (instance?.kind ?? "claude") as EffortKind,
+        instance?.effortName,
+        instance?.effortIndex,
+        instance?.effortUltracode,
+      ) ?? undefined;
+    const current = selected ?? fallback;
+    if (!current) return { word: "", ultracode: false };
+    return { word: effortWireName(current), ultracode: current.ultracode === true };
   }
 
   modelOf(instanceId: Id, kind?: string): string {

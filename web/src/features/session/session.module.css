@@ -811,6 +811,19 @@
   text-align: center;
 }
 
+/* §9.1: unobserved effective level renders the `?` greyed, never as the
+   requested tier — see D-028 §9.1. */
+.chip:has([data-effort-effective="unknown"]) .chipModel {
+  color: var(--mute);
+}
+
+.chipEffortMismatch {
+  color: var(--amber, #ffc107);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
 .barSpacer {
   flex: 1;
 }

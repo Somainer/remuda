@@ -1160,6 +1160,27 @@
               "null"
             ]
           },
+          "effortEffective": {
+            "type": ["object", "null"],
+            "description": "D-028 §9.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown.",
+            "properties": {
+              "name": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "xhigh", "max"]
+              },
+              "ultracode": {
+                "type": ["boolean", "null"],
+                "description": "Observed dynamic-workflow flag; null unless positively observed (the native transcript spells ultracode as xhigh and omits the boolean)."
+              },
+              "source": {
+                "type": "string",
+                "enum": ["launch", "slash", "remuda", "unknown"]
+              },
+              "observedAt": { "type": "string" }
+            },
+            "required": ["name", "source", "observedAt"],
+            "additionalProperties": true
+          },
           "effortName": {
             "description": "Normalized D-028 \u00a79.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default\u2192low, think\u2192high, think-hard\u2192xhigh, ultracode\u2192xhigh with effortUltracode true).",
             "enum": [

@@ -6,6 +6,7 @@ import type { LocalBubble } from "../../lib/store";
 import { SentAttachments } from "./AttachmentChips";
 import { AnchorText } from "./AnchorText";
 import { hubStore } from "../../lib/store";
+import { projectCommandStatus } from "../../lib/commandStatus";
 import ui from "../../styles/ui.module.css";
 import { assembleTranscript, compactTranscript, isToolFailure, type TranscriptNode } from "./assemble";
 import { JournalBanner, type JournalUiStatus } from "./JournalBanner";
@@ -651,6 +652,16 @@ function TranscriptRow({
       data-testid="transcript-row"
       data-anchor={node.id}
       data-kind={node.type}
+      data-role={node.type === "message" ? node.role : undefined}
+      // C2 correlation evidence: the Node joins command-delivered prompts
+      // onto the delivering command; optimistic bubbles carry their
+      // server-assigned id once the POST returns.
+      data-command-id={
+        node.type === "message"
+          ? (node.commandId ??
+            (typeof node.local?.commandId === "string" ? node.local.commandId : undefined))
+          : undefined
+      }
       data-turn-active={active ? "1" : "0"}
       data-search-hit={searchHit ? "1" : "0"}
       data-search-current={searchCurrent ? "1" : "0"}
@@ -720,18 +731,28 @@ function renderNode(
       );
     }
     const streaming = node.status === "streaming";
+    // C2: the bubble speaks the C1 vocabulary projected from its own facts
+    // (null commandId → 状态待确认, queued → 等待发送), never the raw state.
+    const localRow = node.local
+      ? projectCommandStatus({
+          hasServerCommandId: node.local.commandId !== null,
+          localState: node.local.state,
+        })
+      : null;
     return (
       <section
         className={user ? session.user : session.assistant}
         data-testid={node.local ? "optimistic-bubble" : "message"}
         data-status={node.status}
+        data-command-id={node.local?.commandId ?? undefined}
       >
         <div className={session.you}>
           {user ? "You" : node.role}
-          {node.local ? ` · ${node.local.state}` : ""}
-          {/* Status order the composer and transcript share: a queued message
-              has not been sent, a streaming one is still arriving. */}
-          {node.status === "queued" ? <span className={session.stat}> · 排队中</span> : null}
+          {localRow ? ` · ${localRow.label}` : null}
+          {/* Status order the composer and transcript share: a queued
+              journal node has not been sent; the local bubble's own wording
+              comes from the projected row above. */}
+          {node.status === "queued" && !node.local ? <span className={session.stat}> · 排队中</span> : null}
           {node.status === "interrupted" ? <span className={session.stat}> · 已打断</span> : null}
         </div>
         {node.role === "assistant" ? (
@@ -745,15 +766,23 @@ function renderNode(
             attachments={node.local.attachments}
             className={session.bubble}
           />
+        ) : node.localAttachments?.length ? (
+          // Journal node joined onto its optimistic bubble by commandId:
+          // inline [Image #n] anchors resolve against the staged previews.
+          <AnchorText
+            text={node.text}
+            attachments={node.localAttachments}
+            className={session.bubble}
+          />
         ) : (
           <p className={session.bubble}>{node.text}</p>
         )}
         {streaming ? <span className={session.cursor} data-testid="streaming-cursor" aria-hidden /> : null}
-        {node.local?.attachments?.length ? (
-          <SentAttachments attachments={node.local.attachments} />
+        {node.local?.attachments?.length || node.localAttachments?.length ? (
+          <SentAttachments attachments={(node.local?.attachments ?? node.localAttachments)!} />
         ) : null}
         {node.local?.state === "queued" ? (
-          <button className={ui.chip} onClick={() => hubStore.retract(node.local!.id)}>
+          <button className={ui.chip} onClick={() => hubStore.retract(node.local!.clientRequestId)}>
             撤回
           </button>
         ) : null}

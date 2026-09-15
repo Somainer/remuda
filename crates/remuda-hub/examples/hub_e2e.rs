@@ -322,11 +322,11 @@ async fn fake_node(
     );
     let _ = ready.send(());
     let mut append_n = 0u64;
-    // Minimal PTY harness for the QuickFind xterm e2e. It exists only while
-    // this fake node is connected: a terminal session is registered on create,
-    // tty.attach returns its stream + screen, and tty.write records raw bytes
-    // (so the test can prove an Escape reached the process rather than being
-    // swallowed by the browser) and echoes a visible marker back.
+    // Minimal PTY harness for the xterm e2e specs. A terminal session is
+    // registered on create, tty.attach returns its stable per-instance stream
+    // + screen, and tty.write records raw bytes (QuickFind proves an Escape
+    // reached the process) and echoes printable input; CR additionally submits
+    // a commandId-less journal user node (C2 native-typing correlation).
     let mut ttys: HashMap<String, TtyFake> = HashMap::new();
     // A failed Claude launch must not acquire a TTY through lazy attach.
     let mut claude_ptys = HashSet::new();
@@ -452,9 +452,13 @@ async fn fake_node(
                     .lock()
                     .await
                     .insert(interaction_id.as_id().as_str().to_string(), card);
-                append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
+                // C2: the create prompt is a command, so its user observation
+                // carries the commandId the Hub forwards in params.
+                let command_id = params.get("commandId").and_then(Value::as_str);
+                append_n = append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
+                    .await?;
+                // r-ux-comment: a fenced block to exercise 评论.
                 if let Some(reply) = code_comment_reply(prompt) {
-                    // r-ux-comment: a fenced block to exercise 评论.
                     append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
                         .await?;
                 } else {
@@ -483,19 +487,23 @@ async fn fake_node(
                     .or_else(|| params.pointer("/text"))
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
-                append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
+                let command_id = params.get("commandId").and_then(Value::as_str);
                 // r-ux-comment: reply with a fenced code block so the browser
                 // spec can exercise the 评论 quote action. The prompt is also
                 // echoed verbatim below, proving the expanded quote arrived.
                 if let Some(reply) = code_comment_reply(prompt) {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    append_n =
+                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
+                            .await?;
                     append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
                         .await?;
                     append_n =
                         append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                     continue;
                 }
-                // r-ux-w: synthetic workflow timeline-card scenarios.
+                // r-ux-w: synthetic workflow timeline-card scenarios take the
+                // short path (their own scripted journal sequence).
                 if let Some(kind) = workflow_kind(prompt) {
                     send_rpc_ok(
                         &mut ws,
@@ -507,6 +515,11 @@ async fn fake_node(
                         append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
                     continue;
                 }
+                // C2: the journal user node for a composer send carries the
+                // exact commandId the HTTP response returned, so the web folds
+                // optimistic bubble and transcript node into one.
+                append_n = append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
+                    .await?;
                 // D-027: echo the attachment metadata the Hub resolved, so the
                 // e2e can prove staging reached the Node without a real agent.
                 // 2026-09-15: also echo the [Image #n] manifest (index +
@@ -676,9 +689,11 @@ async fn fake_node(
             }
             "tty.write" => {
                 // Raw keyboard bytes from the browser. Every byte is recorded
-                // (the e2e reads the Escape back out of here indirectly via
-                // the echoed marker) and printable input is echoed like a
-                // cooked PTY would.
+                // (the QuickFind e2e reads the Escape back via the marker) and
+                // printable input is echoed like a cooked PTY. A CR submits
+                // the buffered line as a commandId-less journal user node so
+                // the C2 native-typing e2e can prove it renders once with no
+                // command attribution.
                 let bytes = params
                     .get("dataBase64")
                     .and_then(Value::as_str)
@@ -721,33 +736,51 @@ async fn fake_node(
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                     continue;
                 }
-                let mut reply = Vec::new();
-                for byte in &bytes {
-                    // ESC is a control byte for the process, not display text.
-                    if *byte != 0x1b {
-                        reply.push(*byte);
+                let submitted = {
+                    // note_input() above already recorded the bytes; here we
+                    // only echo printable ones and buffer the line for CR.
+                    let mut reply = Vec::new();
+                    for byte in &bytes {
+                        // ESC and CR are control bytes, not display text.
+                        if *byte != 0x1b && *byte != b'\r' {
+                            reply.push(*byte);
+                        }
                     }
-                }
-                if bytes.contains(&0x1b) {
-                    reply.extend_from_slice(b"\r\nQUICKFIND_ESC_RECEIVED\r\n$ ");
-                }
-                if !reply.is_empty() {
-                    tty.screen.extend_from_slice(&reply);
-                    ws.send(Message::Text(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "method": "tty.frame",
-                            "params": {
-                                "instanceId": instance_id,
-                                "streamId": tty.stream_id,
-                                "dataBase64": base64::engine::general_purpose::STANDARD
-                                    .encode(&reply),
-                            },
-                        })
-                        .to_string()
-                        .into(),
-                    ))
+                    if bytes.contains(&0x1b) {
+                        reply.extend_from_slice(b"\r\nQUICKFIND_ESC_RECEIVED\r\n$ ");
+                    }
+                    if !reply.is_empty() {
+                        tty.screen.extend_from_slice(&reply);
+                        ws.send(Message::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "tty.frame",
+                                "params": {
+                                    "instanceId": instance_id,
+                                    "streamId": tty.stream_id,
+                                    "dataBase64": base64::engine::general_purpose::STANDARD
+                                        .encode(&reply),
+                                },
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?;
+                    }
+                    tty.submit(&bytes)
+                };
+                if let Some(line) = submitted {
+                    append_n = append_native_user(&mut ws, &instance_id, append_n, &line).await?;
+                    append_n = append_journal(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "assistant",
+                        &format!("typed echo: {line}"),
+                    )
                     .await?;
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                 }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
@@ -898,15 +931,17 @@ fn g2_scm_answer(method: &str, params: &Value) -> Value {
 
 /// A script-free PTY double for the QuickFind xterm test.
 ///
-/// It models only what that test needs: a stable stream id the Hub binds the
-/// follower to, a one-screen buffer, and a raw byte log. Receiving an ESC byte
-/// is acknowledged with an on-screen marker (`QUICKFIND_ESC_RECEIVED`) so a
-/// browser test can prove the keystroke reached the process instead of being
-/// eaten by a panel's key handler.
+/// It models a stable per-instance stream id the Hub binds the follower to, a
+/// one-screen buffer, and a raw byte log. Receiving an ESC byte is
+/// acknowledged with an on-screen marker (`QUICKFIND_ESC_RECEIVED`, QuickFind
+/// test); CR flushes the buffered cooked line so the C2 native-typing test can
+/// journal it as a commandId-less user node.
 struct TtyFake {
     stream_id: String,
     screen: Vec<u8>,
     received: Vec<u8>,
+    /// Buffered cooked line; CR flushes it (C2 native-typing journal node).
+    line: Vec<u8>,
     /// Current DEC alt-screen mode reported at attach and on `tty.mode`.
     alt_screen: bool,
 }
@@ -923,6 +958,7 @@ impl TtyFake {
             stream_id: format!("tty_{}", uuid::Uuid::now_v7()),
             screen: b"fake-harness terminal\r\n$ ".to_vec(),
             received: Vec::new(),
+            line: Vec::new(),
             alt_screen: false,
         }
     }
@@ -958,6 +994,20 @@ impl TtyFake {
         }
         None
     }
+
+    /// Feed raw bytes; return the trimmed submitted line once CR flushes it.
+    fn submit(&mut self, bytes: &[u8]) -> Option<String> {
+        self.line.extend_from_slice(bytes);
+        if !bytes.contains(&b'\r') {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&self.line)
+            .replace('\r', "")
+            .trim()
+            .to_string();
+        self.line.clear();
+        (!line.is_empty()).then_some(line)
+    }
 }
 
 async fn send_rpc_ok(
@@ -976,13 +1026,10 @@ async fn send_rpc_ok(
     Ok(())
 }
 
-async fn send_rpc_error(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    id: Value,
-    message: &str,
-) -> Result<()> {
+type NodeWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn send_rpc_error(ws: &mut NodeWs, id: Value, message: &str) -> Result<()> {
     ws.send(Message::Text(
         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": message } })
             .to_string()
@@ -994,9 +1041,7 @@ async fn send_rpc_error(
 
 /// Confirm resource lifecycle and the native identity needed by Hub resume.
 async fn append_instance_state(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    ws: &mut NodeWs,
     instance_id: &str,
     n: u64,
     state: &str,
@@ -1021,13 +1066,105 @@ async fn append_instance_state(
         .into(),
     ))
     .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
+}
+
+/// One full-shape user message observation. A composer/command send carries
+/// `command_id` (C2 correlation); a natively typed prompt omits it.
+async fn append_user_message(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+    node: &str,
+) -> Result<u64> {
+    let seq = n + 1;
+    let mut payload = json!({
+        "nodeId": node,
+        "messageId": node,
+        "revision": "1",
+        "operation": "open",
+        "role": "user",
+        "phase": "input",
+        "blocks": [{ "type": "text", "text": text }],
+        "targetBlock": null,
+        "parentToolCallId": null,
+        "nativeOrigin": { "state": "known", "value": "ui" },
+        "origin": "human",
+        "status": "complete",
+    });
+    if let Some(command_id) = command_id {
+        payload["commandId"] = json!(command_id);
+    }
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": format!("j{seq}"),
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "message",
+                    "completeness": "structured",
+                    "payload": payload,
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
+}
+
+/// A command-delivered prompt: its user node carries the delivering commandId.
+async fn append_command_user(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+) -> Result<u64> {
+    let node = command_id
+        .map(|id| {
+            id.strip_prefix("cmd_")
+                .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
+        })
+        .unwrap_or_else(|| format!("obj_legacy_{n}"));
+    append_user_message(ws, instance_id, n, text, command_id, &node).await
+}
+
+/// A prompt typed natively into the PTY: human origin, no commandId, its own
+/// node (eventId-derived identity through the hub shorthand normaliser).
+async fn append_native_user(ws: &mut NodeWs, instance_id: &str, n: u64, text: &str) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": format!("j{seq}"),
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "message",
+                    "completeness": "structured",
+                    "payload": { "role": "user", "text": text, "origin": "human" }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
 }
 
 async fn append_journal(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    ws: &mut NodeWs,
     instance_id: &str,
     n: u64,
     role: &str,

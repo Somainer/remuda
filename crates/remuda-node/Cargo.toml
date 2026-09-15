@@ -46,6 +46,7 @@ uuid.workspace = true
 nix = { version = "0.28", features = ["process", "fs", "signal"] }
 
 [dev-dependencies]
+portable-pty.workspace = true
 remuda-hub.workspace = true
 remuda-testing.workspace = true
 tempfile = "3"

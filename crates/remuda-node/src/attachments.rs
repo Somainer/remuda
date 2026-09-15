@@ -38,6 +38,9 @@ pub struct MaterializedAttachment {
     pub path: PathBuf,
     /// Byte length actually written.
     pub byte_len: u64,
+    /// 1-based `[Image #n]` anchor number from the send manifest, when the
+    /// client numbered its attachments.
+    pub index: Option<u32>,
 }
 
 /// Where a Node fetches staged attachment bytes.
@@ -235,6 +238,7 @@ pub async fn materialize(
             media_type: reference.media_type.clone(),
             byte_len: bytes.len() as u64,
             path,
+            index: reference.index,
         });
     }
     Ok(out)

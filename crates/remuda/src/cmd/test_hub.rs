@@ -98,8 +98,8 @@ fn route(method: &str, path: &str, body: &str) -> (u16, Value) {
             200,
             json!({
                 "instanceId": "ins_test",
-                "items": [attachment("obj_png", "image/png", 168),
-                          attachment("obj_txt", "text/plain", 11)],
+                "items": [attachment_indexed("obj_png", "image/png", 168, 1),
+                          attachment_indexed("obj_txt", "text/plain", 11, 2)],
             }),
         ),
         ("GET", path) if path.starts_with("/v1/attachments/") => attachment_content(path),
@@ -263,6 +263,13 @@ fn attachment(object_id: &str, media_type: &str, size: u64) -> Value {
         "digest": "0".repeat(64),
         "expiresAt": "2126-01-01T00:00:00.000Z",
     })
+}
+
+/// Same metadata plus the `[Image #n]` anchor a numbered send recorded.
+fn attachment_indexed(object_id: &str, media_type: &str, size: u64, index: i64) -> Value {
+    let mut value = attachment(object_id, media_type, size);
+    value["index"] = json!(index);
+    value
 }
 
 /// `GET /v1/attachments/{objectId}/content` for the fixture objects.

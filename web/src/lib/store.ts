@@ -84,8 +84,17 @@ export type LocalBubble = {
   promptMode?: PromptMode;
 };
 
-/** One image shown under a sent bubble. */
-export type BubbleAttachment = { objectId: string; name: string; previewUrl: string };
+/**
+ * One image shown under a sent bubble. `index` is its 1-based `[Image #n]`
+ * anchor (from the send manifest), so an inline token can be paired with the
+ * thumbnail.
+ */
+export type BubbleAttachment = {
+  objectId: string;
+  name: string;
+  previewUrl: string;
+  index?: number;
+};
 
 const COMPACT_KEY = "runtime.compact";
 
@@ -577,15 +586,23 @@ class HubStore {
     previews: BubbleAttachment[] = [],
     mode?: PromptMode,
   ) {
+    // Anchor mapping (D-027 + image anchors): the manifest carries the
+    // [Image #n] index in token order; pair it onto the local bubble's
+    // previews so the token renders as an inline thumbnail chip.
+    const indexOf = new Map(attachments.map((ref) => [ref.objectId, ref.index]));
+    const numberedPreviews = previews.map((preview) => {
+      const index = indexOf.get(preview.objectId);
+      return index ? { ...preview, index } : preview;
+    });
     const clientRequestId = id("local_");
     const bubble: LocalBubble = {
       clientRequestId,
       instanceId,
       text: prompt,
-      ...(previews.length ? { attachments: previews } : {}),
+      ...(numberedPreviews.length ? { attachments: numberedPreviews } : {}),
       // No server identity yet; the projection below reads this null as
       // 「等待发送」 while queued and 「状态待确认」 afterwards, never as
-      // delivery.
+      // delivery. (C2: the local id must never masquerade as a commandId.)
       commandId: null,
       state: "queued",
       ...(mode ? { promptMode: mode } : {}),

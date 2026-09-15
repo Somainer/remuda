@@ -4,6 +4,7 @@ import type { Observation } from "../../types/observation";
 import { MarkdownText } from "../../components/MarkdownText";
 import type { LocalBubble } from "../../lib/store";
 import { SentAttachments } from "./AttachmentChips";
+import { AnchorText } from "./AnchorText";
 import { hubStore } from "../../lib/store";
 import { projectCommandStatus } from "../../lib/commandStatus";
 import ui from "../../styles/ui.module.css";
@@ -754,7 +755,20 @@ function renderNode(
           {node.status === "queued" && !node.local ? <span className={session.stat}> · 排队中</span> : null}
           {node.status === "interrupted" ? <span className={session.stat}> · 已打断</span> : null}
         </div>
-        {node.role === "assistant" ? <MarkdownText text={node.text} /> : <p className={session.bubble}>{node.text}</p>}
+        {node.role === "assistant" ? (
+          <MarkdownText text={node.text} />
+        ) : node.local ? (
+          // Optimistic local bubble: inline [Image #n] thumbnails can render
+          // from the staged previews. Journaled user messages keep plain text
+          // until the Hub echoes attachments on the journal.
+          <AnchorText
+            text={node.text}
+            attachments={node.local.attachments}
+            className={session.bubble}
+          />
+        ) : (
+          <p className={session.bubble}>{node.text}</p>
+        )}
         {streaming ? <span className={session.cursor} data-testid="streaming-cursor" aria-hidden /> : null}
         {node.local?.attachments?.length ? (
           <SentAttachments attachments={node.local.attachments} />

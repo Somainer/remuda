@@ -8492,6 +8492,15 @@
     "MediaBlock": {
       "description": "MediaBlock; `protocol.md` §5.2.",
       "properties": {
+        "anchor": {
+          "description": "1-based anchor number matching the `[Image #n]` token in the\naccompanying text block (2026-09-15). Absent for producers that do not\nnumber attachments; consumers then use block order.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "mediaType": {
           "description": "`media_type`; protocol §5.2.",
           "type": "string"

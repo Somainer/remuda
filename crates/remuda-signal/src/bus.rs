@@ -84,6 +84,17 @@ struct ParkedHook {
     suggestions: Vec<crate::PermissionSuggestion>,
 }
 
+/// A blocking hook whose card is open and whose process may await a decision.
+///
+/// Produced by the non-blocking fold and handed to the socket delivery task,
+/// which alone awaits it — keeping the observation pipeline unblocked.
+struct PendingDecision {
+    /// Rendezvous key, equal to the interaction id.
+    key: crate::pending::DecisionKey,
+    /// Event name the eventual reply must echo.
+    event: String,
+}
+
 /// One turn as seen on the hook channel (P5, c-hookgap).
 struct TurnState {
     /// Agent pid for the turn, from the relay's parent.
@@ -285,9 +296,37 @@ impl SignalBus {
         self.binding().is_some_and(|binding| binding.pid == ppid)
     }
 
-    /// Handle one authenticated event: journal it, then answer the agent.
+    /// Handle one authenticated event: fold and journal it.
+    ///
+    /// This never waits on a human. A blocking event's interaction card is
+    /// emitted and its hook parked, but the decision is awaited only by the
+    /// socket delivery path ([`SignalBus::deliver`]), so direct fold callers —
+    /// and the live observation pipeline — return immediately.
     pub async fn handle(&self, envelope: HookEnvelope) -> HookReply {
         let event = HookEvent::from_envelope(envelope);
+        self.fold_event(event).await;
+        HookReply::empty()
+    }
+
+    /// The socket delivery path: fold the event and, for a blocking event,
+    /// await the human's decision up to the bounded wait.
+    ///
+    /// This is the *only* entry point that blocks, and it runs on the
+    /// per-connection socket task, so a parked approval never stalls the
+    /// observation fold or any other event.
+    pub async fn deliver(&self, envelope: HookEnvelope) -> HookReply {
+        let event = HookEvent::from_envelope(envelope);
+        match self.fold_event(event).await {
+            Some(pending) => self.await_decision(pending).await,
+            None => HookReply::empty(),
+        }
+    }
+
+    /// The fold itself: bind session, track turns/live/OSC, journal the raw +
+    /// derived observations, and — for a blocking event — open the card and
+    /// park the hook. Returns the parked handle (if any) for the caller to
+    /// optionally await.
+    async fn fold_event(&self, event: HookEvent) -> Option<PendingDecision> {
         let mapped = map_event(&event);
         if mapped.kind == MappedKind::SessionStarted
             && let Some(session_id) = mapped.session_id.clone()
@@ -399,35 +438,34 @@ impl SignalBus {
                 }
             }
         }
-        // Blocking events park on the socket and are answered from the
-        // interaction card (tier A). Everything else returns no opinion.
+        // A blocking event opens its interaction card and parks the hook in
+        // the same pass. The fold does not await the decision — it hands the
+        // handle back so the socket delivery task can.
         if crate::event::is_blocking(&event.name) {
-            return self.adjudicate(&event).await;
+            return self.open_and_park(&event).await;
         }
-        HookReply::empty()
+        None
     }
 
-    /// Open an interaction for a blocking event and wait for its decision.
+    /// Open the interaction card for a blocking event and park its hook.
     ///
-    /// The agent is parked on this reply, so every path out of here has to
-    /// produce one: if the interaction cannot be opened at all, the reply is
-    /// `{}` and the agent falls back to its own on-screen dialog, which is the
-    /// honest outcome — Remuda could not take the decision, so it must not
-    /// pretend to have taken it.
-    async fn adjudicate(&self, event: &HookEvent) -> HookReply {
+    /// Returns the handle `await_decision` blocks on. Done synchronously with
+    /// the fold so the card and the phase observations are one ordered batch,
+    /// but *without* blocking on the human — that split is what lets the live
+    /// layer drain observations whether or not a decision ever arrives.
+    async fn open_and_park(&self, event: &HookEvent) -> Option<PendingDecision> {
         let Some((interaction, key)) = self.open_interaction(event) else {
             tracing::debug!(
                 event = %event.name,
                 "no interaction could be opened; the agent keeps its own prompt"
             );
-            return HookReply::empty();
+            return None;
         };
         if !self.emit_interaction(interaction).await {
             // Nobody can see a card that never reached the journal. Answering
-            // it is impossible, so waiting on it would hang the agent for the
-            // full TTL with no way for a human to intervene.
-            tracing::debug!(event = %event.name, "interaction not journaled; not waiting on it");
-            return HookReply::empty();
+            // it is impossible, so the relay must not park for the full TTL.
+            tracing::debug!(event = %event.name, "interaction not journaled; not parking a hook");
+            return None;
         }
         let suggestions = crate::decision::PermissionRequestEvent::from_event(event)
             .map(|request| request.suggestions)
@@ -436,14 +474,29 @@ impl SignalBus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), ParkedHook { suggestions });
-        let (decision, outcome) = self.pending.wait(key.clone(), self.blocking_wait).await;
+        Some(PendingDecision {
+            key,
+            event: event.name.clone(),
+        })
+    }
+
+    /// Block until the parked hook for `pending` is answered or its bounded
+    /// wait expires, then return the decision JSON the harness reads.
+    ///
+    /// This is the only place the bus awaits a human, and it runs on the socket
+    /// delivery task, never on the observation fold.
+    async fn await_decision(&self, pending: PendingDecision) -> HookReply {
+        let (decision, outcome) = self
+            .pending
+            .wait(pending.key.clone(), self.blocking_wait)
+            .await;
         self.parked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
-        tracing::debug!(event = %event.name, ?outcome, "blocking hook resolved");
+            .remove(&pending.key);
+        tracing::debug!(event = %pending.event, ?outcome, "blocking hook resolved");
         HookReply {
-            decision: Some(decision.to_hook_json(&event.name)),
+            decision: Some(decision.to_hook_json(&pending.event)),
         }
     }
 
@@ -590,7 +643,7 @@ impl SignalSink for SignalBus {
         &self,
         envelope: HookEnvelope,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HookReply> + Send + '_>> {
-        Box::pin(self.handle(envelope))
+        Box::pin(SignalBus::deliver(self, envelope))
     }
 }
 
@@ -1044,7 +1097,7 @@ mod tests {
         let (bus, mut rx) = bus();
         let pending = bus.pending();
         let handle = tokio::spawn(async move {
-            bus.handle(envelope("PermissionRequest", permission_request()))
+            bus.deliver(envelope("PermissionRequest", permission_request()))
                 .await
         });
         let key = next_decision_key(&mut rx).await;
@@ -1076,7 +1129,7 @@ mod tests {
         // §4.4 fail-closed, through the real bus wait.
         let (bus, mut rx) = fast_bus();
         let handle = tokio::spawn(async move {
-            bus.handle(envelope("PermissionRequest", permission_request()))
+            bus.deliver(envelope("PermissionRequest", permission_request()))
                 .await
         });
         let _key = next_decision_key(&mut rx).await;
@@ -1090,7 +1143,7 @@ mod tests {
         let (bus, mut rx) = bus();
         let pending = bus.pending();
         let handle = tokio::spawn(async move {
-            bus.handle(envelope(
+            bus.deliver(envelope(
                 "Elicitation",
                 serde_json::json!({"message": "Which account?", "schema": {"type": "object"}}),
             ))
@@ -1139,7 +1192,7 @@ mod tests {
         let (bus, mut rx) = bus();
         let pending = bus.pending();
         let handle = tokio::spawn(async move {
-            bus.handle(envelope("PermissionRequest", permission_request()))
+            bus.deliver(envelope("PermissionRequest", permission_request()))
                 .await
         });
         let key = next_decision_key(&mut rx).await;
@@ -1167,7 +1220,7 @@ mod tests {
         let (bus, mut rx) = bus();
         let pending = bus.pending();
         let handle = tokio::spawn(async move {
-            bus.handle(envelope("PermissionRequest", permission_request()))
+            bus.deliver(envelope("PermissionRequest", permission_request()))
                 .await
         });
         let key = next_decision_key(&mut rx).await;

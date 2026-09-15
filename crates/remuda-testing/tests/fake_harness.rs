@@ -39,6 +39,9 @@ fn claude_artifacts_parse_with_the_transcript_mapper() {
     let mut h = HarnessBuilder::new("claude")
         .scenario("approval.json")
         .spawn();
+    // Do not send body + Enter while a cold process is still starting. If
+    // both queue before its reader starts, Claude treats them as one paste.
+    h.wait_event("session_start", |_| true, WAIT);
     h.submit("RUN_TOOL");
     // Native approval dialog: single approval.
     h.wait_event("approval_prompt", |_| true, WAIT);
@@ -666,6 +669,73 @@ fn grok_ctrl_c_with_draft_only_clears_the_draft() {
 // ===========================================================================
 // Resume
 // ===========================================================================
+
+#[test]
+fn claude_tui_relaunch_changes_pid_and_renderer_without_losing_the_session() {
+    let _serial = support::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(home.join("settings.json"), r#"{"tui":"default"}"#).unwrap();
+    let overlay = dir.path().join("overlay.json");
+    let mut settings = serde_json::json!({
+        "tui":"fullscreen", "hooks":{},
+        "showStatusInTerminalTab":true, "terminalProgressBarEnabled":true,
+    });
+    std::fs::write(&overlay, settings.to_string()).unwrap();
+    let session_id = "00000000-0000-4000-8000-000000000001";
+    let mut h = HarnessBuilder::new("claude")
+        .home(home.clone())
+        .settings(overlay.clone())
+        .scenario("ok.json")
+        .arg("--cwd")
+        .arg(cwd.to_str().unwrap())
+        .arg("--session-id")
+        .arg(session_id)
+        .spawn();
+    let initial = h.wait_event("session_start", |_| true, WAIT);
+    assert_eq!(initial["session_id"], session_id);
+    assert_eq!(initial["pid"], h.pid());
+    assert_eq!(initial["alt_screen"], true);
+
+    // Stand in for Node releasing the deterministic launch pin only once the
+    // authenticated SessionStart has bound. Hooks and status keys stay pinned.
+    settings.as_object_mut().unwrap().remove("tui");
+    std::fs::write(&overlay, settings.to_string()).unwrap();
+    let mut previous_pid = initial["pid"].as_u64().unwrap();
+    for (requested, expected_alt_screen) in [("default", false), ("fullscreen", true)] {
+        h.submit(&format!("/tui {requested}"));
+        let relaunched = h.wait_event(
+            "session_start",
+            |event| event["pid"].as_u64().is_some_and(|pid| pid != previous_pid),
+            WAIT,
+        );
+        assert_eq!(relaunched["session_id"], session_id);
+        assert_eq!(relaunched["tui_latch"], requested);
+        assert_eq!(relaunched["alt_screen"], expected_alt_screen);
+        previous_pid = relaunched["pid"].as_u64().unwrap();
+        let user: Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(user["tui"], requested);
+        let kept: Value = serde_json::from_slice(&std::fs::read(&overlay).unwrap()).unwrap();
+        assert!(kept.get("tui").is_none());
+        assert_eq!(kept["hooks"], serde_json::json!({}));
+        assert_eq!(kept["showStatusInTerminalTab"], true);
+        assert_eq!(kept["terminalProgressBarEnabled"], true);
+    }
+
+    h.submit("AFTER_TUI_RELAUNCH");
+    h.wait_event("turn_end", |_| true, WAIT);
+    h.wait_exit(WAIT);
+    let transcript = h
+        .find_file(&format!("{session_id}.jsonl"))
+        .expect("same transcript");
+    let records = std::fs::read_to_string(transcript).unwrap();
+    assert!(records.contains("AFTER_TUI_RELAUNCH"));
+    assert!(records.contains("SPIKE_COMPLETE"));
+}
 
 #[test]
 fn codex_resume_appends_to_the_same_rollout_with_one_session_meta() {

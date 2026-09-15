@@ -145,6 +145,27 @@ pub(super) fn load(repo: &Path, reference: &str, base: &str) -> Result<MergeRepo
     serde_json::from_str(&contents).context("parse verification report")
 }
 
+/// Remove preparing sidecars a killed lane left behind (a normal finish
+/// removes its own sidecar in [`save`]).
+pub(super) fn cleanup_preparing(repo: &Path, reference: &str) -> Result<()> {
+    let dir = report_dir(repo, reference)?;
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".preparing.json"))
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
 /// Delete every merge pin left for a branch after the queue settles.
 /// Landed merges are reachable from main; dead speculative merges must not
 /// stay pinned in the object store.

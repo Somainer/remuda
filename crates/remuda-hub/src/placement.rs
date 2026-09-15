@@ -45,7 +45,12 @@ pub const RESOURCE_CPU_PCT_MAX: u8 = 90;
 /// See [`RESOURCE_CPU_PCT_MAX`].
 pub const RESOURCE_MEM_PCT_MAX: u8 = 90;
 
-/// Read `(cpuPct, memPct)` off a host's last inventory snapshot.
+/// Read `(cpuPct, memPct, diskFreeGb)` off a host's last inventory snapshot.
+///
+/// Disk free is best-effort like the pressure counters: older Nodes and the
+/// current Node inventory (cpu/mem only) simply report `None`, which never
+/// excludes a host. A future Node collection fills `diskFreeGb` and the
+/// project `diskBudgetGb` check starts enforcing without a Hub change.
 pub(crate) fn resource_pressure(host: &HostRecord) -> (Option<u8>, Option<u8>) {
     let resources = host.resources.as_ref();
     let cpu = resources
@@ -59,6 +64,14 @@ pub(crate) fn resource_pressure(host: &HostRecord) -> (Option<u8>, Option<u8>) {
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u8::try_from(n).ok());
     (cpu, mem)
+}
+
+/// Free scratch disk in GiB when the host's inventory snapshot reports it.
+pub(crate) fn resource_disk_free_gb(host: &HostRecord) -> Option<f64> {
+    host.resources
+        .as_ref()
+        .and_then(|value| value.get("diskFreeGb"))
+        .and_then(serde_json::Value::as_f64)
 }
 
 /// Project layer resolved before solving; design §3.4.
@@ -77,6 +90,8 @@ pub struct ProjectHostPlace {
     pub max_instances: Option<i64>,
     /// Hard label requirements normalized to `key=value`.
     pub requires: Vec<String>,
+    /// Scratch budget in GiB; checked when the host reports `diskFreeGb`.
+    pub disk_budget_gb: Option<i64>,
 }
 
 impl Placement {
@@ -290,6 +305,19 @@ fn consider(
                             host.host_id
                         ));
                     }
+                }
+                // Design §3.4 step 2 disk dimension: a reported free-space
+                // snapshot below the project's allocated scratch budget
+                // removes the host. Missing snapshots never exclude.
+                if let Some(budget_gb) = project_host.disk_budget_gb
+                    && budget_gb > 0
+                    && let Some(free_gb) = resource_disk_free_gb(host)
+                    && free_gb < budget_gb as f64
+                {
+                    return Err(format!(
+                        "{}: free disk {free_gb:.1}GiB under project budget {budget_gb}GiB",
+                        host.host_id
+                    ));
                 }
             }
         }
@@ -523,6 +551,7 @@ pub async fn project_constraints(
                 ProjectHostPlace {
                     max_instances: quota.max_instances,
                     requires: quota.requires.clone(),
+                    disk_budget_gb: quota.disk_budget_gb,
                 },
             )
         })
@@ -612,6 +641,7 @@ mod tests {
             provider_binding: "auto".into(),
             default_launch_args: None,
             claude_binary_path: None,
+            default_tui: None,
         }
     }
 
@@ -755,6 +785,7 @@ mod tests {
                     ProjectHostPlace {
                         max_instances: Some(8),
                         requires: vec!["toolchain=rust".into()],
+                        disk_budget_gb: None,
                     },
                 ),
                 (
@@ -762,6 +793,7 @@ mod tests {
                     ProjectHostPlace {
                         max_instances: Some(8),
                         requires: vec!["toolchain=rust".into()],
+                        disk_budget_gb: None,
                     },
                 ),
             ]
@@ -823,6 +855,7 @@ mod tests {
                 ProjectHostPlace {
                     max_instances: Some(4),
                     requires: vec![],
+                    disk_budget_gb: None,
                 },
             )]
             .into_iter()

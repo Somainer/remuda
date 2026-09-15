@@ -34,13 +34,14 @@ use crate::claude_transcript::{
 use crate::error::{DriverError, DriverResult};
 use crate::promote::{Detected, ProcessTable, ScreenStatus, detect, foreground_pgid};
 use remuda_protocol::{
-    AgentKind, Completeness, DeadlineSource, DeliveryState, EntityLifecycle, EntityMeta, EventId,
-    HostId, Id, InstanceId, Interaction, InteractionAnswer, InteractionCarrier, InteractionId,
-    InteractionKind, InteractionRequest, InteractionRequestKey, InteractionRequestedPayload,
-    InteractionState, Knowledge, LifecycleEntity, LifecyclePayload, LifecycleTopic,
-    NativeLifecycle, NativeRequestKey, Observation, ObservationPayload, ObservationSource,
-    QuestionField, QuestionInput, QuestionOption, QuestionRequest, RunId, RuntimeCursor,
-    SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, Timestamp, U64,
+    AgentKind, Completeness, DeadlineSource, DeliveryState, EffortSelection, EntityLifecycle,
+    EntityMeta, EventId, HostId, Id, InstanceId, Interaction, InteractionAnswer,
+    InteractionCarrier, InteractionId, InteractionKind, InteractionRequest, InteractionRequestKey,
+    InteractionRequestedPayload, InteractionState, Knowledge, LifecycleEntity, LifecyclePayload,
+    LifecycleTopic, NativeLifecycle, NativeRequestKey, Observation, ObservationPayload,
+    ObservationSource, QuestionField, QuestionInput, QuestionOption, QuestionRequest, RunId,
+    RuntimeCursor, SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, Timestamp,
+    U64,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -213,6 +214,33 @@ impl BindingHandle {
                 slot.hooks.push(report);
             }
         }
+    }
+
+    /// An authenticated fresh SessionStart can describe an exec-style renderer
+    /// relaunch: the PID is unchanged but its native session/transcript changed.
+    /// This is explicit identity evidence, never an mtime-based rebind.
+    fn rebind_authenticated_start(&self, found: &Detected, report: &SessionStartReport) -> bool {
+        let Ok(mut slot) = self.inner.lock() else {
+            return false;
+        };
+        let Some(candidate) = report.bind(found.pid) else {
+            return false;
+        };
+        let Some(previous) = &slot.binding else {
+            return false;
+        };
+        if previous.session_id == candidate.session_id
+            || !transcript_belongs_to_cwd(&slot.claude_home, &slot.cwd, &candidate.path)
+        {
+            return false;
+        }
+        slot.epoch = slot.epoch.saturating_add(1);
+        slot.binding = Some(candidate);
+        slot.degraded = false;
+        slot.degraded_reason.clear();
+        slot.cwd_checked = false;
+        slot.hooks.clear();
+        true
     }
 
     /// Current locked binding, if any.
@@ -661,6 +689,8 @@ pub(super) fn spawn(
     interrupt_screen_markers: Arc<Mutex<InterruptBaseline>>,
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
+    effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
+    launch_effort: Option<remuda_protocol::EffortSelection>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
@@ -681,6 +711,7 @@ pub(super) fn spawn(
         // None = nothing announced yet this epoch.
         let mut announced: Option<String> = None;
         let mut bypass_announced = false;
+        let mut tui_released = false;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -753,16 +784,38 @@ pub(super) fn spawn(
             // binding. Without this bridge only Claude's separate pid file
             // could hydrate, leaving a spurious manual picker over a hooked
             // session. begin_epoch must happen first so it cannot erase it.
-            if let Some(binding) = hooks.as_ref().and_then(|hooks| hooks.binding())
+            if let Some(hooks) = hooks.as_ref()
+                && let Some(binding) = hooks.binding()
                 && found.as_ref().is_some_and(|found| found.pid == binding.pid)
-                && let Some(path) = binding.transcript_path
             {
-                bindings.ingest_session_start(SessionStartReport {
-                    session_id: binding.session_id,
-                    transcript_path: path.into(),
-                    cwd: None,
-                    ppid: Some(i64::from(binding.pid)),
-                });
+                // Only an authenticated SessionStart for the observed
+                // foreground agent can release the deterministic start pin.
+                // A /tui relaunch keeps the same --settings argv, so its file
+                // must stop overriding the user's new renderer preference.
+                if !tui_released {
+                    match hooks.release_tui_pin() {
+                        Ok(()) => tui_released = true,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not release launch renderer pin")
+                        }
+                    }
+                }
+                if let Some(path) = binding.transcript_path {
+                    let report = SessionStartReport {
+                        session_id: binding.session_id,
+                        transcript_path: path.into(),
+                        cwd: None,
+                        ppid: Some(i64::from(binding.pid)),
+                    };
+                    if bindings.rebind_authenticated_start(
+                        found.as_ref().expect("matched foreground"),
+                        &report,
+                    ) {
+                        hydrator = None;
+                        announced = None;
+                    }
+                    bindings.ingest_session_start(report);
+                }
             }
 
             if !bypass_announced
@@ -911,6 +964,8 @@ pub(super) fn spawn(
                         &mut announced,
                         &events,
                         &seq,
+                        effort_bridge.as_ref(),
+                        launch_effort,
                     )
                     .await;
                 }
@@ -1099,6 +1154,7 @@ fn current_turn_interrupted(grid: &remuda_screen::ScreenGrid) -> Option<bool> {
 }
 
 /// One tick of the deterministic binding state machine for a promoted Claude.
+#[allow(clippy::too_many_arguments)]
 async fn maintain_binding(
     bindings: &BindingHandle,
     ctx: &PromoteCtx,
@@ -1107,6 +1163,8 @@ async fn maintain_binding(
     announced: &mut Option<String>,
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
+    effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
+    launch_effort: Option<EffortSelection>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1222,7 +1280,7 @@ async fn maintain_binding(
     }
 
     if hydrator.is_none() {
-        *hydrator = Hydrator::open(ctx, &binding);
+        *hydrator = Hydrator::open(ctx, &binding, effort_bridge, launch_effort);
     }
     if let Some(active) = hydrator.as_mut() {
         match pump(active, events, seq, ctx).await {
@@ -1300,6 +1358,20 @@ fn agent_status(status: ScreenStatus) -> ObservationPayload {
     .1
 }
 
+/// §9.1 `instance.configure` effort lifecycle (`effort-queued`,
+/// `effort-applied`, `effort-degraded`, …) emitted by the switch worker.
+pub(super) fn effort_lifecycle(status: &str, severity: Severity) -> ObservationPayload {
+    native(
+        LifecycleTopic::Configuration,
+        "instance.configure",
+        Knowledge::NotApplicable,
+        status,
+        BTreeMap::new(),
+        severity,
+    )
+    .1
+}
+
 /// One detection sample: foreground process group first, screen as fallback.
 async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> {
     let pgid = {
@@ -1330,23 +1402,32 @@ struct Hydrator {
 
 impl Hydrator {
     /// Start replay at byte 0 of the bound transcript.
-    fn open(ctx: &PromoteCtx, binding: &TranscriptBinding) -> Option<Self> {
+    fn open(
+        ctx: &PromoteCtx,
+        binding: &TranscriptBinding,
+        effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
+        launch_effort: Option<EffortSelection>,
+    ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
             session = %binding.session_id,
             source = binding.source.as_wire(),
             "hydrating promoted terminal from its bound Claude transcript"
         );
+        let mut mapper = TranscriptMapper::new(
+            remuda_protocol::DriverKind::ShellPty,
+            ctx.instance_id.clone(),
+            ctx.run_id.clone(),
+            ctx.journal_id.clone(),
+            ctx.host_id.clone(),
+            binding.session_id.clone(),
+            "promoted".to_owned(),
+        );
+        if let Some(bridge) = effort_bridge {
+            mapper = mapper.with_effort_bridge(Arc::clone(bridge), launch_effort);
+        }
         Some(Self {
-            mapper: TranscriptMapper::new(
-                remuda_protocol::DriverKind::ShellPty,
-                ctx.instance_id.clone(),
-                ctx.run_id.clone(),
-                ctx.journal_id.clone(),
-                ctx.host_id.clone(),
-                binding.session_id.clone(),
-                "promoted".to_owned(),
-            ),
+            mapper,
             tail: binding.tail(),
         })
     }
@@ -1789,6 +1870,37 @@ mod tests {
         slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
         let second = bindings.resolve(&found).expect("second poll still bound");
         assert_eq!(second.session_id, CORRECT, "must never switch files");
+    }
+
+    #[test]
+    fn authenticated_renderer_relaunch_can_replace_session_at_the_same_pid() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, tmp.path());
+        slug_session(tmp.path(), &cwd, CORRECT, "{}\n");
+        slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
+        let found = detected_claude(4242, Some(CORRECT));
+        assert_eq!(bindings.resolve(&found).unwrap().session_id, CORRECT);
+        let mut report = SessionStartReport {
+            session_id: LATE_STARTER.into(),
+            transcript_path: crate::claude_transcript::project_dir(tmp.path(), &cwd)
+                .join(format!("{LATE_STARTER}.jsonl")),
+            cwd: None,
+            ppid: Some(7777),
+        };
+        assert!(!bindings.rebind_authenticated_start(&found, &report));
+        assert_eq!(bindings.binding().unwrap().session_id, CORRECT);
+        report.ppid = Some(4242);
+        assert!(bindings.rebind_authenticated_start(&found, &report));
+        assert_eq!(bindings.resolve(&found).unwrap().session_id, LATE_STARTER);
+        assert!(!bindings.rebind_authenticated_start(&found, &report));
+        report.session_id = BUSY_OTHER.into();
+        report.transcript_path = tmp.path().join("other.jsonl");
+        std::fs::write(&report.transcript_path, "{}\n").unwrap();
+        assert!(!bindings.rebind_authenticated_start(&found, &report));
+        assert_eq!(bindings.binding().unwrap().session_id, LATE_STARTER);
     }
 
     #[test]

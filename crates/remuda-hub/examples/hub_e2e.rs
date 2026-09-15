@@ -431,24 +431,42 @@ async fn fake_node(
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
                 let interaction_id = InteractionId::new();
-                let card = fake_approval(
-                    &instance_id,
-                    host_id.as_id().as_str(),
-                    interaction_id.as_id().as_str(),
-                );
+                // A prompt naming the hook path raises the D-028 §4.4 tier A
+                // card instead: harness-hook carrier, the real tool input as
+                // its description, and an always-allow option built from the
+                // permission_suggestion the harness offered.
+                let card = if prompt.contains("hook-approval") {
+                    fake_hook_approval(
+                        &instance_id,
+                        host_id.as_id().as_str(),
+                        interaction_id.as_id().as_str(),
+                    )
+                } else {
+                    fake_approval(
+                        &instance_id,
+                        host_id.as_id().as_str(),
+                        interaction_id.as_id().as_str(),
+                    )
+                };
                 pending
                     .lock()
                     .await
                     .insert(interaction_id.as_id().as_str().to_string(), card);
                 append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
-                append_n = append_journal(
-                    &mut ws,
-                    &instance_id,
-                    append_n,
-                    "assistant",
-                    &format!("echo: {prompt}"),
-                )
-                .await?;
+                if let Some(reply) = code_comment_reply(prompt) {
+                    // r-ux-comment: a fenced block to exercise 评论.
+                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                        .await?;
+                } else {
+                    append_n = append_journal(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "assistant",
+                        &format!("echo: {prompt}"),
+                    )
+                    .await?;
+                }
                 // A freshly launched native-PTY agent is mid-turn until the
                 // web drives it; the approval keeps it blocked until answered.
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "working").await?;
@@ -466,6 +484,17 @@ async fn fake_node(
                     .and_then(Value::as_str)
                     .unwrap_or("hello");
                 append_n = append_journal(&mut ws, &instance_id, append_n, "user", prompt).await?;
+                // r-ux-comment: reply with a fenced code block so the browser
+                // spec can exercise the 评论 quote action. The prompt is also
+                // echoed verbatim below, proving the expanded quote arrived.
+                if let Some(reply) = code_comment_reply(prompt) {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                        .await?;
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    continue;
+                }
                 // r-ux-w: synthetic workflow timeline-card scenarios.
                 if let Some(kind) = workflow_kind(prompt) {
                     send_rpc_ok(
@@ -480,20 +509,47 @@ async fn fake_node(
                 }
                 // D-027: echo the attachment metadata the Hub resolved, so the
                 // e2e can prove staging reached the Node without a real agent.
-                let attachments = params
+                // 2026-09-15: also echo the [Image #n] manifest (index +
+                // objectId + mediaType in token order) on one line each.
+                let sent: Vec<(Option<i64>, String, String)> = params
                     .get("attachments")
                     .and_then(Value::as_array)
                     .map(|list| {
                         list.iter()
-                            .filter_map(|item| item.get("mediaType").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
+                            .map(|item| {
+                                (
+                                    item.get("index").and_then(Value::as_i64),
+                                    item.get("objectId")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    item.get("mediaType")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                )
+                            })
+                            .collect()
                     })
                     .unwrap_or_default();
-                let reply = if attachments.is_empty() {
+                let types = sent
+                    .iter()
+                    .map(|(_, _, media_type)| media_type.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut reply = if sent.is_empty() {
                     format!("echo: {prompt}")
                 } else {
-                    format!("echo: {prompt} [attachments: {}]", attachments.join(","))
+                    format!("echo: {prompt} [attachments: {types}]")
                 };
+                for (index, object_id, media_type) in &sent {
+                    reply.push_str(&format!(
+                        " [attachment-refs: #{} {} {}]",
+                        index.unwrap_or(0),
+                        object_id,
+                        media_type
+                    ));
+                }
                 if prompt.starts_with("stream ") {
                     // D-028 §7: reply as an open/append chain so the web e2e
                     // sees text arrive mid-turn, the way `MessageDisplay`
@@ -518,6 +574,51 @@ async fn fake_node(
             "instance.cancel" => {
                 // §5.3: the turn ends but the instance keeps running.
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+            }
+            "instance.configure" => {
+                // §9.1: emulate a native agent that accepted `/effort` and
+                // whose next assistant record reports the level back. When the
+                // requested level differs from what the transcript says, the
+                // fake agent reports a *clamped* level — exactly the
+                // 请求 max → 实际 xhigh path the UI must render.
+                if let Some(effort) = params.get("effort")
+                    && let Some(requested) = effort.get("name").and_then(Value::as_str)
+                {
+                    let observed = match requested {
+                        // The fake agent's environment caps at xhigh.
+                        "max" => "xhigh",
+                        other => other,
+                    };
+                    let observed_at = "2026-09-14T12:00:00.000Z";
+                    let event = json!({
+                        "kind": "effort",
+                        "completeness": "structured",
+                        "payload": {
+                            "requested": {"name": requested,
+                                "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
+                            "effective": {
+                                "name": observed,
+                                "ultracode": if requested == "ultracode" {
+                                    serde_json::Value::Bool(true)
+                                } else {
+                                    serde_json::Value::Null
+                                },
+                                "source": "remuda",
+                                "observedAt": observed_at
+                            },
+                            "raw": observed
+                        }
+                    });
+                    append_n = append_event(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "effort",
+                        event["payload"].clone(),
+                    )
+                    .await?;
+                }
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
             "instance.close" => {
@@ -967,7 +1068,81 @@ async fn append_native_status(
     Ok(seq)
 }
 
+/// A hook-carried approval, shaped like the one the Node builds from a real
+/// `PermissionRequest` (D-028 §4.4; payload measured in
+/// `docs/design/evidence/native-pty-5.md`).
+///
+/// Three things differ from the control-channel card above and each is the
+/// point of a tier A approval: the carrier is `harness-hook`, the description
+/// is the *real* `tool_input` rather than a screen scrape, and there is an
+/// always-allow option — which exists only because the harness sent a
+/// `permission_suggestion`, so a request without one must not grow one.
+fn fake_hook_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    json!({
+        "id": interaction_id,
+        "revision": "1",
+        "createdAt": "2026-09-12T00:00:00.000Z",
+        "updatedAt": "2026-09-12T00:00:00.000Z",
+        "instanceId": instance_id,
+        "runId": null,
+        "hostId": host_id,
+        "kind": "approval",
+        "requestKey": {
+            // The parked hook's identity: a PermissionRequest carries no
+            // tool_use_id of its own, so the id is the way back to it.
+            "native": { "type": "hook", "invocationId": interaction_id },
+            "processGeneration": "1",
+            "runGeneration": "1",
+            "connectionEpoch": host_id
+        },
+        "requestVersion": "1",
+        "state": "pending",
+        "blocking": true,
+        "answerable": true,
+        "carrier": "harness-hook",
+        "request": {
+            "kind": "approval",
+            "title": "Write",
+            "description": "/tmp/hook-approval.txt",
+            "toolCallId": null,
+            "actionRef": interaction_id,
+            "options": [
+                { "id": "allow-once", "label": "允许一次", "effect": "allow-once", "nativeValueRef": interaction_id },
+                { "id": "allow-always-0", "label": "始终允许 (acceptEdits)", "effect": "allow-session", "nativeValueRef": interaction_id },
+                { "id": "deny", "label": "拒绝", "effect": "deny", "nativeValueRef": interaction_id }
+            ],
+            "requestedPermissionsRef": null,
+            "inputDigest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        "deadline": { "state": "unknown", "reason": "none", "evidenceEventIds": [] },
+        "deadlineSource": "runtime-policy",
+        "answer": { "state": "not-applicable" },
+        "delivery": "not-sent",
+        "resolution": { "state": "not-applicable" }
+    })
+}
+
 /// r-ux-w: select a synthetic workflow scenario by prompt prefix.
+/// r-ux-comment: prompts mentioning code get an assistant reply containing a
+/// fenced ts block, so the browser spec can quote it with the 评论 action.
+fn code_comment_reply(prompt: &str) -> Option<String> {
+    if !prompt.contains("show me code") {
+        return None;
+    }
+    Some(
+        "here is the function:\n\
+         \n\
+         ```ts src/math.ts\n\
+         export function add(a: number, b: number): number {\n\
+         \x20 return a + b;\n\
+         }\n\
+         ```\n\
+         \n\
+         ask about any line."
+            .to_owned(),
+    )
+}
+
 fn workflow_kind(prompt: &str) -> Option<&'static str> {
     const PREFIX: &str = "workflow card";
     if !prompt.starts_with(PREFIX) {

@@ -1,4 +1,6 @@
 import type { Attachment } from "../../lib/attachments";
+import type { DraftCodeQuote } from "../../lib/codeAnchors";
+import { quotePreview } from "../../lib/codeAnchors";
 import css from "./AttachmentChips.module.css";
 
 /**
@@ -6,61 +8,81 @@ import css from "./AttachmentChips.module.css";
  *
  * A failed chip stays in place with its message rather than disappearing, so
  * the upload can be retried without re-picking the file.
+ *
+ * Each chip carries its 1-based anchor number (2026-09-15): the same number
+ * is in the prompt's `[Image #n]` token. A chip whose token was edited out of
+ * the text is marked "未引用" — the image is still sent — rather than removed.
  */
 export function AttachmentChips({
   attachments,
+  unreferenced,
   onRemove,
   onRetry,
 }: {
   attachments: Attachment[];
+  /** localIds whose `[Image #n]` token no longer appears in the draft text. */
+  unreferenced?: ReadonlySet<string>;
   onRemove: (localId: string) => void;
   onRetry?: (localId: string) => void;
 }) {
   if (attachments.length === 0) return null;
   return (
     <div className={css.row} data-testid="attachment-chips">
-      {attachments.map((attachment) => (
-        <div
-          key={attachment.localId}
-          className={css.chip}
-          data-state={attachment.state}
-          data-testid="attachment-chip"
-        >
-          <img className={css.thumb} src={attachment.previewUrl} alt={attachment.name} />
-          <span className={css.meta}>
-            <span className={css.name} title={attachment.name}>
-              {attachment.name}
+      {attachments.map((attachment, position) => {
+        const index = position + 1;
+        const orphan = unreferenced?.has(attachment.localId) === true;
+        return (
+          <div
+            key={attachment.localId}
+            className={css.chip}
+            data-state={attachment.state}
+            data-unreferenced={orphan ? "1" : "0"}
+            data-index={index}
+            data-testid="attachment-chip"
+          >
+            <span className={css.thumbWrap}>
+              <img className={css.thumb} src={attachment.previewUrl} alt={attachment.name} />
+              <span className={css.indexBadge} data-testid="attachment-index" aria-hidden>
+                {index}
+              </span>
             </span>
-            <span className={css.status}>
-              {attachment.state === "uploading"
-                ? "上传中…"
-                : attachment.state === "failed"
-                  ? (attachment.error ?? "上传失败")
-                  : formatSize(attachment.size)}
+            <span className={css.meta}>
+              <span className={css.name} title={attachment.name}>
+                {attachment.name}
+              </span>
+              <span className={css.status}>
+                {attachment.state === "uploading"
+                  ? "上传中…"
+                  : attachment.state === "failed"
+                    ? (attachment.error ?? "上传失败")
+                    : orphan
+                      ? "未引用（仍会发送）"
+                      : formatSize(attachment.size)}
+              </span>
             </span>
-          </span>
-          {attachment.state === "failed" && onRetry ? (
+            {attachment.state === "failed" && onRetry ? (
+              <button
+                type="button"
+                className={css.remove}
+                aria-label={`重试 ${attachment.name}`}
+                data-testid="attachment-retry"
+                onClick={() => onRetry(attachment.localId)}
+              >
+                ↻
+              </button>
+            ) : null}
             <button
               type="button"
               className={css.remove}
-              aria-label={`重试 ${attachment.name}`}
-              data-testid="attachment-retry"
-              onClick={() => onRetry(attachment.localId)}
+              aria-label={`移除 ${attachment.name}（图片 ${index}）`}
+              data-testid="attachment-remove"
+              onClick={() => onRemove(attachment.localId)}
             >
-              ↻
+              ×
             </button>
-          ) : null}
-          <button
-            type="button"
-            className={css.remove}
-            aria-label={`移除 ${attachment.name}`}
-            data-testid="attachment-remove"
-            onClick={() => onRemove(attachment.localId)}
-          >
-            ×
-          </button>
-        </div>
-      ))}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -69,19 +91,89 @@ export function AttachmentChips({
 export function SentAttachments({
   attachments,
 }: {
-  attachments: { objectId: string; name: string; previewUrl: string }[];
+  attachments: { objectId: string; name: string; previewUrl: string; index?: number }[];
 }) {
   if (attachments.length === 0) return null;
   return (
     <div className={css.sent} data-testid="sent-attachments">
       {attachments.map((attachment) => (
-        <img
-          key={attachment.objectId}
-          className={css.sentThumb}
-          src={attachment.previewUrl}
-          alt={attachment.name}
-        />
+        <span key={attachment.objectId} className={css.sentWrap}>
+          <img
+            className={css.sentThumb}
+            src={attachment.previewUrl}
+            alt={attachment.name}
+            data-index={attachment.index ?? ""}
+          />
+          {attachment.index ? (
+            <span className={css.indexBadge} data-testid="sent-attachment-index" aria-hidden>
+              {attachment.index}
+            </span>
+          ) : null}
+        </span>
       ))}
+    </div>
+  );
+}
+
+/**
+ * Draft chips for quoted code blocks (workbench-code-2). Same visual language
+ * as the image chips: numbered badge, title row, a one-line preview, and the
+ * × that strips the `[Code #n]` token. A quote whose token was edited out is
+ * dashed + "未引用（仍会发送）", exactly like image chips.
+ */
+export function CodeQuoteChips({
+  quotes,
+  unreferenced,
+  onRemove,
+}: {
+  quotes: readonly DraftCodeQuote[];
+  /** localIds whose `[Code #n]` token no longer appears in the draft text. */
+  unreferenced?: ReadonlySet<string>;
+  onRemove: (index: number) => void;
+}) {
+  if (quotes.length === 0) return null;
+  return (
+    <div className={css.row} data-testid="code-quote-chips">
+      {quotes.map((quote, position) => {
+        const index = position + 1;
+        const orphan = unreferenced?.has(quote.localId) === true;
+        const heading = quote.path || (quote.lang ? `${quote.lang} block` : "code block");
+        return (
+          <div
+            key={quote.localId}
+            className={css.chip}
+            data-unreferenced={orphan ? "1" : "0"}
+            data-index={index}
+            data-testid="code-quote-chip"
+          >
+            <span className={css.thumbWrap}>
+              <span className={css.codeGlyph} aria-hidden>
+                {"</>"}
+              </span>
+              <span className={css.indexBadge} data-testid="code-quote-index" aria-hidden>
+                {index}
+              </span>
+            </span>
+            <span className={css.meta}>
+              <span className={css.name} title={heading}>
+                {heading}
+              </span>
+              <span className={css.status} title={quotePreview(quote)}>
+                {orphan ? "未引用（仍会发送）" : quotePreview(quote)}
+              </span>
+            </span>
+            <button
+              type="button"
+              className={css.remove}
+              aria-label={`移除引用（代码 ${index}）`}
+              data-testid="code-quote-remove"
+              onClick={() => onRemove(index)}
+            >
+              ×
+            </button>
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -241,6 +241,7 @@ wire_enum!(InteractionState, "2.6", {
 wire_enum!(InteractionCarrier, "2.6", {
     ClaudeControl => "claude-control",
     ClaudeHook => "claude-hook",
+    HarnessHook => "harness-hook",
     CodexRpc => "codex-rpc",
     AcpRpc => "acp-rpc",
     NativeTty => "native-tty",
@@ -357,6 +358,17 @@ wire_enum!(EffortName, "4.1", {
     High => "high",
     Xhigh => "xhigh",
     Max => "max",
+});
+
+// Where an *effective* effort observation came from; D-028 §9.1:
+// `launch` = read back after a `--effort` launch flag; `slash` = the user
+// typed `/effort` in the native TUI; `remuda` = a Remuda-initiated switch;
+// `unknown` = observed with no attributable switch.
+wire_enum!(EffortSource, "9.1", {
+    Launch => "launch",
+    Slash => "slash",
+    Remuda => "remuda",
+    Unknown => "unknown",
 });
 
 wire_enum!(ClaudePermissionMode, "4.1", {
@@ -784,6 +796,7 @@ wire_enum!(ObservationKind, "5.1", {
     Lifecycle => "lifecycle",
     Usage => "usage",
     Artifact => "artifact",
+    Effort => "effort",
     RawTty => "raw_tty",
     Opaque => "opaque",
 });

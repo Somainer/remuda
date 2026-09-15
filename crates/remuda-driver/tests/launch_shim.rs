@@ -127,8 +127,8 @@ fn typing_claude_by_hand_reaches_the_real_binary_with_the_overlay_attached() {
         "{argv:?}"
     );
     assert!(
-        argv.contains(&"--setting-sources".to_owned()),
-        "--setting-sources is what makes the resolved config deterministic: {argv:?}"
+        !argv.contains(&"--setting-sources".to_owned()),
+        "normal settings sources must stay implicit to permit /tui: {argv:?}"
     );
 }
 
@@ -176,6 +176,121 @@ fn explicit_settings_reach_the_merger_with_the_original_argv() {
         "the merger needs both overlays: {argv:?}"
     );
     assert_eq!(&argv[..3], &["hook", "launch", "--overlay"]);
+}
+
+#[test]
+fn explicit_settings_plus_shim_overlay_pin_all_three_terminal_keys() {
+    use remuda_driver::{OverlayOptions, TuiMode, materialize_overlay};
+    use serde_json::{Value, json};
+
+    for (tui, opposite) in [
+        (TuiMode::Fullscreen, "default"),
+        (TuiMode::Default, "fullscreen"),
+    ] {
+        let harness = harness();
+        let overlay = materialize_overlay(&OverlayOptions {
+            launch_dir: harness.overlay.parent().unwrap().to_path_buf(),
+            relay_binary: harness.real_bin.join("claude"),
+            socket_path: harness._dir.path().join("hook.sock"),
+            tui,
+            base: None,
+        })
+        .unwrap();
+        let user = json!({"tui": opposite, "showStatusInTerminalTab": false,
+            "terminalProgressBarEnabled": false, "env":{"RELAY":"preserved"}});
+        let source = harness._dir.path().join("relay.json");
+        std::fs::write(&source, user.to_string()).unwrap();
+        let output = harness.sh(&format!("claude --settings '{}'", source.display()));
+        assert!(output.status.success(), "{output:?}");
+        let recorded = harness.recorded();
+        assert_eq!(&recorded[..3], &["hook", "launch", "--overlay"]);
+        let separator = recorded.iter().position(|arg| arg == "--").unwrap();
+        let mut forwarded = recorded[separator + 2..recorded.len() - 1].to_vec();
+        remuda_driver::launch::overlay::merge_explicit_settings(&overlay.path, &mut forwarded)
+            .unwrap();
+        let merged: Value = serde_json::from_slice(&std::fs::read(&forwarded[1]).unwrap()).unwrap();
+        assert_eq!(merged["tui"], tui.as_str());
+        assert_eq!(merged["showStatusInTerminalTab"], true);
+        assert_eq!(merged["terminalProgressBarEnabled"], true);
+        assert_eq!(merged["env"], user["env"]);
+        assert_eq!(std::fs::read_to_string(source).unwrap(), user.to_string());
+        for prohibited in [
+            "--setting-sources",
+            "--permission-prompt-tool",
+            "--tools",
+            "--system-prompt",
+            "--system-prompt-file",
+            "--append-system-prompt-file",
+            "--managed-settings",
+        ] {
+            assert!(
+                !forwarded.iter().any(|arg| arg == prohibited),
+                "{forwarded:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn overlay_beats_user_project_local_and_both_hook_sources_execute() {
+    // This asserts the isolated fake-harness settings contract. Real Claude
+    // precedence and hook composition are covered by native-pty-9b evidence.
+    use remuda_testing::fake_harness::settings::merged_claude_settings;
+    use remuda_testing::fake_harness::{HookContext, HookEvent, HookKind, HookTable};
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    let hook_log = dir.path().join("hooks.log");
+    for (path, label) in [
+        (home.join("settings.json"), "user"),
+        (cwd.join(".claude/settings.json"), "project"),
+        (cwd.join(".claude/settings.local.json"), "local"),
+    ] {
+        let mut settings = json!({"tui":"default", "fixturePrecedence":label,
+            "showStatusInTerminalTab":false,"terminalProgressBarEnabled":false});
+        if label == "user" {
+            settings["hooks"] = json!({"SessionStart":[{"hooks":[{"type":"command",
+                "command":format!("printf 'user\\n' >> '{}'", hook_log.display())}]}]});
+        }
+        std::fs::write(path, settings.to_string()).unwrap();
+    }
+    let overlay = dir.path().join("overlay.json");
+    let settings = json!({"tui":"fullscreen","fixturePrecedence":"overlay",
+        "showStatusInTerminalTab":true,"terminalProgressBarEnabled":true,
+        "hooks":{"SessionStart":[{"hooks":[{"type":"command",
+            "command":format!("printf 'overlay\\n' >> '{}'", hook_log.display())}]}]}});
+    std::fs::write(&overlay, settings.to_string()).unwrap();
+    let merged = merged_claude_settings(&home, &cwd, Some(&overlay)).unwrap();
+    assert_eq!(merged["tui"], "fullscreen");
+    assert_eq!(merged["fixturePrecedence"], "overlay");
+    assert_eq!(merged["showStatusInTerminalTab"], true);
+    assert_eq!(merged["terminalProgressBarEnabled"], true);
+    let hooks = HookTable::load_claude(&home, &cwd, Some(&overlay)).unwrap();
+    hooks.fire(
+        HookEvent::SessionStart,
+        &json!({}),
+        &HookContext {
+            kind: HookKind::Claude,
+            session_id: "fixture-session",
+            cwd: &cwd,
+        },
+    );
+    assert_eq!(
+        std::fs::read_to_string(hook_log).unwrap(),
+        "user\noverlay\n"
+    );
+    std::fs::write(
+        home.join("managed-settings.json"),
+        r#"{"tui":"default","fixturePrecedence":"managed"}"#,
+    )
+    .unwrap();
+    let managed = merged_claude_settings(&home, &cwd, Some(&overlay)).unwrap();
+    assert_eq!(managed["tui"], "default");
+    assert_eq!(managed["fixturePrecedence"], "managed");
 }
 
 #[test]

@@ -31,7 +31,7 @@ pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool::new(
             "remuda_attachments_list",
-            "List attachments staged for this session (objectId, mediaType, size). Call this to discover what `remuda_attachment` can fetch.",
+            "List attachments staged for this session (index, objectId, mediaType, size). `index` is the 1-based number in the prompt's `[Image #n]` token: to answer about `[Image #2]`, call remuda_attachment with the objectId listed at index 2. Call this to discover what `remuda_attachment` can fetch.",
             json!({
                 "type": "object",
                 "properties": {
@@ -45,14 +45,14 @@ pub(super) fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "remuda_attachment",
-            "Fetch one attachment staged for this session by objectId. Images come back as an image content block you can see directly; text comes back as text. Other media types are refused with their size and type.",
+            "Fetch one attachment staged for this session by objectId — resolve `[Image #n]` through remuda_attachments_list, which pairs each index with its objectId. Images come back as an image content block you can see directly; text comes back as text. Other media types are refused with their size and type.",
             json!({
                 "type": "object",
                 "required": ["objectId"],
                 "properties": {
                     "objectId": {
                         "type": "string",
-                        "description": "`obj_…` id, as named in the prompt's attachment mention or by remuda_attachments_list."
+                        "description": "`obj_…` id, as paired with the prompt's `[Image #n]` index by remuda_attachments_list."
                     }
                 }
             }),
@@ -70,11 +70,30 @@ async fn list(client: &super::HubClient, instance_id: Option<&str>) -> Result<Va
         None => "/v1/attachments".to_owned(),
     };
     let body = client.get(&path).await?;
-    let items: Vec<Value> = body
+    let raw_items = body
         .get("items")
         .and_then(Value::as_array)
-        .map(|items| items.iter().map(summary).collect())
+        .cloned()
         .unwrap_or_default();
+    // The Hub orders by anchor when present. Continue the 1-based numbering
+    // past the largest anchored index for any un-anchored row (an object
+    // uploaded but never consumed by a numbered send).
+    let mut next_fallback = 1i64;
+    let mut items: Vec<Value> = Vec::with_capacity(raw_items.len());
+    for item in raw_items {
+        let index = match item.get("index").and_then(Value::as_i64) {
+            Some(index) => {
+                next_fallback = next_fallback.max(index + 1);
+                index
+            }
+            None => {
+                let index = next_fallback;
+                next_fallback += 1;
+                index
+            }
+        };
+        items.push(summary(&item, index));
+    }
     Ok(json!({
         "instanceId": body.get("instanceId").cloned().unwrap_or(Value::Null),
         "count": items.len(),
@@ -83,9 +102,11 @@ async fn list(client: &super::HubClient, instance_id: Option<&str>) -> Result<Va
 }
 
 /// Drop `digest` and `name` from the listing: neither helps the agent decide
-/// what to fetch, and the derived name only invites a path guess.
-fn summary(item: &Value) -> Value {
+/// what to fetch, and the derived name only invites a path guess. `index` is
+/// the `[Image #n]` number the prompt uses.
+fn summary(item: &Value, index: i64) -> Value {
     json!({
+        "index": index,
         "objectId": item.get("objectId").cloned().unwrap_or(Value::Null),
         "mediaType": item.get("mediaType").cloned().unwrap_or(Value::Null),
         "size": item.get("size").cloned().unwrap_or(Value::Null),
@@ -250,9 +271,11 @@ mod tests {
     fn a_listing_keeps_only_what_the_agent_needs_to_choose() {
         let item = json!({
             "objectId": "obj_1", "instanceId": "ins_self", "mediaType": "image/png",
-            "name": "obj_1.png", "size": 168, "digest": "abc", "expiresAt": "2026-09-15T00:00:00Z"
+            "name": "obj_1.png", "size": 168, "digest": "abc", "expiresAt": "2026-09-15T00:00:00Z",
+            "index": 1
         });
-        let summary = summary(&item);
+        let summary = summary(&item, 1);
+        assert_eq!(summary["index"], json!(1));
         assert_eq!(summary["objectId"], json!("obj_1"));
         assert_eq!(summary["mediaType"], json!("image/png"));
         assert_eq!(summary["size"], json!(168));
@@ -315,7 +338,10 @@ mod tests {
             let body: Value = serde_json::from_str(text).expect("json");
             assert_eq!(body["instanceId"], json!("ins_test"));
             assert_eq!(body["count"], json!(2));
+            // The `[Image #n]` index rides each item, in token order.
+            assert_eq!(body["items"][0]["index"], json!(1));
             assert_eq!(body["items"][0]["objectId"], json!("obj_png"));
+            assert_eq!(body["items"][1]["index"], json!(2));
             assert_eq!(body["items"][1]["mediaType"], json!("text/plain"));
         }
 

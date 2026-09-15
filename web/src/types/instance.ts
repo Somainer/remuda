@@ -21,6 +21,7 @@ export type Connectivity = "connected" | "disconnected" | "reconciling";
 export type Ownership = "managed" | "adopted-control" | "observed-only";
 export type UiMode = "structured-only" | "tty-attachable";
 export type InstanceMode = "native" | "promoted";
+export type TuiMode = "fullscreen" | "default";
 
 export type Instance = EntityMeta & {
   hostId: Id;
@@ -51,12 +52,21 @@ export type Instance = EntityMeta & {
   providerSource?: string | null;
   providerSourceHint?: string | null;
   model?: string | null;
+  /** Requested launch renderer. Actual terminal mode comes from the tty snapshot. */
+  tui?: TuiMode | null;
   /** Normalized D-028 §9.1 level (`low` … `max`). Legacy tiers are mapped by name on read. */
   effortName?: string | null;
   /** Dynamic-workflow flag; session-only, not a sixth level. */
   effortUltracode?: boolean | null;
   /** Legacy index. Preserved for older clients; never used to derive the tier. */
   effortIndex?: number | null;
+  /** §9.1 effective effort read back from the native transcript; null = unobserved → UI shows `?`. */
+  effortEffective?: {
+    name: string;
+    ultracode?: boolean | null;
+    source: "launch" | "slash" | "remuda" | "unknown";
+    observedAt: string;
+  } | null;
   /** How this instance reached its `kind`; `promoted` = a terminal that an agent CLI took over (D-025). */
   mode?: InstanceMode | null;
   /** When the promotion happened. Only set while `mode` is `promoted`. */
@@ -101,6 +111,8 @@ export type Host = EntityMeta & {
   providerBinding?: string;
   /** Per-host default extra CLI args, used when a create omits `args`. */
   defaultLaunchArgs?: string[];
+  /** Per-host Claude renderer default; an omitted value means fullscreen. */
+  defaultTui?: TuiMode;
   /** Per-host default claude executable. Validated by the Node, not the Hub. */
   claudeBinaryPath?: string;
   online?: boolean;

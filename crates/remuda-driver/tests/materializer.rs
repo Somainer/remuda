@@ -123,12 +123,7 @@ fn materializer_is_idempotent_for_the_same_spec() {
             .windows(2)
             .any(|w| w[0] == "--permission-mode" && w[1] == "default")
     );
-    assert!(
-        first
-            .argv
-            .windows(2)
-            .any(|w| w[0] == "--setting-sources" && w[1] == "user,project,local")
-    );
+    assert!(!first.argv.iter().any(|arg| arg == "--setting-sources"));
     assert!(!first.argv.iter().any(|a| a == "--bare"));
 }
 
@@ -1107,7 +1102,7 @@ mod shell_pty_agent {
             tmp.path(),
             LaunchOrigin::Human,
         );
-        assert!(claude.argv.iter().any(|t| t == "--setting-sources"));
+        assert!(!claude.argv.iter().any(|t| t == "--setting-sources"));
         assert_eq!(claude.setting_sources, ["user", "project", "local"]);
 
         for (kind, env) in [

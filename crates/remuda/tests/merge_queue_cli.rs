@@ -7,12 +7,13 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
 const GATE: &str = include_str!("../../../scripts/ci/gate.sh");
 const AFFECTED: &str = include_str!("../../../scripts/ci/affected.py");
+const GATE_SUPERVISOR: &str = include_str!("../../../scripts/ci/gate_supervisor.py");
 const QUEUE_STUB: &str = include_str!("fixtures/merge-queue-gate-stub.py");
 
 fn git_command(repo: &Path) -> Command {
@@ -75,6 +76,7 @@ impl QueueRepo {
         git(&root, &["config", "commit.gpgsign", "false"]);
         fs::write(root.join("scripts/ci/gate.sh"), GATE).unwrap();
         fs::write(root.join("scripts/ci/affected.py"), AFFECTED).unwrap();
+        fs::write(root.join("scripts/ci/gate_supervisor.py"), GATE_SUPERVISOR).unwrap();
         fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/core\"]\nresolver = \"3\"\n",
@@ -108,6 +110,7 @@ impl QueueRepo {
             "state.txt",
             "scripts/ci/gate.sh",
             "scripts/ci/affected.py",
+            "scripts/ci/gate_supervisor.py",
             "web/.keep",
             "web/src/lib/api.generated.ts",
             "Cargo.toml",
@@ -200,10 +203,13 @@ impl QueueRepo {
     }
 
     fn assert_cleaned(&self) {
-        let tmp = self.root.join("data/tmp");
-        if tmp.exists() {
-            assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0);
-        }
+        // Gate worktrees live under OS-temp remuda-mq-* scratch roots now;
+        // the repository checkout itself must never carry scratch state.
+        assert!(
+            !self.root.join("data").exists(),
+            "merge created scratch inside the repo: {:?}",
+            self.root.join("data")
+        );
     }
 }
 
@@ -587,4 +593,279 @@ fn queue_reverifies_b2_onto_main_when_b1_fails() {
     // b1's failed merge pin and b2's speculative pin are both swept.
     assert!(git(&repo.root, &["for-each-ref", "refs/remuda/merge/"]).is_empty());
     repo.assert_cleaned();
+}
+
+// ---------------------------------------------------------------------------
+// Lane death (2026-09-15 production incident regressions)
+// ---------------------------------------------------------------------------
+
+/// Find descendant processes of `root` whose cmdline contains `needle`.
+/// Polls briefly: the lane is launched only after the gate reaches the step.
+fn descendant_with_cmd(root: u32, needle: &[u8]) -> Option<u32> {
+    fn stat_ppid(pid: u32) -> Option<u32> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let comm_end = stat.rfind(')')?;
+        stat[comm_end + 2..].split_whitespace().nth(1)?.parse().ok()
+    }
+    for _ in 0..100 {
+        let mut matches = Vec::new();
+        let mut frontier = vec![root];
+        while let Some(pid) = frontier.pop() {
+            let entries = match fs::read_dir("/proc") {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let Ok(other) = name.parse::<u32>() else {
+                    continue;
+                };
+                if stat_ppid(other) == Some(pid) {
+                    frontier.push(other);
+                    if let Ok(cmdline) = fs::read(format!("/proc/{other}/cmdline"))
+                        && cmdline.windows(needle.len()).any(|w| w == needle)
+                    {
+                        matches.push(other);
+                    }
+                }
+            }
+        }
+        if let Some(pid) = matches.into_iter().min() {
+            return Some(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    None
+}
+
+/// Wait until the gate trace contains a step event matching all predicates.
+fn wait_for_trace<F>(path: &Path, matches: F)
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(text) = fs::read_to_string(path)
+            && text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|event| matches(&event))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate trace never matched"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn queue_killed_lane_is_a_failed_branch_while_others_land() {
+    let repo = QueueRepo::new();
+    commit_file(
+        &repo.work_a,
+        "queue-hang.txt",
+        "lane a will be killed externally\n",
+    );
+    commit_file(&repo.work_b, "docs/b.md", "branch b\n");
+    // A third branch exercises the "settle before dispatch" ordering fix:
+    // it must re-verify onto main after a's death even when a is settled
+    // in the same event round.
+    let work_c = repo.root.parent().unwrap().join("work-c");
+    git(
+        &repo.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wt/c/work",
+            work_c.to_str().unwrap(),
+        ],
+    );
+    commit_file(&work_c, "docs/c.md", "branch c\n");
+
+    let child = repo
+        .command()
+        .args([
+            "merge",
+            "--queue",
+            "wt/a/work",
+            "wt/b/work",
+            "wt/c/work",
+            "--gate",
+            "--no-push",
+            "--json",
+            "--lanes",
+            "2",
+            "--target-dir",
+            "kill-queue-target",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Lane a parks inside cargo-test; kill its remuda lane process exactly
+    // like the operator did on 2026-09-15. The parent-death guard in the
+    // gate driver takes the sleeping gate/stub down with it.
+    wait_for_trace(&repo.trace, |event| {
+        event["step"] == "cargo-test"
+            && event["target"]
+                .as_str()
+                .is_some_and(|target| target.ends_with("kill-queue-target"))
+    });
+    let lane = descendant_with_cmd(child.id(), b"merge\x00wt/a/work\x00--gate".as_slice())
+        .expect("lane process for wt/a/work");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(lane as i32),
+        nix::sys::signal::SIGKILL,
+    )
+    .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("JSON {error}: {}", String::from_utf8_lossy(&output.stderr))
+    });
+    assert_exit(&output, &report, 1);
+    let branches = report["queue"]["branches"].as_array().unwrap();
+    assert_eq!(branches.len(), 3);
+    assert_eq!(branches[0]["branch"], "wt/a/work");
+    assert_eq!(branches[0]["status"], "gate_failed");
+    assert_eq!(branches[0]["landedSha"], Value::Null);
+    let a_attempts = branches[0]["verifications"].as_array().unwrap();
+    assert_eq!(a_attempts.len(), 1);
+    assert_eq!(a_attempts[0]["status"], "failed");
+    let why = a_attempts[0]["reason"].as_str().unwrap();
+    assert!(why.starts_with("lane died: killed by signal"), "{why}");
+    assert!(
+        branches[0]["why"].as_str().unwrap().contains("lane died"),
+        "{}",
+        branches[0]["why"]
+    );
+    assert_eq!(branches[1]["status"], "landed");
+    assert_eq!(branches[2]["status"], "landed");
+    assert!(git(&repo.root, &["for-each-ref", "refs/remuda/merge/"]).is_empty());
+    repo.assert_cleaned();
+}
+
+#[test]
+fn queue_watchdog_kills_a_hung_lane_and_the_queue_completes() {
+    let repo = QueueRepo::new();
+    commit_file(&repo.work_a, "queue-hang.txt", "the gate never returns\n");
+    let output = {
+        let mut command = repo.command();
+        command
+            .args([
+                "merge",
+                "--queue",
+                "wt/a/work",
+                "--gate",
+                "--no-push",
+                "--json",
+                "--lanes",
+                "1",
+            ])
+            // Three seconds of an unreported lane means it is wedged; the
+            // watchdog must reap it instead of parking forever.
+            .env("REMUDA_QUEUE_WATCHDOG_SECS", "3")
+            .env("REMUDA_QUEUE_REAP_GRACE_MS", "1000");
+        command.output().unwrap()
+    };
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_exit(&output, &report, 1);
+    let branches = report["queue"]["branches"].as_array().unwrap();
+    assert_eq!(branches[0]["status"], "gate_failed");
+    assert_eq!(branches[0]["landedSha"], Value::Null);
+    assert!(
+        branches[0]["why"].as_str().unwrap().contains("lane died"),
+        "{}",
+        branches[0]["why"]
+    );
+    // The sleeping gate subprocess (its own process group) must not outlive
+    // the queue: no remuda merge process for this temp repo remains.
+    assert_eq!(repo.main(), repo.base, "a hung gate never lands");
+    repo.assert_cleaned();
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_merge_exits_three_and_wait_runs_after_the_lock_frees() {
+    use std::os::unix::process::CommandExt;
+    let repo = QueueRepo::new();
+    commit_file(
+        &repo.work_a,
+        "queue-hang.txt",
+        "first run holds the locks\n",
+    );
+    commit_file(&repo.work_b, "docs/b.md", "branch b\n");
+
+    // First run: hangs in the gate while holding the repository lock.
+    let mut first = repo
+        .command()
+        .args(["merge", "wt/a/work", "--gate", "--no-push", "--json"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_trace(&repo.trace, |event| event["step"] == "cargo-test");
+
+    // A second run without --wait exits 3 and names the holder.
+    let contended = repo
+        .command()
+        .args(["merge", "wt/b/work", "--gate", "--no-push", "--json"])
+        .output()
+        .unwrap();
+    let contended_report: Value = serde_json::from_slice(&contended.stdout).unwrap();
+    assert_exit(&contended, &contended_report, 3);
+    assert_eq!(contended_report["status"], "locked");
+    let message = contended_report["error"].as_str().unwrap();
+    assert!(
+        message.starts_with("another remuda merge is running on this repo (pid "),
+        "{message}"
+    );
+    assert!(message.contains("since "), "{message}");
+
+    // --wait blocks, then proceeds after the holder is gone. b is docs-only,
+    // so its gate passes and it lands.
+    let waiter = repo
+        .command()
+        .args([
+            "merge",
+            "wt/b/work",
+            "--gate",
+            "--wait",
+            "--no-push",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Give the waiter time to block on the lock.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Releasing the holder (and its hung gate subtree) unblocks the waiter.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-(first.id() as i32)),
+        nix::sys::signal::SIGKILL,
+    )
+    .unwrap();
+    let _ = first.wait();
+
+    let landed = waiter.wait_with_output().unwrap();
+    let landed_report: Value = serde_json::from_slice(&landed.stdout).unwrap_or_else(|error| {
+        panic!("JSON {error}: {}", String::from_utf8_lossy(&landed.stderr))
+    });
+    assert_exit(&landed, &landed_report, 0);
+    assert_eq!(landed_report["status"], "ok");
 }

@@ -135,6 +135,9 @@ pub struct CreateInstanceRequest {
     /// already holds a level + `ultracode` flag by the time argv is built.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<remuda_protocol::EffortSelection>,
+    /// Requested renderer; absent on older requests means fullscreen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui: Option<remuda_protocol::TuiMode>,
 }
 
 impl CreateInstanceRequest {
@@ -211,6 +214,11 @@ impl CreateInstanceRequest {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .and_then(|value| InstanceId::try_from(value.to_owned()).ok());
+        }
+        if self.tui.is_none() {
+            self.tui = spec
+                .get("tui")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
         }
         if self.effort.is_none() {
             // Accepts both the D-028 object and the legacy `effortName`

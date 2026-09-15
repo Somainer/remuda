@@ -225,7 +225,7 @@ test.describe("responsive settings", () => {
       }));
       expect(dims.scroll).toBeLessThanOrEqual(dims.client);
       // Every anchored group is reachable at every width.
-      for (const id of ["appearance", "notifications", "connection"] as const) {
+      for (const id of ["appearance", "notifications", "connection", "host-defaults"] as const) {
         await page.getByTestId(`settings-nav-${id}`).click();
         await expect(page.getByTestId(`settings-group-${id}`)).toBeVisible();
       }
@@ -267,7 +267,7 @@ test.describe("responsive settings", () => {
       await page.evaluate((value) => {
         document.documentElement.dataset.theme = value;
       }, theme);
-      for (const id of ["appearance", "notifications", "connection"] as const) {
+      for (const id of ["appearance", "notifications", "connection", "host-defaults"] as const) {
         await expect(page.getByTestId(`settings-group-${id}`)).toBeVisible();
       }
       // Text stays on-theme: the ground and the ink are distinct in both.
@@ -285,7 +285,7 @@ test.describe("44px touch targets", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/settings");
     await expectMinTarget(page.getByTestId("settings-back"), "back");
-    for (const id of ["appearance", "notifications", "connection"] as const) {
+    for (const id of ["appearance", "notifications", "connection", "host-defaults"] as const) {
       await expectMinTarget(page.getByTestId(`settings-nav-${id}`), `nav-${id}`);
     }
     await expectMinTarget(page.getByTestId("settings-perm-manual"), "perm chip");

@@ -561,3 +561,45 @@ describe("特殊参数 and claude 可执行文件", () => {
     expect(screen.getByTestId("new-session-binary")).toHaveAttribute("placeholder", "/srv/claude");
   });
 });
+
+
+describe("Claude terminal renderer", () => {
+  it("offers both renderers with the in-session switch helper and submits the selection", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    const control = screen.getByTestId("new-session-tui");
+    expect(control).toHaveValue("fullscreen");
+    expect(screen.getByRole("option", { name: "全屏渲染（推荐）" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "行内渲染" })).toBeInTheDocument();
+    expect(control).toHaveAccessibleDescription("启动时使用此渲染方式，会话内可用 /tui 切换");
+    fireEvent.change(control, { target: { value: "default" } });
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ tui: "default" })));
+  });
+
+  it("shows the host default without converting it into a session override", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    vi.mocked(store.useHub).mockReturnValue({
+      ...store.hubStore.getSnapshot(), hosts: [{ ...host, defaultTui: "default" }], workspaces: [workspace], instances: [],
+    });
+    render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    expect(screen.getByTestId("new-session-tui")).toHaveValue("default");
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].tui).toBeUndefined();
+  });
+
+  it("does not show or submit a Claude renderer for other harnesses", async () => {
+    const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+    renderWithCli();
+    fireEvent.click(screen.getByTestId("new-session-advanced"));
+    fireEvent.change(screen.getByTestId("new-session-tui"), { target: { value: "default" } });
+    fireEvent.click(screen.getByTestId("new-session-kind-codex"));
+    expect(screen.queryByTestId("new-session-tui")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("new-session-start"));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].tui).toBeUndefined();
+  });
+});

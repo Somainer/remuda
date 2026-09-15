@@ -52,6 +52,8 @@ pub const METHOD_INTERACTION_RESPOND: &str = "interaction.respond";
 pub const METHOD_JOURNAL_APPEND: &str = "journal.append";
 /// TTY JSON control frame; binary envelopes use [`TTY_BINARY_HEADER_LEN`].
 pub const METHOD_TTY_FRAME: &str = "tty.frame";
+/// Observed renderer screen state for an authenticated TTY stream.
+pub const METHOD_TTY_MODE: &str = "tty.mode";
 /// Write logical keys to an instance PTY (Hub `POST .../commands` `tty.write`).
 pub const METHOD_TTY_WRITE: &str = "tty.write";
 /// Alias accepted for [`METHOD_TTY_WRITE`].
@@ -152,6 +154,8 @@ pub enum HubNodeMethod {
     JournalAppend,
     /// [`METHOD_TTY_FRAME`].
     TtyFrame,
+    /// [`METHOD_TTY_MODE`].
+    TtyMode,
     /// [`METHOD_TTY_WRITE`].
     TtyWrite,
     /// [`METHOD_INSTANCE_KEYS`].
@@ -400,6 +404,12 @@ pub struct AttachmentRef {
     /// Stored byte length, for local budget checks before the pull.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// 1-based anchor number, matching the `[Image #n]` token in the prompt
+    /// text and the composer chip (2026-09-15). The array is ordered by token
+    /// appearance; older clients omit this and the receiver falls back to the
+    /// array position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
 }
 
 /// `instance.send` params.
@@ -606,6 +616,18 @@ pub struct TtyFrameParams {
     pub data_base64: Option<String>,
 }
 
+/// Observed alternate-screen mode for a bound stream; Node → Hub only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtyModeParams {
+    /// Instance whose renderer produced the observation.
+    pub instance_id: String,
+    /// Authenticated, previously registered stream identity (`tty_…`).
+    pub stream_id: String,
+    /// Actual renderer screen state, never inferred from launch preference.
+    pub alt_screen: bool,
+}
+
 /// Fixed binary envelope for WS/stdio `tty.frame` (not JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -667,6 +689,7 @@ impl HubNodeMethod {
             Self::InteractionRespond => METHOD_INTERACTION_RESPOND,
             Self::JournalAppend => METHOD_JOURNAL_APPEND,
             Self::TtyFrame => METHOD_TTY_FRAME,
+            Self::TtyMode => METHOD_TTY_MODE,
             Self::TtyWrite => METHOD_TTY_WRITE,
             Self::InstanceKeys => METHOD_INSTANCE_KEYS,
             Self::TtyResize => METHOD_TTY_RESIZE,
@@ -695,6 +718,7 @@ impl HubNodeMethod {
             METHOD_INTERACTION_RESPOND => Self::InteractionRespond,
             METHOD_JOURNAL_APPEND => Self::JournalAppend,
             METHOD_TTY_FRAME => Self::TtyFrame,
+            METHOD_TTY_MODE => Self::TtyMode,
             METHOD_TTY_WRITE => Self::TtyWrite,
             METHOD_INSTANCE_KEYS => Self::InstanceKeys,
             METHOD_TTY_RESIZE => Self::TtyResize,

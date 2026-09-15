@@ -8,6 +8,8 @@
  * an image and so never links an image library.
  */
 
+import { IMAGE_ANCHOR_RE } from "./imageAnchors";
+
 /** Media types the Hub will accept. Anything else must be converted first. */
 export const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
 
@@ -166,16 +168,53 @@ export function releaseAttachment(attachment: Attachment): void {
 }
 
 /** Metadata put on the send command. Bytes never travel with it. */
-export type AttachmentRef = { objectId: string; mediaType: string; name: string; size: number };
+export type AttachmentRef = {
+  /**
+   * 1-based anchor number, equal to the chip's position and the `[Image #n]`
+   * token the model sees in the prompt. The array itself is ordered by the
+   * tokens' first appearance (see {@link refsOf}); this number is what lets
+   * the model resolve a token even when an unreferenced attachment follows.
+   */
+  index: number;
+  objectId: string;
+  mediaType: string;
+  name: string;
+  size: number;
+};
 
-/** The staged references for a set of chips, in chip order. */
-export function refsOf(attachments: Attachment[]): AttachmentRef[] {
-  return attachments
-    .filter((attachment) => attachment.state === "ready" && attachment.objectId)
-    .map((attachment) => ({
+/**
+ * The staged references for a set of chips.
+ *
+ * Without `tokenText`, refs come out in chip order. With it, attachments that
+ * still have an `[Image #n]` token are ordered by that token's first
+ * appearance, so the manifest the agent resolves reads in the same order as
+ * the prompt; attachments whose token was edited away ("未引用" — they are
+ * still sent) follow in chip order.
+ */
+export function refsOf(attachments: Attachment[], tokenText?: string): AttachmentRef[] {
+  const ready = attachments
+    .map((attachment, position) => ({ attachment, index: position + 1 }))
+    .filter(
+      (entry): entry is { attachment: Attachment; index: number } =>
+        entry.attachment.state === "ready" && Boolean(entry.attachment.objectId),
+    )
+    .map(({ attachment, index }) => ({
+      index,
       objectId: attachment.objectId as string,
       mediaType: attachment.mediaType,
       name: attachment.name,
       size: attachment.size,
     }));
+  if (tokenText === undefined) return ready;
+  const firstAt = new Map<number, number>();
+  tokenText.replace(IMAGE_ANCHOR_RE, (match, digits: string, offset: number) => {
+    const index = Number(digits);
+    if (!firstAt.has(index)) firstAt.set(index, offset);
+    return match;
+  });
+  const referenced = ready
+    .filter((ref) => firstAt.has(ref.index))
+    .sort((a, b) => (firstAt.get(a.index) as number) - (firstAt.get(b.index) as number));
+  const dangling = ready.filter((ref) => !firstAt.has(ref.index));
+  return [...referenced, ...dangling];
 }

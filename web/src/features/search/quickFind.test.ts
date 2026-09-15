@@ -3,7 +3,7 @@ import { mockDb } from "../../lib/mock";
 import { known } from "../../types/wire";
 import type { Instance } from "../../types/instance";
 import { spaceKey, type Space } from "../spaces/store";
-import { rankQuickFind, type QuickFindInput, type QuickFindSpace } from "./quickFind";
+import { rankQuickFind, type QuickFindInput, type QuickFindSpace } from "./quickFindSearch";
 
 /**
  * Fixture notes:

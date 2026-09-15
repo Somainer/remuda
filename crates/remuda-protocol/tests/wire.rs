@@ -563,3 +563,20 @@ mod d028 {
         );
     }
 }
+
+#[test]
+fn renderer_launch_preference_preserves_omission_and_both_modes() {
+    let mut value = fixture("instance-spec.json");
+    let omitted = round_trip::<InstanceSpec>(value.clone());
+    assert_eq!(omitted.tui, None);
+    assert_eq!(omitted.tui.unwrap_or_default(), TuiMode::Fullscreen);
+    for (wire, mode) in [
+        ("fullscreen", TuiMode::Fullscreen),
+        ("default", TuiMode::Default),
+    ] {
+        value["tui"] = json!(wire);
+        assert_eq!(round_trip::<InstanceSpec>(value.clone()).tui, Some(mode));
+    }
+    value["tui"] = json!("auto");
+    assert!(serde_json::from_value::<InstanceSpec>(value).is_err());
+}

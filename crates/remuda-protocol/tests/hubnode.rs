@@ -161,3 +161,29 @@ fn workspace_methods_require_explicit_mutation_phase() {
     assert_eq!(result.workspace_revision, 2);
     assert_eq!(result.phase.as_deref(), Some("settled"));
 }
+
+#[test]
+fn renderer_mode_requires_observed_boolean_and_both_stream_identities() {
+    use remuda_protocol::hubnode::{METHOD_TTY_MODE, TtyModeParams};
+    use serde_json::json;
+
+    assert_eq!(
+        HubNodeMethod::parse(METHOD_TTY_MODE),
+        Some(HubNodeMethod::TtyMode)
+    );
+    assert_eq!(HubNodeMethod::TtyMode.as_str(), "tty.mode");
+    assert!(!HubNodeMethod::TtyMode.is_instance());
+    let mut value = json!({
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "streamId": "tty_01993ab0-0000-7000-8000-000000000007",
+        "altScreen": false,
+    });
+    let mode: TtyModeParams = serde_json::from_value(value.clone()).unwrap();
+    assert!(!mode.alt_screen);
+    assert_eq!(serde_json::to_value(mode).unwrap(), value);
+    value["altScreen"] = Value::Null;
+    assert!(serde_json::from_value::<TtyModeParams>(value.clone()).is_err());
+    value["altScreen"] = json!(true);
+    value.as_object_mut().unwrap().remove("streamId");
+    assert!(serde_json::from_value::<TtyModeParams>(value).is_err());
+}

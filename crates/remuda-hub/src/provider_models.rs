@@ -1,7 +1,14 @@
 //! Structured provider model catalog: the stored list, the legacy string
 //! migration, and the gateway `/v1/models` normalizer shared by `/test` and
 //! `/discover`. Nothing here ever touches an auth token.
+//!
+//! The trailing supply fields are additive coordinator-batch-3 metadata
+//! (design §4.2): per-model declared family/role/priority/concurrency,
+//! fallback chain, model-scoped windows, and the `workhorse` shortcut. They
+//! are all optional/defaulted so legacy catalogs and `/discover` payloads
+//! keep parsing unchanged.
 
+use remuda_protocol::RateLimitWindow;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -17,7 +24,7 @@ pub const SURFACE_OPENAI: &str = "openai";
 ///
 /// `enabled` is what New Session may offer; a discovered-but-unchecked model
 /// stays in the list so the operator sees it without exposing it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
     /// Wire id passed through to the gateway verbatim.
@@ -37,9 +44,33 @@ pub struct ProviderModel {
     /// Which gateway listings reported this id (`anthropic`, `openai`).
     ///
     /// A gateway may serve a different catalog per header, so the probe unions
-    /// both and records where each id came from. Empty for a manually typed id.
+    /// both and records where each id came from. Empty for a manual entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<String>,
+
+    // ── declared supply (coordinator §4.2; all optional) ──
+    /// Rate-limit bucket family; overrides catalog inference when declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Capability role (`frontier` | `workhorse` | `cheap`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Model-level preference order; falls back to profile supply priority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    /// Model-level simultaneous in-flight ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_max: Option<i64>,
+    /// Ordered fallback candidate ids (not an automatic retry; §4.4 ⑥).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
+    /// Model-scoped declared/observed rate-limit windows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<RateLimitWindow>,
+    /// Shortcut declaration: this is the project's workhorse. The minimal
+    /// declaration shape is `{id, workhorse: true}`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workhorse: bool,
 }
 
 fn enabled_default() -> bool {
@@ -56,6 +87,13 @@ impl ProviderModel {
             context_window: None,
             tags: Vec::new(),
             surfaces: Vec::new(),
+            family: None,
+            role: None,
+            priority: None,
+            concurrency_max: None,
+            fallback: Vec::new(),
+            windows: Vec::new(),
+            workhorse: false,
         }
     }
 
@@ -68,7 +106,41 @@ impl ProviderModel {
             "contextWindow": self.context_window,
             "tags": self.tags,
             "surfaces": self.surfaces,
+            "family": self.family,
+            "role": self.role,
+            "priority": self.priority,
+            "concurrencyMax": self.concurrency_max,
+            "fallback": self.fallback,
+            "windows": self.windows,
+            "workhorse": self.workhorse,
         })
+    }
+}
+
+/// Merge declared supply metadata from `incoming` into `existing`, keeping
+/// existing values for fields the incoming row omits. Discovery frames never
+/// carry supply fields, so this is what protects a declaration across reprobe.
+fn merge_supply_fields(existing: &mut ProviderModel, incoming: &ProviderModel) {
+    if incoming.family.is_some() {
+        existing.family = incoming.family.clone();
+    }
+    if incoming.role.is_some() {
+        existing.role = incoming.role.clone();
+    }
+    if incoming.priority.is_some() {
+        existing.priority = incoming.priority;
+    }
+    if incoming.concurrency_max.is_some() {
+        existing.concurrency_max = incoming.concurrency_max;
+    }
+    if !incoming.fallback.is_empty() {
+        existing.fallback = incoming.fallback.clone();
+    }
+    if !incoming.windows.is_empty() {
+        existing.windows = incoming.windows.clone();
+    }
+    if incoming.workhorse {
+        existing.workhorse = true;
     }
 }
 
@@ -89,6 +161,9 @@ pub fn union_catalogs(
         }
         match out.iter_mut().find(|existing| existing.id == model.id) {
             Some(existing) => {
+                // Merge declared supply fields first (borrows `model`); the
+                // lines below move its other fields.
+                merge_supply_fields(existing, &model);
                 // Both listings saw it: record the surface, keep any metadata
                 // the first listing lacked.
                 for surface in model.surfaces {
@@ -102,9 +177,9 @@ pub fn union_catalogs(
                 if existing.context_window.is_none() {
                     existing.context_window = model.context_window;
                 }
-                for tag in model.tags {
-                    if !existing.tags.contains(&tag) {
-                        existing.tags.push(tag);
+                for tag in &model.tags {
+                    if !existing.tags.contains(tag) {
+                        existing.tags.push(tag.clone());
                     }
                 }
             }
@@ -164,6 +239,28 @@ pub fn from_value(value: &Value) -> Vec<ProviderModel> {
                     context_window: context_window(item),
                     tags: tags(item),
                     surfaces: string_list(item, "surfaces"),
+                    family: string_field(item, &["family"]),
+                    role: string_field(item, &["role", "class"]),
+                    priority: item.get("priority").and_then(Value::as_i64),
+                    concurrency_max: item
+                        .get("concurrencyMax")
+                        .or_else(|| item.get("concurrency_max"))
+                        .and_then(Value::as_i64),
+                    fallback: string_list(item, "fallback"),
+                    windows: item
+                        .get("windows")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            serde_json::from_value::<Vec<RateLimitWindow>>(Value::Array(
+                                arr.clone(),
+                            ))
+                            .unwrap_or_default()
+                        })
+                        .unwrap_or_default(),
+                    workhorse: item
+                        .get("workhorse")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 }
             }
             _ => continue,
@@ -234,7 +331,7 @@ fn context_window(item: &Value) -> Option<u64> {
 }
 
 fn tags(item: &Value) -> Vec<String> {
-    let mut out: Vec<String> = string_list(item, "tags");
+    let mut out = string_list(item, "tags");
     if context_window(item).is_some_and(|n| n >= LONG_CONTEXT_TOKENS)
         && !out.iter().any(|tag| tag == "1m")
     {
@@ -245,7 +342,7 @@ fn tags(item: &Value) -> Vec<String> {
 
 /// Deduplicated non-empty strings from an array field.
 fn string_list(item: &Value, key: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     if let Some(list) = item.get(key).and_then(Value::as_array) {
         for entry in list.iter().filter_map(Value::as_str) {
             let entry = entry.trim();
@@ -417,5 +514,35 @@ mod tests {
                 .surfaces
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn declared_supply_fields_round_trip_and_survive_reprobe() {
+        let declared = parse_models_json(
+            r#"[{"id":"gw/es1[1m]","family":"es1","role":"workhorse","priority":20,
+                 "concurrencyMax":4,"fallback":["gw/seed[1m]"],"workhorse":true,
+                 "windows":[{"id":"model","appliesTo":["es1"],"windowDurationMins":300,
+                             "source":"declared"}]}]"#,
+        );
+        assert_eq!(declared.len(), 1);
+        let m = &declared[0];
+        assert_eq!(m.family.as_deref(), Some("es1"));
+        assert_eq!(m.role.as_deref(), Some("workhorse"));
+        assert_eq!(m.priority, Some(20));
+        assert_eq!(m.concurrency_max, Some(4));
+        assert_eq!(m.fallback, vec!["gw/seed[1m]".to_string()]);
+        assert!(m.workhorse);
+        assert_eq!(m.windows.len(), 1);
+        // A fresh gateway discovery lists the same id without supply fields;
+        // the union keeps the declaration.
+        let rediscovered = tag_surface(
+            normalize_catalog(r#"{"data":[{"id":"gw/es1[1m]"}]}"#),
+            SURFACE_OPENAI,
+        );
+        let merged = union_catalogs(declared, rediscovered);
+        assert_eq!(merged[0].family.as_deref(), Some("es1"));
+        assert_eq!(merged[0].fallback, vec!["gw/seed[1m]".to_string()]);
+        assert!(merged[0].workhorse);
+        assert_eq!(merged[0].surfaces, vec!["openai"]);
     }
 }

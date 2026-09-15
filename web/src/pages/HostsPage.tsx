@@ -250,12 +250,14 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
           <HostLaunchDefaults
             args={host.defaultLaunchArgs}
             binaryPath={host.claudeBinaryPath}
+            tui={host.defaultTui}
             probedBinaryPath={host.cli?.find((entry) => entry.kind === "claude")?.path ?? undefined}
             onSave={(patch) => {
               setLaunchError(null);
               hostRegistry.patch(host.id, {
                 defaultLaunchArgs: patch.defaultLaunchArgs ?? undefined,
                 claudeBinaryPath: patch.claudeBinaryPath ?? undefined,
+                ...(patch.defaultTui !== undefined ? { defaultTui: patch.defaultTui ?? undefined } : {}),
               });
               void api.hostPatch(host.id, patch).catch((error: unknown) => {
                 setLaunchError(error instanceof Error ? error.message : "保存失败");

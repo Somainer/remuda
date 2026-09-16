@@ -147,8 +147,9 @@ pub async fn run(args: SshArgs) -> Result<()> {
             }
             argv.push("--display-label".into());
             argv.push(display.clone());
-            argv.push("--transport".into());
-            argv.push("ssh-stdio".into());
+            // `remuda node --stdio` fixes its transport to `ssh-stdio` itself
+            // (cmd/node/daemon.rs); the old `--transport` flag no longer parses
+            // and made the remote exit before `node.hello`.
             if let Some(dir) = node_data_dir {
                 argv.push("--data-dir".into());
                 argv.push(dir);

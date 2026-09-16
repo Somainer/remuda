@@ -52,7 +52,16 @@ fn conversation(
 ) -> Vec<remuda_protocol::Observation> {
     observations
         .iter()
-        .filter(|observation| !matches!(observation.body, ObservationPayload::Lifecycle(_)))
+        // Configuration edges (effort/model) and lifecycle records are
+        // orthogonal to the conversation-block hydration these tests assert.
+        .filter(|observation| {
+            !matches!(
+                observation.body,
+                ObservationPayload::Lifecycle(_)
+                    | ObservationPayload::Effort(_)
+                    | ObservationPayload::Model(_)
+            )
+        })
         .cloned()
         .collect()
 }

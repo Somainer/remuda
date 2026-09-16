@@ -26,7 +26,8 @@ use remuda_protocol::{
     AgentKind, ClaudeRef, Completeness, ContentBlock, Digest, DriverInput, DriverKind,
     EffortSelection, EventId, HerdrRef, HerdrRepresentation, HerdrServer as HerdrPin, HostId, Id,
     InstanceId, InstanceSpec, InteractionAnswer, InteractionId, Knowledge, LifecyclePayload,
-    LifecycleTopic, NativeLifecycle, NativeRef, NativeRequestKey, NativeTerminalFrame, Observation,
+    LifecycleTopic, ModelCatalogInfo, NativeLifecycle, NativeRef, NativeRequestKey,
+    NativeTerminalFrame, Observation,
     ObservationPayload, ObservationSource, PtyBackend, PtyCarrier, RawRef, Redaction, RunId,
     SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, Timestamp, TranscriptRef,
     TtyOutput, TtyRepresentation, U64,
@@ -169,6 +170,11 @@ struct PtyLive {
     effort_bridge: Arc<crate::effort::EffortBridge>,
     effort_queue: Arc<crate::effort::EffortQueue>,
     effort_worker: Option<JoinHandle<()>>,
+    /// §9.1 in-session `/model` switch coordination.
+    #[allow(dead_code)]
+    model_bridge: Arc<crate::model::ModelBridge>,
+    model_queue: Arc<crate::model::ModelQueue>,
+    model_worker: Option<JoinHandle<()>>,
     status_task: Option<JoinHandle<()>>,
     interactions: Arc<PtyInteractions>,
     interaction_task: JoinHandle<()>,
@@ -320,6 +326,28 @@ impl ClaudePtyDriver {
         if let Some(context) = &self.options.agent_mcp {
             env.extend(context.environment()?);
         }
+
+        // §9.1 model list: discover the gateway cache / settings the launched
+        // session can actually switch to, before the pane exists. The scoped
+        // config dir is checked first; the operator's ~/.claude cache backs it
+        // up when discovery has not populated the scoped dir yet.
+        let host_config_dir = crate::claude_onboarding::HostClaudeConfig::from_env()
+            .and_then(|host| {
+                host.user_settings
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+            });
+        let env_pairs: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let model_catalog = crate::model_discovery::resolve_catalog(
+            Some(std::path::Path::new(&recipe.native_home)),
+            host_config_dir.as_deref(),
+            Some(&std::path::Path::new(&recipe.native_home).join("settings.json")),
+            &env_pairs,
+            spec.model_id.as_deref(),
+        );
 
         let created = self
             .resources
@@ -488,6 +516,13 @@ impl ClaudePtyDriver {
             });
         }
         let effort_queue = Arc::new(crate::effort::EffortQueue::new());
+        // §9.1: /model switches share the pane I/O and transcript pump but
+        // keep their own bridge/queue, resolved from the `/model` verdict.
+        let model_bridge = Arc::new(crate::model::ModelBridge::new());
+        if let Some(model) = spec.model_id.clone() {
+            model_bridge.note_launch_request(model);
+        }
+        let model_queue = Arc::new(crate::model::ModelQueue::new());
         // The TUI's tool calls exist only in the native transcript; follow it as
         // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
         let transcript_task = spawn_transcript_pump(
@@ -497,6 +532,11 @@ impl ClaudePtyDriver {
             Arc::clone(&self.seq),
             Some(Arc::clone(&effort_bridge)),
             spec.effort,
+            Some(TranscriptModelSync {
+                bridge: Arc::clone(&model_bridge),
+                launch: spec.model_id.clone(),
+                catalog: Some(model_catalog.clone()),
+            }),
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -509,6 +549,21 @@ impl ClaudePtyDriver {
             Arc::clone(&effort_bridge),
             Arc::clone(&effort_queue),
             effort_io,
+        );
+        // §9.1: /model switches use the same pane I/O, queue and transcript
+        // pump, with their own bridge the mapper resolves from the command
+        // verdict.
+        let model_io: Arc<dyn crate::model::SwitchIo> = Arc::new(HerdrEffortIo {
+            client: client.clone(),
+            pane_id: pane_id.clone(),
+            events: tx.clone(),
+            seq: Arc::clone(&self.seq),
+            ctx: ctx.clone(),
+        });
+        let model_worker = crate::model::spawn_model_worker(
+            Arc::clone(&model_bridge),
+            Arc::clone(&model_queue),
+            model_io,
         );
 
         *self.inner.lock().await = Some(PtyLive {
@@ -529,6 +584,9 @@ impl ClaudePtyDriver {
             effort_bridge,
             effort_queue,
             effort_worker: Some(effort_worker),
+            model_bridge,
+            model_queue,
+            model_worker: Some(model_worker),
             status_task: Some(status_task),
             interactions,
             interaction_task,
@@ -607,6 +665,65 @@ impl ClaudePtyDriver {
             // the worker types it at the next idle and journals the result.
             io.journal(
                 crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
+                Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+
+        let mut ack = DriverAck::transport_written();
+        ack.native_ids
+            .insert("sessionId".into(), session_id.clone());
+        ack.native_ids.insert("paneId".into(), pane_id);
+        Ok(ack)
+    }
+
+    /// §9.1: type `/model <id>` and let the transcript verdict prove it.
+    async fn switch_model(&self, model_id: &str) -> DriverResult<DriverAck> {
+        let Some(request) = crate::model::ModelRequest::new(model_id) else {
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "claude /model requires a non-empty id; got {model_id:?}"
+            )));
+        };
+        let (pane_id, session_id, queue, ready, io) = {
+            let inner = self.inner.lock().await;
+            let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+            if live.closed {
+                return Err(DriverError::ControlUnavailable);
+            }
+            require_session_start(live)?;
+            let ready = crate::pty_interaction::prompt_ready(&live.client, &live.pane_id)
+                .await
+                .is_ok();
+            let io = HerdrEffortIo {
+                client: live.client.clone(),
+                pane_id: live.pane_id.clone(),
+                events: live.events.clone(),
+                seq: Arc::clone(&self.seq),
+                ctx: live.ctx.clone(),
+            };
+            (
+                live.pane_id.clone(),
+                live.session_id.clone(),
+                Arc::clone(&live.model_queue),
+                ready,
+                Arc::new(io) as Arc<dyn crate::model::SwitchIo>,
+            )
+        };
+
+        if ready {
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait =
+                std::time::Duration::from_millis(crate::model::MODEL_READBACK_TIMEOUT_MS + 5_000);
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // Bounded window elapsed without a terminal outcome; never
+                // claim applied from this command.
+            }
+        } else {
+            io.journal(
+                crate::model::ModelSwitchOutcome::Queued
+                    .journal_status(&request.id, ""),
                 Severity::Info,
             )
             .await;
@@ -724,8 +841,18 @@ impl Driver for ClaudePtyDriver {
         if let DriverInput::ModelSwitch(switch) = &input
             && let Some(level) = switch.effort.as_deref()
             && !level.is_empty()
+            && switch.model_id.is_empty()
         {
             return self.switch_effort(level).await;
+        }
+        // §9.1: a model switch is `/model <id>` typed into the composer and
+        // proven by the transcript verdict. (A combined model+effort configure
+        // applies the model here; the structured composer sends them as
+        // separate commands.)
+        if let DriverInput::ModelSwitch(switch) = &input
+            && !switch.model_id.is_empty()
+        {
+            return self.switch_model(&switch.model_id).await;
         }
         let text = prompt_text(&input)?;
         let inner = self.inner.lock().await;
@@ -820,6 +947,10 @@ impl Driver for ClaudePtyDriver {
         live.interaction_task.abort();
         live.effort_queue.close();
         if let Some(task) = live.effort_worker.take() {
+            task.abort();
+        }
+        live.model_queue.close();
+        if let Some(task) = live.model_worker.take() {
             task.abort();
         }
         if let Some(task) = live.status_task.take() {
@@ -1022,6 +1153,15 @@ const TRANSCRIPT_POLL: Duration = Duration::from_millis(75);
 /// only ever exist in `~/.claude/projects/<encoded cwd>/<session>.jsonl`. The
 /// SessionStart hook names that file; without this pump the 结构 view sees the
 /// prompt the Node queued and nothing the agent actually did.
+/// §9.1 model-sync inputs for the transcript hydrator, mirroring the effort
+/// bridge pair.
+#[derive(Clone)]
+struct TranscriptModelSync {
+    bridge: Arc<crate::model::ModelBridge>,
+    launch: Option<String>,
+    catalog: Option<ModelCatalogInfo>,
+}
+
 fn spawn_transcript_pump(
     transcript_slot: Arc<std::sync::Mutex<Option<String>>>,
     tx: mpsc::Sender<Observation>,
@@ -1029,10 +1169,14 @@ fn spawn_transcript_pump(
     seq: Arc<AtomicU64>,
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
+    model: Option<TranscriptModelSync>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
             None;
+        // The launch model snapshot (carrying the discovered catalog) is
+        // emitted once when the pump first binds the transcript.
+        let mut launch_snapshot = model.as_ref().and_then(|m| m.launch.clone());
         while !tx.is_closed() {
             if hydrator.is_none() {
                 let path = transcript_slot
@@ -1055,6 +1199,43 @@ fn spawn_transcript_pump(
                     );
                     if let Some(bridge) = &effort_bridge {
                         mapper = mapper.with_effort_bridge(Arc::clone(bridge), launch_effort);
+                    }
+                    if let Some(model) = &model {
+                        mapper = mapper.with_model_bridge(
+                            Arc::clone(&model.bridge),
+                            launch_snapshot.clone(),
+                            model.catalog.clone(),
+                        );
+                    }
+                    // Emit the launch-time model baseline with the discovered
+                    // catalog before any transcript line is mapped, so the
+                    // picker has its real list immediately.
+                    if model.is_some()
+                        && let Some(id) = launch_snapshot.take()
+                        && !id.is_empty()
+                    {
+                        match mapper.take_launch_model_snapshot(Some(&id)) {
+                            Ok(observations) => {
+                                for observation in observations {
+                                    if emit_obs(
+                                        &tx,
+                                        &seq,
+                                        &ctx,
+                                        SourceChannel::Transcript,
+                                        observation.completeness,
+                                        observation.body,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "launch model snapshot not emitted");
+                            }
+                        }
                     }
                     hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
                 }

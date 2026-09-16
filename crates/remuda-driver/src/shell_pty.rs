@@ -2950,9 +2950,11 @@ mod tests {
         let build = |hooks_on: bool| {
             // Fresh instance dir per variant, like production: a hooks-off
             // launch must never read a previous launch's settings.json.
-            let inst = dir
-                .path()
-                .join(if hooks_on { "instance-hooks" } else { "instance-plain" });
+            let inst = dir.path().join(if hooks_on {
+                "instance-hooks"
+            } else {
+                "instance-plain"
+            });
             let mut options = ShellPtyOptions::agent(
                 dir.path().to_path_buf(),
                 AgentKind::Claude,
@@ -3009,8 +3011,7 @@ mod tests {
             let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
             // Gateway model config reaches the child exactly like a terminal.
             assert_eq!(
-                merged["env"]["ANTHROPIC_BASE_URL"],
-                "https://gateway.example.invalid",
+                merged["env"]["ANTHROPIC_BASE_URL"], "https://gateway.example.invalid",
                 "hooks={hooks_on}"
             );
             assert_eq!(
@@ -3063,7 +3064,11 @@ mod tests {
             {
                 use std::os::unix::fs::PermissionsExt;
                 assert_eq!(
-                    std::fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777,
+                    std::fs::metadata(&settings_path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
                     0o600,
                     "credentials stay in a 0600 instance file"
                 );
@@ -3133,7 +3138,6 @@ mod tests {
             recipe.argv
         );
     }
-
 
     /// it has to work on a live PTY and be honest when there is nothing to
     /// read. A driver that has not started must not answer with an empty grid,

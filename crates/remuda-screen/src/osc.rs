@@ -262,7 +262,10 @@ mod tests {
             Some(ProgressBar::Percent(Some(50)))
         );
         assert_eq!(ProgressBar::parse("1;"), Some(ProgressBar::Percent(None)));
-        assert_eq!(ProgressBar::parse("1;200"), Some(ProgressBar::Percent(Some(100))));
+        assert_eq!(
+            ProgressBar::parse("1;200"),
+            Some(ProgressBar::Percent(Some(100)))
+        );
         assert_eq!(ProgressBar::parse("2;0"), Some(ProgressBar::Error));
         assert_eq!(ProgressBar::parse("4;10"), Some(ProgressBar::Paused));
         assert_eq!(ProgressBar::parse("0"), Some(ProgressBar::Done));
@@ -278,10 +281,7 @@ mod tests {
     #[test]
     fn progress_state_spellings_and_percents_are_stable() {
         assert_eq!(ProgressBar::Done.state_str(), "done");
-        assert_eq!(
-            ProgressBar::Percent(Some(42)).state_str(),
-            "percent"
-        );
+        assert_eq!(ProgressBar::Percent(Some(42)).state_str(), "percent");
         assert_eq!(ProgressBar::Error.state_str(), "error");
         assert_eq!(ProgressBar::Indeterminate.state_str(), "indeterminate");
         assert_eq!(ProgressBar::Paused.state_str(), "paused");

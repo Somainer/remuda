@@ -389,10 +389,7 @@ mod tests {
         });
         let redacted = redact_settings(&settings).to_string();
         assert!(redacted.contains("[redacted]"));
-        assert!(
-            !redacted.contains("super-secret-token-value"),
-            "{redacted}"
-        );
+        assert!(!redacted.contains("super-secret-token-value"), "{redacted}");
         assert!(!redacted.contains("sk-ant-0123456789"), "{redacted}");
         // Non-secret configuration stays diagnostically useful.
         assert!(redacted.contains("ark/gateway-model"), "{redacted}");

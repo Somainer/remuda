@@ -1,7 +1,9 @@
 //! TTY binary framing and per-instance PTY bridges.
 
 use crate::NodeError;
-use remuda_driver::{HerdrTty, LocalPty, ProgressBar, PtySnapshot, SnapshotSource, TTY_SNAPSHOT_MAX, TtyBridge};
+use remuda_driver::{
+    HerdrTty, LocalPty, ProgressBar, PtySnapshot, SnapshotSource, TTY_SNAPSHOT_MAX, TtyBridge,
+};
 use remuda_protocol::{BinaryChannel, Id, InstanceId, StreamUuid, U64, encode_binary_frame};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};

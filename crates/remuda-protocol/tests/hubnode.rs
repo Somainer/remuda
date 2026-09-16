@@ -224,7 +224,11 @@ fn renderer_mode_carries_osc94_progress_as_an_independent_additive_field() {
         remuda_protocol::hubnode::TtyProgressState::Percent
     );
     assert_eq!(progress.percent, Some(50));
-    for bad in [json!({"state": "napping"}), json!({"percent": 10}), json!("3")] {
+    for bad in [
+        json!({"state": "napping"}),
+        json!({"percent": 10}),
+        json!("3"),
+    ] {
         assert!(
             serde_json::from_value::<TtyModeParams>(json!({
                 "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",

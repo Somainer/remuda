@@ -420,8 +420,7 @@ impl DriverFactory for NativeClaudeFactory {
                     // (native-config-1). An inherited home or an explicit
                     // caller-chosen config dir is read natively by the CLI, so
                     // copying it here would double-fire its hooks.
-                    options.user_settings_home = if inherit_default_config
-                        || explicit_config_chosen
+                    options.user_settings_home = if inherit_default_config || explicit_config_chosen
                     {
                         None
                     } else {

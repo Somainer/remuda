@@ -85,11 +85,32 @@ pub struct HubConfig {
     /// while bounding the SQLite blob store. Config key `attachmentMaxBytes`.
     #[serde(default = "default_attachment_max_bytes")]
     pub attachment_max_bytes: usize,
+    /// Placement only trusts a CPU/mem sample younger than this (default 60 s).
+    /// A persisted sample at or beyond this age triggers a bounded
+    /// `host.resources` refresh before the host may be refused as saturated.
+    #[serde(default = "default_resource_sample_max_age_ms")]
+    pub resource_sample_max_age_ms: u64,
+    /// Bounded wait for an on-demand `host.resources` refresh before placement
+    /// decides on the data it has (default one second).
+    #[serde(default = "default_resource_refresh_timeout_ms")]
+    pub resource_refresh_timeout_ms: u64,
 }
 
 /// Default per-file attachment ceiling (D-027b): 25 MiB.
 pub fn default_attachment_max_bytes() -> usize {
     DEFAULT_ATTACHMENT_MAX_BYTES
+}
+
+/// Placement trusts resource samples for 60 s; the Node heartbeat refreshes
+/// them every 15 s, so a healthy link always has a fresh sample on hand.
+pub fn default_resource_sample_max_age_ms() -> u64 {
+    60_000
+}
+
+/// A `host.resources` on-demand refresh must return within ~1 s; refusal
+/// latency stays bounded when a Node is wedged.
+pub fn default_resource_refresh_timeout_ms() -> u64 {
+    1_000
 }
 
 fn default_auth_ip_burst() -> f64 {
@@ -165,6 +186,8 @@ impl Default for HubConfig {
             auth_global_burst: default_auth_global_burst(),
             auth_global_refill_per_sec: default_auth_global_refill_per_sec(),
             attachment_max_bytes: default_attachment_max_bytes(),
+            resource_sample_max_age_ms: default_resource_sample_max_age_ms(),
+            resource_refresh_timeout_ms: default_resource_refresh_timeout_ms(),
         }
     }
 }
@@ -199,6 +222,8 @@ impl HubConfig {
             auth_global_burst: default_auth_global_burst(),
             auth_global_refill_per_sec: default_auth_global_refill_per_sec(),
             attachment_max_bytes: default_attachment_max_bytes(),
+            resource_sample_max_age_ms: default_resource_sample_max_age_ms(),
+            resource_refresh_timeout_ms: default_resource_refresh_timeout_ms(),
         }
     }
 

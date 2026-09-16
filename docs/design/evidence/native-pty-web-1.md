@@ -29,19 +29,25 @@ Spec: `docs/design/native-pty-first.md` §1.0 / §5.1 / §6 / §8 (D-028 / D-028
   the structured projection is enabled by the reported `signalTier`
   (hook/file/osc) — not by `driver !== "claude-print"`. A new shell-pty agent
   session opens on 结构 and keeps 终端 one switch away.
-- **Composer three states (§6).** A pure state machine
-  (`features/composer/state.ts`) maps instance phase × measured
+- **Composer states (§6, revised by c-steer 2026-09-17).** A pure state
+  machine (`features/composer/state.ts`) maps instance phase × measured
   steer/queue/interrupt provisions (`native|emulated|unknown`) to controls:
   - idle → 发送 (new-turn);
-  - working + native steer (claude/codex) → 发送 steers (PromptMode
-    `steer`), 排队 always available (native Tab for codex, otherwise
-    「Remuda 代持」), red 打断 (`instance.cancel`);
-  - working + emulated/unknown steer (grok/agy) → 排队 primary plus
-    「打断并发送」 behind a confirm; unknown renders「尚未验证」, never a
-    fake-greyed button.
-  - Queued items render removable chips; the status chip shows
-    queued/interrupted counts. Enter = primary, Shift+Enter = newline, Esc
-    while the composer is focused = 打断 with a desktop confirm. 400px fits.
+  - working → Enter QUEUES (codex: native Tab posted immediately; every other
+    harness: Remuda-held client-side until the turn ends); 插队
+    (⌘/Ctrl+Enter or its button) posts `mode:steer` — the Node interrupts the
+    running turn and delivers the message ahead of the held queue, journaling
+    origin+reason; 打断 (`instance.cancel`) ends the turn without a message;
+  - blocked (AskUserQuestion / approval / elicitation / plan review pending)
+    is NOT working: the composer stays enabled, offers 打断 but never 插队
+    (Esc would hit the dialog), and Enter holds with「待回答后送出」until the
+    interaction resolves;
+  - provision is reported honestly — native Esc, Remuda-sent cancel sequence,
+    or 尚未验证 — never a faked button.
+  - Queued items render removable chips AND pending transcript rows tagged
+    「排队中 · 第 n 条 · 回车后送出」/「待回答后送出」; delivered rows lose
+    the tag. Enter = queue, Shift+Enter = newline, ⌘/Ctrl+Enter = 插队,
+    Esc while the composer is focused = 打断 with a desktop confirm. 400px fits.
 - **Mobile dock (§5.2).** `LocalInput` no longer appends `\r`; it routes
   through `hubStore.send` → `instance.send`, so the driver performs the
   body-then-Enter two writes. Raw-key buttons stay on the binary channel.
@@ -62,8 +68,8 @@ Spec: `docs/design/native-pty-first.md` §1.0 / §5.1 / §6 / §8 (D-028 / D-028
 |---|---|
 | New Session, native shell-pty default + launch preview, 1440px | [native-pty-web-1-new-session-1440.png](./native-pty-web-1-new-session-1440.png) |
 | Same sheet at 400px (driver choices wrap, preview scrolls) | [native-pty-web-1-new-session-400.png](./native-pty-web-1-new-session-400.png) |
-| Working composer: 发送(steer) / 排队（Remuda 代持）/ 打断, queued chip, 1440px | [native-pty-web-1-composer-working-1440.png](./native-pty-web-1-composer-working-1440.png) |
-| Same at 400px — three controls + removable chip fit the bar | [native-pty-web-1-composer-working-400.png](./native-pty-web-1-composer-working-400.png) |
+| Working composer: Enter 排队（Remuda 代持）/ 插队(⌘/Ctrl+↵) / 打断, queued chip, 1440px | [native-pty-web-1-composer-working-1440.png](./native-pty-web-1-composer-working-1440.png) |
+| Same at 400px — queue + 插队 + 打断 + removable chip fit the bar | [native-pty-web-1-composer-working-400.png](./native-pty-web-1-composer-working-400.png) |
 
 ## Stable testids
 
@@ -72,12 +78,13 @@ Spec: `docs/design/native-pty-first.md` §1.0 / §5.1 / §6 / §8 (D-028 / D-028
 | `new-session-driver-shell-pty` etc. | driver choice rows; `data-default=0\|1`; disabled when the matrix refuses |
 | `new-session-launch-preview` | read-only materialized-argv summary |
 | `composer` | attrs add `data-phase=idle\|working\|blocked\|exited` |
-| `composer-send` | primary send/steer; `data-mode=new-turn\|steer` |
-| `composer-queue`, `composer-queue-btn` | primary queue (emulated steer) / secondary queue; `data-holder=remuda\|native` |
-| `composer-interrupt` | red interrupt; `data-provision=native\|emulated\|unknown` |
-| `composer-interrupt-send` | 打断并发送 (confirm) |
-| `composer-queued-chip` / `composer-queued-remove` / `composer-queue-status` | Remuda-held/native queue ledger |
-| `composer-interrupted-chip` | post-cancel status |
+| `composer-send` | idle primary send; `data-mode=new-turn` |
+| `composer-queue` | busy primary queue (Enter); `data-mode=queue`, `data-holder=remuda\|native` |
+| `composer-steer` | c-steer 插队 (interrupt + deliver first); `data-provision=native\|emulated\|unknown`; ⌘/Ctrl+Enter |
+| `composer-interrupt` | interrupt; `data-provision=native\|emulated\|unknown` |
+| `composer-queued-chip` / `composer-queued-remove` / `composer-queue-status` | held/native queue ledger; chip carries `data-reason=turn\|answer` and `data-ordinal` |
+| `held-queue-tag` / `held-queue-cancel` | pending transcript row tag / per-message cancel |
+| `composer-interrupted-chip` / `steer-delivered-tag` | post-cancel status / delivered 插队 badge |
 | `composer-cap-note` | honest emulation/unverified note |
 | `node-restart-banner`, `node-restart-resume` | §8 banner |
 | `launched-by` | provenance mark; `data-launched-by=user\|remuda` |

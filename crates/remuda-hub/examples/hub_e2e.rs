@@ -356,6 +356,11 @@ async fn fake_node(
     // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
     // back into this loop so journal appends stay single-writer.
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
+    // Frames read while waiting for a journal.append ack (they may be stale
+    // append responses or — importantly — unrelated Hub RPCs such as the
+    // web poll's interaction.list). Never drop RPCs: reprocess them as soon
+    // as the current handler returns.
+    let mut frame_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     loop {
         tokio::select! {
             biased;
@@ -367,7 +372,7 @@ async fn fake_node(
                 // timer then finds nothing. When the terminal wins, journal:
                 // the interaction entity resolved (source terminal, chosen
                 // labels), an assistant turn carrying the labels, then idle.
-                append_n = append_terminal_resolution(
+                let resolution_seq = append_terminal_resolution(
                     &mut ws,
                     &closed_instance,
                     append_n,
@@ -375,7 +380,9 @@ async fn fake_node(
                     &terminal_answers,
                 )
                 .await?;
-                append_n = append_journal(
+                wait_frame_ack(&mut ws, &mut frame_queue, &format!("j{resolution_seq}")).await?;
+                append_n = resolution_seq;
+                let assistant_seq = append_journal(
                     &mut ws,
                     &closed_instance,
                     append_n,
@@ -386,8 +393,12 @@ async fn fake_node(
                     ),
                 )
                 .await?;
-                append_n =
+                wait_frame_ack(&mut ws, &mut frame_queue, &format!("j{assistant_seq}")).await?;
+                append_n = assistant_seq;
+                let idle_seq =
                     append_native_status(&mut ws, &closed_instance, append_n, "idle").await?;
+                wait_frame_ack(&mut ws, &mut frame_queue, &format!("j{idle_seq}")).await?;
+                append_n = idle_seq;
                 continue;
             }
             msg = ws.next() => {
@@ -395,178 +406,184 @@ async fn fake_node(
         let Ok(Message::Text(text)) = msg else {
             continue;
         };
-        let Ok(frame) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        // Journal append acknowledgements share this socket with Hub requests.
-        // Only this loop reads frames so concurrent RPCs are never discarded.
-        if frame.get("method").is_none() {
-            continue;
+        frame_queue.push_back(text.to_string());
         }
-        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
-        let id = frame.get("id").cloned().unwrap_or(Value::Null);
-        let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
-        let instance_id = params
-            .get("instanceId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        match method {
-            "workspace.list" => {
-                send_rpc_ok(
-                    &mut ws,
-                    id,
-                    json!({"workspaceRevision": 1, "workspaces": workspaces}),
-                )
-                .await?;
+        }
+        // Process everything that arrived, including frames stashed behind an
+        // append ack wait.
+        while let Some(text) = frame_queue.pop_front() {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            // Journal append acknowledgements share this socket with Hub requests.
+            // Only this loop reads frames so concurrent RPCs are never discarded.
+            if frame.get("method").is_none() {
+                continue;
             }
-            "instance.create" | "instance.resume" => {
-                let spec = params.get("spec").unwrap_or(&params);
-                if let Some(kind) = spec.get("kind").and_then(Value::as_str) {
-                    instance_kinds.insert(instance_id.clone(), kind.to_owned());
+            let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
+            let instance_id = params
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match method {
+                "workspace.list" => {
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({"workspaceRevision": 1, "workspaces": workspaces}),
+                    )
+                    .await?;
                 }
-                if spec.get("driver").and_then(Value::as_str) == Some("claude-pty") {
-                    claude_ptys.insert(instance_id.clone());
-                    // Model the real driver's launch prerequisite, so this
-                    // e2e fails if resume omits either provider delivery field.
-                    let has_overlay = spec.get("providerOverlay").is_some_and(Value::is_object);
-                    let has_token = spec
-                        .get("providerAuthToken")
-                        .and_then(Value::as_str)
-                        .is_some_and(|token| !token.is_empty());
-                    if spec.get("delegation").and_then(Value::as_str) == Some("gateway")
-                        && (!has_overlay || !has_token)
-                    {
-                        send_rpc_error(
+                "instance.create" | "instance.resume" => {
+                    let spec = params.get("spec").unwrap_or(&params);
+                    if let Some(kind) = spec.get("kind").and_then(Value::as_str) {
+                        instance_kinds.insert(instance_id.clone(), kind.to_owned());
+                    }
+                    if spec.get("driver").and_then(Value::as_str) == Some("claude-pty") {
+                        claude_ptys.insert(instance_id.clone());
+                        // Model the real driver's launch prerequisite, so this
+                        // e2e fails if resume omits either provider delivery field.
+                        let has_overlay = spec.get("providerOverlay").is_some_and(Value::is_object);
+                        let has_token = spec
+                            .get("providerAuthToken")
+                            .and_then(Value::as_str)
+                            .is_some_and(|token| !token.is_empty());
+                        if spec.get("delegation").and_then(Value::as_str) == Some("gateway")
+                            && (!has_overlay || !has_token)
+                        {
+                            send_rpc_error(
                             &mut ws,
                             id,
                             "gateway delegation requires a settings overlay: fake Node did not receive providerOverlay and providerAuthToken",
                         )
                         .await?;
+                            continue;
+                        }
+                        let session_id = spec
+                            .get("resumeSessionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                        ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                        append_n = append_instance_state(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "ready",
+                            Some(&session_id),
+                        )
+                        .await?;
+                        // §9.1 model-sync: the driver's launch snapshot carries the
+                        // gateway-discovered catalog and the launch model so the
+                        // picker shows the real list immediately.
+                        let launch_model = spec
+                            .get("modelId")
+                            .or_else(|| spec.get("model"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("e2e/auto")
+                            .to_string();
+                        append_n = append_event(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "model",
+                            json!({
+                                "requested": launch_model,
+                                "effective": {
+                                    "id": launch_model,
+                                    "source": "launch",
+                                    "observedAt": "2026-09-14T12:00:00.000Z"
+                                },
+                                "catalog": {
+                                    "models": [
+                                        "e2e/auto",
+                                        "e2e/fast",
+                                        "e2e/plain",
+                                        "claude-e2e-only"
+                                    ],
+                                    "source": "gateway-discovery",
+                                    "observedAt": "2026-09-14T12:00:00.000Z"
+                                }
+                            }),
+                        )
+                        .await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
                         continue;
                     }
-                    let session_id = spec
-                        .get("resumeSessionId")
+                    if method == "instance.resume" {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        continue;
+                    }
+                    let kind = params
+                        .pointer("/spec/kind")
+                        .or_else(|| params.get("kind"))
                         .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-                    ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
-                    append_n = append_instance_state(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "ready",
-                        Some(&session_id),
-                    )
-                    .await?;
-                    // §9.1 model-sync: the driver's launch snapshot carries the
-                    // gateway-discovered catalog and the launch model so the
-                    // picker shows the real list immediately.
-                    let launch_model = spec
-                        .get("modelId")
-                        .or_else(|| spec.get("model"))
+                        .unwrap_or("claude");
+                    if kind == "terminal" {
+                        // A raw terminal has no agent prompt, approval or journal
+                        // turns; its surface is the PTY stream the QuickFind test
+                        // attaches to.
+                        ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let prompt = params
+                        .pointer("/initialInput/text")
+                        .or_else(|| params.get("prompt"))
                         .and_then(Value::as_str)
-                        .unwrap_or("e2e/auto")
-                        .to_string();
-                    append_n = append_event(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "model",
-                        json!({
-                            "requested": launch_model,
-                            "effective": {
-                                "id": launch_model,
-                                "source": "launch",
-                                "observedAt": "2026-09-14T12:00:00.000Z"
-                            },
-                            "catalog": {
-                                "models": [
-                                    "e2e/auto",
-                                    "e2e/fast",
-                                    "e2e/plain",
-                                    "claude-e2e-only"
-                                ],
-                                "source": "gateway-discovery",
-                                "observedAt": "2026-09-14T12:00:00.000Z"
-                            }
-                        }),
-                    )
-                    .await?;
-                    send_rpc_ok(
-                        &mut ws,
-                        id,
-                        json!({ "ok": true, "instanceId": instance_id }),
-                    )
-                    .await?;
-                    continue;
-                }
-                if method == "instance.resume" {
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    continue;
-                }
-                let kind = params
-                    .pointer("/spec/kind")
-                    .or_else(|| params.get("kind"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("claude");
-                if kind == "terminal" {
-                    // A raw terminal has no agent prompt, approval or journal
-                    // turns; its surface is the PTY stream the QuickFind test
-                    // attaches to.
-                    ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
-                    send_rpc_ok(
-                        &mut ws,
-                        id,
-                        json!({ "ok": true, "instanceId": instance_id }),
-                    )
-                    .await?;
-                    continue;
-                }
-                let prompt = params
-                    .pointer("/initialInput/text")
-                    .or_else(|| params.get("prompt"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("hello");
-                let interaction_id = InteractionId::new();
-                // A prompt naming the hook path raises the D-028 §4.4 tier A
-                // card instead: harness-hook carrier, the real tool input as
-                // its description, and an always-allow option built from the
-                // permission_suggestion the harness offered.
-                let card = if prompt.contains("ask-question") {
-                    fake_hook_question(
-                        &instance_id,
-                        host_id.as_id().as_str(),
-                        interaction_id.as_id().as_str(),
-                    )
-                } else if prompt.contains("hook-approval") {
-                    fake_hook_approval(
-                        &instance_id,
-                        host_id.as_id().as_str(),
-                        interaction_id.as_id().as_str(),
-                    )
-                } else {
-                    fake_approval(
-                        &instance_id,
-                        host_id.as_id().as_str(),
-                        interaction_id.as_id().as_str(),
-                    )
-                };
-                let terminal_answer = prompt.contains("ask-question-terminal");
-                pending
-                    .lock()
-                    .await
-                    .insert(interaction_id.as_id().as_str().to_string(), card.clone());
-                if terminal_answer {
-                    // Model the human answering in the agent's own TUI: after a
-                    // beat the harness closes the dialog itself (PostToolUse
-                    // with answers), without any interaction.answer RPC.
-                    let tx = close_tx.clone();
-                    let iid = interaction_id.as_id().as_str().to_string();
-                    let terminal_instance = instance_id.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
-                        let _ = tx
+                        .unwrap_or("hello");
+                    let interaction_id = InteractionId::new();
+                    // A prompt naming the hook path raises the D-028 §4.4 tier A
+                    // card instead: harness-hook carrier, the real tool input as
+                    // its description, and an always-allow option built from the
+                    // permission_suggestion the harness offered.
+                    let card = if prompt.contains("ask-question") {
+                        fake_hook_question(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
+                    } else if prompt.contains("hook-approval") {
+                        fake_hook_approval(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
+                    } else {
+                        fake_approval(
+                            &instance_id,
+                            host_id.as_id().as_str(),
+                            interaction_id.as_id().as_str(),
+                        )
+                    };
+                    let terminal_answer = prompt.contains("ask-question-terminal");
+                    pending
+                        .lock()
+                        .await
+                        .insert(interaction_id.as_id().as_str().to_string(), card.clone());
+                    if terminal_answer {
+                        // Model the human answering in the agent's own TUI: after a
+                        // beat the harness closes the dialog itself (PostToolUse
+                        // with answers), without any interaction.answer RPC.
+                        let tx = close_tx.clone();
+                        let iid = interaction_id.as_id().as_str().to_string();
+                        let terminal_instance = instance_id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(1200)).await;
+                            let _ = tx
                             .send((
                                 terminal_instance,
                                 iid,
@@ -576,582 +593,554 @@ async fn fake_node(
                                 }),
                             ))
                             .await;
-                    });
-                }
-                // C2: the create prompt is a command, so its user observation
-                // carries the commandId the Hub forwards in params.
-                let command_id = params.get("commandId").and_then(Value::as_str);
-                append_n = append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
-                    .await?;
-                // r-ux-comment: a fenced block to exercise 评论.
-                if let Some(reply) = code_comment_reply(prompt) {
-                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
-                        .await?;
-                } else {
-                    append_n = append_journal(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "assistant",
-                        &format!("echo: {prompt}"),
-                    )
-                    .await?;
-                }
-                // A freshly launched native-PTY agent is mid-turn until the
-                // web drives it; the approval keeps it blocked until answered.
-                append_n = append_native_status(&mut ws, &instance_id, append_n, "working").await?;
-                // §9.1 model-sync: the launch snapshot carries the
-                // gateway-discovered catalog and current model for any claude
-                // carrier (claude-pty emits in its own branch above; shell-pty
-                // and print land here).
-                if kind == "claude" {
-                    let launch_model = spec
-                        .get("modelId")
-                        .or_else(|| spec.get("model"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("e2e/auto")
-                        .to_string();
-                    append_n = append_event(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "model",
-                        json!({
-                            "requested": launch_model,
-                            "effective": {
-                                "id": launch_model,
-                                "source": "launch",
-                                "observedAt": "2026-09-14T12:00:00.000Z"
-                            },
-                            "catalog": {
-                                "models": [
-                                    "e2e/auto",
-                                    "e2e/fast",
-                                    "e2e/plain",
-                                    "claude-e2e-only"
-                                ],
-                                "source": "gateway-discovery",
-                                "observedAt": "2026-09-14T12:00:00.000Z"
-                            }
-                        }),
-                    )
-                    .await?;
-                }
-                send_rpc_ok(
-                    &mut ws,
-                    id,
-                    json!({ "ok": true, "instanceId": instance_id }),
-                )
-                .await?;
-            }
-            "instance.send" => {
-                let prompt = params
-                    .get("prompt")
-                    .or_else(|| params.pointer("/text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("hello");
-                let command_id = params.get("commandId").and_then(Value::as_str);
-                // §9.1: a terminal-side `/effort <level>` typed in the PTY is
-                // observed as a hand-typed slash command — the fake node emits
-                // the matching effort observation attributed to `slash`, and
-                // nothing calls instance.configure back (no ping-pong).
-                if let Some(word) = prompt.strip_prefix("/effort:") {
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    let (tier, ultra) = if word == "ultracode" {
-                        ("xhigh", serde_json::Value::Bool(true))
-                    } else {
-                        (word, serde_json::Value::Bool(false))
-                    };
-                    append_n = append_event(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "effort",
-                        json!({
-                            "effective": {
-                                "name": tier,
-                                "ultracode": ultra,
-                                "source": "slash",
-                                "observedAt": monotonic_effort_observed_at()
-                            },
-                            "raw": tier
-                        }),
-                    )
-                    .await?;
-                    continue;
-                }
-                // context-usage-1: a `usage:in,out,cacheRead,cacheWrite`
-                // prompt appends one full protocol usage observation (each
-                // position `-` = the channel was not reported, exercising the
-                // Hub rollup's unknown-not-zero rule), then ends the turn.
-                if let Some(usage) = scripted_usage(prompt) {
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    append_n =
-                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
-                            .await?;
-                    append_n =
-                        append_event(&mut ws, &instance_id, append_n, "usage", usage).await?;
-                    append_n = append_journal(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "assistant",
-                        &format!("usage recorded: {prompt}"),
-                    )
-                    .await?;
-                    append_n =
-                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
-                    continue;
-                }
-                // §9.1 model-sync: a terminal-side `/model <id>` typed in the
-                // PTY emits the matching model observation attributed to
-                // `slash` (resolved id verbatim), no configure ping-pong.
-                if let Some(model) = prompt.strip_prefix("/model:") {
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    append_n = append_event(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "model",
-                        json!({
-                            "effective": {
-                                "id": model,
-                                "source": "slash",
-                                "observedAt": "2026-09-14T12:00:00.000Z"
-                            },
-                            "raw": model
-                        }),
-                    )
-                    .await?;
-                    continue;
-                }
-                // r-ux-comment: reply with a fenced code block so the browser
-                // spec can exercise the 评论 quote action. The prompt is also
-                // echoed verbatim below, proving the expanded quote arrived.
-                if let Some(reply) = code_comment_reply(prompt) {
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    append_n =
-                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
-                            .await?;
-                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
-                        .await?;
-                    append_n =
-                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
-                    continue;
-                }
-                // r-ux-w: synthetic workflow timeline-card scenarios take the
-                // short path (their own scripted journal sequence).
-                if let Some(kind) = workflow_kind(prompt) {
-                    send_rpc_ok(
-                        &mut ws,
-                        id,
-                        json!({ "ok": true, "instanceId": instance_id }),
-                    )
-                    .await?;
-                    append_n =
-                        append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
-                    continue;
-                }
-                // C2: the journal user node for a composer send carries the
-                // exact commandId the HTTP response returned, so the web folds
-                // optimistic bubble and transcript node into one.
-                append_n = append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
-                    .await?;
-                // D-027: echo the attachment metadata the Hub resolved, so the
-                // e2e can prove staging reached the Node without a real agent.
-                // 2026-09-15: also echo the [Image #n] manifest (index +
-                // objectId + mediaType in token order) on one line each.
-                // D-027b: the fake Node also pulls each object like the real
-                // one (Bearer host token), lands it under a sanitised name
-                // with a collision suffix, and records the exact
-                // `[File #n] … saved at …` expansion line the harness receives.
-                let sent: Vec<(Option<i64>, String, String, String, String, i64)> = params
-                    .get("attachments")
-                    .and_then(Value::as_array)
-                    .map(|list| {
-                        list.iter()
-                            .map(|item| {
-                                (
-                                    item.get("index").and_then(Value::as_i64),
-                                    item.get("objectId")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_owned(),
-                                    item.get("kind")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("image")
-                                        .to_owned(),
-                                    item.get("mediaType")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_owned(),
-                                    item.get("name")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_owned(),
-                                    item.get("size").and_then(Value::as_i64).unwrap_or(0),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let types = sent
-                    .iter()
-                    .map(|(_, _, _, media_type, _, _)| media_type.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let mut reply = if sent.is_empty() {
-                    format!("echo: {prompt}")
-                } else {
-                    format!("echo: {prompt} [attachments: {types}]")
-                };
-                for (index, object_id, _kind, media_type, _name, _size) in &sent {
-                    reply.push_str(&format!(
-                        " [attachment-refs: #{} {} {}]",
-                        index.unwrap_or(0),
-                        object_id,
-                        media_type
-                    ));
-                }
-                // D-027b: pull + land + expand, exactly like remuda-node.
-                // One line per file, matching the driver's prompt expansion,
-                // so the web transcript can fold each line like an anchor.
-                let mut file_lines: Vec<String> = Vec::new();
-                for (index, object_id, kind, media_type, name, size) in &sent {
-                    if kind != "file" {
-                        continue;
+                        });
                     }
-                    let landed = land_attachment(addr, &durable_token, object_id, name)
-                        .await
-                        .unwrap_or_else(|error| format!("<pull failed: {error}>"));
-                    file_lines.push(format!(
-                        "[File #{}] {} ({}, {}) saved at {}",
-                        index.unwrap_or(0),
-                        name,
-                        media_type,
-                        human_size(*size as u64),
-                        landed
-                    ));
-                }
-                if !file_lines.is_empty() {
-                    reply.push('\n');
-                    reply.push_str(&file_lines.join("\n"));
-                }
-                if prompt.starts_with("stream ") {
-                    // D-028 §7: reply as an open/append chain so the web e2e
-                    // sees text arrive mid-turn, the way `MessageDisplay`
-                    // deltas do on a real agent-in-PTY session.
+                    // C2: the create prompt is a command, so its user observation
+                    // carries the commandId the Hub forwards in params.
+                    let command_id = params.get("commandId").and_then(Value::as_str);
                     append_n =
-                        append_stream_chunks(&mut ws, &instance_id, append_n, &reply).await?;
-                } else {
-                    append_n = append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
+                            .await?;
+                    // r-ux-comment: a fenced block to exercise 评论.
+                    if let Some(reply) = code_comment_reply(prompt) {
+                        append_n =
+                            append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                                .await?;
+                    } else {
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("echo: {prompt}"),
+                        )
                         .await?;
-                }
-                // D-028 §6: a steer/queue send happens mid-turn; report the
-                // native agent status so the web composer projects working.
-                if params.get("mode").and_then(Value::as_str) == Some("new-turn") {
-                    append_n =
-                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
-                } else {
+                    }
+                    // A freshly launched native-PTY agent is mid-turn until the
+                    // web drives it; the approval keeps it blocked until answered.
                     append_n =
                         append_native_status(&mut ws, &instance_id, append_n, "working").await?;
-                }
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
-            "instance.cancel" => {
-                // §5.3: the turn ends but the instance keeps running.
-                append_n = append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
-            "instance.configure" => {
-                // §9.1 model-sync: a model-bearing configure emulates the
-                // `/model` command verdict. Sentinels (posted directly by the
-                // spec, never sent by the UI):
-                //   "__queued__:<id>"  → model-queued lifecycle only
-                //   "__notfound__:<id>"→ model-degraded …:not-found only
-                //   "__resolve__:<alias>=<resolved>" → accepted, alias resolves
-                //   to a different concrete id (the mismatch path)
-                // Otherwise the requested id is accepted verbatim.
-                if let Some(requested) = params.get("model").and_then(Value::as_str) {
-                    if let Some(mid) = requested.strip_prefix("__queued__:") {
-                        append_n = append_configure_status(
-                            &mut ws,
-                            &instance_id,
-                            append_n,
-                            &format!("model-queued:{mid}"),
-                        )
-                        .await?;
-                    } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
-                        append_n = append_configure_status(
-                            &mut ws,
-                            &instance_id,
-                            append_n,
-                            &format!("model-degraded:{mid}:not-found"),
-                        )
-                        .await?;
-                    } else {
-                        let (requested_id, resolved) = if let Some(rest) =
-                            requested.strip_prefix("__resolve__:")
-                            && let Some((alias, resolved)) = rest.split_once('=')
-                        {
-                            (alias.to_owned(), resolved.to_owned())
-                        } else {
-                            (requested.to_owned(), requested.to_owned())
-                        };
+                    // §9.1 model-sync: the launch snapshot carries the
+                    // gateway-discovered catalog and current model for any claude
+                    // carrier (claude-pty emits in its own branch above; shell-pty
+                    // and print land here).
+                    if kind == "claude" {
+                        let launch_model = spec
+                            .get("modelId")
+                            .or_else(|| spec.get("model"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("e2e/auto")
+                            .to_string();
                         append_n = append_event(
                             &mut ws,
                             &instance_id,
                             append_n,
                             "model",
                             json!({
-                                "requested": requested_id,
+                                "requested": launch_model,
                                 "effective": {
-                                    "id": resolved,
-                                    "source": "remuda",
+                                    "id": launch_model,
+                                    "source": "launch",
                                     "observedAt": "2026-09-14T12:00:00.000Z"
                                 },
-                                "raw": resolved
+                                "catalog": {
+                                    "models": [
+                                        "e2e/auto",
+                                        "e2e/fast",
+                                        "e2e/plain",
+                                        "claude-e2e-only"
+                                    ],
+                                    "source": "gateway-discovery",
+                                    "observedAt": "2026-09-14T12:00:00.000Z"
+                                }
                             }),
                         )
                         .await?;
                     }
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    continue;
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "instanceId": instance_id }),
+                    )
+                    .await?;
                 }
-                // §9.1 effort: emulate a native agent that accepted `/effort`
-                // and whose command verdict reports the level back. When the
-                // requested level differs from what the transcript says, the
-                // fake agent reports a *clamped* level — exactly the
-                // 请求 max → 实际 xhigh path the UI must render.
-                //
-                // Test-only sentinels (the UI never sends these; the spec
-                // posts them directly to exercise the driver's lifecycle
-                // paths without a real PTY):
-                //   "__queued__:<word>"   → effort-queued lifecycle only
-                //   "__degrade__:<word>"  → effort-degraded lifecycle only
-                if let Some(effort) = params.get("effort")
-                    && let Some(requested) = effort.get("name").and_then(Value::as_str)
-                {
-                    if let Some(word) = requested.strip_prefix("__queued__:") {
-                        append_n = append_configure_status(
-                            &mut ws,
-                            &instance_id,
-                            append_n,
-                            &format!("effort-queued:{word}"),
-                        )
-                        .await?;
-                    } else if let Some(word) = requested.strip_prefix("__degrade__:") {
-                        append_n = append_configure_status(
-                            &mut ws,
-                            &instance_id,
-                            append_n,
-                            &format!("effort-degraded:{word}:dialog-kept"),
-                        )
-                        .await?;
-                    } else {
-                        // Keep the Claude mismatch fixture; Codex must echo
-                        // both max and ultra unchanged through the Hub.
-                        let clamped = requested == "max"
-                            && instance_kinds.get(&instance_id).map(String::as_str)
-                                == Some("claude");
-                        let ultra = requested == "ultracode";
-                        // ultracode reads back as tier xhigh on Claude; a
-                        // clamped max reads back xhigh too.
-                        let tier = if clamped || ultra { "xhigh" } else { requested };
-                        let observed_at = monotonic_effort_observed_at();
-                        let event = json!({
-                            "kind": "effort",
-                            "completeness": "structured",
-                            "payload": {
-                                "requested": {"name": requested,
-                                    "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
-                                "effective": {
-                                    // Measured 2.1.272: ultracode carries the
-                                    // workflow flag; a plain level accept
-                                    // positively clears it; an unrelated clamp
-                                    // leaves the flag unknown.
-                                    "name": tier,
-                                    "ultracode": if ultra {
-                                        serde_json::Value::Bool(true)
-                                    } else if clamped {
-                                        serde_json::Value::Null
-                                    } else {
-                                        serde_json::Value::Bool(false)
-                                    },
-                                    "source": "remuda",
-                                    "observedAt": observed_at
-                                },
-                                "raw": tier
-                            }
-                        });
+                "instance.send" => {
+                    let prompt = params
+                        .get("prompt")
+                        .or_else(|| params.pointer("/text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("hello");
+                    let command_id = params.get("commandId").and_then(Value::as_str);
+                    // §9.1: a terminal-side `/effort <level>` typed in the PTY is
+                    // observed as a hand-typed slash command — the fake node emits
+                    // the matching effort observation attributed to `slash`, and
+                    // nothing calls instance.configure back (no ping-pong).
+                    if let Some(word) = prompt.strip_prefix("/effort:") {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        let (tier, ultra) = if word == "ultracode" {
+                            ("xhigh", serde_json::Value::Bool(true))
+                        } else {
+                            (word, serde_json::Value::Bool(false))
+                        };
                         append_n = append_event(
                             &mut ws,
                             &instance_id,
                             append_n,
                             "effort",
-                            event["payload"].clone(),
+                            json!({
+                                "effective": {
+                                    "name": tier,
+                                    "ultracode": ultra,
+                                    "source": "slash",
+                                    "observedAt": monotonic_effort_observed_at()
+                                },
+                                "raw": tier
+                            }),
                         )
                         .await?;
+                        continue;
                     }
-                }
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
-            "instance.close" => {
-                if claude_ptys.contains(&instance_id) {
-                    ttys.remove(&instance_id);
+                    // context-usage-1: a `usage:in,out,cacheRead,cacheWrite`
+                    // prompt appends one full protocol usage observation (each
+                    // position `-` = the channel was not reported, exercising the
+                    // Hub rollup's unknown-not-zero rule), then ends the turn.
+                    if let Some(usage) = scripted_usage(prompt) {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_n = append_command_user(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            command_id,
+                        )
+                        .await?;
+                        append_n =
+                            append_event(&mut ws, &instance_id, append_n, "usage", usage).await?;
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("usage recorded: {prompt}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                        continue;
+                    }
+                    // §9.1 model-sync: a terminal-side `/model <id>` typed in the
+                    // PTY emits the matching model observation attributed to
+                    // `slash` (resolved id verbatim), no configure ping-pong.
+                    if let Some(model) = prompt.strip_prefix("/model:") {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_n = append_event(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "model",
+                            json!({
+                                "effective": {
+                                    "id": model,
+                                    "source": "slash",
+                                    "observedAt": "2026-09-14T12:00:00.000Z"
+                                },
+                                "raw": model
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    // r-ux-comment: reply with a fenced code block so the browser
+                    // spec can exercise the 评论 quote action. The prompt is also
+                    // echoed verbatim below, proving the expanded quote arrived.
+                    if let Some(reply) = code_comment_reply(prompt) {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_n = append_command_user(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            prompt,
+                            command_id,
+                        )
+                        .await?;
+                        append_n =
+                            append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                                .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                        continue;
+                    }
+                    // r-ux-w: synthetic workflow timeline-card scenarios take the
+                    // short path (their own scripted journal sequence).
+                    if let Some(kind) = workflow_kind(prompt) {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        append_n =
+                            append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
+                        continue;
+                    }
+                    // C2: the journal user node for a composer send carries the
+                    // exact commandId the HTTP response returned, so the web folds
+                    // optimistic bubble and transcript node into one.
                     append_n =
-                        append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
+                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
                             .await?;
-                }
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
-            "interaction.list" => {
-                let items: Vec<Value> = pending.lock().await.values().cloned().collect();
-                send_rpc_ok(&mut ws, id, json!({ "items": items })).await?;
-            }
-            "interaction.answer" => {
-                let answer = params.get("answer").cloned().unwrap_or(json!({}));
-                let removed = if let Some(iid) = params.get("interactionId").and_then(Value::as_str) {
-                    pending.lock().await.remove(iid)
-                } else {
-                    None
-                };
-                send_rpc_ok(
-                    &mut ws,
-                    id,
-                    json!({ "ok": true, "state": "answer-committed" }),
-                )
-                .await?;
-                // The harness received the hook decision and continues: echo
-                // the chosen labels as the next assistant turn, so an e2e can
-                // prove from the journal that the reply really landed (rather
-                // than merely that the card disappeared).
-                if let Some(card) = removed
-                    && card.get("kind").and_then(Value::as_str) == Some("question")
-                    && let Some(instance_id) =
-                        card.get("instanceId").and_then(Value::as_str)
-                {
-                    let summary = answer
-                        .get("answers")
-                        .map(question_answer_summary)
+                    // D-027: echo the attachment metadata the Hub resolved, so the
+                    // e2e can prove staging reached the Node without a real agent.
+                    // 2026-09-15: also echo the [Image #n] manifest (index +
+                    // objectId + mediaType in token order) on one line each.
+                    // D-027b: the fake Node also pulls each object like the real
+                    // one (Bearer host token), lands it under a sanitised name
+                    // with a collision suffix, and records the exact
+                    // `[File #n] … saved at …` expansion line the harness receives.
+                    let sent: Vec<(Option<i64>, String, String, String, String, i64)> = params
+                        .get("attachments")
+                        .and_then(Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .map(|item| {
+                                    (
+                                        item.get("index").and_then(Value::as_i64),
+                                        item.get("objectId")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_owned(),
+                                        item.get("kind")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("image")
+                                            .to_owned(),
+                                        item.get("mediaType")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_owned(),
+                                        item.get("name")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_owned(),
+                                        item.get("size").and_then(Value::as_i64).unwrap_or(0),
+                                    )
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    append_n = append_journal(
-                        &mut ws,
-                        instance_id,
-                        append_n,
-                        "assistant",
-                        &format!("AskUserQuestion answered via hook: {summary}"),
-                    )
-                    .await?;
-                    append_n =
-                        append_native_status(&mut ws, instance_id, append_n, "idle").await?;
-                }
-            }
-            "workspace.scm.status" | "workspace.scm.diff" | "workspace.scm.file" => {
-                let result = g2_scm_answer(method, &params);
-                send_rpc_ok(&mut ws, id, result).await?;
-            }
-            "subagent.transcript" => {
-                let agent_id = params.get("agentId").and_then(Value::as_str).unwrap_or("");
-                send_rpc_ok(&mut ws, id, drill_subagent_answer(agent_id)).await?;
-            }
-            "tty.attach" => {
-                if claude_ptys.contains(&instance_id) && !ttys.contains_key(&instance_id) {
-                    send_rpc_error(&mut ws, id, "instance has no TTY bridge").await?;
-                    continue;
-                }
-                // The Hub asks for the live PTY stream when a follower opens
-                // the terminal tab. Registering lazily keeps resume onto a
-                // session created before this node connection behaved.
-                let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
-                send_rpc_ok(
-                    &mut ws,
-                    id,
-                    json!({
-                        "ok": true,
-                        "streamId": tty.stream_id,
-                        "snapshotBase64": base64::engine::general_purpose::STANDARD
-                            .encode(&tty.screen),
-                        "availableFrom": "0",
-                        // Trustworthy current mode, the way the Node's
-                        // byte-stream scanner reports it for a herdr pane.
-                        "altScreen": tty.alt_screen,
-                        // Current OSC 9;4 state, or null before any sequence.
-                        "progress": tty.progress,
-                    }),
-                )
-                .await?;
-            }
-            "tty.write" => {
-                // Raw keyboard bytes from the browser. Every byte is recorded
-                // (the QuickFind e2e reads the Escape back via the marker) and
-                // printable input is echoed like a cooked PTY. A CR submits
-                // the buffered line as a commandId-less journal user node so
-                // the C2 native-typing e2e can prove it renders once with no
-                // command attribution.
-                let bytes = params
-                    .get("dataBase64")
-                    .and_then(Value::as_str)
-                    .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
-                    .unwrap_or_default();
-                let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
-                // Scripted alt-screen/progress transition: the sentinel
-                // produces the raw frame (so xterm paints it) and a tty.mode
-                // notice exactly like the Node's emulator/scanner relay.
-                if let Some(scripted) = tty.note_input(&bytes) {
-                    ws.send(Message::Text(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "method": "tty.frame",
-                            "params": {
-                                "instanceId": instance_id,
-                                "streamId": tty.stream_id,
-                                "dataBase64": base64::engine::general_purpose::STANDARD
-                                    .encode(&scripted.frame),
-                            },
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await?;
-                    let mut params = json!({
-                        "instanceId": instance_id,
-                        "streamId": tty.stream_id,
-                    });
-                    if let Some(alt_screen) = scripted.alt_screen {
-                        params["altScreen"] = json!(alt_screen);
+                    let types = sent
+                        .iter()
+                        .map(|(_, _, _, media_type, _, _)| media_type.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let mut reply = if sent.is_empty() {
+                        format!("echo: {prompt}")
+                    } else {
+                        format!("echo: {prompt} [attachments: {types}]")
+                    };
+                    for (index, object_id, _kind, media_type, _name, _size) in &sent {
+                        reply.push_str(&format!(
+                            " [attachment-refs: #{} {} {}]",
+                            index.unwrap_or(0),
+                            object_id,
+                            media_type
+                        ));
                     }
-                    if let Some(progress) = scripted.progress {
-                        params["progress"] = progress;
+                    // D-027b: pull + land + expand, exactly like remuda-node.
+                    // One line per file, matching the driver's prompt expansion,
+                    // so the web transcript can fold each line like an anchor.
+                    let mut file_lines: Vec<String> = Vec::new();
+                    for (index, object_id, kind, media_type, name, size) in &sent {
+                        if kind != "file" {
+                            continue;
+                        }
+                        let landed = land_attachment(addr, &durable_token, object_id, name)
+                            .await
+                            .unwrap_or_else(|error| format!("<pull failed: {error}>"));
+                        file_lines.push(format!(
+                            "[File #{}] {} ({}, {}) saved at {}",
+                            index.unwrap_or(0),
+                            name,
+                            media_type,
+                            human_size(*size as u64),
+                            landed
+                        ));
                     }
-                    ws.send(Message::Text(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "method": "tty.mode",
-                            "params": params,
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await?;
+                    if !file_lines.is_empty() {
+                        reply.push('\n');
+                        reply.push_str(&file_lines.join("\n"));
+                    }
+                    if prompt.starts_with("stream ") {
+                        // D-028 §7: reply as an open/append chain so the web e2e
+                        // sees text arrive mid-turn, the way `MessageDisplay`
+                        // deltas do on a real agent-in-PTY session.
+                        append_n =
+                            append_stream_chunks(&mut ws, &instance_id, append_n, &reply).await?;
+                    } else {
+                        append_n =
+                            append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
+                                .await?;
+                    }
+                    // D-028 §6: a steer/queue send happens mid-turn; report the
+                    // native agent status so the web composer projects working.
+                    if params.get("mode").and_then(Value::as_str) == Some("new-turn") {
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    } else {
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "working")
+                            .await?;
+                    }
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    continue;
                 }
-                let submitted = {
-                    // note_input() above already recorded the bytes; here we
-                    // only echo printable ones and buffer the line for CR.
-                    let mut reply = Vec::new();
-                    for byte in &bytes {
-                        // ESC and CR are control bytes, not display text.
-                        if *byte != 0x1b && *byte != b'\r' {
-                            reply.push(*byte);
+                "instance.cancel" => {
+                    // §5.3: the turn ends but the instance keeps running.
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
+                "instance.configure" => {
+                    // §9.1 model-sync: a model-bearing configure emulates the
+                    // `/model` command verdict. Sentinels (posted directly by the
+                    // spec, never sent by the UI):
+                    //   "__queued__:<id>"  → model-queued lifecycle only
+                    //   "__notfound__:<id>"→ model-degraded …:not-found only
+                    //   "__resolve__:<alias>=<resolved>" → accepted, alias resolves
+                    //   to a different concrete id (the mismatch path)
+                    // Otherwise the requested id is accepted verbatim.
+                    if let Some(requested) = params.get("model").and_then(Value::as_str) {
+                        if let Some(mid) = requested.strip_prefix("__queued__:") {
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("model-queued:{mid}"),
+                            )
+                            .await?;
+                        } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("model-degraded:{mid}:not-found"),
+                            )
+                            .await?;
+                        } else {
+                            let (requested_id, resolved) = if let Some(rest) =
+                                requested.strip_prefix("__resolve__:")
+                                && let Some((alias, resolved)) = rest.split_once('=')
+                            {
+                                (alias.to_owned(), resolved.to_owned())
+                            } else {
+                                (requested.to_owned(), requested.to_owned())
+                            };
+                            append_n = append_event(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                "model",
+                                json!({
+                                    "requested": requested_id,
+                                    "effective": {
+                                        "id": resolved,
+                                        "source": "remuda",
+                                        "observedAt": "2026-09-14T12:00:00.000Z"
+                                    },
+                                    "raw": resolved
+                                }),
+                            )
+                            .await?;
+                        }
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        continue;
+                    }
+                    // §9.1 effort: emulate a native agent that accepted `/effort`
+                    // and whose command verdict reports the level back. When the
+                    // requested level differs from what the transcript says, the
+                    // fake agent reports a *clamped* level — exactly the
+                    // 请求 max → 实际 xhigh path the UI must render.
+                    //
+                    // Test-only sentinels (the UI never sends these; the spec
+                    // posts them directly to exercise the driver's lifecycle
+                    // paths without a real PTY):
+                    //   "__queued__:<word>"   → effort-queued lifecycle only
+                    //   "__degrade__:<word>"  → effort-degraded lifecycle only
+                    if let Some(effort) = params.get("effort")
+                        && let Some(requested) = effort.get("name").and_then(Value::as_str)
+                    {
+                        if let Some(word) = requested.strip_prefix("__queued__:") {
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("effort-queued:{word}"),
+                            )
+                            .await?;
+                        } else if let Some(word) = requested.strip_prefix("__degrade__:") {
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("effort-degraded:{word}:dialog-kept"),
+                            )
+                            .await?;
+                        } else {
+                            // Keep the Claude mismatch fixture; Codex must echo
+                            // both max and ultra unchanged through the Hub.
+                            let clamped = requested == "max"
+                                && instance_kinds.get(&instance_id).map(String::as_str)
+                                    == Some("claude");
+                            let ultra = requested == "ultracode";
+                            // ultracode reads back as tier xhigh on Claude; a
+                            // clamped max reads back xhigh too.
+                            let tier = if clamped || ultra { "xhigh" } else { requested };
+                            let observed_at = monotonic_effort_observed_at();
+                            let event = json!({
+                                "kind": "effort",
+                                "completeness": "structured",
+                                "payload": {
+                                    "requested": {"name": requested,
+                                        "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
+                                    "effective": {
+                                        // Measured 2.1.272: ultracode carries the
+                                        // workflow flag; a plain level accept
+                                        // positively clears it; an unrelated clamp
+                                        // leaves the flag unknown.
+                                        "name": tier,
+                                        "ultracode": if ultra {
+                                            serde_json::Value::Bool(true)
+                                        } else if clamped {
+                                            serde_json::Value::Null
+                                        } else {
+                                            serde_json::Value::Bool(false)
+                                        },
+                                        "source": "remuda",
+                                        "observedAt": observed_at
+                                    },
+                                    "raw": tier
+                                }
+                            });
+                            append_n = append_event(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                "effort",
+                                event["payload"].clone(),
+                            )
+                            .await?;
                         }
                     }
-                    if bytes.contains(&0x1b) {
-                        reply.extend_from_slice(b"\r\nQUICKFIND_ESC_RECEIVED\r\n$ ");
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
+                "instance.close" => {
+                    if claude_ptys.contains(&instance_id) {
+                        ttys.remove(&instance_id);
+                        append_n =
+                            append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
+                                .await?;
                     }
-                    if !reply.is_empty() {
-                        tty.screen.extend_from_slice(&reply);
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
+                "interaction.list" => {
+                    let items: Vec<Value> = pending.lock().await.values().cloned().collect();
+                    send_rpc_ok(&mut ws, id, json!({ "items": items })).await?;
+                }
+                "interaction.answer" => {
+                    let answer = params.get("answer").cloned().unwrap_or(json!({}));
+                    let removed =
+                        if let Some(iid) = params.get("interactionId").and_then(Value::as_str) {
+                            pending.lock().await.remove(iid)
+                        } else {
+                            None
+                        };
+                    // Journal the harness continuation DURABLY (wait for each
+                    // append ack) before answering the RPC, exactly as a real Node
+                    // applies the owner answer first: the HTTP caller may read the
+                    // journal immediately afterwards. Frames that are not the ack
+                    // we wait for are queued for the main dispatch loop.
+                    if let Some(card) = removed
+                        && card.get("kind").and_then(Value::as_str) == Some("question")
+                        && let Some(answered_instance) =
+                            card.get("instanceId").and_then(Value::as_str)
+                    {
+                        let summary = answer
+                            .get("answers")
+                            .map(question_answer_summary)
+                            .unwrap_or_default();
+                        let assistant_seq = append_journal(
+                            &mut ws,
+                            answered_instance,
+                            append_n,
+                            "assistant",
+                            &format!("AskUserQuestion answered via hook: {summary}"),
+                        )
+                        .await?;
+                        wait_frame_ack(&mut ws, &mut frame_queue, &format!("j{assistant_seq}"))
+                            .await?;
+                        append_n = assistant_seq;
+                        let idle_seq =
+                            append_native_status(&mut ws, answered_instance, append_n, "idle")
+                                .await?;
+                        wait_frame_ack(&mut ws, &mut frame_queue, &format!("j{idle_seq}")).await?;
+                        append_n = idle_seq;
+                    }
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "state": "answer-committed" }),
+                    )
+                    .await?;
+                }
+                "workspace.scm.status" | "workspace.scm.diff" | "workspace.scm.file" => {
+                    let result = g2_scm_answer(method, &params);
+                    send_rpc_ok(&mut ws, id, result).await?;
+                }
+                "subagent.transcript" => {
+                    let agent_id = params.get("agentId").and_then(Value::as_str).unwrap_or("");
+                    send_rpc_ok(&mut ws, id, drill_subagent_answer(agent_id)).await?;
+                }
+                "tty.attach" => {
+                    if claude_ptys.contains(&instance_id) && !ttys.contains_key(&instance_id) {
+                        send_rpc_error(&mut ws, id, "instance has no TTY bridge").await?;
+                        continue;
+                    }
+                    // The Hub asks for the live PTY stream when a follower opens
+                    // the terminal tab. Registering lazily keeps resume onto a
+                    // session created before this node connection behaved.
+                    let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({
+                            "ok": true,
+                            "streamId": tty.stream_id,
+                            "snapshotBase64": base64::engine::general_purpose::STANDARD
+                                .encode(&tty.screen),
+                            "availableFrom": "0",
+                            // Trustworthy current mode, the way the Node's
+                            // byte-stream scanner reports it for a herdr pane.
+                            "altScreen": tty.alt_screen,
+                            // Current OSC 9;4 state, or null before any sequence.
+                            "progress": tty.progress,
+                        }),
+                    )
+                    .await?;
+                }
+                "tty.write" => {
+                    // Raw keyboard bytes from the browser. Every byte is recorded
+                    // (the QuickFind e2e reads the Escape back via the marker) and
+                    // printable input is echoed like a cooked PTY. A CR submits
+                    // the buffered line as a commandId-less journal user node so
+                    // the C2 native-typing e2e can prove it renders once with no
+                    // command attribution.
+                    let bytes = params
+                        .get("dataBase64")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
+                        .unwrap_or_default();
+                    let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                    // Scripted alt-screen/progress transition: the sentinel
+                    // produces the raw frame (so xterm paints it) and a tty.mode
+                    // notice exactly like the Node's emulator/scanner relay.
+                    if let Some(scripted) = tty.note_input(&bytes) {
                         ws.send(Message::Text(
                             json!({
                                 "jsonrpc": "2.0",
@@ -1160,42 +1149,122 @@ async fn fake_node(
                                     "instanceId": instance_id,
                                     "streamId": tty.stream_id,
                                     "dataBase64": base64::engine::general_purpose::STANDARD
-                                        .encode(&reply),
+                                        .encode(&scripted.frame),
                                 },
                             })
                             .to_string()
                             .into(),
                         ))
                         .await?;
+                        let mut params = json!({
+                            "instanceId": instance_id,
+                            "streamId": tty.stream_id,
+                        });
+                        if let Some(alt_screen) = scripted.alt_screen {
+                            params["altScreen"] = json!(alt_screen);
+                        }
+                        if let Some(progress) = scripted.progress {
+                            params["progress"] = progress;
+                        }
+                        ws.send(Message::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "tty.mode",
+                                "params": params,
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?;
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        continue;
                     }
-                    tty.submit(&bytes)
-                };
-                if let Some(line) = submitted {
-                    append_n = append_native_user(&mut ws, &instance_id, append_n, &line).await?;
-                    append_n = append_journal(
-                        &mut ws,
-                        &instance_id,
-                        append_n,
-                        "assistant",
-                        &format!("typed echo: {line}"),
-                    )
-                    .await?;
-                    append_n =
-                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    let submitted = {
+                        // note_input() above already recorded the bytes; here we
+                        // only echo printable ones and buffer the line for CR.
+                        let mut reply = Vec::new();
+                        for byte in &bytes {
+                            // ESC and CR are control bytes, not display text.
+                            if *byte != 0x1b && *byte != b'\r' {
+                                reply.push(*byte);
+                            }
+                        }
+                        if bytes.contains(&0x1b) {
+                            reply.extend_from_slice(b"\r\nQUICKFIND_ESC_RECEIVED\r\n$ ");
+                        }
+                        if !reply.is_empty() {
+                            tty.screen.extend_from_slice(&reply);
+                            ws.send(Message::Text(
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "tty.frame",
+                                    "params": {
+                                        "instanceId": instance_id,
+                                        "streamId": tty.stream_id,
+                                        "dataBase64": base64::engine::general_purpose::STANDARD
+                                            .encode(&reply),
+                                    },
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await?;
+                        }
+                        tty.submit(&bytes)
+                    };
+                    if let Some(line) = submitted {
+                        append_n =
+                            append_native_user(&mut ws, &instance_id, append_n, &line).await?;
+                        append_n = append_journal(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "assistant",
+                            &format!("typed echo: {line}"),
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    }
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                 }
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
-            "tty.resize" => {
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
-            _ => {
-                send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-            }
-        }
+                "tty.resize" => {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
+                _ => {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Read frames until the Hub acknowledges the journal append with id `want`.
+///
+/// Any other frame read while waiting — a stale fire-and-forget append ack or
+/// an unrelated Hub RPC like the web poll's interaction.list — is stashed in
+/// `queue` for the main loop to process, so waiting on durability can never
+/// swallow an RPC.
+async fn wait_frame_ack(
+    ws: &mut NodeWs,
+    queue: &mut std::collections::VecDeque<String>,
+    want: &str,
+) -> Result<()> {
+    loop {
+        let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => text,
+            Ok(_) => anyhow::bail!("hub connection closed waiting for append ack {want}"),
+            Err(_) => anyhow::bail!("timed out waiting for append ack {want}"),
+        };
+        let value: Value = serde_json::from_str(&frame)?;
+        let matched =
+            value.get("method").is_none() && value.get("id").and_then(Value::as_str) == Some(want);
+        if matched {
+            return Ok(());
+        }
+        queue.push_back(frame.to_string());
+    }
 }
 
 /// Journal the entity lifecycle a terminal-answered question settles with:

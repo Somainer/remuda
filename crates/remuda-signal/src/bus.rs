@@ -760,6 +760,7 @@ impl SignalBus {
             )))),
             self.binding().map(|binding| binding.session_id).as_ref(),
             Completeness::Structured,
+            None,
         );
         if self.events.send(observation).await.is_err() {
             tracing::debug!("terminal answer resolution not journaled");

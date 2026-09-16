@@ -458,6 +458,46 @@ async fn hostcap_reports_capacity_and_blocks() {
 }
 
 #[tokio::test]
+async fn dispatch_pin_admits_over_cpu_ceiling_but_auto_dispatch_refuses() {
+    let mut ctx = Ctx::spawn_with_resources(json!({
+        "cpuCount": 8, "cpuPct": 100, "memPct": 20,
+        "loadAvg1": 8.0, "diskFreeGb": 120.0,
+    }))
+    .await
+    .unwrap();
+    let project = ctx.create_project(&["58670-58699"]).await;
+    let project_id = project["id"].as_str().unwrap();
+    ctx.drain_calls();
+
+    // Auto (project-member) placement refuses the genuinely saturated host.
+    let (status, body) = ctx
+        .request(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body(project_id)),
+        )
+        .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["code"], json!("PLACEMENT_UNSATISFIABLE"));
+
+    // The same host named explicitly is a pin: it launches, and the saturated
+    // reading rides the response as a warning.
+    let mut pinned = ctx.dispatch_body(project_id);
+    pinned["hostId"] = json!(ctx.host);
+    let (status, body) = ctx
+        .request("POST", "/v1/workers/dispatch", Some(pinned))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let warnings = body["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("CPU at 100%")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_rejects_brief_and_unknown_project() {
     let ctx = Ctx::spawn().await.unwrap();
     // Empty brief.

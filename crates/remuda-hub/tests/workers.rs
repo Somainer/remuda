@@ -433,6 +433,19 @@ async fn hostcap_reports_capacity_and_blocks() {
     assert_eq!(body["cores"], 8);
     assert_eq!(body["diskFreeGb"], 120.0);
     assert_eq!(body["loadAvg1"], 0.4);
+    // The fake node's resource sample carries a Hub-stamped time; hostcap
+    // surfaces both the stamp and its age so a caller can tell a live reading
+    // from the fossil the freshness window exists to catch.
+    assert!(
+        body["sampledAt"].as_str().is_some_and(|s| s.contains('T')),
+        "sampledAt must be an RFC3339 stamp: {body}"
+    );
+    assert!(
+        body["sampleAgeSec"]
+            .as_i64()
+            .is_some_and(|age| (0..=300).contains(&age)),
+        "sampleAgeSec must reflect a recent Hub-stamped sample: {body}"
+    );
     assert_eq!(body["maxInstances"], 8);
     // The fake node does not project a live instance lifecycle, so the
     // Node-confirmed running count stays 0; roster allocations are counted
@@ -442,6 +455,46 @@ async fn hostcap_reports_capacity_and_blocks() {
     assert_eq!(body["activeWorkers"], 1);
     assert_eq!(body["portBlocksInUse"].as_array().unwrap().len(), 1);
     assert_eq!(body["portBlocksInUse"][0]["block"], "58640-58649");
+}
+
+#[tokio::test]
+async fn dispatch_pin_admits_over_cpu_ceiling_but_auto_dispatch_refuses() {
+    let mut ctx = Ctx::spawn_with_resources(json!({
+        "cpuCount": 8, "cpuPct": 100, "memPct": 20,
+        "loadAvg1": 8.0, "diskFreeGb": 120.0,
+    }))
+    .await
+    .unwrap();
+    let project = ctx.create_project(&["58670-58699"]).await;
+    let project_id = project["id"].as_str().unwrap();
+    ctx.drain_calls();
+
+    // Auto (project-member) placement refuses the genuinely saturated host.
+    let (status, body) = ctx
+        .request(
+            "POST",
+            "/v1/workers/dispatch",
+            Some(ctx.dispatch_body(project_id)),
+        )
+        .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["code"], json!("PLACEMENT_UNSATISFIABLE"));
+
+    // The same host named explicitly is a pin: it launches, and the saturated
+    // reading rides the response as a warning.
+    let mut pinned = ctx.dispatch_body(project_id);
+    pinned["hostId"] = json!(ctx.host);
+    let (status, body) = ctx
+        .request("POST", "/v1/workers/dispatch", Some(pinned))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let warnings = body["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("CPU at 100%")),
+        "{warnings:?}"
+    );
 }
 
 #[tokio::test]

@@ -839,6 +839,10 @@ async fn dispatch_rpc(
         "worker.provision" => node.provision_worker(&params).await,
         "worker.remove" => node.remove_worker(&params).await,
         "host.doctor" => node.doctor().await,
+        "host.resources" => {
+            let resources = serde_json::to_value(crate::inventory::sample_resources())?;
+            Ok(json!({ "resources": resources }))
+        }
         "worktree.create" => node.create_worktree(&params),
         method if crate::workspace_scm::is_scm_method(method) => {
             crate::workspace_scm::handle_rpc(node, method, &params)

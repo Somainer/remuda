@@ -31,6 +31,10 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
     }
     match method {
         "host.doctor" => node.doctor().await,
+        "host.resources" => {
+            let resources = serde_json::to_value(crate::inventory::sample_resources())?;
+            Ok(serde_json::json!({ "resources": resources }))
+        }
         "instance.create" => {
             let created = node
                 .create_instance(create_from_params(node, &params)?)

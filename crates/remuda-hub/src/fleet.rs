@@ -314,9 +314,10 @@ async fn create_fleet(
         .to_string();
     let place_spec = PlaceSpec::from_json(&spec);
     let mut chosen = Vec::new();
+    let mut warnings = Vec::new();
     if !body.hosts.is_empty() {
         for host_id in &body.hosts {
-            let hosts = placement::pick_hosts(
+            let outcome = placement::pick_hosts(
                 &state,
                 &Placement::Host {
                     host_id: host_id.clone(),
@@ -324,7 +325,8 @@ async fn create_fleet(
                 &place_spec,
             )
             .await?;
-            chosen.extend(hosts);
+            chosen.extend(outcome.hosts);
+            warnings.extend(outcome.warnings);
         }
     } else if !body.labels.is_empty() {
         chosen = placement::pick_hosts(
@@ -334,9 +336,12 @@ async fn create_fleet(
             },
             &place_spec,
         )
-        .await?;
+        .await?
+        .hosts;
     } else {
-        chosen = placement::pick_hosts(&state, &Placement::Any, &place_spec).await?;
+        chosen = placement::pick_hosts(&state, &Placement::Any, &place_spec)
+            .await?
+            .hosts;
     }
     if let Some(max) = body.max {
         chosen.truncate(max.max(1));
@@ -391,6 +396,7 @@ async fn create_fleet(
     Ok(Json(json!({
         "fleetId": fleet_id,
         "instanceIds": instance_ids,
+        "warnings": warnings,
     })))
 }
 

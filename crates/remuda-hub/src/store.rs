@@ -2048,7 +2048,8 @@ impl Store {
                     params![herdr.to_string(), host_id],
                 )?;
             }
-            if let Some(resources) = update.resources {
+            if let Some(mut resources) = update.resources {
+                stamp_resources_sampled_at(&mut resources, &now);
                 conn.execute(
                     "UPDATE hosts SET resources_json = ?1 WHERE id = ?2",
                     params![resources.to_string(), host_id],
@@ -2073,6 +2074,29 @@ impl Store {
                 )?;
             }
             load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))
+        })
+        .await
+    }
+
+    /// Persist an on-demand `host.resources` sample fetched during placement.
+    ///
+    /// Unlike [`Self::apply_inventory`] it touches nothing but `resources_json`
+    /// (no lease/heartbeat side effects) and stamps the Hub-side sample time,
+    /// so the freshness window is measured against the Hub clock rather than
+    /// the Node's.
+    pub async fn set_host_resources(
+        &self,
+        host_id: String,
+        mut resources: Value,
+    ) -> Result<(), StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            stamp_resources_sampled_at(&mut resources, &now);
+            conn.execute(
+                "UPDATE hosts SET resources_json = ?1 WHERE id = ?2",
+                params![resources.to_string(), host_id],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -5645,6 +5669,17 @@ fn rfc3339_after(secs: i64) -> String {
         t.second(),
         t.millisecond()
     )
+}
+
+/// Stamp the Hub-side sample time onto a Node-reported `resources` object.
+///
+/// The Hub clock is authoritative: freshness gating placement against the
+/// Node's clock would break on clock skew (the hello path already measures
+/// and warns about it).
+pub(crate) fn stamp_resources_sampled_at(resources: &mut Value, now: &str) {
+    if let Some(object) = resources.as_object_mut() {
+        object.insert("sampledAt".into(), json!(now));
+    }
 }
 
 pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord>, StoreError> {

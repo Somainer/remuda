@@ -1223,9 +1223,10 @@ async fn resolve_supply_http(
     require_operator(&state, &headers).await?;
     let placement =
         crate::placement::Placement::from_value(body.placement.as_ref(), body.host_id.as_deref())?;
-    let hosts =
+    let outcome =
         crate::placement::pick_hosts(&state, &placement, &crate::placement::PlaceSpec::default())
             .await?;
+    let hosts = outcome.hosts;
     let coordinator = caller_is_coordinator(&state, &headers).await?;
     let decision = solve_state(&state, &body.task_spec, &hosts, coordinator).await?;
     let mut value = decision.to_json();

@@ -186,13 +186,27 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
           {host.resources ? (
             <>
               {host.resources.cpuPct != null ? (
-                <div className={css.metric}>
+                <div
+                  className={css.metric}
+                  title={
+                    host.resources.sampledAt
+                      ? `资源采样于 ${host.resources.sampledAt}（超 60s 会在放置前向节点重新采样）`
+                      : undefined
+                  }
+                >
                   <div className={css.metricLabel}>cpu</div>
                   <div className={css.metricValue}>{host.resources.cpuPct}%</div>
                 </div>
               ) : null}
               {host.resources.memPct != null ? (
-                <div className={css.metric}>
+                <div
+                  className={css.metric}
+                  title={
+                    host.resources.sampledAt
+                      ? `资源采样于 ${host.resources.sampledAt}（超 60s 会在放置前向节点重新采样）`
+                      : undefined
+                  }
+                >
                   <div className={css.metricLabel}>mem</div>
                   <div className={css.metricValue}>{host.resources.memPct}%</div>
                 </div>

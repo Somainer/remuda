@@ -814,6 +814,9 @@ class HubStore {
     if (!this.state.instances.some((i) => i.id === instanceId)) {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
+    // Fold projected effective state/catalog the single record carries.
+    this.hydrateEffortEffective([instance]);
+    this.hydrateModels([instance]);
     if (this.journals.has(instance.journalId)) return;
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
     const history: Observation[] = [];

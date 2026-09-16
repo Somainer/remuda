@@ -543,6 +543,29 @@ async fn fake_node(
                     .await?;
                     continue;
                 }
+                // context-usage-1: a `usage:in,out,cacheRead,cacheWrite`
+                // prompt appends one full protocol usage observation (each
+                // position `-` = the channel was not reported, exercising the
+                // Hub rollup's unknown-not-zero rule), then ends the turn.
+                if let Some(usage) = scripted_usage(prompt) {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    append_n =
+                        append_command_user(&mut ws, &instance_id, append_n, prompt, command_id)
+                            .await?;
+                    append_n =
+                        append_event(&mut ws, &instance_id, append_n, "usage", usage).await?;
+                    append_n = append_journal(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "assistant",
+                        &format!("usage recorded: {prompt}"),
+                    )
+                    .await?;
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                    continue;
+                }
                 // r-ux-comment: reply with a fenced code block so the browser
                 // spec can exercise the 评论 quote action. The prompt is also
                 // echoed verbatim below, proving the expanded quote arrived.
@@ -1640,6 +1663,55 @@ async fn append_event(
 
 fn wf_known(value: Value) -> Value {
     json!({ "state": "known", "value": value })
+}
+
+/// Parse the context-usage-1 sentinel
+/// `usage:<input>,<output>,<cacheRead>,<cacheWrite>`; each field is a
+/// non-negative integer or `-` for a channel the harness never reported.
+/// Returns the full protocol UsagePayload the driver would have appended.
+fn scripted_usage(prompt: &str) -> Option<Value> {
+    let body = prompt.strip_prefix("usage:")?;
+    let parts: Vec<Option<u64>> = body
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            if part == "-" || part.is_empty() {
+                None
+            } else {
+                part.parse::<u64>().ok()
+            }
+        })
+        .collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let (input, output, cache_read, cache_write) = (parts[0], parts[1], parts[2], parts[3]);
+    let knowledge = |value: Option<u64>| match value {
+        Some(n) => wf_known(json!(n.to_string())),
+        None => wf_unknown(),
+    };
+    // The driver's total is known only when every component was reported.
+    let total = [input, output, cache_read, cache_write]
+        .into_iter()
+        .collect::<Option<Vec<u64>>>()
+        .map(|v| v.iter().sum::<u64>());
+    Some(json!({
+        "usageId": "obj_e2e_usage",
+        "scope": "turn",
+        "scopeId": "obj_e2e_run",
+        "mode": "snapshot",
+        "metricRevision": "1",
+        "inputTokens": knowledge(input),
+        "inputAccounting": "uncached",
+        "outputTokens": knowledge(output),
+        "reasoningTokens": wf_unknown(),
+        "cacheReadTokens": knowledge(cache_read),
+        "cacheWriteTokens": knowledge(cache_write),
+        "totalTokens": knowledge(total),
+        "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
+        "accounting": "estimated",
+        "nativeFieldsRef": null
+    }))
 }
 
 fn wf_unknown() -> Value {

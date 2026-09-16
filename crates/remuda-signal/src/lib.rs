@@ -22,6 +22,7 @@ pub mod event;
 pub mod live;
 pub mod map;
 pub mod pending;
+pub mod question;
 pub mod socket;
 
 pub use approval::{ApprovalContext, approval_interaction, elicitation_interaction};
@@ -34,6 +35,10 @@ pub use event::{HookEnvelope, HookEvent, HookReply};
 pub use live::{LiveFold, LiveState, Phase, tool_node_id};
 pub use map::{Mapped, MappedKind, map_event};
 pub use pending::{DecisionKey, Outcome, PendingDecisions, RetireReason};
+pub use question::{
+    ASK_USER_QUESTION, answer_from_harness, is_ask_user_question, question_decision,
+    question_interaction, question_request, resolved_in_terminal,
+};
 pub use socket::{Delivery, HookServer, SignalSink, SocketError, deliver_event, send_event};
 
 /// How long a blocking hook waits for a decision before falling back.

@@ -572,6 +572,18 @@ impl LiveState {
             ToolOutcome::Succeeded
         };
         let text = response.map(tool_response_text).unwrap_or_default();
+        // AskUserQuestion's structured response carries no displayable text;
+        // render the answers the same way the TUI review screen does
+        // (header → chosen label; free text verbatim) so the row leaves
+        // 运行中 showing what was answered rather than the questions JSON.
+        let answer_blocks = response.map(question_answer_blocks).unwrap_or_default();
+        let blocks = if !answer_blocks.is_empty() {
+            answer_blocks
+        } else if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text(Box::new(TextBlock { text }))]
+        };
         // A background subagent launch returns immediately ("agent started in
         // background"); the launch result is `Partial` at revision 3 (the call
         // owns 1–2, matching the transcript mapper) and a SubagentStop /
@@ -597,11 +609,7 @@ impl LiveState {
             tool_call_id: node,
             stage,
             outcome,
-            blocks: if text.is_empty() {
-                Vec::new()
-            } else {
-                vec![ContentBlock::Text(Box::new(TextBlock { text }))]
-            },
+            blocks,
             structured_result: match response {
                 Some(value) => knowledge(value.clone()),
                 None => match event.payload.get("error") {
@@ -764,6 +772,46 @@ fn tool_exit_code(response: &Value) -> Option<i32> {
         .or_else(|| response.get("exit_code"))
         .and_then(Value::as_i64)
         .and_then(|code| i32::try_from(code).ok())
+}
+
+/// Render an AskUserQuestion `tool_response` into per-question answer lines,
+/// matching the TUI's review screen: `header → chosen label` for every
+/// question, multi-select labels joined; free text verbatim.
+///
+/// The structured object (`{questions, answers}`) has no text field, so
+/// without this the closed row would show an empty result body. Empty when
+/// the response is not an answered question.
+fn question_answer_blocks(response: &Value) -> Vec<ContentBlock> {
+    let (Some(questions), Some(answers)) = (
+        response.get("questions").and_then(Value::as_array),
+        response.get("answers").and_then(Value::as_object),
+    ) else {
+        return Vec::new();
+    };
+    questions
+        .iter()
+        .filter_map(|question| {
+            let key = question.get("question").and_then(Value::as_str)?;
+            let value = answers.get(key)?;
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .filter(|header| !header.is_empty())
+                .unwrap_or(key);
+            let chosen = match value {
+                Value::String(text) => text.clone(),
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => return None,
+            };
+            Some(ContentBlock::Text(Box::new(TextBlock {
+                text: format!("{header} → {chosen}"),
+            })))
+        })
+        .collect()
 }
 
 /// Read the human-readable result text from a `tool_response`.

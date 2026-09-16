@@ -513,12 +513,17 @@ pub(crate) async fn perform_switch(
         return SwitchOutcome::Unsupported;
     }
 
-    // Already showing the target (stable read) — nothing to press.
+    // Already showing the target (stable read) — nothing to press. Still arm
+    // + resolve the rendezvous and journal applied: no keystroke means no new
+    // transcript edge, so the caller's optimistic pending needs this verdict
+    // to settle.
     if bridge.observed() == Some(request.mode)
         && stable_indicator(io).await == Some(request.mode)
     {
         let generation = bridge.arm(request.mode);
         bridge.resolve(generation, request.mode);
+        io.journal(SwitchOutcome::Applied.journal_status(word, ""), Severity::Info)
+            .await;
         return SwitchOutcome::Applied;
     }
 
@@ -998,6 +1003,8 @@ mod switch_tests {
         ).await;
         assert_eq!(outcome, SwitchOutcome::Applied);
         assert!(writes.lock().unwrap().is_empty());
+        // The no-op still journals applied so an optimistic pending settles.
+        assert!(journals.lock().unwrap().iter().any(|(s, _)| s == "permission-applied:plan"));
     }
 
     #[tokio::test]

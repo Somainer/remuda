@@ -380,6 +380,7 @@ async fn handle_stdio_frame(
             || request.method == "host.doctor"
             || request.method == "host.resources"
             || crate::worktree::is_worktree_method(request.method.as_str())
+            || crate::worker::is_worker_method(request.method.as_str())
             || crate::workspace_scm::is_scm_method(request.method.as_str()) =>
         {
             let result =

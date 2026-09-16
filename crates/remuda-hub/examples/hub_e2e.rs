@@ -353,7 +353,45 @@ async fn fake_node(
     // A failed Claude launch must not acquire a TTY through lazy attach.
     let mut claude_ptys = HashSet::new();
     let mut instance_kinds: HashMap<String, String> = HashMap::new();
-    while let Some(msg) = ws.next().await {
+    // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
+    // back into this loop so journal appends stay single-writer.
+    let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
+    loop {
+        tokio::select! {
+            biased;
+            Some((closed_instance, closed_iid, terminal_answers)) = close_rx.recv() => {
+                let Some(card) = pending.lock().await.remove(&closed_iid) else {
+                    continue;
+                };
+                // A device answer may have won the first-answer race; the
+                // timer then finds nothing. When the terminal wins, journal:
+                // the interaction entity resolved (source terminal, chosen
+                // labels), an assistant turn carrying the labels, then idle.
+                append_n = append_terminal_resolution(
+                    &mut ws,
+                    &closed_instance,
+                    append_n,
+                    &card,
+                    &terminal_answers,
+                )
+                .await?;
+                append_n = append_journal(
+                    &mut ws,
+                    &closed_instance,
+                    append_n,
+                    "assistant",
+                    &format!(
+                        "AskUserQuestion answered in terminal: {}",
+                        question_answer_summary(&terminal_answers)
+                    ),
+                )
+                .await?;
+                append_n =
+                    append_native_status(&mut ws, &closed_instance, append_n, "idle").await?;
+                continue;
+            }
+            msg = ws.next() => {
+            let Some(msg) = msg else { break };
         let Ok(Message::Text(text)) = msg else {
             continue;
         };
@@ -495,7 +533,13 @@ async fn fake_node(
                 // card instead: harness-hook carrier, the real tool input as
                 // its description, and an always-allow option built from the
                 // permission_suggestion the harness offered.
-                let card = if prompt.contains("hook-approval") {
+                let card = if prompt.contains("ask-question") {
+                    fake_hook_question(
+                        &instance_id,
+                        host_id.as_id().as_str(),
+                        interaction_id.as_id().as_str(),
+                    )
+                } else if prompt.contains("hook-approval") {
                     fake_hook_approval(
                         &instance_id,
                         host_id.as_id().as_str(),
@@ -508,10 +552,32 @@ async fn fake_node(
                         interaction_id.as_id().as_str(),
                     )
                 };
+                let terminal_answer = prompt.contains("ask-question-terminal");
                 pending
                     .lock()
                     .await
-                    .insert(interaction_id.as_id().as_str().to_string(), card);
+                    .insert(interaction_id.as_id().as_str().to_string(), card.clone());
+                if terminal_answer {
+                    // Model the human answering in the agent's own TUI: after a
+                    // beat the harness closes the dialog itself (PostToolUse
+                    // with answers), without any interaction.answer RPC.
+                    let tx = close_tx.clone();
+                    let iid = interaction_id.as_id().as_str().to_string();
+                    let terminal_instance = instance_id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        let _ = tx
+                            .send((
+                                terminal_instance,
+                                iid,
+                                json!({
+                                    "q0": { "optionIds": ["继续排查 remuda 环境"], "text": null },
+                                    "q1": { "optionIds": ["保存端口"], "text": null }
+                                }),
+                            ))
+                            .await;
+                    });
+                }
                 // C2: the create prompt is a command, so its user observation
                 // carries the commandId the Hub forwards in params.
                 let command_id = params.get("commandId").and_then(Value::as_str);
@@ -944,15 +1010,42 @@ async fn fake_node(
                 send_rpc_ok(&mut ws, id, json!({ "items": items })).await?;
             }
             "interaction.answer" => {
-                if let Some(iid) = params.get("interactionId").and_then(Value::as_str) {
-                    pending.lock().await.remove(iid);
-                }
+                let answer = params.get("answer").cloned().unwrap_or(json!({}));
+                let removed = if let Some(iid) = params.get("interactionId").and_then(Value::as_str) {
+                    pending.lock().await.remove(iid)
+                } else {
+                    None
+                };
                 send_rpc_ok(
                     &mut ws,
                     id,
                     json!({ "ok": true, "state": "answer-committed" }),
                 )
                 .await?;
+                // The harness received the hook decision and continues: echo
+                // the chosen labels as the next assistant turn, so an e2e can
+                // prove from the journal that the reply really landed (rather
+                // than merely that the card disappeared).
+                if let Some(card) = removed
+                    && card.get("kind").and_then(Value::as_str) == Some("question")
+                    && let Some(instance_id) =
+                        card.get("instanceId").and_then(Value::as_str)
+                {
+                    let summary = answer
+                        .get("answers")
+                        .map(question_answer_summary)
+                        .unwrap_or_default();
+                    append_n = append_journal(
+                        &mut ws,
+                        instance_id,
+                        append_n,
+                        "assistant",
+                        &format!("AskUserQuestion answered via hook: {summary}"),
+                    )
+                    .await?;
+                    append_n =
+                        append_native_status(&mut ws, instance_id, append_n, "idle").await?;
+                }
             }
             "workspace.scm.status" | "workspace.scm.diff" | "workspace.scm.file" => {
                 let result = g2_scm_answer(method, &params);
@@ -1099,8 +1192,103 @@ async fn fake_node(
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
         }
+            }
+        }
     }
     Ok(())
+}
+
+/// Journal the entity lifecycle a terminal-answered question settles with:
+/// state `resolved`, actor human with no device, answer carried verbatim.
+async fn append_terminal_resolution(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    card: &Value,
+    answers: &Value,
+) -> Result<u64> {
+    let seq = n + 1;
+    let iid = card.get("id").and_then(Value::as_str).unwrap_or("int_e2e");
+    let mut resolved = card.clone();
+    resolved["state"] = json!("resolved");
+    resolved["blocking"] = json!(false);
+    resolved["answerable"] = json!(false);
+    resolved["revision"] = json!("2");
+    resolved["answer"] = json!({
+        "state": "known",
+        "value": {
+            "commandId": "cmd_e2e_terminal",
+            "actor": {
+                "principalId": "prn_e2e_terminal",
+                "type": "human",
+                "deviceId": null,
+                "instanceId": instance_id
+            },
+            "value": { "kind": "question", "answers": answers },
+            "committedAt": "2026-09-16T00:00:02.000Z"
+        }
+    });
+    resolved["resolution"] = json!({
+        "state": "known",
+        "value": { "reason": "answered", "eventIds": [] }
+    });
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": format!("j{seq}"), "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity",
+                        "entityType": "interaction",
+                        "entityId": iid,
+                        "revision": "2",
+                        "previousState": "pending",
+                        "state": "resolved",
+                        "reasonCode": "terminal-answered",
+                        "entity": resolved
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    Ok(seq)
+}
+
+/// One-line per-question label summary of a card answer, for the assistant
+/// journal turn the harness emits after receiving the answers.
+fn question_answer_summary(answers: &Value) -> String {
+    answers
+        .as_object()
+        .map(|fields| {
+            fields
+                .values()
+                .map(|field| {
+                    let options = field
+                        .get("optionIds")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    field
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or(&options)
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default()
 }
 
 /// Synthetic answers for the three read-only `workspace.scm.*` RPCs. Every body
@@ -1769,6 +1957,76 @@ fn fake_hook_approval(instance_id: &str, host_id: &str, interaction_id: &str) ->
             ],
             "requestedPermissionsRef": null,
             "inputDigest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        "deadline": { "state": "unknown", "reason": "none", "evidenceEventIds": [] },
+        "deadlineSource": "runtime-policy",
+        "answer": { "state": "not-applicable" },
+        "delivery": "not-sent",
+        "resolution": { "state": "not-applicable" }
+    })
+}
+
+/// A hook-carried AskUserQuestion, shaped like the one the Node builds from a
+/// real `PermissionRequest` whose tool_name is `AskUserQuestion` (measured on
+/// claude 2.1.272; `docs/design/evidence/ask-user-question-1.md`).
+///
+/// Two fields — one radio, one checkbox — with label+description options and
+/// free text, exactly what the harness TUI renders. The option id is the
+/// label itself: the hook reply's `updatedInput.answers` is keyed by question
+/// text and carries labels verbatim.
+fn fake_hook_question(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {
+    json!({
+        "id": interaction_id,
+        "revision": "1",
+        "createdAt": "2026-09-16T00:00:00.000Z",
+        "updatedAt": "2026-09-16T00:00:00.000Z",
+        "instanceId": instance_id,
+        "runId": null,
+        "hostId": host_id,
+        "kind": "question",
+        "requestKey": {
+            "native": { "type": "hook", "invocationId": interaction_id },
+            "processGeneration": "1",
+            "runGeneration": "1",
+            "connectionEpoch": host_id
+        },
+        "requestVersion": "1",
+        "state": "pending",
+        "blocking": true,
+        "answerable": true,
+        "carrier": "harness-hook",
+        "request": {
+            "kind": "question",
+            "title": "AskUserQuestion",
+            "fields": [
+                {
+                    "id": "q0",
+                    "title": "接下来这个会话主要想做什么？",
+                    "description": "下一步",
+                    "input": "single-select",
+                    "required": true,
+                    "options": [
+                        { "id": "继续排查 remuda 环境", "label": "继续排查 remuda 环境", "description": "沿当前环境线索继续排查" },
+                        { "id": "回到 GravityDB 开发", "label": "回到 GravityDB 开发", "description": "切回数据库侧开发" },
+                        { "id": "验证 shim 与 lease 行为", "label": "验证 shim 与 lease 行为", "description": "跑一轮行为验证" }
+                    ],
+                    "allowFreeText": true,
+                    "sensitive": false
+                },
+                {
+                    "id": "q1",
+                    "title": "要把哪些设置记下来？",
+                    "description": "记忆",
+                    "input": "multi-select",
+                    "required": true,
+                    "options": [
+                        { "id": "保存端口", "label": "保存端口", "description": "记住本次使用的端口" },
+                        { "id": "保存环境变量", "label": "保存环境变量", "description": "记住相关环境变量" }
+                    ],
+                    "allowFreeText": true,
+                    "sensitive": false
+                }
+            ]
         },
         "deadline": { "state": "unknown", "reason": "none", "evidenceEventIds": [] },
         "deadlineSource": "runtime-policy",

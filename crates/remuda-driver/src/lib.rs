@@ -20,6 +20,7 @@ mod driver;
 pub mod effort;
 mod error;
 mod flags;
+pub mod permission;
 pub mod generic_pty;
 pub mod grok_session;
 pub mod hook_answer;

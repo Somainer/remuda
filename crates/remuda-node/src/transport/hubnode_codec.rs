@@ -478,6 +478,7 @@ async fn dispatch_configure(node: &DevNode, params: Value) -> Result<Value, Node
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                permission_mode: None,
             }
             .with_configure(&params),
         )
@@ -641,6 +642,7 @@ async fn submit(
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                permission_mode: None,
             },
         )
         .await?;

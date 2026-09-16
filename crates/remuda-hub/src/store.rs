@@ -3860,6 +3860,29 @@ fn apply_effective_effort_projection(
     Ok(())
 }
 
+/// §5.1: persist the transcript-observed effective permission mode onto the
+/// spec, mirroring `effortEffective`.
+fn apply_effective_permission_projection(
+    conn: &Connection,
+    instance_id: &str,
+    effective: &Value,
+) -> Result<(), StoreError> {
+    let spec_raw: String = conn.query_row(
+        "SELECT spec_json FROM instances WHERE id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let mut spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+    if let Some(object) = spec.as_object_mut() {
+        object.insert("permissionEffective".into(), effective.clone());
+        conn.execute(
+            "UPDATE instances SET spec_json = ?1 WHERE id = ?2",
+            params![Value::Object(object.clone()).to_string(), instance_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_instance_projection(
     conn: &Connection,
     instance_id: &str,
@@ -3879,6 +3902,10 @@ fn apply_instance_projection(
         && let Some(effective) = payload.get("effective")
     {
         apply_effective_model_projection(conn, instance_id, effective, payload.get("catalog"))?;
+    if kind == "permission"
+        && let Some(effective) = payload.get("effective")
+    {
+        apply_effective_permission_projection(conn, instance_id, effective)?;
     }
     let mut lifecycle: Option<&str> = None;
     let mut last_error: Option<String> = None;

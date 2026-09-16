@@ -685,12 +685,16 @@ impl Driver for NativeAdapter {
                     model,
                     effort,
                     effort_index: _,
+                    effort_index,
+                    permission_mode,
                 } => {
                     let effort = effort.filter(|value| !value.is_empty());
+                    let permission_mode = permission_mode.filter(|value| !value.is_empty());
                     let switch = remuda_protocol::ModelSwitchInput {
                         model_id: model.clone().unwrap_or_default(),
                         effective: remuda_protocol::ModelEffective::NextTurn,
                         effort: effort.clone(),
+                        permission_mode: permission_mode.clone(),
                     };
                     // §9.1: both effort and model switches report their own
                     // lifecycle from the driver (`effort-applied` /
@@ -698,6 +702,30 @@ impl Driver for NativeAdapter {
                     // transcript read-back. A generic "applied" here would
                     // claim success before the verdict exists.
                     self.native
+                    // §9.1: an effort or permission-mode switch reports its own
+                    // lifecycle from the driver (`effort-applied` /
+                    // `permission-applied`, plus queued/degraded) after
+                    // read-back. A generic "applied" here would claim it
+                    // before the read-back exists.
+                    let model_empty = model.as_deref().is_none_or(str::is_empty);
+                    if model_empty && (effort.is_some() || permission_mode.is_some()) {
+                        self.native
+                            .send(remuda_protocol::DriverInput::ModelSwitch(Box::new(switch)))
+                            .await
+                            .map_err(map_driver_error)?;
+                        return Ok(Vec::new());
+                    }
+                    let applied = format!(
+                        "model={} effort={} index={} permission={}",
+                        model.as_deref().unwrap_or("-"),
+                        effort.as_deref().unwrap_or("-"),
+                        effort_index
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        permission_mode.as_deref().unwrap_or("-")
+                    );
+                    match self
+                        .native
                         .send(remuda_protocol::DriverInput::ModelSwitch(Box::new(switch)))
                         .await
                         .map_err(map_driver_error)?;

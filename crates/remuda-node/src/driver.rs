@@ -68,7 +68,8 @@ pub enum DriverRequest {
         /// Normalized key names (`enter`, `esc`, `ctrl+c`, …).
         keys: Vec<String>,
     },
-    /// Switch model / effort on a live driver (`instance.configure`).
+    /// Switch model / effort / permission mode on a live driver
+    /// (`instance.configure`).
     Configure {
         /// Requested model id, when present.
         model: Option<String>,
@@ -76,6 +77,8 @@ pub enum DriverRequest {
         effort: Option<String>,
         /// Native effort index.
         effort_index: Option<u32>,
+        /// Native permission-mode word.
+        permission_mode: Option<String>,
     },
 }
 
@@ -340,15 +343,17 @@ impl Driver for FakeDriver {
                     model,
                     effort,
                     effort_index,
+                    permission_mode,
                 } => Ok(vec![DriverEmission::NativeLifecycle {
                     name: "instance.configure".to_owned(),
                     status: format!(
-                        "applied model={} effort={} index={}",
+                        "applied model={} effort={} index={} permission={}",
                         model.as_deref().unwrap_or("-"),
                         effort.as_deref().unwrap_or("-"),
                         effort_index
                             .map(|n| n.to_string())
-                            .unwrap_or_else(|| "-".into())
+                            .unwrap_or_else(|| "-".into()),
+                        permission_mode.as_deref().unwrap_or("-")
                     ),
                     severity: Severity::Info,
                 }]),

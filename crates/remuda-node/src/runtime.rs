@@ -2097,6 +2097,7 @@ fn command_parts(
                 model: request.model.clone(),
                 effort: request.effort_name.clone(),
                 effort_index: request.effort_index,
+                permission_mode: request.permission_mode.clone(),
             },
             false,
         )),

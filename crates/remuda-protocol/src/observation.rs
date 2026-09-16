@@ -943,6 +943,27 @@ pub struct ModelPayload {
     pub catalog: Option<ModelCatalogInfo>,
 }
 
+///
+/// Emitted whenever the effective permission mode is observed — the native
+/// TUI status line and the transcript's `permission-mode` records agree.
+/// Unchanged values are deduped by the observing driver, so the Hub only
+/// sees edges. The UI renders from this observation — never from the
+/// requested mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionPayload {
+    /// The mode Remuda asked for (launch argv or an in-session switch), when
+    /// known on the observing side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    /// The mode actually observed.
+    pub effective: PermissionEffective,
+    /// Native spelling read off the record or status line, kept for
+    /// diagnostics (an unknown future name normalizes into `mode`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+}
+
 /// ObservationPayload; `protocol.md` §5.1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", content = "payload")]
@@ -992,6 +1013,9 @@ pub enum ObservationPayload {
     /// `model` payload; §5.1 / D-028 §9.1 model sync.
     #[serde(rename = "model")]
     Model(Box<ModelPayload>),
+    /// `permission` payload; §5.1.
+    #[serde(rename = "permission")]
+    Permission(Box<PermissionPayload>),
     /// `raw_tty` payload; §5.1.
     #[serde(rename = "raw_tty")]
     RawTty(Box<RawTtyPayload>),
@@ -1019,6 +1043,7 @@ impl ObservationPayload {
             Self::Artifact(..) => ObservationKind::Artifact,
             Self::Effort(..) => ObservationKind::Effort,
             Self::Model(..) => ObservationKind::Model,
+            Self::Permission(..) => ObservationKind::Permission,
             Self::RawTty(..) => ObservationKind::RawTty,
             Self::Opaque(..) => ObservationKind::Opaque,
         }

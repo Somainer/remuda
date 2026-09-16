@@ -2014,6 +2014,10 @@ pub struct TranscriptMapper {
     model_catalog: Option<remuda_protocol::ModelCatalogInfo>,
     /// Whether the launch model snapshot was already emitted.
     model_launch_emitted: bool,
+    /// Effective permission-mode read-back state (dedup + attribution).
+    permission: remuda_protocol::LivePermissionTracker,
+    /// Rendezvous for Remuda-initiated permission switches.
+    permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
 }
 
 impl TranscriptMapper {
@@ -2056,6 +2060,8 @@ impl TranscriptMapper {
             model_generation: None,
             model_catalog: None,
             model_launch_emitted: false,
+            permission: remuda_protocol::LivePermissionTracker::new(),
+            permission_bridge: None,
         }
     }
 
@@ -2128,6 +2134,22 @@ impl TranscriptMapper {
             NativeRequestKey::None,
             payload,
         )?])
+    }
+
+    /// Attach the permission bridge so shift+tab switches get transcript
+    /// corroboration and `permission` observations are emitted. `launch` names
+    /// the mode the process started with, when known.
+    pub(crate) fn with_permission_bridge(
+        mut self,
+        bridge: Arc<crate::permission::PermissionBridge>,
+        launch: Option<ClaudePermissionMode>,
+    ) -> Self {
+        if let Some(mode) = launch {
+            self.permission.mark_launch(mode);
+            bridge.note_launch_mode(mode);
+        }
+        self.permission_bridge = Some(bridge);
+        self
     }
 
     /// Map one transcript line. Blank lines and undecodable JSON yield nothing:
@@ -2231,6 +2253,7 @@ impl TranscriptMapper {
         } else if kind == "user" {
             extra = self.note_effort_user(&value)?;
             extra.extend(self.note_model_user(&value)?);
+            extra.extend(self.note_permission_user(&value)?);
         } else if kind == "system" {
             extra = self.note_model_system(&value)?;
         } else if kind == "attachment" {
@@ -2322,6 +2345,19 @@ impl TranscriptMapper {
                 };
                 bridge.reject(generation, reason);
             }
+        }
+        Ok(Vec::new())
+    }
+
+    /// A `/plan` command switches mode natively; arm slash attribution so the
+    /// following `permission-mode` edge is attributed to the terminal.
+    fn note_permission_user(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        let Some(message) = value.get("message") else {
+            return Ok(Vec::new());
+        };
+        let text = records::record_text(message);
+        if text.contains("<command-name>/plan</command-name>") {
+            self.permission.note_slash();
         }
         Ok(Vec::new())
     }
@@ -2642,21 +2678,87 @@ impl TranscriptMapper {
         )?])
     }
 
-    /// `permission-mode` / `mode` → a permission lifecycle recording the drift.
+    /// `permission-mode` / `mode` → the effective-mode edge observation plus
+    /// the existing permission lifecycle recording the drift.
     fn map_permission_mode(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
-        let mode = value
-            .get("mode")
-            .or_else(|| value.get("permissionMode"))
+        let raw = value
+            .get("permissionMode")
+            .or_else(|| value.get("mode"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let session_id = self.mapper.session_id.clone();
-        Ok(vec![self.mapper.lifecycle_related(
+        let lifecycle = self.mapper.lifecycle_related(
             LifecycleTopic::Permission,
             "permission-mode",
             Knowledge::Known { value: session_id },
-            mode,
+            raw,
             std::collections::BTreeMap::new(),
             false,
+        )?;
+
+        // `mode: "normal"` records the TUI render mode, not a permission mode;
+        // only permission vocabulary emits an effective edge.
+        let Some(mode) = crate::permission::from_native(raw) else {
+            return Ok(vec![lifecycle]);
+        };
+        let pending = self
+            .permission_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.pending_with_gen());
+        let remuda_pending = pending.map(|(_, target)| target);
+        let Some((observed, source)) = self.permission.note(raw, remuda_pending) else {
+            // Even a deduped record settles a live switch the status line has
+            // not been read for (e.g. right after launch).
+            if let Some((generation, target)) = pending
+                && target == mode
+            {
+                self.permission_bridge
+                    .as_ref()
+                    .expect("pending implies a bridge")
+                    .resolve(generation, mode);
+            }
+            return Ok(vec![lifecycle]);
+        };
+        if let Some((generation, target)) = pending
+            && target == observed
+        {
+            self.permission_bridge
+                .as_ref()
+                .expect("pending implies a bridge")
+                .resolve(generation, observed);
+        }
+        let mut out = self.permission_observation(observed, source, Some(raw.to_owned()))?;
+        out.push(lifecycle);
+        Ok(out)
+    }
+
+    /// Build the effective permission-mode observation for one edge.
+    fn permission_observation(
+        &mut self,
+        mode: ClaudePermissionMode,
+        source: remuda_protocol::PermissionSource,
+        raw: Option<String>,
+    ) -> DriverResult<Vec<Observation>> {
+        let requested = self
+            .permission_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.armed())
+            .map(|(_, target)| crate::permission::wire_word(target).to_owned());
+        let payload = ObservationPayload::Permission(Box::new(
+            remuda_protocol::PermissionPayload {
+                requested,
+                effective: remuda_protocol::PermissionEffective {
+                    mode: crate::permission::wire_word(mode).to_owned(),
+                    source,
+                    observed_at: now()?,
+                },
+                raw,
+            },
+        ));
+        Ok(vec![self.mapper.observation(
+            Completeness::Structured,
+            NativeRequestKey::None,
+            payload,
         )?])
     }
 

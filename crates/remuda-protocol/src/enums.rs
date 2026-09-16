@@ -371,6 +371,18 @@ wire_enum!(EffortSource, "9.1", {
     Unknown => "unknown",
 });
 
+// Where an *effective* permission-mode observation came from; mirrors
+// [`EffortSource`]. `launch` = read back after a `--permission-mode` launch
+// flag; `slash` = the user typed `/plan` (or a future mode command) in the
+// native TUI; `remuda` = a Remuda shift+tab push-down; `unknown` = observed
+// (e.g. a bare shift+tab) with no attributable switch.
+wire_enum!(PermissionSource, "9.1", {
+    Launch => "launch",
+    Slash => "slash",
+    Remuda => "remuda",
+    Unknown => "unknown",
+});
+
 wire_enum!(ClaudePermissionMode, "4.1", {
     Manual => "manual",
     Auto => "auto",
@@ -798,6 +810,7 @@ wire_enum!(ObservationKind, "5.1", {
     Artifact => "artifact",
     Effort => "effort",
     Model => "model",
+    Permission => "permission",
     RawTty => "raw_tty",
     Opaque => "opaque",
 });

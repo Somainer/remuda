@@ -67,6 +67,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                permission_mode: None,
                     }
                     .with_configure(&params),
                 )
@@ -91,6 +92,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                permission_mode: None,
                     },
                 )
                 .await?;
@@ -120,6 +122,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                permission_mode: None,
                     },
                 )
                 .await?;
@@ -147,6 +150,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                permission_mode: None,
                     },
                 )
                 .await?;

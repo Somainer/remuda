@@ -708,6 +708,8 @@ pub(super) fn spawn(
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<remuda_protocol::EffortSelection>,
     model: Option<ModelSync>,
+    permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
+    launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
@@ -1079,6 +1081,8 @@ pub(super) fn spawn(
                         effort_bridge.as_ref(),
                         launch_effort,
                         model.as_ref(),
+                        permission_bridge.as_ref(),
+                        launch_permission,
                     )
                     .await;
                 }
@@ -1279,6 +1283,8 @@ async fn maintain_binding(
     effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
     model: Option<&ModelSync>,
+    permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
+    launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1395,6 +1401,7 @@ async fn maintain_binding(
 
     if hydrator.is_none() {
         *hydrator = Hydrator::open(ctx, &binding, effort_bridge, launch_effort, model);
+        *hydrator = Hydrator::open(ctx, &binding, effort_bridge, launch_effort, permission_bridge, launch_permission);
     }
     if let Some(active) = hydrator.as_mut() {
         match pump(active, events, seq, ctx).await {
@@ -1486,6 +1493,20 @@ pub(super) fn effort_lifecycle(status: &str, severity: Severity) -> ObservationP
     .1
 }
 
+/// `instance.configure` permission lifecycle (`permission-queued`,
+/// `permission-applied`, `permission-degraded`, …) from the wheel worker.
+pub(super) fn permission_lifecycle(status: &str, severity: Severity) -> ObservationPayload {
+    native(
+        LifecycleTopic::Configuration,
+        "instance.configure",
+        Knowledge::NotApplicable,
+        status,
+        BTreeMap::new(),
+        severity,
+    )
+    .1
+}
+
 /// One detection sample: foreground process group first, screen as fallback.
 async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> {
     let pgid = {
@@ -1524,6 +1545,8 @@ impl Hydrator {
         effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
         launch_effort: Option<EffortSelection>,
         model: Option<&ModelSync>,
+        permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
+        launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
@@ -1555,6 +1578,8 @@ impl Hydrator {
             {
                 pending = observations;
             }
+        if let Some(bridge) = permission_bridge {
+            mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }
         Some(Self {
             mapper,

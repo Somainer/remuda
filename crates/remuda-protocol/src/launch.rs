@@ -345,6 +345,24 @@ pub struct EffortEffective {
     pub observed_at: Timestamp,
 }
 
+/// Effective permission mode, read back from the native TUI status line and
+/// the transcript's `permission-mode` records.
+///
+/// Mirrors [`EffortEffective`]: this is the *observed* mode, never the
+/// requested one. `mode` carries the protocol wire spelling for every harness
+/// (Claude's TUI/transcript spelling `default` is normalized to `manual` by
+/// the observing driver).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionEffective {
+    /// Observed mode in protocol wire spelling.
+    pub mode: String,
+    /// What established this mode.
+    pub source: PermissionSource,
+    /// When the observation was made.
+    pub observed_at: Timestamp,
+}
+
 /// Claude renderer requested at launch (D-028 §9.2).
 ///
 /// This is intent only; the terminal snapshot's `altScreen` reports the
@@ -495,6 +513,11 @@ pub struct ModelSwitchInput {
     /// Native effort tier name when the driver supports a runtime switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Native permission-mode spelling when the driver supports a runtime
+    /// switch (Claude PTY: shift+tab cycling). Launch-only modes the carrier
+    /// cannot cycle into are rejected by the driver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 /// DriverInput; `protocol.md` §3.1.

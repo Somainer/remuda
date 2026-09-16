@@ -482,6 +482,7 @@ mod tests {
                     model_id: "opus".into(),
                     effective: remuda_protocol::ModelEffective::NextTurn,
                     effort: Some("ultracode".into()),
+                    permission_mode: None,
                 },
             )))
             .await

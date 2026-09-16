@@ -272,16 +272,23 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                 let is_hello = kind.is_some_and(HubNodeMethod::is_hello);
                 let is_auth = kind.is_some_and(HubNodeMethod::is_auth);
                 if !hello_done && !is_hello && !is_auth {
+                    // Terminal: write straight to the socket so the frame is
+                    // flushed before this loop drops the connection.
                     if !id.is_null() {
-                        let _ = out_tx.send(rpc_err(id, -32000, "runtime.hello required")).await;
+                        let _ = sink
+                            .send(Message::Text(
+                                rpc_err(id, -32000, "runtime.hello required").to_string().into(),
+                            ))
+                            .await;
                     }
                     break;
                 }
                 match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, method, params, &out_tx, &pending).await {
-                    // Replies ride the same FIFO as handler-emitted frames
-                    // (object.pull streams its chunks just before this reply),
-                    // so they are queued rather than written straight to the
-                    // socket — a direct send could overtake queued chunks.
+                    // Normal replies ride the same FIFO as handler-emitted
+                    // frames (object.pull streams its chunks just before this
+                    // reply), so they are queued rather than written straight
+                    // to the socket — a direct send could overtake queued
+                    // chunks.
                     Ok(Some(result)) => {
                         if !id.is_null() {
                             let _ = out_tx.send(rpc_ok(id, result)).await;
@@ -289,8 +296,16 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        // Unauthenticated is terminal: flush the error directly
+                        // before closing (a queued frame could be dropped).
                         if !id.is_null() {
-                            let _ = out_tx.send(rpc_err(id, rpc_code(&err), &err.to_string())).await;
+                            let _ = sink
+                                .send(Message::Text(
+                                    rpc_err(id, rpc_code(&err), &err.to_string())
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
                         }
                         if matches!(err, HubError::Unauthenticated) {
                             break;

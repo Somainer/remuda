@@ -53,16 +53,31 @@ async function patchMaxInstances(page: Page, value: number): Promise<number | un
 }
 
 async function forceDeleteAllInstances(page: Page) {
+  // The list key is `instanceId` (not `id`); a wrong key deletes
+  // `/v1/instances/undefined` and leaves a live/requested row holding a
+  // placement slot, which makes a later serial spec hit the fake node's
+  // maxInstances cap. Wait for each delete to settle so no slot leaks.
   await page.evaluate(async () => {
     const list = await fetch("/v1/instances", { credentials: "include" });
-    const body = (await list.json()) as { items?: { id: string }[] };
+    const body = (await list.json()) as {
+      items?: { instanceId?: string; lifecycle?: string }[];
+    };
     await Promise.all(
-      (body.items ?? []).map((instance) =>
-        fetch(`/v1/instances/${instance.id}?force=1`, {
-          method: "DELETE",
-          credentials: "include",
-        }).catch(() => undefined),
-      ),
+      (body.items ?? [])
+        .filter((instance) => instance.instanceId)
+        .filter(
+          (instance) =>
+            instance.lifecycle !== "exited" &&
+            instance.lifecycle !== "failed" &&
+            instance.lifecycle !== "closed",
+        )
+        .map(async (instance) => {
+          const response = await fetch(
+            `/v1/instances/${instance.instanceId}?force=1`,
+            { method: "DELETE", credentials: "include" },
+          );
+          if (!response.ok) throw new Error(`force delete failed: ${response.status()}`);
+        }),
     );
   });
 }

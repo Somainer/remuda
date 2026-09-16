@@ -37,7 +37,7 @@
 //! one debug log this path emits goes through [`redact_settings`]) or shown in
 //! the web — the launch audit records the file digest and env *names* only.
 
-use crate::error::{DriverError, DriverResult};
+use crate::error::DriverResult;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -48,10 +48,12 @@ const LOCAL_SETTINGS: &str = "settings.local.json";
 /// Load the launching user's effective user-level settings from `config_dir`.
 ///
 /// `settings.json` is merged first and `settings.local.json` overlays it with
-/// [`merge_settings_layers`]. Returns `Ok(None)` when neither file exists. A
-/// present-but-unreadable or malformed file is an error, not a silent skip:
-/// proceeding without it could send traffic to the wrong endpoint with no
-/// credential while looking like a normal launch.
+/// [`merge_settings_layers`]. Returns `Ok(None)` when no usable settings are
+/// available: no files, a present-but-unreadable file, or a malformed/non-object
+/// document all degrade to Remuda-only overlay rather than failing the launch.
+/// The overlay is additive to the harness configuration — a bad user file must
+/// never turn instance creation into an error, so the degradation is logged
+/// (with no file contents) and treated like an absent layer.
 pub fn load_effective_user_settings(config_dir: &Path) -> DriverResult<Option<Value>> {
     let shared = read_settings_object(&config_dir.join(SHARED_SETTINGS))?;
     let local = read_settings_object(&config_dir.join(LOCAL_SETTINGS))?;
@@ -63,26 +65,40 @@ pub fn load_effective_user_settings(config_dir: &Path) -> DriverResult<Option<Va
     })
 }
 
-/// Read one settings file. `Ok(None)` means the file does not exist.
+/// Read one settings file. `Ok(None)` means the file does not exist or could
+/// not be used (unreadable, malformed JSON, non-object): the launch proceeds
+/// without that layer instead of failing.
 fn read_settings_object(path: &Path) -> DriverResult<Option<Value>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "user settings unreadable; launching without that layer"
+            );
+            return Ok(None);
+        }
     };
-    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
-        DriverError::SettingsIsolationUnavailable(format!(
-            "{} is not valid settings JSON: {error}",
-            path.display()
-        ))
-    })?;
-    if !value.is_object() {
-        return Err(DriverError::SettingsIsolationUnavailable(format!(
-            "{} must contain a JSON settings object",
-            path.display()
-        )));
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) if value.is_object() => Ok(Some(value)),
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "user settings must be a JSON object; launching without that layer"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "user settings are not valid JSON; launching without that layer"
+            );
+            Ok(None)
+        }
     }
-    Ok(Some(value))
 }
 
 /// Merge two settings layers in Claude's precedence order: `lower` first,
@@ -325,12 +341,26 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_settings_file_fails_the_load_rather_than_dropping_it() {
+    fn malformed_or_nonobject_settings_degrade_to_no_layer_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
+        // A broken shared file must never fail the launch: the caller falls
+        // back to Remuda-only overlay and instance creation proceeds.
         write(dir.path(), SHARED_SETTINGS, r#"{"env": "#);
-        assert!(load_effective_user_settings(dir.path()).is_err());
-        write(dir.path(), SHARED_SETTINGS, r#"[1, 2]"#);
-        assert!(load_effective_user_settings(dir.path()).is_err());
+        assert_eq!(load_effective_user_settings(dir.path()).unwrap(), None);
+
+        // A valid local file still overlays when shared is unusable.
+        write(dir.path(), LOCAL_SETTINGS, r#"{"verbose": true}"#);
+        assert_eq!(
+            load_effective_user_settings(dir.path())
+                .unwrap()
+                .map(|v| v["verbose"].as_bool()),
+            Some(Some(true))
+        );
+
+        // A non-object document degrades the same way.
+        let dir2 = tempfile::tempdir().unwrap();
+        write(dir2.path(), SHARED_SETTINGS, r#"[1, 2]"#);
+        assert_eq!(load_effective_user_settings(dir2.path()).unwrap(), None);
     }
 
     #[test]

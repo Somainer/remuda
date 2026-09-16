@@ -1218,6 +1218,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/workers/observe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Read every live worker's screen, classify it, and persist the observation (remuda watch) */
+        post: operations["workerObserve"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/workers/{id}": {
         parameters: {
             query?: never;
@@ -1235,6 +1252,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/workers/{id}/answer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Answer a dialog with enter/esc/a digit/free text through tty.write */
+        post: operations["workerAnswer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/workers/{id}/brief": {
         parameters: {
             query?: never;
@@ -1246,6 +1280,57 @@ export interface paths {
         put?: never;
         /** Re-deliver a brief/handback file to a live worker */
         post: operations["workerBrief"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/nudge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Nudge a worker to continue (throttled by project policy) */
+        post: operations["workerNudge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/replace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retire a worker and dispatch the same brief again (fresh branch) */
+        post: operations["workerReplace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Respawn a lost worker (native resume or same-worktree relaunch) and re-send the brief */
+        post: operations["workerResume"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1280,6 +1365,40 @@ export interface paths {
         put?: never;
         /** Record a worker's DONE/BLOCKED/working state */
         post: operations["workerState"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stop a worker instance without reclaiming its worktree */
+        post: operations["workerStop"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/workers/{id}/switch-model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Run the /model + confirm key dance, gated on the screen confirmation */
+        post: operations["workerSwitchModel"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2351,6 +2470,14 @@ export interface components {
         };
         /** @enum {string} */
         TuiMode: "fullscreen" | "default";
+        /** @description Result of a worker intervention verb; carries the updated roster row and/or the queued command. */
+        WorkerActionResult: {
+            [key: string]: unknown;
+        };
+        WorkerAnswer: {
+            /** @description enter | esc | a digit 1..9 | free text (submitted with Enter). */
+            key: string;
+        };
         WorkerBriefResult: {
             command?: {
                 [key: string]: unknown;
@@ -2365,6 +2492,11 @@ export interface components {
             /** @description Brief bytes (utf8); staged as an object attachment, never inlined. */
             brief: string;
             briefName?: string;
+            /**
+             * @description Optional carrier override; shell-pty is the native screen-readable carrier for remuda watch.
+             * @enum {string}
+             */
+            driver?: "claude-pty" | "shell-pty" | "claude-print" | "generic-pty";
             /** @enum {string} */
             harness?: "claude" | "codex" | "grok";
             hostId?: string;
@@ -2382,9 +2514,25 @@ export interface components {
             warnings?: string[];
             worker: components["schemas"]["WorkerRoster"];
         };
+        WorkerNudge: {
+            /** @description Custom nudge; absent delivers the default continue prompt as a file. */
+            text?: string;
+        };
+        WorkerObserve: {
+            projectId?: string;
+            /** Format: int64 */
+            stallMins?: number;
+        };
+        WorkerObserveResult: {
+            items: components["schemas"]["WorkerRoster"][];
+        };
         WorkerPage: {
             items: components["schemas"]["WorkerRoster"][];
             nextCursor?: string | null;
+        };
+        WorkerResume: {
+            /** @description Override the state-loss handback note. */
+            handback?: string;
         };
         WorkerRetire: {
             /** @default false */
@@ -2406,12 +2554,16 @@ export interface components {
             hostId: string;
             id: string;
             instanceId?: string;
+            /** Format: date-time */
+            lastNudgeAt?: string;
             model?: string;
             name: string;
             portBlock?: string | null;
             projectId: string;
             providerProfileId?: string;
             reclaimedBytes?: string;
+            replaceCount?: string;
+            resumedFrom?: string;
             revision: string;
             state: components["schemas"]["WorkerState"];
             supplyDecision?: {
@@ -2421,6 +2573,7 @@ export interface components {
             taskId?: string;
             /** Format: date-time */
             updatedAt: string;
+            watch?: components["schemas"]["WorkerWatch"];
             workspaceId: string;
             worktreePath: string;
         };
@@ -2453,6 +2606,27 @@ export interface components {
             sha?: string;
             state: components["schemas"]["WorkerStateKind"];
         };
+        WorkerSwitchModel: {
+            model: string;
+        };
+        /** @description Point-in-time remuda-watch classification persisted on the roster row (5b). */
+        WorkerWatch: {
+            detail?: string;
+            /** Format: date-time */
+            lastActivityAt?: string;
+            lastBlocked?: string;
+            lastDoneSha?: string;
+            lastScreenDigest?: string;
+            /** Format: date-time */
+            observedAt: string;
+            /** @description Present when status is blocked. */
+            reason?: string;
+            /** @description Present when status is done. */
+            sha?: string;
+            status: components["schemas"]["WorkerWatchStatus"];
+        };
+        /** @enum {string} */
+        WorkerWatchStatus: "working" | "done" | "blocked" | "idle-api-error" | "stalled" | "gone";
         WorktreeCreate: {
             /** @description Start-point (default main). */
             base?: string;
@@ -4964,6 +5138,33 @@ export interface operations {
             429: components["responses"]["Error"];
         };
     };
+    workerObserve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerObserve"];
+            };
+        };
+        responses: {
+            /** @description Roster rows with fresh watch classifications */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerObserveResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
     workerGet: {
         parameters: {
             query?: never;
@@ -4983,6 +5184,36 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkerRoster"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    workerAnswer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerAnswer"];
+            };
+        };
+        responses: {
+            /** @description Keys written to the worker PTY */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerActionResult"];
                 };
             };
             400: components["responses"]["Error"];
@@ -5018,6 +5249,94 @@ export interface operations {
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
+        };
+    };
+    workerNudge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerNudge"];
+            };
+        };
+        responses: {
+            /** @description Nudge delivered as a file attachment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerActionResult"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    workerReplace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Old worker retired and the same brief re-dispatched */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerActionResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    workerResume: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["WorkerResume"];
+            };
+        };
+        responses: {
+            /** @description Worker respawned in its same worktree and re-briefed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerActionResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     workerRetire: {
@@ -5078,6 +5397,62 @@ export interface operations {
             400: components["responses"]["Error"];
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
+        };
+    };
+    workerStop: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance closed; worktree and target dir retained */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerActionResult"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+        };
+    };
+    workerSwitchModel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description wkr_ id or active worker name */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerSwitchModel"];
+            };
+        };
+        responses: {
+            /** @description Switch performed only when the screen showed a confirmation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerActionResult"];
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     worktreeList: {

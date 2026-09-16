@@ -48,6 +48,7 @@ mod transport;
 mod tty;
 mod usage_store;
 mod web;
+mod worker_watch;
 mod workers;
 mod workspaces;
 mod ws;
@@ -237,6 +238,34 @@ impl RunningHub {
             .await
             .map_err(|err| anyhow::anyhow!("mint device token: {err}"))?;
         Ok(token)
+    }
+
+    /// Test-only seam: age one worker's recorded `watch.lastActivityAt` so an
+    /// integration test can reach the stall transition without waiting for the
+    /// real quiet window. The HTTP API derives that clock from live timing and
+    /// deliberately cannot set it.
+    #[doc(hidden)]
+    pub async fn age_worker_last_activity_for_tests(
+        &self,
+        worker_id: &str,
+        rfc3339: &str,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let stamp = remuda_protocol::Timestamp::try_from(rfc3339.to_string())
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        store
+            .mutate_worker(worker_id.to_string(), move |row| {
+                if let Some(watch) = row.watch.as_mut() {
+                    watch.last_activity_at = Some(stamp);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        Ok(())
     }
 
     /// Mint a single-use Node enroll token against this Hub's store (D-018).
@@ -473,6 +502,7 @@ pub fn router(state: AppState) -> Router {
         .merge(attachments::routes())
         .merge(workspaces::routes())
         .merge(workers::routes())
+        .merge(worker_watch::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {
         app = app.nest_service("/push", push_http::nest(push, state.store.clone()));

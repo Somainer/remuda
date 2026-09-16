@@ -18052,6 +18052,17 @@
           ],
           "description": "Instance (`ins_…`) running the harness; absent if provisioning stopped\nbefore the agent launched."
         },
+        "lastNudgeAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the coordinator last nudged this worker (nudge throttle, §3.2\n`policy.configurable.nudgeThrottleMins`)."
+        },
         "model": {
           "description": "Model id the agent launched with.",
           "type": [
@@ -18092,6 +18103,28 @@
           ],
           "description": "Bytes reclaimed from the target dir at retire (reported by the Node)."
         },
+        "replaceCount": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How many times `worker replace` re-dispatched this worker name."
+        },
+        "resumedFrom": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When `worker resume` respawns the agent, the previous instance id is\nkept here and `instance_id` is repointed at the replacement."
+        },
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "`revision`; protocol §1.1."
@@ -18124,6 +18157,17 @@
         "updatedAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "`updated_at`; protocol §1.1."
+        },
+        "watch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerWatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Latest `remuda watch` screen classification (5b); absent until the\nworker is first observed. Point-in-time observation, distinct from the\ndurable lifecycle `state`: idle-api-error/stalled/gone never move the\nlifecycle, only a freshly-read DONE/BLOCKED line does."
         },
         "workspaceId": {
           "$ref": "#/$defs/WorkspaceId",
@@ -18229,6 +18273,241 @@
           },
           "required": [
             "state"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorkerWatch": {
+      "description": "One persisted `remuda watch` observation on a roster row.\n\nBesides the current status it carries the echo-suppression baselines\n(`lastDoneSha` / `lastBlocked` — a resumed session re-shows its old DONE)\nand the activity bookkeeping the stall detector needs across polls.",
+      "oneOf": [
+        {
+          "description": "Working normally.",
+          "properties": {
+            "status": {
+              "const": "working",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "New `DONE <sha>` on screen (not an echo of a known tip).",
+          "properties": {
+            "sha": {
+              "description": "Claimed landed sha.",
+              "type": "string"
+            },
+            "status": {
+              "const": "done",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "sha"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "New `BLOCKED <reason>` on screen.",
+          "properties": {
+            "reason": {
+              "description": "Block reason text.",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Idle with an API error / connection drop / retry loop on screen.",
+          "properties": {
+            "status": {
+              "const": "idle-api-error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Busy but silent past the stall threshold.",
+          "properties": {
+            "status": {
+              "const": "stalled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Host offline, instance closed, or carrier gone.",
+          "properties": {
+            "status": {
+              "const": "gone",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "detail": {
+          "description": "The screen line or error that drove the classification, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastActivityAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Last observed activity (screen change or journal event), as UTC\nRFC3339; the stall detector compares this to the observation time."
+        },
+        "lastBlocked": {
+          "description": "Most recent BLOCKED reason already treated as real.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastDoneSha": {
+          "description": "Most recent DONE sha already treated as real; an equal later line is an\necho, not a new report.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastScreenDigest": {
+          "description": "Digest of the last screen that differed from the one before it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When this observation was made (UTC RFC3339)."
+        }
+      },
+      "required": [
+        "observedAt"
+      ],
+      "type": "object"
+    },
+    "WorkerWatchStatus": {
+      "description": "The point-in-time status `remuda watch` derives from a worker's screen.\n\nAdjacently tagged on `status`, so the wire shape is\n`{\"status\":\"done\",\"sha\":\"…\"}` / `{\"status\":\"blocked\",\"reason\":\"…\"}`.",
+      "oneOf": [
+        {
+          "description": "Working normally.",
+          "properties": {
+            "status": {
+              "const": "working",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "New `DONE <sha>` on screen (not an echo of a known tip).",
+          "properties": {
+            "sha": {
+              "description": "Claimed landed sha.",
+              "type": "string"
+            },
+            "status": {
+              "const": "done",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "sha"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "New `BLOCKED <reason>` on screen.",
+          "properties": {
+            "reason": {
+              "description": "Block reason text.",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Idle with an API error / connection drop / retry loop on screen.",
+          "properties": {
+            "status": {
+              "const": "idle-api-error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Busy but silent past the stall threshold.",
+          "properties": {
+            "status": {
+              "const": "stalled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Host offline, instance closed, or carrier gone.",
+          "properties": {
+            "status": {
+              "const": "gone",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
           ],
           "type": "object"
         }

@@ -4048,18 +4048,22 @@ export type WorkerRoster = ({
   "hostId": HostId;
   "id": WorkerRosterId;
   "instanceId"?: (InstanceId | (null));
+  "lastNudgeAt"?: (Timestamp | (null));
   "model"?: (string | null);
   "name": (string);
   "portBlock"?: (string | null);
   "projectId": ProjectId;
   "providerProfileId"?: (string | null);
   "reclaimedBytes"?: (U64 | (null));
+  "replaceCount"?: (U64 | (null));
+  "resumedFrom"?: (InstanceId | (null));
   "revision": U64;
   "state": WorkerState;
   "supplyDecision"?: unknown;
   "targetDir"?: (string | null);
   "taskId"?: (TaskId | (null));
   "updatedAt": Timestamp;
+  "watch"?: (WorkerWatch | (null));
   "workspaceId": WorkspaceId;
   "worktreePath": (string);
   [key: string]: unknown;
@@ -4084,6 +4088,60 @@ export type WorkerState = (({
   [key: string]: unknown;
 }) | ({
   "state": "retired";
+  [key: string]: unknown;
+}));
+
+/** One persisted `remuda watch` observation on a roster row.  Besides the current status it carries the echo-suppression baselines (`lastDoneSha` / `lastBlocked` — a resumed session re-shows its old DONE) and the activity bookkeeping the stall detector needs across polls. */
+export type WorkerWatch = (({
+  "status": "working";
+  [key: string]: unknown;
+}) | ({
+  "sha": (string);
+  "status": "done";
+  [key: string]: unknown;
+}) | ({
+  "reason": (string);
+  "status": "blocked";
+  [key: string]: unknown;
+}) | ({
+  "status": "idle-api-error";
+  [key: string]: unknown;
+}) | ({
+  "status": "stalled";
+  [key: string]: unknown;
+}) | ({
+  "status": "gone";
+  [key: string]: unknown;
+})) & ({
+  "detail"?: (string | null);
+  "lastActivityAt"?: (Timestamp | (null));
+  "lastBlocked"?: (string | null);
+  "lastDoneSha"?: (string | null);
+  "lastScreenDigest"?: (string | null);
+  "observedAt": Timestamp;
+  [key: string]: unknown;
+});
+
+/** The point-in-time status `remuda watch` derives from a worker's screen.  Adjacently tagged on `status`, so the wire shape is `{"status":"done","sha":"…"}` / `{"status":"blocked","reason":"…"}`. */
+export type WorkerWatchStatus = (({
+  "status": "working";
+  [key: string]: unknown;
+}) | ({
+  "sha": (string);
+  "status": "done";
+  [key: string]: unknown;
+}) | ({
+  "reason": (string);
+  "status": "blocked";
+  [key: string]: unknown;
+}) | ({
+  "status": "idle-api-error";
+  [key: string]: unknown;
+}) | ({
+  "status": "stalled";
+  [key: string]: unknown;
+}) | ({
+  "status": "gone";
   [key: string]: unknown;
 }));
 

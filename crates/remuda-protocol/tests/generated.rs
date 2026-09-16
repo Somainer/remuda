@@ -108,6 +108,12 @@ fn public_wire_types_are_registered_for_generation() {
         // §9.1: parsed verdict of an /effort stdout line — mapper output, not
         // a wire type.
         "EffortStdout",
+        // M1 5b `remuda watch`: borrowed classifier input / classified output
+        // / key-encoding result — pure rule logic shared by Hub and tests,
+        // never serialized on the wire (the roster carries `WorkerWatch`).
+        "ScreenSignals",
+        "ScreenClass",
+        "EncodedKeys",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

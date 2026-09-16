@@ -425,6 +425,8 @@ pub fn schema_document() -> Value {
         WorkerRoster,
         WorkerRosterId,
         WorkerState,
+        WorkerWatch,
+        WorkerWatchStatus,
         WorkflowEngine,
         WorkflowMemberPayload,
         WorkflowPhasePayload,

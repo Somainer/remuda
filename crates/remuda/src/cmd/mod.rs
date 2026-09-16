@@ -22,11 +22,14 @@ mod own;
 mod profile;
 mod project;
 pub(crate) mod registry;
+mod report;
 mod retire;
 pub mod ssh;
 pub mod table;
 mod task;
 pub mod version;
+mod watch;
+mod worker;
 pub mod worktree;
 
 macro_rules! commands {
@@ -61,6 +64,9 @@ commands! {
     Own(own::OwnArgs),
     Profile(profile::ProfileArgs),
     Dispatch(dispatch::DispatchArgs),
+    Watch(watch::WatchArgs),
+    Worker(worker::WorkerArgs),
+    Report(report::ReportArgs),
     Retire(retire::RetireArgs),
     Hostcap(hostcap::HostcapArgs),
     Brief(brief::BriefArgs),

@@ -44,6 +44,10 @@ pub(crate) struct DispatchArgs {
     /// Placement tendency: `local` or `remote` (project member latencyClass).
     #[arg(long)]
     placement: Option<String>,
+    /// Carrier driver override (`claude-pty` / `shell-pty` / `claude-print`).
+    /// `shell-pty` is the native, screen-readable carrier for `remuda watch`.
+    #[arg(long)]
+    driver: Option<String>,
     /// Skip the local brief lint gate (not recommended; gate still scans).
     #[arg(long)]
     force_lint: bool,
@@ -94,6 +98,7 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         "name": args.name,
         "hostId": args.host,
         "placement": args.placement,
+        "driver": args.driver,
     });
     let value = client.post("/v1/workers/dispatch", &body).await?;
     print_json(&value)?;

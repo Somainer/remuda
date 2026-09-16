@@ -1,5 +1,12 @@
 import { expect, test, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const evidenceDir = process.env.REMUDA_EVIDENCE === "1"
+  ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence")
+  : path.resolve("test-results/evidence");
 
 async function clearApprovals(page: Page, instanceId: string) {
   // Mirror the effort-sync helper: resolve any pending approval before typing.
@@ -109,6 +116,11 @@ test("the composer permission menu lists the six real Claude modes with dontAsk 
     "data-launch-only",
     "1",
   );
+  await mkdir(evidenceDir, { recursive: true });
+  await page.screenshot({
+    path: path.join(evidenceDir, "permission-modes-1-menu-1440.png"),
+    animations: "disabled",
+  });
 });
 
 test("picking a live mode posts a configure and settles the chip from the read-back", async ({
@@ -134,6 +146,11 @@ test("picking a live mode posts a configure and settles the chip from the read-b
   // chip settles on the read-back word and clears the pending tag.
   await expect(page.getByTestId("permission-chip")).toHaveAttribute("data-permission", "auto");
   await expect(page.getByTestId("permission-chip")).not.toHaveAttribute("data-pending");
+  await mkdir(evidenceDir, { recursive: true });
+  await page.screenshot({
+    path: path.join(evidenceDir, "permission-modes-1-chip-auto-1440.png"),
+    animations: "disabled",
+  });
 });
 
 test("a terminal-side mode change folds into the chip without a configure", async ({

@@ -224,19 +224,33 @@ enum Control {
     Shutdown,
 }
 
-/// Give the runtime a Hub object source built from the dial URL and the
-/// current host token (D-027). A Node that cannot derive one still runs; it
-/// refuses sends that carry attachments rather than dropping the images.
-fn attach_object_source(runtime: Option<&runtime_wss::RuntimeLink>, ws_url: &str, token: &str) {
+/// Give the runtime an object source for this connection (D-027): HTTP first,
+/// pulling over the carrier when the Hub HTTP origin is unreachable. The
+/// unreachable decision is taken once per connection — [`attach_object_source`]
+/// runs after every (re)connected hello with a fresh fallback flag. A Node that
+/// cannot derive an HTTP base uses the carrier alone.
+fn attach_object_source(
+    runtime: Option<&runtime_wss::RuntimeLink>,
+    ws_url: &str,
+    token: &str,
+    broker: &Arc<crate::carrier_objects::CarrierObjectBroker>,
+) {
     let Some(link) = runtime else {
         return;
     };
     match crate::attachments::HubObjectSource::from_ws_url(ws_url, token) {
-        Ok(source) => link.node.set_object_source(Arc::new(source)),
-        Err(error) => tracing::warn!(
-            %error,
-            "Node cannot derive a Hub object URL; sends with attachments will be refused"
-        ),
+        Ok(http) => {
+            let source =
+                crate::carrier_objects::FallbackObjectSource::new(http, broker.source());
+            link.node.set_object_source(Arc::new(source));
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "Node cannot derive a Hub object URL; pulling attachments over the carrier"
+            );
+            link.node.set_object_source(Arc::new(broker.source()));
+        }
     }
 }
 
@@ -635,6 +649,10 @@ async fn session_task(
         watermarks: watermarks.clone(),
         pumps,
     });
+    // object.pull rides this socket whenever the Hub HTTP origin is
+    // unreachable; pending pulls are failed on every reconnect below.
+    let (carrier_tx, mut carrier_rx) = mpsc::channel(16);
+    let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
     let mut stream = match dial(&config.url, &token).await {
         Ok(stream) => stream,
         Err(err) => {
@@ -676,7 +694,7 @@ async fn session_task(
     // very hello on first enroll — point the runtime at the Hub's object
     // store. The same credential authenticates this socket and
     // `GET /v1/objects/{id}`, so no second secret is introduced.
-    attach_object_source(runtime.as_ref(), &config.url, &token);
+    attach_object_source(runtime.as_ref(), &config.url, &token, &object_broker);
     let mut connection_id = hello
         .get("connectionId")
         .and_then(Value::as_str)
@@ -711,7 +729,7 @@ async fn session_task(
                         let result = reconnect(
                             &mut stream, &mut config, &mut token, &node_epoch,
                             &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id,
-                            &mut pending, runtime.as_ref(), &metrics,
+                            &mut pending, runtime.as_ref(), &metrics, &object_broker,
                         ).await;
                         let _ = done.send(result);
                     }
@@ -734,7 +752,7 @@ async fn session_task(
                 }
                 let frame = rpc_request(&id, METHOD_NODE_HEARTBEAT, params);
                 if send_ws(&mut stream, &frame).await.is_err()
-                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker).await.is_err()
                 {
                     break;
                 }
@@ -761,7 +779,7 @@ async fn session_task(
                     }
                     Err(_) => {
                         let _ = job.reply.send(Err(NodeError::Disconnected));
-                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err() {
+                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker).await.is_err() {
                             break;
                         }
                     }
@@ -774,7 +792,15 @@ async fn session_task(
                     Err(error) => rpc_node_error(reply.id, &error),
                 };
                 if send_ws(&mut stream, &frame).await.is_err()
-                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker).await.is_err()
+                {
+                    break;
+                }
+            }
+            pull = carrier_rx.recv() => {
+                let Some(frame) = pull else { break; };
+                if send_ws(&mut stream, &frame).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker).await.is_err()
                 {
                     break;
                 }
@@ -782,10 +808,10 @@ async fn session_task(
             incoming = recv_ws(&mut stream) => {
                 match incoming {
                     Ok(Some(frame)) => {
-                        handle_incoming(frame, &mut pending, &hub_tx, &hub_reply_tx, runtime.as_ref(), &watermarks, &mut stream, &metrics).await;
+                        handle_incoming(frame, &mut pending, &hub_tx, &hub_reply_tx, runtime.as_ref(), &watermarks, &mut stream, &metrics, &object_broker).await;
                     }
                     Ok(None) | Err(_) => {
-                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err() {
+                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker).await.is_err() {
                             break;
                         }
                     }
@@ -801,7 +827,7 @@ async fn session_task(
                         .is_ok(),
                 };
                 if !send_ok
-                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics).await.is_err()
+                    && reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker).await.is_err()
                 {
                     break;
                 }
@@ -881,7 +907,13 @@ async fn handle_incoming(
     watermarks: &Arc<Mutex<HashMap<String, SeqWatermark>>>,
     stream: &mut WsStream,
     metrics: &TransportMetrics,
+    object_broker: &crate::carrier_objects::CarrierObjectBroker,
 ) {
+    // object.pull replies and object.chunk notifications complete attachment
+    // fetches; they are neither Hub requests nor journal acknowledgements.
+    if object_broker.handle_frame(&frame) {
+        return;
+    }
     let method = frame.get("method").and_then(Value::as_str);
     if let Some(method) = method {
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
@@ -1109,9 +1141,12 @@ async fn reconnect(
     pending: &mut HashMap<String, PendingAppend>,
     runtime: Option<&runtime_wss::RuntimeLink>,
     metrics: &TransportMetrics,
+    object_broker: &Arc<crate::carrier_objects::CarrierObjectBroker>,
 ) -> Result<(), NodeError> {
     metrics.reconnect();
     fail_pending(pending, NodeError::Disconnected, metrics);
+    // Pulls in flight belong to the dead socket; their retry rides this one.
+    object_broker.fail_all(NodeError::Disconnected);
     let _ = stream.close(None).await;
     loop {
         let delay = config
@@ -1133,7 +1168,12 @@ async fn reconnect(
                             *token = new_token.to_owned();
                             config.token = token.clone();
                         }
-                        attach_object_source(runtime.as_ref().copied(), &config.url, token);
+                        attach_object_source(
+                            runtime.as_ref().copied(),
+                            &config.url,
+                            token,
+                            object_broker,
+                        );
                         *connection_id = hello
                             .get("connectionId")
                             .and_then(Value::as_str)

@@ -494,6 +494,20 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let mut last_ack = tokio::time::Instant::now();
     let (tty_tx, mut tty_rx) = tokio::sync::mpsc::channel(128);
     let _tty_pump = TtyPump(crate::stdio::spawn_stdio_tty_pump(node.clone(), tty_tx));
+    // Carrier object pulls for this controller session. The persistent daemon
+    // has no HTTP route to the Hub any more than the one-shot stdio process.
+    let (carrier_tx, mut carrier_rx) = tokio::sync::mpsc::channel(16);
+    let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
+    node.set_object_source(std::sync::Arc::new(object_broker.source()));
+    // Controller exit (takeover/disconnect) fails every pull immediately; the
+    // retry either rides the next controller's source or surfaces the loss.
+    struct FailOnDrop(std::sync::Arc<crate::carrier_objects::CarrierObjectBroker>);
+    impl Drop for FailOnDrop {
+        fn drop(&mut self) {
+            self.0.fail_all(NodeError::Disconnected);
+        }
+    }
+    let _object_session = FailOnDrop(object_broker.clone());
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut line = Vec::new();
     loop {
@@ -502,6 +516,15 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
         tokio::select! {
             _ = changed.changed() => return Ok(()),
+            frame = carrier_rx.recv() => {
+                let Some(frame) = frame else { return Ok(()); };
+                tokio::select! {
+                    _ = changed.changed() => return Ok(()),
+                    result = tokio::time::timeout(Duration::from_secs(30), write_frame(write, &frame)) => {
+                        result.map_err(|_| NodeError::Transport("carrier frame write timed out".into()))??;
+                    }
+                }
+            }
             frame = tty_rx.recv(), if ready => {
                 if let Some(frame) = frame {write_frame(write, &frame).await?;}
             }
@@ -518,6 +541,10 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             }
             frame = read_frame(read, &mut line) => {
                 let Some(frame) = frame? else {return Ok(());};
+                // object.pull replies/chunks complete attachment fetches.
+                if object_broker.handle_frame(&frame) {
+                    continue;
+                }
                 if frame.get("method").is_none() {
                     if frame.get("id").and_then(Value::as_str) == Some("hello-1") {
                         let result = frame.get("result").ok_or_else(|| NodeError::Transport("Hub rejected daemon hello".into()))?;

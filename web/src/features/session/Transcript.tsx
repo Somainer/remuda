@@ -780,16 +780,38 @@ function renderNode(
         className={user ? session.user : session.assistant}
         data-testid={node.local ? "optimistic-bubble" : "message"}
         data-status={node.status}
+        data-held={node.local?.held ? node.holdReason ?? "turn" : undefined}
         data-command-id={node.local?.commandId ?? undefined}
       >
         <div className={session.you}>
           {user ? "You" : node.role}
-          {localRow ? ` · ${localRow.label}` : null}
+          {/* c-steer: held queue rows show why they wait and their queue
+              position; delivered (POSTed) rows lose the tag entirely. */}
+          {node.local?.held ? (
+            <span
+              className={session.stat}
+              data-testid="held-queue-tag"
+              data-ordinal={node.holdOrdinal ?? undefined}
+            >
+              {node.holdReason === "answer"
+                ? " · 待回答后送出"
+                : ` · 排队中 · 第 ${node.holdOrdinal ?? 1} 条 · 回车后送出`}
+            </span>
+          ) : localRow ? (
+            ` · ${localRow.label}`
+          ) : null}
           {/* Status order the composer and transcript share: a queued
               journal node has not been sent; the local bubble's own wording
               comes from the projected row above. */}
           {node.status === "queued" && !node.local ? <span className={session.stat}> · 排队中</span> : null}
           {node.status === "interrupted" ? <span className={session.stat}> · 已打断</span> : null}
+          {/* c-steer: a delivered 插队 row keeps a small badge even after the
+              queued tag drops, so the reader knows the turn was interrupted. */}
+          {!node.local && (node as { promptMode?: string }).promptMode === "steer" ? (
+            <span className={session.stat} data-testid="steer-delivered-tag">
+              {" "}· 插队
+            </span>
+          ) : null}
         </div>
         {node.role === "assistant" ? (
           <MarkdownText text={node.text} />
@@ -818,8 +840,12 @@ function renderNode(
           <SentAttachments attachments={(node.local?.attachments ?? node.localAttachments)!} />
         ) : null}
         {node.local?.state === "queued" ? (
-          <button className={ui.chip} onClick={() => hubStore.retract(node.local!.clientRequestId)}>
-            撤回
+          <button
+            className={ui.chip}
+            data-testid="held-queue-cancel"
+            onClick={() => hubStore.retract(node.local!.clientRequestId)}
+          >
+            {node.local.held ? "取消排队" : "撤回"}
           </button>
         ) : null}
         {node.local?.state === "unknown" ? (

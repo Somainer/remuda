@@ -212,6 +212,18 @@ export type LocalBubble = {
   attachments?: BubbleAttachment[];
   /** D-028 §6 PromptMode used for this send; absent is a normal new turn. */
   promptMode?: PromptMode;
+  /**
+   * c-steer: a Remuda-held queue row. Held messages have NOT been POSTed —
+   * they wait for the running turn to end (or for a pending question to be
+   * answered), render in the transcript as pending user rows with a reason
+   * tag, can be cancelled locally, and are posted in order by
+   * {@link HubStore.flushHeld}. The wire never sees them until they flush.
+   */
+  held?: boolean;
+  /** Why a held row waits; drives its transcript tag. */
+  holdReason?: "turn" | "answer";
+  /** Manifest refs posted with the prompt when the hold flushes. */
+  heldRefs?: AttachmentRef[];
 };
 
 /**
@@ -1192,6 +1204,79 @@ class HubStore {
     const bubble = this.state.bubbles.find((b) => b.clientRequestId === bubbleId);
     if (!bubble || bubble.state === "accepted" || bubble.state === "settled") return;
     this.emit({ bubbles: this.state.bubbles.filter((b) => b.clientRequestId !== bubbleId) });
+  }
+
+  /**
+   * c-steer: hold a prompt client-side (Enter while working / while a question
+   * is pending). Nothing is POSTed; the row shows why it waits and can be
+   * cancelled. {@link flushHeld} posts the rows in order.
+   */
+  hold(
+    instanceId: Id,
+    prompt: string,
+    reason: "turn" | "answer",
+    refs: AttachmentRef[] = [],
+    previews: BubbleAttachment[] = [],
+  ): Id {
+    const clientRequestId = id("local_");
+    const bubble: LocalBubble = {
+      clientRequestId,
+      instanceId,
+      text: prompt,
+      commandId: null,
+      state: "queued",
+      promptMode: "queue",
+      held: true,
+      holdReason: reason,
+      heldRefs: refs,
+      ...(previews.length ? { attachments: previews } : {}),
+      createdAt: now(),
+    };
+    this.emit({ bubbles: this.state.bubbles.concat(bubble) });
+    return clientRequestId;
+  }
+
+  /** Held rows for one instance, in queue order (oldest first). */
+  heldBubbles(instanceId: Id): LocalBubble[] {
+    return this.state.bubbles.filter((b) => b.instanceId === instanceId && b.held && b.state === "queued");
+  }
+
+  /**
+   * Post every held prompt as an ordinary new turn, in queue order — the
+   * working→idle (or blocked→working/idle) transition handler. Each row loses
+   * its held tag the moment its POST lands; a failed POST leaves that row as
+   * 状态待确认, exactly like a direct send failure, never silently dropped.
+   */
+  async flushHeld(instanceId: Id) {
+    const items = this.heldBubbles(instanceId);
+    for (const item of items) {
+      // Drop the hold marker before the POST so a second transition cannot
+      // double-send the same row.
+      this.emit({
+        bubbles: this.state.bubbles.map((b) =>
+          b.clientRequestId === item.clientRequestId
+            ? { ...b, held: false, promptMode: "new-turn" as const }
+            : b,
+        ),
+      });
+      try {
+        const result = await api.instanceSend(instanceId, item.text, item.heldRefs ?? []);
+        this.emit({
+          bubbles: this.state.bubbles.map((b) =>
+            b.clientRequestId === item.clientRequestId
+              ? { ...b, state: result.command.state, commandId: result.command.commandId }
+              : b,
+          ),
+        });
+      } catch {
+        this.emit({
+          bubbles: this.state.bubbles.map((b) =>
+            b.clientRequestId === item.clientRequestId ? { ...b, state: "unknown" } : b,
+          ),
+        });
+      }
+    }
+    await this.catchup(instanceId);
   }
 
   async close(instanceId: Id) {

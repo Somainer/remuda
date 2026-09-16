@@ -51,13 +51,17 @@ import css from "./session.module.css";
 type MenuId = "effort" | "permission" | "usage" | null;
 type Placement = "up" | "down";
 
-type HeldItem = {
+/** A held prompt row (c-steer). `id` is the local bubble id. */
+export type HeldItem = {
   id: string;
   text: string;
+  /** "turn" = 回合结束后送出; "answer" = pending question answered first. */
+  reason: "turn" | "answer";
+  /** remuda = client-held + cancelable; native = mirror of the harness queue. */
   holder: "remuda" | "native";
 };
 
-let heldSeq = 0;
+let mirrorSeq = 0;
 
 export function Composer({
   instanceId,
@@ -66,6 +70,10 @@ export function Composer({
   sending,
   onSend,
   onInterrupt,
+  held = [],
+  onHold,
+  onRetractHeld,
+  onFlushHeld,
   permissionMode = "manual",
   onPermission,
   launchPermissionMode,
@@ -99,6 +107,19 @@ export function Composer({
   ) => Promise<void> | void;
   /** D-028 §5.3 instance.cancel — interrupt the turn, process stays alive. */
   onInterrupt?: () => void | Promise<void>;
+  /** Held queue rows, oldest first (c-steer). */
+  held?: HeldItem[];
+  /** Enter while busy/blocked: hold a message without POSTing. */
+  onHold?: (
+    text: string,
+    reason: "turn" | "answer",
+    refs: AttachmentRef[],
+    staged: Attachment[],
+  ) => void;
+  /** Cancel one held row (Remuda-held only). */
+  onRetractHeld?: (id: string) => void;
+  /** Post every held row in order (the turn-end / answer transition). */
+  onFlushHeld?: () => void | Promise<void>;
   permissionMode?: string;
   onPermission?: (mode: string) => void;
   /** Mode the session launched with; decides whether bypass is live-reachable. */
@@ -136,7 +157,10 @@ export function Composer({
   const [text, setText] = useState(() => readDraft(instanceId));
   const [menu, setMenu] = useState<MenuId>(null);
   const [placement, setPlacement] = useState<Placement>("down");
-  const [held, setHeld] = useState<HeldItem[]>([]);
+  // Mirrors of prompts posted straight into a harness-native queue (codex
+  // Tab): the wire owns them, so these chips are display-only and never
+  // cancelable here. Remuda-held rows arrive through the `held` prop.
+  const [mirrors, setMirrors] = useState<HeldItem[]>([]);
   const [interrupted, setInterrupted] = useState(false);
   const hoverCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // A click (rather than a hover) pins the panel open: subsequent pointer
@@ -228,21 +252,26 @@ export function Composer({
 
   const busy = phase === "working" || phase === "blocked";
   const remudaHeld = held.filter((item) => item.holder === "remuda");
+  const heldRows: HeldItem[] = [...held, ...mirrors];
+  /** 1-based queue ordinal among turn-wait Remuda-held rows. */
+  const ordinalOf = (id: string) =>
+    remudaHeld.filter((item) => item.reason === "turn").findIndex((item) => item.id === id) + 1;
 
-  // D-028 §6: Remuda-held items are delivered when the turn ends. Native-held
-  // chips are ledger mirrors only and flush themselves.
+  // c-steer: held prompts flush when the wait ends — a working turn goes idle
+  // (or is interrupted into a steer), a pending question resolves (blocked →
+  // working/idle). Delivery keeps queue order; see store.flushHeld.
   useEffect(() => {
-    const wasBusy = phaseRef.current === "working";
+    const prev = phaseRef.current;
     phaseRef.current = phase;
-    if (!wasBusy || phase !== "idle") return;
-    if (remudaHeld.length === 0) return;
-    const items = remudaHeld;
-    setHeld((cur) => cur.filter((item) => item.holder !== "remuda"));
-    void (async () => {
-      for (const item of items) {
-        await onSend(item.text, undefined, undefined, "new-turn");
-      }
-    })();
+    const turnEnded = prev === "working" && phase === "idle";
+    const answered = prev === "blocked" && (phase === "idle" || phase === "working");
+    if (!turnEnded && !answered) return;
+    if (remudaHeld.length === 0) {
+      setMirrors([]);
+      return;
+    }
+    setMirrors([]);
+    void onFlushHeld?.();
     setInterrupted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
@@ -361,7 +390,13 @@ export function Composer({
     setInterrupted(true);
   };
 
-  /** Submit the PRIMARY control: send/steer goes out, queue holds a chip. */
+  /**
+   * Submit the PRIMARY control.
+   * Idle → send a normal new turn immediately.
+   * Working/blocked → queue: Remuda holds it (reason = turn end / question
+   * answered); a harness-native queue (codex Tab) is posted with mode:queue
+   * and the chip becomes a display-only ledger mirror.
+   */
   const submitPrimary = async () => {
     if (!canSubmit()) return;
     const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
@@ -369,11 +404,16 @@ export function Composer({
     const staged = images.attachments;
     const action = controls.primary;
     if (action.kind === "queue") {
-      // Primary queue (no native send-now): Remuda holds it until idle.
-      setHeld((cur) => [
-        ...cur,
-        { id: `held_${++heldSeq}`, text: value, holder: "remuda" },
-      ]);
+      if (action.holder === "native") {
+        setMirrors((cur) => [
+          ...cur,
+          { id: `mirror_${++mirrorSeq}`, text: value, reason: "turn", holder: "native" },
+        ]);
+        clearBox();
+        void onSend(value, refs, staged, "queue");
+        return;
+      }
+      onHold?.(value, phase === "blocked" ? "answer" : "turn", refs, staged);
       clearBox();
       return;
     }
@@ -381,47 +421,26 @@ export function Composer({
     await onSend(value, refs, staged, action.mode);
   };
 
-  /** Explicit secondary queue control: native Tab sends now; otherwise hold. */
-  const submitQueue = () => {
-    if (!controls.queue.available || !canSubmit()) return;
-    const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
-    const refs = images.refs(value);
-    const staged = images.attachments;
-    if (controls.queue.holder === "native") {
-      setHeld((cur) => [
-        ...cur,
-        { id: `held_${++heldSeq}`, text: value, holder: "native" },
-      ]);
-      clearBox();
-      void onSend(value, refs, staged, "queue");
-    } else {
-      setHeld((cur) => [
-        ...cur,
-        { id: `held_${++heldSeq}`, text: value, holder: "remuda" },
-      ]);
-      clearBox();
-    }
-  };
-
-  /** Emulated/unknown send-now: confirm, cancel the turn, then steer. */
-  const submitInterruptAndSend = async () => {
-    if (!canSubmit() || !controls.interruptAndSend) return;
-    const confirmed = window.confirm(
-      controls.note
-        ? `${controls.note}。确定打断当前 turn 并立即发送吗？`
-        : "打断当前 turn 并立即发送？",
-    );
+  /**
+   * c-steer 插队 (Cmd/Ctrl+Enter or the visible button): confirm, interrupt
+   * the running turn through the driver's own key path, and deliver this
+   * message first — the Node sends Esc, waits for turn-ended, and jumps it
+   * ahead of the held queue. Blocked (a question is open) never offers it.
+   */
+  const submitSteer = async () => {
+    if (!canSubmit() || !controls.steer.available || phase !== "working") return;
+    const confirmed = window.confirm("打断当前 turn 并立即发送（插队）？已排队的消息仍会按顺序随后送出。");
     if (!confirmed) return;
     const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     const refs = images.refs(value);
     const staged = images.attachments;
-    await doInterrupt();
     clearBox();
     await onSend(value, refs, staged, "steer");
+    setInterrupted(true);
   };
 
   const removeHeld = (id: string) => {
-    setHeld((cur) => cur.filter((item) => item.id !== id));
+    onRetractHeld?.(id);
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -435,8 +454,19 @@ export function Composer({
       if (confirmed) void doInterrupt();
       return;
     }
-    // Enter = primary (Cmd/Ctrl+Enter is the same primary, kept for muscle
-    // memory); Shift+Enter falls through to the textarea's newline.
+    // Cmd/Ctrl+Enter while working = 插队: interrupt and send this first.
+    if (
+      event.key === "Enter"
+      && (event.metaKey || event.ctrlKey)
+      && !event.shiftKey
+      && phase === "working"
+      && controls.steer.available
+    ) {
+      event.preventDefault();
+      void submitSteer();
+      return;
+    }
+    // Enter = primary (idle: send; busy/blocked: queue). Shift+Enter newline.
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void submitPrimary();
@@ -503,11 +533,7 @@ export function Composer({
       : mismatch
         ? `请求 ${mismatch.requested} → 实际 ${mismatch.effective}`
         : `实际档位 ${effectiveWord}（来源 ${effortEffective?.source ?? "unknown"}）`;
-  const primaryLabel = sending
-    ? "发送中"
-    : controls.primary.kind === "steer"
-      ? "发送"
-      : controls.primary.label;
+  const primaryLabel = sending ? "发送中" : controls.primary.label;
   const primaryTestId =
     controls.primary.kind === "queue" ? "composer-queue" : "composer-send";
 
@@ -527,31 +553,44 @@ export function Composer({
         void submitPrimary();
       }}
     >
-      {held.length ? (
+      {heldRows.length ? (
         <div className={css.queuedRow} data-testid="composer-queued-row">
-          {held.map((item) => (
-            <span
-              key={item.id}
-              className={css.queuedChip}
-              data-testid="composer-queued-chip"
-              data-holder={item.holder}
-              title={item.holder === "remuda" ? "Remuda 代持：turn 结束后投递，可撤回" : "harness 原生队列"}
-            >
-              <span className={css.queuedTag}>{item.holder === "remuda" ? "排队" : "原生"}</span>
-              <span className={css.queuedText}>{item.text}</span>
-              {item.holder === "remuda" ? (
-                <button
-                  type="button"
-                  className={css.queuedRemove}
-                  data-testid="composer-queued-remove"
-                  aria-label="撤回排队消息"
-                  onClick={() => removeHeld(item.id)}
-                >
-                  ✕
-                </button>
-              ) : null}
-            </span>
-          ))}
+          {heldRows.map((item) => {
+            const nth = item.holder === "remuda" && item.reason === "turn" ? ordinalOf(item.id) : null;
+            const tag =
+              item.holder === "native"
+                ? "原生"
+                : item.reason === "answer"
+                  ? "待回答后送出"
+                  : nth
+                    ? `排队中 · 第 ${nth} 条 · 回车后送出`
+                    : "排队中";
+            return (
+              <span
+                key={item.id}
+                className={css.queuedChip}
+                data-testid="composer-queued-chip"
+                data-holder={item.holder}
+                data-reason={item.reason}
+                data-ordinal={nth ?? undefined}
+                title={item.holder === "remuda" ? "Remuda 代持：可撤回" : "harness 原生队列"}
+              >
+                <span className={css.queuedTag}>{tag}</span>
+                <span className={css.queuedText}>{item.text}</span>
+                {item.holder === "remuda" ? (
+                  <button
+                    type="button"
+                    className={css.queuedRemove}
+                    data-testid="composer-queued-remove"
+                    aria-label="撤回排队消息"
+                    onClick={() => removeHeld(item.id)}
+                  >
+                    ✕
+                  </button>
+                ) : null}
+              </span>
+            );
+          })}
         </div>
       ) : null}
       <AttachmentChips
@@ -585,7 +624,7 @@ export function Composer({
           data-testid="composer-input"
           value={text}
           disabled={disabled}
-          placeholder="输入提示词…  Enter 主操作 · Shift+Enter 换行 · 工作中 Esc 打断 · IME 组字期间不送"
+          placeholder="输入提示词…  Enter 排队 · ⌘/Ctrl+Enter 插队 · 工作中 Esc 打断 · IME 组字期间不送"
           onChange={(e) => {
             textRef.current = e.target.value;
             setText(e.target.value);
@@ -723,9 +762,9 @@ export function Composer({
             </span>
           )
         ) : null}
-        {held.length ? (
+        {heldRows.length ? (
           <span className={css.chip} data-testid="composer-queue-status">
-            已排队 {held.length}
+            已排队 {heldRows.length}
           </span>
         ) : null}
         {interrupted ? (
@@ -739,30 +778,23 @@ export function Composer({
           </span>
         ) : null}
         <span className={css.barSpacer} />
-        {/* D-028 §6 three-state controls */}
-        {busy && controls.queue.available ? (
+        {/* c-steer controls: Enter queues; 插队 interrupts and jumps; 打断 ends. */}
+        {busy && controls.steer.available ? (
           <button
             type="button"
             className={css.queueBtn}
-            data-testid="composer-queue-btn"
-            data-holder={controls.queue.holder}
+            data-testid="composer-steer"
+            data-provision={controls.steer.provision}
             disabled={disabled || sending || images.uploading || !text.trim()}
-            title={controls.queue.holder === "remuda" ? "Remuda 代持，turn 结束后投递" : "harness 原生排队（Tab）"}
-            onClick={() => submitQueue()}
+            title={
+              controls.steer.note
+                ? `插队：打断当前 turn 并立即发送（${controls.steer.note}）`
+                : "插队：打断当前 turn 并立即发送（⌘/Ctrl+Enter）"
+            }
+            onClick={() => void submitSteer()}
           >
-            排队
-            {controls.queue.holder === "remuda" ? <span className={css.controlSub}>Remuda 代持</span> : null}
-          </button>
-        ) : null}
-        {busy && controls.interruptAndSend ? (
-          <button
-            type="button"
-            className={css.queueBtn}
-            data-testid="composer-interrupt-send"
-            disabled={disabled || sending || images.uploading || !text.trim()}
-            onClick={() => void submitInterruptAndSend()}
-          >
-            打断并发送
+            插队
+            <span className={css.controlSub}>⌘/Ctrl+↵</span>
           </button>
         ) : null}
         {busy && controls.interrupt.available ? (
@@ -783,7 +815,8 @@ export function Composer({
           type="submit"
           className={controls.primary.kind === "queue" ? css.queueBtn : css.send}
           data-testid={primaryTestId}
-          data-mode={controls.primary.mode}
+          data-mode={controls.primary.kind === "queue" ? "queue" : controls.primary.mode}
+          data-holder={controls.primary.kind === "queue" ? controls.primary.holder : undefined}
           disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
         >
           {primaryLabel}

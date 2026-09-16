@@ -433,6 +433,19 @@ async fn hostcap_reports_capacity_and_blocks() {
     assert_eq!(body["cores"], 8);
     assert_eq!(body["diskFreeGb"], 120.0);
     assert_eq!(body["loadAvg1"], 0.4);
+    // The fake node's resource sample carries a Hub-stamped time; hostcap
+    // surfaces both the stamp and its age so a caller can tell a live reading
+    // from the fossil the freshness window exists to catch.
+    assert!(
+        body["sampledAt"].as_str().is_some_and(|s| s.contains('T')),
+        "sampledAt must be an RFC3339 stamp: {body}"
+    );
+    assert!(
+        body["sampleAgeSec"]
+            .as_i64()
+            .is_some_and(|age| (0..=300).contains(&age)),
+        "sampleAgeSec must reflect a recent Hub-stamped sample: {body}"
+    );
     assert_eq!(body["maxInstances"], 8);
     // The fake node does not project a live instance lifecycle, so the
     // Node-confirmed running count stays 0; roster allocations are counted

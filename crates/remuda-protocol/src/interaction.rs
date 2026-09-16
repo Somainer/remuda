@@ -107,6 +107,11 @@ pub struct QuestionOption {
     pub id: String,
     /// `label`; protocol §5.4.
     pub label: String,
+    /// `description`; protocol §5.4. AskUserQuestion options carry a
+    /// human-readable elaboration under the label; screen-scraped questions
+    /// may not have one.
+    #[serde(default, deserialize_with = "crate::scalar::required_option")]
+    pub description: Option<String>,
 }
 
 /// QuestionField; `protocol.md` §5.4.

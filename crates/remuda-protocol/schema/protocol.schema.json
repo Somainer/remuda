@@ -14334,6 +14334,14 @@
     "QuestionOption": {
       "description": "QuestionOption; `protocol.md` §5.4.",
       "properties": {
+        "description": {
+          "default": null,
+          "description": "`description`; protocol §5.4. AskUserQuestion options carry a\nhuman-readable elaboration under the label; screen-scraped questions\nmay not have one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "description": "`id`; protocol §5.4.",
           "type": "string"
@@ -14345,7 +14353,8 @@
       },
       "required": [
         "id",
-        "label"
+        "label",
+        "description"
       ],
       "type": "object"
     },

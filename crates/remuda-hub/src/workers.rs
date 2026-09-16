@@ -73,32 +73,39 @@ pub fn routes() -> Router<AppState> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DispatchBody {
-    project_id: ProjectId,
+pub(crate) struct DispatchBody {
     /// Brief text (utf8). The CLI reads the brief file and posts the bytes;
     /// the Hub stores it as an object attachment, never as inline prompt text.
-    brief: String,
+    pub(crate) brief: String,
     /// Original brief file name (sanitised for the attachment name).
     #[serde(default)]
-    brief_name: Option<String>,
+    pub(crate) brief_name: Option<String>,
+    /// Owning project `prj_…`.
+    pub(crate) project_id: ProjectId,
     /// Optional bound task.
     #[serde(default)]
-    task_id: Option<String>,
+    pub(crate) task_id: Option<String>,
     /// `claude` (default) / `codex` / `grok`.
     #[serde(default)]
-    harness: Option<String>,
+    pub(crate) harness: Option<String>,
     /// Explicit model id; pins supply admission.
     #[serde(default)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Explicit worker name (one safe segment).
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Explicit host (`hst_…`).
     #[serde(default)]
-    host_id: Option<String>,
+    pub(crate) host_id: Option<String>,
     /// `local` / `remote` tendency; resolved against project member hosts.
     #[serde(default)]
-    placement: Option<String>,
+    pub(crate) placement: Option<String>,
+    /// Optional explicit driver override. Defaults to the harness/herdr choice
+    /// (claude-pty on a herdr host, claude-print otherwise); `shell-pty` selects
+    /// the Node's native PTY carrier, which serves a readable live screen for
+    /// `remuda watch` (D-028).
+    #[serde(default)]
+    pub(crate) driver: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -174,7 +181,7 @@ async fn get_worker(
 
 /// Resolve a roster row by `wkr_…` id or active worker name within the
 /// caller's project scope.
-async fn resolve_worker(
+pub(crate) async fn resolve_worker(
     state: &AppState,
     id_or_name: &str,
     scope: &InstanceScope,
@@ -215,6 +222,17 @@ async fn dispatch_worker(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<DispatchBody>,
+) -> Result<Json<Value>, HubError> {
+    dispatch_core(State(state), headers, body).await
+}
+
+/// Dispatch a worker from a validated body. Shared by the HTTP route and
+/// `worker replace` (5b), which retires a dead worker then re-dispatches the
+/// same brief/name through this exact path.
+pub(crate) async fn dispatch_core(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: DispatchBody,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = caller(&state, &headers).await?;
@@ -385,42 +403,25 @@ async fn dispatch_worker(
         .map(str::to_string);
 
     // ── launch env: per-worker target dir, build cap, port block ───────────
-    let mut extra_env = serde_json::Map::new();
-    if let Some(target) = &target_dir {
-        extra_env.insert("CARGO_TARGET_DIR".into(), json!(target));
-    }
-    extra_env.insert("CARGO_INCREMENTAL".into(), json!("0"));
-    extra_env.insert("CARGO_BUILD_JOBS".into(), json!(WORKER_BUILD_JOBS));
-    if let Some(block) = &port_block
-        && let Some((first, _last)) = parse_block(block)
-    {
-        extra_env.insert("HUB_E2E_LISTEN".into(), json!(first.to_string()));
-        extra_env.insert(
-            "HUB_E2E_WEB_PORT".into(),
-            json!((first + PORT_BLOCK_SIZE - 1).to_string()),
-        );
-    }
-
-    let driver = driver_for(&harness, &host);
-    let mut spec = json!({
-        "kind": harness,
-        "driver": driver,
-        "model": model,
-        "providerProfileId": provider_profile_id,
-        "delegation": delegation,
-        "permissionMode": "bypassPermissions",
-        "workspaceId": workspace_id.as_id(),
-        "hostId": host.host_id,
-        "cwd": worktree_path,
-        "name": name,
-        "title": name,
-        "prompt": null,
-        "extraEnv": Value::Object(extra_env),
-        "projectId": project.meta.id.as_id(),
-    });
-    if let Some(task) = &task {
-        spec["taskId"] = json!(task.meta.id.as_id());
-    }
+    let driver = match body.driver.as_deref() {
+        Some(explicit) => select_worker_driver(&harness, explicit)?,
+        None => driver_for(&harness, &host),
+    };
+    let extra_env = worker_extra_env(target_dir.as_deref(), port_block.as_deref());
+    let mut spec = worker_launch_spec(
+        &harness,
+        &driver,
+        &model,
+        &provider_profile_id,
+        &delegation,
+        workspace_id.as_id().as_str(),
+        &host.host_id,
+        &worktree_path,
+        &name,
+        project.meta.id.as_id().as_str(),
+        task.as_ref().map(|task| task.meta.id.as_id().as_str()),
+        extra_env,
+    );
     crate::agent_scope::prepare_create(
         &state,
         &headers,
@@ -543,6 +544,10 @@ async fn dispatch_worker(
         brief_object_id: Some(object_id),
         task_id: task.as_ref().map(|task| task.meta.id.clone()),
         state: WorkerState::Working,
+        watch: None,
+        last_nudge_at: None,
+        resumed_from: None,
+        replace_count: None,
         supply_decision,
         reclaimed_bytes: None,
     };
@@ -635,7 +640,7 @@ fn matches_tendency(
     }
 }
 
-fn driver_for(harness: &str, host: &HostRecord) -> String {
+pub(crate) fn driver_for(harness: &str, host: &HostRecord) -> String {
     match harness {
         "claude" => {
             // Pty drivers require an advertised herdr; fall back to print.
@@ -649,6 +654,85 @@ fn driver_for(harness: &str, host: &HostRecord) -> String {
         "codex" | "grok" => "generic-pty".to_string(),
         _ => "claude-pty".to_string(),
     }
+}
+
+/// Validate an explicit `dispatch --driver` override. Only Claude may pick the
+/// native `shell-pty` / `claude-print` / `claude-pty` carriers; codex and grok
+/// always run on `generic-pty`.
+fn select_worker_driver(harness: &str, explicit: &str) -> Result<String, HubError> {
+    match (harness, explicit) {
+        ("claude", driver @ ("claude-pty" | "shell-pty" | "claude-print")) => {
+            Ok(driver.to_string())
+        }
+        ("codex" | "grok", "generic-pty") => Ok("generic-pty".to_string()),
+        _ => Err(HubError::BadRequest(format!(
+            "driver {explicit} is not valid for harness {harness}"
+        ))),
+    }
+}
+
+/// Product-assigned tab env for one worker launch: per-worker cargo target
+/// dir, the shared-host build cap, and the worker's e2e port pair. Shared by
+/// dispatch and `worker resume` (5b) so a respawned worker keeps the same env.
+pub(crate) fn worker_extra_env(
+    target_dir: Option<&str>,
+    port_block: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut extra_env = serde_json::Map::new();
+    if let Some(target) = target_dir {
+        extra_env.insert("CARGO_TARGET_DIR".into(), json!(target));
+    }
+    extra_env.insert("CARGO_INCREMENTAL".into(), json!("0"));
+    extra_env.insert("CARGO_BUILD_JOBS".into(), json!(WORKER_BUILD_JOBS));
+    if let Some(block) = port_block
+        && let Some((first, _last)) = parse_block(block)
+    {
+        extra_env.insert("HUB_E2E_LISTEN".into(), json!(first.to_string()));
+        extra_env.insert(
+            "HUB_E2E_WEB_PORT".into(),
+            json!((first + PORT_BLOCK_SIZE - 1).to_string()),
+        );
+    }
+    extra_env
+}
+
+/// Base instance-create spec for one worker, identical for the first launch
+/// and for a same-worktree respawn (`worker resume`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn worker_launch_spec(
+    harness: &str,
+    driver: &str,
+    model: &Option<String>,
+    provider_profile_id: &Option<String>,
+    delegation: &Option<String>,
+    workspace_id: &str,
+    host_id: &str,
+    cwd: &str,
+    name: &str,
+    project_id: &str,
+    task_id: Option<&str>,
+    extra_env: serde_json::Map<String, Value>,
+) -> Value {
+    let mut spec = json!({
+        "kind": harness,
+        "driver": driver,
+        "model": model,
+        "providerProfileId": provider_profile_id,
+        "delegation": delegation,
+        "permissionMode": "bypassPermissions",
+        "workspaceId": workspace_id,
+        "hostId": host_id,
+        "cwd": cwd,
+        "name": name,
+        "title": name,
+        "prompt": null,
+        "extraEnv": Value::Object(extra_env),
+        "projectId": project_id,
+    });
+    if let Some(task_id) = task_id {
+        spec["taskId"] = json!(task_id);
+    }
+    spec
 }
 
 fn build_task_spec(
@@ -727,11 +811,10 @@ async fn unique_slug(
             candidate
         };
         let branch = format!("wt/{name}/{candidate}");
-        if !active
-            .iter()
-            .filter(|worker| worker.state.is_active())
-            .any(|worker| worker.branch == branch)
-        {
+        // Retired rows keep their branch (gate/land owns branch deletion), so
+        // a `worker replace` reusing the name must take a fresh slug rather
+        // than collide with the kept branch.
+        if !active.iter().any(|worker| worker.branch == branch) {
             return Ok(candidate);
         }
         n += 1;
@@ -812,7 +895,7 @@ fn parse_block(block: &str) -> Option<(i64, i64)> {
 }
 
 /// Stage the brief bytes as an object and build the `instance.send` payload.
-async fn stage_brief(
+pub(crate) async fn stage_brief(
     state: &AppState,
     instance_id: &str,
     host_id: &str,
@@ -877,12 +960,26 @@ async fn retire_worker(
     Path(id): Path<String>,
     Json(body): Json<RetireBody>,
 ) -> Result<Json<Value>, HubError> {
+    Ok(Json(
+        retire_core(State(state), headers, id, body.force).await?,
+    ))
+}
+
+/// Retire one worker: close its instance (best effort), ask the Node to remove
+/// its carrier/worktree/target dir, mark the row retired. Shared by the HTTP
+/// route and `worker replace` (5b).
+pub(crate) async fn retire_core(
+    state: State<AppState>,
+    headers: HeaderMap,
+    id: String,
+    force: bool,
+) -> Result<Value, HubError> {
     require_origin(&headers, &state.config)?;
     let device = caller(&state, &headers).await?;
     require_grant(&state, &device, remuda_protocol::GrantVerb::Dispatch).await?;
     let scope = caller_project_scope(&state, &device).await?;
     let worker = resolve_worker(&state, &id, &scope).await?;
-    if worker.state.is_working() && !body.force {
+    if worker.state.is_working() && !force {
         return Err(HubError::Conflict(
             "worker is still working; retire --force to reclaim anyway".into(),
         ));
@@ -941,11 +1038,11 @@ async fn retire_worker(
             device.id,
             "worker.retire".into(),
             Some(updated.meta.id.as_id().to_string()),
-            json!({ "force": body.force, "reclaimedBytes": reclaimed }),
+            json!({ "force": force, "reclaimedBytes": reclaimed }),
         )
         .await
         .map_err(map_store)?;
-    Ok(Json(json!({ "worker": updated, "node": removed })))
+    Ok(json!({ "worker": updated, "node": removed }))
 }
 
 async fn set_worker_state(
@@ -1152,9 +1249,16 @@ impl Store {
             } else {
                 conn.prepare("SELECT id FROM worker_roster ORDER BY created_at")?
             };
-            let ids: Vec<String> = stmt
-                .query_map(params![project_id], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
+            // Bind the project id only on the parameterised query; binding a
+            // NULL to the parameterless `else` statement is a rusqlite error.
+            let ids: Vec<String> = match &project_id {
+                Some(project_id) => stmt
+                    .query_map(params![project_id], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?,
+                None => stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?,
+            };
             drop(stmt);
             ids.into_iter()
                 .map(|id| {

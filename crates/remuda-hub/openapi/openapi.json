@@ -3602,6 +3602,21 @@
           "reclaimedBytes": {
             "pattern": "^[0-9]+$",
             "type": "string"
+          },
+          "watch": {
+            "$ref": "#/components/schemas/WorkerWatch"
+          },
+          "lastNudgeAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "resumedFrom": {
+            "pattern": "^ins_",
+            "type": "string"
+          },
+          "replaceCount": {
+            "pattern": "^[0-9]+$",
+            "type": "string"
           }
         },
         "required": [
@@ -3683,6 +3698,16 @@
               "remote",
               "auto"
             ]
+          },
+          "driver": {
+            "type": "string",
+            "enum": [
+              "claude-pty",
+              "shell-pty",
+              "claude-print",
+              "generic-pty"
+            ],
+            "description": "Optional carrier override; shell-pty is the native screen-readable carrier for remuda watch."
           }
         },
         "required": [
@@ -3774,6 +3799,132 @@
         "required": [
           "worker"
         ]
+      },
+      "WorkerWatchStatus": {
+        "type": "string",
+        "enum": [
+          "working",
+          "done",
+          "blocked",
+          "idle-api-error",
+          "stalled",
+          "gone"
+        ]
+      },
+      "WorkerWatch": {
+        "type": "object",
+        "description": "Point-in-time remuda-watch classification persisted on the roster row (5b).",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/WorkerWatchStatus"
+          },
+          "sha": {
+            "type": "string",
+            "description": "Present when status is done."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Present when status is blocked."
+          },
+          "observedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "lastDoneSha": {
+            "type": "string"
+          },
+          "lastBlocked": {
+            "type": "string"
+          },
+          "lastScreenDigest": {
+            "type": "string"
+          },
+          "lastActivityAt": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "observedAt"
+        ]
+      },
+      "WorkerObserve": {
+        "type": "object",
+        "properties": {
+          "projectId": {
+            "pattern": "^prj_",
+            "type": "string"
+          },
+          "stallMins": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        }
+      },
+      "WorkerObserveResult": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkerRoster"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "WorkerNudge": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Custom nudge; absent delivers the default continue prompt as a file."
+          }
+        }
+      },
+      "WorkerAnswer": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "enter | esc | a digit 1..9 | free text (submitted with Enter)."
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "WorkerSwitchModel": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "model"
+        ]
+      },
+      "WorkerResume": {
+        "type": "object",
+        "properties": {
+          "handback": {
+            "type": "string",
+            "description": "Override the state-loss handback note."
+          }
+        }
+      },
+      "WorkerActionResult": {
+        "type": "object",
+        "description": "Result of a worker intervention verb; carries the updated roster row and/or the queued command.",
+        "additionalProperties": true
       },
       "HostCapacity": {
         "type": "object",
@@ -7725,6 +7876,337 @@
           }
         },
         "summary": "Re-deliver a brief/handback file to a live worker",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/observe": {
+      "post": {
+        "operationId": "workerObserve",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerObserve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerObserveResult"
+                }
+              }
+            },
+            "description": "Roster rows with fresh watch classifications"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read every live worker's screen, classify it, and persist the observation (remuda watch)",
+        "tags": [
+          "workers"
+        ]
+      }
+    },
+    "/v1/workers/{id}/nudge": {
+      "post": {
+        "operationId": "workerNudge",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerNudge"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerActionResult"
+                }
+              }
+            },
+            "description": "Nudge delivered as a file attachment"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Nudge a worker to continue (throttled by project policy)",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/answer": {
+      "post": {
+        "operationId": "workerAnswer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerAnswer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerActionResult"
+                }
+              }
+            },
+            "description": "Keys written to the worker PTY"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Answer a dialog with enter/esc/a digit/free text through tty.write",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/switch-model": {
+      "post": {
+        "operationId": "workerSwitchModel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerSwitchModel"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerActionResult"
+                }
+              }
+            },
+            "description": "Switch performed only when the screen showed a confirmation"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Run the /model + confirm key dance, gated on the screen confirmation",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/resume": {
+      "post": {
+        "operationId": "workerResume",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerResume"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerActionResult"
+                }
+              }
+            },
+            "description": "Worker respawned in its same worktree and re-briefed"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Respawn a lost worker (native resume or same-worktree relaunch) and re-send the brief",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/replace": {
+      "post": {
+        "operationId": "workerReplace",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerActionResult"
+                }
+              }
+            },
+            "description": "Old worker retired and the same brief re-dispatched"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Retire a worker and dispatch the same brief again (fresh branch)",
+        "tags": [
+          "workers"
+        ],
+        "parameters": [
+          {
+            "description": "wkr_ id or active worker name",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/workers/{id}/stop": {
+      "post": {
+        "operationId": "workerStop",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerActionResult"
+                }
+              }
+            },
+            "description": "Instance closed; worktree and target dir retained"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Stop a worker instance without reclaiming its worktree",
         "tags": [
           "workers"
         ],

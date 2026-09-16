@@ -88,6 +88,13 @@ pub struct HerdrReport {
 }
 
 /// Load snapshot. Hub persists `cpuPct` / `memPct`; counts are extra.
+///
+/// `cpuPct` is the **1-minute** load average relative to logical CPU count:
+/// Linux reads the first whitespace-separated field of `/proc/loadavg`
+/// (`1m 5m 15m`); macOS reads the first numeric token of `sysctl -n
+/// vm.loadavg` (same order, printed inside braces). The 5/15-minute indices
+/// are deliberately not used: admission must see the load that is gone now,
+/// not the load that is still decaying from an hour ago.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceReport {
@@ -96,7 +103,7 @@ pub struct ResourceReport {
     /// Total physical memory in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_bytes: Option<u64>,
-    /// Load average relative to CPU count, 0–100.
+    /// 1-minute load average relative to CPU count, 0–100.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_pct: Option<u8>,
     /// Raw 1-minute load average (not normalized by CPU count).
@@ -109,6 +116,19 @@ pub struct ResourceReport {
     /// placement §3.4 and `remuda hostcap`. Best-effort like the other fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_free_gb: Option<f64>,
+}
+
+/// Fresh CPU/memory sample, bypassing the 30 s inventory probe cache.
+///
+/// The full inventory probe shells out for CLI versions and hashes binaries;
+/// placement heartbeats need only a `/proc/loadavg` + `/proc/meminfo` read
+/// (microseconds), so the periodic resource report uses this directly rather
+/// than [`collect`], whose cached snapshot would freeze the Hub's admission
+/// view between `node.hello` frames — the stale-CPU refusal this sampler
+/// exists to prevent.
+#[must_use]
+pub fn sample_resources() -> ResourceReport {
+    detect_resources()
 }
 
 /// Labels, concurrency, and Herdr socket supplied by Node config.
@@ -734,14 +754,11 @@ fn detect_resources() -> ResourceReport {
         .max(1);
     let (mem_bytes, mem_available) = memory_bytes();
     let mem_pct = match (mem_bytes, mem_available) {
-        (Some(total), Some(avail)) if total > 0 => {
-            let used = total.saturating_sub(avail);
-            Some(percent(used as f64, total as f64))
-        }
+        (Some(total), Some(avail)) if total > 0 => Some(mem_to_pct(total, avail)),
         _ => None,
     };
-    let cpu_pct = loadavg().map(|load| percent(load, f64::from(cpu_count)));
     let load_avg1 = loadavg();
+    let cpu_pct = load_avg1.map(|load| load_to_pct(load, cpu_count));
     let disk_free_gb = disk_free_gib();
     ResourceReport {
         cpu_count,
@@ -751,6 +768,17 @@ fn detect_resources() -> ResourceReport {
         mem_pct,
         disk_free_gb,
     }
+}
+
+/// 1-minute load average as a percentage of logical CPU count, clamped 0–100.
+pub(crate) fn load_to_pct(load_one_minute: f64, cpu_count: u32) -> u8 {
+    percent(load_one_minute, f64::from(cpu_count.max(1)))
+}
+
+/// Used memory as a percentage of total: `(total - available) / total`.
+pub(crate) fn mem_to_pct(total_bytes: u64, available_bytes: u64) -> u8 {
+    let used = total_bytes.saturating_sub(available_bytes);
+    percent(used as f64, total_bytes as f64)
 }
 
 /// Free scratch disk in GiB via `df -Pk <dir>` (the same source the
@@ -803,6 +831,11 @@ fn linux_meminfo() -> Option<(Option<u64>, Option<u64>)> {
     Some((total, available))
 }
 
+/// 1-minute load average (index 0 of the OS triple).
+///
+/// Linux `/proc/loadavg` and macOS `sysctl vm.loadavg` both print
+/// `1m 5m 15m` in that order, so the first numeric token is the one-minute
+/// value on both platforms.
 fn loadavg() -> Option<f64> {
     if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
         return text.split_whitespace().next()?.parse().ok();
@@ -1095,6 +1128,37 @@ mod tests {
         assert_eq!(third.cli[0].version.as_deref(), Some("claude 0.0.2"));
         let fresh = collector.snapshot_fresh(&cfg);
         assert_eq!(fresh.cli[0].version.as_deref(), Some("claude 0.0.3"));
+    }
+
+    #[test]
+    fn sampler_reports_one_minute_load_as_cpu_percent_and_real_counts() {
+        // 6 runnable on 14 cores is the post-build reading from the Mac demo
+        // ticket: load is already gone, but a frozen 100% sample kept refusing.
+        assert_eq!(load_to_pct(0.0, 14), 0);
+        assert_eq!(load_to_pct(6.0, 14), 43);
+        assert_eq!(load_to_pct(14.0, 14), 100);
+        // Oversubscription clamps to 100 rather than overflowing u8.
+        assert_eq!(load_to_pct(28.0, 14), 100);
+        // A zero/absent cpu count must not divide by zero.
+        assert_eq!(load_to_pct(6.0, 0), 100);
+        assert_eq!(mem_to_pct(0, 0), 0);
+        assert_eq!(mem_to_pct(100, 25), 75);
+        assert_eq!(mem_to_pct(100, 100), 0);
+
+        // The live sampler reads this host: count is always populated, and on
+        // the Unix CI machines both pressure figures resolve (MemAvailable on
+        // Linux; memPct stays None on macOS where only hw.memsize exists).
+        let sample = sample_resources();
+        assert!(sample.cpu_count >= 1);
+        assert!(sample.cpu_pct.is_some(), "1-minute loadavg must resolve");
+        assert!((0..=100).contains(&sample.cpu_pct.unwrap()));
+        if cfg!(target_os = "linux") {
+            assert!(sample.mem_pct.is_some(), "MemAvailable must resolve");
+            assert!(sample.mem_bytes.is_some());
+        }
+        let encoded = serde_json::to_value(&sample).expect("serialize");
+        assert!(encoded.get("cpuPct").is_some());
+        assert!(encoded.get("cpuCount").is_some());
     }
 
     fn auth_of(snap: &HostSnapshot, kind: &str) -> CliAuth {

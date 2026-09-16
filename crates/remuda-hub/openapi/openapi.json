@@ -613,6 +613,13 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "warnings": {
+            "description": "Advisory over-limit CPU/mem readings for explicitly requested (pinned) hosts; the fleet was still created.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -727,6 +734,38 @@
         },
         "type": "object"
       },
+      "HostResources": {
+        "additionalProperties": true,
+        "description": "Node-reported load snapshot, persisted verbatim. Placement only trusts cpuPct/memPct when sampledAt is within the freshness window (60 s); older samples trigger a bounded host.resources refresh before a refusal.",
+        "properties": {
+          "cpuCount": {
+            "description": "Logical CPU count reported by the Node.",
+            "type": "integer"
+          },
+          "cpuPct": {
+            "description": "1-minute load average relative to cpuCount (0-100).",
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memBytes": {
+            "description": "Total physical memory in bytes.",
+            "type": "integer"
+          },
+          "memPct": {
+            "description": "Used / total memory (0-100).",
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sampledAt": {
+            "description": "Hub-stamped RFC3339 time the sample was received (hello, heartbeat, or on-demand refresh). Placement compares this to the Hub clock.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "HostView": {
         "additionalProperties": true,
         "properties": {
@@ -821,10 +860,14 @@
             "type": "string"
           },
           "resources": {
-            "additionalProperties": true,
-            "type": [
-              "object",
-              "null"
+            "description": "Latest CPU/mem snapshot with Hub-stamped sample time.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostResources"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "ssh": {
@@ -1071,6 +1114,13 @@
           },
           "instance": {
             "$ref": "#/components/schemas/InstanceRecord"
+          },
+          "warnings": {
+            "description": "Non-fatal placement warnings, e.g. an explicitly pinned host over its CPU/memory ceiling. Auto-placement refuses those hosts instead of returning a warning; each warning is also journaled against the new instance.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [

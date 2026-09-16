@@ -186,6 +186,10 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
       ? {
           cpuPct: typeof resources.cpuPct === "number" ? resources.cpuPct : undefined,
           memPct: typeof resources.memPct === "number" ? resources.memPct : undefined,
+          sampledAt:
+            typeof (resources as { sampledAt?: unknown }).sampledAt === "string"
+              ? ((resources as { sampledAt: string }).sampledAt)
+              : undefined,
         }
       : undefined,
     herdr: herdr

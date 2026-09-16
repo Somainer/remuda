@@ -103,7 +103,7 @@ export type Host = EntityMeta & {
   cli?: HostCli[];
   labels?: string[];
   maxInstances?: number;
-  resources?: { cpuPct?: number; memPct?: number };
+  resources?: { cpuPct?: number; memPct?: number; sampledAt?: string };
   herdr?: { version?: string; socket?: string; path?: string };
   nodeVersion?: string;
   instanceCount?: number;

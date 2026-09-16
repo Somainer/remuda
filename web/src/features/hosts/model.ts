@@ -40,7 +40,7 @@ export type HostView = {
   lastSeenAt?: string;
   rttMs?: number;
   agentVersion?: string;
-  resources?: { cpuPct?: number; memPct?: number };
+  resources?: { cpuPct?: number; memPct?: number; sampledAt?: string };
   cli: HostCli[];
   labels: string[];
   maxInstances: number;

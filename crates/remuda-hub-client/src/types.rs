@@ -79,6 +79,9 @@ pub struct InstanceCreateResult {
     /// Chosen host, when Hub reports it.
     #[serde(default)]
     pub host_id: Option<String>,
+    /// Non-fatal placement warnings (pinned host over its CPU/mem ceiling).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// `openapi.json` `#/components/schemas/CommandRequest`.

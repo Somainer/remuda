@@ -1490,6 +1490,8 @@ export interface components {
         FleetCreateResult: {
             fleetId?: string;
             instanceIds?: string[];
+            /** @description Advisory over-limit CPU/mem readings for explicitly requested (pinned) hosts; the fleet was still created. */
+            warnings?: string[];
         };
         /** @description Current host capacity snapshot; design §2.2/§3.4/§7 #6. */
         HostCapacity: {
@@ -1539,6 +1541,24 @@ export interface components {
             /** @description auto | native | profile:<id> */
             providerBinding?: string;
         };
+        /** @description Node-reported load snapshot, persisted verbatim. Placement only trusts cpuPct/memPct when sampledAt is within the freshness window (60 s); older samples trigger a bounded host.resources refresh before a refusal. */
+        HostResources: {
+            /** @description Logical CPU count reported by the Node. */
+            cpuCount?: number;
+            /** @description 1-minute load average relative to cpuCount (0-100). */
+            cpuPct?: number;
+            /** @description Total physical memory in bytes. */
+            memBytes?: number;
+            /** @description Used / total memory (0-100). */
+            memPct?: number;
+            /**
+             * Format: date-time
+             * @description Hub-stamped RFC3339 time the sample was received (hello, heartbeat, or on-demand refresh). Placement compares this to the Hub clock.
+             */
+            sampledAt?: string;
+        } & {
+            [key: string]: unknown;
+        };
         HostView: {
             capabilities?: {
                 [key: string]: unknown;
@@ -1571,9 +1591,8 @@ export interface components {
             online: boolean;
             /** @description auto | native | profile:<id> */
             providerBinding?: string;
-            resources?: {
-                [key: string]: unknown;
-            } | null;
+            /** @description Latest CPU/mem snapshot with Hub-stamped sample time. */
+            resources?: components["schemas"]["HostResources"] | null;
             ssh?: {
                 /**
                  * @default require_installed
@@ -1651,6 +1670,8 @@ export interface components {
             command: components["schemas"]["CommandRecord"];
             hostId?: string;
             instance: components["schemas"]["InstanceRecord"];
+            /** @description Non-fatal placement warnings, e.g. an explicitly pinned host over its CPU/memory ceiling. Auto-placement refuses those hosts instead of returning a warning; each warning is also journaled against the new instance. */
+            warnings?: string[];
         };
         InstanceDeleted: {
             /** @constant */

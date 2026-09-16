@@ -11,7 +11,13 @@ import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
 import { TuiModeIndicator } from "./TuiModeIndicator";
-import { openTtySession, type TtySession, type TtyStatus } from "./client";
+import { TtyProgressBar } from "./TtyProgressBar";
+import {
+  openTtySession,
+  type TtyProgress,
+  type TtySession,
+  type TtyStatus,
+} from "./client";
 import { binaryStringToBytes } from "./ids";
 import { LocalInput } from "./LocalInput";
 import { attachTerminalRenderer, type TerminalRenderer } from "./renderer";
@@ -79,6 +85,8 @@ export function TerminalView({
   // display. `undefined` = not reported (older Node, or the raw-ring carrier
   // which cannot know), and the wheel behaviour is then unchanged.
   const [altScreen, setAltScreen] = useState<boolean | undefined>(undefined);
+  // OSC 9;4 header progress; null = hidden (no progress / state 0).
+  const [progress, setProgress] = useState<TtyProgress | null>(null);
   const [hasEngagedAltScreen, setHasEngagedAltScreen] = useState(false);
   // A3: a narrow *desktop* window is still a mouse+keyboard terminal. Only a
   // coarse pointer (no hardware keyboard) should default to the local dock.
@@ -166,6 +174,7 @@ export function TerminalView({
     setMouseMode(term.modes.mouseTrackingMode);
     setMouseReports(true);
     setAltScreen(undefined);
+    setProgress(null);
     setHasEngagedAltScreen(false);
     setPreview("");
     setRawTail("");
@@ -341,6 +350,7 @@ export function TerminalView({
         if (next === "connecting") {
           resetStreamRef.current = true;
           setAltScreen(undefined);
+          setProgress(null);
         }
         if (next === "failed") failRef.current?.(message ?? "tty follow failed");
       },
@@ -350,6 +360,7 @@ export function TerminalView({
         setAltScreen(active);
         if (active === true) setHasEngagedAltScreen(true);
       },
+      onProgress: setProgress,
     });
     sessionRef.current = session;
     generationRef.current += 1;
@@ -463,6 +474,7 @@ export function TerminalView({
       data-tty-mouse-reports={mouseReports ? "1" : "0"}
       data-tty-fullscreen={fullscreen ? "1" : "0"}
       data-tty-alt-screen={altScreen === undefined ? "unknown" : String(altScreen)}
+      data-tty-progress={progress ? progress.state : "hidden"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
       <header className={css.toolbar}>
@@ -580,6 +592,7 @@ export function TerminalView({
           </form>
         ) : null}
       </header>
+      <TtyProgressBar progress={progress} />
       {status !== "live" ? (
         <div className={css.banner} role="status">
           <span className={css.dots} aria-hidden>

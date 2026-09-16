@@ -852,6 +852,24 @@ fn spawn_wss_tty_pump(node: crate::DevNode, tx: mpsc::Sender<TtyWire>) {
                         break;
                     }
                 }
+                Ok(crate::TtyEvent::Progress {
+                    instance_id,
+                    stream_id,
+                    progress,
+                }) => {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "tty.mode",
+                        "params": {
+                            "instanceId": instance_id,
+                            "streamId": stream_id,
+                            "progress": crate::tty::progress_json(progress),
+                        }
+                    });
+                    if tx.send(TtyWire::Json(frame)).await.is_err() {
+                        break;
+                    }
+                }
                 Ok(crate::TtyEvent::Bytes {
                     stream_id,
                     offset,

@@ -52,6 +52,57 @@
   border-bottom: 1px solid var(--line);
 }
 
+/* OSC 9;4 progress directly under the header (native-config, 2026-09-16). */
+.progressTrack {
+  flex: none;
+  position: relative;
+  height: 3px;
+  margin: -1px 0 0;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.progressFill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 100%;
+  background: var(--dust);
+}
+
+.progressFill[data-progress-state="indeterminate"] {
+  width: 30%;
+  animation: tty-progress-slide 1.3s ease-in-out infinite;
+}
+
+.progressFill[data-progress-state="percent"] {
+  transition: width 120ms linear;
+}
+
+.progressFill[data-progress-state="error"] {
+  background: #d97757;
+}
+
+.progressFill[data-progress-state="paused"] {
+  background: var(--mute);
+}
+
+@keyframes tty-progress-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progressFill[data-progress-state="indeterminate"] {
+    animation: none;
+    width: 100%;
+    opacity: 0.6;
+  }
+}
+
 .geo {
   font-family: var(--mono);
   font-size: 11px;

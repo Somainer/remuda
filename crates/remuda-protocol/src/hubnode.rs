@@ -777,8 +777,12 @@ pub struct TtyFrameParams {
     pub data_base64: Option<String>,
 }
 
-/// Observed alternate-screen mode for a bound stream; Node → Hub only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Observed renderer state for a bound stream; Node → Hub only.
+///
+/// Both observations are optional and independent: a mode edge carries
+/// `altScreen` only, an `OSC 9;4` edge carries `progress` only, and the
+/// attach notice may carry either or both.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TtyModeParams {
     /// Instance whose renderer produced the observation.
@@ -786,7 +790,55 @@ pub struct TtyModeParams {
     /// Authenticated, previously registered stream identity (`tty_…`).
     pub stream_id: String,
     /// Actual renderer screen state, never inferred from launch preference.
-    pub alt_screen: bool,
+    /// Omitted on a progress-only edge; an explicit null is rejected — the
+    /// "clear to unknown" reading exists only on the Hub's own attach notice.
+    #[serde(
+        default,
+        deserialize_with = "missing_ok_null_rejected_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alt_screen: Option<bool>,
+    /// Parsed `OSC 9;4` progress for the terminal header bar, when the Node's
+    /// emulator observed one this update (native-config, 2026-09-16).
+    /// Additive: absent on older Nodes and on carriers without an emulator;
+    /// clients must then leave the bar as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TtyProgress>,
+}
+
+/// ConEmu `OSC 9;4` progress state for the terminal header bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TtyProgressState {
+    /// State 0: finished — the bar is hidden.
+    Done,
+    /// State 1: determinate percent.
+    Percent,
+    /// State 2: error.
+    Error,
+    /// State 3: indeterminate activity.
+    Indeterminate,
+    /// State 4: paused / warning.
+    Paused,
+}
+
+/// Parsed `OSC 9;4` progress carried by a `tty.mode` notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TtyProgress {
+    /// `done` / `percent` / `error` / `indeterminate` / `paused`.
+    pub state: TtyProgressState,
+    /// 0..=100 for determinate progress; senders frequently omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+}
+
+/// Missing becomes `None`; an explicit `null` stays an error.
+fn missing_ok_null_rejected_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(bool::deserialize(deserializer)?))
 }
 
 /// Fixed binary envelope for WS/stdio `tty.frame` (not JSON).

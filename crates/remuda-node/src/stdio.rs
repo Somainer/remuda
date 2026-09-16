@@ -482,6 +482,24 @@ pub(crate) fn spawn_stdio_tty_pump(node: DevNode, output: mpsc::Sender<Value>) -
                         break;
                     }
                 }
+                Ok(crate::TtyEvent::Progress {
+                    instance_id,
+                    stream_id,
+                    progress,
+                }) => {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": "tty.mode",
+                        "params": {
+                            "instanceId": instance_id,
+                            "streamId": stream_id,
+                            "progress": crate::tty::progress_json(progress),
+                        }
+                    });
+                    if output.send(frame).await.is_err() {
+                        break;
+                    }
+                }
                 Ok(crate::TtyEvent::Bytes {
                     instance_id,
                     stream_id,

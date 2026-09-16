@@ -150,6 +150,53 @@ describe("follow tty client", () => {
     await session.detach();
   });
 
+  it("surfaces OSC 9;4 progress on the tty.mode channel and hides on done/null", async () => {
+    // native-config, 2026-09-16: progress rides the same notice as alt-screen
+    // and is an independent field — a progress edge must not clobber mode.
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const progress: Array<unknown> = [];
+    const modes: Array<boolean | undefined> = [];
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb12" as const };
+    const session = openTtySession(instance, {
+      onFrame: () => {},
+      onStatus: () => {},
+      onAltScreen: (mode) => modes.push(mode),
+      onProgress: (value) => progress.push(value),
+    });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    const ws = FakeSocket.latest!;
+    ws.emitJson({ type: "snapshot", tty: { streamId: TTY_LAB_STREAM_ID } });
+
+    const edge = (extra: Record<string, unknown>) => ({
+      type: "event",
+      event: {
+        type: "tty.mode",
+        params: { instanceId: instance.id, streamId: TTY_LAB_STREAM_ID, ...extra },
+      },
+    });
+    ws.emitJson(edge({ progress: { state: "indeterminate" } }));
+    ws.emitJson(edge({ progress: { state: "percent", percent: 50 } }));
+    ws.emitJson(edge({ progress: { state: "error" } }));
+    ws.emitJson(edge({ progress: { state: "done" } }));
+    // Explicit null also hides; malformed states are ignored entirely.
+    ws.emitJson(edge({ progress: null }));
+    ws.emitJson(edge({ progress: { state: "napping" } }));
+    ws.emitJson(edge({ progress: { state: "percent", percent: 200 } }));
+    expect(progress).toEqual([
+      null, // the snapshot reset clears any stale bar
+      { state: "indeterminate" },
+      { state: "percent", percent: 50 },
+      { state: "error" },
+      null,
+      null,
+      { state: "percent", percent: 100 },
+    ]);
+    // No altScreen field on the progress edges: the mode observation only
+    // saw the snapshot reset, never a progress-induced value.
+    expect(modes).toEqual([undefined]);
+    await session.detach();
+  });
+
   it("follows live mode events on the current stream after an in-session renderer switch", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const modes: Array<boolean | undefined> = [];

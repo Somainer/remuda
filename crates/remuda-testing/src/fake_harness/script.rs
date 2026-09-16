@@ -72,6 +72,23 @@ pub struct TurnSpec {
     /// Extra usage numbers; defaults are small deterministic counters.
     #[serde(default)]
     pub usage: Option<UsageSpec>,
+    /// Scripted spinner status line(s), painted verbatim in the working
+    /// region instead of the dialect's stock line. Frames advance on the
+    /// fake's one-second working repaint and then hold; they reproduce real
+    /// 2.1.272 status lines (`· Razzmatazzing… (49m 38s · ↓ 66.0k tokens ·
+    /// thinking some more with xhigh effort)`) for screen-tier tests.
+    #[serde(default)]
+    pub spinner: Option<SpinnerSpec>,
+}
+
+/// Scripted spinner status line sequence.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct SpinnerSpec {
+    /// Exact spinner rows, one per elapsed-second repaint; the last frame is
+    /// held for the rest of the turn. At least one is required when present.
+    #[serde(default)]
+    pub frames: Vec<String>,
 }
 
 impl TurnSpec {
@@ -282,6 +299,13 @@ impl Scenario {
             if turn.tools.iter().any(|tool| tool.name.is_empty()) {
                 return Err(format!("turn {idx}: tool name is empty"));
             }
+            if turn
+                .spinner
+                .as_ref()
+                .is_some_and(|spinner| spinner.frames.is_empty())
+            {
+                return Err(format!("turn {idx}: spinner requires at least one frame"));
+            }
         }
         Ok(scenario)
     }
@@ -358,6 +382,24 @@ mod tests {
         consumed.insert(1, ());
         assert_eq!(scenario.select_turn("other", &consumed), None);
         assert_eq!(scenario.select_turn("other", &BTreeMap::new()), Some(1));
+    }
+
+    #[test]
+    fn spinner_frames_are_optional_and_must_be_nonempty_when_present() {
+        let ok = Scenario::parse(
+            r#"{"turns":[{"text":"done","spinner":{"frames":[
+                "· Forging… (3s · thinking with xhigh effort)",
+                "· Forging… (4s · ↓ 25 tokens · thinking with xhigh effort)"]}}]}"#,
+            "json",
+        )
+        .expect("parse");
+        assert_eq!(ok.turns[0].spinner.as_ref().unwrap().frames.len(), 2);
+        let err = Scenario::parse(
+            r#"{"turns":[{"text":"x","spinner":{"frames":[]}}]}"#,
+            "json",
+        )
+        .unwrap_err();
+        assert!(err.contains("spinner"), "{err}");
     }
 
     #[test]

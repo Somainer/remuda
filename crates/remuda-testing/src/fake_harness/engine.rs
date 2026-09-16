@@ -157,6 +157,9 @@ struct TurnRun {
     claude_seq: u64,
     tool_ids: Vec<String>,
     streamed_text: String,
+    /// Scripted spinner rows, advanced (and held) on the per-second repaint.
+    spinner_frames: Vec<String>,
+    spinner_idx: usize,
 }
 
 /// One prompt sitting in claude's native queue.
@@ -762,11 +765,18 @@ impl Engine {
         loop {
             let deadline = self.pump()?;
             // Elapsed-second repaint while working.
-            if let Some(turn) = &self.turn {
+            if let Some(turn) = &mut self.turn {
                 let secs = turn.started.elapsed().as_secs();
                 if secs != self.last_second {
                     self.last_second = secs;
                     self.view.elapsed_secs = secs;
+                    // Advance the scripted spinner one frame per repaint and
+                    // hold the last frame for the rest of the turn.
+                    let next = turn.spinner_idx + 1;
+                    if next < turn.spinner_frames.len() {
+                        turn.spinner_idx = next;
+                        self.view.status_line = Some(turn.spinner_frames[next].clone());
+                    }
                     self.dirty = true;
                 }
             }
@@ -1393,6 +1403,12 @@ impl Engine {
         self.view.notice = None;
         self.view.running_tool = None;
         self.view.streaming_line = None;
+        let spinner_frames = spec
+            .spinner
+            .as_ref()
+            .map(|spinner| spinner.frames.clone())
+            .unwrap_or_default();
+        self.view.status_line = spinner_frames.first().cloned();
         self.turn = Some(TurnRun {
             prompt,
             spec,
@@ -1403,6 +1419,8 @@ impl Engine {
             claude_seq: 0,
             tool_ids: Vec::new(),
             streamed_text: String::new(),
+            spinner_idx: 0,
+            spinner_frames,
         });
         self.pending_redirect = redirect.map(str::to_owned);
         self.event("turn_start", json!({ "redirect": redirect }));
@@ -2308,6 +2326,7 @@ impl Engine {
         self.view.running_tool = None;
         self.view.notice = None;
         self.view.steering.clear();
+        self.view.status_line = None;
         self.turn = None;
 
         // Claude: a backgrounded Agent completes after the launching turn's
@@ -2527,6 +2546,7 @@ impl Engine {
         self.view.phase = None;
         self.view.running_tool = None;
         self.view.notice = None;
+        self.view.status_line = None;
         self.turn = None;
         if trigger == "send_now"
             && let Some(next) = self.grok_queue.pop_front()

@@ -107,6 +107,8 @@ pub(crate) struct DevNodeInner {
     pub(crate) workspace_registry: std::sync::RwLock<crate::workspace::WorkspaceRegistry>,
     projection_epoch: Id,
     tty: TtyRegistry,
+    /// Batch 6 lane gate runner state (lane locks, live jobs, event uplink).
+    pub(crate) gate: crate::gate::GateRegistry,
     diagnostics: std::sync::RwLock<crate::DoctorContext>,
 }
 
@@ -183,6 +185,7 @@ impl DevNode {
                 workspace_registry: std::sync::RwLock::new(workspace_registry),
                 projection_epoch: Id::new("epoch")?,
                 tty: TtyRegistry::new(),
+                gate: crate::gate::GateRegistry::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
             }),
         })
@@ -202,6 +205,12 @@ impl DevNode {
     #[must_use]
     pub fn tty(&self) -> &TtyRegistry {
         &self.inner.tty
+    }
+
+    /// Lane gate runner state (batch 6 co-lanes).
+    #[must_use]
+    pub(crate) fn gate_registry(&self) -> &crate::gate::GateRegistry {
+        &self.inner.gate
     }
 
     /// Set diagnostics inputs from trusted process composition, never RPC params.

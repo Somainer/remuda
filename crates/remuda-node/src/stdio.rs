@@ -195,7 +195,9 @@ where
     let (carrier_tx, mut carrier_rx) = mpsc::channel(16);
     let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
     node.set_object_source(Arc::new(object_broker.source()));
+    let (gate_tx, mut gate_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
     spawn_stdio_tty_pump(node.clone(), tty_tx);
+    spawn_stdio_gate_pump(node.clone(), gate_tx);
     let mut pumps = HashMap::<InstanceId, JoinHandle<()>>::new();
 
     loop {
@@ -210,6 +212,11 @@ where
                 write_ndjson(&mut output, &frame).await?;
             }
             frame = tty_rx.recv() => {
+                if let Some(frame) = frame {
+                    write_ndjson(&mut output, &frame).await?;
+                }
+            }
+            frame = gate_rx.recv() => {
                 if let Some(frame) = frame {
                     write_ndjson(&mut output, &frame).await?;
                 }
@@ -397,6 +404,7 @@ async fn handle_stdio_frame(
             || request.method == "host.resources"
             || crate::worktree::is_worktree_method(request.method.as_str())
             || crate::worker::is_worker_method(request.method.as_str())
+            || crate::gate::is_gate_method(request.method.as_str())
             || crate::workspace_scm::is_scm_method(request.method.as_str()) =>
         {
             let result =
@@ -533,6 +541,33 @@ pub(crate) fn spawn_stdio_tty_pump(node: DevNode, output: mpsc::Sender<Value>) -
                             "offset": offset.to_string(),
                             "dataBase64": base64::engine::general_purpose::STANDARD.encode(&payload),
                         }
+                    });
+                    if output.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Pump Node-originated `gate.event` notifications (batch 6 lane runner).
+pub(crate) fn spawn_stdio_gate_pump(node: DevNode, output: mpsc::Sender<Value>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut events = node.gate_registry().subscribe();
+        loop {
+            let event = tokio::select! {
+                _ = output.closed() => break,
+                event = events.recv() => event,
+            };
+            match event {
+                Ok(event) => {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": remuda_protocol::METHOD_GATE_EVENT,
+                        "params": event,
                     });
                     if output.send(frame).await.is_err() {
                         break;

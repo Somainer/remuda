@@ -246,6 +246,10 @@ async fn dispatch_hub(
         // M1 batch 5a worker lifecycle RPCs over the outbound Hub link.
         Some(HubNodeMethod::WorkerProvision) => runtime.node.provision_worker(&params).await,
         Some(HubNodeMethod::WorkerRemove) => runtime.node.remove_worker(&params).await,
+        // Batch 6 lane gate runner.
+        _ if method == "gate.run" => runtime.node.run_gate(&params).await,
+        _ if method == "gate.cancel" => runtime.node.cancel_gate(&params).await,
+        _ if method == "gate.then" => runtime.node.run_gate_then(&params).await,
         _ => Ok(json!({ "ok": true })),
     }
 }

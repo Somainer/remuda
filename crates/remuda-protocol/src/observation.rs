@@ -916,6 +916,33 @@ pub struct EffortPayload {
     pub raw: Option<String>,
 }
 
+/// ModelPayload; `protocol.md` §5.1 (D-028 §9.1 model sync).
+///
+/// Emitted when the effective model is observed: an assistant record's
+/// `message.model` or a `/model` command's `<local-command-stdout>` verdict.
+/// Unchanged ids are deduped by the emitting driver, so the Hub only sees
+/// edges. The UI renders the current model from this observation — never from
+/// the requested switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPayload {
+    /// The id Remuda asked for (launch `--model` or an in-session switch),
+    /// when known on the observing side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    /// The id actually observed in the transcript verdict/record.
+    pub effective: EffectiveModel,
+    /// Native spelling read off the record (the raw verdict line), kept for
+    /// diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    /// The session's switchable model list, carried on the launch snapshot so
+    /// the picker shows the gateway's discovered models before any switch.
+    /// Absent on later edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<ModelCatalogInfo>,
+}
+
 /// ObservationPayload; `protocol.md` §5.1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", content = "payload")]
@@ -962,6 +989,9 @@ pub enum ObservationPayload {
     /// `effort` payload; §5.1 / D-028 §9.1.
     #[serde(rename = "effort")]
     Effort(Box<EffortPayload>),
+    /// `model` payload; §5.1 / D-028 §9.1 model sync.
+    #[serde(rename = "model")]
+    Model(Box<ModelPayload>),
     /// `raw_tty` payload; §5.1.
     #[serde(rename = "raw_tty")]
     RawTty(Box<RawTtyPayload>),
@@ -988,6 +1018,7 @@ impl ObservationPayload {
             Self::Usage(..) => ObservationKind::Usage,
             Self::Artifact(..) => ObservationKind::Artifact,
             Self::Effort(..) => ObservationKind::Effort,
+            Self::Model(..) => ObservationKind::Model,
             Self::RawTty(..) => ObservationKind::RawTty,
             Self::Opaque(..) => ObservationKind::Opaque,
         }

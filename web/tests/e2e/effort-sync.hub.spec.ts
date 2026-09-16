@@ -267,6 +267,96 @@ test("ultracode read-back names the chip ultracode; a terminal /effort moves the
   expect(configureCalls).toBe(configuresAfterSlider);
 });
 
+test("three consecutive switches including ultracode each settle the chip (c-effort3)", async ({
+  page,
+}) => {
+  // Regression for the second-switch failure: after the first switch to
+  // ultracode read back, the next plain-tier switch used to end with
+  // 未收到回读 and the chip returned to "?". Every switch in any order must
+  // settle from its own read-back.
+  const instanceId = await createSession(page, "effort multi switch");
+  await clearApprovals(page, instanceId);
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
+
+  let configureCalls = 0;
+  await page.route("**/v1/instances/*/commands", async (route) => {
+    const request = route.request();
+    if (
+      request.method() === "POST"
+      && (request.postDataJSON() as { operation?: string } | null)?.operation
+        === "instance.configure"
+    ) {
+      configureCalls += 1;
+    }
+    await route.continue();
+  });
+
+  // Pick one stop from the popover list, wait for its configure wire call, and
+  // assert the chip settles on the read-back label (no "?", no mismatch).
+  const pick = async (
+    stop: string,
+    expectedLabel: string,
+    expectedEffective: string,
+  ) => {
+    const configure = page.waitForRequest(
+      (r) =>
+        r.method() === "POST"
+        && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
+        && r.postDataJSON()?.operation === "instance.configure"
+        && r.postDataJSON()?.payload?.effort?.name === stop,
+    );
+    await page.getByTestId("model-effort-chip").click();
+    await page.getByTestId("effort-open-list").click();
+    await page.getByTestId(`effort-tier-${stop}`).click();
+    await configure;
+    await expect(page.getByTestId("model-effort-chip-label")).toHaveText(expectedLabel, {
+      timeout: 15_000,
+    });
+    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
+      "data-effort-effective",
+      expectedEffective,
+    );
+    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
+      "data-effort-source",
+      "remuda",
+    );
+    await expect(page.getByTestId("model-effort-chip")).toHaveAttribute(
+      "data-effort-mismatch",
+      "0",
+    );
+    await expect(page.getByTestId("model-effort-pending")).toHaveCount(0);
+    // Selecting a row does not close the list; reset the popover for the next
+    // pick (matches the codex-tiers spec).
+    await page.keyboard.press("Escape");
+  };
+
+  // First switch to ultracode, then a plain tier, then ultracode again — the
+  // exact order from the owner's report — and finish on max.
+  await pick("ultracode", "ultracode", "ultracode");
+  await pick("high", "high", "high");
+  await pick("ultracode", "ultracode", "ultracode");
+
+  // Claude max is the existing clamp fixture (reads back xhigh with an unknown
+  // flag); the chip must still settle rather than show "?" / no-read-back.
+  const maxConfigure = configureCalls;
+  await page.getByTestId("model-effort-chip").click();
+  await page.getByTestId("effort-open-list").click();
+  const maxRequest = page.waitForRequest(
+    (r) =>
+      r.method() === "POST"
+      && r.url().endsWith(`/v1/instances/${instanceId}/commands`)
+      && r.postDataJSON()?.operation === "instance.configure"
+      && r.postDataJSON()?.payload?.effort?.name === "max",
+  );
+  await page.getByTestId("effort-tier-max").click();
+  await maxRequest;
+  await expect(page.getByTestId("model-effort-chip-label")).not.toHaveText("?", {
+    timeout: 15_000,
+  });
+  await expect(page.getByTestId("model-effort-pending")).toHaveCount(0);
+  expect(configureCalls).toBeGreaterThan(maxConfigure);
+});
+
 test("a queued push-down shows 排队中; a rejected one reverts the chip", async ({ page }) => {
   const instanceId = await createSession(page, "effort queue and reject");
   await clearApprovals(page, instanceId);

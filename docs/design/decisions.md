@@ -105,3 +105,111 @@ apply/rollback 脚本：apply 添加 Remuda import，并将全局 admin 改为
   沿用全局 `:focus-visible`。沿用 Night Corral tokens，400px 可用。
 
 证据见 [tabs-1.md](./evidence/tabs-1.md)。
+
+## D-034
+
+**2026-09-17 · M1 batch 6 co-lanes：gate verify/land 通过项目 lane 上的 Node 落地（gate queue + lane runner + D-034）**
+
+| 日期 | 2026-09-17 |
+|---|---|
+| 状态 | adopted |
+| 相关 | D-028 §13.6、D-031、[coordinator-hierarchy.md](./coordinator-hierarchy.md) §3.2/§8 批 6、[remuda-cli.md](./remuda-cli.md) §134-173 |
+
+**背景**：r-mergequeue/merge2 已在 `crates/src/cmd/merge.rs` 实现
+`remuda merge <branch> --gate --onto/--land`（临时 worktree 内跑权威
+`scripts/ci/gate.sh`、verify-only 报告落
+`<gitdir>/remuda/merge-reports/`、land-only 消费报告做 CAS、退出码 1 门禁失败 /
+2 冲突 / 3 cas_lost / 2 base_moved、`--queue` 多 lane 乐观队列）。批 6 之前，
+批 5 的人工回路靠两个 shell 脚本：Mac 上 `rgate2.sh` 串行加锁、scp、ssh 到
+bolt-devbox-sg 跑 `remote-gate.sh`，后者在共享 checkout 里手动 fetch/ff 分支、
+拒绝 worker worktree 的 stale tip、`flock e2e.lock` 跑 merge CLI，成功后再由
+Mac 把远端 sha 推上 origin/main。需要把这条链路产品化：Hub 排队、lane 主机上的
+Node 执行，coordinator 只用 `remuda gate/land/watch/report`。
+
+**决策**：
+
+1. **Hub 拥有队列（`gate_jobs` 表，doc_json 行）**：作业 `{branch, mode:
+   verify|land, web: auto|always|never, laneId?, requestedBy, state:
+   queued→running→passed|failed|landed（canceling/canceled 旁路）, steps[],
+   hostId, queuedAt/startedAt/finishedAt, base/head/merge/currentMainSha,
+   attempts, thenCommand/thenOutput}`。verify 可跨 lane 并行；land 按项目串行
+   （`ProjectGate.landSerialization = global-cas`）：调度器 FIFO 遍历每个项目的
+   queued 作业，只要有更早的 land 在跑，后续 land 不派出，verify 仍可填空闲
+   lane；一条 lane 同时只跑一个作业（Hub 调度 + Node lane 锁双保险）；队列顺序
+   按 `queuedAt` 严格 FIFO，前一个派不出去就 break 保持顺序。Hub 重启时把
+   running/canceling 的作业 reconcile 回 queued。
+2. **Node 跑的是它自己的 `remuda` 二进制，不是重写 merge**：lane runner
+   （`remuda-node/src/gate.rs`，`gate.run`/`gate.cancel`/`gate.then`）在 lane
+   checkout 内调用
+   `remuda merge <branch> --onto main --gate [--land] --json --repo <lane>
+   --target-dir <lane-target> [--web --web-e2e] [--no-push]`。gate 步骤权威仍在
+   合并 worktree 内的 `scripts/ci/gate.sh`（remuda-cli.md §134-137），Node 只
+   承担 remote-gate.sh 的 lane 机械动作：`git fetch origin`、把本地 main 对齐
+   origin/main、`git branch -f <br> origin/<br>`，分支被 worker worktree 占用时改
+   为在该 worktree `merge --ff-only`，之后本地 tip ≠ origin tip 即以
+   `stale-tip` 拒绝（rc 70 的产品化），不 gate 一个 diverged tip。这样 r-mergequeue
+   被 wrap 而非修改（`crates/remuda/src/cmd/merge.rs`、`merge/` 零改动）。
+3. **global-cas 落地语义**：land 作业在一次 merge 调用里 verify+land（
+   `--gate --land --onto main`）；merge 返回 `base_moved`（main 在 verify 后
+   前进、CAS 失败）时，Hub 把作业重新置为 queued、清空 lane/host、下一个 tick
+   在**新 main** 上重新 verify 再推，最多 3 次（`attempts`），超过记 failed。
+   push 从 **lane 主机**发出（`push:true`，沿用 lane checkout 的 git 凭据），
+   Mac/协调机不再经手 main 的推送——这正是 §1.1 I1「依赖 gating 而非信任」。
+4. **流式结果用 Node 主动发起的 `gate.event`（不是一 RPC 多响应）**：协议上
+   Hub→Node 的 JSON-RPC 一律一请求一响应（oneshot per id，32 in-flight），没有
+   server-streaming。Node 在 broadcast
+   `GateRegistry.events` 上发 `phase` / `step`（tail
+   `<tmp>/remuda-mq-*/gate.jsonl`，gate.sh 每步 flush，400ms 轮询 + 去重）/
+   `log` / `finished`，stdio carrier 用一个与 journal/tty 并列的 mpsc pump 发
+   NDJSON `gate.event`，WSS carrier 用 tty pump 同款 socket pump；Hub 在
+   `ws::handle_node_method` 加 `gate.event` 臂，校验发送方 host == 作业 lane host
+   后落 `steps[]`/终态。`gate.run` 的最终回复与 `finished` 事件同一 verdict，
+   `apply_result` 对 running 状态幂等，回复丢失也不影响终态。
+5. **lane 环境在 Project 上设置一次，永不按 run 重打**：`ProjectGateLane` 新增
+   纯增量字段 `env`（BTreeMap，CARGO_HOME/RUSTFLAGS/…）、`lockPath`
+   （REMUDA_E2E_LOCK）、`pwEndpoint`（PW_TEST_CONNECT_WS_ENDPOINT +
+   PW_CHANNEL=chromium）、`toolchainPath`（PATH 前缀）；原有
+   repoPath/targetDir/ports/remote 不变。Hub 派出 gate.run 时整体下发，Node
+   再补 CARGO_TARGET_DIR/CARGO_INCREMENTAL=0/VITE_NO_WATCH=1 和由 ports 推导的
+   HUB_E2E_LISTEN/WEB_PORT；per-step 超时走 gate.sh 已有的
+   REMUDA_GATE_STEP_TIMEOUTS，整跑预算由 Node 自己兜底（默认 1h）。无 tunnel：
+   lane runner 只在 Node 本地 spawn，不提供任意命令执行。
+6. **取消与超时**：`gate.cancel` 置 watch 标志并对该步骤进程组
+   `killpg(SIGTERM)→SIGKILL`（子进程 `process_group(0)` 成组组长）；queued 作业
+   取消直接 canceled（从不调 Node）；running 作业先 canceling、Node 以
+   `canceled` verdict 收尾。整跑超时同样 kill 整组并 failed。
+7. **`remuda land --then "<cmd>"`**：land 成功后 Hub 通过项目 homeHost 的 Node
+   发 `gate.then`（`bash -lc`，独立超时，输出截断 16KB 落 thenOutput），用于
+   demo refresh；命令不经过 lane 主机。
+8. **carrier 偏好（dispatch 附带项）**：`remuda dispatch --carrier
+   native|herdr|print`；默认看 Node hello 里
+   `capabilities.driverInventory[shell-pty].launchable`（D-028 已上报），可用即
+   shell-pty，否则 herdr；print 只在显式 `--carrier print` 时选，绝不静默降级。
+   旧 `--driver` 细粒度覆盖保留、优先。
+9. **CLI**：`remuda gate <branch> [--web auto|always|never] [--lane] [--wait/
+   --no-wait]`、`remuda land <branch> [--then]`、`remuda gate list [--state
+   …] [--branch]`、`remuda gate cancel <gjb|branch>`；等待时按 merge
+   `--gate --json` 的同款 `name: status (duration ms)` 行实时打印，exit code =
+   outcome（passed/landed 0，canceled 2，其余 1）。`remuda watch` 增加活动 gate
+   作业行，`remuda report [--for-owner]` 增加 gate 队列活动/失败与 lastLandedSha。
+   转换审计落 `audit_log`（subject=job id，detail 带 projectId/branch/mode/state/
+   mergeSha），即「每次转换 journal 为 project-scoped observation」——复用审计流
+   而非新增观测类型（协议没有 project-scoped observation，§5 co-watch 也是行内
+   状态 + audit；此处同构）。
+10. **为什么不让 merge queue 直接承担跨机调度**：r-mergequeue 的 `--queue` 是单
+    checkout 本地队列（文件 flock + lane CLI 偏移），没有主机在线判定、没有跨
+    checkout 的 lane 概念、也没有取消/推送回执通道；这些属于 Hub 编排层，merge
+    保持纯本地原语。Hub 队列调度 + Node lane runner 的分层让 merge.rs 可继续被
+    本地 CI/人工直接调用，语义不分叉。
+
+**影响**：新增 `remuda-protocol/src/gate.rs`（GateJob/GateStep/枚举/gate.* RPC
+线类型）、`remuda-hub/src/gatequeue.rs`（表/路由/调度器）、
+`remuda-node/src/gate.rs`（lane runner）、`remuda/src/cmd/gate.rs`
+（gate/land CLI）；`ProjectGateLane` 纯增量 4 字段；`merge.rs`/`merge/`
+零改动；agent 路由白名单、OpenAPI、gen-types/gen-api 同步；4 个分发面
+（server.rs、hubnode_codec.rs、runtime_wss.rs、stdio.rs）与两 carrier 的 event
+pump 均接好。测试：hub `tests/gate_queue.rs`（并行 verify、串行 land、CAS
+reverify、FIFO、queued/running cancel、输入校验 8 例）、node gate runner 7 例
+（假 merge 二进制 + 真 git fixture：stream/stale-tip/lane-busy/cancel
+killpg/超时/argv）、CLI `tests/gate_cli.rs` 5 例。真实 proof 见
+[gate-lane-1.md](./evidence/gate-lane-1.md)。

@@ -23,6 +23,12 @@ use std::path::{Path, PathBuf};
 /// Directory name holding per-worker cargo targets beside a repository root.
 pub const TARGET_DIR_NAME: &str = "remuda-target";
 
+/// Hub→Node worker RPCs served by every carrier (outbound WSS and ssh-stdio).
+#[must_use]
+pub fn is_worker_method(method: &str) -> bool {
+    matches!(method, "worker.provision" | "worker.remove")
+}
+
 /// Validate the assigned branch (pub(crate) so `worktree.rs` shares the rule).
 pub(crate) fn validate_branch(branch: &str) -> Result<(), NodeError> {
     validate_worker_branch(branch).map_err(NodeError::InvalidRequest)

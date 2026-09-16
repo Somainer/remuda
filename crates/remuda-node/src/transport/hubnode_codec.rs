@@ -341,6 +341,7 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             binary_sha256: None,
             provider_profile_id: "dev-fake".into(),
             permission_mode: "manual".into(),
+            sandbox: None,
             prompt: String::new(),
             cwd: None,
             delegation: None,

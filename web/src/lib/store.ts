@@ -49,6 +49,14 @@ import {
   type ModelCatalogView,
   type ModelEffectiveView,
 } from "../features/session/modelEffective";
+import {
+  effectivePermissionFromObservation,
+  effectivePermissionFromRecord,
+  type PermissionEffectiveView,
+} from "../features/session/permissionEffective";
+import {
+  normalizePermissionMode as normalizeKindPermissionMode,
+} from "../features/session/permissions";
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -87,6 +95,15 @@ export type ModelPending = {
   at: number;
 };
 
+/** A permission-mode wheel walk in flight (chip shows 切换中 / 排队中). */
+export type PermissionPending = {
+  /** Wire mode the user chose. */
+  mode: string;
+  /** True while the agent is working — applies at the next idle. */
+  queued: boolean;
+  at: number;
+};
+
 /** Parse an `instance.configure` model lifecycle status the driver journals. */
 function modelLifecycleStatus(status: unknown):
   | { kind: "queued" | "applied" | "degraded"; id: string; reason: string }
@@ -107,6 +124,40 @@ function modelLifecycleStatus(status: unknown):
   }
   return null;
 }
+
+/** Parse an `instance.configure` permission lifecycle the driver journals. */
+function permissionLifecycleStatus(status: unknown):
+  | { kind: "queued" | "applied" | "degraded" | "unsupported"; mode: string; reason: string }
+  | null {
+  if (typeof status !== "string") return null;
+  if (status.startsWith("permission-queued:")) {
+    return { kind: "queued", mode: status.slice("permission-queued:".length), reason: "" };
+  }
+  if (status.startsWith("permission-applied:")) {
+    return { kind: "applied", mode: status.slice("permission-applied:".length), reason: "" };
+  }
+  if (status.startsWith("permission-unsupported-in-session:")) {
+    return {
+      kind: "unsupported",
+      mode: status.slice("permission-unsupported-in-session:".length),
+      reason: "launch-only",
+    };
+  }
+  const prefix = "permission-degraded:";
+  if (status.startsWith(prefix)) {
+    const rest = status.slice(prefix.length);
+    const colon = rest.indexOf(":");
+    if (colon < 0) return { kind: "degraded", mode: rest, reason: "" };
+    return {
+      kind: "degraded",
+      mode: rest.slice(0, colon),
+      reason: rest.slice(colon + 1),
+    };
+  }
+  return null;
+}
+
+const PERMISSION_PENDING_MAX_AGE_MS = 30 * 60_000;
 
 /** Parse an `instance.configure` effort lifecycle status the driver journals. */
 function effortLifecycleStatus(status: unknown):
@@ -208,6 +259,10 @@ export type HubState = {
    *  follow-bumped durableSeq is ahead, which would hide the polled row's
    *  fresh TPM windows. */
   usageRollup: Record<string, UsageRollup>;
+  /** Effective permission mode per instance, read back from the TUI/transcript. */
+  permissionEffective: Record<string, PermissionEffectiveView>;
+  /** A permission wheel walk in flight (queued while the agent works). */
+  permissionPending: Record<string, PermissionPending>;
   /** §9.1 a push-down in flight: `queued` while the agent works (applies at
    *  the next idle), `queued:false` on the idle fast path. Cleared when the
    *  effective read-back lands or the switch is rejected. */
@@ -246,6 +301,8 @@ const initial: HubState = {
   effortEffective: {},
   usageRollup: {},
   effortPending: {},
+  permissionEffective: {},
+  permissionPending: {},
   models: {},
   modelEffective: {},
   modelCatalogs: {},
@@ -474,6 +531,22 @@ class HubStore {
     }
   }
 
+  /** Fold Hub-record `permissionEffective` into the live map. */
+  private hydratePermissionEffective(instances: Instance[]) {
+    let updated = false;
+    const next = { ...this.state.permissionEffective };
+    for (const instance of instances) {
+      const view = effectivePermissionFromRecord(instance.permissionEffective);
+      if (!view) continue;
+      const current = next[instance.id];
+      if (!current || view.observedAt >= current.observedAt) {
+        next[instance.id] = view;
+        updated = true;
+      }
+    }
+    if (updated) this.emit({ permissionEffective: next });
+  }
+
   /** Apply one transcript-read-back effort observation to the live map.
    *  Settles any pending push-down and, when the change came from the
    *  terminal side, moves the slider to the observed stop (single source of
@@ -578,6 +651,93 @@ class HubStore {
     this.emit({ toast: { id: String(Date.now()), text } });
   }
 
+  /** Fold one effective permission-mode observation. A pending Remuda walk
+   *  settles; a terminal-side change moves the chip locally without ever
+   *  calling configure back (no ping-pong). */
+  private notePermissionObservation(instanceId: Id, observation: Observation): boolean {
+    const parsed = effectivePermissionFromObservation(observation);
+    if (!parsed) return false;
+    const current = this.state.permissionEffective[instanceId];
+    if (current && parsed.effective.observedAt < current.observedAt) return false;
+    const patch: Partial<HubState> = {
+      permissionEffective: {
+        ...this.state.permissionEffective,
+        [instanceId]: parsed.effective,
+      },
+    };
+    const pending = this.state.permissionPending[instanceId];
+    if (pending) {
+      patch.permissionPending = { ...this.state.permissionPending };
+      delete patch.permissionPending[instanceId];
+    } else {
+      // Terminal-side change (shift+tab / /plan with no pending walk): move
+      // the requested mode to the observed word locally.
+      const instance = this.state.instances.find((row) => row.id === instanceId);
+      const kind = instance?.kind ?? "claude";
+      const mode = normalizeKindPermissionMode(kind, parsed.effective.mode);
+      if (this.state.permissionMode[instanceId] !== mode) {
+        patch.permissionMode = {
+          ...this.state.permissionMode,
+          [instanceId]: mode,
+        };
+      }
+    }
+    this.emit(patch);
+    return true;
+  }
+
+  /** Fold one `instance.configure` permission lifecycle. */
+  private notePermissionLifecycle(instanceId: Id, observation: Observation) {
+    const payload = observation.payload as
+      | { type?: string; nativeName?: string; status?: unknown }
+      | undefined;
+    if (payload?.type !== "native" || payload.nativeName !== "instance.configure") return;
+    const value =
+      typeof payload.status === "string"
+        ? payload.status
+        : payload.status && typeof payload.status === "object" && "value" in payload.status
+          ? (payload.status as { value: unknown }).value
+          : undefined;
+    const parsed = permissionLifecycleStatus(value);
+    if (!parsed) return;
+    const pending = { ...this.state.permissionPending };
+    if (parsed.kind === "queued") {
+      pending[instanceId] = { mode: parsed.mode, queued: true, at: Date.now() };
+      this.emit({ permissionPending: pending });
+      return;
+    }
+    if (!pending[instanceId] && parsed.kind === "applied") return;
+    delete pending[instanceId];
+    if (parsed.kind === "degraded" || parsed.kind === "unsupported") {
+      // Revert the optimistic chip to the last observed mode.
+      const effective = this.state.permissionEffective[instanceId];
+      const permissionMode = { ...this.state.permissionMode };
+      if (effective) {
+        const instance = this.state.instances.find((row) => row.id === instanceId);
+        permissionMode[instanceId] = normalizeKindPermissionMode(
+          instance?.kind ?? "claude",
+          effective.mode,
+        );
+      } else {
+        delete permissionMode[instanceId];
+      }
+      const reason =
+        ({
+          "dialog-kept": "已取消切换",
+          "bypass-dialog-kept": "绕过确认已取消",
+          "launch-only": "仅启动时可选",
+          "no-status-line": "未读到状态行",
+          "landed-other": "状态行未确认目标模式",
+          "no-readback-within-window": "未收到回读",
+          "screen-unreadable": "屏幕不可读",
+        } as Record<string, string>)[parsed.reason] ?? parsed.reason;
+      this.toast(`权限模式切换被拒绝：${reason}`);
+      this.emit({ permissionPending: pending, permissionMode });
+    } else {
+      this.emit({ permissionPending: pending });
+    }
+  }
+
   clearToast() {
     this.emit({ toast: null });
   }
@@ -638,6 +798,7 @@ class HubStore {
       this.hydrateEffortEffective(instances.items);
       this.hydrateUsageRollups(instances.items);
       this.hydrateModels(instances.items);
+      this.hydratePermissionEffective(instances.items);
       this.stopWorkspaceFollow?.();
       this.stopWorkspaceFollow = api.hostWorkspaceSubscribe(
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
@@ -818,6 +979,7 @@ class HubStore {
     this.hydrateEffortEffective(instances.items);
     this.hydrateUsageRollups(instances.items);
     this.hydrateModels(instances.items);
+    this.hydratePermissionEffective(instances.items);
   }
 
   async follow(instanceId: Id) {
@@ -854,6 +1016,8 @@ class HubStore {
       // push-down pending or fold the selection (those belong to live events).
       this.noteModelObservation(instanceId, event, false);
       this.noteModelLifecycle(instanceId, event, false);
+      this.notePermissionObservation(instanceId, event);
+      this.notePermissionLifecycle(instanceId, event);
     }
     const read: JournalRead = async (args) => {
       if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
@@ -874,6 +1038,8 @@ class HubStore {
           this.noteEffortLifecycle(instanceId, event);
           this.noteModelObservation(instanceId, event, true);
           this.noteModelLifecycle(instanceId, event, true);
+          this.notePermissionObservation(instanceId, event);
+          this.notePermissionLifecycle(instanceId, event);
         }
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
@@ -1202,6 +1368,51 @@ class HubStore {
     return this.state.modelCatalogs[instanceId] ?? null;
   }
 
+  /** Runtime permission-mode switch (Claude shift+tab wheel). Optimistic
+   *  pending, settled by the `permission` observation; queued while working. */
+  async setPermission(instanceId: Id, mode: string) {
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    const busy =
+      instance?.activity?.state === "known" ? instance.activity.value === "working" : false;
+    this.emit({
+      permissionMode: { ...this.state.permissionMode, [instanceId]: mode },
+      permissionPending: {
+        ...this.state.permissionPending,
+        [instanceId]: { mode, queued: busy, at: Date.now() },
+      },
+    });
+    try {
+      // Configure with permission only (no effort/model): the Node forwards it
+      // as a ModelSwitch carrying permissionMode, which the PTY driver turns
+      // into a shift+tab wheel walk.
+      await api.instanceConfigure(instanceId, this.permissionModeOf(instanceId), {
+        permissionMode: mode,
+      });
+    } catch (error) {
+      const pending = { ...this.state.permissionPending };
+      delete pending[instanceId];
+      this.emit({ permissionPending: pending });
+      throw error;
+    }
+  }
+
+  /** Pending permission walk for an instance, if any. */
+  permissionPendingOf(instanceId: Id): PermissionPending | null {
+    const pending = this.state.permissionPending[instanceId];
+    if (pending && Date.now() - pending.at > PERMISSION_PENDING_MAX_AGE_MS) {
+      const next = { ...this.state.permissionPending };
+      delete next[instanceId];
+      this.state = { ...this.state, permissionPending: next };
+      return null;
+    }
+    return pending ?? null;
+  }
+
+  /** Last read-back effective mode for an instance. */
+  permissionEffectiveOf(instanceId: Id): PermissionEffectiveView | null {
+    return this.state.permissionEffective[instanceId] ?? null;
+  }
+
   async respond(interactionId: Id, answer: InteractionAnswer) {
     this.emit({ answering: { ...this.state.answering, [interactionId]: true } });
     try {
@@ -1232,6 +1443,13 @@ class HubStore {
 
   permissionModeOf(instanceId: Id) {
     return this.state.permissionMode[instanceId] ?? api.permissionModeOf(instanceId);
+  }
+
+  /** The mode the session launched with (persisted create spec), used to
+   *  decide whether bypass is live-reachable in the wheel. */
+  launchPermissionModeOf(instanceId: Id): string {
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    return normalizeKindPermissionMode(instance?.kind ?? "claude", api.permissionModeOf(instanceId));
   }
 
   effortOf(instanceId: Id, kind?: EffortKind | string): EffortSelection {

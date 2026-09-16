@@ -366,6 +366,11 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .and_then(Value::as_str)
             .unwrap_or("manual")
             .to_owned(),
+        sandbox: spec
+            .get("sandbox")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         prompt: parsed
             .prompt
             .clone()

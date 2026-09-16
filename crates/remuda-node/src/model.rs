@@ -94,6 +94,10 @@ pub struct CreateInstanceRequest {
     /// Permission label; omission defaults to manual.
     #[serde(default = "default_permission")]
     pub permission_mode: String,
+    /// Codex sandbox mode (`read-only` / `workspace-write` /
+    /// `danger-full-access`); Codex creates only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     /// Optional initial prompt delivered through the bounded instance task.
     #[serde(default)]
     pub prompt: String,

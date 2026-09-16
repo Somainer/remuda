@@ -98,9 +98,14 @@ describe("no new default permissions", () => {
     renderSettings(["/settings"]);
     expect(screen.getByTestId("settings-perm-manual")).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByTestId("settings-perm-acceptEdits")).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByTestId("settings-perm-dontAsk")).toHaveAttribute("aria-pressed", "false");
-    // bypassPermissions exists in the storage type but must never be offered.
+    // Plan and auto are the real shift+tab wheel modes; the launch-only
+    // dontAsk / bypass rows are not offered as device defaults either.
+    expect(screen.getByTestId("settings-perm-plan")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("settings-perm-auto")).toHaveAttribute("aria-pressed", "false");
+    // bypassPermissions and dontAsk exist as launch modes but must never be
+    // offered as a device default.
     expect(screen.queryByTestId("settings-perm-bypassPermissions")).toBeNull();
+    expect(screen.queryByTestId("settings-perm-dontAsk")).toBeNull();
     expect(screen.getByTestId("settings-auto-reveal-tty")).not.toBeChecked();
     expect(screen.getByTestId("settings-effort-high")).toHaveAttribute("data-selected", "1");
     expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true");

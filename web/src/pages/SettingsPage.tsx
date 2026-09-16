@@ -8,6 +8,7 @@ import {
   type PermissionDefault,
 } from "../features/settings";
 import { effortTable, isEmberTier } from "../features/session/effort";
+import { defaultPermissionTable } from "../features/session/permissions";
 import css from "../features/settings/settings.module.css";
 import { readAccessCode, writeAccessCode } from "../lib/accessCode";
 import { clipboardIo } from "../lib/clipboard";
@@ -445,11 +446,19 @@ function PasskeysSection() {
   );
 }
 
-const PERMS: { id: PermissionDefault; label: string }[] = [
-  { id: "manual", label: "询问" },
-  { id: "acceptEdits", label: "可改文件" },
-  { id: "dontAsk", label: "全自动" },
-];
+const PERMS: { id: PermissionDefault; label: string; native: string; description: string }[] =
+  defaultPermissionTable()
+    .filter((option) =>
+      (["manual", "acceptEdits", "plan", "auto"] as const).includes(
+        option.id as PermissionDefault,
+      ),
+    )
+    .map((option) => ({
+      id: option.id as PermissionDefault,
+      label: option.label,
+      native: option.native,
+      description: option.description,
+    }));
 
 /* ------------------------------------------------------------------ */
 /* Page                                                                */
@@ -645,7 +654,7 @@ export function SettingsPage() {
 
             <div className={css.section}>
               <div className={css.label}>权限默认</div>
-              <p className={css.hint}>新建会话的默认 permissionMode。全自动仅限本人遥控。</p>
+              <p className={css.hint}>新建会话的默认权限（Claude 真实模式：default · acceptEdits · plan · auto）。</p>
               <div className={css.row} data-testid="settings-permission">
                 {PERMS.map((opt) => (
                   <button
@@ -656,7 +665,8 @@ export function SettingsPage() {
                     aria-pressed={settings.permissionDefault === opt.id}
                     onClick={() => void commitDevicePrefs({ permissionDefault: opt.id })}
                   >
-                    {opt.label}
+                    <span className={css.chipLabel}>{opt.label}</span>
+                    <span className={css.chipNative}>{opt.native}</span>
                   </button>
                 ))}
               </div>

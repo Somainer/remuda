@@ -139,6 +139,7 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
         extra_env: std::collections::BTreeMap::new(),
         provider_profile_id: "dev-fake".into(),
         permission_mode: "manual".into(),
+        sandbox: None,
         prompt: "FGAGENT foreground".into(),
         cwd: None,
         delegation: None,

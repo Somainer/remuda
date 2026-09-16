@@ -376,3 +376,19 @@
     font-size: var(--text-lg);
   }
 }
+
+.chipLabel {
+  font-weight: 600;
+}
+
+.chipNative {
+  color: var(--mute);
+  font-size: 11px;
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chipOn .chipNative {
+  color: var(--mute);
+  opacity: 0.8;
+}

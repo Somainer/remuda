@@ -43,10 +43,11 @@ fn hydrate() -> Vec<remuda_protocol::Observation> {
     out
 }
 
-/// The conversation payloads, dropping the bookkeeping lifecycles that D-028
-/// §7 now retains (`mode`, `permission-mode`, the queue ledger). Those have
-/// their own coverage in `transcript_origin.rs`; these tests are about the
-/// conversation shape.
+/// The conversation payloads, dropping the bookkeeping/effective-state
+/// observations D-028 §7 retains (`mode`, `permission-mode`, the queue
+/// ledger, and the effective permission-mode edge). Those have their own
+/// coverage in `transcript_origin.rs` / `permission_transcript.rs`; these
+/// tests are about the conversation shape.
 fn conversation(
     observations: &[remuda_protocol::Observation],
 ) -> Vec<remuda_protocol::Observation> {
@@ -60,6 +61,10 @@ fn conversation(
                 ObservationPayload::Lifecycle(_)
                     | ObservationPayload::Effort(_)
                     | ObservationPayload::Model(_)
+        .filter(|observation| {
+            !matches!(
+                observation.body,
+                ObservationPayload::Lifecycle(_) | ObservationPayload::Permission(_)
             )
         })
         .cloned()
@@ -75,6 +80,7 @@ fn payload_kinds(observations: &[remuda_protocol::Observation]) -> Vec<&'static 
             ObservationPayload::ToolCall(_) => "toolCall",
             ObservationPayload::ToolResult(_) => "toolResult",
             ObservationPayload::Lifecycle(_) => "lifecycle",
+            ObservationPayload::Permission(_) => "permission",
             _ => "other",
         })
         .collect()
@@ -211,6 +217,23 @@ fn bookkeeping_and_sidechain_records_are_not_journaled() {
             "{line} must reach the journal as a lifecycle"
         );
     }
+}
+
+#[test]
+fn a_permission_mode_record_emits_an_effective_edge_and_a_lifecycle() {
+    // The promoted driver's mapper surfaces the read-back mode for the chip
+    // (a Permission observation) AND keeps the §7 drift lifecycle.
+    let all = hydrate();
+    let edges = all
+        .iter()
+        .filter(|observation| matches!(observation.body, ObservationPayload::Permission(_)))
+        .count();
+    assert_eq!(edges, 1, "the fixture's one permission-mode edge");
+    let lifecycles = all
+        .iter()
+        .filter(|observation| matches!(observation.body, ObservationPayload::Lifecycle(_)))
+        .count();
+    assert!(lifecycles >= 1, "the mode/permission lifecycles are retained");
 }
 
 #[test]

@@ -38,6 +38,7 @@ fn create_req(kind: AgentKind, driver: DriverKind) -> CreateInstanceRequest {
         args: Vec::new(),
         provider_profile_id: "dev-fake".to_owned(),
         permission_mode: "dontAsk".to_owned(),
+        sandbox: None,
         prompt: String::new(),
         cwd: None,
         delegation: None,

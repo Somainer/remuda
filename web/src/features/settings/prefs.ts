@@ -1,4 +1,4 @@
-export type PermissionDefault = "manual" | "acceptEdits" | "dontAsk" | "bypassPermissions";
+export type PermissionDefault = "manual" | "acceptEdits" | "plan" | "auto";
 
 export type DeviceSettings = {
   deviceName: string;
@@ -10,6 +10,14 @@ export type DeviceSettings = {
 };
 
 const KEY = "runtime.device-settings.v1";
+
+/** The four safe settable device defaults (no bypass / dontAsk). */
+const PERMISSION_DEFAULTS: readonly PermissionDefault[] = [
+  "manual",
+  "acceptEdits",
+  "plan",
+  "auto",
+];
 
 export const DEFAULT_SETTINGS: DeviceSettings = {
   deviceName: "this-device",
@@ -24,12 +32,13 @@ export function readDeviceSettings(): DeviceSettings {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<DeviceSettings>;
-    const permissionDefault: PermissionDefault =
-      parsed.permissionDefault === "acceptEdits" ||
-      parsed.permissionDefault === "dontAsk" ||
-      parsed.permissionDefault === "bypassPermissions"
-        ? parsed.permissionDefault
-        : "manual";
+    // Legacy stored values migrate: the old "全自动" id was dontAsk, which is
+    // a launch-only deny mode and is not a device default.
+    const permissionDefault: PermissionDefault = PERMISSION_DEFAULTS.includes(
+      parsed.permissionDefault as PermissionDefault,
+    )
+      ? (parsed.permissionDefault as PermissionDefault)
+      : "manual";
     const effortRaw = Number(parsed.defaultEffortIndex);
     return {
       deviceName: parsed.deviceName?.trim() || DEFAULT_SETTINGS.deviceName,

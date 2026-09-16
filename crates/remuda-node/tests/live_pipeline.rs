@@ -184,6 +184,7 @@ async fn start_run(hooks: bool) -> LiveRun {
         extra_env: std::collections::BTreeMap::new(),
         provider_profile_id: "dev-fake".into(),
         permission_mode: "manual".into(),
+        sandbox: None,
         prompt: "LIVE probe".into(),
         cwd: None,
         delegation: None,

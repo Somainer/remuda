@@ -12,7 +12,8 @@ use remuda_driver::{
     ShellPtyOptions, preset_by_id, write_claude_provider_overlay,
 };
 use remuda_protocol::{
-    ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode, ClaudePermission,
+    AgentKind, ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode,
+    ClaudePermission,
     ClaudePermissionMode, CompletionScope, ContentBlock, DriverInput, DriverKind,
     HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceSpec, InteractionAnswer,
     NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend,
@@ -1115,6 +1116,86 @@ fn merge_launch_env(
     merged
 }
 
+fn build_permission_mode(
+    launch: &DriverLaunch,
+    claude_mode: ClaudePermissionMode,
+) -> PermissionMode {
+    use remuda_protocol::{
+        AgyPermission, AgyPermissionMode, ApprovalPolicy, CodexExecution, CodexPermission,
+        GenericPermission, GenericPermissionMode, GrokPermission, GrokPermissionMode,
+        SandboxMode,
+    };
+    let interaction = if matches!(
+        launch.request.driver,
+        DriverKind::ClaudePty | DriverKind::GenericPty | DriverKind::ShellPty
+    ) {
+        ClaudeInteractionMode::NativeTty
+    } else {
+        ClaudeInteractionMode::Host
+    };
+    match launch.request.kind {
+        AgentKind::Claude | AgentKind::Terminal => PermissionMode::Claude(Box::new(
+            ClaudePermission {
+                mode: claude_mode,
+                interaction,
+            },
+        )),
+        AgentKind::Codex => {
+            let policy = match launch.request.permission_mode.as_str() {
+                "never" | "no-request" => ApprovalPolicy::Never,
+                "on-request" | "onRequest" => ApprovalPolicy::OnRequest,
+                "untrusted" => ApprovalPolicy::Untrusted,
+                _ => ApprovalPolicy::Untrusted,
+            };
+            let sandbox = match launch
+                .request
+                .sandbox
+                .as_deref()
+                .unwrap_or("workspace-write")
+            {
+                "read-only" => SandboxMode::ReadOnly,
+                "danger-full-access" | "danger" => SandboxMode::DangerFullAccess,
+                _ => SandboxMode::WorkspaceWrite,
+            };
+            PermissionMode::Codex(Box::new(CodexPermission {
+                approval_policy: policy,
+                approvals_reviewer: remuda_protocol::ApprovalsReviewer::User,
+                execution: CodexExecution::Sandbox(
+                    remuda_protocol::SandboxExecution { sandbox },
+                ),
+            }))
+        }
+        AgentKind::Grok => {
+            let mode = match launch.request.permission_mode.as_str() {
+                "always-approve" | "alwaysApprove" | "bypassPermissions" => {
+                    GrokPermissionMode::AlwaysApprove
+                }
+                "auto" => GrokPermissionMode::Auto,
+                "native-prompt" | "nativePrompt" => GrokPermissionMode::NativePrompt,
+                _ => GrokPermissionMode::NativePrompt,
+            };
+            PermissionMode::Grok(Box::new(GrokPermission { mode }))
+        }
+        AgentKind::Agy => {
+            let mode = match launch.request.permission_mode.as_str() {
+                "always-proceed" | "alwaysProceed" | "bypassPermissions" => {
+                    AgyPermissionMode::AlwaysProceed
+                }
+                "accept-edits" | "acceptEdits" => AgyPermissionMode::AcceptEdits,
+                "plan" => AgyPermissionMode::Plan,
+                "native" => AgyPermissionMode::Native,
+                _ => AgyPermissionMode::Native,
+            };
+            PermissionMode::Agy(Box::new(AgyPermission { mode }))
+        }
+        AgentKind::Generic => PermissionMode::Generic(Box::new(
+            GenericPermission {
+                mode: GenericPermissionMode::Native,
+            },
+        )),
+    }
+}
+
 fn instance_spec(
     launch: &DriverLaunch,
     config: &NativeDriverConfig,
@@ -1135,14 +1216,13 @@ fn instance_spec(
         }
         _ => ClaudePermissionMode::Manual,
     };
-    let interaction = if matches!(
-        launch.request.driver,
-        DriverKind::ClaudePty | DriverKind::GenericPty | DriverKind::ShellPty
-    ) {
-        ClaudeInteractionMode::NativeTty
-    } else {
-        ClaudeInteractionMode::Host
-    };
+    // The real per-harness permission union. Claude rides the mode above;
+    // Codex's axis is approval policy (+ an optional sandbox mode), Grok and
+    // agy their own native enums. A mode not in the harness's own set falls
+    // back to that harness's native default rather than forcing a Claude word
+    // through (the picker never offers a foreign list — this is the wire
+    // trust boundary).
+    let permission_mode = build_permission_mode(launch, mode);
     let carrier = match launch.request.driver {
         DriverKind::ShellPty => CarrierSpec::ShellPty,
         DriverKind::ClaudePty | DriverKind::GenericPty => CarrierSpec::Pty(Box::new(PtyCarrier {
@@ -1208,7 +1288,7 @@ fn instance_spec(
         model_id,
         effort: launch.request.effort,
         tui: launch.request.tui,
-        permission_mode: PermissionMode::Claude(Box::new(ClaudePermission { mode, interaction })),
+        permission_mode,
         env: BTreeMap::new(),
         args: with_max_budget(
             launch.request.args.clone(),
@@ -1376,6 +1456,7 @@ mod tests {
                 binary_sha256: None,
                 provider_profile_id: "native".to_owned(),
                 permission_mode: "manual".to_owned(),
+                sandbox: None,
                 prompt: String::new(),
                 cwd: None,
                 delegation: None,
@@ -1618,6 +1699,7 @@ mod tests {
                 extra_env: std::collections::BTreeMap::new(),
                 provider_profile_id: "native".into(),
                 permission_mode: spelling.into(),
+                sandbox: None,
                 prompt: String::new(),
                 cwd: None,
                 delegation: None,
@@ -1672,6 +1754,7 @@ mod tests {
             extra_env: std::collections::BTreeMap::new(),
             provider_profile_id: "native".into(),
             permission_mode: "no-such-mode".into(),
+            sandbox: None,
             prompt: String::new(),
             cwd: None,
             delegation: None,
@@ -1716,6 +1799,7 @@ mod tests {
             binary_sha256: None,
             provider_profile_id: "none".into(),
             permission_mode: "dontAsk".into(),
+            sandbox: None,
             prompt: String::new(),
             cwd: None,
             delegation: Some("gateway".into()),
@@ -1767,6 +1851,7 @@ mod tests {
             binary_sha256: None,
             provider_profile_id: "gateway".into(),
             permission_mode: "dontAsk".into(),
+            sandbox: None,
             prompt: String::new(),
             cwd: None,
             delegation: Some("gateway".into()),
@@ -1821,6 +1906,7 @@ mod tests {
             binary_sha256: None,
             provider_profile_id: "gateway".into(),
             permission_mode: "dontAsk".into(),
+            sandbox: None,
             prompt: String::new(),
             cwd: None,
             delegation: Some("gateway".into()),
@@ -1995,6 +2081,7 @@ mod tests {
             binary_sha256: None,
             provider_profile_id: "pvp_other".into(),
             permission_mode: "dontAsk".into(),
+            sandbox: None,
             prompt: String::new(),
             cwd: None,
             delegation: Some("gateway".into()),

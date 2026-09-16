@@ -98,6 +98,11 @@ fn public_wire_types_are_registered_for_generation() {
         "JournalSeqWatermark",
         "TtyFrameParams",
         "TtyModeParams",
+        // Additive tty.mode companion (native-config, 2026-09-16): same
+        // Node→Hub JSON-RPC param family as TtyModeParams; the web tty client
+        // parses this channel by hand rather than from generated types.
+        "TtyProgress",
+        "TtyProgressState",
         "TtyWriteParams",
         "TtyResizeParams",
         "TtyAttachParams",

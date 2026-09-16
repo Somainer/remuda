@@ -378,6 +378,7 @@ async fn handle_stdio_frame(
         }
         _ if crate::workspace::is_workspace_method(request.method.as_str())
             || request.method == "host.doctor"
+            || request.method == "host.resources"
             || crate::worktree::is_worktree_method(request.method.as_str())
             || crate::workspace_scm::is_scm_method(request.method.as_str()) =>
         {

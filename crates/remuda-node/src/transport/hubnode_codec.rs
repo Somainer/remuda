@@ -186,6 +186,10 @@ pub async fn dispatch_method(
     if method == "host.doctor" {
         return node.doctor().await;
     }
+    if method == "host.resources" {
+        let resources = serde_json::to_value(crate::inventory::sample_resources())?;
+        return Ok(serde_json::json!({ "resources": resources }));
+    }
     if crate::worktree::is_worktree_method(method) {
         return node.worktree_rpc(method, &params);
     }

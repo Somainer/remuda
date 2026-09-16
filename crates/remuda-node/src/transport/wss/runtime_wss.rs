@@ -120,6 +120,12 @@ async fn dispatch_hub(
     if method == "host.doctor" {
         return runtime.node.doctor().await;
     }
+    if method == "host.resources" {
+        // On-demand fresh sample for the Hub's stale-before-refuse placement
+        // check. No Node state involved; the read is /proc/loadavg + meminfo.
+        let resources = serde_json::to_value(crate::inventory::sample_resources())?;
+        return Ok(json!({ "resources": resources }));
+    }
     if crate::workspace::is_workspace_method(method) {
         return runtime.node.workspace_rpc(method, params);
     }

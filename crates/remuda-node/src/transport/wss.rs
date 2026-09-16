@@ -494,6 +494,25 @@ async fn recv_ws(stream: &mut WsStream) -> Result<Option<Value>, NodeError> {
     }
 }
 
+/// Replace the `resources` block in the outbound inventory with a sample taken
+/// now.
+///
+/// The full `host` inventory is collected once (CLI versions, binary hashes)
+/// and stays cached; only CPU/memory must move on their own cadence. Without
+/// this refresh every heartbeat re-advertised the connect-time sample and a
+/// single build spike froze the host at `cpuPct:100` until the next reconnect.
+fn refresh_host_resources(config: &mut WssConfig) {
+    let Some(host) = config.host.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    match serde_json::to_value(crate::inventory::sample_resources()) {
+        Ok(resources) if resources.is_object() => {
+            host.insert("resources".into(), resources);
+        }
+        _ => {}
+    }
+}
+
 fn rpc_request(id: &str, method: &str, params: Value) -> Value {
     hubnode::rpc_request(id, method, params)
 }
@@ -625,6 +644,7 @@ async fn session_task(
             return;
         }
     };
+    refresh_host_resources(&mut config);
     let snapshot = runtime_wss::snapshot_watermarks(&watermarks);
     let hello = match perform_hello(
         &mut stream,
@@ -700,6 +720,10 @@ async fn session_task(
             _ = heartbeat.tick() => {
                 let id = format!("n-{}", ids.fetch_add(1, Ordering::Relaxed));
                 let snapshot = runtime_wss::snapshot_watermarks(&watermarks);
+                // Piggyback a fresh load/MemInfo sample on the existing 15 s
+                // lease frame: the Hub refuses placement on stale CPU, so the
+                // number has to track the machine between hellos.
+                refresh_host_resources(&mut config);
                 let mut params = encode_heartbeat_params(&config, connection_id.as_deref(), lease_id.as_deref(), &snapshot);
                 if let Some(runtime) = runtime.as_ref() {
                     if !params["host"].is_object() { params["host"] = json!({}); }
@@ -1099,6 +1123,7 @@ async fn reconnect(
             "hub wss reconnecting; commands are not replayed"
         );
         sleep(delay).await;
+        refresh_host_resources(config);
         let snapshot = runtime_wss::snapshot_watermarks(watermarks);
         match dial(&config.url, token).await {
             Ok(mut next) => {
@@ -1386,6 +1411,40 @@ mod tests {
         );
         let value = encode_hello_params(&bare, &epoch, &HashMap::new());
         assert!(value["capabilities"].is_null());
+    }
+
+    #[test]
+    fn heartbeat_resource_refresh_replaces_only_the_resources_block() {
+        let host_id = remuda_protocol::HostId::new();
+        let mut config = WssConfig::loopback(
+            "127.0.0.1:1".parse().expect("addr"),
+            "tok",
+            host_id.as_id().as_str().to_owned(),
+        );
+        config.host = Some(json!({
+            "hostname": "lab",
+            "labels": { "region": "sg" },
+            "resources": { "cpuPct": 100, "memPct": 99, "cpuCount": 14 }
+        }));
+        refresh_host_resources(&mut config);
+        let host = config.host.as_ref().expect("host");
+        // The frozen spike reading is replaced by a live sample…
+        let resources = host.get("resources").expect("resources");
+        assert!(resources.get("cpuPct").is_some());
+        assert!(resources.get("cpuCount").is_some());
+        // …while the rest of the cached inventory is untouched.
+        assert_eq!(host["hostname"], json!("lab"));
+        assert_eq!(host["labels"]["region"], json!("sg"));
+
+        // A config without host inventory (loopback tests, bare carriers) is a
+        // no-op rather than a synthesized partial host frame.
+        let mut bare = WssConfig::loopback(
+            "127.0.0.1:1".parse().expect("addr"),
+            "tok",
+            host_id.as_id().as_str().to_owned(),
+        );
+        refresh_host_resources(&mut bare);
+        assert!(bare.host.is_none());
     }
 
     #[test]

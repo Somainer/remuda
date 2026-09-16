@@ -30,6 +30,7 @@ pub mod emulator;
 pub mod grid;
 pub mod osc;
 pub mod signature;
+pub mod statusline;
 
 pub use ansi::{char_tail, screen_tail, strip_ansi};
 pub use dialog::{
@@ -40,6 +41,9 @@ pub use emulator::{DEFAULT_SCROLLBACK_LINES, Emulator, MAX_COLS, MAX_ROWS};
 pub use grid::{ModeSet, OscState, ScreenGrid};
 pub use osc::{OscStatus, progress_active, progress_state};
 pub use signature::{HookHealth, ScreenLatch, ScreenStatus, detect_from_screen, screen_status};
+pub use statusline::{
+    ScreenElapsed, ScreenLive, ScreenLiveChange, ScreenLiveLatch, ScreenTokens, screen_live,
+};
 
 /// Where an attach snapshot's bytes came from.
 ///

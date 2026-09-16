@@ -293,3 +293,88 @@ fn mapper_with_bridge(
 ) -> TranscriptMapper {
     remuda_driver::test_support::mapper_with_bridge(bridge.clone(), "effort-session", "2.1.272")
 }
+
+// ───────── Real claude 2.1.273 PTY session, four switches in one run ────────
+
+const WALK_21273: &str = include_str!("fixtures/effort-21273/effort-multi-switch-21273.jsonl");
+
+#[tokio::test]
+async fn real_21273_four_consecutive_switches_each_resolve_their_own_generation() {
+    // The owner's c-effort3 report: the first switch (ultracode) read back, but
+    // the next switch ended with no-readback-within-window. Replay the verbatim
+    // 2.1.273 transcript — low baseline, ultracode → high → ultracode → max with
+    // real turns between them — arming a fresh generation before each slash
+    // record exactly as `perform_switch` does, and assert EVERY generation
+    // resolves Applied with the tier and ultracode flag the verdict carries.
+    use std::time::Duration;
+    let bridge = std::sync::Arc::new(remuda_driver::test_support::Bridge::new());
+    let mut mapper = remuda_driver::test_support::mapper_with_bridge(
+        bridge.clone(),
+        "effort-session",
+        "2.1.273",
+    );
+
+    // (slash word, expected tier, expected ultracode flag), in fixture order.
+    let expected: [(&str, &str, Option<bool>); 4] = [
+        ("ultracode", "xhigh", Some(true)),
+        ("high", "high", Some(false)),
+        ("ultracode", "xhigh", Some(true)),
+        ("max", "max", Some(false)),
+    ];
+    let mut switch = 0usize;
+    let mut pending: Option<(u64, &str, Option<bool>)> = None;
+    let mut resolved: Vec<(&str, Option<bool>)> = Vec::new();
+    let mut edges: Vec<(String, Option<bool>)> = Vec::new();
+    for line in WALK_21273.lines().filter(|l| !l.trim().is_empty()) {
+        // Arm before the slash record is mapped: perform_switch arms before it
+        // types, and the slash record is the first record the command produces.
+        if line.contains("<command-name>/effort</command-name>") {
+            let (word, tier, flag) = expected[switch];
+            assert!(line.contains(&format!("<command-args>{word}</command-args>")));
+            let generation = bridge.arm_word(word);
+            pending = Some((generation, tier, flag));
+            switch += 1;
+        }
+        for obs in mapper.map_line(line).expect("map") {
+            if let ObservationPayload::Effort(payload) = &obs.body {
+                edges.push((
+                    payload.effective.name.wire().to_string(),
+                    payload.effective.ultracode,
+                ));
+            }
+        }
+        // The slash record is immediately followed by its stdout verdict line.
+        if line.contains("<local-command-stdout>")
+            && let Some((generation, tier, flag)) = pending.take()
+        {
+            match bridge.wait(generation, Duration::from_secs(1)).await {
+                Some(remuda_driver::effort::Readback::Applied(observed)) => {
+                    assert_eq!(observed.name.wire(), tier, "stdout line: {line}");
+                    assert_eq!(observed.ultracode, flag);
+                    resolved.push((tier, flag));
+                }
+                other => panic!("switch {switch} did not resolve Applied: {other:?}\n{line}"),
+            }
+        }
+    }
+    assert_eq!(resolved.len(), 4, "all four switches resolved");
+    assert!(
+        !bridge.has_pending(),
+        "no generation left pending after the walk"
+    );
+    // Edges include every accepted tier, the flag on → off → on, then max, so
+    // no switch is silently dropped by dedup.
+    for (tier, flag) in [
+        ("xhigh", Some(true)),
+        ("high", Some(false)),
+        ("xhigh", Some(true)),
+        ("max", Some(false)),
+    ] {
+        assert!(
+            edges
+                .iter()
+                .any(|(name, edge_flag)| name == tier && *edge_flag == flag),
+            "missing edge ({tier}, {flag:?}): {edges:?}"
+        );
+    }
+}

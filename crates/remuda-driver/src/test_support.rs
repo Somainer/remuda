@@ -39,6 +39,22 @@ impl Bridge {
             .arm(EffortRequest::from_level("max").expect("level"))
     }
 
+    /// Arm an arbitrary `/effort <word>` switch; returns its generation.
+    pub fn arm_word(&self, word: &str) -> u64 {
+        self.inner
+            .arm(EffortRequest::from_level(word).expect("level"))
+    }
+
+    /// Whether a switch is still awaiting its verdict.
+    pub fn has_pending(&self) -> bool {
+        self.inner.has_pending()
+    }
+
+    /// Give up on a generation without a verdict (bounded timeout / reject).
+    pub fn fail(&self, generation: u64) {
+        self.inner.fail(generation);
+    }
+
     /// Wait for the generation's verdict.
     pub async fn wait(&self, generation: u64, timeout: Duration) -> Option<Readback> {
         self.inner.wait(generation, timeout).await

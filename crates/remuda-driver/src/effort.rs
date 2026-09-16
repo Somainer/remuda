@@ -157,12 +157,28 @@ pub fn ensure_no_effort_in_extras(kind: AgentKind, extras: &[String]) -> DriverR
 /// synchronous idle-path configure call against a wedged TUI; a switch made
 /// while the agent is working is queued instead.
 pub(crate) const EFFORT_READBACK_TIMEOUT_MS: u64 = 10_000;
-/// Poll cadence while waiting for read-back.
+/// Poll cadence while waiting for read-back (also the rescue-read cadence).
 pub(crate) const EFFORT_READBACK_POLL_MS: u64 = 250;
 /// Settle pause between writes (composer body, the submitting CR, the confirm
 /// dialog CR). The ready ladder already gates the first write; these small
 /// gaps keep keystrokes out of one TTY read.
 pub(crate) const EFFORT_WRITE_SETTLE_MS: u64 = 120;
+/// How long the confirming dialog is waited for before the read-back wait
+/// begins. If the dialog is missed inside this window the rescue pass during
+/// the read-back wait confirms it once it is seen.
+pub(crate) const EFFORT_DIALOG_DEADLINE_MS: u64 = 1_500;
+/// Poll cadence of the dialog phase.
+pub(crate) const EFFORT_DIALOG_POLL_MS: u64 = 40;
+/// A rescue Enter is only sent this long after the previous one, so a dialog
+/// repainting itself closed never earns a double-confirm.
+pub(crate) const EFFORT_RESCUE_CR_GAP_MS: u64 = 700;
+/// Maximum rescue Enters per switch (the original confirm plus two).
+pub(crate) const EFFORT_MAX_RESCUE_CRS: u32 = 2;
+
+/// Lowercased screen markers for the `/effort` confirmation dialog and the
+/// invalid-argument error. Compared against ANSI-stripped, lowercased text.
+pub(crate) const DIALOG_MARKER: &str = "change effort level";
+pub(crate) const INVALID_MARKER: &str = "invalid argument";
 
 /// The exact `/effort` vocabulary measured in-session on claude 2.1.221.
 #[allow(dead_code)] // documentation constant; also used by the fake harness
@@ -231,6 +247,27 @@ impl EffortRequest {
     /// The whole slash command body, without the submitting CR.
     pub(crate) fn command_body(&self) -> String {
         format!("/effort {}", self.command_word())
+    }
+
+    /// Word the confirmation dialog uses to name the tier this switch targets.
+    ///
+    /// The dialog (measured on 2.1.272/2.1.273) renders
+    /// "1. Yes, switch to <tier>" / "Switching to <tier> means …". An ultracode
+    /// switch is an xhigh switch plus the workflow flag, so the dialog names
+    /// `xhigh`, not `ultracode`. This is what gates the confirming CR: a stale
+    /// dialog left on screen by the previous switch names a different tier and
+    /// must never eat the next switch's Enter (c-effort3).
+    pub(crate) fn dialog_target_word(&self) -> &'static str {
+        match self.name {
+            EffortName::Low => "low",
+            EffortName::Medium => "medium",
+            EffortName::High => "high",
+            EffortName::Xhigh => "xhigh",
+            EffortName::Max => "max",
+            // EffortRequest never carries either name for Claude.
+            EffortName::Minimal => "minimal",
+            EffortName::Ultra => "ultra",
+        }
     }
 
     /// Level the transcript must report for this switch to count as observed.
@@ -457,18 +494,45 @@ pub(crate) trait EffortSwitchIo: Send + Sync {
 /// cached conversation, then wait for the command's stdout verdict.
 ///
 /// The body and both Enter presses are separate writes with a settle gap,
-/// matching [`crate::shell_pty::send`]'s measured requirement. The dialog is
-/// polled rather than read once after a fixed sleep: measured paint is ~100 ms,
-/// and the idle-path budget is ~2 s end to end.
+/// matching [`crate::shell_pty::send`]'s measured requirement.
+///
+/// ## Dialog gating (c-effort3)
+///
+/// The confirming Enter used to be sent as soon as the screen contained
+/// "Change effort level". On the second switch of a session a **rendered**
+/// dialog from the previous switch can still be inside the visible region
+/// (a short Herdr grid, a slow repaint): the Enter then raced the new dialog's
+/// paint, and when it landed first the real "Yes, switch" modal was left
+/// open — no stdout verdict ever came, and the switch was falsely reported
+/// `no-readback-within-window` even though Claude had applied the command.
+///
+/// Two layers prevent that now:
+///
+/// 1. **Target gating.** The screen is snapshotted before typing. A dialog
+///    already present is treated as stale; the phase-1 Enter waits for a dialog
+///    naming THIS switch's tier ("switch to \<tier\>"). A stale dialog naming
+///    the previous tier can never take it.
+/// 2. **Rescue pass.** While the read-back is waited on, a dialog still open
+///    and attributable to this command gets a bounded number of spaced
+///    Enters. This both heals a phase-1 miss (late paint) and an Enter that
+///    raced the paint; an extra Enter after the dialog has closed lands in an
+///    empty composer, which the TUI ignores. The transcript verdict remains
+///    the only authority.
 pub(crate) async fn perform_switch(
     request: EffortRequest,
     bridge: &EffortBridge,
     io: &dyn EffortSwitchIo,
 ) -> SwitchOutcome {
     let word = request.command_word();
+    let target = request.dialog_target_word();
     // Arm before typing so the mapper correlates the slash record the command
     // produces with this generation.
     let generation = bridge.arm(request);
+
+    // Snapshot before typing: a dialog the previous switch left rendered is
+    // stale and must not receive this switch's Enter.
+    let pre_screen = normalize_screen(&io.screen_text().await.unwrap_or_default());
+    let mut stale_dialog = pre_screen.contains(DIALOG_MARKER);
 
     if let Err(error) = io.type_body(&request.command_body()).await {
         tracing::warn!(%error, "effort switch: body write failed");
@@ -492,44 +556,113 @@ pub(crate) async fn perform_switch(
         return SwitchOutcome::ControlUnavailable;
     }
 
-    // A cached conversation makes Claude confirm ("Change effort level? …
-    // 1. Yes, switch …"). Poll for the dialog text and accept only when it is
-    // really there; an invalid argument renders an error instead and must not
-    // get a confirming CR. `Esc` cancels, so the extra CR is gated.
-    let dialog_deadline = std::time::Duration::from_millis(1_500);
-    let dialog_start = std::time::Instant::now();
-    let mut dialog_seen = false;
-    while dialog_start.elapsed() < dialog_deadline {
-        match io.screen_text().await {
-            Ok(text) if text.contains("Change effort level") => {
-                dialog_seen = true;
-                break;
-            }
-            Ok(text) if text.contains("Invalid argument") => break,
-            Ok(_) => {}
+    // Phase 1: confirm the dialog THIS command opened. An invalid argument
+    // renders an error instead and must never get a confirming Enter; `Esc`
+    // cancels, so every Enter here is gated. A verdict can arrive inside this
+    // window too (a dialog-free build applies on the submit CR), in which case
+    // the wait ends immediately.
+    let dialog_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(EFFORT_DIALOG_DEADLINE_MS);
+    let mut invalid = false;
+    let mut confirmed = false;
+    let mut outcome = None;
+    while std::time::Instant::now() < dialog_deadline {
+        // Non-blocking verdict check: a dialog-free switch applies within
+        // hundreds of ms of the submit CR and must not wait out the window.
+        if let Some(verdict) = bridge.wait(generation, std::time::Duration::ZERO).await {
+            outcome = Some(verdict);
+            break;
+        }
+        let text = match io.screen_text().await {
+            Ok(text) => normalize_screen(&text),
             Err(error) => {
-                // The dialog read failing must not stop the switch: it may
-                // already be applied. The verdict is the authority.
+                // A failed screen read cannot stop the switch — the command
+                // may already be applied, and the verdict is the authority.
                 tracing::debug!(%error, "effort switch: dialog screen read failed; continuing");
                 break;
             }
+        };
+        if text.contains(INVALID_MARKER) {
+            invalid = true;
+            break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        if text.contains(DIALOG_MARKER) {
+            let names_target = screen_names_target(&text, target);
+            // A dialog naming our target is ours even when a same-word dialog
+            // was rendered pre-submit (a modal cannot stay open while the
+            // composer accepted the new command). When no dialog predated the
+            // submit, a marker-only dialog (unknown future copy) is accepted
+            // too; a stale marker naming the previous tier is simply waited out.
+            if names_target || !stale_dialog {
+                tokio::time::sleep(std::time::Duration::from_millis(EFFORT_WRITE_SETTLE_MS)).await;
+                if io.press_enter().await.is_ok() {
+                    confirmed = true;
+                }
+                break;
+            }
+            // Marker present but naming the previous tier: keep waiting for
+            // the stale render to clear and the new dialog to paint.
+        } else {
+            // The visible region is dialog-free; whatever paints next is new.
+            stale_dialog = false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(EFFORT_DIALOG_POLL_MS)).await;
     }
-    if dialog_seen {
-        tokio::time::sleep(std::time::Duration::from_millis(EFFORT_WRITE_SETTLE_MS)).await;
-        if let Err(error) = io.press_enter().await {
-            tracing::warn!(%error, "effort switch: confirm write failed");
+
+    // Phase 2: wait for the command verdict, rescuing a still-open dialog.
+    let readback_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(EFFORT_READBACK_TIMEOUT_MS);
+    let mut last_enter: Option<std::time::Instant> = confirmed.then(std::time::Instant::now);
+    let mut rescue_enters = 0_u32;
+    // The screen was observed dialog-free at least once after the submit
+    // (immediately so when no stale dialog existed); a later marker-only dialog
+    // is then attributable even without a tier word in its text.
+    let mut seen_dialog_free = !pre_screen.contains(DIALOG_MARKER);
+    while outcome.is_none() && std::time::Instant::now() < readback_deadline {
+        if let Some(verdict) = bridge
+            .wait(
+                generation,
+                std::time::Duration::from_millis(EFFORT_READBACK_POLL_MS),
+            )
+            .await
+        {
+            outcome = Some(verdict);
+            break;
+        }
+        if std::time::Instant::now() >= readback_deadline {
+            break;
+        }
+        if invalid {
+            continue;
+        }
+        let Ok(raw_text) = io.screen_text().await else {
+            continue;
+        };
+        let text = normalize_screen(&raw_text);
+        if text.contains(INVALID_MARKER) {
+            invalid = true;
+            continue;
+        }
+        if !text.contains(DIALOG_MARKER) {
+            seen_dialog_free = true;
+            continue;
+        }
+        let names_target = screen_names_target(&text, target);
+        let attributable = names_target || seen_dialog_free;
+        let gap_elapsed = last_enter
+            .map(|when| when.elapsed() >= std::time::Duration::from_millis(EFFORT_RESCUE_CR_GAP_MS))
+            .unwrap_or(true);
+        if attributable
+            && gap_elapsed
+            && rescue_enters < EFFORT_MAX_RESCUE_CRS
+            && io.press_enter().await.is_ok()
+        {
+            rescue_enters += 1;
+            last_enter = Some(std::time::Instant::now());
         }
     }
 
-    match bridge
-        .wait(
-            generation,
-            std::time::Duration::from_millis(EFFORT_READBACK_TIMEOUT_MS),
-        )
-        .await
-    {
+    match outcome {
         Some(Readback::Applied(_)) => SwitchOutcome::Applied,
         Some(Readback::Rejected { reason }) => {
             // The dialog was dismissed (Esc) or the argument rejected. The
@@ -554,6 +687,24 @@ pub(crate) async fn perform_switch(
             SwitchOutcome::Degraded
         }
     }
+}
+
+/// Lowercase a screen read and collapse every whitespace run to one space,
+/// matching `remuda_screen::Grid::flat`'s convention: the TUI soft-wraps the
+/// dialog copy across rows, so a multi-word phrase must match with the newlines
+/// and the dialog's own odd spacing stripped (the measured 2.1.273 modal renders
+/// "Switchingtoxhigh"-adjacent fragments with ragged spacing on narrow grids).
+fn normalize_screen(raw: &str) -> String {
+    raw.to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a screen names `tier` inside the `/effort` confirmation dialog.
+fn screen_names_target(screen_lowercased: &str, tier: &str) -> bool {
+    screen_lowercased.contains(&format!("switch to {tier}"))
+        || screen_lowercased.contains(&format!("switching to {tier}"))
 }
 
 /// A switch held for the next idle moment (D-028 §9.1 ready ladder).
@@ -878,6 +1029,7 @@ mod sync_tests {
 mod switch_tests {
     use super::*;
     use crate::DriverResult;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -886,10 +1038,20 @@ mod switch_tests {
         writes: Mutex<Vec<String>>,
         journals: Mutex<Vec<(String, Severity)>>,
         idle: AtomicBool,
+        /// Current screen; each scripted screen read overwrites this slot.
         screen: Mutex<String>,
+        /// Screens served in order on successive `screen_text` calls; when the
+        /// script is exhausted the last served screen persists.
+        screen_script: Mutex<VecDeque<String>>,
+        /// Screen text observed at each Enter write.
+        cr_screens: Mutex<Vec<String>>,
         bridge: Mutex<Option<Arc<EffortBridge>>>,
         /// Resolve the read-back once this many writes have happened.
         resolve_after: usize,
+        /// Reject the pending generation (with `invalid-argument`) the first
+        /// time a screen containing the invalid marker is observed.
+        reject_on_invalid: bool,
+        invalid_rejected: AtomicBool,
         journal_count: AtomicUsize,
     }
 
@@ -902,6 +1064,12 @@ mod switch_tests {
         }
         fn journals(&self) -> Vec<(String, Severity)> {
             self.journals.lock().unwrap().clone()
+        }
+        fn cr_screens(&self) -> Vec<String> {
+            self.cr_screens.lock().unwrap().clone()
+        }
+        fn script(&self, screens: &[&str]) {
+            *self.screen_script.lock().unwrap() = screens.iter().map(|s| (*s).to_owned()).collect();
         }
         fn maybe_resolve(&self) {
             let n = self.writes.lock().unwrap().len();
@@ -919,6 +1087,16 @@ mod switch_tests {
                 );
             }
         }
+        fn maybe_reject_invalid(&self, screen: &str) {
+            if self.reject_on_invalid
+                && screen.contains(INVALID_MARKER)
+                && !self.invalid_rejected.swap(true, Ordering::SeqCst)
+                && let Some(bridge) = self.bridge.lock().unwrap().clone()
+                && let Some((generation, _)) = bridge.pending_with_gen()
+            {
+                bridge.reject(generation, "invalid-argument");
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -932,31 +1110,46 @@ mod switch_tests {
             Ok(())
         }
         async fn press_enter(&self) -> DriverResult<()> {
+            self.cr_screens
+                .lock()
+                .unwrap()
+                .push(self.screen.lock().unwrap().clone());
             self.writes.lock().unwrap().push("cr".into());
             self.journal_count.fetch_add(1, Ordering::SeqCst);
             self.maybe_resolve();
             Ok(())
         }
         async fn screen_text(&self) -> DriverResult<String> {
-            Ok(self.screen.lock().unwrap().clone())
+            if let Some(next) = self.screen_script.lock().unwrap().pop_front() {
+                *self.screen.lock().unwrap() = next;
+            }
+            let screen = self.screen.lock().unwrap().clone();
+            self.maybe_reject_invalid(&screen.to_ascii_lowercase());
+            Ok(screen)
         }
         async fn journal(&self, status: String, severity: Severity) {
             self.journals.lock().unwrap().push((status, severity));
         }
     }
 
+    const XHIGH_DIALOG: &str =
+        "Change effort level? This conversation is cached. 1. Yes, switch to xhigh 2. No, go back";
+    const HIGH_DIALOG: &str =
+        "Change effort level? This conversation is cached. 1. Yes, switch to high 2. No, go back";
+    const MAX_DIALOG: &str =
+        "Change effort level? This conversation is cached. 1. Yes, switch to max 2. No, go back";
+    const INVALID_SCREEN: &str = "Invalid argument: bogus. Valid options are: low, medium, high, xhigh, max, ultracode, auto";
+
     #[tokio::test]
     async fn an_idle_switch_types_body_then_two_crs_and_reports_applied() {
         let bridge = Arc::new(EffortBridge::new());
         let io = Arc::new(MockIo {
-            resolve_after: 2, // resolve read-back at the confirmation CR
+            // With a dialog the verdict lands on the confirm CR (write 3).
+            resolve_after: 3,
             ..Default::default()
         });
         io.set_idle(true);
-        io.screen
-            .lock()
-            .unwrap()
-            .push_str("Change effort level? 1. Yes, switch to xhigh");
+        io.screen.lock().unwrap().push_str(XHIGH_DIALOG);
         *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
         let request = EffortRequest::from_level("xhigh").unwrap();
 
@@ -1015,9 +1208,144 @@ mod switch_tests {
             "waits the bounded window: {:?}",
             start.elapsed()
         );
+        // No dialog ever appears, so no rescue Enter is sent.
+        assert_eq!(io.writes().len(), 2);
         assert!(io.journals().iter().any(|(status, severity)| {
             status.starts_with("effort-degraded:max") && *severity == Severity::Warning
         }));
+    }
+
+    /// c-effort3: a dialog the PREVIOUS switch left rendered must never take
+    /// the next switch's confirming Enter. The CR waits for a dialog naming
+    /// the NEW tier.
+    #[tokio::test]
+    async fn a_stale_dialog_naming_the_old_tier_never_gets_the_confirm_cr() {
+        let bridge = Arc::new(EffortBridge::new());
+        let io = Arc::new(MockIo {
+            resolve_after: 3, // body + submit CR + the one correct confirm CR
+            ..Default::default()
+        });
+        io.set_idle(true);
+        // Pre-snapshot read and the first post-submit reads still show the
+        // xhigh dialog the previous (ultracode/xhigh) switch left rendered;
+        // then the screen clears and THIS switch's high dialog paints.
+        io.screen.lock().unwrap().push_str(XHIGH_DIALOG);
+        io.script(&[XHIGH_DIALOG, XHIGH_DIALOG, "", HIGH_DIALOG, HIGH_DIALOG]);
+        *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+
+        let outcome = perform_switch(
+            EffortRequest::from_level("high").unwrap(),
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
+        assert_eq!(outcome, SwitchOutcome::Applied);
+        assert_eq!(
+            io.writes(),
+            vec![
+                "body:/effort high".to_string(),
+                "cr".to_string(),
+                "cr".to_string(),
+            ],
+            "exactly one confirm Enter, after the high dialog paints"
+        );
+        // The Enter that confirmed did so against the high dialog, never the
+        // stale xhigh one.
+        let cr_screens = io.cr_screens();
+        assert_eq!(cr_screens.len(), 2, "submit CR and confirm CR");
+        assert!(
+            cr_screens[1].contains("switch to high"),
+            "confirm CR screen: {}",
+            cr_screens[1]
+        );
+        assert!(
+            !cr_screens[1].contains("switch to xhigh"),
+            "stale xhigh dialog must be gone before the confirm: {}",
+            cr_screens[1]
+        );
+    }
+
+    /// c-effort3: when the dialog paints only after phase 1's window (a slow
+    /// repaint, an Enter that raced the paint), the rescue pass confirms it
+    /// during the read-back wait and the switch still reads back Applied —
+    /// never a false `no-readback-within-window`.
+    #[tokio::test]
+    async fn a_dialog_painting_after_phase1_is_confirmed_by_the_rescue_pass() {
+        let bridge = Arc::new(EffortBridge::new());
+        let io = Arc::new(MockIo {
+            resolve_after: 3, // body + submit CR + rescue confirm CR
+            ..Default::default()
+        });
+        io.set_idle(true);
+        // Dialog-free through all of phase 1 (~37 reads over 1.5 s) and the
+        // first rescue reads; the max dialog appears only later.
+        let mut screens = vec![""];
+        screens.extend(std::iter::repeat_n("", 44));
+        screens.push(MAX_DIALOG);
+        io.script(&screens);
+        *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+
+        let start = std::time::Instant::now();
+        let outcome = perform_switch(
+            EffortRequest::from_level("max").unwrap(),
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
+        assert_eq!(outcome, SwitchOutcome::Applied);
+        assert_eq!(
+            io.writes(),
+            vec![
+                "body:/effort max".to_string(),
+                "cr".to_string(),
+                "cr".to_string(),
+            ],
+            "the rescue pass sends the missing confirm Enter"
+        );
+        assert!(
+            start.elapsed().as_millis() >= 1_400,
+            "phase 1 genuinely elapsed before rescue: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed().as_millis() < 9_000,
+            "rescue lands well inside the bounded window: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// An invalid argument renders an error, never a dialog: no confirming
+    /// Enter is sent and the bridge rejects with `invalid-argument`.
+    #[tokio::test]
+    async fn an_invalid_argument_gets_no_confirm_cr_and_degrades_with_the_reason() {
+        let bridge = Arc::new(EffortBridge::new());
+        let io = Arc::new(MockIo {
+            reject_on_invalid: true,
+            ..Default::default()
+        });
+        io.set_idle(true);
+        io.script(&["", INVALID_SCREEN, INVALID_SCREEN]);
+        *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+
+        let outcome = perform_switch(
+            EffortRequest::from_level("max").unwrap(),
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
+        assert_eq!(outcome, SwitchOutcome::Degraded);
+        assert_eq!(
+            io.writes(),
+            vec!["body:/effort max".to_string(), "cr".to_string()],
+            "the invalid-argument error must never receive an Enter"
+        );
+        assert!(
+            io.journals()
+                .iter()
+                .any(|(status, _)| status == "effort-degraded:max:invalid-argument"),
+            "{:?}",
+            io.journals()
+        );
     }
 
     #[tokio::test]
@@ -1028,7 +1356,9 @@ mod switch_tests {
             ..Default::default()
         });
         io.set_idle(false);
-        io.screen.lock().unwrap().push_str("Change effort level?");
+        // No dialog until the queued command is actually typed once idle;
+        // then the real dialog paints and gets its confirm CR.
+        io.script(&["", "", "", "", XHIGH_DIALOG]);
         *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
         let queue = Arc::new(EffortQueue::new());
         let _worker = spawn_worker(
@@ -1046,7 +1376,7 @@ mod switch_tests {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         assert!(io.writes().is_empty(), "nothing goes out while working");
         io.set_idle(true);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(3_000);
         while io.writes().len() < 3 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }

@@ -231,9 +231,9 @@ pub struct ModelRoles {
     pub cheap: Option<String>,
 }
 
-/// One gate lane; consumed later by r-mergequeue's `--onto/--lanes`.
-///
-/// Placeholder for batch 1: stored and returned verbatim, not yet enforced.
+/// One gate lane; batch 6 enforces these via the Hub gate queue and the Node
+/// lane runner (`gate.run`). Lane environment is set once on the Project and
+/// sent verbatim on every run — never re-typed per gate.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectGateLane {
@@ -251,6 +251,19 @@ pub struct ProjectGateLane {
     /// SSH remote alias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Extra environment applied to every gate run on this lane
+    /// (`CARGO_HOME`, `PW_CHANNEL`, `RUSTFLAGS`, …).
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Advisory lock path for the shared browser web-hub-e2e step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_path: Option<String>,
+    /// Playwright WebSocket endpoint (`PW_TEST_CONNECT_WS_ENDPOINT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pw_endpoint: Option<String>,
+    /// PATH prefix (toolchain bin dirs) for the gate environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_path: Option<String>,
 }
 
 /// Gate configuration; design §3.2 (placeholder, consumed by r-mergequeue).

@@ -4542,6 +4542,715 @@
       ],
       "type": "object"
     },
+    "GateCancelParams": {
+      "description": "`gate.cancel` params.",
+      "properties": {
+        "jobId": {
+          "description": "Job to cancel.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId"
+      ],
+      "type": "object"
+    },
+    "GateEventKind": {
+      "description": "One streamed Node→Hub job event.",
+      "oneOf": [
+        {
+          "description": "The run started on the lane (`phase`: fetch/ff/gate/land/push).",
+          "properties": {
+            "kind": {
+              "const": "phase",
+              "type": "string"
+            },
+            "phase": {
+              "description": "Phase name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "phase"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One gate step reached a terminal status.",
+          "properties": {
+            "kind": {
+              "const": "step",
+              "type": "string"
+            },
+            "step": {
+              "$ref": "#/$defs/GateStep",
+              "description": "The finished step."
+            }
+          },
+          "required": [
+            "kind",
+            "step"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A line of runner diagnostics.",
+          "properties": {
+            "kind": {
+              "const": "log",
+              "type": "string"
+            },
+            "message": {
+              "description": "Diagnostic text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The run finished with its full verdict; the gate.run reply mirrors it.",
+          "properties": {
+            "kind": {
+              "const": "finished",
+              "type": "string"
+            },
+            "result": {
+              "$ref": "#/$defs/GateRunResult",
+              "description": "Final verdict."
+            }
+          },
+          "required": [
+            "kind",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "GateEventParams": {
+      "description": "Params of the Node-originated `gate.event` notification.",
+      "oneOf": [
+        {
+          "description": "The run started on the lane (`phase`: fetch/ff/gate/land/push).",
+          "properties": {
+            "kind": {
+              "const": "phase",
+              "type": "string"
+            },
+            "phase": {
+              "description": "Phase name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "phase"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One gate step reached a terminal status.",
+          "properties": {
+            "kind": {
+              "const": "step",
+              "type": "string"
+            },
+            "step": {
+              "$ref": "#/$defs/GateStep",
+              "description": "The finished step."
+            }
+          },
+          "required": [
+            "kind",
+            "step"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A line of runner diagnostics.",
+          "properties": {
+            "kind": {
+              "const": "log",
+              "type": "string"
+            },
+            "message": {
+              "description": "Diagnostic text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The run finished with its full verdict; the gate.run reply mirrors it.",
+          "properties": {
+            "kind": {
+              "const": "finished",
+              "type": "string"
+            },
+            "result": {
+              "$ref": "#/$defs/GateRunResult",
+              "description": "Final verdict."
+            }
+          },
+          "required": [
+            "kind",
+            "result"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "jobId": {
+          "description": "The job this event belongs to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId"
+      ],
+      "type": "object"
+    },
+    "GateJob": {
+      "description": "One queued gate/land job (Hub document; coordinator-hierarchy.md §8 row 6).",
+      "properties": {
+        "attempts": {
+          "default": 0,
+          "description": "Number of verify+land attempts (CAS retries).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "baseSha": {
+          "description": "Base (`main`) sha the merge was verified onto.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "description": "Branch under verification.",
+          "type": "string"
+        },
+        "currentMainSha": {
+          "description": "Current main when a land lost the compare-and-swap (retry signal).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Failure / cancel reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finishedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the job reached a terminal state."
+        },
+        "headSha": {
+          "description": "Pinned branch-tip sha incorporated by the merge.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host the job runs on (the lane's host)."
+        },
+        "id": {
+          "$ref": "#/$defs/GateJobId",
+          "description": "`gjb_…` id."
+        },
+        "laneId": {
+          "description": "Pinned lane (chosen at dispatch when not given).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mergeSha": {
+          "description": "Verified / landed merge commit sha.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/GateMode",
+          "description": "Verify vs verify-then-land."
+        },
+        "projectId": {
+          "$ref": "#/$defs/ProjectId",
+          "description": "Owning project."
+        },
+        "queuedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Queue ordering key (RFC3339 enqueue time)."
+        },
+        "requestedBy": {
+          "description": "Device that enqueued the job.",
+          "type": "string"
+        },
+        "startedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the Node took the job."
+        },
+        "state": {
+          "$ref": "#/$defs/GateJobState",
+          "description": "Lifecycle state."
+        },
+        "steps": {
+          "default": [],
+          "description": "Step results streamed back from the lane Node.",
+          "items": {
+            "$ref": "#/$defs/GateStep"
+          },
+          "type": "array"
+        },
+        "thenCommand": {
+          "description": "`land --then \"<cmd>\"`: post-land command on the project home host.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thenOutput": {
+          "description": "Output of the completed `--then` command.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "web": {
+          "$ref": "#/$defs/GateWebMode",
+          "description": "Web gate selection."
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "branch",
+        "mode",
+        "web",
+        "requestedBy",
+        "state",
+        "steps",
+        "queuedAt",
+        "attempts"
+      ],
+      "type": "object"
+    },
+    "GateJobId": {
+      "pattern": "^(gjb)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "GateJobState": {
+      "description": "Gate job lifecycle: queued → running → passed|failed|landed, with cancel.",
+      "oneOf": [
+        {
+          "const": "queued",
+          "description": "Waiting for a lane / the land serial position.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "A Node is running the job.",
+          "type": "string"
+        },
+        {
+          "const": "passed",
+          "description": "Verify finished green; main was not advanced.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Gate or landing failed.",
+          "type": "string"
+        },
+        {
+          "const": "landed",
+          "description": "Land finished and pushed main.",
+          "type": "string"
+        },
+        {
+          "const": "canceling",
+          "description": "Cancel was requested while running; the Node is killing the step.",
+          "type": "string"
+        },
+        {
+          "const": "canceled",
+          "description": "Cancel completed (queued cancel or killed run).",
+          "type": "string"
+        }
+      ]
+    },
+    "GateMode": {
+      "description": "What the job does: verify only, or verify-then-land.",
+      "oneOf": [
+        {
+          "const": "verify",
+          "description": "Verify the merge onto current main; never advance it.",
+          "type": "string"
+        },
+        {
+          "const": "land",
+          "description": "Verify when needed, then compare-and-swap and push main.",
+          "type": "string"
+        }
+      ]
+    },
+    "GateRunParams": {
+      "description": "`gate.run` params: everything the lane runner needs, derived from the\nproject's `ProjectGateLane` (set once, never re-typed per run).",
+      "properties": {
+        "baseBranch": {
+          "default": "main",
+          "description": "Base branch (default `main`).",
+          "type": "string"
+        },
+        "binary": {
+          "description": "Test seam: override the merge binary (defaults to the Node's own exe).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "description": "Branch to verify/land.",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra environment for the gate (toolchain, build jobs, …).",
+          "type": "object"
+        },
+        "gateTimeoutSecs": {
+          "default": 0,
+          "description": "Overall run wall-clock budget (seconds); 0 disables the runner cap.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jobId": {
+          "description": "Hub job id (`gjb_…`); key for cancel and for streamed events.",
+          "type": "string"
+        },
+        "laneId": {
+          "description": "Lane id (Node-side lane lock key).",
+          "type": "string"
+        },
+        "lockPath": {
+          "description": "Advisory lock for the shared web-hub-e2e browser (`REMUDA_E2E_LOCK`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "`verify` | `land`.",
+          "type": "string"
+        },
+        "ports": {
+          "description": "Allocated port block, e.g. `58480-58489`; derives HUB_E2E_LISTEN/WEB.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "push": {
+          "default": false,
+          "description": "Land mode pushes main from the lane host when true.",
+          "type": "boolean"
+        },
+        "pwEndpoint": {
+          "description": "Playwright WebSocket endpoint (`PW_TEST_CONNECT_WS_ENDPOINT`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repoPath": {
+          "description": "Lane checkout on this host.",
+          "type": "string"
+        },
+        "targetDir": {
+          "description": "Dedicated cargo target dir.",
+          "type": "string"
+        },
+        "timeouts": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Per-step wall-clock budgets, forwarded as REMUDA_GATE_STEP_TIMEOUTS.",
+          "type": "object"
+        },
+        "toolchainPath": {
+          "description": "PATH prefix (toolchain bin dirs) applied to the gate environment.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "web": {
+          "description": "`auto` | `always` | `never`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "laneId",
+        "repoPath",
+        "targetDir",
+        "branch",
+        "baseBranch",
+        "mode",
+        "web",
+        "env",
+        "timeouts",
+        "gateTimeoutSecs",
+        "push"
+      ],
+      "type": "object"
+    },
+    "GateRunResult": {
+      "description": "`gate.run` verdict, mirrored by the terminal `finished` event.",
+      "properties": {
+        "baseSha": {
+          "description": "Base sha.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currentMainSha": {
+          "description": "Current main when the land CAS lost.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Failure text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headSha": {
+          "description": "Branch tip sha.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jobId": {
+          "description": "Job id echoed back.",
+          "type": "string"
+        },
+        "mergeSha": {
+          "description": "Merge commit sha.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`passed` | `landed` | `failed` | `canceled` | `base-moved` | `stale-tip` | `lane-busy`.",
+          "type": "string"
+        },
+        "steps": {
+          "default": [],
+          "description": "Step results.",
+          "items": {
+            "$ref": "#/$defs/GateStep"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "jobId",
+        "status",
+        "steps"
+      ],
+      "type": "object"
+    },
+    "GateStep": {
+      "description": "One gate step result; same JSON shape as `remuda merge --gate --json`.",
+      "properties": {
+        "attempts": {
+          "default": 0,
+          "description": "Attempt ordinal (the gate retries some steps).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "durationMs": {
+          "description": "Wall duration in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error": {
+          "description": "Failure text / timeout / kill reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Step name (`cargo-test`, `web-hub-e2e`, …).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "`\"timeout\"` | `\"child-lost\"` when a supervisor killed the step.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retried": {
+          "default": false,
+          "description": "Whether the last run was a retry.",
+          "type": "boolean"
+        },
+        "status": {
+          "description": "`planned` | `ok` | `failed` | `skipped`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "status",
+        "durationMs",
+        "attempts",
+        "retried"
+      ],
+      "type": "object"
+    },
+    "GateThenParams": {
+      "description": "`gate.then` params: post-land command on the project's home host.",
+      "properties": {
+        "command": {
+          "description": "Command line (`bash -lc`).",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "Working directory (default: the Node's primary workspace).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra environment.",
+          "type": "object"
+        },
+        "jobId": {
+          "description": "Job the post-land hook belongs to.",
+          "type": "string"
+        },
+        "timeoutSecs": {
+          "default": 0,
+          "description": "Wall-clock budget (seconds); default enforced by the Node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "jobId",
+        "command",
+        "env",
+        "timeoutSecs"
+      ],
+      "type": "object"
+    },
+    "GateThenResult": {
+      "description": "`gate.then` result.",
+      "properties": {
+        "exitCode": {
+          "description": "Process exit code.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "jobId": {
+          "description": "Job id echoed back.",
+          "type": "string"
+        },
+        "output": {
+          "description": "Captured stdout/stderr (truncated).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "exitCode",
+        "output"
+      ],
+      "type": "object"
+    },
+    "GateWebMode": {
+      "description": "Web gate selection.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Diff-driven: the merge gate includes web checks when the diff touches\n`crates/` or `web/`; the live Hub e2e suite is not run.",
+          "type": "string"
+        },
+        {
+          "const": "always",
+          "description": "Force every web check including the live Hub Playwright suite.",
+          "type": "string"
+        },
+        {
+          "const": "never",
+          "description": "Never add web-only gates (the Rust gate still runs). The consumed\nmerge CLI has no suppression flag, so on a web-touching diff this is\nequivalent to `auto`; documented rather than silently different.",
+          "type": "string"
+        }
+      ]
+    },
     "GenericPermission": {
       "description": "GenericPermission; `protocol.md` §4.1.",
       "properties": {
@@ -5178,7 +5887,7 @@
       ]
     },
     "Id": {
-      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr|gjb)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
     "InputAccounting": {
@@ -12636,8 +13345,16 @@
       "type": "object"
     },
     "ProjectGateLane": {
-      "description": "One gate lane; consumed later by r-mergequeue's `--onto/--lanes`.\n\nPlaceholder for batch 1: stored and returned verbatim, not yet enforced.",
+      "description": "One gate lane; batch 6 enforces these via the Hub gate queue and the Node\nlane runner (`gate.run`). Lane environment is set once on the Project and\nsent verbatim on every run — never re-typed per gate.",
       "properties": {
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Extra environment applied to every gate run on this lane\n(`CARGO_HOME`, `PW_CHANNEL`, `RUSTFLAGS`, …).",
+          "type": "object"
+        },
         "hostId": {
           "$ref": "#/$defs/HostId",
           "description": "Host that runs the lane."
@@ -12646,8 +13363,22 @@
           "description": "Stable lane id.",
           "type": "string"
         },
+        "lockPath": {
+          "description": "Advisory lock path for the shared browser web-hub-e2e step.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "ports": {
           "description": "Allocated port block.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pwEndpoint": {
+          "description": "Playwright WebSocket endpoint (`PW_TEST_CONNECT_WS_ENDPOINT`).",
           "type": [
             "string",
             "null"
@@ -12667,13 +13398,21 @@
         "targetDir": {
           "description": "Dedicated cargo target dir.",
           "type": "string"
+        },
+        "toolchainPath": {
+          "description": "PATH prefix (toolchain bin dirs) for the gate environment.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "id",
         "hostId",
         "repoPath",
-        "targetDir"
+        "targetDir",
+        "env"
       ],
       "type": "object"
     },

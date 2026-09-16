@@ -952,6 +952,161 @@ export type ForwardIntent = ({
   [key: string]: unknown;
 });
 
+/** `gate.cancel` params. */
+export type GateCancelParams = ({
+  "jobId": (string);
+  [key: string]: unknown;
+});
+
+/** One streamed Node→Hub job event. */
+export type GateEventKind = (({
+  "kind": "phase";
+  "phase": (string);
+  [key: string]: unknown;
+}) | ({
+  "kind": "step";
+  "step": GateStep;
+  [key: string]: unknown;
+}) | ({
+  "kind": "log";
+  "message": (string);
+  [key: string]: unknown;
+}) | ({
+  "kind": "finished";
+  "result": GateRunResult;
+  [key: string]: unknown;
+}));
+
+/** Params of the Node-originated `gate.event` notification. */
+export type GateEventParams = (({
+  "kind": "phase";
+  "phase": (string);
+  [key: string]: unknown;
+}) | ({
+  "kind": "step";
+  "step": GateStep;
+  [key: string]: unknown;
+}) | ({
+  "kind": "log";
+  "message": (string);
+  [key: string]: unknown;
+}) | ({
+  "kind": "finished";
+  "result": GateRunResult;
+  [key: string]: unknown;
+})) & ({
+  "jobId": (string);
+  [key: string]: unknown;
+});
+
+/** One queued gate/land job (Hub document; coordinator-hierarchy.md §8 row 6). */
+export type GateJob = ({
+  "attempts": (number);
+  "baseSha"?: (string | null);
+  "branch": (string);
+  "currentMainSha"?: (string | null);
+  "error"?: (string | null);
+  "finishedAt"?: (Timestamp | (null));
+  "headSha"?: (string | null);
+  "hostId"?: (HostId | (null));
+  "id": GateJobId;
+  "laneId"?: (string | null);
+  "mergeSha"?: (string | null);
+  "mode": GateMode;
+  "projectId": ProjectId;
+  "queuedAt": Timestamp;
+  "requestedBy": (string);
+  "startedAt"?: (Timestamp | (null));
+  "state": GateJobState;
+  "steps": ((GateStep)[]);
+  "thenCommand"?: (string | null);
+  "thenOutput"?: (string | null);
+  "web": GateWebMode;
+  [key: string]: unknown;
+});
+
+export type GateJobId = (string);
+
+/** Gate job lifecycle: queued → running → passed|failed|landed, with cancel. */
+export type GateJobState = ("queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled");
+
+/** What the job does: verify only, or verify-then-land. */
+export type GateMode = ("verify" | "land");
+
+/** `gate.run` params: everything the lane runner needs, derived from the project's `ProjectGateLane` (set once, never re-typed per run). */
+export type GateRunParams = ({
+  "baseBranch": (string);
+  "binary"?: (string | null);
+  "branch": (string);
+  "env": ({
+  [key: string]: (string);
+});
+  "gateTimeoutSecs": (number);
+  "jobId": (string);
+  "laneId": (string);
+  "lockPath"?: (string | null);
+  "mode": (string);
+  "ports"?: (string | null);
+  "push": (boolean);
+  "pwEndpoint"?: (string | null);
+  "repoPath": (string);
+  "targetDir": (string);
+  "timeouts": ({
+  [key: string]: (number);
+});
+  "toolchainPath"?: (string | null);
+  "web": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.run` verdict, mirrored by the terminal `finished` event. */
+export type GateRunResult = ({
+  "baseSha"?: (string | null);
+  "currentMainSha"?: (string | null);
+  "error"?: (string | null);
+  "headSha"?: (string | null);
+  "jobId": (string);
+  "mergeSha"?: (string | null);
+  "status": (string);
+  "steps": ((GateStep)[]);
+  [key: string]: unknown;
+});
+
+/** One gate step result; same JSON shape as `remuda merge --gate --json`. */
+export type GateStep = ({
+  "attempts": (number);
+  "durationMs": (number);
+  "error"?: (string | null);
+  "name": (string);
+  "reason"?: (string | null);
+  "retried": (boolean);
+  "status": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.then` params: post-land command on the project's home host. */
+export type GateThenParams = ({
+  "command": (string);
+  "cwd"?: (string | null);
+  "env": ({
+  [key: string]: (string);
+});
+  "jobId": (string);
+  "timeoutSecs": (number);
+  [key: string]: unknown;
+});
+
+/** `gate.then` result. */
+export type GateThenResult = ({
+  "exitCode": (number);
+  "jobId": (string);
+  "output": (string);
+  [key: string]: unknown;
+});
+
+/** Web gate selection. */
+export type GateWebMode = ("auto" | "always" | "never");
+
 /** GenericPermission; `protocol.md` §4.1. */
 export type GenericPermission = ({
   "mode": GenericPermissionMode;
@@ -2812,14 +2967,20 @@ export type ProjectGate = ({
   [key: string]: unknown;
 });
 
-/** One gate lane; consumed later by r-mergequeue's `--onto/--lanes`.  Placeholder for batch 1: stored and returned verbatim, not yet enforced. */
+/** One gate lane; batch 6 enforces these via the Hub gate queue and the Node lane runner (`gate.run`). Lane environment is set once on the Project and sent verbatim on every run — never re-typed per gate. */
 export type ProjectGateLane = ({
+  "env": ({
+  [key: string]: (string);
+});
   "hostId": HostId;
   "id": (string);
+  "lockPath"?: (string | null);
   "ports"?: (string | null);
+  "pwEndpoint"?: (string | null);
   "remote"?: (string | null);
   "repoPath": (string);
   "targetDir": (string);
+  "toolchainPath"?: (string | null);
   [key: string]: unknown;
 });
 

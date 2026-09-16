@@ -1365,6 +1365,7 @@ async fn materialize_instance(
                     // arrives on a later send.
                     attachments: Vec::new(),
                     origin: crate::origin::input_origin(create_command.origin),
+                    mode: remuda_protocol::PromptMode::NewTurn,
                 },
                 close_after: false,
                 attachment_refs: Vec::new(),
@@ -2048,6 +2049,9 @@ fn command_parts(
                     prompt,
                     attachments,
                     origin: request.origin,
+                    // c-steer: a steer carries through to the PTY queue; an
+                    // ordinary send and an unmarked older client are new turns.
+                    mode: request.prompt_mode.unwrap_or(remuda_protocol::PromptMode::NewTurn),
                 },
                 false,
             ))

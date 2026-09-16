@@ -188,6 +188,7 @@ impl Run {
                     command_id: None,
                     operation: CommandAction::Send,
                     prompt: Some(prompt.into()),
+                    prompt_mode: None,
                     attachments: Vec::new(),
                     run_id: None,
                     interaction_id: None,

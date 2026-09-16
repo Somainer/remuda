@@ -240,6 +240,7 @@ pub async fn dispatch_method(
             &instance_id,
             CommandAction::Close,
             None,
+            None,
             Vec::new(),
             parsed.command_id.as_deref(),
             None,
@@ -444,6 +445,12 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
         &instance_id,
         CommandAction::Send,
         Some(prompt),
+        // c-steer: carry the web's `mode` ("steer" jumps the queue); an
+        // unknown value degrades to a plain new turn.
+        params
+            .get("mode")
+            .and_then(Value::as_str)
+            .and_then(|raw| serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok()),
         parsed.attachments(),
         parsed.command_id.as_deref(),
         parsed.run_id.as_deref(),
@@ -471,6 +478,7 @@ async fn dispatch_configure(node: &DevNode, params: Value) -> Result<Value, Node
                 command_id: command_id.map(str::parse).transpose()?,
                 operation: CommandAction::Configure,
                 prompt: None,
+                prompt_mode: None,
                 attachments: Vec::new(),
                 run_id: None,
                 interaction_id: None,
@@ -495,6 +503,7 @@ async fn dispatch_cancel(node: &DevNode, params: Value) -> Result<Value, NodeErr
         node,
         &instance_id,
         CommandAction::Cancel,
+        None,
         None,
         Vec::new(),
         parsed.command_id.as_deref(),
@@ -571,6 +580,7 @@ async fn dispatch_keys(node: &DevNode, params: Value) -> Result<Value, NodeError
         &instance_id,
         CommandAction::WriteTty,
         None,
+        None,
         Vec::new(),
         parsed.command_id.as_deref(),
         None,
@@ -602,6 +612,7 @@ async fn dispatch_respond(node: &DevNode, params: Value) -> Result<Value, NodeEr
         &instance_id,
         CommandAction::RespondInteraction,
         None,
+        None,
         Vec::new(),
         parsed.command_id.as_deref(),
         None,
@@ -619,6 +630,8 @@ async fn submit(
     instance_id: &InstanceId,
     operation: CommandAction,
     prompt: Option<String>,
+    // c-steer delivery mode; `None` is an ordinary new turn.
+    prompt_mode: Option<remuda_protocol::PromptMode>,
     // D-027 metadata; the runtime pulls the bytes before dispatch.
     attachments: Vec<remuda_protocol::hubnode::AttachmentRef>,
     command_id: Option<&str>,
@@ -635,6 +648,7 @@ async fn submit(
                 command_id: command_id.map(str::parse).transpose()?,
                 operation,
                 prompt,
+                prompt_mode,
                 attachments,
                 run_id: run_id.map(str::parse).transpose()?,
                 interaction_id: interaction_id.map(str::parse).transpose()?,

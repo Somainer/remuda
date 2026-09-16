@@ -335,6 +335,11 @@ pub struct InstanceCommandRequest {
     /// Prompt text for `send`.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// c-steer: delivery mode for a `send`. Older clients omit it; reads as a
+    /// plain new turn. `"steer"` interrupts the running turn and delivers this
+    /// prompt ahead of the PTY queue; `"queue"` is delivered after the turn.
+    #[serde(default, rename = "mode")]
+    pub prompt_mode: Option<remuda_protocol::PromptMode>,
     /// Attachment metadata for `send` (D-027). The bytes are pulled from the
     /// Hub and written to disk before the command reaches a driver.
     #[serde(default)]

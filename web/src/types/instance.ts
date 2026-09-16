@@ -68,6 +68,18 @@ export type Instance = EntityMeta & {
     source: "launch" | "slash" | "remuda" | "unknown";
     observedAt: string;
   } | null;
+  /** §9.1 effective model read back from the /model verdict / message.model. */
+  modelEffective?: {
+    id: string;
+    source: "launch" | "slash" | "remuda" | "unknown";
+    observedAt: string;
+  } | null;
+  /** §9.1 discovered switchable model list (gateway cache / settings / builtin). */
+  modelCatalog?: {
+    models: string[];
+    source: "gateway-discovery" | "settings" | "builtin";
+    observedAt: string;
+  } | null;
   /** How this instance reached its `kind`; `promoted` = a terminal that an agent CLI took over (D-025). */
   mode?: InstanceMode | null;
   /** When the promotion happened. Only set while `mode` is `promoted`. */

@@ -1971,6 +1971,24 @@ export interface components {
              */
             mode?: "native" | "promoted" | null;
             model?: string | null;
+            /** @description D-028 §9.1 the model list this session can switch to, discovered from the gateway cache (gateway-discovery), settings/env (settings), or the built-in aliases (builtin). {models: string[], source, observedAt}. */
+            modelCatalog?: ({
+                models: string[];
+                observedAt: string;
+                /** @enum {string} */
+                source: "gateway-discovery" | "settings" | "builtin";
+            } & {
+                [key: string]: unknown;
+            }) | null;
+            /** @description D-028 §9.1 effective model read back from the /model <local-command-stdout> verdict or message.model ({id, source, observedAt}). This is the RESOLVED id (an alias can resolve to a concrete gateway id), not necessarily the requested word. */
+            modelEffective?: ({
+                id: string;
+                observedAt: string;
+                /** @enum {string} */
+                source: "launch" | "slash" | "remuda" | "unknown";
+            } & {
+                [key: string]: unknown;
+            }) | null;
             name?: string | null;
             /** @description Native session id the driver reported; what POST /v1/instances/{id}/resume passes to `claude --resume` (D-026). */
             readonly nativeSessionId?: string | null;

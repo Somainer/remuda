@@ -121,7 +121,7 @@
         "type": "object"
       },
       "AttachmentRef": {
-        "description": "One staged attachment as the in-session MCP tools see it (D-028 \u00a74.5, generalized to arbitrary files in D-027b). Metadata only; `AttachmentContent` adds the bytes.",
+        "description": "One staged attachment as the in-session MCP tools see it (D-028 §4.5, generalized to arbitrary files in D-027b). Metadata only; `AttachmentContent` adds the bytes.",
         "properties": {
           "digest": {
             "description": "Lowercase hex SHA-256 of the stored bytes.",
@@ -203,7 +203,7 @@
             "type": "string"
           },
           "mediaType": {
-            "description": "Hub-accepted MIME essence (`image/png`, `application/pdf`, `text/plain`, \u2026).",
+            "description": "Hub-accepted MIME essence (`image/png`, `application/pdf`, `text/plain`, …).",
             "type": "string"
           },
           "name": {
@@ -402,7 +402,7 @@
         "type": "object"
       },
       "EffortSelection": {
-        "description": "Native effort selection (D-028 \u00a79.1): the harness-native level plus an orthogonal ultracode boolean (Claude only). Claude takes low | medium | high | xhigh | max; Codex takes low | medium | high | xhigh | max | ultra. Codex accepts legacy minimal as low; ultra is a real Codex level, independent of the Claude-only ultracode flag. Legacy tier names (default / think / think-hard / ultracode) are accepted and normalized by NAME \u2014 never by index, because the old per-harness tables differed in length.",
+        "description": "Native effort selection (D-028 §9.1): the harness-native level plus an orthogonal ultracode boolean (Claude only). Claude takes low | medium | high | xhigh | max; Codex takes low | medium | high | xhigh | max | ultra. Codex accepts legacy minimal as low; ultra is a real Codex level, independent of the Claude-only ultracode flag. Legacy tier names (default / think / think-hard / ultracode) are accepted and normalized by NAME — never by index, because the old per-harness tables differed in length.",
         "properties": {
           "name": {
             "description": "low | medium | high | xhigh | max | ultra (ultra is Codex-only), or a legacy tier name to be normalized; Codex minimal maps to low.",
@@ -804,7 +804,7 @@
             ]
           },
           "hostId": {
-            "description": "Stable Node identity (`hst_\u2026`).",
+            "description": "Stable Node identity (`hst_…`).",
             "type": "string"
           },
           "hostname": {
@@ -1069,7 +1069,7 @@
             "type": "string"
           },
           "role": {
-            "description": "Preset name applied at create and stored for display; enforcement reads scope+grants, never this field (design \u00a72.5).",
+            "description": "Preset name applied at create and stored for display; enforcement reads scope+grants, never this field (design §2.5).",
             "enum": [
               "worker",
               "project-coordinator",
@@ -1242,7 +1242,7 @@
               "object",
               "null"
             ],
-            "description": "D-028 \u00a79.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown.",
+            "description": "D-028 §9.1 effective effort read back from the native transcript ({name, ultracode, source, observedAt}). This is the OBSERVED tier, not the requested one: null means no assistant record has reported a level yet, and clients must show `?` rather than fall back to effortName. source is launch|slash|remuda|unknown.",
             "properties": {
               "name": {
                 "type": "string",
@@ -1283,7 +1283,7 @@
             "additionalProperties": true
           },
           "effortName": {
-            "description": "Normalized D-028 \u00a79.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default\u2192low, think\u2192high, think-hard\u2192xhigh, ultracode\u2192xhigh with effortUltracode true). Codex minimal maps to low; Codex max and ultra persist unchanged. Ultra is rejected by Claude, agy and Grok.",
+            "description": "Normalized D-028 §9.1 effort level. Legacy tiers stored on older rows are mapped by name on read (default→low, think→high, think-hard→xhigh, ultracode→xhigh with effortUltracode true). Codex minimal maps to low; Codex max and ultra persist unchanged. Ultra is rejected by Claude, agy and Grok.",
             "enum": [
               "minimal",
               "low",
@@ -1319,7 +1319,7 @@
             "type": "string"
           },
           "launchedBy": {
-            "description": "Who ran the launch command (D-028 \u00a71.0 rule 4). Provenance only, never a capability level: a user-launched session is entitled to exactly the same signals as a Remuda-launched one. Derived from mode/promotedAt for rows written before D-028.",
+            "description": "Who ran the launch command (D-028 §1.0 rule 4). Provenance only, never a capability level: a user-launched session is entitled to exactly the same signals as a Remuda-launched one. Derived from mode/promotedAt for rows written before D-028.",
             "enum": [
               "remuda",
               "user",
@@ -1474,7 +1474,7 @@
         "type": "object"
       },
       "InstanceScope": {
-        "description": "Delegation-tree resource reach (design \u00a72.5). Empty dimensions mean 'not narrowed'; child scope must be a subset of the parent.",
+        "description": "Delegation-tree resource reach (design §2.5). Empty dimensions mean 'not narrowed'; child scope must be a subset of the parent.",
         "properties": {
           "hostIds": {
             "items": {
@@ -1604,7 +1604,7 @@
         "type": "object"
       },
       "MandateLink": {
-        "description": "One edge of the inherited owner-intent chain; design \u00a72.5.",
+        "description": "One edge of the inherited owner-intent chain; design §2.5.",
         "properties": {
           "depth": {
             "type": "integer",
@@ -1652,7 +1652,7 @@
         "type": "object"
       },
       "OwnCheckResult": {
-        "description": "within=false means changed paths cross the task's owns[] boundary (\u00a74.3/\u00a77 #3).",
+        "description": "within=false means changed paths cross the task's owns[] boundary (§4.3/§7 #3).",
         "properties": {
           "checked": {
             "type": "integer"
@@ -1989,7 +1989,7 @@
         "type": "object"
       },
       "PlacementLedgerRow": {
-        "description": "Placement ledger row; reasons[]/rejected[] are audit trail and bot card (\u00a75.6).",
+        "description": "Placement ledger row; reasons[]/rejected[] are audit trail and bot card (§5.6).",
         "properties": {
           "branch": {
             "type": "string"
@@ -2109,7 +2109,7 @@
         "type": "object"
       },
       "Project": {
-        "description": "Thin authoritative Hub Project entity; design \u00a73.2.",
+        "description": "Thin authoritative Hub Project entity; design §3.2.",
         "properties": {
           "branchPattern": {
             "type": "string"
@@ -2219,7 +2219,7 @@
             "type": "integer"
           },
           "maxDelegationDepth": {
-            "description": "Delegation-tree depth limit (Hub default 3); design \u00a72.5.",
+            "description": "Delegation-tree depth limit (Hub default 3); design §2.5.",
             "minimum": 1,
             "type": "integer"
           },
@@ -2456,7 +2456,7 @@
             "type": "string"
           },
           "role": {
-            "description": "Display-only member role (primary/build/\u2026).",
+            "description": "Display-only member role (primary/build/…).",
             "type": "string"
           },
           "workspaceId": {
@@ -3107,7 +3107,7 @@
         "type": "object"
       },
       "Task": {
-        "description": "One row of the task ledger; design \u00a72.2/\u00a72.5/\u00a78.1 row 4.",
+        "description": "One row of the task ledger; design §2.2/§2.5/§8.1 row 4.",
         "properties": {
           "blockedReason": {
             "type": "string"
@@ -3184,7 +3184,7 @@
         "type": "object"
       },
       "TaskBudget": {
-        "description": "Estimated budget envelope; amounts are estimates (\u00a74.5).",
+        "description": "Estimated budget envelope; amounts are estimates (§4.5).",
         "properties": {
           "maxTurns": {
             "type": "integer"
@@ -3209,7 +3209,7 @@
           "triage",
           "docs"
         ],
-        "description": "Task class; design \u00a74.3."
+        "description": "Task class; design §4.3."
       },
       "TaskCreate": {
         "description": "remuda task add",
@@ -3251,7 +3251,7 @@
         "type": "object"
       },
       "TaskDep": {
-        "description": "Dependency edge; unlocks only from the referenced task's landed sha (\u00a77 #8).",
+        "description": "Dependency edge; unlocks only from the referenced task's landed sha (§7 #8).",
         "properties": {
           "note": {
             "type": "string"
@@ -3282,7 +3282,7 @@
         "type": "object"
       },
       "TaskLand": {
-        "description": "Record the landed sha from gate/land; the only dep-unlock signal (\u00a77 #8).",
+        "description": "Record the landed sha from gate/land; the only dep-unlock signal (§7 #8).",
         "properties": {
           "sha": {
             "type": "string"
@@ -3383,7 +3383,7 @@
           "parked",
           "deferred"
         ],
-        "description": "Task ledger state; design \u00a75.3. Legal transitions are enforced Hub-side."
+        "description": "Task ledger state; design §5.3. Legal transitions are enforced Hub-side."
       },
       "TaskStateSet": {
         "description": "remuda task set-state; illegal transitions are refused (409).",
@@ -3494,7 +3494,7 @@
           "blocked",
           "retired"
         ],
-        "description": "Worker roster lifecycle state; design \u00a72.2."
+        "description": "Worker roster lifecycle state; design §2.2."
       },
       "WorkerState": {
         "description": "Adjacently tagged worker state ({state,sha?} / {state,reason?}).",
@@ -3565,7 +3565,7 @@
         ]
       },
       "WorkerRoster": {
-        "description": "One row of the per-project worker roster; design \u00a72.2\u2463.",
+        "description": "One row of the per-project worker roster; design §2.2④.",
         "type": "object",
         "properties": {
           "id": {
@@ -3985,7 +3985,7 @@
       },
       "HostCapacity": {
         "type": "object",
-        "description": "Current host capacity snapshot; design \u00a72.2/\u00a73.4/\u00a77 #6.",
+        "description": "Current host capacity snapshot; design §2.2/§3.4/§7 #6.",
         "properties": {
           "hostId": {
             "pattern": "^hst_",
@@ -4253,7 +4253,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "List a session's live attachments (D-028 \u00a74.5)",
+        "summary": "List a session's live attachments (D-028 §4.5)",
         "tags": [
           "objects"
         ]
@@ -4261,11 +4261,11 @@
     },
     "/v1/attachments/{objectId}/content": {
       "get": {
-        "description": "Backs the in-session MCP tool `remuda_attachment`. Unlike `GET /v1/objects/{id}`, this route admits the instance credential the MCP server runs with, and pins the read to that credential's own session \u2014 not a child's, not a parent's. Bytes come back base64 in JSON because the caller is building an MCP content block. Attachments over 3670016 bytes (3.5 MiB, mirroring the claude-print inline budget) are refused with RESOURCE_LIMIT naming the size and media type. Expired objects read as 404.",
+        "description": "Backs the in-session MCP tool `remuda_attachment`. Unlike `GET /v1/objects/{id}`, this route admits the instance credential the MCP server runs with, and pins the read to that credential's own session — not a child's, not a parent's. Bytes come back base64 in JSON because the caller is building an MCP content block. Attachments over 3670016 bytes (3.5 MiB, mirroring the claude-print inline budget) are refused with RESOURCE_LIMIT naming the size and media type. Expired objects read as 404.",
         "operationId": "attachmentContent",
         "parameters": [
           {
-            "description": "`obj_\u2026` from the staging upload.",
+            "description": "`obj_…` from the staging upload.",
             "in": "path",
             "name": "objectId",
             "required": true,
@@ -4298,7 +4298,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Read one attachment as base64 for an MCP content block (D-028 \u00a74.5)",
+        "summary": "Read one attachment as base64 for an MCP content block (D-028 §4.5)",
         "tags": [
           "objects"
         ]
@@ -5545,7 +5545,7 @@
                 }
               }
             },
-            "description": "Instance page. lifecycle is derived from Node journal observations (requested\u2192starting\u2192running\u2192exited/failed). activity=idle only after a herdr/Node idle observation, never the create default."
+            "description": "Instance page. lifecycle is derived from Node journal observations (requested→starting→running→exited/failed). activity=idle only after a herdr/Node idle observation, never the create default."
           },
           "401": {
             "$ref": "#/components/responses/Error"
@@ -6076,7 +6076,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Bootstrap token \u2192 device cookie",
+        "summary": "Bootstrap token → device cookie",
         "tags": [
           "auth"
         ]
@@ -6163,7 +6163,7 @@
     },
     "/v1/objects/{id}": {
       "get": {
-        "description": "Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance \u2014 a Node cannot read another host's attachments \u2014 or as a Human/Bot device. Images are served inline; non-images carry Content-Disposition: attachment with the sanitised filename plus X-Content-Type-Options: nosniff (D-027b). Expired objects read as 404.",
+        "description": "Used by the Node to materialize an attachment before dispatch, and by the UI to re-display one. Authorized either as the Node hosting the object's instance — a Node cannot read another host's attachments — or as a Human/Bot device. Images are served inline; non-images carry Content-Disposition: attachment with the sanitised filename plus X-Content-Type-Options: nosniff (D-027b). Expired objects read as 404.",
         "operationId": "objectRead",
         "parameters": [
           {
@@ -6225,7 +6225,7 @@
         ],
         "parameters": [
           {
-            "description": "prj_\u2026 project id",
+            "description": "prj_… project id",
             "in": "query",
             "name": "project",
             "required": false,
@@ -6436,7 +6436,7 @@
       },
       "parameters": [
         {
-          "description": "prj_\u2026 id",
+          "description": "prj_… id",
           "in": "path",
           "name": "id",
           "required": true,
@@ -6531,7 +6531,7 @@
       },
       "parameters": [
         {
-          "description": "prj_\u2026 id",
+          "description": "prj_… id",
           "in": "path",
           "name": "id",
           "required": true,
@@ -6579,7 +6579,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Add a (hostId, workspaceId) member \u2014 the Space key (D-024)",
+        "summary": "Add a (hostId, workspaceId) member — the Space key (D-024)",
         "tags": [
           "projects"
         ]
@@ -7136,7 +7136,7 @@
         ],
         "parameters": [
           {
-            "description": "prj_\u2026 project id",
+            "description": "prj_… project id",
             "in": "query",
             "name": "project",
             "required": false,
@@ -7224,7 +7224,7 @@
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7273,13 +7273,13 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Move a task along the state machine (illegal jumps \u2192 409)",
+        "summary": "Move a task along the state machine (illegal jumps → 409)",
         "tags": [
           "tasks"
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7330,13 +7330,13 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Record the landed sha; the only thing dependency edges unlock from (\u00a77 #8)",
+        "summary": "Record the landed sha; the only thing dependency edges unlock from (§7 #8)",
         "tags": [
           "tasks"
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7387,13 +7387,13 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Claim path globs; conflicting active claims \u2192 409",
+        "summary": "Claim path globs; conflicting active claims → 409",
         "tags": [
           "own"
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7445,7 +7445,7 @@
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7486,7 +7486,7 @@
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7541,7 +7541,7 @@
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7598,7 +7598,7 @@
         ],
         "parameters": [
           {
-            "description": "tsk_\u2026 id",
+            "description": "tsk_… id",
             "in": "path",
             "name": "id",
             "required": true,
@@ -7671,7 +7671,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Create a git worktree on a host (`git worktree add -b wt/<name>/\u2026` from main) at the Node's fixed `../remuda-wt/<name>` location",
+        "summary": "Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main) at the Node's fixed `../remuda-wt/<name>` location",
         "tags": [
           "worktrees"
         ]
@@ -7704,7 +7704,7 @@
         ],
         "parameters": [
           {
-            "description": "prj_\u2026 project id",
+            "description": "prj_… project id",
             "in": "query",
             "name": "project",
             "required": false,
@@ -8335,6 +8335,796 @@
             }
           }
         ]
+      }
+    },
+    "/v1/gate/jobs": {
+      "get": {
+        "operationId": "gateJobsList",
+        "summary": "List gate jobs across in-scope projects (batch 6)",
+        "tags": [
+          "gate"
+        ],
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "active",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Jobs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "projectId": {
+                            "type": "string"
+                          },
+                          "branch": {
+                            "type": "string"
+                          },
+                          "mode": {
+                            "type": "string",
+                            "enum": [
+                              "verify",
+                              "land"
+                            ]
+                          },
+                          "web": {
+                            "type": "string",
+                            "enum": [
+                              "auto",
+                              "always",
+                              "never"
+                            ]
+                          },
+                          "laneId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "requestedBy": {
+                            "type": "string"
+                          },
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "queued",
+                              "running",
+                              "passed",
+                              "failed",
+                              "landed",
+                              "canceling",
+                              "canceled"
+                            ]
+                          },
+                          "steps": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "additionalProperties": true
+                            }
+                          },
+                          "hostId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "queuedAt": {
+                            "type": "string"
+                          },
+                          "startedAt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "finishedAt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "mergeSha": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "error": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "nextCursor": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/projects/{id}/gate": {
+      "parameters": [
+        {
+          "description": "prj_… id",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "projectGateList",
+        "tags": [
+          "gate"
+        ],
+        "summary": "List a project's gate jobs",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Jobs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "projectId": {
+                            "type": "string"
+                          },
+                          "branch": {
+                            "type": "string"
+                          },
+                          "mode": {
+                            "type": "string",
+                            "enum": [
+                              "verify",
+                              "land"
+                            ]
+                          },
+                          "web": {
+                            "type": "string",
+                            "enum": [
+                              "auto",
+                              "always",
+                              "never"
+                            ]
+                          },
+                          "laneId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "requestedBy": {
+                            "type": "string"
+                          },
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "queued",
+                              "running",
+                              "passed",
+                              "failed",
+                              "landed",
+                              "canceling",
+                              "canceled"
+                            ]
+                          },
+                          "steps": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "additionalProperties": true
+                            }
+                          },
+                          "hostId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "queuedAt": {
+                            "type": "string"
+                          },
+                          "startedAt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "finishedAt": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "mergeSha": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "error": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    "nextCursor": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "projectGateEnqueue",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Enqueue a verify or land job on a project lane",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "branch"
+                ],
+                "properties": {
+                  "branch": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "verify",
+                      "land"
+                    ]
+                  },
+                  "web": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "always",
+                      "never"
+                    ]
+                  },
+                  "laneId": {
+                    "type": "string"
+                  },
+                  "thenCommand": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Enqueued job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "projectId": {
+                      "type": "string"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "verify",
+                        "land"
+                      ]
+                    },
+                    "web": {
+                      "type": "string",
+                      "enum": [
+                        "auto",
+                        "always",
+                        "never"
+                      ]
+                    },
+                    "laneId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "requestedBy": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "running",
+                        "passed",
+                        "failed",
+                        "landed",
+                        "canceling",
+                        "canceled"
+                      ]
+                    },
+                    "steps": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "hostId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "queuedAt": {
+                      "type": "string"
+                    },
+                    "startedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "finishedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mergeSha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/projects/{id}/gate/jobs/{jobId}": {
+      "parameters": [
+        {
+          "description": "prj_… id",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "gjb_… id",
+          "in": "path",
+          "name": "jobId",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "projectGateJobGet",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Get one gate job",
+        "responses": {
+          "200": {
+            "description": "Job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "projectId": {
+                      "type": "string"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "verify",
+                        "land"
+                      ]
+                    },
+                    "web": {
+                      "type": "string",
+                      "enum": [
+                        "auto",
+                        "always",
+                        "never"
+                      ]
+                    },
+                    "laneId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "requestedBy": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "running",
+                        "passed",
+                        "failed",
+                        "landed",
+                        "canceling",
+                        "canceled"
+                      ]
+                    },
+                    "steps": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "hostId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "queuedAt": {
+                      "type": "string"
+                    },
+                    "startedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "finishedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mergeSha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/projects/{id}/gate/jobs/{jobId}/cancel": {
+      "parameters": [
+        {
+          "description": "prj_… id",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "gjb_… id",
+          "in": "path",
+          "name": "jobId",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "projectGateJobCancel",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Cancel a queued or running gate job",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Canceled/canceling job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "projectId": {
+                      "type": "string"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "verify",
+                        "land"
+                      ]
+                    },
+                    "web": {
+                      "type": "string",
+                      "enum": [
+                        "auto",
+                        "always",
+                        "never"
+                      ]
+                    },
+                    "laneId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "requestedBy": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "running",
+                        "passed",
+                        "failed",
+                        "landed",
+                        "canceling",
+                        "canceled"
+                      ]
+                    },
+                    "steps": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "hostId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "queuedAt": {
+                      "type": "string"
+                    },
+                    "startedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "finishedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "mergeSha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
       }
     }
   },

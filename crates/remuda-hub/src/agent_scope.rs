@@ -172,19 +172,28 @@ fn project_read_target(path: &str) -> bool {
         return true;
     }
     match path.strip_prefix("/v1/projects/") {
-        Some(rest) => !rest.is_empty() && !rest.contains('/'),
+        // `/v1/projects/{id}` and its batch-6 gate-queue GETs. Read matching
+        // only applies to GET; the `/cancel` route is POST-only and 405s here.
+        Some(rest) if !rest.is_empty() => !rest.contains('/') || rest.contains("/gate"),
+        Some(_) => false,
         None => false,
     }
 }
 
-/// `PATCH /v1/projects/{id}` or `POST|DELETE /v1/projects/{id}/members`.
+/// `PATCH /v1/projects/{id}`, `POST|DELETE /v1/projects/{id}/members`, or the
+/// batch-6 gate-queue POSTs (enqueue/cancel).
 fn project_write_target(path: &str) -> bool {
     match path.strip_prefix("/v1/projects/") {
         Some(rest) => {
             if let Some(rest) = rest.strip_suffix("/members") {
                 return !rest.is_empty() && !rest.contains('/');
             }
-            !rest.is_empty() && !rest.contains('/')
+            if !rest.is_empty() && !rest.contains('/') {
+                return true;
+            }
+            // `{id}/gate` and `{id}/gate/jobs/…/cancel`.
+            rest.split_once('/')
+                .is_some_and(|(_, suffix)| suffix == "gate" || suffix.starts_with("gate/"))
         }
         None => false,
     }
@@ -596,6 +605,8 @@ pub async fn restrict_agent_routes(
                     || path == "/v1/fleet/broadcast"
                     || (path.starts_with("/v1/instances/") && path.ends_with("/commands"))
                     || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
+                    // Batch 6 gate-queue enqueue/cancel POSTs.
+                    || project_write_target(path)
                     || task_write_target(request.method(), path))
                 || request.method() == axum::http::Method::PATCH
                     && (project_write_target(path) || task_write_target(request.method(), path))

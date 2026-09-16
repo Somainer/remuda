@@ -1108,6 +1108,7 @@ async fn replace_worker(
         host_id: Some(worker.host_id.as_id().to_string()),
         placement: None,
         driver: None,
+        carrier: None,
     };
 
     // Retire (force) reclaims worktree/target, then re-dispatch the same brief

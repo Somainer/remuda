@@ -799,22 +799,30 @@ fn map_system(
         }
         if text.contains("<local-command-stdout>") && text.to_lowercase().contains("model") {
             let stdout = extract_local_stdout(text);
-            // Kept/not-found clear attribution; a defensive accept here still
-            // emits the edge.
-            if let Some((observed, source)) = ids.model.note_stdout(&stdout, false) {
-                return Ok(vec![model_edge_envelope(
-                    ctx,
-                    ids,
-                    value,
-                    line,
-                    cursor,
-                    "model-stdout",
-                    observed,
-                    source,
-                    Some(&stdout),
-                )?]);
+            match remuda_protocol::parse_model_stdout(&stdout) {
+                remuda_protocol::ModelStdout::Other => {
+                    // Mentions "model" but is not a /model verdict: fall through
+                    // to the normal local_command lifecycle mapping.
+                }
+                _ => {
+                    // Kept/not-found clear attribution; a defensive accept here
+                    // still emits the edge.
+                    if let Some((observed, source)) = ids.model.note_stdout(&stdout, false) {
+                        return Ok(vec![model_edge_envelope(
+                            ctx,
+                            ids,
+                            value,
+                            line,
+                            cursor,
+                            "model-stdout",
+                            observed,
+                            source,
+                            Some(&stdout),
+                        )?]);
+                    }
+                    return Ok(Vec::new());
+                }
             }
-            return Ok(Vec::new());
         }
     }
     let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");

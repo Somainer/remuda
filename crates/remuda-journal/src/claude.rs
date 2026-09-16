@@ -43,6 +43,8 @@ pub struct NativeIds {
     phases: HashMap<String, Id>,
     /// §9.1 effective-effort edges across this tail.
     effort: EffortTracker,
+    /// §9.1 effective-model edges across this tail.
+    model: remuda_protocol::ModelTracker,
 }
 
 impl NativeIds {
@@ -58,7 +60,13 @@ impl NativeIds {
             members: HashMap::new(),
             phases: HashMap::new(),
             effort: EffortTracker::new(),
+            model: remuda_protocol::ModelTracker::new(),
         }
+    }
+
+    /// Deterministic event id for an §9.1 model edge read from one record.
+    pub(crate) fn model_event(&self, assistant_native_id: &str, model: &str) -> EventId {
+        remuda_protocol::model_event_id(&self.scope, assistant_native_id, model)
     }
 
     /// Deterministic event id for an §9.1 effort edge read from one assistant
@@ -263,7 +271,7 @@ pub(crate) fn map_claude_value(
     match kind {
         "user" => map_user(ctx, ids, value, line, cursor),
         "assistant" => map_assistant(ctx, ids, value, line, cursor),
-        "system" => map_system(ctx, value, line, cursor),
+        "system" => map_system(ctx, ids, value, line, cursor),
         "result" => Ok(vec![lifecycle(
             ctx,
             cursor,
@@ -389,6 +397,28 @@ fn map_user(
                 line,
                 cursor,
                 "effort-stdout",
+                observed,
+                source,
+                Some(&stdout),
+            )?);
+        }
+    }
+    // §9.1: accepted `/model` switches are `user` records (same arm/settle
+    // split as effort). Rejects/dismissals are `system` records (map_system).
+    if let Some(args) = remuda_protocol::slash_model_args(&text) {
+        ids.model.note_slash(&args, false);
+    } else if text.contains("<local-command-stdout>")
+        && text.to_lowercase().contains("model")
+    {
+        let stdout = extract_local_stdout(&text);
+        if let Some((observed, source)) = ids.model.note_stdout(&stdout, false) {
+            out.push(model_edge_envelope(
+                ctx,
+                ids,
+                value,
+                line,
+                cursor,
+                "model-stdout",
                 observed,
                 source,
                 Some(&stdout),
@@ -532,9 +562,68 @@ fn effort_edge_envelope(
     )
 }
 
+/// §9.1 model edge envelope. `native_key` scopes the deterministic event id;
+/// the file tailer cannot know the Remuda requested id, so `requested` and
+/// `catalog` stay unset here (the live channel supplies those).
+#[allow(clippy::too_many_arguments)]
+fn model_envelope(
+    ctx: &MapContext,
+    ids: &NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+    native_key: &str,
+    observed: remuda_protocol::ObservedModel,
+    source: remuda_protocol::EffortSource,
+    raw: Option<&str>,
+) -> Result<Envelope, Error> {
+    let event_id = ids.model_event(native_key, &observed.id);
+    let mut env = envelope(
+        ctx,
+        cursor,
+        line,
+        value,
+        Completeness::Structured,
+        native_uuid(value).as_deref(),
+        ObservationPayload::Model(Box::new(remuda_protocol::ModelPayload {
+            requested: None,
+            effective: remuda_protocol::EffectiveModel {
+                id: observed.id,
+                source,
+                observed_at: timestamp_now()?,
+            },
+            raw: raw.map(str::to_owned),
+            catalog: None,
+        })),
+    )?;
+    env.event_id = Some(event_id);
+    Ok(env)
+}
+
+/// Model edge settled by a `/model` verdict — a record with no assistant
+/// message id.
+#[allow(clippy::too_many_arguments)]
+fn model_edge_envelope(
+    ctx: &MapContext,
+    ids: &NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+    native_suffix: &str,
+    observed: remuda_protocol::ObservedModel,
+    source: remuda_protocol::EffortSource,
+    raw: Option<&str>,
+) -> Result<Envelope, Error> {
+    let native = native_uuid(value)
+        .map(|uuid| format!("{native_suffix}:{uuid}"))
+        .unwrap_or_else(|| format!("{native_suffix}:{}", cursor.offset.0));
+    model_envelope(
+        ctx, ids, value, line, cursor, &native, observed, source, raw,
+    )
+}
+
 /// Plain-text view of a user record's content (string or text-block array).
-fn user_record_text(content: &Value) -> String {
-    match content {
+fn user_record_text(content: &Value) -> String {    match content {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
             .iter()
@@ -592,6 +681,24 @@ fn map_assistant(
             observed,
             source,
             raw_effort.or(raw_per_turn),
+        )?);
+    }
+    // §9.1: assistant records carry the resolved model at message.model.
+    let raw_model = message.get("model").and_then(Value::as_str);
+    if let Some((observed, source)) = ids.model.observe(raw_model) {
+        let model_native = native_msg
+            .clone()
+            .unwrap_or_else(|| format!("assistant-{}", cursor.offset.0));
+        out.push(model_envelope(
+            ctx,
+            ids,
+            value,
+            line,
+            cursor,
+            &model_native,
+            observed,
+            source,
+            raw_model,
         )?);
     }
     let has_tool = content
@@ -674,10 +781,42 @@ fn map_assistant(
 
 fn map_system(
     ctx: &MapContext,
+    ids: &mut NativeIds,
     value: &Value,
     line: &[u8],
     cursor: &FileCursor,
 ) -> Result<Vec<Envelope>, Error> {
+    // §9.1: a rejected `/model` (`Model '<id>' not found`) and a dismissed
+    // picker (`Kept model as <id>`) are `system` local_command records with a
+    // top-level content string. They emit no model edge; they only settle the
+    // tracker so a later edge is not mis-attributed.
+    if value.get("subtype").and_then(Value::as_str) == Some("local_command")
+        && let Some(text) = value.get("content").and_then(Value::as_str)
+    {
+        if let Some(args) = remuda_protocol::slash_model_args(text) {
+            ids.model.note_slash(&args, false);
+            return Ok(Vec::new());
+        }
+        if text.contains("<local-command-stdout>") && text.to_lowercase().contains("model") {
+            let stdout = extract_local_stdout(text);
+            // Kept/not-found clear attribution; a defensive accept here still
+            // emits the edge.
+            if let Some((observed, source)) = ids.model.note_stdout(&stdout, false) {
+                return Ok(vec![model_edge_envelope(
+                    ctx,
+                    ids,
+                    value,
+                    line,
+                    cursor,
+                    "model-stdout",
+                    observed,
+                    source,
+                    Some(&stdout),
+                )?]);
+            }
+            return Ok(Vec::new());
+        }
+    }
     let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
     let (topic, name, completeness, affects) = match subtype {
         "init" => (

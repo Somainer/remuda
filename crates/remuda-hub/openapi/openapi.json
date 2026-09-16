@@ -1306,6 +1306,68 @@
               "null"
             ]
           },
+          "modelEffective": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "D-028 §9.1 effective model read back from the /model <local-command-stdout> verdict or message.model ({id, source, observedAt}). This is the RESOLVED id (an alias can resolve to a concrete gateway id), not necessarily the requested word.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "launch",
+                  "slash",
+                  "remuda",
+                  "unknown"
+                ]
+              },
+              "observedAt": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "source",
+              "observedAt"
+            ],
+            "additionalProperties": true
+          },
+          "modelCatalog": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "D-028 §9.1 the model list this session can switch to, discovered from the gateway cache (gateway-discovery), settings/env (settings), or the built-in aliases (builtin). {models: string[], source, observedAt}.",
+            "properties": {
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "gateway-discovery",
+                  "settings",
+                  "builtin"
+                ]
+              },
+              "observedAt": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "models",
+              "source",
+              "observedAt"
+            ],
+            "additionalProperties": true
+          },
           "hostId": {
             "type": "string"
           },

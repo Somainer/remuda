@@ -421,6 +421,40 @@ async fn fake_node(
                         Some(&session_id),
                     )
                     .await?;
+                    // §9.1 model-sync: the driver's launch snapshot carries the
+                    // gateway-discovered catalog and the launch model so the
+                    // picker shows the real list immediately.
+                    let launch_model = spec
+                        .get("modelId")
+                        .or_else(|| spec.get("model"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("e2e/auto")
+                        .to_string();
+                    append_n = append_event(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "model",
+                        json!({
+                            "requested": launch_model,
+                            "effective": {
+                                "id": launch_model,
+                                "source": "launch",
+                                "observedAt": "2026-09-14T12:00:00.000Z"
+                            },
+                            "catalog": {
+                                "models": [
+                                    "e2e/auto",
+                                    "e2e/fast",
+                                    "e2e/plain",
+                                    "claude-e2e-only"
+                                ],
+                                "source": "gateway-discovery",
+                                "observedAt": "2026-09-14T12:00:00.000Z"
+                            }
+                        }),
+                    )
+                    .await?;
                     send_rpc_ok(
                         &mut ws,
                         id,
@@ -566,6 +600,28 @@ async fn fake_node(
                         append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                     continue;
                 }
+                // §9.1 model-sync: a terminal-side `/model <id>` typed in the
+                // PTY emits the matching model observation attributed to
+                // `slash` (resolved id verbatim), no configure ping-pong.
+                if let Some(model) = prompt.strip_prefix("/model:") {
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    append_n = append_event(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "model",
+                        json!({
+                            "effective": {
+                                "id": model,
+                                "source": "slash",
+                                "observedAt": "2026-09-14T12:00:00.000Z"
+                            },
+                            "raw": model
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
                 // r-ux-comment: reply with a fenced code block so the browser
                 // spec can exercise the 评论 quote action. The prompt is also
                 // echoed verbatim below, proving the expanded quote arrived.
@@ -705,8 +761,62 @@ async fn fake_node(
                 send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
             }
             "instance.configure" => {
-                // §9.1: emulate a native agent that accepted `/effort` and
-                // whose command verdict reports the level back. When the
+                // §9.1 model-sync: a model-bearing configure emulates the
+                // `/model` command verdict. Sentinels (posted directly by the
+                // spec, never sent by the UI):
+                //   "__queued__:<id>"  → model-queued lifecycle only
+                //   "__notfound__:<id>"→ model-degraded …:not-found only
+                //   "__resolve__:<alias>=<resolved>" → accepted, alias resolves
+                //   to a different concrete id (the mismatch path)
+                // Otherwise the requested id is accepted verbatim.
+                if let Some(requested) = params.get("model").and_then(Value::as_str) {
+                    if let Some(mid) = requested.strip_prefix("__queued__:") {
+                        append_n = append_configure_status(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            &format!("model-queued:{mid}"),
+                        )
+                        .await?;
+                    } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
+                        append_n = append_configure_status(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            &format!("model-degraded:{mid}:not-found"),
+                        )
+                        .await?;
+                    } else {
+                        let (requested_id, resolved) =
+                            if let Some(rest) = requested.strip_prefix("__resolve__:")
+                                && let Some((alias, resolved)) = rest.split_once('=')
+                            {
+                                (alias.to_owned(), resolved.to_owned())
+                            } else {
+                                (requested.to_owned(), requested.to_owned())
+                            };
+                        append_n = append_event(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "model",
+                            json!({
+                                "requested": requested_id,
+                                "effective": {
+                                    "id": resolved,
+                                    "source": "remuda",
+                                    "observedAt": "2026-09-14T12:00:00.000Z"
+                                },
+                                "raw": resolved
+                            }),
+                        )
+                        .await?;
+                    }
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    continue;
+                }
+                // §9.1 effort: emulate a native agent that accepted `/effort`
+                // and whose command verdict reports the level back. When the
                 // requested level differs from what the transcript says, the
                 // fake agent reports a *clamped* level — exactly the
                 // 请求 max → 实际 xhigh path the UI must render.

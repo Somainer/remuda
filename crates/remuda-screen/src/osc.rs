@@ -105,6 +105,86 @@ pub fn progress_active(status: &OscStatus) -> bool {
     matches!(status.progress, Some(state) if state != STATE_OFF)
 }
 
+/// ConEmu `OSC 9;4` progress, parsed for the web terminal header.
+///
+/// The sequence is `OSC 9 ; 4 ; <state> ; <percent> ST`, with the percent
+/// frequently left empty (claude emits `9;4;3;` while a turn runs). The
+/// wire spelling is additive: older clients ignore the new notice, exactly
+/// like the `altScreen` field it rides with (native-config, 2026-09-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressBar {
+    /// State `0`: no operation in progress — the bar is hidden.
+    Done,
+    /// State `1`: determinate progress, with the 0..=100 percent when the
+    /// sender gave one.
+    Percent(Option<u8>),
+    /// State `2`: the operation errored.
+    Error,
+    /// State `3`: indeterminate activity (claude's busy indicator).
+    Indeterminate,
+    /// State `4`: paused / warning.
+    Paused,
+}
+
+impl ProgressBar {
+    /// Parse a retained `OSC 9;4` payload.
+    ///
+    /// `None` means the harness never emitted a recognisable sequence, not
+    /// "done": a fresh attach must not flash the bar just to hide it. Payloads
+    /// seen in the wild are `"3"` (claude's empty-percent `9;4;3;`),
+    /// `"3;0"`, `"1;50"` and `"0;0"`.
+    #[must_use]
+    pub fn parse(payload: &str) -> Option<Self> {
+        let mut parts = payload.split(';').map(str::trim);
+        let state: u8 = parts
+            .next()
+            .filter(|token| !token.is_empty())?
+            .parse()
+            .ok()?;
+        let percent = parts
+            .next()
+            .filter(|token| !token.is_empty())
+            .and_then(|token| token.parse::<u8>().ok())
+            .map(|value| value.min(100));
+        Some(match state {
+            STATE_OFF => Self::Done,
+            STATE_PERCENT => Self::Percent(percent),
+            STATE_ERROR => Self::Error,
+            STATE_INDETERMINATE => Self::Indeterminate,
+            STATE_PAUSED => Self::Paused,
+            _ => return None,
+        })
+    }
+
+    /// Stable lowercase spelling for the additive `progress.state` wire field.
+    #[must_use]
+    pub fn state_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Percent(_) => "percent",
+            Self::Error => "error",
+            Self::Indeterminate => "indeterminate",
+            Self::Paused => "paused",
+        }
+    }
+
+    /// Reported percent for determinate progress.
+    #[must_use]
+    pub fn percent(self) -> Option<u8> {
+        match self {
+            Self::Percent(percent) => percent,
+            _ => None,
+        }
+    }
+}
+
+/// ConEmu OSC 9;4 progress state 1: determinate percent.
+pub const STATE_PERCENT: u8 = 1;
+/// ConEmu OSC 9;4 progress state 2: error.
+pub const STATE_ERROR: u8 = 2;
+/// ConEmu OSC 9;4 progress state 4: paused / warning.
+pub const STATE_PAUSED: u8 = 4;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +248,44 @@ mod tests {
             title: None,
             progress: Some("1;-1".into())
         })));
+    }
+
+    #[test]
+    fn osc_9_4_payloads_parse_into_header_states() {
+        // The four states the terminal header renders, with claude's exact
+        // empty-percent spelling (`ESC ] 9 ; 4 ; 3 ; BEL`).
+        assert_eq!(ProgressBar::parse("3"), Some(ProgressBar::Indeterminate));
+        assert_eq!(ProgressBar::parse("3;0"), Some(ProgressBar::Indeterminate));
+        assert_eq!(ProgressBar::parse("3;"), Some(ProgressBar::Indeterminate));
+        assert_eq!(
+            ProgressBar::parse("1;50"),
+            Some(ProgressBar::Percent(Some(50)))
+        );
+        assert_eq!(ProgressBar::parse("1;"), Some(ProgressBar::Percent(None)));
+        assert_eq!(ProgressBar::parse("1;200"), Some(ProgressBar::Percent(Some(100))));
+        assert_eq!(ProgressBar::parse("2;0"), Some(ProgressBar::Error));
+        assert_eq!(ProgressBar::parse("4;10"), Some(ProgressBar::Paused));
+        assert_eq!(ProgressBar::parse("0"), Some(ProgressBar::Done));
+        assert_eq!(ProgressBar::parse("0;0"), Some(ProgressBar::Done));
+        // Never-emitted / unparseable is None, which is distinct from Done:
+        // an attach with no OSC evidence must clear a stale bar, not render one.
+        assert_eq!(ProgressBar::parse(""), None);
+        assert_eq!(ProgressBar::parse(";50"), None);
+        assert_eq!(ProgressBar::parse("x;50"), None);
+        assert_eq!(ProgressBar::parse("9;10"), None);
+    }
+
+    #[test]
+    fn progress_state_spellings_and_percents_are_stable() {
+        assert_eq!(ProgressBar::Done.state_str(), "done");
+        assert_eq!(
+            ProgressBar::Percent(Some(42)).state_str(),
+            "percent"
+        );
+        assert_eq!(ProgressBar::Error.state_str(), "error");
+        assert_eq!(ProgressBar::Indeterminate.state_str(), "indeterminate");
+        assert_eq!(ProgressBar::Paused.state_str(), "paused");
+        assert_eq!(ProgressBar::Percent(Some(42)).percent(), Some(42));
+        assert_eq!(ProgressBar::Indeterminate.percent(), None);
     }
 }

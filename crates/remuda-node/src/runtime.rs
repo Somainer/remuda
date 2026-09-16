@@ -733,6 +733,11 @@ impl DevNode {
         self.inner.store.get_command(command_id)
     }
 
+    /// Local store backing this Node (internal RPC helpers).
+    pub(crate) fn store(&self) -> &dyn crate::LocalStore {
+        self.inner.store.as_ref()
+    }
+
     /// Read one exclusive sequence page from a journal.
     pub fn read_journal(
         &self,

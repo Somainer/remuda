@@ -438,9 +438,15 @@ impl SignalBus {
         // the same fold and is journaled before any blocking reply, so the card
         // and its surrounding stream are ordered together.
         if let Some(at) = at {
+            // Sub-agent tool hooks (workflow members and foreground/background
+            // Agent tasks) carry `agent_id`; stamp it onto the derived tool
+            // observations so the web can group them UNDER their parent row
+            // instead of flattening them into the main transcript. Main-session
+            // hooks omit the field and stay unattributed.
+            let agent_id = event.text("agent_id");
             for payload in fold.extras {
                 if let Err(error) = self
-                    .emit_derived(payload, mapped.session_id.as_ref(), at.clone())
+                    .emit_derived(payload, mapped.session_id.as_ref(), at.clone(), agent_id)
                     .await
                 {
                     tracing::debug!(%error, event = %event.name, "live content not journaled");
@@ -614,15 +620,24 @@ impl SignalBus {
     }
 
     /// Emit a live-layer payload (`turn.live`, `ToolCall`, `ToolResult`) on the
-    /// same envelope the raw hook observation uses.
+    /// same envelope the raw hook observation uses. `agent_id` is stamped onto
+    /// `source.native_agent_id` when the fold ran on a sub-agent hook.
     async fn emit_derived(
         &self,
         body: ObservationPayload,
         session_id: Option<&String>,
         observed_at: Timestamp,
+        agent_id: Option<&str>,
     ) -> Result<(), mpsc::error::SendError<Observation>> {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let observation = self.build_payload(seq, observed_at, body, session_id, HOOK_COMPLETENESS);
+        let observation = self.build_payload(
+            seq,
+            observed_at,
+            body,
+            session_id,
+            HOOK_COMPLETENESS,
+            agent_id,
+        );
         self.events.send(observation).await
     }
 
@@ -634,6 +649,7 @@ impl SignalBus {
             mapped.payload.clone(),
             mapped.session_id.as_ref(),
             mapped.completeness,
+            None,
         ))
     }
 
@@ -644,6 +660,7 @@ impl SignalBus {
         body: ObservationPayload,
         session_id: Option<&String>,
         completeness: Completeness,
+        agent_id: Option<&str>,
     ) -> Observation {
         Observation {
             schema_version: SchemaVersion,
@@ -678,7 +695,12 @@ impl SignalBus {
                     },
                 },
                 native_turn_id: Knowledge::NotApplicable,
-                native_agent_id: Knowledge::NotApplicable,
+                native_agent_id: match agent_id {
+                    Some(value) => Knowledge::Known {
+                        value: value.to_owned(),
+                    },
+                    None => Knowledge::NotApplicable,
+                },
                 native_item_id: Knowledge::NotApplicable,
                 native_event_id: Knowledge::NotApplicable,
                 native_request_id: NativeRequestKey::None,

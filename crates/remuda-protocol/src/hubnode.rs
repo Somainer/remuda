@@ -80,6 +80,8 @@ pub const METHOD_OBJECT_CHUNK: &str = "object.chunk";
 /// unlike [`METHOD_TTY_ATTACH`] it opens no stream and moves no offset, so it
 /// is safe to call against a session a human is watching.
 pub const METHOD_TTY_SCREEN: &str = "tty.screen";
+/// On-demand bounded read of one subagent's sidechain transcript (drill-in).
+pub const METHOD_SUBAGENT_TRANSCRIPT: &str = "subagent.transcript";
 /// HTTP Authorization scheme for `GET /v1/node`.
 pub const WS_AUTHORIZATION_SCHEME: &str = "Bearer";
 /// `params.scheme` on [`METHOD_NODE_AUTH`].

@@ -862,6 +862,9 @@ async fn dispatch_rpc(
         method if crate::workspace_scm::is_scm_method(method) => {
             crate::workspace_scm::handle_rpc(node, method, &params)
         }
+        method if crate::subagent::is_subagent_method(method) => {
+            crate::subagent::handle_rpc(node, method, &params)
+        }
         "instance.list" => {
             let mut page = node.list_instances()?;
             if let Some(raw_workspace) = params.get("workspaceId").and_then(Value::as_str) {

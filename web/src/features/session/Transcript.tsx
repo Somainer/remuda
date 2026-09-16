@@ -8,12 +8,13 @@ import { AnchorText } from "./AnchorText";
 import { hubStore } from "../../lib/store";
 import { projectCommandStatus } from "../../lib/commandStatus";
 import ui from "../../styles/ui.module.css";
-import { assembleTranscript, compactTranscript, isToolFailure, type TranscriptNode } from "./assemble";
+import { assembleTranscript, compactTranscript, isToolFailure, subagentToolNodes, type TranscriptNode } from "./assemble";
 import { JournalBanner, type JournalUiStatus } from "./JournalBanner";
 import { ToolCard } from "./ToolCard";
 import { WorkflowTree } from "./WorkflowTree";
 import { UsageFooter } from "./UsageFooter";
 import { OpaqueRow } from "./OpaqueRow";
+import { SubagentFolds } from "./subagent/SubagentRows";
 import css from "./transcript.module.css";
 import session from "./session.module.css";
 import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "./virtualWindow";
@@ -49,7 +50,24 @@ function locateNode(nodes: readonly TranscriptNode[], nodeId: string): NodeLocat
   for (let i = 0; i < nodes.length; i += 1) {
     const node = nodes[i];
     if (node.id === nodeId) return { index: i, compactId: null };
-    if (node.type === "compact" && node.children.some((child) => child.id === nodeId)) {
+    if (node.type === "compact") {
+      if (node.children.some((child) => child.id === nodeId)) {
+        return { index: i, compactId: node.id };
+      }
+      // Subagent rows nested under a Task that the compact group swallowed.
+      if (
+        node.children.some(
+          (child) => child.type === "tool" && subagentToolNodes(child).some((sub) => sub.id === nodeId),
+        )
+      ) {
+        return { index: i, compactId: node.id };
+      }
+    }
+    // Subagent tool rows are folded under Task / workflow member parents.
+    if (
+      node.type === "tool"
+      && subagentToolNodes(node).some((child) => child.id === nodeId)
+    ) {
       return { index: i, compactId: node.id };
     }
   }
@@ -581,7 +599,13 @@ function TranscriptInner({
                 searchHit={Boolean(hit)}
                 searchCurrent={Boolean(hit?.current)}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
-                hitChildId={node.type === "compact" ? compactHit?.childId ?? null : null}
+                hitChildId={
+                  node.type === "compact"
+                    ? (compactHit?.childId ?? null)
+                    : node.type === "tool"
+                      ? (hit?.childId ?? null)
+                      : null
+                }
               />
             );
           })}
@@ -672,8 +696,7 @@ function TranscriptRow({
         searchCurrent ? css.rowCurrent : "",
       ].join(" ").trim()}
     >
-      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId })}
-    </div>
+      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId })}    </div>
   );
 }
 
@@ -681,9 +704,11 @@ function TranscriptRow({
 function ToolRow({
   node,
   opts,
+  hitChildId,
 }: {
   node: Extract<TranscriptNode, { type: "tool" }>;
   opts: { defaultFolded: boolean; collapseTick: number; settle: boolean };
+  hitChildId?: string | null;
 }): ReactNode {
   const failed = isToolFailure(node);
   const card = (
@@ -699,13 +724,24 @@ function ToolRow({
       settle={opts.settle}
     />
   );
-  if (!failed) return card;
+  const folds = (node.subagents?.length ?? 0) > 0 ? (
+    <SubagentFolds refs={node.subagents ?? []} openChildId={hitChildId ?? null} />
+  ) : null;
+  if (!failed) {
+    return (
+      <>
+        {card}
+        {folds}
+      </>
+    );
+  }
   return (
     <div className={css.failWrap} data-testid="tool-failure" data-tool-outcome={node.result?.outcome}>
       <span className={css.failTag} data-testid="tool-failure-tag">
         工具失败 · {node.result?.outcome === "denied" ? "已拒绝" : "失败"}
       </span>
       {card}
+      {folds}
     </div>
   );
 }
@@ -803,7 +839,7 @@ function renderNode(
     );
   }
   if (node.type === "tool") {
-    return <ToolRow node={node} opts={opts} />;
+    return <ToolRow node={node} opts={opts} hitChildId={opts.hitChildId ?? null} />;
   }
   if (node.type === "workflow") {
     return <WorkflowTree run={node.run} phases={node.phases} members={node.members} />;
@@ -825,6 +861,7 @@ function renderNode(
               key={child.id}
               node={child}
               opts={{ defaultFolded: opts.defaultFolded, collapseTick: opts.collapseTick, settle: opts.settle }}
+              hitChildId={opts.hitChildId ?? null}
             />
           ) : child.type === "thought" ? (
             <details key={child.id} className={session.thought}>

@@ -352,7 +352,6 @@ journals.set(journalWorking, [
     modelResolved: known("claude-haiku-4-5-20251001"),
     resultRef: null,
     revision: "1",
-    childInstanceId: insIdle,
   }),
   obs(insWorking, journalWorking, 14, "workflow.member", {
     workflowId,

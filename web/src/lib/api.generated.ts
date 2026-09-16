@@ -688,6 +688,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/instances/{id}/subagents/{agentId}/transcript": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description On-demand drill-in read of one subagent sidechain transcript. Subagents are sub-sessions inside the same Remuda session, never instances, so their tool calls are not in the live journal; the Node parses the bounded agent-<id>.jsonl through its normal transcript pipeline on this request. Read-only. available=false means the agent transcript has not landed yet (启动中). */
+        get: operations["instanceSubagentTranscript"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/instances/{id}/usage": {
         parameters: {
             query?: never;
@@ -3943,6 +3960,35 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Current screen text for a PTY-carried instance */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    instanceSubagentTranscript: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+                /** @description Native agent id (the agent-<id> file stem). */
+                agentId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Subagent transcript metadata and mapped observations */
             200: {
                 headers: {
                     [name: string]: unknown;

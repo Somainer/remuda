@@ -10,11 +10,17 @@
  * the pure projection; this file only renders and owns toggle state.
  */
 import { Fragment, useEffect, useId, useMemo, useState } from "react";
+import { Link, useParams } from "react-router-dom";
 import type {
   WorkflowMemberPayload,
   WorkflowPhasePayload,
   WorkflowRunPayload,
 } from "../../../types/generated";
+import type { SubagentRef } from "../assemble";
+import { ToolCard } from "../ToolCard";
+import { isToolFailure } from "../assemble";
+import sessionCss from "../session.module.css";
+import { subagentHref } from "../subagent/SubagentRows";
 import {
   fmtDuration,
   fmtTokens,
@@ -143,28 +149,107 @@ function Chip({ status }: { status: WfStatus }) {
   );
 }
 
-function AgentRow({ agent, rowId }: { agent: WfAgent; rowId?: string }) {
-  const model = shortModel(agent.model);
+/** Inline fold of a member's live tool calls. */
+function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
+  const [open, setOpen] = useState(false);
+  if (!subagent.nodes.length) return null;
   return (
-    <li className={css.agent} data-state={agent.state} data-testid="workflow-agent" id={rowId}>
+    <div className={css.memberTools}>
+      <button
+        type="button"
+        className={css.memberToolsToggle}
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        {open ? "▾" : "▸"} {subagent.nodes.length} tool calls
+      </button>
+      {open ? (
+        <div className={css.memberToolRows}>
+          {subagent.nodes.map((node) =>
+            isToolFailure(node) ? (
+              <div key={node.id} className={css.memberToolFail} data-tool-outcome={node.result?.outcome}>
+                <ToolCard
+                  driverKind={node.driverKind}
+                  call={node.call}
+                  result={node.result}
+                  completeness={node.completeness}
+                  diffState={node.diffState}
+                />
+              </div>
+            ) : (
+              <ToolCard
+                key={node.id}
+                driverKind={node.driverKind}
+                call={node.call}
+                result={node.result}
+                completeness={node.completeness}
+                diffState={node.diffState}
+              />
+            ),
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function AgentRow({
+  agent,
+  rowId,
+  memberRef,
+  starting,
+}: {
+  agent: WfAgent;
+  rowId?: string;
+  memberRef?: SubagentRef;
+  starting: boolean;
+}) {
+  const model = shortModel(agent.model);
+  const { instanceId = "" } = useParams();
+  return (
+    <li
+      className={css.agent}
+      data-state={agent.state}
+      data-testid="workflow-agent"
+      data-agent-id={agent.id}
+      id={rowId}
+    >
       <span className={css.state}>
         <StateGlyph state={agent.state} />
         <span className={css.sr}>{STATE_WORD[agent.state]}</span>
       </span>
-      <span className={css.agentLabel} title={agent.label}>
-        <span className={css.agentName}>{agent.label}</span>
-        {agent.attempt && agent.attempt > 1 ? (
-          <span className={css.retry} title={`第 ${agent.attempt} 次尝试`}>
-            ×{agent.attempt}
-          </span>
-        ) : null}
+      <Link
+        className={css.agentOpen}
+        to={subagentHref(instanceId, agent.id)}
+        data-testid="workflow-agent-open"
+        title="打开子会话"
+      >
+        <span className={css.agentLabel} title={agent.label}>
+          <span className={css.agentName}>{agent.label}</span>
+          {agent.attempt && agent.attempt > 1 ? (
+            <span className={css.retry} title={`第 ${agent.attempt} 次尝试`}>
+              ×{agent.attempt}
+            </span>
+          ) : null}
+        </span>
+        <span className={css.agentMeta}>
+          {model ? <span className={`${css.model} ${css.soft}`}>{model}</span> : null}
+          {starting ? <span className={css.soft}>启动中</span> : null}
+          {!starting && agent.latestTool ? <span className={`${css.tool} ${css.soft}`}>{agent.latestTool}</span> : null}
+          {!starting && typeof agent.durationMs === "number" && agent.durationMs > 0 ? <b>{fmtDuration(agent.durationMs)}</b> : null}
+          {!starting && typeof agent.tokens === "number" && agent.tokens > 0 ? <b>{fmtTokens(agent.tokens)}</b> : null}
+        </span>
+      </Link>
+      <span className={css.agentOpenBtn}>
+        <Link
+          className={sessionCss.openBtn}
+          to={subagentHref(instanceId, agent.id)}
+          data-testid="workflow-agent-open-btn"
+        >
+          打开
+        </Link>
       </span>
-      <span className={css.agentMeta}>
-        {model ? <span className={`${css.model} ${css.soft}`}>{model}</span> : null}
-        {agent.latestTool ? <span className={`${css.tool} ${css.soft}`}>{agent.latestTool}</span> : null}
-        {typeof agent.durationMs === "number" && agent.durationMs > 0 ? <b>{fmtDuration(agent.durationMs)}</b> : null}
-        {typeof agent.tokens === "number" && agent.tokens > 0 ? <b>{fmtTokens(agent.tokens)}</b> : null}
-      </span>
+      {memberRef ? <MemberToolFold subagent={memberRef} /> : null}
     </li>
   );
 }
@@ -194,7 +279,7 @@ function FoldToggle({
   );
 }
 
-function PhaseBlock({ phase }: { phase: WfPhaseView }) {
+function PhaseBlock({ phase, refsByAgent }: { phase: WfPhaseView; refsByAgent: Map<string, SubagentRef> }) {
   // Follow `expandedByDefault` until the user toggles, then remember it.
   // Following the prop matters because the phase head mounts before members
   // stream in: an initializer would lock it to "0 agents → collapsed" forever.
@@ -234,7 +319,11 @@ function PhaseBlock({ phase }: { phase: WfPhaseView }) {
           {laid.rows.map((agent, index) => (
             <Fragment key={agent.id}>
               {laid.foldIndex === index ? <FoldToggle key="fold" phaseId={phase.id} folded={laid.folded} open={showFolded} onToggle={() => setShowFolded(!showFolded)} /> : null}
-              <AgentRow agent={agent} />
+              <AgentRow
+                agent={agent}
+                memberRef={refsByAgent.get(agent.id)}
+                starting={agent.state === "queued" && !refsByAgent.has(agent.id) && (agent.calls ?? 0) === 0}
+              />
             </Fragment>
           ))}
           {laid.foldIndex === laid.rows.length ? (
@@ -242,7 +331,13 @@ function PhaseBlock({ phase }: { phase: WfPhaseView }) {
           ) : null}
           {showFolded
             ? laid.folded.map((agent) => (
-                <AgentRow key={`fold-row-${phase.id}-${agent.id}`} rowId={`fold-${phase.id}-${agent.id}`} agent={agent} />
+                <AgentRow
+                  key={`fold-row-${phase.id}-${agent.id}`}
+                  rowId={`fold-${phase.id}-${agent.id}`}
+                  agent={agent}
+                  memberRef={refsByAgent.get(agent.id)}
+                  starting={agent.state === "queued" && !refsByAgent.has(agent.id) && (agent.calls ?? 0) === 0}
+                />
               ))
             : null}
         </ul>
@@ -264,7 +359,7 @@ function useElapsed(active: boolean, snapshotMs: number): number {
   return elapsed;
 }
 
-function DetailedCard({ card }: { card: WfCard }) {
+function DetailedCard({ card, refsByAgent }: { card: WfCard; refsByAgent: Map<string, SubagentRef> }) {
   const running = card.status === "running";
   const [open, setOpen] = useState(running);
   const rawId = useId();
@@ -344,7 +439,7 @@ function DetailedCard({ card }: { card: WfCard }) {
           ) : null}
           <div className={css.body}>
             {card.phases.map((phase) => (
-              <PhaseBlock key={phase.id} phase={phase} />
+              <PhaseBlock key={phase.id} phase={phase} refsByAgent={refsByAgent} />
             ))}
           </div>
         </div>
@@ -377,10 +472,21 @@ export function WorkflowTimelineCard(props: {
   run: WorkflowRunPayload;
   phases: WorkflowPhasePayload[];
   members: WorkflowMemberPayload[];
+  /** c-wfdrill: live tool rows folded per member, keyed by native agent id. */
+  subagents?: SubagentRef[];
 }) {
   const card = useMemo(
     () => projectWorkflow({ run: props.run, phases: props.phases, members: props.members }),
     [props.run, props.phases, props.members],
   );
-  return card.detailed ? <DetailedCard card={card} /> : <FlatCard card={card} />;
+  const refsByAgent = useMemo(() => {
+    const map = new Map<string, SubagentRef>();
+    for (const ref of props.subagents ?? []) map.set(ref.agentId, ref);
+    return map;
+  }, [props.subagents]);
+  return card.detailed ? (
+    <DetailedCard card={card} refsByAgent={refsByAgent} />
+  ) : (
+    <FlatCard card={card} />
+  );
 }

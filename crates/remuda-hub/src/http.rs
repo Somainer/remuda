@@ -1510,6 +1510,34 @@ pub async fn get_screen(
     }
 }
 
+/// `GET /v1/instances/:id/subagents/:agentId/transcript`
+///
+/// On-demand drill-in read of one subagent's sidechain transcript. Subagents
+/// are sub-sessions inside the SAME Remuda session (never instances), so their
+/// tool calls never enter the live journal; the Node parses the bounded
+/// `agent-<id>.jsonl` through its normal transcript pipeline on this request.
+/// Read-only; `available:false` means the agent is still 「启动中」.
+pub async fn get_subagent_transcript(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((instance_id, agent_id)): Path<(String, String)>,
+) -> Result<Json<Value>, HubError> {
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
+    let instance = state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let response = call_node(
+        &state,
+        &instance.host_id,
+        remuda_protocol::hubnode::METHOD_SUBAGENT_TRANSCRIPT,
+        json!({ "instanceId": instance_id, "agentId": agent_id }),
+    )
+    .await?;
+    Ok(Json(response))
+}
+
 /// `GET /v1/instances/:id/journal`
 pub async fn get_journal(
     State(state): State<AppState>,

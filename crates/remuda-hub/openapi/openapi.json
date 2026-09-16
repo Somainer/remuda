@@ -5825,6 +5825,51 @@
         ]
       }
     },
+    "/v1/instances/{id}/subagents/{agentId}/transcript": {
+      "get": {
+        "description": "On-demand drill-in read of one subagent sidechain transcript. Subagents are sub-sessions inside the same Remuda session, never instances, so their tool calls are not in the live journal; the Node parses the bounded agent-<id>.jsonl through its normal transcript pipeline on this request. Read-only. available=false means the agent transcript has not landed yet (启动中).",
+        "operationId": "instanceSubagentTranscript",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "description": "Native agent id (the agent-<id> file stem).",
+            "in": "path",
+            "name": "agentId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Subagent transcript metadata and mapped observations"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
     "/v1/instances/{id}/mcp-token": {
       "post": {
         "description": "Requires Human origin. The returned credential always has Agent origin and cannot be rebound to another instance.",

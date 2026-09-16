@@ -1,0 +1,139 @@
+.folds {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.fold {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--canvas);
+  padding: 6px 8px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--paper);
+  font: inherit;
+  font-size: var(--text-aux);
+  cursor: pointer;
+  padding: 2px 0;
+  min-width: 0;
+  flex: 1;
+  text-align: left;
+}
+
+.caret {
+  color: var(--mute);
+}
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.failWrap {
+  border-left: 2px solid var(--danger);
+  padding-left: 8px;
+}
+
+/* Drill-in page. */
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.backBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.backLink {
+  color: var(--paper);
+  text-decoration: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 3px 10px;
+  font-size: var(--text-aux);
+}
+
+.backLink:hover {
+  border-color: var(--mute);
+}
+
+.title {
+  font-size: var(--text-body);
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  color: var(--mute);
+  font-size: var(--text-aux);
+  flex-wrap: wrap;
+}
+
+.scroller {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.prompt {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 8px 10px;
+  font-size: var(--text-aux);
+  color: var(--mute);
+  white-space: pre-wrap;
+}
+
+.final {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 8px 10px;
+  white-space: pre-wrap;
+}
+
+.notice {
+  padding: 24px 12px;
+  color: var(--mute);
+  text-align: center;
+}

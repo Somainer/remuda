@@ -788,6 +788,10 @@ async fn fake_node(
                 let result = g2_scm_answer(method, &params);
                 send_rpc_ok(&mut ws, id, result).await?;
             }
+            "subagent.transcript" => {
+                let agent_id = params.get("agentId").and_then(Value::as_str).unwrap_or("");
+                send_rpc_ok(&mut ws, id, drill_subagent_answer(agent_id)).await?;
+            }
             "tty.attach" => {
                 if claude_ptys.contains(&instance_id) && !ttys.contains_key(&instance_id) {
                     send_rpc_error(&mut ws, id, "instance has no TTY bridge").await?;
@@ -1636,6 +1640,7 @@ fn workflow_kind(prompt: &str) -> Option<&'static str> {
         "fold running" => "fold-running",
         "fail" => "fail",
         "legacy" => "legacy",
+        "drill" => "drill",
         "demo running" => "demo-running",
         "demo done" => "demo-done",
         _ => "demo",
@@ -1688,13 +1693,32 @@ async fn append_event(
     kind: &str,
     payload: Value,
 ) -> Result<u64> {
+    append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({ "kind": kind, "payload": payload }),
+    )
+    .await
+}
+
+/// Append a full event object, allowing the scenario to set `source`
+/// (c-wfdrill: sub-agent hook observations carry `nativeAgentId`).
+async fn append_full_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    n: u64,
+    event: Value,
+) -> Result<u64> {
     let seq = n + 1;
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
             "id": format!("j{seq}"),
             "method": "journal.append",
-            "params": { "instanceId": instance_id, "event": { "kind": kind, "payload": payload } }
+            "params": { "instanceId": instance_id, "event": event }
         })
         .to_string()
         .into(),
@@ -1702,6 +1726,17 @@ async fn append_event(
     .await?;
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
+}
+
+/// A hook-channel observation source stamped with the subagent's native id.
+fn hook_agent_source(agent_id: &str) -> Value {
+    json!({
+        "channel": "hook",
+        "delivery": "live",
+        "driverKind": "shell-pty",
+        "nativeSessionId": { "state": "unknown", "reason": "not-emitted", "evidenceEventIds": [] },
+        "nativeAgentId": wf_known(json!(agent_id)),
+    })
 }
 
 fn wf_known(value: Value) -> Value {
@@ -1881,6 +1916,11 @@ async fn append_workflow_scenario(
         )
         .await?;
         return Ok(n);
+    }
+
+    if kind == "drill" {
+        return append_drill_scenario(ws, instance_id, n, &workflow_id, &tool_id, &phase, &member)
+            .await;
     }
 
     // Terminal half of the demo scenario (second prompt after "demo running"):
@@ -2349,6 +2389,351 @@ async fn append_workflow_scenario(
     )
     .await?;
     Ok(n)
+}
+
+/// c-wfdrill drill scenario ids — a running member with its own hook tool
+/// calls and a queued member whose transcript has not landed yet.
+const DRILL_AGENT_SEC: &str = "aae139d44933cefe2";
+const DRILL_AGENT_QUEUED: &str = "a600b756a51671bdd";
+
+/// Append the two-phase drill scenario: workflow card plus live sub-agent tool
+/// observations that must group UNDER the member rows, keyed by the same
+/// native agent ids the `subagent.transcript` RPC answers for.
+#[allow(clippy::too_many_arguments)]
+async fn append_drill_scenario(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    mut n: u64,
+    workflow_id: &str,
+    tool_id: &str,
+    phase: &impl Fn(u8) -> String,
+    member: &impl Fn(u8) -> String,
+) -> Result<u64> {
+    let mut totals_map = serde_json::Map::new();
+    for (k, v) in [
+        ("totalKnown", json!(true)),
+        ("agentsTotal", json!("2")),
+        ("agentsDone", json!(0)),
+        ("agentsFailed", json!(0)),
+        ("agentsKilled", json!(0)),
+        ("agentsRunning", json!(1)),
+        ("tokens", json!("83319")),
+        ("calls", json!("3")),
+        ("elapsedMs", json!("21572")),
+    ] {
+        totals_map.insert(k.into(), v);
+    }
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.run",
+        json!({
+            "workflowId": workflow_id,
+            "engine": "claude-workflow",
+            "nativeRunId": wf_known(json!("wf-native-drill")),
+            "nativeTaskId": wf_known(json!("task-drill")),
+            "toolCallId": tool_id,
+            "state": "running",
+            "revision": "1",
+            "title": wf_known(json!("card-drill")),
+            "name": wf_known(json!("card-drill")),
+            "description": wf_known(json!("subagent drill-in spike")),
+            "totals": json!(totals_map),
+            "live": {
+                "phaseTitle": wf_known(json!("Review")),
+                "agentLabel": wf_known(json!("review:security")),
+                "summary": wf_unknown(),
+            },
+            "note": null,
+            "resultRef": null,
+        }),
+    )
+    .await?;
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.phase",
+        wf_phase(workflow_id, &phase(1), "Review", "running"),
+    )
+    .await?;
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.phase",
+        wf_phase(workflow_id, &phase(2), "Verify", "queued"),
+    )
+    .await?;
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.member",
+        drill_member(
+            workflow_id,
+            &member(2),
+            &phase(1),
+            "review:security",
+            "running",
+            DRILL_AGENT_SEC,
+            "Grep",
+            83_319,
+            3,
+        ),
+    )
+    .await?;
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "workflow.member",
+        drill_member(
+            workflow_id,
+            &member(3),
+            &phase(2),
+            "verify:auth.ts",
+            "queued",
+            DRILL_AGENT_QUEUED,
+            "",
+            0,
+            0,
+        ),
+    )
+    .await?;
+
+    // The running member's own Bash tool activity arrives interleaved on the
+    // HOOK channel with agent_id stamped. The web must fold these under the
+    // member row instead of flattening them into the main transcript.
+    let sub_tool = "toolu_sec_bash1";
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "tool_call",
+            "source": hook_agent_source(DRILL_AGENT_SEC),
+            "payload": {
+                "nodeId": sub_tool,
+                "revision": "1",
+                "operation": "open",
+                "baseRevision": null,
+                "toolCallId": sub_tool,
+                "parentToolCallId": null,
+                "toolName": wf_known(json!("Bash")),
+                "displayTitle": wf_known(json!("Bash")),
+                "category": "shell",
+                "input": wf_known(json!({ "command": "echo 'reviewing auth path'" })),
+                "inputTextDelta": null,
+                "state": "running",
+                "executor": {
+                    "state": "known",
+                    "value": { "hostId": "hst", "workspaceId": null, "nativeAgentId": DRILL_AGENT_SEC },
+                },
+            },
+        }),
+    )
+    .await?;
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "tool_result",
+            "source": hook_agent_source(DRILL_AGENT_SEC),
+            "payload": {
+                "nodeId": sub_tool,
+                "revision": "2",
+                "operation": "close",
+                "baseRevision": "1",
+                "toolCallId": sub_tool,
+                "stage": "final",
+                "outcome": "succeeded",
+                "blocks": [{ "type": "text", "text": "reviewing auth path\n" }],
+                "structuredResult": wf_known(json!({ "stdout": "reviewing auth path\n" })),
+                "exitCode": wf_known(json!(0)),
+                "changes": [],
+            },
+        }),
+    )
+    .await?;
+
+    // A main-agent tool call stays at top level (no agent id on the source).
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "tool_call",
+        json!({
+            "nodeId": "toolu_main_note",
+            "revision": "1",
+            "operation": "open",
+            "baseRevision": null,
+            "toolCallId": "toolu_main_note",
+            "parentToolCallId": null,
+            "toolName": wf_known(json!("TodoWrite")),
+            "displayTitle": wf_known(json!("TodoWrite")),
+            "category": "other",
+            "input": wf_known(json!({ "todos": [] })),
+            "inputTextDelta": null,
+            "state": "running",
+            "executor": wf_unknown(),
+        }),
+    )
+    .await?;
+    Ok(n)
+}
+
+/// Drill-scenario member with a deterministic native agent id the drill RPC
+/// recognises.
+#[allow(clippy::too_many_arguments)]
+fn drill_member(
+    workflow_id: &str,
+    member_id: &str,
+    phase_id: &str,
+    label: &str,
+    state: &str,
+    agent_id: &str,
+    latest_tool: &str,
+    tokens: u64,
+    calls: u64,
+) -> Value {
+    json!({
+        "workflowId": workflow_id,
+        "memberId": member_id,
+        "nativeAgentId": wf_known(json!(agent_id)),
+        "nativeKey": wf_unknown(),
+        "attempt": wf_known(json!("1")),
+        "phaseId": phase_id,
+        "label": wf_known(json!(label)),
+        "state": state,
+        "modelRequested": wf_unknown(),
+        "modelResolved": wf_known(json!("claude-opus-5")),
+        "resultRef": null,
+        "revision": "1",
+        "latestTool": if latest_tool.is_empty() { Value::Null } else { wf_known(json!(latest_tool)) },
+        "tokens": if tokens > 0 { Some(tokens.to_string()) } else { None },
+        "calls": if calls > 0 { Some(calls.to_string()) } else { None },
+        "durationMs": Value::Null,
+        "startedAt": null,
+        "endedAt": null,
+    })
+}
+
+/// Synthetic answer to the on-demand `subagent.transcript` RPC in the drill
+/// scenario. The running member has a sidechain transcript; the queued member
+/// answers `available:false` so the UI shows 启动中.
+fn drill_subagent_answer(agent_id: &str) -> Value {
+    if agent_id != DRILL_AGENT_SEC {
+        return json!({ "available": false, "events": [] });
+    }
+    let transcript_source = json!({
+        "channel": "transcript",
+        "delivery": "replay",
+        "driverKind": "claude-print",
+        "nativeAgentId": wf_known(json!(agent_id)),
+    });
+    let event = |seq: u64, kind: &str, payload: Value| {
+        json!({
+            "seq": seq.to_string(),
+            "kind": kind,
+            "source": transcript_source,
+            "completeness": "structured",
+            "payload": payload,
+        })
+    };
+    let message = |id: &str, role: &str, blocks: Value| {
+        json!({
+            "nodeId": id,
+            "messageId": id,
+            "revision": "1",
+            "operation": "open",
+            "baseRevision": null,
+            "role": role,
+            "phase": if role == "user" { "input" } else { "final" },
+            "blocks": blocks,
+            "targetBlock": null,
+            "parentToolCallId": null,
+            "nativeOrigin": { "state": "known", "value": role },
+            "origin": if role == "user" { "human" } else { "assistant" },
+            "status": "complete",
+        })
+    };
+    let events = json!([
+        event(
+            1,
+            "message",
+            message(
+                "m_prompt",
+                "user",
+                json!([
+                    { "type": "text", "text": "Review the auth module for token handling bugs" }
+                ])
+            )
+        ),
+        event(2, "tool_call", {
+            json!({
+                "nodeId": "toolu_agent_grep",
+                "revision": "1",
+                "operation": "open",
+                "baseRevision": null,
+                "toolCallId": "toolu_agent_grep",
+                "parentToolCallId": null,
+                "toolName": wf_known(json!("Grep")),
+                "displayTitle": wf_known(json!("Grep")),
+                "category": "search",
+                "input": wf_known(json!({ "pattern": "token" })),
+                "inputTextDelta": null,
+                "state": "complete",
+                "executor": wf_unknown(),
+            })
+        }),
+        event(3, "tool_result", {
+            json!({
+                "nodeId": "toolu_agent_grep",
+                "revision": "1",
+                "operation": "close",
+                "baseRevision": null,
+                "toolCallId": "toolu_agent_grep",
+                "stage": "final",
+                "outcome": "succeeded",
+                "blocks": [{ "type": "text", "text": "2 matches" }],
+                "structuredResult": wf_known(json!({})),
+                "exitCode": wf_known(json!(0)),
+                "changes": [],
+            })
+        }),
+        event(
+            4,
+            "message",
+            message(
+                "m_final",
+                "assistant",
+                json!([
+                    { "type": "text", "text": "auth review done: token refresh race found in sessions.rs" }
+                ])
+            )
+        ),
+    ]);
+    json!({
+        "available": true,
+        "meta": {
+            "agentId": DRILL_AGENT_SEC,
+            "runId": "wf-native-drill",
+            "prompt": "Review the auth module for token handling bugs",
+            "model": "claude-opus-5",
+            "tokens": 83_319,
+            "calls": 3,
+            "latestTool": "Grep",
+            "startedAt": "2026-09-14T10:00:00.000Z",
+            "endedAt": "2026-09-14T10:00:21.572Z",
+            "finalText": "auth review done: token refresh race found in sessions.rs",
+        },
+        "events": events,
+    })
 }
 
 fn fake_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {

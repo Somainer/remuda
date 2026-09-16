@@ -371,3 +371,42 @@
   .spin { animation: none; }
   .chev, .railFill { transition: none; }
 }
+
+/* c-wfdrill: drill-in member rows. */
+.agentOpen {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  text-decoration: none;
+  color: inherit;
+  border-radius: var(--radius);
+}
+.agentOpen:hover { background: var(--ink-2); }
+.agentOpen .agentLabel { flex: 0 1 auto; min-width: 80px; }
+.agentOpen .agentMeta { flex: 1 1 auto; }
+.agentOpenBtn { display: inline-flex; align-items: center; }
+.memberTools {
+  grid-column: 2 / -1;
+  margin: 2px 0 4px;
+}
+.memberToolsToggle {
+  border: 0;
+  background: transparent;
+  color: var(--mute);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 1px 0;
+}
+.memberToolsToggle:hover { color: var(--paper); }
+.memberToolRows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.memberToolFail {
+  border-left: 2px solid var(--danger);
+  padding-left: 8px;
+}

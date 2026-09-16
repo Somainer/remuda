@@ -21,4 +21,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/instances/{id}/resume", post(http::resume_instance))
         .route("/v1/instances/{id}/journal", get(http::get_journal))
         .route("/v1/instances/{id}/screen", get(http::get_screen))
+        .route(
+            "/v1/instances/{id}/subagents/{agentId}/transcript",
+            get(http::get_subagent_transcript),
+        )
 }

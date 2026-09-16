@@ -10,8 +10,11 @@ test.describe("workflow tree, task track, events drawer", () => {
     await row(page, "看 TaskManager spill").click();
     await expect(page.getByTestId("workflow-tree")).toBeVisible();
     await expect(page.getByTestId("workflow-phase")).toContainText("compile");
-    const linked = page.getByTestId("workflow-member").filter({ has: page.locator("a") });
-    await expect(linked.first()).toBeVisible();
+    // Members are Claude sub-sessions inside this session: every row opens the
+    // subagent drill-in (never a /s/<child> instance link).
+    const members = page.getByTestId("workflow-member");
+    await expect(members.first()).toBeVisible();
+    await expect(members.first().locator("a")).toBeVisible();
     await expect(page.getByTestId("workflow-member").filter({ hasText: "sonnet-cold" })).toBeVisible();
     await expect(page.getByTestId("task-track")).toContainText("summarize");
     await expect(page.getByTestId("usage-row").first()).toContainText("usage");
@@ -33,11 +36,11 @@ test.describe("workflow tree, task track, events drawer", () => {
     await expect(page.getByTestId("raw-event-json")).toContainText("workflowId");
   });
 
-  test("workflow member without childInstanceId is not a link", async ({ page }) => {
+  test("every workflow member drills into the agent route", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "看 TaskManager spill").click();
     const cold = page.getByTestId("workflow-member").filter({ hasText: "sonnet-cold" });
-    await expect(cold).toHaveAttribute("data-child", "0");
-    await expect(cold.locator("a")).toHaveCount(0);
+    const link = cold.locator("a").first();
+    await expect(link).toHaveAttribute("href", /\/agents\/agent-2$/);
   });
 });

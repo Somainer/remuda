@@ -11,6 +11,12 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// How to pick a host for an Instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,6 +50,71 @@ pub enum Placement {
 pub const RESOURCE_CPU_PCT_MAX: u8 = 90;
 /// See [`RESOURCE_CPU_PCT_MAX`].
 pub const RESOURCE_MEM_PCT_MAX: u8 = 90;
+
+/// How many stale hosts at once may wait on a `host.resources` round trip.
+const REFRESH_CONCURRENCY: usize = 8;
+
+/// Result of host selection plus advisory warnings the caller should surface.
+#[derive(Clone, Debug, Default)]
+pub struct PlacementOutcome {
+    /// Ranked eligible hosts, best first.
+    pub hosts: Vec<HostRecord>,
+    /// Over-limit CPU/mem readings for an explicitly pinned host.
+    ///
+    /// A `Placement::Host` is an operator instruction, not a guess: a saturated
+    /// sample downgrades to a warning carried in the create response and
+    /// journaled against the instance, never to a refusal. Auto-placement
+    /// refuses on the same readings.
+    pub warnings: Vec<String>,
+}
+
+/// Age of a persisted resource sample as measured by the Hub clock.
+///
+/// `None` covers every unparseable/absent timestamp the same way the existing
+/// admission treats a missing snapshot: the value cannot be trusted as fresh.
+pub(crate) fn resource_sample_age(resources: Option<&Value>) -> Option<Duration> {
+    let raw = resources?.get("sampledAt")?.as_str()?;
+    let sampled = OffsetDateTime::parse(raw, &Rfc3339).ok()?;
+    // Clamp a future-dated sample (minor clock wobble) to age zero = fresh.
+    let age_ms = (OffsetDateTime::now_utc() - sampled).whole_milliseconds().max(0);
+    Some(Duration::from_millis(u64::try_from(age_ms).unwrap_or(u64::MAX)))
+}
+
+/// Whether a persisted sample is young enough to admit against.
+fn sample_is_fresh(host: &HostRecord, max_age: Duration) -> bool {
+    match resource_sample_age(host.resources.as_ref()) {
+        Some(age) => age <= max_age,
+        // A sample without any timestamp came from a pre-freshness Hub/Node:
+        // its age is unknown, so it cannot count as fresh.
+        None => host.resources.as_ref().is_none_or(|value| value.is_null()),
+    }
+}
+
+/// Over-limit CPU/mem readings as human-readable pin warnings.
+///
+/// Returns nothing for absent/under-limit samples; callers run this only for
+/// [`Placement::Host`], where the reading is advisory.
+pub(crate) fn resource_warnings(host: &HostRecord) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let (cpu_pct, mem_pct) = resource_pressure(host);
+    if let Some(cpu) = cpu_pct
+        && cpu >= RESOURCE_CPU_PCT_MAX
+    {
+        warnings.push(format!(
+            "{}: host CPU at {cpu}% (limit {RESOURCE_CPU_PCT_MAX}%); pinned host, admitting despite saturation",
+            host.host_id
+        ));
+    }
+    if let Some(mem) = mem_pct
+        && mem >= RESOURCE_MEM_PCT_MAX
+    {
+        warnings.push(format!(
+            "{}: host memory at {mem}% (limit {RESOURCE_MEM_PCT_MAX}%); pinned host, admitting despite saturation",
+            host.host_id
+        ));
+    }
+    warnings
+}
 
 /// Read `(cpuPct, memPct, diskFreeGb)` off a host's last inventory snapshot.
 ///
@@ -355,22 +426,30 @@ fn consider(
     // Design §3.4 step 2: the inventory snapshot the Node already reports is
     // finally read here. A missing snapshot never excludes (older Nodes, first
     // hello), matching the best-effort nature of the field.
-    let (cpu_pct, mem_pct) = resource_pressure(host);
-    if let Some(cpu) = cpu_pct
-        && cpu >= RESOURCE_CPU_PCT_MAX
-    {
-        return Err(format!(
-            "{}: host CPU at {cpu}% (limit {RESOURCE_CPU_PCT_MAX}%)",
-            host.host_id
-        ));
-    }
-    if let Some(mem) = mem_pct
-        && mem >= RESOURCE_MEM_PCT_MAX
-    {
-        return Err(format!(
-            "{}: host memory at {mem}% (limit {RESOURCE_MEM_PCT_MAX}%)",
-            host.host_id
-        ));
+    //
+    // An explicit hostId is a pin, not a preference: the operator named the
+    // machine, so over-limit CPU/mem downgrades to a warning (surfaced by
+    // [`resource_warnings`]) instead of removing the host. Auto-placement —
+    // Any/Labels/Project — keeps the hard refusal on the same readings.
+    let pinned = matches!(placement, Placement::Host { .. });
+    if !pinned {
+        let (cpu_pct, mem_pct) = resource_pressure(host);
+        if let Some(cpu) = cpu_pct
+            && cpu >= RESOURCE_CPU_PCT_MAX
+        {
+            return Err(format!(
+                "{}: host CPU at {cpu}% (limit {RESOURCE_CPU_PCT_MAX}%)",
+                host.host_id
+            ));
+        }
+        if let Some(mem) = mem_pct
+            && mem >= RESOURCE_MEM_PCT_MAX
+        {
+            return Err(format!(
+                "{}: host memory at {mem}% (limit {RESOURCE_MEM_PCT_MAX}%)",
+                host.host_id
+            ));
+        }
     }
     if host.ssh.is_some() && spec.driver == "generic-pty" && !has_herdr(host) {
         return Err(format!(
@@ -499,12 +578,12 @@ pub async fn spawn_on_host(
     Ok((instance, command))
 }
 
-/// Load hosts + running counts and select.
+/// Load hosts + running counts, freshen stale resource samples, and select.
 pub async fn pick_hosts(
     state: &AppState,
     placement: &Placement,
     spec: &PlaceSpec,
-) -> Result<Vec<HostRecord>, HubError> {
+) -> Result<PlacementOutcome, HubError> {
     if let Placement::Host { host_id } = placement {
         let exists = state.store.get_host(host_id.clone()).await?.is_some();
         if exists && state.nodes.kind_of(host_id).await.is_none() {
@@ -514,13 +593,91 @@ pub async fn pick_hosts(
         }
     }
     let constraints = project_constraints(state, placement).await?;
-    let hosts = hosts_with_live_links(state).await?;
+    let mut hosts = hosts_with_live_links(state).await?;
+    refresh_stale_resource_samples(state, &mut hosts).await;
     let mut running = Vec::new();
     for host in &hosts {
         let n = state.store.running_count(host.host_id.clone()).await?;
         running.push((host.host_id.clone(), n));
     }
-    select_hosts(&hosts, &running, placement, spec, &constraints)
+    let hosts = select_hosts(&hosts, &running, placement, spec, &constraints)?;
+    let warnings = match placement {
+        Placement::Host { .. } => hosts.iter().flat_map(resource_warnings).collect(),
+        _ => Vec::new(),
+    };
+    Ok(PlacementOutcome { hosts, warnings })
+}
+
+/// Replace stale resource samples with on-demand Node readings before select.
+///
+/// The Mac demo failure: a `cargo build` left the persisted `cpuPct` at 100
+/// and nothing refreshed it for ~20 minutes although the 1-minute load was
+/// already 6/14, so every auto-placement 422'd on the fossil. A persisted
+/// sample at/beyond the configured window now triggers a bounded
+/// `host.resources` RPC at the Node; refusal then runs on the fresh reading.
+/// If no fresh reading can be obtained (old Node, timeout, socket error) the
+/// stale sample is dropped for this decision only — a host is never refused
+/// on a number nobody could re-confirm. The persisted row is left untouched
+/// in that case so the operator UI still shows what was last reported.
+async fn refresh_stale_resource_samples(state: &AppState, hosts: &mut [HostRecord]) {
+    let max_age = Duration::from_millis(state.config.resource_sample_max_age_ms.max(1));
+    let timeout = Duration::from_millis(state.config.resource_refresh_timeout_ms.max(50));
+    let live: HashSet<String> = state.nodes.host_ids().await.into_iter().collect();
+    let stale_indices: Vec<usize> = hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, host)| live.contains(&host.host_id) && !sample_is_fresh(host, max_age))
+        .map(|(index, _)| index)
+        .collect();
+    if stale_indices.is_empty() {
+        return;
+    }
+    let permits = Arc::new(Semaphore::new(REFRESH_CONCURRENCY));
+    let refreshes = futures::future::join_all(stale_indices.iter().map(|&index| {
+        let state = state.clone();
+        let permits = permits.clone();
+        let host_id = hosts[index].host_id.clone();
+        async move {
+            let _permit = permits.acquire().await.ok();
+            let sample = request_resource_sample(&state, &host_id, timeout).await;
+            (index, sample)
+        }
+    }))
+    .await;
+    for (index, sample) in refreshes {
+        match sample {
+            Some(resources) => {
+                let host_id = hosts[index].host_id.clone();
+                if state
+                    .store
+                    .set_host_resources(host_id, resources.clone())
+                    .await
+                    .is_ok()
+                {
+                    hosts[index].resources = Some(resources);
+                }
+            }
+            None => hosts[index].resources = None,
+        }
+    }
+}
+
+/// One bounded `host.resources` call; any failure or malformed reply is None.
+async fn request_resource_sample(
+    state: &AppState,
+    host_id: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    let frame = state
+        .nodes
+        .call(host_id, "host.resources", json!({}), timeout)
+        .await
+        .ok()??;
+    frame
+        .get("result")
+        .and_then(|result| result.get("resources"))
+        .filter(|value| value.is_object())
+        .cloned()
 }
 
 /// Resolve a [`Placement::Project`] into member hosts + per-host quotas;
@@ -597,10 +754,11 @@ async fn resolve_http(
     if body.delegation.is_some() {
         spec.delegation = body.delegation;
     }
-    let hosts = pick_hosts(&state, &placement, &spec).await?;
+    let outcome = pick_hosts(&state, &placement, &spec).await?;
     Ok(Json(json!({
-        "hostId": hosts.first().map(|h| h.host_id.clone()),
-        "hosts": hosts,
+        "hostId": outcome.hosts.first().map(|h| h.host_id.clone()),
+        "hosts": outcome.hosts,
+        "warnings": outcome.warnings,
         "projectId": match &placement {
             Placement::Project { project_id } => Some(project_id.clone()),
             _ => None,
@@ -929,6 +1087,87 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn pinned_host_admits_over_limit_and_emits_warnings() {
+        let mut busy = host("hst_pin", true, &[], false, 8);
+        busy.resources = Some(json!({ "cpuPct": 100, "memPct": 95 }));
+        let spec = PlaceSpec {
+            driver: "claude-print".into(),
+            delegation: None,
+        };
+        // Auto-placement refuses on the same readings.
+        let err = consider(
+            &busy,
+            &[],
+            &Placement::Any,
+            &spec,
+            &PlaceConstraints::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("CPU at 100%"), "{err}");
+        // The pin admits; the readings resurface as warnings instead.
+        consider(
+            &busy,
+            &[],
+            &Placement::Host {
+                host_id: "hst_pin".into(),
+            },
+            &spec,
+            &PlaceConstraints::default(),
+        )
+        .expect("pinned saturated host admits");
+        let warnings = resource_warnings(&busy);
+        assert!(warnings.iter().any(|w| w.contains("CPU at 100%")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("memory at 95%")), "{warnings:?}");
+        // Under-limit pins produce no warnings.
+        busy.resources = Some(json!({ "cpuPct": 89, "memPct": 89 }));
+        assert!(resource_warnings(&busy).is_empty());
+    }
+
+    #[test]
+    fn resource_sample_age_distinguishes_fresh_stale_and_unknown() {
+        use time::OffsetDateTime;
+        use time::format_description::well_known::Rfc3339;
+        let now = OffsetDateTime::now_utc();
+        let fresh = json!({
+            "cpuPct": 100,
+            "sampledAt": (now - time::Duration::seconds(5)).format(&Rfc3339).unwrap()
+        });
+        let stale = json!({
+            "cpuPct": 100,
+            "sampledAt": (now - time::Duration::seconds(120)).format(&Rfc3339).unwrap()
+        });
+        assert!(
+            resource_sample_age(Some(&fresh)).unwrap() < Duration::from_secs(60),
+            "5 s sample is fresh"
+        );
+        assert!(
+            resource_sample_age(Some(&stale)).unwrap() >= Duration::from_secs(60),
+            "120 s sample is stale"
+        );
+        // A pre-freshness row (resources present, no stamp) has no age,
+        // an absent sample is treated as fresh-vacuous (never excludes).
+        assert_eq!(
+            sample_is_fresh(
+                &host("h", true, &[], false, 1),
+                Duration::from_secs(60)
+            ),
+            true
+        );
+        let mut unstamped = host("h", true, &[], false, 1);
+        unstamped.resources = Some(json!({ "cpuPct": 100 }));
+        assert_eq!(
+            sample_is_fresh(&unstamped, Duration::from_secs(60)),
+            false,
+            "unstamped pressure sample cannot be trusted as fresh"
+        );
+        let mut stamped = host("h", true, &[], false, 1);
+        stamped.resources = Some(stale);
+        assert_eq!(sample_is_fresh(&stamped, Duration::from_secs(60)), false);
+        stamped.resources = Some(fresh);
+        assert_eq!(sample_is_fresh(&stamped, Duration::from_secs(60)), true);
     }
 
     #[test]

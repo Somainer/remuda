@@ -858,7 +858,13 @@ pub async fn create_instance(
     )?;
     let project_provider = project.as_ref().map(|project| project.provider.clone());
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
-    let mut hosts = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
+    let placement_outcome =
+        crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
+    let mut hosts = placement_outcome.hosts;
+    // Pinned-host resource warnings ride the response and get journaled once
+    // the instance exists (below). Auto-placement has no warnings by
+    // construction: saturation is a refusal there, not an advisory.
+    let placement_warnings = placement_outcome.warnings;
 
     // ── §4.4 model-supply admission (coordinator dispatch only) ──────────
     // A plain New Session request (no taskSpec) keeps the legacy provider
@@ -1026,8 +1032,20 @@ pub async fn create_instance(
             tracing::warn!(%error, "placement ledger write failed");
         }
     }
+    // A pinned host over its CPU/mem ceiling is admitted, not refused:
+    // journal the saturation as a Hub warning so the session shows why, and
+    // carry the same strings on the create response.
+    for warning in &placement_warnings {
+        crate::ws::publish_hub_diagnostic(
+            &state,
+            &instance.instance_id,
+            "placement_resource_warning",
+            warning,
+        )
+        .await;
+    }
     Ok(Json(
-        json!({ "instance": instance, "command": command, "hostId": host.host_id }),
+        json!({ "instance": instance, "command": command, "hostId": host.host_id, "warnings": placement_warnings }),
     ))
 }
 
@@ -1405,6 +1423,7 @@ async fn pick_worktree_host(
     let spec = crate::placement::PlaceSpec::from_json(&json!({}));
     crate::placement::pick_hosts(state, &placement, &spec)
         .await?
+        .hosts
         .into_iter()
         .next()
         .ok_or(HubError::Unsatisfiable {

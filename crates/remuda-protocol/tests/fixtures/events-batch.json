@@ -413,11 +413,13 @@
                   "options": [
                     {
                       "id": "tea",
-                      "label": "Tea"
+                      "label": "Tea",
+                      "description": null
                     },
                     {
                       "id": "coffee",
-                      "label": "Coffee"
+                      "label": "Coffee",
+                      "description": null
                     }
                   ],
                   "allowFreeText": false,

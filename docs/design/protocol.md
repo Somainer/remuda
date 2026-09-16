@@ -1696,11 +1696,13 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
       "options": [
         {
           "id": "tea",
-          "label": "Tea"
+          "label": "Tea",
+          "description": null
         },
         {
           "id": "coffee",
-          "label": "Coffee"
+          "label": "Coffee",
+          "description": null
         }
       ],
       "allowFreeText": false,

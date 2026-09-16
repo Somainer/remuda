@@ -16,6 +16,7 @@ import { knowledgeValue } from "../../types/command";
 import { familyFor, type ToolFamily } from "./toolRegistry";
 import type { LocalBubble } from "../../lib/store";
 import { supersedeStreamed } from "./live/supersede";
+import { mountLiveThinking } from "./live/liveThinking";
 
 export type DiffState = "proposed" | "applied" | "unknown";
 
@@ -488,7 +489,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
 
   // Hook-streamed assistant bubbles are display echoes: collapse them onto
   // the authoritative transcript message in the projection (design §2.3).
-  return supersedeStreamed(nodes, events);
+  // The screen-tier "thinking" hint is the one other live mount: a collapsed
+  // thought row while the spinner phrase says reasoning is in progress.
+  return supersedeStreamed(mountLiveThinking(nodes, events), events);
 }
 
 /**

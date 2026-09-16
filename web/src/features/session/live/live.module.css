@@ -101,6 +101,43 @@
   flex: 1 1 120px;
 }
 
+.verb {
+  flex: none;
+  color: var(--paper);
+}
+
+.tokenCount {
+  flex: none;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--mute);
+}
+
+/* Subtle screen-tier affordance: claude itself takes Esc while the spinner is
+   up. Looks like a chip, acts like a button, stays quiet in the row. */
+.interrupt {
+  flex: none;
+  font: inherit;
+  font-size: var(--text-label);
+  line-height: 1.6;
+  color: var(--mute);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 8px;
+  cursor: pointer;
+}
+
+.interrupt:hover {
+  color: var(--paper);
+  border-color: var(--dust);
+}
+
+.interrupt:active {
+  color: var(--danger-strong);
+  border-color: var(--danger);
+}
+
 .warnStalled,
 .warnMissing {
   flex: none;

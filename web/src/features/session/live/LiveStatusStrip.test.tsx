@@ -54,6 +54,74 @@ function turnLiveEvent(
   } as unknown as Observation;
 }
 
+function screenStatusEvent(seq: number, tags: Record<string, string>, at = new Date().toISOString()): Observation {
+  return {
+    ...turnLiveEvent(seq, tags, at, "pty"),
+    completeness: "screen-derived",
+    payload: {
+      type: "native",
+      topic: "turn",
+      nativeName: "live.status",
+      nativeId: { state: "not-applicable" },
+      status: { state: "not-applicable" },
+      relatedIds: { tier: "screen", provision: "emulated", ...tags },
+      dataRef: null,
+      severity: "info",
+      affectsCompletion: false,
+    },
+  } as unknown as Observation;
+}
+
+function usageEvent(seq: number, output: string, at = new Date().toISOString()): Observation {
+  return {
+    kind: "usage",
+    eventId: `ev_u_${seq}`,
+    journalId: "jrn_1",
+    instanceId: "ins_1",
+    hostId: "hos_1",
+    processGeneration: "1",
+    runGeneration: "1",
+    runId: "run_1",
+    seq: String(seq),
+    observedAt: at,
+    nativeAt: { state: "not-applicable" },
+    source: {
+      adapterVersion: "t",
+      channel: "transcript",
+      delivery: "live",
+      driverKind: "shell-pty",
+      driverVersion: "t",
+      nativeAgentId: { state: "not-applicable" },
+      nativeEventId: { state: "not-applicable" },
+      nativeItemId: { state: "not-applicable" },
+      nativeRequestId: { type: "none" },
+      nativeSessionId: { state: "known", value: "s" },
+      nativeTurnId: { state: "not-applicable" },
+      sourceCursor: { type: "runtime", value: { ledgerRevision: String(seq) } },
+    },
+    completeness: "structured",
+    rawRef: null,
+    evidenceEventIds: [],
+    schemaVersion: 1,
+    payload: {
+      usageId: "obj_u1",
+      metricRevision: String(seq),
+      scope: "message",
+      mode: "snapshot",
+      accounting: "api",
+      inputAccounting: "api",
+      inputTokens: { state: "known", value: "10" },
+      outputTokens: { state: "known", value: output },
+      totalTokens: { state: "known", value: String(Number(output) + 10) },
+      cacheReadTokens: { state: "known", value: "0" },
+      cacheWriteTokens: { state: "known", value: "0" },
+      reasoningTokens: { state: "known", value: "0" },
+      cost: { state: "unknown", reason: "pending", evidenceEventIds: [] },
+      nativeFieldsRef: null,
+    },
+  } as unknown as Observation;
+}
+
 const ref = (tiers: NativeRef["signalTier"][], caps: NativeRef["capabilities"] = []): NativeRef => ({
   hostId: "hos_1",
   nativeStoreId: "obj_1",
@@ -154,6 +222,119 @@ describe("LiveStatusStrip", () => {
     const note = screen.getByTestId("live-health-file");
     expect(note.getAttribute("data-reason")).toBe("never-materialised");
     expect(note.textContent).toContain("没有记录");
+  });
+
+  it("screen-only spinner line: thinking label, verb, screen tokens, muted phrase", () => {
+    const at = new Date().toISOString();
+    const events = [
+      screenStatusEvent(
+        1,
+        {
+          liveStatus: "1",
+          verb: "Razzmatazzing",
+          elapsedScreen: "49m 38s",
+          since: new Date(Date.now() - 5_000).toISOString(),
+          tokensLabel: "66.0k",
+          tokensDown: "66000",
+          phrase: "thinking some more with xhigh effort",
+        },
+        at,
+      ),
+    ];
+    render(<LiveStatusStrip events={events} nativeRef={null} />);
+    const strip = screen.getByTestId("live-status-strip");
+    expect(strip.getAttribute("data-phase")).toBe("thinking");
+    expect(screen.getByTestId("live-phase").textContent).toContain("思考中");
+    expect(screen.getByTestId("live-verb").textContent).toBe("Razzmatazzing…");
+    expect(screen.getByTestId("live-token-count").textContent).toContain("66.0k");
+    expect(screen.getByTestId("live-token-count").getAttribute("data-source")).toBe("screen");
+    expect(screen.getByTestId("live-phrase").textContent).toContain("xhigh");
+  });
+
+  it("screen-only spinner line without a thinking phrase reads as working, not thinking", () => {
+    const events = [
+      screenStatusEvent(1, {
+        liveStatus: "1",
+        verb: "Effecting",
+        elapsedScreen: "34s",
+        tokensLabel: "120",
+      }),
+    ];
+    render(<LiveStatusStrip events={events} nativeRef={null} />);
+    expect(screen.getByTestId("live-status-strip").getAttribute("data-phase")).toBe("working");
+    expect(screen.getByTestId("live-phase").textContent).toContain("工作中");
+  });
+
+  it("clears screen fields after liveStatus:0", () => {
+    const at = new Date().toISOString();
+    const events = [
+      screenStatusEvent(1, { liveStatus: "1", verb: "Working", tokensLabel: "5" }, at),
+      screenStatusEvent(2, { liveStatus: "0" }, at),
+    ];
+    const { container } = render(<LiveStatusStrip events={events} nativeRef={null} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("shows one token count, preferring real usage over the screen number", () => {
+    const at = new Date().toISOString();
+    const events = [
+      turnLiveEvent(1, { phase: "prompt-accepted", since: at }, at),
+      screenStatusEvent(
+        2,
+        {
+          liveStatus: "1",
+          verb: "Forging",
+          elapsedScreen: "12s",
+          since: at,
+          tokensLabel: "138",
+          tokensDown: "138",
+          phrase: "thought for 9s",
+        },
+        at,
+      ),
+      usageEvent(3, "204", at),
+    ];
+    render(<LiveStatusStrip events={events} nativeRef={ref(["hook"])} />);
+    const count = screen.getByTestId("live-token-count");
+    expect(count.textContent).toContain("204");
+    expect(count.getAttribute("data-source")).toBe("usage");
+    expect(screen.getAllByTestId("live-token-count")).toHaveLength(1);
+  });
+
+  it("renders the Esc affordance only while interruptible and sends through the callback", () => {
+    const at = new Date().toISOString();
+    const onInterrupt = vi.fn();
+    const events = [
+      turnLiveEvent(1, { phase: "prompt-accepted", since: at }, at),
+      screenStatusEvent(
+        2,
+        { liveStatus: "1", verb: "Working", elapsedScreen: "2s", since: at, interruptible: "1" },
+        at,
+      ),
+    ];
+    const { rerender } = render(
+      <LiveStatusStrip events={events} nativeRef={ref(["hook"])} onInterrupt={onInterrupt} />,
+    );
+    const button = screen.getByTestId("live-interrupt");
+    expect(button.textContent).toContain("Esc");
+    act(() => {
+      button.click();
+    });
+    expect(onInterrupt).toHaveBeenCalledOnce();
+
+    // A blocked phase owns the keyboard itself: no strip interrupt.
+    const blocked = [
+      turnLiveEvent(1, { phase: "blocked", since: at }, at),
+      screenStatusEvent(2, { liveStatus: "1", verb: "Working", interruptible: "1" }, at),
+    ];
+    rerender(
+      <LiveStatusStrip events={blocked} nativeRef={ref(["hook"])} onInterrupt={onInterrupt} />,
+    );
+    expect(screen.queryByTestId("live-interrupt")).toBeNull();
+
+    // No callback wired: the affordance is absent, not dead.
+    rerender(<LiveStatusStrip events={events} nativeRef={ref(["hook"])} />);
+    expect(screen.queryByTestId("live-interrupt")).toBeNull();
   });
 
   it("never renders content from the screen/OSC tier: status text only", () => {

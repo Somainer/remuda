@@ -105,6 +105,552 @@ impl WorkerState {
     }
 }
 
+// ── watch classification (M1 batch 5b) ─────────────────────────────────────
+
+/// Worker is actively running its brief (no report line, no trouble).
+pub const WATCH_WORKING: &str = "working";
+/// A freshly-read `DONE <sha>` line, newer than the roster's known tip.
+pub const WATCH_DONE: &str = "done";
+/// A freshly-read `BLOCKED <reason>` line.
+pub const WATCH_BLOCKED: &str = "blocked";
+/// Agent idle while the screen shows an API/connection error — needs a nudge.
+pub const WATCH_IDLE_API_ERROR: &str = "idle-api-error";
+/// One turn has run with no screen/process activity past the stall threshold.
+pub const WATCH_STALLED: &str = "stalled";
+/// Host offline, instance closed, or no readable live carrier.
+pub const WATCH_GONE: &str = "gone";
+
+/// Default quiet window before a busy, silent turn is called stalled. The
+/// behaviour spec productised here ("a single API turn running for >30 min
+/// with no process activity") uses 30 minutes; per-project policy can narrow
+/// it (§3.2 `policy.configurable.stallThresholdMins`).
+pub const DEFAULT_STALL_THRESHOLD_MINS: i64 = 30;
+
+/// The point-in-time status `remuda watch` derives from a worker's screen.
+///
+/// Adjacently tagged on `status`, so the wire shape is
+/// `{"status":"done","sha":"…"}` / `{"status":"blocked","reason":"…"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum WorkerWatchStatus {
+    /// Working normally.
+    Working,
+    /// New `DONE <sha>` on screen (not an echo of a known tip).
+    Done {
+        /// Claimed landed sha.
+        sha: String,
+    },
+    /// New `BLOCKED <reason>` on screen.
+    Blocked {
+        /// Block reason text.
+        reason: String,
+    },
+    /// Idle with an API error / connection drop / retry loop on screen.
+    IdleApiError,
+    /// Busy but silent past the stall threshold.
+    Stalled,
+    /// Host offline, instance closed, or carrier gone.
+    Gone,
+}
+
+impl WorkerWatchStatus {
+    /// Canonical wire discriminant.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Working => WATCH_WORKING,
+            Self::Done { .. } => WATCH_DONE,
+            Self::Blocked { .. } => WATCH_BLOCKED,
+            Self::IdleApiError => WATCH_IDLE_API_ERROR,
+            Self::Stalled => WATCH_STALLED,
+            Self::Gone => WATCH_GONE,
+        }
+    }
+
+    /// True for the all-good terminal state `remuda watch --follow` waits for.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        matches!(self, Self::Done { .. })
+    }
+}
+
+/// One persisted `remuda watch` observation on a roster row.
+///
+/// Besides the current status it carries the echo-suppression baselines
+/// (`lastDoneSha` / `lastBlocked` — a resumed session re-shows its old DONE)
+/// and the activity bookkeeping the stall detector needs across polls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerWatch {
+    /// The classified status (flattened, so its `status`/`sha`/`reason` ride
+    /// this object directly).
+    #[serde(flatten)]
+    pub status: WorkerWatchStatus,
+    /// When this observation was made (UTC RFC3339).
+    pub observed_at: crate::Timestamp,
+    /// The screen line or error that drove the classification, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Most recent DONE sha already treated as real; an equal later line is an
+    /// echo, not a new report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_done_sha: Option<String>,
+    /// Most recent BLOCKED reason already treated as real.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_blocked: Option<String>,
+    /// Digest of the last screen that differed from the one before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_screen_digest: Option<String>,
+    /// Last observed activity (screen change or journal event), as UTC
+    /// RFC3339; the stall detector compares this to the observation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<crate::Timestamp>,
+}
+
+/// Normalised inputs to the screen classifier. All time is Unix seconds so the
+/// rule is testable without a clock.
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenSignals<'a> {
+    /// Visible screen rows, oldest first (the Node `tty.screen` `lines`).
+    pub lines: &'a [String],
+    /// Instance lifecycle (`ready` / `closed` / …).
+    pub lifecycle: &'a str,
+    /// Instance activity (`idle` / `blocked` / …).
+    pub activity: &'a str,
+    /// Whether the worker's host is currently connected.
+    pub host_online: bool,
+    /// Observation time (Unix seconds).
+    pub now_unix: i64,
+    /// Time of the last real activity (screen change / journal event), if any.
+    pub last_activity_unix: Option<i64>,
+    /// Quiet window that makes a busy turn stalled, in minutes.
+    pub stall_mins: i64,
+    /// The DONE sha already known to the roster (echo baseline).
+    pub known_done_sha: Option<&'a str>,
+    /// The BLOCKED reason already known to the roster (echo baseline).
+    pub known_blocked: Option<&'a str>,
+    /// Whether `lines` is a raw VT ring tail rather than an emulated row grid.
+    /// A headless `tty.screen` (no live viewer driving the emulator) returns
+    /// the ANSI-stripped ring tail: one string of cursor-positioned,
+    /// width-padded repaint rows with no `\n` boundaries. In that mode the
+    /// report token is located anywhere in the tail (the `coord-watch-all.sh`
+    /// grep semantics) instead of requiring a start-of-line anchor.
+    pub raw: bool,
+}
+
+/// The classified screen state plus the evidence line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenClass {
+    /// Working normally.
+    Working,
+    /// A new `DONE <sha>` line.
+    Done {
+        /// Claimed sha.
+        sha: String,
+        /// Matched screen line.
+        line: String,
+    },
+    /// A new `BLOCKED <reason>` line.
+    Blocked {
+        /// Reason text.
+        reason: String,
+        /// Matched screen line.
+        line: String,
+    },
+    /// Idle with an API/connection error on screen.
+    IdleApiError {
+        /// Error fragment seen.
+        fragment: String,
+    },
+    /// Busy and silent for at least the stall threshold.
+    Stalled {
+        /// Minutes without activity.
+        quiet_mins: i64,
+    },
+    /// Host offline / instance closed / carrier gone.
+    Gone {
+        /// Machine-readable why.
+        reason: &'static str,
+    },
+}
+
+/// TUI list markers that may prefix a worker's report line; one is stripped at
+/// match time, mirroring `instance wait --until 'line:(?m)^DONE'`.
+const LINE_MARKERS: &[char] = &['•', '●', '◆', '▸', '▪', '-', '*', '>'];
+
+/// Substrings that mark a line as the brief contract echoing back (a resumed
+/// session re-renders its prompt) rather than a worker report.
+const BRIEF_ECHO_HINTS: &[&str] = &[
+    "<sha>",
+    "<reason>",
+    "last line",
+    "reply on one line",
+    "reply with",
+    "reply done",
+    "done tip",
+    "further input",
+    "for example",
+];
+
+/// Screen fragments that mean the harness is in an API error / retry loop.
+const API_ERROR_FRAGMENTS: &[&str] = &["api error", "connection closed", "retrying"];
+
+fn trim_report_line(raw: &str) -> &str {
+    let mut line = raw.trim_start();
+    if let Some(first) = line.chars().next()
+        && LINE_MARKERS.contains(&first)
+    {
+        line = line[first.len_utf8()..].trim_start();
+    }
+    line.trim_end()
+}
+
+fn is_brief_echo(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    BRIEF_ECHO_HINTS.iter().any(|hint| lower.contains(hint))
+}
+
+/// Parse a `DONE <7-40 hex>` report at the start of a normalised line.
+fn parse_done(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("DONE")?;
+    if !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let token: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if (7..=40).contains(&token.len()) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+/// Parse a `BLOCKED <reason>` report at the start of a normalised line.
+fn parse_blocked(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("BLOCKED")?;
+    if !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let reason = rest.trim().trim_start_matches([':', '-', '–']).trim();
+    if reason.is_empty() {
+        return None;
+    }
+    let truncated: String = reason.chars().take(120).collect();
+    Some(truncated)
+}
+
+fn is_terminal_lifecycle(lifecycle: &str) -> bool {
+    matches!(
+        lifecycle.to_ascii_lowercase().as_str(),
+        "closed" | "failed" | "terminated" | "exited"
+    )
+}
+
+fn is_idle(lifecycle: &str, activity: &str) -> bool {
+    let activity = activity.to_ascii_lowercase();
+    let lifecycle = lifecycle.to_ascii_lowercase();
+    if activity == "blocked" || activity == "waiting-interaction" {
+        return false;
+    }
+    activity == "idle" || lifecycle == "ready" || lifecycle == "idle"
+}
+
+/// True when a turn is running (not idle, not blocked, not still starting).
+fn is_busy(lifecycle: &str, activity: &str) -> bool {
+    if is_idle(lifecycle, activity) {
+        return false;
+    }
+    let activity = activity.to_ascii_lowercase();
+    if activity == "blocked" || activity == "waiting-interaction" {
+        return false;
+    }
+    !matches!(
+        lifecycle.to_ascii_lowercase().as_str(),
+        "requested" | "creating" | "starting" | ""
+    )
+}
+
+/// The bottom-most DONE/BLOCKED report on a screen, classified as a new report
+/// or an echo of a known tip. Returns `(keyword-index, class)` where the index
+/// lets the caller compare DONE vs BLOCKED ordering against other signals.
+fn bottom_report(signals: &ScreenSignals<'_>) -> Option<ScreenClass> {
+    for (idx, raw) in signals.lines.iter().enumerate().rev() {
+        let line = trim_report_line(raw);
+        if is_brief_echo(line) {
+            continue;
+        }
+        if let Some(sha) = parse_done(line) {
+            if signals.known_done_sha == Some(sha.as_str()) {
+                // Old tip re-shown by a resumed/rescrolled session: an echo,
+                // not a new report. Fall through to trouble detection.
+                return None;
+            }
+            return Some(ScreenClass::Done {
+                sha,
+                line: line.to_string(),
+            });
+        }
+        if let Some(reason) = parse_blocked(line) {
+            if signals.known_blocked == Some(reason.as_str()) {
+                return None;
+            }
+            return Some(ScreenClass::Blocked {
+                reason,
+                line: line.to_string(),
+            });
+        }
+        let _ = idx;
+    }
+    None
+}
+
+/// Locate a report token in a raw VT ring tail.
+///
+/// Unlike [`bottom_report`] this does not need a line boundary: the tail is a
+/// run of cursor-positioned, width-padded repaint rows with no newlines. It
+/// mirrors the `coord-watch-all.sh` greps (`DONE [0-9a-f]{7,40}`,
+/// `BLOCKED …`) by searching the flattened text and keeping whichever keyword
+/// occurs latest (bottom-most). The strict 7–40 hex suffix is a strong guard
+/// against prose such as "reply DONE <sha>", and the brief echo is excluded by
+/// the same known-tip / placeholder checks.
+fn raw_tail_report(signals: &ScreenSignals<'_>) -> Option<ScreenClass> {
+    let text = signals.lines.join(" ");
+    let done = rfind_token(&text, "DONE").and_then(|(idx, _)| {
+        parse_done_at(&text[idx..])
+            .filter(|(sha, _)| signals.known_done_sha != Some(sha.as_str()))
+            .map(|(sha, span)| ScreenClass::Done {
+                sha,
+                line: snippet(&text, idx, span + 5),
+            })
+    });
+    let blocked = rfind_token(&text, "BLOCKED").and_then(|(idx, _)| {
+        parse_blocked_at(&text[idx..])
+            .filter(|(reason, _)| signals.known_blocked != Some(reason.as_str()))
+            .filter(|(reason, _)| !is_brief_echo(reason))
+            .map(|(reason, span)| ScreenClass::Blocked {
+                reason,
+                line: snippet(&text, idx, span + 7),
+            })
+    });
+    // Keep the bottom-most (latest in the tail) of the two.
+    let di = rfind_token(&text, "DONE")
+        .map(|(i, _)| i)
+        .unwrap_or(usize::MAX);
+    let bi = rfind_token(&text, "BLOCKED")
+        .map(|(i, _)| i)
+        .unwrap_or(usize::MAX);
+    match (done, blocked) {
+        (Some(done), Some(blocked)) => {
+            if di >= bi {
+                Some(done)
+            } else {
+                Some(blocked)
+            }
+        }
+        (Some(done), None) => Some(done),
+        (None, Some(blocked)) => Some(blocked),
+        _ => None,
+    }
+}
+
+/// Byte index of the last case-sensitive occurrence of `token` that is a whole
+/// word (preceded by a non-alphanumeric boundary).
+fn rfind_token(text: &str, token: &str) -> Option<(usize, usize)> {
+    let mut search = text;
+    let mut base = 0usize;
+    let mut found = None;
+    while let Some(rel) = search.find(token) {
+        let idx = base + rel;
+        let boundary_before = text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        if boundary_before {
+            found = Some((idx, token.len()));
+        }
+        // Advance past this occurrence.
+        let next = rel + token.len();
+        base += next;
+        search = &search[next..];
+    }
+    found
+}
+
+/// Parse `DONE <7-40 hex>` starting at byte 0 of a substring; returns the sha
+/// and the consumed length.
+fn parse_done_at(s: &str) -> Option<(String, usize)> {
+    let rest = s.strip_prefix("DONE")?;
+    let after = rest.strip_prefix(|c: char| c.is_whitespace())?;
+    let take = after.bytes().take_while(|b| b.is_ascii_hexdigit()).count();
+    if (7..=40).contains(&take) {
+        Some((after[..take].to_string(), take))
+    } else {
+        None
+    }
+}
+
+/// Parse `BLOCKED <reason>` at byte 0; reason up to the first control/padding
+/// boundary or 120 chars. Returns (reason, consumed length).
+fn parse_blocked_at(s: &str) -> Option<(String, usize)> {
+    let rest = s.strip_prefix("BLOCKED")?;
+    let after = rest.strip_prefix(|c: char| c.is_whitespace())?;
+    let end = after
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() && (*ch == '\n' || *ch == '\r'))
+        .map(|(i, _)| i)
+        .unwrap_or(after.len());
+    // A raw row is space-padded to the terminal width; trim that padding.
+    let mut end = end.min(120);
+    while end > 0 && after.as_bytes()[end - 1] == b' ' {
+        end -= 1;
+    }
+    let reason = after[..end].trim_start_matches([':', '-', '–']).trim();
+    if reason.is_empty() || reason.starts_with('<') {
+        return None;
+    }
+    Some((reason.to_string(), end))
+}
+
+/// A short evidence snippet around a matched token.
+fn snippet(text: &str, start: usize, consumed: usize) -> String {
+    let begin = start.saturating_sub(20);
+    let end = (start + consumed + 20).min(text.len());
+    text[begin..end].trim().to_string()
+}
+
+/// Classify a worker's visible screen per the coordinator watcher practice:
+/// gone → new DONE/BLOCKED → idle-after-API-error → stalled → working.
+#[must_use]
+pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
+    if !signals.host_online {
+        return ScreenClass::Gone {
+            reason: "host-offline",
+        };
+    }
+    if is_terminal_lifecycle(signals.lifecycle) {
+        return ScreenClass::Gone {
+            reason: "instance-closed",
+        };
+    }
+    if let Some(report) = bottom_report(signals) {
+        return report;
+    }
+    // Headless raw-ring tail: locate the report token anywhere in the
+    // concatenated repaint (no start-of-line boundary available).
+    if signals.raw
+        && let Some(report) = raw_tail_report(signals)
+    {
+        return report;
+    }
+    // Idle after API error / connection drop / retry loop.
+    if is_idle(signals.lifecycle, signals.activity) {
+        for raw in signals.lines {
+            let lower = raw.to_ascii_lowercase();
+            if let Some(fragment) = API_ERROR_FRAGMENTS
+                .iter()
+                .find(|needle| lower.contains(**needle))
+            {
+                return ScreenClass::IdleApiError {
+                    fragment: (*fragment).to_string(),
+                };
+            }
+        }
+    }
+    // A single turn busy with no activity past the stall threshold.
+    if is_busy(signals.lifecycle, signals.activity)
+        && let Some(last) = signals.last_activity_unix
+        && signals.stall_mins > 0
+    {
+        let quiet_secs = signals.now_unix - last;
+        let threshold = signals.stall_mins * 60;
+        if quiet_secs >= threshold {
+            return ScreenClass::Stalled {
+                quiet_mins: quiet_secs / 60,
+            };
+        }
+    }
+    ScreenClass::Working
+}
+
+/// Logical key names accepted by `worker answer`, already encoded for
+/// `tty.write` (names + base64 PTY bytes). Mirrors the CLI's key map so the
+/// Hub can answer a dialog without the bytes ever round-tripping a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedKeys {
+    /// Normalised key names actually sent.
+    pub names: Vec<String>,
+    /// Base64 of the raw PTY bytes.
+    pub data_base64: String,
+}
+
+/// Encode the `enter|esc|1..9|<text>` answer vocabulary.
+///
+/// `enter`/`return` → CR, `esc`/`escape` → ESC, a single digit → that byte.
+/// Any other token is typed verbatim (printable ASCII) and submitted with a
+/// trailing CR, since free text answers must be submitted.
+pub fn encode_answer_key(token: &str) -> Result<EncodedKeys, String> {
+    let raw = token.trim();
+    if raw.is_empty() {
+        return Err("empty answer key".into());
+    }
+    let (name, bytes) = match raw.to_ascii_lowercase().as_str() {
+        "enter" | "return" => ("enter".to_string(), vec![b'\r']),
+        "esc" | "escape" => ("esc".to_string(), vec![0x1b]),
+        "space" => ("space".to_string(), vec![b' ']),
+        "tab" => ("tab".to_string(), vec![b'\t']),
+        other if other.len() == 1 && other.as_bytes()[0].is_ascii_digit() => {
+            (other.to_string(), vec![other.as_bytes()[0]])
+        }
+        _ => {
+            if !raw.is_ascii()
+                || raw
+                    .chars()
+                    .any(|c| !c.is_ascii_graphic() && !matches!(c, ' ' | '\t'))
+            {
+                return Err(
+                    "answer text must be printable ASCII (enter, esc, a digit, or text)".into(),
+                );
+            }
+            let mut bytes = raw.as_bytes().to_vec();
+            bytes.push(b'\r');
+            (raw.to_string(), bytes)
+        }
+    };
+    Ok(EncodedKeys {
+        names: vec![name],
+        data_base64: base64_encode(&bytes),
+    })
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < input.len() {
+        let remaining = input.len() - i;
+        let b0 = input[i];
+        let b1 = if remaining > 1 { input[i + 1] } else { 0 };
+        let b2 = if remaining > 2 { input[i + 2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if remaining > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if remaining > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
+
 /// One row of the per-project worker roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +699,23 @@ pub struct WorkerRoster {
     pub task_id: Option<TaskId>,
     /// Lifecycle state.
     pub state: WorkerState,
+    /// Latest `remuda watch` screen classification (5b); absent until the
+    /// worker is first observed. Point-in-time observation, distinct from the
+    /// durable lifecycle `state`: idle-api-error/stalled/gone never move the
+    /// lifecycle, only a freshly-read DONE/BLOCKED line does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WorkerWatch>,
+    /// When the coordinator last nudged this worker (nudge throttle, §3.2
+    /// `policy.configurable.nudgeThrottleMins`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_nudge_at: Option<crate::Timestamp>,
+    /// When `worker resume` respawns the agent, the previous instance id is
+    /// kept here and `instance_id` is repointed at the replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<InstanceId>,
+    /// How many times `worker replace` re-dispatched this worker name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_count: Option<crate::U64>,
     /// The admission/placement decision JSON (reasons[]/rejected[]), stored for
     /// the audit trail and the bot placement card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,5 +909,167 @@ mod tests {
         assert_eq!(slugify("Fix the thing!"), "fix-the-thing");
         assert_eq!(slugify("..."), "work");
         assert_eq!(slugify("TRAIL---dash"), "trail-dash");
+    }
+
+    fn sig<'a>(lines: &'a [String], lifecycle: &'a str, activity: &'a str) -> ScreenSignals<'a> {
+        ScreenSignals {
+            lines,
+            lifecycle,
+            activity,
+            host_online: true,
+            now_unix: 10_000,
+            last_activity_unix: None,
+            stall_mins: DEFAULT_STALL_THRESHOLD_MINS,
+            known_done_sha: None,
+            known_blocked: None,
+            raw: false,
+        }
+    }
+
+    fn rows(text: &str) -> Vec<String> {
+        text.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn classifies_a_new_done_line() {
+        let lines = rows("working on it…\nDONE 0123456789abcdef\n");
+        assert_eq!(
+            classify_screen(&sig(&lines, "ready", "idle")),
+            ScreenClass::Done {
+                sha: "0123456789abcdef".into(),
+                line: "DONE 0123456789abcdef".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_done_equal_to_the_known_tip_is_an_echo() {
+        let lines = rows("DONE 0123456789abcdef\n");
+        let mut s = sig(&lines, "ready", "idle");
+        s.known_done_sha = Some("0123456789abcdef");
+        // Echoed old tip + idle, no API trouble → just working, not done again.
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
+    }
+
+    #[test]
+    fn brief_contract_placeholder_is_not_a_done() {
+        let lines = rows("When finished reply on one line: DONE <sha> or BLOCKED <reason>.\n");
+        assert_eq!(
+            classify_screen(&sig(&lines, "ready", "idle")),
+            ScreenClass::Working
+        );
+    }
+
+    #[test]
+    fn blocked_reason_is_parsed_and_deduped() {
+        let lines = rows("• BLOCKED need credentials for the registry\n");
+        match classify_screen(&sig(&lines, "ready", "blocked")) {
+            ScreenClass::Blocked { reason, .. } => {
+                assert_eq!(reason, "need credentials for the registry")
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut s = sig(&lines, "ready", "blocked");
+        s.known_blocked = Some("need credentials for the registry");
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
+    }
+
+    #[test]
+    fn idle_after_api_error_only_when_idle() {
+        let lines = rows("API Error: bad gateway, Retrying…\n");
+        assert_eq!(
+            classify_screen(&sig(&lines, "ready", "idle")),
+            ScreenClass::IdleApiError {
+                fragment: "api error".into(),
+            }
+        );
+        // A busy turn momentarily showing a retry is not "idle after API error".
+        assert_eq!(
+            classify_screen(&sig(&lines, "running", "busy")),
+            ScreenClass::Working
+        );
+    }
+
+    #[test]
+    fn connection_closed_counts_as_api_trouble() {
+        let lines = rows("Connection closed.\n");
+        assert!(matches!(
+            classify_screen(&sig(&lines, "ready", "idle")),
+            ScreenClass::IdleApiError { .. }
+        ));
+    }
+
+    #[test]
+    fn stalled_needs_busy_and_a_quiet_window() {
+        let lines = rows("thinking…\n");
+        let mut s = sig(&lines, "running", "busy");
+        s.last_activity_unix = Some(10_000 - 31 * 60);
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Stalled { quiet_mins } if quiet_mins >= 31
+        ));
+        // Recent activity is not a stall.
+        s.last_activity_unix = Some(10_000 - 5 * 60);
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
+    }
+
+    #[test]
+    fn gone_when_offline_or_closed() {
+        let lines = rows("DONE 0123456789abcdef\n");
+        let mut s = sig(&lines, "ready", "idle");
+        s.host_online = false;
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Gone {
+                reason: "host-offline"
+            }
+        ));
+        let closed = sig(&lines, "closed", "idle");
+        assert!(matches!(
+            classify_screen(&closed),
+            ScreenClass::Gone {
+                reason: "instance-closed"
+            }
+        ));
+    }
+
+    #[test]
+    fn raw_ring_tail_finds_done_without_line_boundary() {
+        // A raw VT ring tail: one string of width-padded repaint rows.
+        let row = |content: &str| format!("{content:<80}");
+        let tail = vec![format!(
+            "{}{}{}",
+            row("Your coordinator brief is delivered as the attached file brief.md."),
+            row("DONE 9f3807e59491"),
+            row("/help for shortcuts")
+        )];
+        let mut s = sig(&tail, "ready", "idle");
+        s.raw = true;
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Done { ref sha, .. } if sha == "9f3807e59491"
+        ));
+        // Emulated grids keep requiring the start-of-line anchor.
+        s.raw = false;
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
+        // The contract placeholder is never a DONE, even in a raw tail.
+        let placeholder = vec![row("Reply on one line: DONE <sha> or BLOCKED <reason>.")];
+        let mut p = sig(&placeholder, "ready", "idle");
+        p.raw = true;
+        assert_eq!(classify_screen(&p), ScreenClass::Working);
+    }
+
+    #[test]
+    fn answer_keys_encode() {
+        assert_eq!(encode_answer_key("enter").unwrap().data_base64, "DQ==");
+        assert_eq!(encode_answer_key("ESC").unwrap().data_base64, "Gw==");
+        let digit = encode_answer_key("3").unwrap();
+        assert_eq!(digit.names, ["3"]);
+        assert_eq!(digit.data_base64, "Mw==");
+        let text = encode_answer_key("yes").unwrap();
+        assert_eq!(text.names, ["yes"]);
+        // Free text is submitted with a trailing CR.
+        assert_eq!(text.data_base64, "eWVzDQ==");
+        assert!(encode_answer_key("").is_err());
     }
 }

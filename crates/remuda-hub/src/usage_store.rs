@@ -36,10 +36,14 @@ pub struct UsageEventRow {
     pub mode: String,
     /// Total tokens when known.
     pub total_tokens: Option<i64>,
-    /// Input tokens when known.
+    /// Fresh (uncached) input tokens when known.
     pub input_tokens: Option<i64>,
     /// Output tokens when known.
     pub output_tokens: Option<i64>,
+    /// Prompt-cache read tokens when known.
+    pub cache_read_tokens: Option<i64>,
+    /// Prompt-cache creation (write) tokens when known.
+    pub cache_write_tokens: Option<i64>,
     /// Estimated/reported cost decimal string ("USD") when known.
     pub cost_usd: Option<String>,
     /// `reported` / `estimated`.
@@ -61,6 +65,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             total_tokens INTEGER,
             input_tokens INTEGER,
             output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
             cost_usd TEXT,
             accounting TEXT NOT NULL DEFAULT 'estimated',
             observed_at TEXT NOT NULL,
@@ -70,6 +76,9 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
              ON usage_events(profile_id, model);
          CREATE INDEX IF NOT EXISTS usage_events_instance ON usage_events(instance_id);",
     )?;
+    // Rows created before the context rollup carried no cache counters.
+    crate::store::ensure_column(conn, "usage_events", "cache_read_tokens", "INTEGER")?;
+    crate::store::ensure_column(conn, "usage_events", "cache_write_tokens", "INTEGER")?;
     Ok(())
 }
 
@@ -79,8 +88,9 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
             (instance_id, seq, profile_id, model, scope, mode, total_tokens,
-             input_tokens, output_tokens, cost_usd, accounting, observed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             cost_usd, accounting, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             row.instance_id,
             row.seq,
@@ -91,6 +101,8 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
             row.total_tokens,
             row.input_tokens,
             row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
             row.cost_usd,
             row.accounting,
             row.observed_at,
@@ -125,6 +137,8 @@ pub fn project_usage_event(
     let total_tokens = payload.get("totalTokens").and_then(knowledge_u64);
     let input_tokens = payload.get("inputTokens").and_then(knowledge_u64);
     let output_tokens = payload.get("outputTokens").and_then(knowledge_u64);
+    let cache_read_tokens = payload.get("cacheReadTokens").and_then(knowledge_u64);
+    let cache_write_tokens = payload.get("cacheWriteTokens").and_then(knowledge_u64);
     let cost_usd = payload
         .get("cost")
         .and_then(|cost| cost.get("value"))
@@ -149,6 +163,8 @@ pub fn project_usage_event(
         total_tokens,
         input_tokens,
         output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         cost_usd,
         accounting: payload
             .get("accounting")
@@ -254,6 +270,198 @@ pub fn aggregate_supply(
             })
         },
     )
+}
+
+/// Per-session token/context rollup backing the composer's context chip
+/// popover (context-usage-1).
+///
+/// An additive projection of `usage_events`, recomputed on read, so the TPM
+/// windows never go stale. Every counter is `None` until at least one usage
+/// observation has reported it: adapters that do not emit a channel (Codex
+/// cache fields, Grok uncached breakdown) leave it unknown — the client
+/// renders `—`, never a fabricated zero.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceUsageRollup {
+    /// Tokens the next request will carry: the last turn's fresh input +
+    /// cache read + cache creation. `None` when no component was reported.
+    pub context_used_tokens: Option<i64>,
+    /// Context window size in tokens (model catalog / `[1m]` tag / kind).
+    pub context_window_tokens: Option<i64>,
+    /// `context_used / context_window`, rounded and clamped to 0..=100.
+    pub context_pct: Option<i64>,
+    /// Sum of fresh (uncached) input tokens across the session.
+    pub session_input_tokens: Option<i64>,
+    /// Sum of output tokens across the session.
+    pub session_output_tokens: Option<i64>,
+    /// Sum of prompt-cache reads across the session.
+    pub cache_read_tokens: Option<i64>,
+    /// Sum of prompt-cache creations (writes) across the session.
+    pub cache_creation_tokens: Option<i64>,
+    /// Number of usage observations folded (one per turn for Claude).
+    pub turns: i64,
+    /// Fresh input tokens observed during the last 60 seconds.
+    pub tpm_in_60s: Option<i64>,
+    /// Output tokens observed during the last 60 seconds.
+    pub tpm_out_60s: Option<i64>,
+    /// Average per-minute input rate over the last 5 minutes.
+    pub tpm_in_5m: Option<i64>,
+    /// Average per-minute output rate over the last 5 minutes.
+    pub tpm_out_5m: Option<i64>,
+    /// Observed-at of the most recent usage event.
+    pub last_turn_at: Option<String>,
+}
+
+/// Kind-level fallback context windows, matching the web's own table before
+/// the model catalog was available. Generic/terminal kinds report nothing.
+fn kind_context_window(kind: &str) -> Option<i64> {
+    match kind {
+        "claude" | "codex" | "agy" => Some(200_000),
+        "grok" => Some(128_000),
+        _ => None,
+    }
+}
+
+/// Resolve a session's context window: explicit `[1m]` long-context tag,
+/// then the static model catalog, then the harness-kind fallback.
+#[must_use]
+pub fn context_window_tokens(kind: &str, model: Option<&str>) -> Option<i64> {
+    if let Some(model) = model {
+        let trimmed = model.trim();
+        if trimmed.to_ascii_lowercase().ends_with("[1m]") {
+            return Some(1_000_000);
+        }
+        if let Some(row) = crate::model_catalog::lookup(trimmed) {
+            return Some(row.context_window as i64);
+        }
+    }
+    kind_context_window(kind)
+}
+
+/// RFC3339 UTC millisecond timestamp `seconds` in the past, byte-comparable
+/// with the stamps `Store::append_journal` writes (both are fixed-width
+/// `…Z`), so the TPM window predicates are plain string comparisons.
+fn threshold_rfc3339(seconds: i64) -> String {
+    let t = time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
+}
+
+fn sum_tokens_since(
+    conn: &Connection,
+    instance_id: &str,
+    since: &str,
+) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
+    conn.query_row(
+        "SELECT SUM(input_tokens), SUM(output_tokens)
+         FROM usage_events WHERE instance_id = ?1 AND observed_at >= ?2",
+        params![instance_id, since],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+}
+
+/// Session-wide totals of one rollup query (named so the fold signature
+/// stays below the type-complexity lint).
+struct RollupTotals {
+    turns: i64,
+    session_input: Option<i64>,
+    session_output: Option<i64>,
+    cache_read: Option<i64>,
+    cache_creation: Option<i64>,
+    last_turn_at: Option<String>,
+}
+
+/// Fold every persisted usage event of one instance into
+/// [`InstanceUsageRollup`]. Returns `None` when the session has no usage
+/// observations yet, so the field stays off the instance record entirely.
+pub fn rollup_instance(
+    conn: &Connection,
+    instance_id: &str,
+    kind: &str,
+    model: Option<&str>,
+) -> rusqlite::Result<Option<InstanceUsageRollup>> {
+    let totals = conn.query_row(
+        "SELECT COUNT(*),
+                SUM(input_tokens),
+                SUM(output_tokens),
+                SUM(cache_read_tokens),
+                SUM(cache_write_tokens),
+                MAX(observed_at)
+         FROM usage_events WHERE instance_id = ?1",
+        params![instance_id],
+        |row| {
+            Ok(RollupTotals {
+                turns: row.get(0)?,
+                session_input: row.get(1)?,
+                session_output: row.get(2)?,
+                cache_read: row.get(3)?,
+                cache_creation: row.get(4)?,
+                last_turn_at: row.get(5)?,
+            })
+        },
+    )?;
+    if totals.turns == 0 {
+        return Ok(None);
+    }
+
+    // What the next request carries comes from the newest observation:
+    // fresh input plus every cached bucket, summed over whichever buckets
+    // that turn actually reported.
+    let context_used_tokens = conn
+        .query_row(
+            "SELECT input_tokens, cache_read_tokens, cache_write_tokens
+             FROM usage_events WHERE instance_id = ?1
+             ORDER BY seq DESC LIMIT 1",
+            params![instance_id],
+            |row| {
+                let input: Option<i64> = row.get(0)?;
+                let cache_read: Option<i64> = row.get(1)?;
+                let cache_write: Option<i64> = row.get(2)?;
+                let components = [input, cache_read, cache_write].into_iter().flatten();
+                Ok::<_, rusqlite::Error>(components.reduce(i64::saturating_add))
+            },
+        )
+        .ok()
+        .flatten();
+
+    let context_window_tokens = context_window_tokens(kind, model);
+    let context_pct = context_used_tokens
+        .zip(context_window_tokens)
+        .map(|(used, window)| {
+            (used as f64 / window as f64 * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as i64
+        });
+
+    let (in_60s, out_60s) = sum_tokens_since(conn, instance_id, &threshold_rfc3339(60))?;
+    let (in_5m, out_5m) = sum_tokens_since(conn, instance_id, &threshold_rfc3339(300))?;
+    // The 5-minute figure is an average per-minute rate (sum / 5).
+    let per_minute_5m =
+        |total: Option<i64>| -> Option<i64> { total.map(|n| (n as f64 / 5.0).round() as i64) };
+
+    Ok(Some(InstanceUsageRollup {
+        context_used_tokens,
+        context_window_tokens,
+        context_pct,
+        session_input_tokens: totals.session_input,
+        session_output_tokens: totals.session_output,
+        cache_read_tokens: totals.cache_read,
+        cache_creation_tokens: totals.cache_creation,
+        turns: totals.turns,
+        tpm_in_60s: in_60s,
+        tpm_out_60s: out_60s,
+        tpm_in_5m: per_minute_5m(in_5m),
+        tpm_out_5m: per_minute_5m(out_5m),
+        last_turn_at: totals.last_turn_at,
+    }))
 }
 
 /// Observe a fresh journal append: project + persist usage events. Called from
@@ -375,5 +583,168 @@ mod tests {
         };
         assert_eq!(agg.budget_status(Some(5.0)), BudgetStatus::Stop);
         assert_eq!(agg.budget_status(None), BudgetStatus::Ok);
+    }
+
+    /// RFC3339 stamp `seconds` before now, same fixed-width millisecond
+    /// shape the store writes (so the SQL window predicates compare
+    /// lexicographically).
+    fn ago(seconds: i64) -> String {
+        let t = time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            t.year(),
+            u8::from(t.month()),
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.millisecond()
+        )
+    }
+
+    fn row(
+        seq: i64,
+        observed_at: &str,
+        input: Option<i64>,
+        output: Option<i64>,
+        cache_read: Option<i64>,
+        cache_write: Option<i64>,
+    ) -> UsageEventRow {
+        UsageEventRow {
+            instance_id: "ins_test".into(),
+            seq,
+            profile_id: None,
+            model: None,
+            scope: "turn".into(),
+            mode: "snapshot".into(),
+            total_tokens: None,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: observed_at.into(),
+        }
+    }
+
+    /// Three real `message.usage` frames recorded from a Claude Code 2.1.x
+    /// transcript on the dev host (assistant records, per turn):
+    ///   `{input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens}`
+    /// = (4794, 0, 29496, 260), (1839, 0, 33592, 185), (1223, 0, 34616, 144).
+    /// Timestamps are re-anchored to exercise the TPM windows; the counters
+    /// are byte-for-byte the native record.
+    #[test]
+    fn rollup_folds_recorded_usage_sequence() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let turns = [
+            (1, 500, 4_794, 260, 29_496, 0),
+            (2, 200, 1_839, 185, 33_592, 0),
+            (3, 5, 1_223, 144, 34_616, 0),
+        ];
+        let stamps: Vec<String> = turns.iter().map(|(_, secs, ..)| ago(*secs)).collect();
+        for ((seq, _, input, output, cache_read, cache_write), stamp) in
+            turns.iter().zip(stamps.iter())
+        {
+            insert_usage_event(
+                &conn,
+                &row(
+                    *seq,
+                    stamp,
+                    Some(*input),
+                    Some(*output),
+                    Some(*cache_read),
+                    Some(*cache_write),
+                ),
+            )
+            .unwrap();
+        }
+
+        let rollup = rollup_instance(&conn, "ins_test", "claude", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.turns, 3);
+        assert_eq!(rollup.session_input_tokens, Some(7_856));
+        assert_eq!(rollup.session_output_tokens, Some(589));
+        assert_eq!(rollup.cache_read_tokens, Some(97_704));
+        assert_eq!(rollup.cache_creation_tokens, Some(0));
+        // Last turn: 1223 fresh + 34616 cache read + 0 cache write.
+        assert_eq!(rollup.context_used_tokens, Some(35_839));
+        assert_eq!(rollup.context_window_tokens, Some(200_000));
+        assert_eq!(rollup.context_pct, Some(18));
+        assert_eq!(rollup.last_turn_at.as_deref(), Some(stamps[2].as_str()));
+        // Only turn 3 is inside 60 s; turns 2+3 inside 5 min (turn 1 at
+        // 500 s is outside).
+        assert_eq!(rollup.tpm_in_60s, Some(1_223));
+        assert_eq!(rollup.tpm_out_60s, Some(144));
+        assert_eq!(
+            rollup.tpm_in_5m,
+            Some(((1_839 + 1_223) as f64 / 5.0).round() as i64)
+        );
+        assert_eq!(rollup.tpm_out_5m, Some(66));
+    }
+
+    /// Codex/Grok-shaped observations report only some channels. Missing
+    /// counters stay NULL end to end and roll up to `None` — never 0 — and
+    /// when nothing composing the next request's context was reported, the
+    /// context figure (and therefore the ring percentage) is unknown too.
+    #[test]
+    fn rollup_leaves_unreported_channels_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // A Grok-like turn: output only, no input/cache breakdown.
+        insert_usage_event(&conn, &row(1, &ago(2), None, Some(420), None, None)).unwrap();
+
+        let rollup = rollup_instance(&conn, "ins_test", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.turns, 1);
+        assert_eq!(rollup.session_output_tokens, Some(420));
+        assert_eq!(rollup.session_input_tokens, None);
+        assert_eq!(rollup.cache_read_tokens, None);
+        assert_eq!(rollup.cache_creation_tokens, None);
+        assert_eq!(rollup.context_used_tokens, None);
+        assert_eq!(rollup.context_window_tokens, Some(128_000));
+        assert_eq!(rollup.context_pct, None);
+        assert_eq!(rollup.tpm_in_60s, None);
+        assert_eq!(rollup.tpm_out_60s, Some(420));
+
+        // A generic/terminal kind has no window table either.
+        let rollup = rollup_instance(&conn, "ins_test", "generic", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.context_window_tokens, None);
+        assert_eq!(rollup.context_pct, None);
+    }
+
+    #[test]
+    fn rollup_no_events_means_no_rollup() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            rollup_instance(&conn, "ins_empty", "claude", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn context_window_resolution_order() {
+        // Explicit [1m] tag wins over everything.
+        assert_eq!(
+            context_window_tokens("claude", Some("gw/es1[1m]")),
+            Some(1_000_000)
+        );
+        // Static catalog row for a real model.
+        assert!(context_window_tokens("claude", Some("claude-opus-5")).is_some());
+        // Kind fallback when the model is unknown.
+        assert_eq!(
+            context_window_tokens("grok", Some("mystery-model")),
+            Some(128_000)
+        );
+        assert_eq!(context_window_tokens("claude", None), Some(200_000));
+        // Nothing to say for a generic PTY.
+        assert_eq!(context_window_tokens("generic", None), None);
     }
 }

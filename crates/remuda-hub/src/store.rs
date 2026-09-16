@@ -461,6 +461,16 @@ pub struct InstanceRecord {
     /// Task this node works (`tsk_…`).
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "taskId")]
     pub task_id: Option<String>,
+    /// Additive per-session token/context rollup (context-usage-1). Not a
+    /// column: computed from the durable `usage_events` table on every read,
+    /// so TPM windows stay fresh. Absent (`null`) for sessions with no usage
+    /// observations or for rows constructed outside [`load_instance`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "usageRollup"
+    )]
+    pub usage_rollup: Option<crate::usage_store::InstanceUsageRollup>,
 }
 
 /// Delegation-tree state attached at instance create; design §2.5.
@@ -4153,7 +4163,7 @@ fn is_deleted_instance(conn: &Connection, instance_id: &str) -> Result<bool, Sto
         .is_some())
 }
 
-fn ensure_column(
+pub(crate) fn ensure_column(
     conn: &Connection,
     table: &str,
     name: &str,
@@ -5906,6 +5916,14 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(|raw| serde_json::from_str(&raw).ok())
                 .unwrap_or_default();
             let task_id: Option<String> = row.get(21)?;
+            // Additive context-usage rollup (context-usage-1), folded from the
+            // durable usage_events table so it is never stored redundantly.
+            let usage_rollup = crate::usage_store::rollup_instance(
+                conn,
+                id,
+                &row.get::<_, String>(3)?,
+                model.as_deref(),
+            )?;
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,
                 parent_instance_id: spec
@@ -5966,6 +5984,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 project_id,
                 grants,
                 task_id,
+                usage_rollup,
             })
         },
     )

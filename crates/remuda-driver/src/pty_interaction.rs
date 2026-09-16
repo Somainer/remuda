@@ -729,6 +729,7 @@ pub(crate) fn screen_request(
                     .map(|choice| QuestionOption {
                         id: choice.id.clone(),
                         label: choice.label.clone(),
+                        description: None,
                     })
                     .collect(),
                 allow_free_text: parsed.free_text(),

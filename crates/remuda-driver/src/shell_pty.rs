@@ -2135,13 +2135,20 @@ impl Driver for ShellPtyDriver {
         // §14 risk 1 is that that case still needs answering — routing on
         // `is_parked` would send it to the transcript picker, which would
         // reject it as the wrong answer kind and lose the decision entirely.
-        // The picker is the only thing that asks a Question here; approvals
-        // and elicitations can only have come from a hook.
+        // Approvals and elicitations can only have come from a hook; a hook
+        // question (AskUserQuestion) goes to the hook while its card is open,
+        // otherwise to the transcript picker, the only other question source.
         let hook_carried = matches!(
             &answer,
             remuda_protocol::InteractionAnswer::Approval(_)
                 | remuda_protocol::InteractionAnswer::Elicitation(_)
-        );
+        ) || matches!(&answer, remuda_protocol::InteractionAnswer::Question(_)
+            if self
+                .hooks
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|hooks| hooks.is_parked(&id)));
         if hook_carried {
             let outcome = match self.hooks.lock().await.clone() {
                 Some(hooks) => hooks.resolve_answer(&id, &answer),

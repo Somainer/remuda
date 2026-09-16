@@ -352,6 +352,7 @@ impl BindingHandle {
                 .map(|candidate| QuestionOption {
                     id: candidate.session_id.clone(),
                     label: candidate.label(),
+                    description: None,
                 })
                 .collect();
             let interaction = picker_interaction(ctx, options.clone()).ok()?;

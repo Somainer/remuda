@@ -1599,6 +1599,10 @@ fn question_request(req: &CanUseToolRequest) -> QuestionRequest {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned)
                         .unwrap_or_else(|| format!("option-{opt_i}")),
+                    description: option
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
                 })
                 .collect();
             let multi = question

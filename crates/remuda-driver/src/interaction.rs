@@ -462,6 +462,12 @@ pub fn validate_answer(
             }
         }
         (InteractionRequest::Question(request), InteractionAnswer::Question(answer)) => {
+            // An empty answers map is the explicit Deny/Cancel of the whole
+            // batch; the hook layer turns it into a deny decision. Every other
+            // answer must fill each required field.
+            if answer.answers.is_empty() {
+                return Ok(());
+            }
             if answer
                 .answers
                 .keys()

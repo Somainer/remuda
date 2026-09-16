@@ -7,6 +7,7 @@ mod dispatch;
 pub mod dispatcher;
 pub mod doctor;
 pub mod fleet;
+mod gate;
 pub mod hook;
 mod hostcap;
 pub mod hub;
@@ -64,6 +65,8 @@ commands! {
     Own(own::OwnArgs),
     Profile(profile::ProfileArgs),
     Dispatch(dispatch::DispatchArgs),
+    Gate(gate::GateArgs),
+    Land(gate::LandArgs),
     Watch(watch::WatchArgs),
     Worker(worker::WorkerArgs),
     Report(report::ReportArgs),
